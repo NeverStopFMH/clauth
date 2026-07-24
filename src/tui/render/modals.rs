@@ -534,10 +534,7 @@ fn tab_specific_rows(tab: Tab) -> Vec<(&'static str, &'static [(&'static str, &'
                 ),
                 ("+ / -", "step rotate at / weekly at by 5"),
                 ("\u{21b5} on rotate at", "type a value, \u{21b5} saves"),
-                (
-                    "\u{21b5} on weekly at",
-                    "type a %, empty follows the chain default",
-                ),
+                ("\u{21b5} on weekly at", "type a %, empty clears"),
                 ("esc", "back / cancel edit"),
             ][..],
         )],

@@ -555,9 +555,7 @@ fn member_detail(
                         "weekly gate is off — this line isn't checked for this account".to_string()
                     } else {
                         match profile.weekly_threshold {
-                            Some(v) => format!(
-                                "switches away once weekly usage hits {v:.0}% here (chain default {chain_default:.0}%)"
-                            ),
+                            Some(v) => format!("switches away once weekly usage hits {v:.0}% here"),
                             None => format!(
                                 "follows the chain-wide weekly limit ({chain_default:.0}%); type a value to override"
                             ),
@@ -667,10 +665,10 @@ fn threshold_range_tooltip(input: &InputState, width: usize) -> Vec<Line<'static
     }
 }
 
-/// Sub-line under the `weekly at` field while typing: the valid range plus
-/// the empty-clears rule, DANGER when the buffer parses invalid.
+/// Sub-line under the `weekly at` field while typing: the valid range, DANGER
+/// when the buffer parses invalid.
 fn weekly_override_range_tooltip(input: &InputState, width: usize) -> Vec<Line<'static>> {
-    let range = "50-100 % · empty follows the chain default";
+    let range = "50-100 %";
     if parse_weekly_override(input.trimmed()).is_none() {
         invalid_tooltip_lines(range, width)
     } else {

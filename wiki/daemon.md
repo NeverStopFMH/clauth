@@ -72,6 +72,11 @@ stays the only resolution surface.
   defeated. The daemon checks its own stderr at boot and warns loudly when it
   is a non-append file, so a defeated cap shows up in the log instead of only
   in this page.
+- **Usage-history samples**: the lease holder appends every live `/usage` reading
+  to `~/.clauth/profiles/<name>/usage_history.jsonl`, the series the burn rate and
+  burn-aware switching read. Headless counts: the daemon keeps it advancing with no
+  TUI open. Retention is 2 days, re-trimmed on a 6-hour cadence rather than only at
+  startup, so a long-lived daemon bounds the file without a restart.
 - **Single usage fetcher (`usage-fetch.lock` lease)**: every instance (the
   daemon and each open TUI) runs the same refresher, but only the one holding
   the `usage-fetch.lock` flock fetches usage, rotates tokens, and decides

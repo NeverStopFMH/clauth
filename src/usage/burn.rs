@@ -76,8 +76,11 @@ fn gap_boundary(entries: &[(u64, f64)], max_gap_ms: u64) -> usize {
 ///
 /// Returns rates in %/h. Drives the 5-hour window's `%/h` rate and the overview
 /// burn-ETA. The 7-day windows show a window-anchored average pace instead
-/// (`window_avg_pace_per_day`), which a history slope can't give: a per-profile
-/// history jumps to another account's utilization on every rotation.
+/// (`window_avg_pace_per_day`): utilization is whole percents, so a week's series
+/// yields distinct samples far too slowly to slope, and the log holds only 2 days
+/// either way. Not for the reason this comment used to give — the log lives under
+/// `profiles/<name>/` and is read by name, so it never carries another account's
+/// numbers.
 pub(crate) fn compute_burn_rates_from_history(
     history: &[(u64, UsageInfo)],
     windows: &[(&str, &UsageWindow)],

@@ -107,6 +107,20 @@ pub(crate) enum Command {
         json: bool,
     },
 
+    /// List accounts as a table with each profile's usage
+    ///
+    /// Reads the same on-disk usage caches `status --json` prints, so the
+    /// numbers match, and never fetches. The active profile is marked `*` and
+    /// always shown; disabled profiles are hidden unless `--all`/`--disabled`.
+    List {
+        /// Also list disabled profiles, hidden by default.
+        #[arg(long)]
+        all: bool,
+        /// Alias for --all.
+        #[arg(long)]
+        disabled: bool,
+    },
+
     /// List Claude Code sessions as a table
     ///
     /// Exits 0 on success, 2 on a usage error, 1 on any other failure.

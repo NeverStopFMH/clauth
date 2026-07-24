@@ -11,6 +11,7 @@ mod jsonsync;
 // file, so a switch must also write there. Gated so non-macOS builds stay clean.
 #[cfg(target_os = "macos")]
 mod keychain;
+mod list;
 mod lock;
 mod lockorder;
 mod logline;
@@ -138,6 +139,7 @@ fn dispatch(cli: Cli) -> Result<()> {
         Command::Disable { profile, yes } => cmd_disable(&profile, yes),
         Command::Enable { profile } => cmd_enable(&profile),
         Command::Which { json } => which::run(json),
+        Command::List { all, disabled } => list::run(all || disabled),
         Command::Sessions { json } => sessions_cli::run_sessions(json),
         Command::Resume { target, profile } => {
             sessions_cli::run_resume(&target, profile.as_deref())

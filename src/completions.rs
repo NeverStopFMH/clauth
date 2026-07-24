@@ -11,7 +11,7 @@ const BASH: &str = r#"_clauth() {
     if [ "$COMP_CWORD" -eq 1 ]; then
         local profiles
         profiles=$(clauth __complete 2>/dev/null)
-        COMPREPLY=( $(compgen -W "${profiles} start login delete disable enable which sessions resume info daemon status mcp completions --theme" -- "${cur}") )
+        COMPREPLY=( $(compgen -W "${profiles} start login delete disable enable which list sessions resume info daemon status mcp completions --theme" -- "${cur}") )
     elif [ "$prev" = "--theme" ]; then
         COMPREPLY=( $(compgen -W "full compatible" -- "${cur}") )
     elif [ "${COMP_WORDS[1]}" = "login" ] && [ "${cur:0:2}" = "--" ]; then
@@ -40,6 +40,8 @@ const BASH: &str = r#"_clauth() {
         COMPREPLY=( $(compgen -W "--yes -y" -- "${cur}") )
     elif [ "${COMP_WORDS[1]}" = "status" ] && [ "${cur:0:2}" = "--" ]; then
         COMPREPLY=( $(compgen -W "--json --all --disabled" -- "${cur}") )
+    elif [ "${COMP_WORDS[1]}" = "list" ] && [ "${cur:0:2}" = "--" ]; then
+        COMPREPLY=( $(compgen -W "--all --disabled" -- "${cur}") )
     fi
     return 0
 }
@@ -59,6 +61,7 @@ _clauth() {
             'disable[hide a profile from auto-switch and usage polling]' \
             'enable[restore a disabled profile]' \
             'which[print profile owning the loaded credentials]' \
+            'list[list accounts as a table with per-profile usage]' \
             'sessions[list Claude Code sessions (add --json)]' \
             'resume[resume a session under a chosen profile]' \
             'info[print resume command + storage path for a session]' \
@@ -104,6 +107,8 @@ _clauth() {
             '--status[print the running daemon, or exit 1 when none is]'
     elif (( CURRENT >= 3 )) && [[ "${words[2]}" == status ]]; then
         _values 'flag' '--json[print the status snapshot as JSON]' '--all[also list disabled profiles]' '--disabled[also list disabled profiles]'
+    elif (( CURRENT >= 3 )) && [[ "${words[2]}" == list ]]; then
+        _values 'flag' '--all[also list disabled profiles]' '--disabled[also list disabled profiles]'
     fi
 }
 _clauth "$@"
@@ -120,6 +125,7 @@ complete -c clauth -f -n __fish_is_first_token -a delete -d "Remove a profile an
 complete -c clauth -f -n __fish_is_first_token -a disable -d "Hide a profile from auto-switch and usage polling"
 complete -c clauth -f -n __fish_is_first_token -a enable -d "Restore a disabled profile"
 complete -c clauth -f -n __fish_is_first_token -a which -d "Print profile owning the loaded credentials"
+complete -c clauth -f -n __fish_is_first_token -a list -d "List accounts as a table with per-profile usage"
 complete -c clauth -f -n __fish_is_first_token -a sessions -d "List Claude Code sessions"
 complete -c clauth -f -n __fish_is_first_token -a resume -d "Resume a session under a chosen profile"
 complete -c clauth -f -n __fish_is_first_token -a info -d "Print resume command + storage path"
@@ -150,6 +156,8 @@ complete -c clauth -f -n "__fish_seen_subcommand_from disable" -a -y -d "Skip th
 complete -c clauth -f -n "__fish_seen_subcommand_from status" -a --json -d "Print the status snapshot as JSON"
 complete -c clauth -f -n "__fish_seen_subcommand_from status" -a --all -d "Also list disabled profiles"
 complete -c clauth -f -n "__fish_seen_subcommand_from status" -a --disabled -d "Also list disabled profiles"
+complete -c clauth -f -n "__fish_seen_subcommand_from list" -a --all -d "Also list disabled profiles"
+complete -c clauth -f -n "__fish_seen_subcommand_from list" -a --disabled -d "Also list disabled profiles"
 complete -c clauth -f -n "__fish_seen_subcommand_from daemon" -a --standby -d "Wait and take over when the running daemon exits"
 complete -c clauth -f -n "__fish_seen_subcommand_from daemon" -a --no-standby -d "Explicit spelling of the default"
 complete -c clauth -f -n "__fish_seen_subcommand_from daemon" -a --replace -d "Terminate the running daemon and take over"

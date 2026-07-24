@@ -602,6 +602,46 @@ fn status_requires_json_and_treats_disabled_as_an_alias_for_all() {
     assert_eq!(parse_exit_code(&["status", "--json", "--bogus"]), 2);
 }
 
+/// `list` mirrors `status`'s hide-by-default posture: bare shows only enabled
+/// profiles, `--all` and its `--disabled` alias each reveal the disabled ones.
+/// Unlike `status` it has no required `--json` — the table is its only output.
+#[test]
+fn list_takes_all_and_disabled_flags_with_neither_required() {
+    let Command::List { all, disabled } = command(&["list"]) else {
+        panic!("bare `list` must parse");
+    };
+    assert!(!all && !disabled, "bare list reveals nothing");
+
+    let Command::List { all, disabled } = command(&["list", "--all"]) else {
+        panic!("must parse");
+    };
+    assert!(all && !disabled);
+
+    let Command::List { all, disabled } = command(&["list", "--disabled"]) else {
+        panic!("must parse");
+    };
+    assert!(
+        !all && disabled,
+        "--disabled is its own flag, ORed with --all"
+    );
+
+    let Command::List { all, disabled } = command(&["list", "--all", "--disabled"]) else {
+        panic!("must parse");
+    };
+    assert!(all && disabled);
+
+    assert_eq!(
+        parse_exit_code(&["list", "--json"]),
+        2,
+        "list has no --json"
+    );
+    assert_eq!(
+        parse_exit_code(&["list", "extra"]),
+        2,
+        "list takes no positional"
+    );
+}
+
 // ── theme ───────────────────────────────────────────────────────────────────
 
 /// Both spellings work, and the flag applies ahead of a subcommand the way the
@@ -672,6 +712,7 @@ fn every_visible_subcommand_is_listed_in_the_root_help() {
         "disable",
         "enable",
         "which",
+        "list",
         "sessions",
         "resume",
         "info",

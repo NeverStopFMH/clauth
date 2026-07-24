@@ -537,7 +537,7 @@ fn member_detail(
             match row_editing {
                 Some(input) => lines.extend(threshold_range_tooltip(input, width)),
                 None if selected => lines.extend(help_tooltip_lines(
-                    &format!("switches to the next account once 5h usage hits {threshold:.0}%"),
+                    "switches to the next account once 5h usage passes this level",
                     width,
                 )),
                 None => {}
@@ -550,18 +550,14 @@ fn member_detail(
             match row_editing {
                 Some(input) => lines.extend(weekly_override_range_tooltip(input, width)),
                 None if selected => {
-                    let chain_default = cfg.state.weekly_switch_threshold_pct();
                     let hint = if !profile.check_weekly {
-                        "weekly gate is off — this line isn't checked for this account".to_string()
+                        "weekly gate is off, this line isn't checked for this account"
+                    } else if profile.weekly_threshold.is_some() {
+                        "switches away from this account once weekly usage passes this level"
                     } else {
-                        match profile.weekly_threshold {
-                            Some(v) => format!("switches away once weekly usage hits {v:.0}% here"),
-                            None => format!(
-                                "follows the chain-wide weekly limit ({chain_default:.0}%); type a value to override"
-                            ),
-                        }
+                        "switches away from this account at the chain's shared weekly level"
                     };
-                    lines.extend(help_tooltip_lines(&hint, width));
+                    lines.extend(help_tooltip_lines(hint, width));
                 }
                 None => {}
             }
@@ -828,7 +824,6 @@ fn detail_row(
                             format!("{weekly_default:.0}%"),
                             theme::faint(),
                         ));
-                        spans.push(Span::styled("   chain default", theme::faint()));
                     }
                 },
             }

@@ -14,6 +14,18 @@ clauth handles live credentials. Before you paste any log, config, or output int
 strip OAuth tokens, API keys, and the contents of `~/.claude/.credentials.json` or any
 `~/.clauth/profiles/*` file. An `sk-ant-*` string is a live credential, not an ID.
 
+## Flag user-visible changes
+
+Anything a user reads or presses can change without failing a build, so it reads as diff noise
+and slips past review. If your PR moves any of these, say so in the summary with why you changed it:
+
+- wording a user reads: hints, labels, help text, error messages
+- a key binding
+- a default value a first run inherits
+
+"reworded for X" or "changed the default because Y" is enough. A surface change with no reason
+behind it gets reverted even when the new value reads better.
+
 ## AI and agent contributions
 
 AI-assisted work is welcome. The one requirement is transparency: a reviewer should be able to see

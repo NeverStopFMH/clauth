@@ -139,12 +139,14 @@ fn drain_rate_covers_third_party_windows_from_avg_pace() {
         .expect("a half-elapsed 7d window yields an avg pace");
     assert!(five_rate > 0.0 && seven_rate > 0.0);
 
-    // 60% over the 2.5h elapsed half of a 5h window = 24 %/h.
+    // 60% over the 2.5h elapsed half of a 5h window is past its 50% ideal line,
+    // so the cap applies: 70 / 3h = 23.3 %/h rather than the plain 24.
     assert!(
-        (five_rate - 24.0).abs() < 0.5,
+        (five_rate - 23.333).abs() < 0.1,
         "5h rate in %/h: {five_rate}"
     );
-    // 30% over the 3.5d elapsed half of a 7d window ≈ 8.57 %/d.
+    // 30% at the 3.5d half of a 7d window is under the line, so it reads the
+    // plain 30 / 3.5d ≈ 8.57 %/d untouched.
     assert!(
         (seven_rate - 30.0 / 3.5).abs() < 0.2,
         "7d rate in %/d: {seven_rate}",

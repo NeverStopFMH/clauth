@@ -495,7 +495,7 @@ fn make_window_stat(
     let burn_rate = gates
         .show_estimates
         .then(|| {
-            crate::usage::window_avg_pace_per_day(label, &window, now, 3600).map(|per_day| {
+            crate::usage::window_avg_pace_per_day(label, &window, now).map(|per_day| {
                 if rate_unit == "d" {
                     per_day
                 } else {

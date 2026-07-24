@@ -458,27 +458,56 @@ pub(crate) fn ideal_pace_pct(label: &str, window: &UsageWindow, now_secs: i64) -
     Some(elapsed as f64 / duration as f64 * 100.0)
 }
 
-/// Average burn pace in %/day for `window`: utilization spread evenly over the
-/// time elapsed since the window opened (`resets_at − duration`). Unlike the
-/// recency-weighted recent-burn rate, this is anchored to the fixed window, so
-/// it is unaffected by account rotation (which makes a per-profile history jump
-/// to another account's utilization). `None` until `min_elapsed_secs` have
-/// elapsed — a freshly opened window would otherwise divide by ~0 — or when the
-/// window has no reset time or no fixed duration.
+/// Weight of the on-pace pseudo-observation that caps [`window_avg_pace_per_day`],
+/// as a fraction of the window's own length. An over-pace window needs this much
+/// elapsed time before its measurement outweighs the cap (16.8 h into a week,
+/// 30 min into a 5h window). For a utilization inside the API's own 0..=100
+/// range that puts a ceiling of
+/// `100 × (1 + PACE_PRIOR_FRACTION) / (PACE_PRIOR_FRACTION × duration_days)`
+/// on the reported pace — 157 %/d for a week.
+const PACE_PRIOR_FRACTION: f64 = 0.1;
+
+/// Average burn pace in %/day for `window`: utilization over the time elapsed
+/// since the window opened (`resets_at − duration`), capped for a window running
+/// ahead of its own ideal pace.
+///
+/// The plain quotient divides by ~0 for as long as a window is young, so early
+/// activity reads as an enormous %/day and the ETA it feeds claims a week's
+/// budget runs dry within a day. Blending in a pseudo-observation worth
+/// [`PACE_PRIOR_FRACTION`] of the window at the ideal pace holds the denominator
+/// off zero, which bounds the result and decays out as real elapsed time
+/// accumulates.
+///
+/// The cap is ONE-SIDED, because only the high side is pathological: a small
+/// numerator over a small denominator stays small, while a large one explodes.
+/// The two forms cross exactly where utilization meets [`ideal_pace_pct`], so
+/// taking the lower never reports an at-or-under-pace window above its plain
+/// average (an idle window still paces at 0, never at the prior) and trims only
+/// the overshoot above the line. The run-dry projection the callers derive keeps
+/// the plain form's threshold either way: both warn iff utilization is past the
+/// ideal line.
+///
+/// Anchored to the window rather than to sample history, so which account served
+/// the traffic cannot move it. `None` when the window carries no reset time, has
+/// no fixed duration, or has not opened yet (`resets_at` a full duration out,
+/// which `/usage` reports for an idle 5h window).
 pub(crate) fn window_avg_pace_per_day(
     label: &str,
     window: &UsageWindow,
     now_secs: i64,
-    min_elapsed_secs: i64,
 ) -> Option<f64> {
     let duration = window_duration_secs(label)?;
     let reset = iso_to_epoch_secs(window.resets_at.as_deref()?)?;
     let remaining = (reset - now_secs).clamp(0, duration);
     let elapsed = duration - remaining;
-    if elapsed < min_elapsed_secs {
+    if elapsed <= 0 {
         return None;
     }
-    Some(window.utilization / (elapsed as f64 / 86_400.0))
+    let elapsed_days = elapsed as f64 / 86_400.0;
+    let prior_days = duration as f64 * PACE_PRIOR_FRACTION / 86_400.0;
+    let plain = window.utilization / elapsed_days;
+    let capped = (window.utilization + 100.0 * PACE_PRIOR_FRACTION) / (elapsed_days + prior_days);
+    Some(plain.min(capped))
 }
 
 #[derive(Deserialize)]

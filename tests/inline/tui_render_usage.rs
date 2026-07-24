@@ -109,9 +109,11 @@ fn stats_from_bars_does_not_rename_duplicate_labels() {
 fn stats_from_bars_fills_pace_for_windowed_labels() {
     let approx = |a: Option<f64>, b: f64| a.is_some_and(|v| (v - b).abs() < 0.1);
     let now = crate::usage::now_epoch_secs();
+    // All three sit under their ideal line, so the over-pace cap is inert and
+    // each reads its plain average.
     // 5h window 4h in (resets in 1h), 20% used → 5 %/h, 80% of the way through.
     // 7d window 3.5d in, 35% used → 10 %/d, half elapsed.
-    // 30d window 15d in, 30% used → 2 %/d (proves the new 30d duration arm).
+    // 30d window 15d in, 30% used → 2 %/d (proves the 30d duration arm).
     let bars = vec![
         tp_bar("5h", 20.0, now + 3600, None, None),
         tp_bar("7d", 35.0, now + 3 * 86_400 + 43_200, None, None),

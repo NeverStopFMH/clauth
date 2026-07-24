@@ -867,7 +867,7 @@ fn drain_rate(
     {
         return app.active_burn_rate(name, usage);
     }
-    let per_day = crate::usage::window_avg_pace_per_day(label, window, now_epoch_secs(), 3600)?;
+    let per_day = crate::usage::window_avg_pace_per_day(label, window, now_epoch_secs())?;
     Some(if window_rate_unit(label) == "d" {
         per_day
     } else {

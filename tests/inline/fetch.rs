@@ -645,27 +645,99 @@ fn ideal_pace_tracks_elapsed_window_fraction() {
     );
 }
 
-/// Window-anchored average pace = utilization spread over the time elapsed since
-/// the window opened, in %/day — rotation-proof because it reads only `resets_at`
-/// and the current utilization (no history). Gated below `min_elapsed_secs`, and
-/// `None` without a reset time or fixed duration.
-#[test]
-fn window_avg_pace_is_util_over_elapsed_days() {
-    let win = |util: f64, reset_secs: i64| UsageWindow {
+const WEEK: i64 = 7 * 86_400;
+
+fn pace_win(util: f64, reset_secs: i64) -> UsageWindow {
+    UsageWindow {
         utilization: util,
         resets_at: Some(epoch_secs_to_iso(reset_secs)),
-    };
-    let duration = 7 * 86_400;
+    }
+}
 
-    // 7d window 12h into the week at 21% → 21 / 0.5d = 42 %/d.
-    let reset = BASE_UTC + duration - 12 * 3600;
-    let pace = window_avg_pace_per_day(LABEL_7D, &win(21.0, reset), BASE_UTC, 3600).unwrap();
-    assert!((pace - 42.0).abs() < 1e-6, "12h/21% → 42 %/d, got {pace}");
+/// A 7d window `elapsed` seconds into its week at `util`%.
+fn pace_at(util: f64, elapsed: i64) -> f64 {
+    window_avg_pace_per_day(
+        LABEL_7D,
+        &pace_win(util, BASE_UTC + WEEK - elapsed),
+        BASE_UTC,
+    )
+    .expect("a live 7d window with elapsed time has a pace")
+}
 
-    // Freshly opened (30 min elapsed) is below the 1h floor → None, no divide-by-~0.
-    let reset = BASE_UTC + duration - 1800;
+/// The exact figures an over-pace window reports, the only side
+/// `PACE_PRIOR_FRACTION` touches. Every assertion here reds if that constant
+/// moves; the shape invariants live in their own test so a constant change can't
+/// abort the run before they execute.
+#[test]
+fn window_avg_pace_caps_an_over_pace_window() {
+    // 7d window 12h into the week at 21%, well past the 7.14% ideal line: the
+    // plain quotient reads 21 / 0.5d = 42 %/d, the cap trims it to 31 / 1.2d.
+    let pace = pace_at(21.0, 12 * 3600);
+    assert!((pace - 25.833_333).abs() < 1e-5, "12h/21%, got {pace}");
+
+    // The reported bug: an hour after the weekly reset, 3% burned. The plain
+    // form reads 72 %/d and projects the week dry in 1d 8h.
+    let pace = pace_at(3.0, 3600);
+    assert!(
+        (pace - 17.528_089).abs() < 1e-5,
+        "1h/3% must not read as a 72 %/d burn, got {pace}"
+    );
+
+    // Late in the window the cap has all but decayed out: 6d/90% trims the plain
+    // 15.0 to 100 / 6.7d, half a percent off.
+    let pace = pace_at(90.0, 6 * 86_400);
+    assert!((pace - 14.925_373).abs() < 1e-5, "6d/90%, got {pace}");
+
+    // Hard ceiling: the denominator never falls below the prior's own 0.7d, so
+    // even a full window burned in an instant tops out at 110 / 0.7d = 157.14.
+    // The plain form has no such ceiling.
+    let saturated = pace_at(100.0, 1);
+    assert!(
+        (saturated - 157.142_857).abs() < 0.01,
+        "an instant 100% saturates the ceiling, got {saturated}"
+    );
+}
+
+/// Shape invariants that hold for any `PACE_PRIOR_FRACTION`: the cap is
+/// one-sided, so an at-or-under-pace window reads its plain average exactly and
+/// an idle one still paces at zero. Plus the three `None` arms.
+#[test]
+fn window_avg_pace_leaves_an_under_pace_window_alone() {
+    // 3d into the week at 5%, far under the 42.9% ideal line → the untouched
+    // plain average, not the prior.
+    let under = pace_at(5.0, 3 * 86_400);
+    assert!(
+        (under - 5.0 / 3.0).abs() < 1e-9,
+        "an under-pace window reads its plain average, got {under}"
+    );
+
+    // An idle window paces at 0 so its row stays bare (`Stat::render` gates the
+    // rate on `> 0.0`). A positive rate here would claim a burn that never
+    // happened, with an ETA longer than the window itself.
     assert_eq!(
-        window_avg_pace_per_day(LABEL_7D, &win(5.0, reset), BASE_UTC, 3600),
+        pace_at(0.0, 86_400),
+        0.0,
+        "a day of zero usage is zero burn"
+    );
+
+    // The branch flips at the ideal line and nowhere else. A point either side
+    // of the day-one line (14.29%) picks a different form: below it the plain
+    // average survives intact, above it the cap bites.
+    let ideal = 100.0 / 7.0;
+    let below = pace_at(ideal - 1.0, 86_400);
+    assert!(
+        (below - (ideal - 1.0)).abs() < 1e-9,
+        "a hair under the line still reads the plain average, got {below}"
+    );
+    let above = pace_at(ideal + 1.0, 86_400);
+    assert!(
+        above < ideal + 1.0,
+        "a hair over the line is capped below its plain average, got {above}"
+    );
+
+    // A window that has not opened yet → None, no divide-by-zero.
+    assert_eq!(
+        window_avg_pace_per_day(LABEL_7D, &pace_win(0.0, BASE_UTC + WEEK), BASE_UTC),
         None
     );
 
@@ -674,12 +746,9 @@ fn window_avg_pace_is_util_over_elapsed_days() {
         utilization: 21.0,
         resets_at: None,
     };
+    assert_eq!(window_avg_pace_per_day(LABEL_7D, &no_reset, BASE_UTC), None);
     assert_eq!(
-        window_avg_pace_per_day(LABEL_7D, &no_reset, BASE_UTC, 3600),
-        None
-    );
-    assert_eq!(
-        window_avg_pace_per_day("extra", &win(21.0, BASE_UTC + 100), BASE_UTC, 3600),
+        window_avg_pace_per_day("extra", &pace_win(21.0, BASE_UTC + 100), BASE_UTC),
         None
     );
 }

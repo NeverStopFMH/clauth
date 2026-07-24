@@ -77,14 +77,16 @@ pub(crate) const CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
 /// Claude Code puts on every messages request (verified on the wire).
 const MESSAGES_ENDPOINT: &str = "https://api.anthropic.com/v1/messages?beta=true";
 
-/// The `anthropic-beta` set Claude Code sends on `/v1/messages` — its full
-/// feature list, distinct from the single `oauth-2025-04-20` on `/usage`.
-/// Captured 2026-07-14 against CC 2.1.209; drifts with CC's bundle, re-capture
-/// on a bump (`docs/wire-parity.md`).
+/// The `anthropic-beta` set Claude Code sends on its launch WARMUP post to
+/// `/v1/messages`, distinct from the single `oauth-2025-04-20` on `/usage` and
+/// from the longer lists CC's real inference calls carry. Captured 2026-07-14
+/// against CC 2.1.209, re-verified unchanged 2026-07-24 against CC 2.1.219;
+/// drifts with CC's bundle, re-capture on a bump (`docs/wire-parity.md`).
 const KICK_ANTHROPIC_BETA: &str = "oauth-2025-04-20,interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05";
 
-/// anthropic-sdk-js (stainless) version CC 2.1.209 bundles, sent verbatim on the
-/// kick so its client-instrumentation headers match CC's. NOTE: this is a
+/// anthropic-sdk-js (stainless) version CC bundles (2.1.209, still 0.94.0 at
+/// 2.1.219), sent verbatim on the kick so its client-instrumentation headers
+/// match CC's. NOTE: this is a
 /// deliberately *partial* stainless set (lang/runtime/package-version only) — a
 /// real SDK client also sends `x-stainless-arch/os/runtime-version`, which are
 /// host-derived (and clauth has no honest node runtime-version), so they stay

@@ -436,12 +436,21 @@ pub(crate) fn window_duration_secs(label: &str) -> Option<i64> {
 
 /// Parse a `"<n>h"` / `"<n>d"` window label into a duration in seconds. `None`
 /// for any other shape.
+///
+/// The label is a third-party provider's free-form JSON string, so it is
+/// untrusted: the unit is taken as a whole character (a byte-index split lands
+/// mid-codepoint on a multi-byte tail) and the scale-up is checked (`9e15h`
+/// overflows an `i64`, and a wrapped negative duration would panic the
+/// `clamp(0, duration)` in every consumer).
 fn parse_nh_nd_label(label: &str) -> Option<i64> {
-    let (num, unit) = label.split_at(label.len().checked_sub(1)?);
-    let n = num.parse::<i64>().ok().filter(|&n| n > 0)?;
+    let unit = label.chars().next_back()?;
+    let n = label[..label.len() - unit.len_utf8()]
+        .parse::<i64>()
+        .ok()
+        .filter(|&n| n > 0)?;
     match unit {
-        "h" => Some(n * 3600),
-        "d" => Some(n * 86_400),
+        'h' => n.checked_mul(3600),
+        'd' => n.checked_mul(86_400),
         _ => None,
     }
 }

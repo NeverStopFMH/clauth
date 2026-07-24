@@ -772,6 +772,26 @@ fn window_duration_parses_provider_labels() {
     assert_eq!(window_duration_secs(""), None);
 }
 
+/// The label reaching [`window_duration_secs`] is a third-party provider's
+/// free-form JSON string (`providers::generic`), so every shape has to resolve
+/// rather than panic: a count that overflows its unit, and a label whose last
+/// character is multi-byte (splitting one byte back lands mid-codepoint).
+#[test]
+fn window_duration_survives_a_hostile_provider_label() {
+    // 2e14 days is inside i64 but 2e14 × 86_400 is not.
+    assert_eq!(window_duration_secs("200000000000000d"), None);
+    assert_eq!(window_duration_secs("9000000000000000h"), None);
+    // Multi-byte tail: `°` and `日` both occupy the byte the old split used.
+    assert_eq!(window_duration_secs("5°"), None);
+    assert_eq!(window_duration_secs("7日"), None);
+    assert_eq!(window_duration_secs("—"), None);
+    // A count that still fits keeps resolving.
+    assert_eq!(
+        window_duration_secs("100000000000d"),
+        Some(8_640_000_000_000_000)
+    );
+}
+
 /// `/profile` re-fetch policy: fetches on first load (no stamp yet) and on a
 /// `force` (401 retry), reuses the plan within the hourly TTL, re-pulls once it
 /// lapses, and `expire_profile_ttl` (manual single refresh) re-arms it. A

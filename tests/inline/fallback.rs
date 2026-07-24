@@ -3196,6 +3196,209 @@ fn candidate_exclusion_and_dead_first_chip_stay_coupled() {
     );
 }
 
+// The test above admits its own gap: "a brand-new exclusion class needs its
+// own fixture added below to be covered" — until then, a fourth dead-first
+// variant can be added to `BlockedReason` and land Disabled/Canceled/AuthBroken
+// classification without ever touching `candidate_excluded`, and nothing reds.
+// `dead_first` below closes it structurally rather than by convention: it
+// matches every current `BlockedReason` variant with NO wildcard arm, so
+// adding a variant to the enum fails to compile here until a developer
+// classifies it dead-first or not. Each arm then gets a fixture proving both
+// which reason it triggers and whether the walk's skip agrees with that
+// classification — so a future variant that ships dead-first without also
+// widening `candidate_excluded`/`walk_excluded` reds the moment its fixture is
+// added, instead of drifting silently like the three above already do today.
+#[test]
+fn every_blocked_reason_variant_stays_coupled_to_candidate_excluded() {
+    fn dead_first(reason: &BlockedReason) -> bool {
+        match reason {
+            BlockedReason::Disabled | BlockedReason::Canceled | BlockedReason::AuthBroken => true,
+            BlockedReason::WeeklySpent { .. }
+            | BlockedReason::KickRejected { .. }
+            | BlockedReason::BudgetSpent
+            | BlockedReason::FiveHour { .. }
+            | BlockedReason::ScopedSpent { .. }
+            | BlockedReason::WeeklySoft { .. }
+            | BlockedReason::Stale => false,
+        }
+    }
+
+    // Confirms the fixture actually triggers `expected` AND that the walk's
+    // skip agrees with `dead_first` on it, for the resolvable non-active
+    // "cand" behind a healthy active "keep".
+    let assert_variant = |config: &AppConfig,
+                          kick_lift: Option<i64>,
+                          expected: &dyn Fn(&BlockedReason) -> bool,
+                          label: &str| {
+        let cand = config.find("cand").expect("candidate is resolvable");
+        let reason = blocked_reason(config, cand, kick_lift)
+            .unwrap_or_else(|| panic!("{label}: blocked_reason returned None"));
+        assert!(expected(&reason), "{label}: got {reason:?}");
+        assert_eq!(
+            candidate_excluded(config, "cand"),
+            dead_first(&reason),
+            "{label}: walk skip and dead-first chip disagree, got {reason:?}"
+        );
+    };
+
+    let keeper = || mark_fresh(profile_with_util("keep", Some(90.0), Some(10.0)));
+
+    // Disabled — dead-first.
+    let config = config_with_chain(
+        vec![
+            keeper(),
+            mark_disabled(profile_with_util("cand", Some(90.0), Some(10.0))),
+        ],
+        "keep",
+    );
+    assert_variant(
+        &config,
+        None,
+        &|r| matches!(r, BlockedReason::Disabled),
+        "Disabled",
+    );
+
+    // Canceled — dead-first.
+    let config = config_with_chain(
+        vec![
+            keeper(),
+            profile_with_usage("cand", Some(90.0), Some(canceled_usage())),
+        ],
+        "keep",
+    );
+    assert_variant(
+        &config,
+        None,
+        &|r| matches!(r, BlockedReason::Canceled),
+        "Canceled",
+    );
+
+    // AuthBroken — dead-first.
+    let mut config = config_with_chain(
+        vec![keeper(), profile_with_util("cand", Some(90.0), Some(10.0))],
+        "keep",
+    );
+    config.state.auth_broken.push("cand".into());
+    assert_variant(
+        &config,
+        None,
+        &|r| matches!(r, BlockedReason::AuthBroken),
+        "AuthBroken",
+    );
+
+    // WeeklySpent — 7d at the hard cap: usage-only, stays a walk candidate.
+    let config = config_with_chain(
+        vec![
+            keeper(),
+            profile_with_usage("cand", Some(90.0), Some(weekly_usage(100.0))),
+        ],
+        "keep",
+    );
+    assert_variant(
+        &config,
+        None,
+        &|r| matches!(r, BlockedReason::WeeklySpent { .. }),
+        "WeeklySpent",
+    );
+
+    // KickRejected — the messages limiter refuses the auto-start kick despite
+    // live headroom: usage/limiter-only, stays a walk candidate.
+    let config = config_with_chain(
+        vec![
+            keeper(),
+            mark_fresh(profile_with_util("cand", Some(90.0), Some(10.0))),
+        ],
+        "keep",
+    );
+    let until = now_epoch_secs() + 3600;
+    assert_variant(
+        &config,
+        Some(until),
+        &|r| matches!(r, BlockedReason::KickRejected { .. }),
+        "KickRejected",
+    );
+
+    // BudgetSpent — 5h spent, billing, over its auto-spend ceiling: usage-only.
+    let mut config = config_with_chain(
+        vec![keeper(), spend_member("cand", 10.0, 20.0, None)],
+        "keep",
+    );
+    config.state.spend_budget_switching = true;
+    assert_variant(
+        &config,
+        None,
+        &|r| matches!(r, BlockedReason::BudgetSpent),
+        "BudgetSpent",
+    );
+
+    // FiveHour — over its own rotate threshold: usage-only.
+    let config = config_with_chain(
+        vec![keeper(), profile_with_util("cand", Some(90.0), Some(97.0))],
+        "keep",
+    );
+    assert_variant(
+        &config,
+        None,
+        &|r| matches!(r, BlockedReason::FiveHour { .. }),
+        "FiveHour",
+    );
+
+    // ScopedSpent — a gated per-model weekly window over the line, aggregate
+    // windows clear: usage-only.
+    let config = config_with_chain(
+        vec![
+            keeper(),
+            profile_with_usage(
+                "cand",
+                Some(90.0),
+                Some(usage_with_scoped(
+                    10.0,
+                    50.0,
+                    vec![scoped_window("7d fable", 99.0, Some(week_reset()))],
+                )),
+            ),
+        ],
+        "keep",
+    );
+    assert_variant(
+        &config,
+        None,
+        &|r| matches!(r, BlockedReason::ScopedSpent { .. }),
+        "ScopedSpent",
+    );
+
+    // WeeklySoft — 7d over the soft line, under the hard cap: usage-only.
+    let config = config_with_chain(
+        vec![
+            keeper(),
+            profile_with_usage("cand", Some(90.0), Some(both_windows(40.0, 99.0))),
+        ],
+        "keep",
+    );
+    assert_variant(
+        &config,
+        None,
+        &|r| matches!(r, BlockedReason::WeeklySoft { .. }),
+        "WeeklySoft",
+    );
+
+    // Stale — the last read was cached, otherwise live and clear: usage-only.
+    let config = config_with_chain(
+        vec![keeper(), {
+            let mut p = profile_with_util("cand", Some(90.0), Some(40.0));
+            p.fetch_status = Some(FetchStatus::Cached);
+            p
+        }],
+        "keep",
+    );
+    assert_variant(
+        &config,
+        None,
+        &|r| matches!(r, BlockedReason::Stale),
+        "Stale",
+    );
+}
+
 #[test]
 fn blocked_reason_none_for_a_live_member_with_headroom() {
     let p = mark_fresh(profile_with_util("a", Some(95.0), Some(40.0)));

@@ -11,7 +11,6 @@
 //!     only when the stack is empty.
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::io::Write;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -1083,20 +1082,6 @@ pub(crate) fn incident_is_active(incident: &Incident) -> bool {
     incident.is_active()
 }
 
-/// Open a profile's `usage_history.jsonl` for append, creating it 0o600 on Unix.
-/// The log records per-profile utilization samples under `~/.clauth`, so it
-/// rides the owner-only invariant rather than the process umask.
-fn history_append_file(path: &std::path::Path) -> std::io::Result<std::fs::File> {
-    let mut opts = std::fs::OpenOptions::new();
-    opts.create(true).append(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        opts.mode(0o600);
-    }
-    opts.open(path)
-}
-
 // ── Plugin tab ─────────────────────────────────────────────────────────────────
 
 /// Which Plugin pane has focus. `List`: the checks + profiles selector (↑↓ moves,
@@ -1482,14 +1467,12 @@ pub(crate) struct App {
     /// Reset when utilization drops back below threshold.
     pub(crate) bell_fired: HashMap<String, bool>,
 
-    /// Cached parsed usage history per profile from usage_history.jsonl.
+    /// Cached parsed usage history per profile from usage_history.jsonl. The
+    /// file itself belongs to the scheduler's fetch path (`apply_outcome`),
+    /// which may be running in another process, so this side is read-only.
     pub(crate) history_cache: HashMap<String, Vec<(u64, UsageInfo)>>,
     /// Last-known mtime per profile history file, for cache invalidation.
     pub(crate) history_mtimes: HashMap<String, std::time::SystemTime>,
-
-    /// Last-seen usage per profile, keyed by name.
-    /// Used to detect fresh fetches and append history JSONL lines.
-    pub(crate) last_history_usage: HashMap<String, UsageInfo>,
 
     /// Cached long-lived-token status per profile, keyed by name (absent when a
     /// profile has no sidecar). Read by the Overview render for the `⊘` danger
@@ -1585,12 +1568,6 @@ impl App {
         let third_party_status: ThirdPartyStatusStore = Arc::new(RankedMutex::new(HashMap::new()));
         let refresh_interval = Arc::new(AtomicU64::new(config.state.refresh_interval_ms));
 
-        // Kick the best-effort update check; verdict lands in `update_results`, toasted from `on_tick`.
-        // Prune old history entries before loading (startup-only).
-        for profile in &config.profiles {
-            crate::profile::prune_usage_history(profile.name.as_str());
-        }
-
         let mut history_cache: HashMap<String, Vec<(u64, UsageInfo)>> = HashMap::new();
         let mut history_mtimes: HashMap<String, std::time::SystemTime> = HashMap::new();
         for profile in &config.profiles {
@@ -1607,6 +1584,7 @@ impl App {
             }
         }
 
+        // Kick the best-effort update check; verdict lands in `update_results`, toasted from `on_tick`.
         let (update_sender, update_results) = std::sync::mpsc::channel::<UpdateEvent>();
         let update_handle = update::spawn(update_sender);
 
@@ -1754,7 +1732,6 @@ impl App {
             bell_fired: HashMap::new(),
             history_cache,
             history_mtimes,
-            last_history_usage: HashMap::new(),
             session_tokens,
         }
     }
@@ -1983,7 +1960,7 @@ impl App {
         // On poisoned lock keep the prior value — a blank map would blind auto-switch permanently.
         // Third-party stores BEFORE OAuth stores: ranks 270/280 < 300/350.
         let bells;
-        let usage_snapshots;
+        let history_names;
         {
             let third_party_map = self.third_party_usage_store.lock().ok();
             let third_party_status_map = self.third_party_status.lock().ok();
@@ -2024,13 +2001,11 @@ impl App {
                 .collect::<Vec<_>>();
 
             // Collect while cfg is still alive.
-            usage_snapshots = cfg
+            history_names = cfg
                 .profiles
                 .iter()
-                .filter_map(|p| {
-                    let fresh = p.fetch_status == Some(FetchStatus::Fresh);
-                    p.usage.clone().map(|u| (p.name.to_string(), u, fresh))
-                })
+                .filter(|p| p.usage.is_some())
+                .map(|p| p.name.to_string())
                 .collect::<Vec<_>>();
         }
         for (name, threshold, util, fresh) in bells {
@@ -2055,55 +2030,10 @@ impl App {
             }
         }
 
-        for (name, usage, fresh) in &usage_snapshots {
-            // Record only live samples to the durable history file. A synthetic
-            // just-kicked 0% window or a stale cached snapshot would land a
-            // phantom reset that survives restart and skews the burn rate.
-            if !fresh {
-                continue;
-            }
-            let old_usage = self.last_history_usage.get(name.as_str()).cloned();
-            let changed = match &old_usage {
-                Some(last) => serde_json::to_string(last).ok() != serde_json::to_string(usage).ok(),
-                None => true,
-            };
-            if changed {
-                if let Ok(path) = crate::profile::profile_history_path(name)
-                    && path
-                        .parent()
-                        .is_some_and(|p| crate::profile::mkdir_700(p).is_ok())
-                    && let Ok(mut file) = history_append_file(&path)
-                {
-                    let ts = now_ms();
-                    // Bridge: stamp the old value one ms before the new sample
-                    // so the idle end has temporal density for burn-rate anchors
-                    // without sharing an instant with the live entry.
-                    if let Some(last) = &old_usage {
-                        let last_json = serde_json::to_string(last).unwrap_or_default();
-                        let name_json = serde_json::to_string(name)
-                            .unwrap_or_else(|_| format!(r#""{}""#, name));
-                        let _ = writeln!(
-                            file,
-                            r#"{{"ts":{},"name":{},"usage":{}}}"#,
-                            ts.saturating_sub(1),
-                            name_json,
-                            last_json,
-                        );
-                    }
-                    let usage_json = serde_json::to_string(usage).unwrap_or_default();
-                    let name_json =
-                        serde_json::to_string(name).unwrap_or_else(|_| format!(r#""{}""#, name));
-                    let _ = writeln!(
-                        file,
-                        r#"{{"ts":{},"name":{},"usage":{}}}"#,
-                        ts, name_json, usage_json,
-                    );
-                }
-                self.last_history_usage.insert(name.clone(), usage.clone());
-            }
-        }
-
-        for (name, _, _) in &usage_snapshots {
+        // Re-read any history log that changed on disk. The file is written by
+        // whichever process holds the fetch lease — this one or a headless
+        // daemon — so an mtime bump is the only signal that new samples landed.
+        for name in &history_names {
             if let Ok(path) = crate::profile::profile_history_path(name)
                 && let Ok(mtime) = path.metadata().and_then(|m| m.modified())
                 && self.history_mtimes.get(name) != Some(&mtime)

@@ -3000,6 +3000,7 @@ fn standdown_tick_drains_forced_and_publishes_countdowns() {
         shutting_down: Arc::new(AtomicBool::new(false)),
         fetch_lease: Arc::new(crate::daemon::FetchLease::new()),
         standdown_active: AtomicBool::new(true),
+        last_history_prune: AtomicU64::new(crate::usage::now_ms()),
     };
 
     // A manual `r` landed just before this tick: forced name + Queued mark.
@@ -3080,6 +3081,7 @@ fn standdown_sweeps_bootstrap_queued_marks() {
         shutting_down: Arc::new(AtomicBool::new(false)),
         fetch_lease: Arc::new(crate::daemon::FetchLease::new()),
         standdown_active: AtomicBool::new(true),
+        last_history_prune: AtomicU64::new(crate::usage::now_ms()),
     };
 
     // Bootstrap pre-marked a cache-due profile; a rotate worker from the last
@@ -3160,6 +3162,7 @@ fn tick_stands_down_when_another_instance_holds_the_fetch_lease() {
         // `other` holds the flock.
         fetch_lease: Arc::new(crate::daemon::FetchLease::new()),
         standdown_active: AtomicBool::new(false),
+        last_history_prune: AtomicU64::new(crate::usage::now_ms()),
     };
 
     // Stamp `kitty` as just-fetched so it is NOT due this tick: an armed tick
@@ -3402,6 +3405,7 @@ fn completion_order_state() -> super::SchedulerState {
         shutting_down: Arc::new(AtomicBool::new(false)),
         fetch_lease: Arc::new(crate::daemon::FetchLease::new()),
         standdown_active: AtomicBool::new(false),
+        last_history_prune: AtomicU64::new(crate::usage::now_ms()),
     }
 }
 
@@ -4042,5 +4046,401 @@ fn spawn_refresher_seeds_kick_blocks_before_returning() {
         kick_blocks.lock().unwrap().get("kitty").copied(),
         Some(cached),
         "the on-disk kick block must be seeded before spawn_refresher returns"
+    );
+}
+
+// ── Durable burn-rate history (usage_history.jsonl) ──────────────────────────
+//
+// The sample series behind BOTH burn readers: the TUI's in-memory
+// `history_cache` and `fallback::burn_rate_for_profile`, the disk read that
+// gates burn-aware auto-switching. It is appended on the FETCH path, so the
+// holder of the single-fetcher lease owns it — a headless `clauth daemon` keeps
+// it advancing with no TUI open, and no second process can interleave a line.
+// Written from `App::apply_usage` instead, the log tracked TUI uptime: headless
+// it froze, the 2-day prune then emptied it, and burn-aware auto-switch
+// degraded to the static threshold indistinguishably from "no history yet".
+//
+// The seam: `apply_outcome` is where every fetch outcome lands, and it already
+// holds both halves of a sample — `from_fetch` (the live-body gate the old TUI
+// path spelled `FetchStatus::Fresh`) and the store entry the body replaces.
+
+/// A 5h window at `utilization` with no reset stamp, so `preserve_live_window`
+/// leaves the body untouched and the recorded sample is the fetched one.
+fn history_sample(utilization: f64) -> crate::usage::UsageInfo {
+    crate::usage::UsageInfo {
+        five_hour: Some(crate::usage::UsageWindow {
+            utilization,
+            resets_at: None,
+        }),
+        ..Default::default()
+    }
+}
+
+/// `(ts, 5h utilization)` pairs recorded for `name`, oldest first — read back
+/// through the same parser both burn readers use.
+fn recorded_samples(name: &str) -> Vec<(u64, f64)> {
+    crate::profile::load_usage_history(name)
+        .into_iter()
+        .filter_map(|(ts, info)| Some((ts, info.five_hour?.utilization)))
+        .collect()
+}
+
+/// The four stores `apply_outcome` writes, empty.
+fn history_stores() -> (
+    super::UsageStore,
+    super::StatusStore,
+    LastFetchedAt,
+    super::PollStreaks,
+) {
+    (
+        Arc::new(RankedMutex::new(HashMap::new())),
+        Arc::new(RankedMutex::new(HashMap::new())),
+        Arc::new(RankedMutex::new(HashMap::new())),
+        Arc::new(RankedMutex::new(HashMap::new())),
+    )
+}
+
+/// A live fetch records the new sample AND bridges the one it replaces: the
+/// previous value is re-stamped 1 ms earlier so an idle stretch keeps its
+/// temporal density instead of replaying as one long ramp between two distant
+/// points. Delete the `append_usage_sample` call in `apply_outcome` and the log
+/// never appears at all — nothing else writes it.
+#[test]
+fn a_live_fetch_appends_the_sample_and_its_bridge() {
+    use super::{FetchOutcome, apply_outcome};
+
+    let _home = crate::testutil::HomeSandbox::new();
+    let (store, status, last_fetched, streaks) = history_stores();
+    // What the previous tick left in the store — the value the bridge carries.
+    store
+        .lock()
+        .unwrap()
+        .insert("alice".to_string(), history_sample(50.0));
+
+    apply_outcome(
+        FetchOutcome::live("alice", history_sample(80.0), None),
+        &store,
+        &status,
+        &last_fetched,
+        &streaks,
+        REFRESH_INTERVAL_MS,
+        false,
+    );
+
+    let samples = recorded_samples("alice");
+    assert_eq!(
+        samples.len(),
+        2,
+        "a live fetch over a known previous value records the bridge plus the \
+         new sample (got {samples:?})"
+    );
+    assert_eq!(
+        samples[0].1, 50.0,
+        "the bridge line carries the value being replaced, not the new one"
+    );
+    assert_eq!(
+        samples[1].1, 80.0,
+        "the live sample carries the fetched value"
+    );
+    assert_eq!(
+        samples[1].0 - samples[0].0,
+        1,
+        "the bridge is stamped exactly 1 ms earlier so it never shares an \
+         instant with the live sample"
+    );
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let path = crate::profile::profile_history_path("alice").expect("history path");
+        let mode = std::fs::metadata(&path)
+            .expect("history metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "the history log holds per-account utilization — owner-only, not umask"
+        );
+    }
+}
+
+/// A cached body — the recycled `usage_cache.json` snapshot a 429 or a network
+/// failure falls back to — must record nothing. Its window may have rolled over
+/// since, so a sample off it would write a phantom reset that survives restart
+/// and skews the rate. Same gate the old `apply_usage` path spelled as
+/// `FetchStatus::Fresh`; here it is `from_fetch`.
+#[test]
+fn a_cached_body_appends_no_sample() {
+    use super::{FetchOutcome, FetchStatus, USAGE_CACHE_FILE, apply_outcome, write_profile_cache};
+
+    let _home = crate::testutil::HomeSandbox::new();
+    let (store, status, last_fetched, streaks) = history_stores();
+    // A cached outcome loads its body off disk, so seed one to recycle.
+    write_profile_cache("alice", USAGE_CACHE_FILE, &history_sample(80.0));
+
+    let outcome = FetchOutcome::cached("alice", FetchStatus::RateLimited, None, None);
+    assert!(
+        outcome.info.is_some(),
+        "fixture must carry a body, or this asserts nothing about the gate"
+    );
+    apply_outcome(
+        outcome,
+        &store,
+        &status,
+        &last_fetched,
+        &streaks,
+        REFRESH_INTERVAL_MS,
+        false,
+    );
+
+    assert!(
+        recorded_samples("alice").is_empty(),
+        "a recycled cached snapshot must not land a history sample"
+    );
+}
+
+/// Two live fetches reading the same numbers record one sample, not two: the
+/// series only grows when the numbers move. Without the dedup a quiet account
+/// would fill the log with identical lines at the poll cadence.
+#[test]
+fn an_unchanged_live_sample_appends_nothing() {
+    use super::{FetchOutcome, apply_outcome};
+
+    let _home = crate::testutil::HomeSandbox::new();
+    let (store, status, last_fetched, streaks) = history_stores();
+    let apply = || {
+        apply_outcome(
+            FetchOutcome::live("alice", history_sample(80.0), None),
+            &store,
+            &status,
+            &last_fetched,
+            &streaks,
+            REFRESH_INTERVAL_MS,
+            false,
+        );
+    };
+
+    apply();
+    let after_first = recorded_samples("alice");
+    apply();
+
+    assert_eq!(
+        after_first.len(),
+        1,
+        "the first live sample over a cold store records itself and nothing to \
+         bridge (got {after_first:?})"
+    );
+    assert_eq!(
+        recorded_samples("alice"),
+        after_first,
+        "an identical second reading must leave the log untouched"
+    );
+}
+
+/// Restart guard: a new process starts with an empty store, so the first live
+/// fetch has no in-memory previous value to compare against. It must fall back
+/// to the log's own last entry — otherwise every daemon restart re-appends the
+/// sample already on disk, and the dedup above only holds within one process.
+#[test]
+fn a_cold_store_does_not_re_append_the_last_recorded_sample() {
+    use super::{FetchOutcome, apply_outcome};
+
+    let _home = crate::testutil::HomeSandbox::new();
+    let (store, status, last_fetched, streaks) = history_stores();
+    let apply = |util: f64| {
+        apply_outcome(
+            FetchOutcome::live("alice", history_sample(util), None),
+            &store,
+            &status,
+            &last_fetched,
+            &streaks,
+            REFRESH_INTERVAL_MS,
+            false,
+        );
+    };
+
+    apply(80.0);
+    let before_restart = recorded_samples("alice");
+
+    // The restart: the store the previous run built is gone, the log is not.
+    store.lock().unwrap().clear();
+    apply(80.0);
+
+    assert_eq!(
+        recorded_samples("alice"),
+        before_restart,
+        "the same reading after a restart must not duplicate the last line"
+    );
+
+    // A moved reading still records — and with no in-memory previous value it
+    // records ONE line: bridging across the downtime would invent an anchor
+    // over exactly the gap `BURN_GAP_CUT_MS` exists to cut.
+    store.lock().unwrap().clear();
+    apply(90.0);
+    let after = recorded_samples("alice");
+    assert_eq!(
+        after.len(),
+        before_restart.len() + 1,
+        "a changed reading on a cold store records the sample alone, no bridge \
+         over the downtime (got {after:?})"
+    );
+    assert_eq!(
+        after.last().map(|(_, util)| *util),
+        Some(90.0),
+        "and it carries the new reading"
+    );
+}
+
+/// Seed `name`'s history log with one sample 3 days old (past the retention
+/// window) and one a minute old, and return the recent one for comparison.
+///
+/// `now` is the caller's clock, not this function's: seeding several profiles
+/// from one base is what makes their `recent` stamps equal by construction. Read
+/// per call, the disk write between two calls can cross a millisecond and the
+/// stamps drift apart — a 12%-of-runs flake, not a theoretical one.
+fn seed_stale_history(name: &str, now: u64) -> (u64, f64) {
+    let path = crate::profile::profile_history_path(name).expect("history path");
+    std::fs::create_dir_all(path.parent().expect("profile dir")).expect("create profile dir");
+    let line = |ts: u64, util: f64| {
+        format!(
+            "{{\"ts\":{ts},\"name\":\"{name}\",\"usage\":{}}}\n",
+            serde_json::to_string(&history_sample(util)).expect("sample serializes"),
+        )
+    };
+    let stale = now - 3 * 24 * 60 * 60 * 1000;
+    let recent = now - 60_000;
+    std::fs::write(
+        &path,
+        format!("{}{}", line(stale, 10.0), line(recent, 40.0)),
+    )
+    .expect("seed history log");
+    (recent, 40.0)
+}
+
+/// A profile carrying a history log, `disabled` or not. No credentials: what
+/// makes a log prunable is the file on disk, not whether the profile is
+/// currently pollable.
+fn history_profile(name: &str, disabled: bool) -> crate::profile::Profile {
+    let mut p = crate::testutil::blank_profile(name);
+    p.disabled = disabled;
+    p
+}
+
+/// The startup leg of the retention trim runs on `spawn_refresher`'s CALLING
+/// thread, next to the kick-block seed and for the same reason: it resolves a
+/// home-derived path, and a path resolved on the never-joined tick thread could
+/// outlive a test's `HOME_OVERRIDE` and rewrite a file in the operator's home.
+///
+/// Scope is every profile in config, NOT the poll work-list: `disabled` is
+/// pinned here because `collect_tokens` filters it out, so a work-list-scoped
+/// trim would silently leave that account's utilization history on disk forever.
+#[test]
+fn spawn_refresher_prunes_stale_history_before_returning() {
+    use super::spawn_refresher;
+    use crate::profile::{AppConfig, AppState};
+    use std::sync::atomic::{AtomicBool, AtomicU64};
+
+    let _home = crate::testutil::HomeSandbox::new();
+
+    // `kitty` polls; `sleepy` is disabled and `orphan` has no token entry at
+    // all (creds dropped, or converted to an api-key base-url) — both still own
+    // a log that has to age out. One clock for all three, so the expected stamp
+    // below is a single value.
+    let now = crate::usage::now_ms();
+    let recent = seed_stale_history("kitty", now);
+    seed_stale_history("sleepy", now);
+    seed_stale_history("orphan", now);
+
+    spawn_refresher(
+        Arc::new(RankedMutex::new(AppConfig {
+            state: AppState::default(),
+            profiles: vec![
+                history_profile("kitty", false),
+                history_profile("sleepy", true),
+                history_profile("orphan", false),
+            ],
+        })),
+        Arc::new(RankedMutex::new(vec![token("kitty")])),
+        Arc::new(RankedMutex::new(HashMap::new())),
+        Arc::new(RankedMutex::new(HashMap::new())),
+        Arc::new(AtomicU64::new(REFRESH_INTERVAL_MS)),
+        Arc::new(RankedMutex::new(HashMap::new())),
+        Arc::new(RankedMutex::new(HashMap::new())),
+        Arc::new(RankedMutex::new(HashMap::new())),
+        Arc::new(RankedMutex::new(HashMap::new())),
+        Arc::new(RankedMutex::new(HashMap::new())),
+        Arc::new(RankedMutex::new(HashSet::new())),
+        Arc::new(RankedMutex::new(false)),
+        Arc::new(RankedMutex::new(HashSet::new())),
+        Arc::new(RankedMutex::new(vec![])),
+        Arc::new(RankedMutex::new(HashMap::new())),
+        Arc::new(RankedMutex::new(HashMap::new())),
+        Arc::new(RankedMutex::new(HashSet::new())),
+        // Same pre-armed shutdown as the kick-block seed test: if the
+        // `cfg!(test)` spawn-skip ever goes while this hoist stays, the tick
+        // thread breaks at its loop top instead of outliving the sandbox.
+        Arc::new(AtomicBool::new(true)),
+        Arc::new(crate::daemon::FetchLease::new()),
+    );
+
+    for name in ["kitty", "sleepy", "orphan"] {
+        assert_eq!(
+            recorded_samples(name),
+            vec![recent],
+            "{name}: the 3-day-old sample must be gone and the recent one \
+             intact by the time spawn_refresher returns"
+        );
+    }
+}
+
+/// The startup trim alone leaves the retention bound unenforced in the very
+/// deployment this log exists for: a launchd/systemd daemon is built never to
+/// restart, so nothing would trim after boot while the fetch path appends for
+/// months — and `burn_rate_for_profile` re-parses the whole file from
+/// `scan_auto_switch` on every 1 s tick. The cadenced leg is what bounds it.
+#[test]
+fn the_retention_trim_reruns_on_its_cadence_not_only_at_startup() {
+    use super::{HISTORY_PRUNE_INTERVAL_MS, prune_histories_if_due};
+    use crate::profile::{AppConfig, AppState};
+    use std::sync::atomic::AtomicU64;
+
+    let _home = crate::testutil::HomeSandbox::new();
+    let now = crate::usage::now_ms();
+    let recent = seed_stale_history("kitty", now);
+    let config: crate::profile::ConfigHandle = Arc::new(RankedMutex::new(AppConfig {
+        state: AppState::default(),
+        profiles: vec![history_profile("kitty", false)],
+    }));
+
+    // Startup pass just ran, so the log is left alone on the ticks in between.
+    let last_prune = AtomicU64::new(now);
+    assert!(
+        !prune_histories_if_due(&last_prune, &config, now + HISTORY_PRUNE_INTERVAL_MS - 1),
+        "a tick inside the cadence must not pay for a full read + rewrite"
+    );
+    assert_eq!(
+        recorded_samples("kitty").len(),
+        2,
+        "and must leave the log untouched"
+    );
+
+    // The cadence elapses: the same long-running process trims without ever
+    // having restarted.
+    let due_at = now + HISTORY_PRUNE_INTERVAL_MS;
+    assert!(
+        prune_histories_if_due(&last_prune, &config, due_at),
+        "the trim must run once the cadence has elapsed"
+    );
+    assert_eq!(
+        recorded_samples("kitty"),
+        vec![recent],
+        "the stale sample is gone without a restart"
+    );
+
+    // The window is claimed, so the next tick is inside the cadence again.
+    assert!(
+        !prune_histories_if_due(&last_prune, &config, due_at + 1),
+        "the run must reset the clock, not re-trim every tick from here on"
     );
 }

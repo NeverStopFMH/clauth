@@ -4332,12 +4332,16 @@ fn parse_weekly_pct_pins_the_band_edges() {
 // ── apply_usage Fresh-gate (docs/todo.md #1) ─────────────────────────────────
 //
 // `App::apply_usage` is driven every tick over the shared usage stores. The
-// bell + the burn-rate history JSONL append must fire ONLY when the per-
-// profile status is `FetchStatus::Fresh`. A phantom entry from a
-// `RateLimited` or stale-`Cached` tick survives restart and skews the burn
-// rate; a false bell cries wolf. The three tests below inject the status
-// directly into `usage_status` — the same field the scheduler writes on
-// every fetch — then call `apply_usage` and assert the durable side effects.
+// bell must ring ONLY when the per-profile status is `FetchStatus::Fresh` — a
+// false bell off a `RateLimited` or stale-`Cached` tick cries wolf. The three
+// tests below inject the status directly into `usage_status` — the same field
+// the scheduler writes on every fetch — then call `apply_usage`.
+//
+// The burn-rate history log is asserted here from the other side: this process
+// must never WRITE it. It belongs to the fetch path (`apply_outcome`), whose
+// single-fetcher lease may be held by a headless daemon, so a UI-tick writer
+// would be a second one racing it. The TUI only re-reads the file on an mtime
+// change, which is also covered below.
 //
 // The seam: `apply_usage` reads each profile's status out of the shared
 // `usage_status` map (`Arc<RankedMutex<HashMap<String, FetchStatus>>>`), so
@@ -4417,7 +4421,7 @@ fn gate_app(
 }
 
 #[test]
-fn apply_usage_fresh_status_fires_bell_and_appends_history() {
+fn apply_usage_fresh_status_fires_bell_and_never_writes_history() {
     let _home = crate::testutil::HomeSandbox::new();
     let prior = seed_prior_history_entry();
     let (mut app, history_path) = gate_app(&_home, FetchStatus::Fresh);
@@ -4431,23 +4435,94 @@ fn apply_usage_fresh_status_fires_bell_and_appends_history() {
         "Fresh + util over threshold must ring the bell",
     );
 
-    // History arm: file gains a new entry carrying the live util.
+    // History arm: a live store entry is exactly what used to make the UI tick
+    // append. The fetch path owns the log now, so even Fresh writes nothing —
+    // a second writer would race whichever process holds the fetch lease.
     let after =
         std::fs::read_to_string(&history_path).expect("history file readable after apply_usage");
+    assert_eq!(
+        after, prior,
+        "the UI tick must never write the history log (it belongs to \
+         `apply_outcome`, possibly in another process)",
+    );
+}
+
+/// The read half: the log is written by whichever process holds the fetch lease,
+/// so a file that appeared or grew since the last look must be picked up off its
+/// mtime. Written here AFTER the `App` is built, standing in for the daemon
+/// landing a sample while the TUI is open.
+#[test]
+fn apply_usage_reloads_history_written_by_another_process() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let (mut app, history_path) = gate_app(&_home, FetchStatus::Fresh);
     assert!(
-        after.len() > prior.len(),
-        "Fresh must append a new history line (pre {} bytes, post {} bytes)",
+        !app.history_cache.contains_key(GATE_PROFILE),
+        "no log exists yet, so nothing is cached",
+    );
+
+    let prior = seed_prior_history_entry();
+    assert!(
+        history_path.exists(),
+        "the external writer must have landed the log ({} bytes seeded)",
         prior.len(),
-        after.len(),
     );
-    assert!(
-        after.contains(r#""utilization":"#.to_string().as_str())
-            && after.contains(&format!("{}", GATE_UTIL)),
-        "the appended live sample must carry the seeded utilization {GATE_UTIL} (got: {after})",
+    app.apply_usage();
+
+    let cached = app
+        .history_cache
+        .get(GATE_PROFILE)
+        .expect("the externally written log must be read into history_cache");
+    assert_eq!(
+        cached
+            .last()
+            .and_then(|(_, info)| info.five_hour.as_ref())
+            .map(|w| w.utilization),
+        Some(50.0),
+        "and it must carry the sample that other process recorded (got {cached:?})",
     );
-    assert!(
-        after.starts_with(&prior),
-        "the prior entry must survive intact at the head of the file",
+    let first_read = cached.len();
+
+    // The steady-state case: the file was already read once, and the other
+    // process appends to it again. A cache keyed only on the file's existence
+    // would stop here and serve a stale rate for the rest of the session.
+    let grown = format!(
+        "{prior}{{\"ts\":{},\"name\":\"{GATE_PROFILE}\",\"usage\":{}}}\n",
+        crate::usage::now_ms(),
+        serde_json::to_string(&UsageInfo {
+            five_hour: Some(UsageWindow {
+                utilization: 65.0,
+                resets_at: None,
+            }),
+            ..UsageInfo::default()
+        })
+        .expect("sample serializes"),
+    );
+    // The mtime watch compares `SystemTime`s, which on a coarse-granularity fs
+    // can repeat within a test; push it forward explicitly rather than sleeping.
+    std::fs::write(&history_path, grown).expect("append as the other process");
+    crate::testutil::set_mtime(
+        &history_path,
+        std::time::SystemTime::now() + std::time::Duration::from_secs(2),
+    );
+    app.apply_usage();
+
+    let regrown = app
+        .history_cache
+        .get(GATE_PROFILE)
+        .expect("the log must still be cached");
+    assert_eq!(
+        regrown.len(),
+        first_read + 1,
+        "a log that GREW since the last read must be re-read, not held at the \
+         first parse (got {regrown:?})",
+    );
+    assert_eq!(
+        regrown
+            .last()
+            .and_then(|(_, info)| info.five_hour.as_ref())
+            .map(|w| w.utilization),
+        Some(65.0),
+        "and the newest sample must be the one just appended",
     );
 }
 

@@ -23,6 +23,11 @@ use serde::{Deserialize, Serialize};
 /// Scheduler wake interval. Network work only fires for profiles whose cadence has elapsed.
 const TICK_INTERVAL: Duration = Duration::from_secs(1);
 
+/// How often the fetch-lease holder re-trims the usage-history logs to their
+/// retention window. Coarse on purpose: the trim is a full read + rewrite per
+/// profile, and the window it enforces is measured in days.
+const HISTORY_PRUNE_INTERVAL_MS: u64 = 6 * 60 * 60 * 1000;
+
 /// Hard ceiling on a server-provided `retry-after` so a bogus huge value
 /// can't starve a profile's refresh slot.
 const MAX_RETRY_AFTER_MS: u64 = 15 * 60 * 1000;
@@ -1346,9 +1351,22 @@ fn apply_outcome(
     // the tier advances.
     let plan_refresh = outcome.plan_override.clone().filter(|_| !is_fresh);
 
+    // The sample this outcome replaces, cloned out under a short lock that is
+    // released before either disk write below. Read once and shared by both
+    // consumers — the live-window preservation and the history sample — so the
+    // store is never locked twice for the same value. Only the Fresh-with-body
+    // path has a consumer, so the lock is not taken at all otherwise.
+    let prev: Option<UsageInfo> = if is_fresh && outcome.info.is_some() {
+        store
+            .lock()
+            .ok()
+            .and_then(|s| s.get(&outcome.name).cloned())
+    } else {
+        None
+    };
+
     // For a Fresh body, keep any just-opened live 5h window we already hold so a
-    // lagging `/usage` read can't re-close it (see `preserve_live_window`). The
-    // prev window is read under a short lock, released before the disk write.
+    // lagging `/usage` read can't re-close it (see `preserve_live_window`).
     let merged: Option<UsageInfo> = outcome.info.as_ref().map(|info| {
         if !is_fresh {
             let mut info = info.clone();
@@ -1357,12 +1375,7 @@ fn apply_outcome(
             }
             return info;
         }
-        let now_secs = now_epoch_secs();
-        let prev = store
-            .lock()
-            .ok()
-            .and_then(|s| s.get(&outcome.name).cloned());
-        preserve_live_window(info.clone(), prev.as_ref(), now_secs)
+        preserve_live_window(info.clone(), prev.as_ref(), now_epoch_secs())
     });
 
     // A profile added while ALREADY canceled 429s `/usage` from its first poll and
@@ -1384,6 +1397,17 @@ fn apply_outcome(
         && let Some(info) = merged.as_ref().or(cold_fill.as_ref())
     {
         write_profile_cache(&outcome.name, USAGE_CACHE_FILE, info);
+    }
+
+    // Durable burn-rate series. It rides the fetch path, not a UI tick, so the
+    // holder of the single-fetcher lease is its only writer: a headless daemon
+    // keeps the log advancing with no TUI open, and no second process can
+    // interleave a line. Same `Fresh` gate the sample-quality invariant wants —
+    // a synthetic just-kicked 0% window or a recycled cached snapshot would
+    // land a phantom reset that survives restart and skews the rate. Outside
+    // every lock, like the cache write above.
+    if is_fresh && let Some(info) = merged.as_ref() {
+        crate::profile::append_usage_sample(&outcome.name, prev.as_ref(), info);
     }
 
     if let Ok(mut s) = store.lock() {
@@ -2013,6 +2037,57 @@ fn publish_one_countdown(
     }
 }
 
+/// Every profile that could own a `usage_history.jsonl`, disabled and
+/// third-party included. Deliberately WIDER than [`collect_tokens`]'s work-list
+/// and than [`collect_oauth_seed_names`]: retention is a property of the file on
+/// disk, not of whether the profile is currently pollable. A disabled profile —
+/// or one converted to an api-key base-url after its OAuth days — still holds
+/// per-account utilization history that has to age out. Config(400) is acquired
+/// alone and released here.
+fn history_profile_names(config: &crate::profile::ConfigHandle) -> Vec<String> {
+    config
+        .lock()
+        .map(|c| c.profiles.iter().map(|p| p.name.to_string()).collect())
+        .unwrap_or_default()
+}
+
+/// Re-trim every usage-history log once the cadence has elapsed; reports whether
+/// it ran. The retention window itself is [`crate::profile::prune_usage_history`]'s
+/// 2 days — this only bounds how far past it a file can drift.
+///
+/// A startup-only trim was enough while the TUI was the writer (a launch
+/// re-pruned), but the appender is the fetch path now, and a daemon under
+/// launchd/systemd is built never to restart: nothing would ever trim it, the
+/// log would grow for the life of the process, and `burn_rate_for_profile`
+/// re-parses the whole file from `scan_auto_switch` on EVERY tick.
+///
+/// Called only by the fetch-lease holder, which is also the only appender, so
+/// this rewrite can never race an append of its own. The cadence check is an
+/// atomic load, so the config lock and the name list are only reached on the
+/// tick that actually prunes — not on the ~21 600 ticks between two of them.
+fn prune_histories_if_due(
+    last_prune: &AtomicU64,
+    config: &crate::profile::ConfigHandle,
+    now: u64,
+) -> bool {
+    let last = last_prune.load(Ordering::Relaxed);
+    if now.saturating_sub(last) < HISTORY_PRUNE_INTERVAL_MS {
+        return false;
+    }
+    // Claim the window before doing the work, so a second caller entering
+    // concurrently backs off instead of pruning the same files alongside us.
+    if last_prune
+        .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+        .is_err()
+    {
+        return false;
+    }
+    for name in history_profile_names(config) {
+        crate::profile::prune_usage_history(&name);
+    }
+    true
+}
+
 /// Background scheduler state. Holds **cloned `Arc`s only** — no live lock guards —
 /// so the struct carries no lock rank. `tick` acquires individual mutexes in rank order.
 pub(crate) struct SchedulerState {
@@ -2044,6 +2119,10 @@ pub(crate) struct SchedulerState {
     /// Whether the previous tick stood down — transition edges get one log
     /// line each way, never a per-tick repeat.
     standdown_active: AtomicBool,
+    /// When the usage-history logs were last trimmed to their retention window,
+    /// as epoch ms. Seeded at the startup pass in [`spawn_refresher`]; the tick
+    /// re-runs the trim once [`HISTORY_PRUNE_INTERVAL_MS`] has elapsed.
+    last_history_prune: AtomicU64,
 }
 
 /// One scheduler tick: drain forced refetches, partition both legs, publish
@@ -2075,6 +2154,11 @@ fn tick(state: &SchedulerState) {
     if state.standdown_active.swap(false, Ordering::Relaxed) {
         standdown_transition_log("clauth: acquired the usage-fetch lease: fetching");
     }
+
+    // Retention trim for the logs this process appends to. Under the lease, so
+    // it never races its own appends, and ahead of the fetch legs so a long-run
+    // process re-trims before adding to the file rather than after.
+    prune_histories_if_due(&state.last_history_prune, &state.config, now_ms());
 
     // Names pushed by rotation or manual refresh — bypass cadence this tick.
     // Drained once and handed to both legs; a forced name only matches the leg
@@ -2400,6 +2484,14 @@ pub(crate) fn spawn_refresher(
         .map(|t| t.iter().map(|e| e.name.clone()).collect())
         .unwrap_or_default();
     sync_kick_blocks_from_cache(&kick_blocks, &names);
+    // Startup leg of the usage-history retention trim (the cadenced leg runs in
+    // `tick`). Here rather than in the spawned closure for the same home-path
+    // reason as the kick-block seed above.
+    let history_names = history_profile_names(&config);
+    for name in &history_names {
+        crate::profile::prune_usage_history(name);
+    }
+    let last_history_prune = AtomicU64::new(now_ms());
 
     let state = SchedulerState {
         config,
@@ -2422,6 +2514,7 @@ pub(crate) fn spawn_refresher(
         shutting_down,
         fetch_lease,
         standdown_active: AtomicBool::new(false),
+        last_history_prune,
     };
     // Same test-skip rationale as the status/tokens/pricing workers in
     // `tui/app.rs`: a detached tick thread is never joined, so it could run

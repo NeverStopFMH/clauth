@@ -937,9 +937,12 @@ struct HistoryLine {
 }
 
 /// Prune a profile's usage_history.jsonl to keep at most 2 days of entries.
-/// Called at startup only — rewrites the file in-place when there's anything
-/// to remove. No-op when the file is missing, unparseable, or already within
-/// the retention window.
+/// Rewrites the file in place when there's anything to remove; no-op when it is
+/// missing, unparseable, or already within the retention window.
+///
+/// Not a hot-path call: a full read + parse + rewrite per profile. The scheduler
+/// runs it at startup and then on a coarse cadence (`HISTORY_PRUNE_INTERVAL_MS`),
+/// under the fetch lease so the rewrite never races an append.
 pub(crate) fn prune_usage_history(name: &str) {
     let Ok(path) = profile_history_path(name) else {
         return;
@@ -973,6 +976,91 @@ pub(crate) fn prune_usage_history(name: &str) {
         if let Err(e) = atomic_write_600(&path, body) {
             logline!("clauth: failed to prune usage history for {name}: {e}");
         }
+    }
+}
+
+/// Open a profile's `usage_history.jsonl` for append, creating it 0o600 on Unix.
+/// The log records per-profile utilization samples under `~/.clauth`, so it
+/// rides the owner-only invariant rather than the process umask.
+fn history_append_file(path: &Path) -> std::io::Result<std::fs::File> {
+    let mut opts = std::fs::OpenOptions::new();
+    opts.create(true).append(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    opts.open(path)
+}
+
+/// Append one live usage sample for `name` to its `usage_history.jsonl` — the
+/// durable series both burn-rate readers replay ([`load_usage_history`]).
+///
+/// `prev` is the sample this one replaces, as the caller's shared store held it.
+/// When it differs, a bridge line stamps it one ms before the new sample so an
+/// idle stretch keeps its temporal density instead of replaying as one long
+/// ramp. An unchanged sample writes nothing, so the log grows only when the
+/// numbers actually moved.
+///
+/// With no `prev` the file's own last entry stands in for that comparison, so
+/// nothing can re-append a line the log already holds. This is the cold-fill
+/// case — a profile with no `usage_cache.json` for the startup bootstrap to
+/// seed the store from — not the ordinary restart, where the seed makes `prev`
+/// the cached value and the bridge is written normally. That branch never
+/// bridges: with no seeded value, the span it would cross is unmeasured.
+///
+/// Both lines go out in one `write_all` so an append can never land interleaved.
+/// Best-effort like [`prune_usage_history`]: a failure is logged, never fatal.
+///
+/// Appends are serialized by the fetch lease (one writer per tick), but the
+/// retention trim is NOT under it: [`prune_usage_history`] rewrites through a
+/// rename, so a starting process's startup trim can still drop an append that
+/// lands mid-rewrite. One telemetry sample, bounded by the rewrite duration —
+/// a sidecar lock on both sides is the upgrade path if that ever stops being
+/// acceptable (flocking the log itself cannot work: the rename swaps the inode).
+pub(crate) fn append_usage_sample(name: &str, prev: Option<&UsageInfo>, next: &UsageInfo) {
+    let Ok(next_json) = serde_json::to_string(next) else {
+        return;
+    };
+    let bridge_json = prev.and_then(|p| serde_json::to_string(p).ok());
+    let unchanged = match &bridge_json {
+        Some(json) => json == &next_json,
+        None => load_usage_history(name)
+            .last()
+            .and_then(|(_, info)| serde_json::to_string(info).ok())
+            .is_some_and(|json| json == next_json),
+    };
+    if unchanged {
+        return;
+    }
+
+    let Ok(path) = profile_history_path(name) else {
+        return;
+    };
+    if let Some(dir) = path.parent()
+        && let Err(e) = mkdir_700(dir)
+    {
+        logline!("clauth: failed to create the profile dir for {name}: {e}");
+        return;
+    }
+    let name_json = serde_json::to_string(name).unwrap_or_else(|_| format!("\"{name}\""));
+    let line =
+        |ts: u64, usage: &str| format!("{{\"ts\":{ts},\"name\":{name_json},\"usage\":{usage}}}\n");
+    let ts = crate::usage::now_ms();
+    let mut body = match &bridge_json {
+        Some(json) => line(ts.saturating_sub(1), json),
+        None => String::new(),
+    };
+    body.push_str(&line(ts, &next_json));
+
+    match history_append_file(&path) {
+        Ok(mut file) => {
+            use std::io::Write;
+            if let Err(e) = file.write_all(body.as_bytes()) {
+                logline!("clauth: failed to append usage history for {name}: {e}");
+            }
+        }
+        Err(e) => logline!("clauth: failed to open usage history for {name}: {e}"),
     }
 }
 

@@ -49,3 +49,35 @@ fn every_sub_focus_tab_documents_esc_in_help() {
         );
     }
 }
+
+/// Pins a tab's `(key, description)` help-modal rows, flattened across
+/// sections and in order, exactly — so editing a key, its description, or
+/// reordering the rows reds here instead of drifting unnoticed. Flattening
+/// drops section titles: every current tab documents exactly one, so nothing
+/// is lost. Add another tab's row list to this loop by extending the call.
+fn assert_tab_rows(tab: Tab, expected: &[(&str, &str)]) {
+    let rows: Vec<(&str, &str)> = tab_specific_rows(tab)
+        .iter()
+        .flat_map(|(_, entries)| entries.iter().copied())
+        .collect();
+    assert_eq!(rows, expected, "{tab:?} help-modal row list drifted");
+}
+
+#[test]
+fn fallback_tab_key_grammar_rows_pin_exact_order_and_copy() {
+    assert_tab_rows(
+        Tab::Fallback,
+        &[
+            ("↑↓", "move cursor / detail row"),
+            ("shift ↑↓", "reorder to set priority"),
+            (
+                "↵",
+                "open · edit threshold · edit weekly at · edit max spend · toggle gates / last resort · remove · add",
+            ),
+            ("+ / -", "step rotate at / weekly at by 5"),
+            ("↵ on rotate at", "type a value, ↵ saves"),
+            ("↵ on weekly at", "type a %, empty clears"),
+            ("esc", "back / cancel edit"),
+        ],
+    );
+}

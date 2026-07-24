@@ -1096,6 +1096,79 @@ fn weekly_at_default_reminder_only_shows_when_value_differs_from_default() {
     );
 }
 
+// Pins the weekly-at hint family to EXACT strings (not `.contains()` prefixes)
+// so any future edit reds instead of surviving unnoticed — the class of drift
+// `d9b6a71` itself caused: it trimmed a restated "(chain default N%)"
+// parenthetical off the set-override hint and a "· empty follows the chain
+// default" suffix off the typing tooltip, and nothing failed to flag either
+// change. Both removed fragments are asserted absent below.
+#[test]
+fn weekly_at_hint_and_tooltip_pin_exact_copy() {
+    use crate::profile::DEFAULT_WEEKLY_SWITCH_PCT;
+
+    // Set override: names the account-local value, no restated default.
+    let mut set = profile("a", 95.0, 20.0, 3600);
+    set.weekly_threshold = Some(90.0);
+    let cfg = config_with(vec![set], Some("a"), vec!["a"]);
+    let lines: Vec<String> = member_detail(&cfg, "a", true, 1, false, None, None, None, 80, None)
+        .0
+        .iter()
+        .map(line_text)
+        .collect();
+    let expected = " └ switches away once weekly usage hits 90% here";
+    assert!(
+        lines.iter().any(|t| t == expected),
+        "expected exact hint {expected:?}, got {lines:?}"
+    );
+    assert!(
+        !lines.iter().any(|t| t.contains("chain default")),
+        "set-override hint must not restate the chain default: {lines:?}"
+    );
+
+    // Unset override: follows the chain-wide default, phrased as an invite to
+    // type one — value read from `DEFAULT_WEEKLY_SWITCH_PCT`, not hardcoded.
+    let unset = profile("a", 95.0, 20.0, 3600);
+    let cfg = config_with(vec![unset], Some("a"), vec!["a"]);
+    let lines: Vec<String> = member_detail(&cfg, "a", true, 1, false, None, None, None, 80, None)
+        .0
+        .iter()
+        .map(line_text)
+        .collect();
+    let expected = format!(
+        " └ follows the chain-wide weekly limit ({DEFAULT_WEEKLY_SWITCH_PCT:.0}%); type a value to override"
+    );
+    assert!(
+        lines.contains(&expected),
+        "expected exact hint {expected:?}, got {lines:?}"
+    );
+
+    // Typing mode: the always-on range tooltip, independent of the hint above.
+    let typing = profile("a", 95.0, 20.0, 3600);
+    let cfg = config_with(vec![typing], Some("a"), vec!["a"]);
+    let input = InputState::new("70");
+    let lines: Vec<String> = member_detail(
+        &cfg,
+        "a",
+        true,
+        1,
+        false,
+        None,
+        None,
+        Some(&input),
+        80,
+        None,
+    )
+    .0
+    .iter()
+    .map(line_text)
+    .collect();
+    let expected = " └ 50-100 %";
+    assert!(
+        lines.iter().any(|t| t == expected),
+        "expected exact tooltip {expected:?}, got {lines:?}"
+    );
+}
+
 // Bug 6 class fix: the edit-mode glyph pairs ACCENT + bold, matching the
 // selection caret `❯` — this card rendered it accent-only.
 #[test]

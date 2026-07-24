@@ -339,23 +339,29 @@ fn config_rows_account_actions_tail_matches_runtime_order() {
     app.config_draft = None;
 
     let rows = config_rows(&app);
-    // Head: an OAuth account renders auto-start in the second slot, so the
-    // enum's second-declared variant lines up with config_rows' second row.
+    // Full runtime sequence for this fixture (OAuth account, no base url, no
+    // overrides, no custom env, holding OAuth credentials): auto-start in the
+    // second slot, the alias overrides collapsed behind `ModelOverrideAdd`, no
+    // env rows, then the login/delete-creds/disabled/delete action tail. A
+    // future reorder of `config_rows`' row-construction (the `rows.push(...)`
+    // builder) reds here; a match-arm reorder elsewhere is unobservable at
+    // runtime and isn't what this test guards.
     assert_eq!(
-        &rows[..2],
-        [ConfigRow::Name, ConfigRow::AutoStart],
-        "auto-start renders in the second slot, right below name: {rows:?}"
-    );
-    let tail = &rows[rows.len() - 4..];
-    assert_eq!(
-        tail,
+        rows,
         [
+            ConfigRow::Name,
+            ConfigRow::AutoStart,
+            ConfigRow::BaseUrl,
+            ConfigRow::Model,
+            ConfigRow::ModelOverrideAdd,
+            ConfigRow::EnvAdd,
             ConfigRow::Login,
             ConfigRow::DeleteCreds,
             ConfigRow::Disabled,
             ConfigRow::Delete,
         ],
-        "account-actions tail must render login, delete-creds, disabled, delete in that order: {rows:?}"
+        "config_rows must render this exact sequence for an OAuth account with \
+         credentials, no overrides, and no custom env: {rows:?}"
     );
 }
 

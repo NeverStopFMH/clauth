@@ -429,11 +429,11 @@ fn snap_value(snap: &Snap, row: ConfigRow) -> &str {
         ConfigRow::SubagentModel => &snap.subagent,
         ConfigRow::EnvEntry(i) => snap.env.get(i).map(|(_, v)| v.as_str()).unwrap_or(""),
         ConfigRow::AutoStart
-        | ConfigRow::EnvAdd
         | ConfigRow::ModelOverrideAdd
-        | ConfigRow::Disabled
+        | ConfigRow::EnvAdd
         | ConfigRow::Login
         | ConfigRow::DeleteCreds
+        | ConfigRow::Disabled
         | ConfigRow::Delete
         | ConfigRow::Create => "",
     }

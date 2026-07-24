@@ -397,12 +397,12 @@ impl ConfigDraft {
             ConfigRow::EnvEntry(_) if self.active == Some(row) => &self.env_value,
             ConfigRow::EnvAdd if self.active == Some(ConfigRow::EnvAdd) => &self.env_new_key,
             ConfigRow::AutoStart
+            | ConfigRow::ModelOverrideAdd
             | ConfigRow::EnvEntry(_)
             | ConfigRow::EnvAdd
-            | ConfigRow::ModelOverrideAdd
-            | ConfigRow::Disabled
             | ConfigRow::Login
             | ConfigRow::DeleteCreds
+            | ConfigRow::Disabled
             | ConfigRow::Delete
             | ConfigRow::Create => return None,
         })
@@ -421,12 +421,12 @@ impl ConfigDraft {
             ConfigRow::EnvEntry(_) if self.active == Some(row) => &mut self.env_value,
             ConfigRow::EnvAdd if self.active == Some(ConfigRow::EnvAdd) => &mut self.env_new_key,
             ConfigRow::AutoStart
+            | ConfigRow::ModelOverrideAdd
             | ConfigRow::EnvEntry(_)
             | ConfigRow::EnvAdd
-            | ConfigRow::ModelOverrideAdd
-            | ConfigRow::Disabled
             | ConfigRow::Login
             | ConfigRow::DeleteCreds
+            | ConfigRow::Disabled
             | ConfigRow::Delete
             | ConfigRow::Create => return None,
         })
@@ -5763,11 +5763,11 @@ fn row_committed_value(profile: Option<&Profile>, name: &str, row: ConfigRow) ->
             .and_then(|p| p.env.values().nth(i).cloned())
             .unwrap_or_default(),
         ConfigRow::AutoStart
-        | ConfigRow::EnvAdd
         | ConfigRow::ModelOverrideAdd
-        | ConfigRow::Disabled
+        | ConfigRow::EnvAdd
         | ConfigRow::Login
         | ConfigRow::DeleteCreds
+        | ConfigRow::Disabled
         | ConfigRow::Delete
         | ConfigRow::Create => String::new(),
     }

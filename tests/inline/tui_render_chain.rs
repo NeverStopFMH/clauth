@@ -1022,6 +1022,10 @@ fn weekly_at_row_distinguishes_default_override_and_gated_off() {
         .expect("weekly at row renders");
     assert!(row.contains("98%"), "{row}");
     assert!(
+        !row.contains("chain default"),
+        "unset row must not restate the deleted chain-default label: {row}"
+    );
+    assert!(
         unset
             .iter()
             .any(|t| t

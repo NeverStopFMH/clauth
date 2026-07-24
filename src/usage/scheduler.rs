@@ -835,7 +835,7 @@ struct FetchOutcome {
     /// what ladders the cadence and names the state on the row.
     refresh_failed: bool,
     /// A `/profile` reading fetched DESPITE a `/usage` 429 (a canceled account
-    /// 429s `/usage` forever). Overlaid onto the cached snapshot by
+    /// has been observed to keep 429ing `/usage`). Overlaid onto the cached snapshot by
     /// [`apply_outcome`] so only the tier advances — windows stay cached — and
     /// persisted so the flip survives the next tick. `Some` only on the ~hourly
     /// tick `/profile` is actually re-pulled, never per masked tick.
@@ -1338,8 +1338,8 @@ fn apply_outcome(
     // so the staleness stays visible.
     let is_fresh = outcome.from_fetch;
 
-    // A `/profile` plan fetched despite a `/usage` 429 (a canceled account 429s
-    // `/usage` forever): the ONLY fresh signal on an otherwise cached bail. The
+    // A `/profile` plan fetched despite a `/usage` 429 (a canceled account has been
+    // observed to keep 429ing `/usage`): the ONLY fresh signal on an otherwise cached bail. The
     // fetch path carries it only on the ~hourly tick `/profile` is re-pulled, so
     // persisting it re-stamps the disk mtime at most once an hour — not the
     // per-tick storm the cached path guards against. Windows stay cached; only

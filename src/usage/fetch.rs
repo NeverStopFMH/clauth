@@ -707,9 +707,9 @@ pub(super) enum FetchError {
     /// present (delta-seconds or an IMF HTTP-date); an unparseable value is
     /// absent, and a `0` / past date parses to `ZERO` ("retry now"). `plan`
     /// carries a `/profile` reading taken DESPITE the 429: a canceled account
-    /// 429s `/usage` forever, so the profile leg is the only place its
-    /// cancellation is ever observed. `None` from the low-level `get_json`
-    /// (no profile context there); populated by [`fetch_raw`].
+    /// has been observed to keep 429ing `/usage` (one sample), so the profile
+    /// leg is the only place its cancellation has been observed. `None` from the
+    /// low-level `get_json` (no profile context there); populated by [`fetch_raw`].
     RateLimited {
         retry_after: Option<Duration>,
         plan: Option<PlanInfo>,
@@ -985,8 +985,9 @@ fn plan_from_profile(p: &RawProfile) -> PlanInfo {
 /// The TTL-gated `/profile` leg on its own: `Some(plan)` only when
 /// [`take_profile_fetch`] elects to fetch AND the leg parses; `None` when it's
 /// skipped this round or the fetch/parse fails. Split out of [`fetch_raw`] so
-/// the `/usage` 429 bail can run the SAME leg — a canceled account never returns
-/// a 200 `/usage`, so this is the only path that ever sees its cancellation.
+/// the `/usage` 429 bail can run the SAME leg — a canceled account has not been
+/// observed to return a 200 `/usage`, so in practice this is the only path that
+/// surfaces its cancellation.
 /// Never bypasses the hourly cap unless `force_profile` (the rotation retry
 /// holding no plan yet).
 fn fetch_profile_plan(
@@ -1052,8 +1053,8 @@ fn assemble_usage(
 /// rotation retry sets it only when no plan is held yet, since a refresh mints a
 /// token for the same account and can't change what `/profile` would say. A
 /// `/usage` 429 no longer suppresses `/profile`: the profile leg still runs and
-/// its plan rides the error, so a canceled (`claude_free`) account — which 429s
-/// `/usage` on every tick — is finally observed.
+/// its plan rides the error, so a canceled (`claude_free`) account — observed to
+/// 429 `/usage` on every tick so far — is finally observed.
 pub(super) fn fetch_raw(
     name: &str,
     access_token: &str,

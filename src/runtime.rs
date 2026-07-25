@@ -363,6 +363,45 @@ fn session_marker_paths(profile: &str, isolated: bool, session_id: &str) -> Resu
     Ok([marker(LinkMode::Real)?, marker(LinkMode::Fake)?])
 }
 
+/// Whether the session a registry row names is still running. `true` on anything
+/// the probe could not decide, keeping [`is_session_alive`]'s direction: a row
+/// wrongly read as live costs one wasted registry write, while one wrongly read as
+/// dead silently freezes that session out of the chain (or, for GC, reaps a live
+/// session's row).
+///
+/// One predicate for both consumers — GC's reap and the decision leg's per-row
+/// gate — so a row can never be alive for one and dead for the other.
+pub(crate) fn session_row_is_live(start_profile: &str, isolated: bool, session_id: &str) -> bool {
+    let Ok(markers) = session_marker_paths(start_profile, isolated, session_id) else {
+        return true;
+    };
+    markers.iter().any(|marker| is_session_alive(marker))
+}
+
+/// Stamp and hold the marker [`session_row_is_live`] probes, so a test can give a
+/// registry row a live session without spawning one. In here rather than in the
+/// test module because the marker layout lives in this file and nothing else may
+/// rebuild it.
+#[cfg(test)]
+pub(crate) fn hold_session_row_marker(
+    start_profile: &str,
+    isolated: bool,
+    session_id: &str,
+) -> Result<File> {
+    // [0] is the per-session (`LinkMode::Real`) layout — what `acquire` stamps.
+    let path = session_marker_paths(start_profile, isolated, session_id)?
+        .into_iter()
+        .next()
+        .context("session_marker_paths yielded no path")?;
+    if let Some(dir) = path.parent() {
+        crate::profile::mkdir_700(dir)?;
+    }
+    let file = open_pid_file(&path)?;
+    file.try_lock()
+        .with_context(|| format!("marker {} already held", path.display()))?;
+    Ok(file)
+}
+
 fn profiles_root_dir() -> Result<PathBuf> {
     Ok(clauth_dir()?.join("profiles"))
 }
@@ -531,11 +570,7 @@ pub(crate) fn gc_stale_runtimes() {
 /// existing `gc_stale_runtimes` caller gets it.
 fn gc_live_session_rows() {
     for row in crate::live_sessions::list() {
-        let Ok(markers) = session_marker_paths(&row.start_profile, row.isolated, &row.session_id)
-        else {
-            continue;
-        };
-        if !markers.iter().any(|marker| is_session_alive(marker))
+        if !session_row_is_live(&row.start_profile, row.isolated, &row.session_id)
             && let Err(e) = crate::live_sessions::unregister(&row.session_id)
         {
             logline!("clauth: dropping stale live-session row failed: {e}");
@@ -831,20 +866,55 @@ pub(crate) enum SwapOutcome {
 /// this snapshot is what is live in the child's `process.env`: `settings.json`
 /// env is applied at startup only.
 #[derive(Debug, Clone, PartialEq)]
-struct LaunchTransport {
+pub(crate) struct LaunchTransport {
     env: std::collections::BTreeMap<String, String>,
     models: crate::profile::ModelSettings,
     has_api_key: bool,
 }
 
 impl LaunchTransport {
-    fn of(profile: &Profile) -> Self {
+    pub(crate) fn of(profile: &Profile) -> Self {
         Self {
             env: profile.env.clone(),
             models: profile.models.clone(),
             has_api_key: profile.api_key.is_some(),
         }
     }
+}
+
+/// Whether `candidate` is a member this session could be swapped onto, judged on
+/// CONFIG grounds alone — no disk IO, no platform or transport-mode check.
+///
+/// Shared with the daemon's per-session decision leg, which needs it as a walk
+/// PREFERENCE: a candidate the executor refuses is one the walk must step PAST,
+/// or the intent stops changing and the session never reaches the next viable
+/// member (a chain holding a `z.ai` or DeepSeek profile is enough to do it). One
+/// function rather than two so the preference and the gate cannot drift.
+///
+/// The executor stays the safety gate. What is deliberately NOT here: the
+/// store-exists check (disk IO the daemon would repeat per candidate per tick)
+/// and the transport/platform + isolated refusals ([`swap_support`], which the
+/// decision leg has no business re-deriving).
+pub(crate) fn swap_eligible(
+    candidate: &Profile,
+    launch: &LaunchTransport,
+) -> Result<(), SwapRefused> {
+    if !candidate.is_oauth() {
+        return Err(SwapRefused::NotOauth);
+    }
+    if candidate.is_disabled() {
+        return Err(SwapRefused::Disabled);
+    }
+    if candidate.env != launch.env {
+        return Err(SwapRefused::EnvDiffers);
+    }
+    if candidate.models != launch.models {
+        return Err(SwapRefused::ModelsDiffers);
+    }
+    if candidate.api_key.is_some() != launch.has_api_key {
+        return Err(SwapRefused::ApiKeyDiffers);
+    }
+    Ok(())
 }
 
 /// A precondition-cleared swap target, minted ONLY by
@@ -1096,8 +1166,9 @@ impl SessionSwap {
 
     /// The swap leg of this session's own watchdog tick: execute a move when the
     /// daemon has named a member that differs from the one the link resolves to.
-    /// Nothing writes `intended_member` yet, so the leg is inert by construction
-    /// until the decision leg lands.
+    /// The daemon writes `intended_member` only for a row whose `follows_chain` is
+    /// set, and nothing sets it yet, so the leg is inert by construction until the
+    /// `--with-fallback` flag lands.
     fn poll(&self) {
         let Some(intended) = crate::live_sessions::get(self.session.as_str())
             .and_then(|row| row.intended_member)
@@ -1150,21 +1221,7 @@ impl SessionSwap {
         }
         let profile = crate::profile::load_profile(intended)
             .map_err(|e| SwapRefused::ProfileUnreadable(format!("{e:#}")))?;
-        if !profile.is_oauth() {
-            return Err(SwapRefused::NotOauth);
-        }
-        if profile.is_disabled() {
-            return Err(SwapRefused::Disabled);
-        }
-        if profile.env != self.launch.env {
-            return Err(SwapRefused::EnvDiffers);
-        }
-        if profile.models != self.launch.models {
-            return Err(SwapRefused::ModelsDiffers);
-        }
-        if profile.api_key.is_some() != self.launch.has_api_key {
-            return Err(SwapRefused::ApiKeyDiffers);
-        }
+        swap_eligible(&profile, &self.launch)?;
         let store = crate::claude::install_source_path(intended)
             .map_err(|e| SwapRefused::ProfileUnreadable(format!("{e:#}")))?;
         if !store.exists() {

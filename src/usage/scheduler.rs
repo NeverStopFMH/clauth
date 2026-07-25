@@ -2310,6 +2310,17 @@ fn tick(state: &SchedulerState) {
         &state.pending_switch,
         &state.pending_switch_off,
     );
+    // Per-session fallback, off the SAME stores the global scan just read: one
+    // fetcher, N decisions. Only from here, never from `standdown_tick` — a
+    // non-lease-owner decides nothing, exactly as it skips both scans above.
+    scan_session_switches(
+        &state.config,
+        &state.store,
+        &state.status,
+        &state.third_party_status,
+        &state.poll_streaks,
+        &state.kick_blocks,
+    );
     scan_recovery(
         &state.config,
         &state.store,
@@ -2597,6 +2608,37 @@ pub(crate) fn is_stuck_rate_limited(status: FetchStatus, streak: u32) -> bool {
     matches!(status, FetchStatus::RateLimited) && is_stuck_streak(streak)
 }
 
+/// Whether a member's last store reading may drive a switch decision.
+///
+/// Only a confirmed-live (`Fresh`) read qualifies — a stale or synthetic entry
+/// would drive a false switch (see [`decision_fresh`]). TWO exceptions bypass it,
+/// both because the member can never come back `Fresh` on its own, so requiring
+/// one wedges the scan on it:
+///   * an auth-broken member (AUTH-4) — its login is dead (observed 2026-07-09);
+///     the walk never consults its usage.
+///   * a deep-slot stuck `RateLimited` member (the `RateLimited` analogue) — the
+///     `/usage` throttle stayed pinned past the active cap, so no `Fresh` read is
+///     coming. Unlike auth-broken, this one still faces the walk's own last-known
+///     exhaustion gate, so a throttle artifact with headroom stays put and only a
+///     genuinely spent stuck member moves.
+///
+/// ONE predicate for the global active ([`scan_auto_switch`]) and for each
+/// chain-following session's own member ([`scan_session_switches`]): the rule is
+/// about what a reading is worth, which does not change with who is reading it.
+fn reading_is_actionable(
+    broken: bool,
+    status: &StatusStore,
+    streaks: &PollStreaks,
+    name: &str,
+) -> bool {
+    if broken {
+        return true;
+    }
+    let reading = status.lock().ok().and_then(|m| m.get(name).copied());
+    reading.is_some_and(|s| is_stuck_rate_limited(s, rate_limit_streak(streaks, name)))
+        || matches!(reading, Some(FetchStatus::Fresh))
+}
+
 /// Whether a consecutive-failure streak has run deeper than the active row's
 /// retry cap ([`ACTIVE_CAP_MAX_STREAK`]) — the point past which whatever we are
 /// waiting out is not draining on its own. One home for the boundary, so the
@@ -2662,25 +2704,11 @@ fn scan_auto_switch(
         .map(|m| m.name.clone())
         .collect();
 
-    // Only act on a confirmed-live read of the active profile — a stale or
-    // synthetic store entry would drive a false switch (see `decision_fresh`).
-    // TWO exceptions bypass the freshness gate, both because the active can
-    // never come back Fresh on its own so requiring one wedges the scan on it:
-    //   * an auth-broken active (AUTH-4) — its login is dead (observed
-    //     2026-07-09); the walk never consults its usage.
-    //   * a deep-slot stuck RateLimited active (the RateLimited analogue) — the
-    //     `/usage` throttle stayed pinned past the active cap, so no Fresh read
-    //     is coming. Unlike auth-broken, this one still faces the walk's
-    //     last-known exhaustion gate, so a throttle artifact with headroom stays
-    //     put and only a genuinely spent stuck active rotates away.
+    // Only act on a reading worth acting on. The rule, and the two bypasses that
+    // keep it from wedging the scan, live in `reading_is_actionable` — shared with
+    // the per-session leg, which applies it to each session's own member.
     let active_broken = snapshot.broken.iter().any(|b| b == &snapshot.active);
-    let active_status = status
-        .lock()
-        .ok()
-        .and_then(|m| m.get(&snapshot.active).copied());
-    let active_stuck_rl = active_status
-        .is_some_and(|s| is_stuck_rate_limited(s, rate_limit_streak(streaks, &snapshot.active)));
-    if !active_broken && !active_stuck_rl && !matches!(active_status, Some(FetchStatus::Fresh)) {
+    if !reading_is_actionable(active_broken, status, streaks, &snapshot.active) {
         return;
     }
 
@@ -2696,6 +2724,176 @@ fn scan_auto_switch(
             }
         }
         None => {}
+    }
+}
+
+/// One live session's evaluation inputs, carried out of the `config` hold so the
+/// walk itself runs lock-free.
+struct SessionDecision {
+    snapshot: crate::fallback::ChainSnapshot,
+    /// The member this session's link resolves to — what the walk starts from.
+    member: String,
+    row: crate::live_sessions::LiveSession,
+}
+
+/// Per-session fallback: decide which chain member each chain-following live
+/// session should be on, and write it into that session's registry row.
+///
+/// The DECISION half only. Nothing here touches a link, a marker, or a credential
+/// file — the session's own watchdog executes the swap
+/// ([`crate::runtime::SessionSwap::poll`]), and stays the safety gate for
+/// everything this leg can only guess at from outside the child process.
+///
+/// **The retry is the recomputation.** A dropped write needs no queue and must not
+/// be given one: the decision is re-derived from scratch every tick, so a failed
+/// write self-heals within one interval, and `lock.rs` logs a state-lock timeout
+/// once at the lock layer already.
+///
+/// Lock order is the shape of this function. Snapshot under `config` (400), DROP
+/// it, evaluate lock-free, then take the state flock (500) ONCE for the whole
+/// batch — `with_state_lock` is reentrant, so the `update_as_daemon` calls nested
+/// inside it take no second flock, where per-session acquisition would expose one
+/// tick to N × `STATE_LOCK_TIMEOUT`. Holding `config` across that flock would
+/// lengthen contention for every other clauth process (the same reason
+/// `ProfileTtl` ranks outside `State`), and no pending-switch lock is held
+/// anywhere here: those rank OUTSIDE the flock (1500/1700 vs 500), so holding one
+/// across the write inverts the order.
+fn scan_session_switches(
+    config: &crate::profile::ConfigHandle,
+    store: &UsageStore,
+    status: &StatusStore,
+    third_party_status: &ThirdPartyStatusStore,
+    streaks: &PollStreaks,
+    kick_blocks: &KickBlocks,
+) {
+    let rows: Vec<crate::live_sessions::LiveSession> = crate::live_sessions::list()
+        .into_iter()
+        .filter(|row| {
+            // An isolated session runs a throwaway tree that is deliberately not
+            // part of any chain, and the executor refuses it outright.
+            row.follows_chain
+                && !row.isolated
+                // `gc_stale_runtimes` reaps rows at daemon STARTUP, not per tick,
+                // so a SIGKILLed session's row outlives the whole daemon run and
+                // would keep taking decisions nothing can execute.
+                && crate::runtime::session_row_is_live(
+                    &row.start_profile,
+                    row.isolated,
+                    &row.session_id,
+                )
+        })
+        .collect();
+    if rows.is_empty() {
+        return;
+    }
+
+    // Snapshot under `config` only, exactly as `scan_auto_switch` does: holding it
+    // while taking `usage_store` is the `App::apply_usage` inversion.
+    let (chain, pending): (Vec<String>, Vec<SessionDecision>) = {
+        let Ok(cfg) = config.lock() else { return };
+        let chain = cfg
+            .state
+            .fallback_chain
+            .iter()
+            .map(|n| n.as_str().to_string())
+            .collect();
+        let pending = rows
+            .into_iter()
+            .filter_map(|row| {
+                // `current_member` is `None` until a session's FIRST swap, which
+                // is every session most of the time.
+                let member = row
+                    .current_member
+                    .clone()
+                    .unwrap_or_else(|| row.start_profile.clone());
+                let launch = crate::runtime::LaunchTransport::of(cfg.find(&row.start_profile)?);
+                let snapshot = crate::fallback::snapshot_session_chain(&cfg, &member, &launch)?;
+                Some(SessionDecision {
+                    snapshot,
+                    member,
+                    row,
+                })
+            })
+            .collect();
+        (chain, pending)
+    };
+
+    let kick_rejected = kick_rejected_names(kick_blocks, now_epoch_secs());
+    let mut writes: Vec<(String, String, usize)> = Vec::new();
+    for SessionDecision {
+        mut snapshot,
+        member,
+        row,
+    } in pending
+    {
+        // Neither of these is config state, so `snapshot_session_chain` cannot fill
+        // them — same split `scan_auto_switch` works to.
+        snapshot.kick_rejected = kick_rejected.clone();
+        snapshot.fresh = snapshot
+            .chain
+            .iter()
+            .filter(|m| decision_fresh_any(status, third_party_status, &m.name))
+            .map(|m| m.name.clone())
+            .collect();
+        let member_broken = snapshot.broken.iter().any(|b| b == &member);
+        // The OAuth `StatusStore` alone, where the candidate fill above unions both
+        // — and `decision_fresh_any` records why the twins must not disagree. Sound
+        // here only because `swap_eligible`'s `is_oauth` arm leaves a
+        // third-party-launched session a SINGLETON chain, which `walk_chain` cannot
+        // move off whatever this gate says. Relaxing that arm (same-provider
+        // swapping is the obvious next ask) closes such a session's gate
+        // permanently with nothing saying so, so relax it and this gate goes
+        // through the union too.
+        if !reading_is_actionable(member_broken, status, streaks, &member) {
+            continue;
+        }
+        // `Off` means "sign every account out", which has no per-session form: a
+        // session cannot be left credential-less mid-flight and there is no member
+        // name to write. It, and a stay-put `None`, leave the row as it stands.
+        let Some(crate::fallback::SwitchAction::To(target)) =
+            crate::fallback::next_auto_switch_target(&snapshot, store)
+        else {
+            continue;
+        };
+        // The cursor indexes the ON-DISK chain. `snapshot.chain` is filtered
+        // (disabled members, and the swap-eligibility skip), so an index into it is
+        // a different number the moment any member is dropped.
+        let Some(cursor) = chain.iter().position(|n| n == &target) else {
+            continue;
+        };
+        // Already what the row says: rewriting it every tick would take the
+        // cross-process flock for nothing. A dropped write still self-heals, since
+        // the row then differs from the decision this comparison is made against.
+        if row.intended_member.as_deref() == Some(target.as_str())
+            && row.chain_cursor == Some(cursor)
+        {
+            continue;
+        }
+        writes.push((row.session_id, target, cursor));
+    }
+    if writes.is_empty() {
+        return;
+    }
+
+    let batch = crate::lock::with_state_lock(|| {
+        for (session_id, target, cursor) in &writes {
+            // A session that died between `list()` and this hold is skipped
+            // silently — that is what keeps "no row for this id" from being this
+            // leg's ordinary outcome rather than a real failure.
+            if crate::live_sessions::get(session_id).is_none() {
+                continue;
+            }
+            if let Err(e) = crate::live_sessions::update_as_daemon(session_id, |fields| {
+                fields.set_intended_member(target.as_str());
+                fields.set_chain_cursor(*cursor);
+            }) {
+                logline!("clauth: session {session_id} could not be pointed at {target}: {e:#}");
+            }
+        }
+        Ok::<_, anyhow::Error>(())
+    });
+    if let Err(e) = batch {
+        logline!("clauth: per-session fallback decisions deferred to the next tick: {e:#}");
     }
 }
 

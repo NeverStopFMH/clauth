@@ -820,12 +820,63 @@ pub(crate) struct ChainSnapshot {
 /// short-circuits anyway, so callers can skip evaluation on `None`.
 pub(crate) fn snapshot_chain(config: &AppConfig) -> Option<ChainSnapshot> {
     let active = config.state.active_profile.as_deref()?.to_string();
-    let chain = &config.state.fallback_chain;
-    if !chain.iter().any(|n| n == &active) {
+    if !config.state.fallback_chain.iter().any(|n| n == &active) {
         return None;
     }
+    Some(build_chain_snapshot(config, active, &|_| false))
+}
+
+/// [`snapshot_chain`] for ONE live session: the same chain, evaluated from the
+/// member THAT session sits on rather than from the global active.
+///
+/// Two differences, and both are why the global builder cannot serve here:
+///
+/// - **No global active is required.** After a wrap-off switch-off-all there is
+///   none, and that is precisely when a session most needs to move; gating on it
+///   would leave every session with no decision, forever and silently.
+/// - **A candidate the executor would refuse on config grounds is skipped**
+///   ([`crate::runtime::swap_eligible`]). The walk picks the first clear member
+///   after the session's, so a refusable one WEDGES it: `precondition` refuses
+///   every tick, the intent never changes, and the session never reaches the next
+///   viable member. A walk PREFERENCE in the exact sense `ChainSnapshot::fresh` is
+///   one — the executor stays the safety gate, and the store-exists check and the
+///   transport/platform refusals are deliberately not re-derived here.
+///
+/// `launch` is reconstructed from the session's `start_profile` as it reads NOW,
+/// while what is live in the child's `process.env` is what `acquire` was handed —
+/// so an operator editing that profile mid-session moves this view away from the
+/// truth. A wrong guess either way costs a logged refusal or a stay-put, never a
+/// burned chain.
+pub(crate) fn snapshot_session_chain(
+    config: &AppConfig,
+    member: &str,
+    launch: &crate::runtime::LaunchTransport,
+) -> Option<ChainSnapshot> {
+    if !config.state.fallback_chain.iter().any(|n| n == member) {
+        return None;
+    }
+    Some(build_chain_snapshot(
+        config,
+        member.to_string(),
+        &|profile| profile.is_none_or(|p| crate::runtime::swap_eligible(p, launch).is_err()),
+    ))
+}
+
+/// The shared body of [`snapshot_chain`] and [`snapshot_session_chain`],
+/// parameterized on the name that plays "active" plus an extra per-candidate skip.
+///
+/// `skip_candidate` never applies to `active` itself: the walk locates that slot by
+/// `position(|m| m.name == snapshot.active)`, so filtering it out returns `None`
+/// every tick and wedges the decision on the one member it must leave.
+fn build_chain_snapshot(
+    config: &AppConfig,
+    active: String,
+    skip_candidate: &dyn Fn(Option<&Profile>) -> bool,
+) -> ChainSnapshot {
     let weekly_pct = config.state.weekly_switch_threshold_pct();
-    let chain = chain
+    let chain = config
+        .state
+        .fallback_chain
         .iter()
         // A disabled NON-active member is invisible to the scheduler-side walk
         // (`next_auto_switch_target`) — dropped here rather than carried as a
@@ -839,7 +890,12 @@ pub(crate) fn snapshot_chain(config: &AppConfig) -> Option<ChainSnapshot> {
         // skips `chain[i] == active` either — `disabled` is a candidate-only
         // exclusion, same as `broken`/`canceled`).
         .filter(|name| {
-            name.as_str() == active.as_str() || !config.find(name).is_some_and(Profile::is_disabled)
+            // Bound once: `find` is a linear scan and `skip_candidate`'s argument is
+            // evaluated eagerly, so spelling it twice here charged the GLOBAL path a
+            // third scan per member for a closure that is `|_| false` there.
+            let profile = config.find(name);
+            name.as_str() == active.as_str()
+                || (!profile.is_some_and(Profile::is_disabled) && !skip_candidate(profile))
         })
         .map(|name| {
             let profile = config.find(name);
@@ -858,7 +914,7 @@ pub(crate) fn snapshot_chain(config: &AppConfig) -> Option<ChainSnapshot> {
             }
         })
         .collect();
-    Some(ChainSnapshot {
+    ChainSnapshot {
         active,
         chain,
         switch_off_when_spent: config.state.switch_off_when_spent,
@@ -876,7 +932,7 @@ pub(crate) fn snapshot_chain(config: &AppConfig) -> Option<ChainSnapshot> {
         switch_off_when_budget_spent: config.state.switch_off_when_budget_spent,
         kick_rejected: Vec::new(),
         fresh: Vec::new(),
-    })
+    }
 }
 
 /// Scheduler-side [`is_exhausted`] over a usage snapshot: reads 5h utilization

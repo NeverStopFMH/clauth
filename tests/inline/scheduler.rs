@@ -1802,6 +1802,608 @@ fn scan_auto_switch_distrusts_a_deep_slot_stuck_rate_limited_active() {
     );
 }
 
+// ── per-session decision leg ─────────────────────────────────────────────────
+
+/// One registry row, opted IN and shared-flavor. Tests flip the one field they
+/// are about, so every other value is pinned here rather than per test.
+fn session_row(session_id: &str, start_profile: &str) -> crate::live_sessions::LiveSession {
+    crate::live_sessions::LiveSession {
+        session_id: session_id.to_string(),
+        start_profile: start_profile.to_string(),
+        pid: 4242,
+        started_at: 1_700_000_000_000,
+        cwd: None,
+        isolated: false,
+        follows_chain: true,
+        intended_member: None,
+        chain_cursor: None,
+        current_member: None,
+        last_swap_at: None,
+    }
+}
+
+/// File `row` AND hold the liveness marker the decision leg probes, so the row
+/// reads live exactly as a real session's does. The returned lock is the fixture:
+/// dropping it makes the session dead.
+#[must_use]
+fn register_live_row(row: &crate::live_sessions::LiveSession) -> std::fs::File {
+    crate::live_sessions::register(row).expect("register row");
+    crate::runtime::hold_session_row_marker(&row.start_profile, row.isolated, &row.session_id)
+        .expect("hold the row's liveness marker")
+}
+
+/// A chain of plain OAuth members, every one `swap_eligible`, with `active` as the
+/// global active profile.
+fn session_config(names: &[&str], active: Option<&str>) -> crate::profile::ConfigHandle {
+    use crate::profile::{AppConfig, AppState, Profile};
+    Arc::new(RankedMutex::new(AppConfig {
+        state: AppState {
+            active_profile: active.map(Into::into),
+            profiles: names.iter().map(|n| (*n).into()).collect(),
+            fallback_chain: names.iter().map(|n| (*n).into()).collect(),
+            ..AppState::default()
+        },
+        profiles: names
+            .iter()
+            .map(|n| Profile::new((*n).to_string(), None, None))
+            .collect(),
+    }))
+}
+
+/// Live 5h windows at the given utilizations — a member at 100 is spent, one at 10
+/// has headroom.
+fn session_store(utils: &[(&str, f64)]) -> UsageStore {
+    use crate::usage::{UsageInfo, UsageWindow, epoch_secs_to_iso, now_epoch_secs};
+    Arc::new(RankedMutex::new(
+        utils
+            .iter()
+            .map(|(name, util)| {
+                (
+                    (*name).to_string(),
+                    UsageInfo {
+                        five_hour: Some(UsageWindow {
+                            utilization: *util,
+                            resets_at: Some(epoch_secs_to_iso(now_epoch_secs() + 3600)),
+                        }),
+                        ..Default::default()
+                    },
+                )
+            })
+            .collect(),
+    ))
+}
+
+fn all_fresh(names: &[&str]) -> super::StatusStore {
+    Arc::new(RankedMutex::new(
+        names
+            .iter()
+            .map(|n| ((*n).to_string(), super::FetchStatus::Fresh))
+            .collect(),
+    ))
+}
+
+/// Drive the decision leg with empty third-party / streak / kick state — the
+/// inputs most tests in this block do not vary.
+fn scan_sessions(
+    config: &crate::profile::ConfigHandle,
+    store: &UsageStore,
+    status: &super::StatusStore,
+) {
+    scan_sessions_with_streaks(
+        config,
+        store,
+        status,
+        &Arc::new(RankedMutex::new(HashMap::new())),
+    );
+}
+
+/// [`scan_sessions`] with the poll-streak map the freshness gate's stuck-`RateLimited`
+/// bypass reads — the one input a deep-slot fixture has to set.
+fn scan_sessions_with_streaks(
+    config: &crate::profile::ConfigHandle,
+    store: &UsageStore,
+    status: &super::StatusStore,
+    streaks: &super::PollStreaks,
+) {
+    super::scan_session_switches(
+        config,
+        store,
+        status,
+        &Arc::new(RankedMutex::new(HashMap::new())),
+        streaks,
+        &Arc::new(RankedMutex::new(HashMap::new())),
+    );
+}
+
+/// The decision written into a row: `(intended_member, chain_cursor)`.
+fn decision_of(session_id: &str) -> (Option<String>, Option<usize>) {
+    let row = crate::live_sessions::get(session_id).expect("the row must still exist");
+    (row.intended_member, row.chain_cursor)
+}
+
+/// THE INERTNESS PIN — what makes landing phase 2 before the `--with-fallback`
+/// flag safe. Nothing sets `follows_chain` true yet, so an opted-out session must
+/// get NO decision even in the state that would move an opted-in one. Without this
+/// gate every live session on the box starts following the chain.
+#[test]
+fn an_opted_out_session_gets_no_decision_so_this_leg_is_inert_until_the_flag_lands() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut row = session_row("4242-0", "a");
+    row.follows_chain = false;
+    let _marker = register_live_row(&row);
+
+    scan_sessions(
+        &session_config(&["a", "b"], Some("a")),
+        &session_store(&[("a", 100.0), ("b", 10.0)]),
+        &all_fresh(&["a", "b"]),
+    );
+
+    assert_eq!(
+        decision_of("4242-0"),
+        (None, None),
+        "an opted-out session must not be pointed at a chain member"
+    );
+}
+
+/// §9's own phase-2 test: one shared chain, two sessions at different cursors, two
+/// different decisions. `a` and `c` are clear, `b` and `d` are spent, so the first
+/// clear member AFTER each session's own differs — a leg that decided globally, or
+/// off the walk's start rather than the session's, could not produce both.
+///
+/// Both rows also carry a `start_profile` of `a` with a DIFFERENT
+/// `current_member`, so `current_member` winning over `start_profile` is pinned
+/// here (its absence is pinned by the never-swapped test below).
+#[test]
+fn two_opted_in_sessions_on_different_members_get_different_intended_members() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut on_b = session_row("4242-0", "a");
+    on_b.current_member = Some("b".to_string());
+    let mut on_d = session_row("4242-1", "a");
+    on_d.current_member = Some("d".to_string());
+    let _b_marker = register_live_row(&on_b);
+    let _d_marker = register_live_row(&on_d);
+
+    scan_sessions(
+        &session_config(&["a", "b", "c", "d"], Some("a")),
+        &session_store(&[("a", 10.0), ("b", 100.0), ("c", 10.0), ("d", 100.0)]),
+        &all_fresh(&["a", "b", "c", "d"]),
+    );
+
+    assert_eq!(
+        decision_of("4242-0"),
+        (Some("c".to_string()), Some(2)),
+        "the session on b must walk forward to c"
+    );
+    assert_eq!(
+        decision_of("4242-1"),
+        (Some("a".to_string()), Some(0)),
+        "the session on d must WRAP to a — the same chain, a different cursor"
+    );
+}
+
+/// B6. `current_member` is `None` until a session's first swap, which is every
+/// session most of the time. A leg keying on it alone decides nothing for any of
+/// them while looking entirely correct.
+#[test]
+fn a_session_that_has_never_swapped_decides_off_its_start_profile() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let row = session_row("4242-0", "b");
+    assert!(
+        row.current_member.is_none(),
+        "fixture: the row must be pre-first-swap"
+    );
+    let _marker = register_live_row(&row);
+
+    scan_sessions(
+        &session_config(&["a", "b", "c"], Some("a")),
+        &session_store(&[("a", 100.0), ("b", 100.0), ("c", 10.0)]),
+        &all_fresh(&["a", "b", "c"]),
+    );
+
+    assert_eq!(
+        decision_of("4242-0"),
+        (Some("c".to_string()), Some(2)),
+        "a never-swapped session must be decided off the member it launched on"
+    );
+}
+
+/// B1a. After a wrap-off switch-off-all there is no global active — exactly the
+/// state where a session most needs to move. Keying the per-session decision on it
+/// leaves every session with no decision, forever and silently.
+#[test]
+fn a_session_decision_lands_with_no_global_active_profile() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let row = session_row("4242-0", "a");
+    let _marker = register_live_row(&row);
+
+    scan_sessions(
+        &session_config(&["a", "b"], None),
+        &session_store(&[("a", 100.0), ("b", 10.0)]),
+        &all_fresh(&["a", "b"]),
+    );
+
+    assert_eq!(
+        decision_of("4242-0"),
+        (Some("b".to_string()), Some(1)),
+        "a session with no global active must still be given somewhere to go"
+    );
+}
+
+/// B1b. A session sitting on a DISABLED member is the one case that must leave it,
+/// and the global snapshot drops a disabled non-active member out of the chain —
+/// which makes the walk's `position()` return `None` and wedges the session there.
+#[test]
+fn a_session_on_a_disabled_member_is_moved_off_it() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let row = session_row("4242-0", "a");
+    let _marker = register_live_row(&row);
+    let config = session_config(&["a", "b"], Some("b"));
+    config
+        .lock()
+        .unwrap()
+        .find_mut("a")
+        .expect("member a")
+        .disabled = true;
+
+    scan_sessions(
+        &config,
+        &session_store(&[("a", 100.0), ("b", 10.0)]),
+        &all_fresh(&["a", "b"]),
+    );
+
+    assert_eq!(
+        decision_of("4242-0"),
+        (Some("b".to_string()), Some(1)),
+        "a session on a spent, disabled member must be given a way off it"
+    );
+}
+
+/// B5. A candidate the executor refuses on CONFIG grounds wedges the walk: it is
+/// picked every tick, refused every tick, and the session never reaches the member
+/// behind it. That kills the chain's recovery half on any mixed chain, and a chain
+/// holding a `z.ai` or DeepSeek profile is ordinary.
+#[test]
+fn a_session_walks_past_a_member_the_executor_would_refuse() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let row = session_row("4242-0", "a");
+    let _marker = register_live_row(&row);
+    let config = session_config(&["a", "b", "c"], Some("a"));
+    config
+        .lock()
+        .unwrap()
+        .find_mut("b")
+        .expect("member b")
+        .base_url = Some("https://api.example/anthropic".into());
+
+    scan_sessions(
+        &config,
+        &session_store(&[("a", 100.0), ("b", 10.0), ("c", 10.0)]),
+        &all_fresh(&["a", "b", "c"]),
+    );
+
+    assert_eq!(
+        decision_of("4242-0"),
+        (Some("c".to_string()), Some(2)),
+        "b has headroom but a different endpoint, so the walk must reach c"
+    );
+}
+
+/// B4. `Off` means "sign every account out". A session cannot be left
+/// credential-less mid-flight and there is no member name to write, so the row is
+/// left exactly as it stands — including an intent a previous tick put there.
+#[test]
+fn a_wrap_off_decision_leaves_the_sessions_intended_member_untouched() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut row = session_row("4242-0", "a");
+    row.intended_member = Some("b".to_string());
+    row.chain_cursor = Some(1);
+    let _marker = register_live_row(&row);
+    let config = session_config(&["a", "b"], Some("a"));
+    config.lock().unwrap().state.switch_off_when_spent = true;
+
+    scan_sessions(
+        &config,
+        &session_store(&[("a", 100.0), ("b", 100.0)]),
+        &all_fresh(&["a", "b"]),
+    );
+
+    assert_eq!(
+        decision_of("4242-0"),
+        (Some("b".to_string()), Some(1)),
+        "a halt decision has no per-session form and must write nothing"
+    );
+}
+
+/// B7. `gc_stale_runtimes` reaps rows at daemon STARTUP, not per tick, so a
+/// SIGKILLed session's row survives the whole daemon run and would keep taking
+/// decisions nothing will ever execute.
+#[test]
+fn a_row_whose_session_is_gone_gets_no_decision() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let row = session_row("4242-0", "a");
+    // Registered, but no marker is ever held — the SIGKILLed shape.
+    crate::live_sessions::register(&row).expect("register row");
+
+    scan_sessions(
+        &session_config(&["a", "b"], Some("a")),
+        &session_store(&[("a", 100.0), ("b", 10.0)]),
+        &all_fresh(&["a", "b"]),
+    );
+
+    assert_eq!(
+        decision_of("4242-0"),
+        (None, None),
+        "a dead session's row must stop taking decisions"
+    );
+}
+
+/// B3, mirroring `scan_auto_switch_walks_off_a_broken_active_without_a_fresh_read`
+/// one level down: the freshness gate keys on the SESSION's member, not the global
+/// active. The same frozen stores must not drive a decision for a member whose
+/// reading is merely distrusted, and must drive one once it is confirmed dead.
+///
+/// The member is GENUINELY spent (a live window at its cap), which is what makes
+/// the gate the only thing standing between these stores and a decision. A lapsed
+/// window would read as regained headroom and the walk would stay put for its own
+/// reasons, leaving the gate unfalsifiable — the mutation caught exactly that.
+#[test]
+fn a_session_on_a_distrusted_member_gets_no_decision_unless_that_member_is_broken() {
+    // `a` is spent on a LIVE window, but its status is stuck on RateLimited with a
+    // shallow streak — the reading we do not trust. `b` is viable and Fresh.
+    let frozen_store = || session_store(&[("a", 100.0), ("b", 10.0)]);
+    let frozen_status = || {
+        Arc::new(RankedMutex::new(HashMap::from([
+            ("a".to_string(), super::FetchStatus::RateLimited),
+            ("b".to_string(), super::FetchStatus::Fresh),
+        ])))
+    };
+    let run = |broken: bool, streak: u32| -> (Option<String>, Option<usize>) {
+        let _home = crate::testutil::HomeSandbox::new();
+        let _marker = register_live_row(&session_row("4242-0", "a"));
+        let config = session_config(&["a", "b"], Some("a"));
+        config.lock().unwrap().set_auth_broken("a", broken);
+        let streaks: super::PollStreaks = Arc::new(RankedMutex::new(HashMap::from([(
+            "a".to_string(),
+            super::StreakCounts {
+                rate_limit: streak,
+                refresh_fail: 0,
+            },
+        )])));
+        scan_sessions_with_streaks(&config, &frozen_store(), &frozen_status(), &streaks);
+        decision_of("4242-0")
+    };
+
+    assert_eq!(
+        run(false, 0),
+        (None, None),
+        "a spent member whose reading is distrusted must not drive a decision"
+    );
+    assert_eq!(
+        run(true, 0),
+        (Some("b".to_string()), Some(1)),
+        "a member whose login is dead can never read Fresh again, so requiring one \
+         wedges the session on it forever"
+    );
+    // The THIRD rule, and the one the session call site could get wrong on its own:
+    // a `RateLimited` reading past the active cap's retry depth is stuck, so no Fresh
+    // read is coming for it either. Same stores, same status, deeper slot.
+    assert_eq!(
+        run(false, super::ACTIVE_CAP_MAX_STREAK + 1),
+        (Some("b".to_string()), Some(1)),
+        "a deep-slot stuck RateLimited member must be walked off too, or the session \
+         wedges on a throttle that never drains"
+    );
+}
+
+/// B2. `chain_cursor` indexes the ON-DISK chain, never the snapshot's. The
+/// snapshot is FILTERED, so with a disabled member ahead of the target the two
+/// indices differ — here the target is snapshot slot 1 and config slot 2.
+#[test]
+fn the_chain_cursor_indexes_the_config_chain_not_the_filtered_snapshot() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let _marker = register_live_row(&session_row("4242-0", "a"));
+    let config = session_config(&["a", "b", "c"], Some("a"));
+    config
+        .lock()
+        .unwrap()
+        .find_mut("b")
+        .expect("member b")
+        .disabled = true;
+
+    scan_sessions(
+        &config,
+        &session_store(&[("a", 100.0), ("b", 10.0), ("c", 10.0)]),
+        &all_fresh(&["a", "b", "c"]),
+    );
+
+    assert_eq!(
+        decision_of("4242-0"),
+        (Some("c".to_string()), Some(2)),
+        "the cursor must be c's index in `fallback_chain`, not in the filtered snapshot"
+    );
+}
+
+/// B9. The batch takes the cross-process state flock ONCE, not once per session.
+/// `with_state_lock` is reentrant, so the nested `update_as_daemon` calls take no
+/// second flock — per-session acquisition would expose one tick to N × the 25 s
+/// `STATE_LOCK_TIMEOUT` instead of one.
+#[test]
+fn a_batch_of_session_decisions_takes_the_state_flock_once() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut on_b = session_row("4242-0", "a");
+    on_b.current_member = Some("b".to_string());
+    let mut on_d = session_row("4242-1", "a");
+    on_d.current_member = Some("d".to_string());
+    let _b_marker = register_live_row(&on_b);
+    let _d_marker = register_live_row(&on_d);
+
+    crate::lock::OUTERMOST_ACQUISITIONS.with(|c| c.set(0));
+    scan_sessions(
+        &session_config(&["a", "b", "c", "d"], Some("a")),
+        &session_store(&[("a", 10.0), ("b", 100.0), ("c", 10.0), ("d", 100.0)]),
+        &all_fresh(&["a", "b", "c", "d"]),
+    );
+    let flocks = crate::lock::OUTERMOST_ACQUISITIONS.with(|c| c.get());
+
+    assert_eq!(
+        decision_of("4242-0").0,
+        Some("c".to_string()),
+        "fixture: both sessions must actually be written, or one hold is trivial"
+    );
+    assert_eq!(decision_of("4242-1").0, Some("a".to_string()));
+    assert_eq!(
+        flocks, 1,
+        "two sessions' decisions must cost one flock wait, not one apiece"
+    );
+}
+
+/// Recomputation IS this leg's retry — there is deliberately no queue — and both
+/// halves of that follow from one rule: the row is written iff it disagrees with
+/// the decision. A tick that changes nothing must not take the cross-process state
+/// flock to rewrite the same bytes once a second for the life of the session; a row
+/// that has drifted from the decision must be corrected on the very next tick, with
+/// nothing remembering that the earlier write was lost.
+#[test]
+fn a_decision_is_rewritten_only_when_the_row_disagrees_with_it() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let _marker = register_live_row(&session_row("4242-0", "a"));
+    let config = session_config(&["a", "b"], Some("a"));
+    let store = session_store(&[("a", 100.0), ("b", 10.0)]);
+    let status = all_fresh(&["a", "b"]);
+
+    scan_sessions(&config, &store, &status);
+    assert_eq!(
+        decision_of("4242-0"),
+        (Some("b".to_string()), Some(1)),
+        "fixture: the first tick must decide"
+    );
+
+    // The registry keeps one file per session, so the dir holds exactly this row.
+    let row_file = std::fs::read_dir(
+        crate::profile::clauth_dir()
+            .expect("clauth dir")
+            .join("live_sessions"),
+    )
+    .expect("read the registry dir")
+    .next()
+    .expect("one row on disk")
+    .expect("readable entry")
+    .path();
+    let long_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(600);
+    crate::testutil::set_mtime(&row_file, long_ago);
+
+    scan_sessions(&config, &store, &status);
+
+    assert_eq!(
+        std::fs::metadata(&row_file)
+            .expect("row metadata")
+            .modified()
+            .expect("row mtime"),
+        long_ago,
+        "an unchanged decision must not be rewritten every tick"
+    );
+
+    // …and a row that no longer agrees is corrected on the next tick, which is why
+    // a dropped write needs no retry of its own.
+    crate::live_sessions::update_as_daemon("4242-0", |fields| fields.set_intended_member("a"))
+        .expect("drift the row's member");
+
+    scan_sessions(&config, &store, &status);
+
+    assert_eq!(
+        decision_of("4242-0"),
+        (Some("b".to_string()), Some(1)),
+        "a row that drifted from the decision must be re-derived and rewritten"
+    );
+
+    // The CURSOR is half of the decision, not a derived echo of the name: inserting
+    // a member ahead of the target moves its config index while its name stays put,
+    // so a guard comparing names alone leaves `chain_cursor` permanently stale —
+    // and that field is what the Sessions surface reads.
+    crate::live_sessions::update_as_daemon("4242-0", |fields| fields.set_chain_cursor(7))
+        .expect("drift the row's cursor");
+
+    scan_sessions(&config, &store, &status);
+
+    assert_eq!(
+        decision_of("4242-0"),
+        (Some("b".to_string()), Some(1)),
+        "a row whose cursor drifted must be rewritten even though its member agrees"
+    );
+}
+
+/// The stay-put `None` — this leg's most common outcome by far, since a session
+/// whose member has headroom is the steady state. Nothing may be written for it: a
+/// leg that wrote an intent here would touch every live row every tick, and would
+/// hand the executor a target for a session that has no reason to move.
+#[test]
+fn a_healthy_session_gets_no_decision_and_its_row_is_not_touched() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut row = session_row("4242-0", "a");
+    // A standing intent from an earlier tick, so "nothing was written" is pinned as
+    // the row being UNCHANGED rather than merely still empty.
+    row.intended_member = Some("b".to_string());
+    row.chain_cursor = Some(1);
+    let _marker = register_live_row(&row);
+
+    let row_file = std::fs::read_dir(
+        crate::profile::clauth_dir()
+            .expect("clauth dir")
+            .join("live_sessions"),
+    )
+    .expect("read the registry dir")
+    .next()
+    .expect("one row on disk")
+    .expect("readable entry")
+    .path();
+    let long_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(600);
+    crate::testutil::set_mtime(&row_file, long_ago);
+
+    scan_sessions(
+        &session_config(&["a", "b"], Some("a")),
+        // The session's own member has real headroom, and so does its sibling.
+        &session_store(&[("a", 10.0), ("b", 10.0)]),
+        &all_fresh(&["a", "b"]),
+    );
+
+    assert_eq!(
+        decision_of("4242-0"),
+        (Some("b".to_string()), Some(1)),
+        "a healthy session's row must come through untouched"
+    );
+    assert_eq!(
+        std::fs::metadata(&row_file)
+            .expect("row metadata")
+            .modified()
+            .expect("row mtime"),
+        long_ago,
+        "a stay-put tick must not write the row at all"
+    );
+}
+
+/// An `--isolated` session runs a throwaway tree that is deliberately not part of
+/// any chain, and the executor refuses it outright. Deciding for one would write an
+/// intent nothing can ever act on.
+#[test]
+fn an_isolated_session_gets_no_decision() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut row = session_row("4242-0", "a");
+    row.isolated = true;
+    let _marker = register_live_row(&row);
+
+    scan_sessions(
+        &session_config(&["a", "b"], Some("a")),
+        &session_store(&[("a", 100.0), ("b", 10.0)]),
+        &all_fresh(&["a", "b"]),
+    );
+
+    assert_eq!(
+        decision_of("4242-0"),
+        (None, None),
+        "an isolated session follows no chain"
+    );
+}
+
 /// A Fresh `/usage` body fetched in the same tick as a kick can lag the
 /// just-opened window and still report it closed; `preserve_live_window` keeps
 /// the live window we already hold so it can't re-lapse and re-fire the kick.

@@ -3077,6 +3077,7 @@ fn gc_drops_a_registry_row_whose_marker_is_unlocked_and_keeps_a_held_one() {
             started_at: 1,
             cwd: None,
             isolated: false,
+            follows_chain: false,
             intended_member: None,
             chain_cursor: None,
             current_member: None,
@@ -3258,6 +3259,53 @@ fn lone_session(
     (swap, markers)
 }
 
+/// The decision leg gates on `follows_chain` and nothing sets it true yet, so an
+/// acquire-shaped registration must leave a session opted OUT — otherwise landing
+/// the leg would move EVERY live session off the account it launched on.
+#[test]
+fn a_registered_session_is_opted_out_of_the_chain() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let launch = member("optin-a");
+        member_store(&launch);
+        let (swap, _launch_markers) = lone_session(&launch, Isolation::Shared);
+
+        let row = crate::live_sessions::get(swap.session.as_str()).expect("the registered row");
+
+        assert!(
+            !row.follows_chain,
+            "registration must not opt a session into the fallback chain"
+        );
+    });
+}
+
+/// The liveness predicate the decision leg gates every row on, anchored against the
+/// REAL stamper rather than against a fixture that shares its path derivation. The
+/// shared (non-isolated) layout is the production default and had no positive
+/// anchor: a GC test asserting a row is DEAD passes for any wrong path, since a
+/// marker that isn't there reads `NotFound` → dead.
+#[test]
+fn session_row_is_live_finds_the_marker_a_real_session_stamped() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let launch = member("rowlive-a");
+        member_store(&launch);
+        let (swap, _launch_markers) = lone_session(&launch, Isolation::Shared);
+        let sid = swap.session.as_str();
+
+        assert!(
+            session_row_is_live("rowlive-a", false, sid),
+            "the probe must look where `stamp_swapped_markers` actually writes"
+        );
+        // The other direction, so the assert above cannot be won by a predicate that
+        // reads everything as live: a session id nothing stamped is dead.
+        assert!(
+            !session_row_is_live("rowlive-a", false, "9999-0"),
+            "an unstamped session id must read dead"
+        );
+    });
+}
+
 /// Every member in one config, each carrying a refresh token, so only the
 /// live-session gate can keep it out of `rotation_candidates`.
 fn config_of(members: &[&Profile]) -> crate::profile::AppConfig {
@@ -3394,6 +3442,85 @@ fn swap_support_refuses_a_shared_tree_and_a_keychain_first_host() {
         Err(SwapUnsupported::KeychainFirst)
     );
     assert_eq!(swap_support(LinkMode::Real, false), Ok(()));
+}
+
+/// The profile-comparison half of the precondition, as a pure function the
+/// daemon's per-session walk shares. It exists so the two cannot drift: a
+/// candidate the executor refuses on CONFIG grounds has to be walked PAST, or the
+/// intent never changes and the session never reaches the next viable member.
+/// One case per arm, and the api-key arm both directions — it compares STATES, so
+/// a launch that has a key needs a candidate that has one too.
+#[test]
+fn swap_eligible_refuses_exactly_the_config_grounds_the_precondition_does() {
+    let mut launch = make_profile("elig-launch");
+    launch.env.insert("SHARED".into(), "1".into());
+    launch.models.default = Some("sonnet".into());
+    let transport = LaunchTransport::of(&launch);
+
+    let mut twin = make_profile("elig-twin");
+    twin.env = launch.env.clone();
+    twin.models = launch.models.clone();
+    assert_eq!(swap_eligible(&twin, &transport), Ok(()));
+
+    let mut endpoint = twin.clone();
+    endpoint.base_url = Some("https://api.example/anthropic".into());
+    assert_eq!(
+        swap_eligible(&endpoint, &transport),
+        Err(SwapRefused::NotOauth)
+    );
+
+    let mut disabled = twin.clone();
+    disabled.disabled = true;
+    assert_eq!(
+        swap_eligible(&disabled, &transport),
+        Err(SwapRefused::Disabled)
+    );
+
+    let mut env = twin.clone();
+    env.env.insert("EXTRA".into(), "2".into());
+    assert_eq!(
+        swap_eligible(&env, &transport),
+        Err(SwapRefused::EnvDiffers)
+    );
+
+    let mut models = twin.clone();
+    models.models.default = Some("opus".into());
+    assert_eq!(
+        swap_eligible(&models, &transport),
+        Err(SwapRefused::ModelsDiffers)
+    );
+
+    let mut keyed = twin.clone();
+    keyed.api_key = Some("k".into());
+    assert_eq!(
+        swap_eligible(&keyed, &transport),
+        Err(SwapRefused::ApiKeyDiffers)
+    );
+
+    // ORDER is observable, not incidental: `announce_refusal` dedupes per
+    // `(member, reason)`, so which cause an operator is told for a member hitting
+    // two arms is decided here. Nothing couples `base_url` to `disabled`, so a
+    // disabled third-party member hits both — the endpoint is the cause to report,
+    // since it disqualifies the member even once re-enabled.
+    let mut endpoint_and_disabled = endpoint.clone();
+    endpoint_and_disabled.disabled = true;
+    assert_eq!(
+        swap_eligible(&endpoint_and_disabled, &transport),
+        Err(SwapRefused::NotOauth),
+        "the endpoint must be reported ahead of the disabled bit"
+    );
+
+    // A session launched on an api-key member: the same-state candidate clears
+    // and the keyless one is the one refused, so the compare cannot degrade into
+    // "the candidate has no key".
+    let mut keyed_launch = launch.clone();
+    keyed_launch.api_key = Some("k".into());
+    let keyed_transport = LaunchTransport::of(&keyed_launch);
+    assert_eq!(swap_eligible(&keyed, &keyed_transport), Ok(()));
+    assert_eq!(
+        swap_eligible(&twin, &keyed_transport),
+        Err(SwapRefused::ApiKeyDiffers)
+    );
 }
 
 /// `settings.json` env reaches Claude Code's `process.env` only at STARTUP,

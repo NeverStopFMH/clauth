@@ -44,6 +44,14 @@ pub(crate) struct LiveSession {
     pub(crate) started_at: u64,
     pub(crate) cwd: Option<PathBuf>,
     pub(crate) isolated: bool,
+    /// Whether this session follows the shared fallback chain. Set once at
+    /// registration and never mutated, so it needs no view of its own — which is
+    /// also why it is safe for the daemon's decision leg to READ it while the
+    /// session owns it. `serde(default)` is the upgrade gate: a row written by a
+    /// clauth that predates the field must read as opted OUT, or the decision leg
+    /// would move every already-running session off its launch account.
+    #[serde(default)]
+    pub(crate) follows_chain: bool,
     /// Daemon-owned: the member the decision leg wants this session on.
     #[serde(default)]
     pub(crate) intended_member: Option<String>,
@@ -69,6 +77,9 @@ impl LiveSession {
             started_at: crate::usage::now_ms(),
             cwd: std::env::current_dir().ok(),
             isolated,
+            // Phase 3's `--with-fallback` is what will pass this in; until then
+            // the decision leg is inert in production by construction.
+            follows_chain: false,
             intended_member: None,
             chain_cursor: None,
             current_member: None,
@@ -82,18 +93,10 @@ impl LiveSession {
 pub(crate) struct DaemonFields<'a>(&'a mut LiveSession);
 
 impl DaemonFields<'_> {
-    #[allow(
-        dead_code,
-        reason = "written by the phase-2 decision leg; the registry lands first"
-    )]
     pub(crate) fn set_intended_member(&mut self, member: impl Into<String>) {
         self.0.intended_member = Some(member.into());
     }
 
-    #[allow(
-        dead_code,
-        reason = "written by the phase-2 decision leg; the registry lands first"
-    )]
     pub(crate) fn set_chain_cursor(&mut self, cursor: usize) {
         self.0.chain_cursor = Some(cursor);
     }
@@ -204,10 +207,6 @@ fn update(session_id: &str, edit: impl FnOnce(&mut LiveSession)) -> Result<()> {
 
 /// Edit the daemon-owned fields of one row. The session's own fields are carried
 /// through untouched by construction: the row is reloaded here, not supplied.
-#[allow(
-    dead_code,
-    reason = "called by the phase-2 decision leg; the registry lands first"
-)]
 pub(crate) fn update_as_daemon(
     session_id: &str,
     edit: impl FnOnce(&mut DaemonFields<'_>),

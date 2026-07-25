@@ -13,11 +13,28 @@ fn row(session_id: &str, profile: &str) -> LiveSession {
         started_at: 1_700_000_000_000,
         cwd: Some(PathBuf::from("/w/proj")),
         isolated: false,
+        follows_chain: false,
         intended_member: None,
         chain_cursor: None,
         current_member: None,
         last_swap_at: None,
     }
+}
+
+/// A row written by a clauth that predates the opt-in field must not read as
+/// opted IN on upgrade — the decision leg would then move EVERY live session off
+/// the account it launched on.
+#[test]
+fn a_row_predating_the_opt_in_key_deserializes_as_not_following_the_chain() {
+    let pre_upgrade = br#"{"session_id":"4242-0","start_profile":"work","pid":4242,
+        "started_at":1700000000000,"cwd":"/w/proj","isolated":false}"#;
+
+    let row: LiveSession = serde_json::from_slice(pre_upgrade).expect("parse a pre-upgrade row");
+
+    assert!(
+        !row.follows_chain,
+        "a row with no `follows_chain` key must default to opted OUT"
+    );
 }
 
 #[test]

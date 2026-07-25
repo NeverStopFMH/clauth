@@ -14,6 +14,7 @@ use std::sync::Arc;
 
 use super::*;
 use crate::profile::{AppConfig, AppState, Profile, ProfileName};
+use crate::runtime::LaunchTransport;
 use crate::usage::{
     PlanInfo, PlanTier, SpendInfo, UsageInfo, UsageStore, UsageWindow, epoch_secs_to_iso,
     now_epoch_secs,
@@ -327,6 +328,138 @@ fn snapshot_chain_none_when_active_not_in_chain() {
     // active is set but absent from the chain
     config.state.fallback_chain = vec!["other".into()];
     assert!(snapshot_chain(&config).is_none());
+}
+
+/// B1a. A session's decision cannot depend on the GLOBAL active: after a wrap-off
+/// switch-off-all there is none, and that is exactly the state where a session
+/// most needs to move. `snapshot_chain` returns `None` there, so the per-session
+/// builder has to be the one that does not.
+#[test]
+fn a_session_snapshot_needs_no_global_active_profile() {
+    let mut config = config_with_chain(
+        vec![
+            profile_with_util("a", Some(95.0), Some(100.0)),
+            profile_with_util("b", Some(95.0), Some(10.0)),
+        ],
+        "a",
+    );
+    config.state.active_profile = None;
+    let launch = LaunchTransport::of(&profile_with_util("a", None, None));
+
+    assert!(
+        snapshot_chain(&config).is_none(),
+        "fixture: the global builder must be the one that gives up here"
+    );
+    let snap = snapshot_session_chain(&config, "a", &launch).expect("a session snapshot");
+    assert_eq!(snap.active, "a", "the session's own member plays `active`");
+    assert_eq!(
+        snap.chain
+            .iter()
+            .map(|m| m.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["a", "b"]
+    );
+}
+
+/// B1b. The disabled filter has to spare the SESSION's member, not the global
+/// active: `next_auto_switch_target` locates the active by `position()` in this
+/// vec, so dropping it returns `None` every tick and wedges the session on the one
+/// member it must leave.
+#[test]
+fn a_session_snapshot_keeps_the_sessions_own_disabled_member_resolvable() {
+    let config = config_with_chain(
+        vec![
+            profile_with_util("a", Some(95.0), Some(50.0)),
+            mark_disabled(profile_with_util("b", Some(95.0), Some(10.0))),
+            profile_with_util("c", Some(95.0), Some(10.0)),
+        ],
+        "a",
+    );
+    let launch = LaunchTransport::of(&profile_with_util("a", None, None));
+
+    let snap = snapshot_session_chain(&config, "b", &launch).expect("a session snapshot");
+    assert_eq!(
+        snap.chain
+            .iter()
+            .map(|m| m.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["a", "b", "c"],
+        "the session's disabled member must stay resolvable"
+    );
+
+    // …and a disabled member the session is NOT on is still dropped as a
+    // candidate, exactly as the global builder drops it.
+    let snap = snapshot_session_chain(&config, "a", &launch).expect("a session snapshot");
+    assert_eq!(
+        snap.chain
+            .iter()
+            .map(|m| m.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["a", "c"]
+    );
+}
+
+/// B5. A candidate the executor refuses on CONFIG grounds WEDGES the walk: the
+/// intent never changes, so the session never reaches the next viable member and
+/// the chain's recovery half dies on any mixed chain. The eligibility skip is a
+/// walk preference in the same sense `ChainSnapshot::fresh` is one.
+#[test]
+fn a_session_snapshot_drops_a_member_the_executor_would_refuse() {
+    let mut endpoint = profile_with_util("b", Some(95.0), Some(10.0));
+    endpoint.base_url = Some("https://api.example/anthropic".into());
+    let mut config = config_with_chain(
+        vec![
+            profile_with_util("a", Some(95.0), Some(100.0)),
+            endpoint,
+            profile_with_util("c", Some(95.0), Some(10.0)),
+        ],
+        "a",
+    );
+    // A chain entry with no profile behind it — a hand-edited `state.json`, or one
+    // whose profile failed to load. Same wedge, different cause: `precondition`'s
+    // `load_profile` refuses it `ProfileUnreadable` every tick, so naming it stops
+    // the session ever reaching the member past it.
+    config.state.fallback_chain.push("ghost".into());
+    let launch = LaunchTransport::of(&profile_with_util("a", None, None));
+
+    let snap = snapshot_session_chain(&config, "a", &launch).expect("a session snapshot");
+    assert_eq!(
+        snap.chain
+            .iter()
+            .map(|m| m.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["a", "c"],
+        "a member carrying an endpoint, and one with no profile at all, are both \
+         members the executor refuses"
+    );
+    // The global builder keeps both — this skip is per-session, not a change to the
+    // single-active path.
+    let global = snapshot_chain(&config).expect("global snapshot");
+    assert_eq!(
+        global
+            .chain
+            .iter()
+            .map(|m| m.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["a", "b", "c", "ghost"]
+    );
+}
+
+/// A member the session's own chain does not carry has no cursor to walk from, so
+/// there is nothing to decide.
+#[test]
+fn a_session_snapshot_is_none_for_a_member_outside_the_chain() {
+    let mut config = config_with_chain(
+        vec![
+            profile_with_util("a", Some(95.0), Some(100.0)),
+            profile_with_util("b", Some(95.0), Some(10.0)),
+        ],
+        "a",
+    );
+    config.state.fallback_chain = vec!["b".into()];
+    let launch = LaunchTransport::of(&profile_with_util("a", None, None));
+
+    assert!(snapshot_session_chain(&config, "a", &launch).is_none());
 }
 
 #[test]

@@ -82,6 +82,16 @@ thread_local! {
     static DEPTH: Cell<u32> = const { Cell::new(0) };
 }
 
+// Test-only per-thread counter: increments once per OUTERMOST acquisition, i.e.
+// once per real flock wait. What it makes falsifiable is that a batching caller
+// takes the flock once for N items rather than N times — the difference between
+// one tick risking `STATE_LOCK_TIMEOUT` and one risking N × it. Thread-local, so
+// parallel tests cannot pollute each other's count.
+#[cfg(test)]
+thread_local! {
+    pub(crate) static OUTERMOST_ACQUISITIONS: Cell<u64> = const { Cell::new(0) };
+}
+
 #[must_use]
 pub(crate) struct StateLock {
     // Non-None only for the outermost acquisition on this thread.
@@ -148,6 +158,8 @@ impl StateLock {
         }
 
         DEPTH.set(1);
+        #[cfg(test)]
+        OUTERMOST_ACQUISITIONS.with(|c| c.set(c.get() + 1));
 
         // Enter the STATE rank on the outermost hold. `config` (rank CONFIG) may
         // already be held — STATE sits inside it; `RankGuard::enter` asserts it.

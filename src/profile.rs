@@ -1089,16 +1089,35 @@ fn profile_credentials_pending_path(name: &str) -> Result<PathBuf> {
 }
 
 /// Tempfile + rename write; readers always see old or new, never partial.
+/// Makes a staging name unique per WRITER, not merely per process. Two threads
+/// of one process can aim an atomic write at ONE destination — two
+/// `ProfileRuntime` watchdogs sharing a fake-symlink runtime tree — and a
+/// pid-only name puts both on one staging path: one renames it away while the
+/// other still holds an fd, so the loser's remaining writes land in the live
+/// destination, non-atomically, and its own rename then fails ENOENT.
+static TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Staging path for an atomic publish of `path`: a hidden sibling, so the rename
+/// stays within one directory (and therefore one filesystem).
+pub(crate) fn tmp_sibling(path: &Path) -> PathBuf {
+    let dir = path.parent().unwrap_or_else(|| Path::new("."));
+    let file_name = path
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "file".to_string());
+    dir.join(format!(
+        ".{file_name}.tmp.{}.{}",
+        std::process::id(),
+        TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ))
+}
+
 pub(crate) fn atomic_write(path: &Path, content: impl AsRef<[u8]>) -> std::io::Result<()> {
     let dir = path.parent().unwrap_or_else(|| Path::new("."));
     if !dir.exists() {
         std::fs::create_dir_all(dir)?;
     }
-    let file_name = path
-        .file_name()
-        .map(|s| s.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "file".to_string());
-    let tmp = dir.join(format!(".{file_name}.tmp.{}", std::process::id()));
+    let tmp = tmp_sibling(path);
     std::fs::write(&tmp, content)?;
     match std::fs::rename(&tmp, path) {
         Ok(()) => Ok(()),
@@ -1119,13 +1138,11 @@ pub(crate) fn atomic_write_600(path: &Path, content: impl AsRef<[u8]>) -> std::i
         // any dir this helper must create is 0o700 to keep the secret contained.
         mkdir_700(dir)?;
     }
-    let file_name = path
-        .file_name()
-        .map(|s| s.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "file".to_string());
-    let tmp = dir.join(format!(".{file_name}.tmp.{}", std::process::id()));
+    let tmp = tmp_sibling(path);
     // Clear any stale temp so `create_new` lands on a fresh inode — guarantees
     // the 0o600 mode is applied at creation, never inherited from a looser file.
+    // Unique per writer, so this can only fire on a leftover from a crashed
+    // process whose pid was recycled, never on a live sibling's staging file.
     if tmp.exists() {
         std::fs::remove_file(&tmp)?;
     }

@@ -47,12 +47,19 @@ pub(crate) fn rescue_effective(rescue_override: Option<bool>, auto_rescue: bool)
 /// `(transcripts, sidecar files)` moved. Best-effort throughout: an error is
 /// logged, never fails the run.
 ///
-/// Gated on being the only live marker in `sessions`. Each session owns its own
-/// runtime tree and marker dir, so the count is this session alone and the guard
-/// does not fire today; it stays because the count, not the keying, is what
-/// proves nothing is reading the tree being emptied — the sidecar leg would
-/// otherwise pull `shell-snapshots/` out from under a live Claude Code
-/// mid-session. Self holds its own marker, hence `> 1`.
+/// Gated on being the only live marker in `sessions`, because the count — not
+/// the keying — is what proves nothing is reading the tree being emptied: the
+/// sidecar leg would otherwise pull `shell-snapshots/` out from under a live
+/// Claude Code mid-session. Self holds its own marker, hence `> 1`.
+///
+/// Under real symlinks each session owns its tree and marker dir, so the count is
+/// this session alone and the guard never fires. It DOES fire on a fake-symlink
+/// host, where the profile's isolated sessions share one tree: the first out
+/// rescues nothing and the last out rescues everything, since the shared tree
+/// holds every session's transcripts. The consequence is that auto-rescue becomes
+/// all-or-nothing on the last session's clean exit — SIGKILL the last one and GC
+/// discards the tree with every session's transcripts in it. Not separable while
+/// the tree is shared: the sidecar trees carry no per-session attribution.
 fn rescue_teardown(iso_root: &Path, sessions: &Path, claude_home: &Path) -> (usize, usize) {
     // An unreadable marker dir falls to "do not move": this leg pulls
     // `shell-snapshots/` out from under whatever is reading the tree, so an

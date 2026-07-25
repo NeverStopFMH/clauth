@@ -662,11 +662,17 @@ fn copy_file_leaves_no_tmp_artifact() {
 
     copy_file(&src, &dst).expect("copy_file");
 
-    // `.<name>.tmp.<pid>` sidecar must be renamed away after atomic write
-    let stray = tmp
-        .path()
-        .join(format!(".dst.json.tmp.{}", std::process::id()));
-    assert!(!stray.exists(), "atomic copy must not leave a tmp file");
+    // Any `.dst.json.tmp.*` sidecar must be renamed away after the atomic write.
+    // Matched by PREFIX, not by the exact `<pid>` name: pinning the full name
+    // would pass vacuously the moment the tmp scheme gains a component.
+    let stray: Vec<String> = dir_entry_names(tmp.path())
+        .into_iter()
+        .filter(|n| n.starts_with(".dst.json.tmp."))
+        .collect();
+    assert!(
+        stray.is_empty(),
+        "atomic copy must not leave a tmp file, found {stray:?}"
+    );
 }
 
 // A racing reader must never see a torn file — only old or complete-new bytes.
@@ -710,6 +716,118 @@ fn copy_file_visible_state_is_never_torn() {
     stop.store(true, Ordering::Relaxed);
     reader.join().expect("reader panicked");
     assert_eq!(fs::read(dst.as_ref()).expect("final read"), new);
+}
+
+/// Same invariant for the BULK materialize path. Under `LinkMode::Fake` a second
+/// session's `acquire` copies new `~/.claude` entries into a tree a live sibling
+/// is already using, while that sibling's lockless `mirror_tree` walks it. A
+/// truncate-then-stream copy is byte-different and mtime-now, so `merge_path`
+/// reads it as the newer side and copies the PARTIAL bytes back over
+/// `~/.claude/<entry>` — operator data loss outside the runtime tree.
+#[test]
+fn copy_tree_visible_state_is_never_torn() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let src = tmp.path().join("src.json");
+    let dst = Arc::new(tmp.path().join("dst.json"));
+
+    let old = vec![b'a'; 64 * 1024];
+    let new = vec![b'b'; 64 * 1024];
+    fs::write(&src, &new).expect("write src");
+    fs::write(dst.as_ref(), &old).expect("seed dst");
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let reader_dst = dst.clone();
+    let reader_stop = stop.clone();
+    let old_clone = old.clone();
+    let new_clone = new.clone();
+    let reader = std::thread::spawn(move || {
+        while !reader_stop.load(Ordering::Relaxed) {
+            if let Ok(bytes) = fs::read(reader_dst.as_ref()) {
+                assert!(
+                    bytes == old_clone || bytes == new_clone,
+                    "reader observed a torn file ({} bytes)",
+                    bytes.len()
+                );
+            }
+        }
+    });
+
+    for _ in 0..200 {
+        copy_tree(&src, &dst).expect("copy_tree");
+    }
+    stop.store(true, Ordering::Relaxed);
+    reader.join().expect("reader panicked");
+    assert_eq!(fs::read(dst.as_ref()).expect("final read"), new);
+}
+
+/// Both fake-mode publish paths must carry the source's mode over. `~/.claude`
+/// holds `statusline.sh`, hooks, and plugin executables; a copy at 0644 runs a
+/// Claude Code whose statusline and hooks fail. A read-then-`atomic_write`
+/// creates at the umask, which is why both paths stream through `std::fs::copy`.
+///
+/// The mirror leg is the one that used to lose it, and in BOTH directions: the
+/// bit only dies on the first edit after the tree is built, because
+/// `files_match` short-circuits identical files until then.
+#[cfg(unix)]
+#[test]
+fn both_fake_mode_publish_paths_preserve_the_executable_bit() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let mode_of = |p: &Path| {
+        fs::metadata(p)
+            .unwrap_or_else(|e| panic!("stat {}: {e}", p.display()))
+            .permissions()
+            .mode()
+            & 0o777
+    };
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let claude = tmp.path().join("claude");
+    let runtime = tmp.path().join("runtime");
+    fs::create_dir_all(&claude).expect("mkdir claude");
+    fs::create_dir_all(&runtime).expect("mkdir runtime");
+
+    // 1. The bulk materialize walk.
+    let hook = claude.join("hook.sh");
+    fs::write(&hook, b"#!/bin/sh\necho v1\n").expect("write hook");
+    fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).expect("chmod hook");
+    copy_tree(&hook, &runtime.join("hook.sh")).expect("copy_tree");
+    assert_eq!(
+        mode_of(&runtime.join("hook.sh")),
+        0o755,
+        "a hook materialized into the runtime tree must stay executable"
+    );
+
+    // 2. The mirror leg, ~/.claude → runtime: the operator edits the hook, so
+    //    `files_match` stops short-circuiting and the copy actually runs.
+    fs::write(&hook, b"#!/bin/sh\necho v2\n").expect("edit hook");
+    set_mtime(&hook, SystemTime::now() + Duration::from_secs(60));
+    mirror_tree(&claude, &runtime).expect("mirror to runtime");
+    assert_eq!(
+        fs::read(runtime.join("hook.sh")).expect("read runtime hook"),
+        b"#!/bin/sh\necho v2\n",
+        "the edit must actually reach the runtime — otherwise the mode assert is vacuous"
+    );
+    assert_eq!(
+        mode_of(&runtime.join("hook.sh")),
+        0o755,
+        "the mirror must not strip +x off the runtime copy"
+    );
+
+    // 3. The mirror leg, runtime → ~/.claude: a write-back at 0644 would strip
+    //    +x off the operator's own file, outside the runtime tree.
+    let back = runtime.join("cc-made-this.sh");
+    fs::write(&back, b"#!/bin/sh\necho cc\n").expect("write runtime-only hook");
+    fs::set_permissions(&back, fs::Permissions::from_mode(0o755)).expect("chmod runtime hook");
+    mirror_tree(&claude, &runtime).expect("mirror to claude");
+    assert_eq!(
+        mode_of(&claude.join("cc-made-this.sh")),
+        0o755,
+        "the write-back must not strip +x off the operator's side"
+    );
 }
 
 #[test]
@@ -2609,6 +2727,96 @@ fn live_sessions_at_reports_unknown_separately_from_zero() {
         live_sessions_at(&sessions),
         None,
         "an unreadable marker dir is unknown, never zero"
+    );
+
+    fs::set_permissions(&sessions, fs::Permissions::from_mode(0o700)).expect("restore");
+}
+
+/// The same rule at the DESTRUCTIVE level. `prune_stale_sessions` unlinks what
+/// `is_session_alive` reads as dead, and its zero is what three callers turn into
+/// `remove_dir_all` of a runtime tree — shared across the profile's sessions
+/// under `LinkMode::Fake`. So an unopenable marker (EMFILE, ESTALE, EACCES) must
+/// read LIVE: folding one into a false deletes a live session's only marker and
+/// unblocks a rotation against the single-use token it still holds.
+#[cfg(unix)]
+#[test]
+fn an_unopenable_marker_reads_as_live_and_is_never_unlinked() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let sessions = tmp.path().join("sessions-9003-0");
+    fs::create_dir_all(&sessions).expect("mkdir sessions");
+    let marker = sessions.join("9003-0");
+    fs::write(&marker, b"").expect("marker");
+
+    // Control: a readable, unlocked marker IS dead, and pruning removes it.
+    assert!(!is_session_alive(&marker));
+    assert_eq!(prune_stale_sessions(&sessions), Some(0));
+    assert!(
+        !marker.exists(),
+        "a genuinely dead marker must be collected"
+    );
+
+    fs::write(&marker, b"").expect("re-create marker");
+    fs::set_permissions(&marker, fs::Permissions::from_mode(0o000)).expect("chmod");
+    if fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&marker)
+        .is_ok()
+    {
+        // Running with rights that ignore the mode (root); the probe cannot be
+        // posed, so assert nothing rather than pass vacuously.
+        fs::set_permissions(&marker, fs::Permissions::from_mode(0o600)).expect("restore");
+        return;
+    }
+
+    assert!(
+        is_session_alive(&marker),
+        "an unopenable marker is unknown, and unknown must read live"
+    );
+    assert_eq!(
+        prune_stale_sessions(&sessions),
+        Some(1),
+        "an unopenable marker must not be counted as dead"
+    );
+    assert!(
+        marker.exists(),
+        "pruning unlinked a marker it could not prove dead"
+    );
+
+    fs::set_permissions(&marker, fs::Permissions::from_mode(0o600)).expect("restore");
+}
+
+/// And the same rule for the marker DIR one level up. `prune_stale_sessions`'s
+/// zero authorizes `remove_dir_all`, so an unreadable dir has to be an unknown —
+/// `Some(0)` is reserved for a dir that is genuinely absent.
+#[cfg(unix)]
+#[test]
+fn prune_reports_an_unreadable_marker_dir_as_unknown_not_zero() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let sessions = tmp.path().join("sessions-9004-0");
+    fs::create_dir_all(&sessions).expect("mkdir sessions");
+
+    assert_eq!(
+        prune_stale_sessions(&tmp.path().join("absent")),
+        Some(0),
+        "a genuinely absent dir is idle, not unknown"
+    );
+    assert_eq!(prune_stale_sessions(&sessions), Some(0));
+
+    fs::set_permissions(&sessions, fs::Permissions::from_mode(0o000)).expect("chmod");
+    if fs::read_dir(&sessions).is_ok() {
+        fs::set_permissions(&sessions, fs::Permissions::from_mode(0o700)).expect("restore");
+        return;
+    }
+
+    assert_eq!(
+        prune_stale_sessions(&sessions),
+        None,
+        "an unreadable marker dir must never authorize a teardown"
     );
 
     fs::set_permissions(&sessions, fs::Permissions::from_mode(0o700)).expect("restore");

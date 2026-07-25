@@ -1,8 +1,10 @@
 //! Per-session `CLAUDE_CONFIG_DIR` trees used by `clauth start`.
 //!
-//! Every `clauth start <profile>` session gets its OWN runtime tree, keyed by a
-//! session id (`<pid>-<seq>`): `~/.clauth/profiles/<profile>/runtime-<sid>/`, or
-//! `runtime-isolated-<sid>/` for an isolated run. Its `.credentials.json` still
+//! Under real symlinks every `clauth start <profile>` session gets its OWN
+//! runtime tree, keyed by a session id (`<pid>-<seq>`):
+//! `~/.clauth/profiles/<profile>/runtime-<sid>/`, or `runtime-isolated-<sid>/`
+//! for an isolated run. Without them the tree is shared per profile+flavor
+//! instead — see the keying rule below. Its `.credentials.json` still
 //! resolves to the profile's canonical creds, so concurrent sessions of one
 //! profile observe a single chain of refresh tokens. A watchdog thread in each
 //! parent process keeps the runtime tree and canonical state in sync.
@@ -39,9 +41,10 @@
 //! its lifetime, so any other process reads liveness without cooperation. Token
 //! rotation gates on a live marker in ANY of a profile's sessions dirs
 //! ([`has_live_session`]) — missing one would spend a single-use refresh token a
-//! live session still holds. Teardown drops the marker and discards that
-//! session's own tree; [`gc_stale_runtimes`] collects what a crashed session
-//! left behind, of either flavor and in either layout.
+//! live session still holds. Teardown drops the marker and discards the tree —
+//! its own under real symlinks, the shared one under [`LinkMode::Fake`] and only
+//! once the last session of the profile has left; [`gc_stale_runtimes`] collects
+//! what a crashed session left behind, of either flavor and in either layout.
 
 use std::collections::HashSet;
 use std::fs::{File, OpenOptions};
@@ -57,8 +60,8 @@ use crate::claude::{build_claude_settings_json, create_symlink};
 use crate::lock::with_state_lock;
 use crate::logline::logline;
 use crate::profile::{
-    ClaudeCredentials, Profile, atomic_write, atomic_write_600, claude_dir, clauth_dir, home_dir,
-    profile_dir, profile_subpath,
+    ClaudeCredentials, Profile, atomic_write_600, claude_dir, clauth_dir, home_dir, profile_dir,
+    profile_subpath,
 };
 
 /// Watchdog tick. 1s instead of a longer interval because fake-symlink mode
@@ -219,11 +222,12 @@ fn paired_runtime_name(sessions_name: &str) -> Option<String> {
 /// [`LinkMode::Real`] keys each session's pair by its own `<sid>`, so sessions
 /// are independent. [`LinkMode::Fake`] returns the BARE stem, shared by every
 /// session of the profile+flavor: that tree is built by recursive COPY of
-/// `~/.claude/`, so per-session keying would charge sessions 2..N a full copy
-/// each (multiple GB apiece on a real install) and make the fake-mode watchdog
-/// re-walk `~/.claude/` once per session per second instead of once per profile.
-/// The accepted cost is that a fake-symlink host cannot give its sessions
-/// independent credentials.
+/// `~/.claude/`, so per-session keying charges sessions 2..N a full copy each,
+/// multiple GB apiece on a real install. Disk is the whole reason — the fake-mode
+/// watchdog walk is NOT: `acquire` spawns one per `ProfileRuntime` either way, so
+/// N sessions perform N walks per second under both keyings, and sharing only
+/// converges them on one destination tree. The accepted cost is that a
+/// fake-symlink host cannot give its sessions independent credentials.
 ///
 /// `session` is a [`SessionId`]'s string — digits and one `-`, which is what
 /// keeps a per-session name from spelling the `isolated` flavor stem.
@@ -544,7 +548,10 @@ fn gc_live_session_rows() {
 /// collects the orphaned marker dir alone.
 fn gc_one_pair(runtime: &Path, sessions: &Path) -> Result<()> {
     with_state_lock(|| {
-        if prune_stale_sessions(sessions).unwrap_or(0) == 0 {
+        // An unknown reads as live: this leg runs from the daemon's timer, in a
+        // different process, against every profile, and under `LinkMode::Fake`
+        // the tree it would remove is the one a live sibling is running out of.
+        if prune_stale_sessions(sessions).unwrap_or(1) == 0 {
             let _ = std::fs::remove_dir_all(runtime);
             let _ = std::fs::remove_dir(sessions);
         }
@@ -586,9 +593,12 @@ pub(crate) fn shared_runtime_dirs() -> Vec<PathBuf> {
     out
 }
 
-/// Every live isolated SESSION, paired with its own `runtime-isolated-<sid>/
-/// projects/` dir — so a profile running two isolated sessions appears twice,
-/// once per store. A consumer keying by profile name must expect that.
+/// Every live isolated SESSION, paired with the `runtime-isolated…/projects/`
+/// dir backing it — so under real symlinks a profile running two isolated
+/// sessions appears twice, once per store. A consumer keying by profile name must
+/// expect that. Under [`LinkMode::Fake`] both sessions share one store, so the
+/// profile appears once; a consumer must not read the row count as a session
+/// count either way.
 ///
 /// An isolated runtime's transcripts live
 /// ONLY in this throwaway tree (never symlinked to the global store) and are
@@ -783,13 +793,30 @@ impl ProfileRuntime {
 
             crate::profile::mkdir_700(sessions)
                 .with_context(|| format!("failed to create {}", sessions.display()))?;
-            let active = prune_stale_sessions(sessions)?;
+            // An unknown reads as live, so the wipe below is skipped rather than
+            // aimed at a tree this probe could not clear. The build is additive,
+            // so declining to wipe is always the recoverable direction, and an
+            // `sessions` dir this could not read still fails loudly at the
+            // `open_pid_file` + `lock` below.
+            let active = prune_stale_sessions(sessions).unwrap_or(1);
             // Nothing live in this session's marker dir, yet a tree already sits
             // at its path: a dead session's leftovers under a recycled pid, or —
             // under the shared tree — a whole profile's worth nobody is using.
             // Rebuild from scratch so stale symlinks/copies to entries that have
             // since vanished from ~/.claude/ don't carry over. A live sibling
             // holds a marker here, so its tree is never the one wiped.
+            //
+            // The converse does NOT hold, and mixed mode is reachable without
+            // anyone changing a setting (an elevated Windows shell has
+            // `SeCreateSymbolicLinkPrivilege`, a normal one does not, so two
+            // concurrent starts can land on different modes). A live REAL
+            // session's compat marker sits in this same shared dir, so it makes
+            // `active` nonzero for a Fake acquire and suppresses the wipe of a
+            // bare `runtime/` that session does not use. A stale pre-upgrade tree
+            // is then adopted rather than rebuilt, and since the build is
+            // additive, a symlink forest stays symlinks under `mode == Fake`.
+            // Benign — reading a symlink needs no privilege — but it is why this
+            // wipe cannot be relied on as the only staleness cure.
             if active == 0 && runtime.symlink_metadata().is_ok() {
                 std::fs::remove_dir_all(runtime)
                     .with_context(|| format!("failed to clear {}", runtime.display()))?;
@@ -896,10 +923,15 @@ impl ProfileRuntime {
         &self.runtime
     }
 
-    /// This session's liveness-marker dir, holding its marker and no other's.
-    /// Its live count still gates anything that MOVES state out of `config_dir`:
-    /// the count, not the keying, is what proves no Claude Code is reading the
-    /// tree being emptied.
+    /// This session's liveness-marker dir. Holds only its own marker under real
+    /// symlinks; under [`LinkMode::Fake`] it is shared with every other session
+    /// of this profile+flavor, so the dir can hold several.
+    ///
+    /// Its live count gates anything that MOVES state out of `config_dir` — the
+    /// count, not the keying, is what proves no Claude Code is reading the tree
+    /// being emptied. Under the shared tree that gate genuinely fires: a caller
+    /// that moves state out (`start::rescue_teardown`) does nothing until the
+    /// LAST session of the profile leaves.
     pub(crate) fn sessions_dir(&self) -> &Path {
         &self.sessions
     }
@@ -1140,21 +1172,29 @@ fn try_real_symlink(_target: &Path, _link: &Path) -> std::io::Result<()> {
 /// Walk `sessions/`, drop entries whose owner has died, return the live count.
 /// Caller holds the cross-process state lock so two simultaneous starts can't
 /// both conclude "no other sessions" and tear down the runtime under each other.
-fn prune_stale_sessions(sessions: &Path) -> Result<usize> {
+///
+/// Same `Some(0)`-is-absent / `None`-is-unknown shape as [`live_marker_names`],
+/// and the reason is sharper here because this is the DESTRUCTIVE level: all
+/// three callers turn a zero into `remove_dir_all` of a runtime tree, which under
+/// [`LinkMode::Fake`] is shared by every session of the profile+flavor. An
+/// unreadable dir, or an entry that cannot be read, is therefore an unknown —
+/// folding either into a zero would hand a live session's tree to the sweep.
+fn prune_stale_sessions(sessions: &Path) -> Option<usize> {
     let entries = match std::fs::read_dir(sessions) {
-        Ok(e) => e,
-        Err(_) => return Ok(0),
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Some(0),
+        Err(_) => return None,
     };
     let mut alive = 0;
-    for entry in entries.flatten() {
-        let path = entry.path();
+    for entry in entries {
+        let path = entry.ok()?.path();
         if is_session_alive(&path) {
             alive += 1;
         } else {
             let _ = std::fs::remove_file(&path);
         }
     }
-    Ok(alive)
+    Some(alive)
 }
 
 fn is_session_alive(pid_file: &Path) -> bool {
@@ -1162,8 +1202,16 @@ fn is_session_alive(pid_file: &Path) -> bool {
     // that just created it but hasn't locked it yet, producing a false
     // "unlocked = dead" reading. try_lock succeeds iff no other open fd holds
     // an exclusive flock, i.e. the previous owner has exited.
-    let Ok(file) = OpenOptions::new().read(true).write(true).open(pid_file) else {
-        return false;
+    //
+    // Only a genuinely absent marker is dead. Every other `open` failure —
+    // EMFILE under fd pressure, ESTALE on an NFS home, an EACCES from a mode
+    // change — is an unknown, and `prune_stale_sessions` UNLINKS whatever this
+    // reads as dead. Folding one into a false would delete a live session's
+    // marker, then let the rotation leg spend the single-use refresh token that
+    // session still holds.
+    let file = match OpenOptions::new().read(true).write(true).open(pid_file) {
+        Ok(file) => file,
+        Err(e) => return e.kind() != std::io::ErrorKind::NotFound,
     };
     // Any I/O error: treat as alive so we don't race a live session.
     file.try_lock().is_err()
@@ -1517,9 +1565,10 @@ fn copy_tree(src: &Path, dst: &Path) -> Result<()> {
         }
         Ok(())
     } else {
-        std::fs::copy(src, dst)
-            .map(|_| ())
-            .with_context(|| format!("failed to copy {} -> {}", src.display(), dst.display()))
+        // Same publish primitive the watchdog mirror uses: a sibling session
+        // shares this tree, and its lockless `mirror_tree` must never sample a
+        // file this walk is still writing.
+        copy_file(src, dst)
     }
 }
 
@@ -1552,9 +1601,12 @@ fn tick(
             // under "latest mtime wins" + byte-equality skip, and never deletes
             // — a file changing in the TOCTOU window re-converges next tick.
             // mirror_tree skips settings.json / .credentials.json, so it never
-            // races build_runtime_dir's per-profile writes. Only credential
-            // reconciliation (must not interleave with acquire/switch credential
-            // writes) stays under the lock.
+            // races build_runtime_dir's per-profile writes. It CAN meet that
+            // build's top-level materialize walk, since a sibling session shares
+            // this tree — both publish through `copy_file`'s rename, so the walk
+            // only ever samples a complete file. Only credential reconciliation
+            // (must not interleave with acquire/switch credential writes) stays
+            // under the lock.
             mirror_tree(claude_home, runtime)?;
             with_state_lock(|| mirror_credentials(&runtime.join(".credentials.json"), canonical))
         }
@@ -1852,16 +1904,48 @@ fn files_match(a: &Path, b: &Path) -> Result<bool> {
     Ok(a_bytes == b_bytes)
 }
 
-/// Copy `src` onto `dst` via a PID-suffixed tmp + atomic rename. `mirror_tree`
-/// runs lockless, so a concurrent reader (sibling session, user, or
-/// `build_runtime_dir`) could observe `dst` mid-write; a raw `std::fs::copy`
-/// truncates-then-streams (non-atomic, seen torn). The rename makes the swap
-/// atomic on POSIX (observer sees old or complete-new); the PID suffix keeps two
-/// processes off the same tmp name.
+/// The ONE way fake-symlink mode publishes a file: stream `src` into a uniquely
+/// named hidden sibling of `dst`, then rename. Used by both the bulk materialize
+/// walk ([`copy_tree`]) and the watchdog mirror ([`merge_path`]), so the two can
+/// never drift on atomicity or on mode.
+///
+/// **Atomic.** `mirror_tree` runs lockless, so a concurrent reader — a sibling
+/// session sharing this tree, the Claude Code running out of it, or
+/// `build_runtime_dir`'s own walk — could observe `dst` mid-write. A raw
+/// `std::fs::copy` truncates-then-streams, and `mirror_tree` is BIDIRECTIONAL and
+/// mtime-wins: a half-written `dst` is byte-different with mtime-now, so
+/// `merge_path` would read it as the newer side and copy the TRUNCATED bytes back
+/// over `~/.claude/<entry>`. Nothing repairs that — the next tick sees two
+/// matching truncated files and converges on the loss. The rename makes the swap
+/// atomic on POSIX (an observer sees old or complete-new); the per-writer tmp
+/// suffix keeps two threads of one process off the same staging path.
+///
+/// **Mode-preserving.** `std::fs::copy` carries the source's permission bits
+/// over, which a read-then-`atomic_write` does not (that creates at the umask).
+/// `~/.claude` holds `statusline.sh`, hooks, and plugin executables, and both
+/// directions matter: a runtime copy at 0644 runs a Claude Code whose hooks fail,
+/// and a write-back at 0644 strips `+x` off the operator's own file outside the
+/// runtime tree.
+///
+/// **Streaming.** The bulk path copies a whole `~/.claude` fanned across a worker
+/// pool, so reading each file whole would peak at workers × largest file.
 fn copy_file(src: &Path, dst: &Path) -> Result<()> {
-    let bytes = std::fs::read(src).with_context(|| format!("failed to read {}", src.display()))?;
-    atomic_write(dst, &bytes)
-        .with_context(|| format!("failed to copy {} -> {}", src.display(), dst.display()))
+    if let Some(parent) = dst.parent()
+        && !parent.exists()
+    {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
+    let tmp = crate::profile::tmp_sibling(dst);
+    std::fs::copy(src, &tmp)
+        .with_context(|| format!("failed to copy {} -> {}", src.display(), tmp.display()))?;
+    match std::fs::rename(&tmp, dst) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp);
+            Err(e).with_context(|| format!("failed to publish {}", dst.display()))
+        }
+    }
 }
 
 #[cfg(unix)]

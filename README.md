@@ -233,6 +233,7 @@ The **Fallback** tab holds an ordered chain of profiles clauth hops between when
   profiles.toml          # profile order, active marker, fallback chain, wrap-off, theme, refresh interval
   price_cache.json       # cached model price table (LiteLLM rates) for the Tokens cost lens
   status_cache.json      # cached Claude status incident feed
+  live_sessions/         # one row per live `clauth start` session (pid, start profile, chain state)
   profiles/
     work/
       config.toml        # base_url, api_key, auto_start, fallback_threshold, [env], [models]
@@ -240,10 +241,11 @@ The **Fallback** tab holds an ordered chain of profiles clauth hops between when
       usage_cache.json   # last known utilization + plan info
       account_id.json    # which account this profile is, so a live re-login can be told apart
       profile_fetched.json  # when the plan/tier was last fetched, so a restart doesn't re-ask
-      runtime/           # per-profile CLAUDE_CONFIG_DIR tree for `clauth start`
-      runtime-isolated/  # same, for `clauth start --isolated` (no operator memory/plugins/hooks)
-      sessions/          # per-session PID files (ref-counting live launches)
-      sessions-isolated/ # per-session PID files for isolated launches
+      runtime-<sid>/     # one CLAUDE_CONFIG_DIR tree per live `clauth start` session
+      runtime-isolated-<sid>/  # same, for `clauth start --isolated` (no operator memory/plugins/hooks)
+      sessions-<sid>/    # that session's PID file, flock-held while it runs
+      sessions-isolated-<sid>/ # same, for isolated launches
+      sessions/          # PID files a pre-per-session clauth can still see (upgrade shim)
       throughput_cache.json  # observed delegate tok/s + rate-limit hits per model
     personal/
       ...

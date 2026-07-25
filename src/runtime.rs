@@ -155,22 +155,43 @@ pub(crate) fn is_session_id(s: &str) -> bool {
     })
 }
 
+/// True when `name` is one of the four shapes clauth gives a paired dir with
+/// this stem: the legacy `<stem>` and `<stem>-isolated`, or the per-session
+/// `<stem>-<sid>` and `<stem>-isolated-<sid>`. The single parser behind every
+/// strict name check below, so the flavors and the two layouts cannot drift
+/// apart across them.
+fn is_paired_dir_name(name: &str, stem: &str) -> bool {
+    let Some(rest) = name.strip_prefix(stem) else {
+        return false;
+    };
+    let rest = rest.strip_prefix("-isolated").unwrap_or(rest);
+    rest.is_empty() || rest.strip_prefix('-').is_some_and(is_session_id)
+}
+
+/// True for a runtime dir name of EITHER flavor. This is the predicate GC gates
+/// on, and GC `remove_dir_all`s what it matches — so it is the strict form. The
+/// loose `runtime<rest>` split that [`paired_sessions_name`] uses would hand the
+/// sweep anything a future release happens to name `runtime*`.
+fn is_runtime_dir_name(name: &str) -> bool {
+    is_paired_dir_name(name, RUNTIME_STEM)
+}
+
+/// Sibling of [`is_runtime_dir_name`] for marker dirs.
+fn is_sessions_dir_name(name: &str) -> bool {
+    is_paired_dir_name(name, SESSIONS_STEM)
+}
+
 /// True for a SHARED runtime dir name — a per-session `runtime-<sid>` or the
 /// legacy bare `runtime` — and false for the isolated flavor or any unrelated
 /// name. Callers that must reach only shared copies (both config reconcilers,
-/// `clauth which`) key on this rather than an exact name, and stay exact by
-/// construction: `<sid>` is digits and one `-`, so `runtime-isolated…` can never
-/// parse as one.
+/// `clauth which`) key on this rather than an exact name.
 pub(crate) fn is_shared_runtime_dir_name(name: &str) -> bool {
-    match name.strip_prefix(RUNTIME_STEM) {
-        Some("") => true,
-        Some(rest) => rest.strip_prefix('-').is_some_and(is_session_id),
-        None => false,
-    }
+    is_runtime_dir_name(name) && !name.starts_with(ISOLATED_RUNTIME_STEM)
 }
 
 /// The sessions dir paired with a runtime dir of this name, per the module's one
-/// layout rule: `runtime<rest>` ↔ `sessions<rest>`.
+/// layout rule: `runtime<rest>` ↔ `sessions<rest>`. Deliberately loose about
+/// what `<rest>` is; callers that DELETE gate on [`is_runtime_dir_name`] first.
 fn paired_sessions_name(runtime_name: &str) -> Option<String> {
     runtime_name
         .strip_prefix(RUNTIME_STEM)
@@ -198,6 +219,65 @@ fn sessions_dir(name: &str, isolation: Isolation, session: &SessionId) -> Result
     )
 }
 
+/// This session's marker at the PRE-per-session path,
+/// `<profile>/sessions[-isolated]/<sid>`. See [`stamp_legacy_marker`].
+fn legacy_marker_path(name: &str, isolation: Isolation, session: &SessionId) -> Result<PathBuf> {
+    Ok(profile_subpath(name, isolation.sessions_stem())?.join(session.as_str()))
+}
+
+/// Stamp and hold this session's upgrade-compat marker, returning the fd whose
+/// flock is the liveness signal.
+///
+/// A clauth process built before the per-session layout probes exactly
+/// `<profile>/sessions` and `<profile>/sessions-isolated`. It cannot see a
+/// `sessions-<sid>/` dir, so its `has_live_session` reads a live new-layout
+/// session as idle and its rotation leg spends the single-use refresh token that
+/// session still holds — the chain dies and the account needs a re-login. That is
+/// the DEFAULT state right after an upgrade: `clauth daemon --replace` exists
+/// precisely because the running daemon is otherwise the old binary until the
+/// next restart.
+///
+/// Best-effort: failing to stamp costs upgrade safety, not the session, so it is
+/// logged and stepped over rather than propagated.
+///
+/// Ceiling: an upgrade-window shim, added 2026-07-25. Delete it — with
+/// `ProfileRuntime::legacy_marker` and the count dedupe it forces in
+/// [`live_session_count`] — a few releases after the per-session layout ships,
+/// once no pre-layout binary can still be supervising a live install.
+fn stamp_legacy_marker(path: &Path) -> Option<File> {
+    let dir = path.parent()?;
+    if let Err(e) = crate::profile::mkdir_700(dir) {
+        logline!(
+            "clauth: upgrade-compat marker dir {} failed: {e}",
+            dir.display()
+        );
+        return None;
+    }
+    let file = match open_pid_file(path) {
+        Ok(file) => file,
+        Err(e) => {
+            logline!(
+                "clauth: upgrade-compat marker {} failed: {e}",
+                path.display()
+            );
+            return None;
+        }
+    };
+    // `try_lock`, not `lock`: this path is shared across sessions of the profile,
+    // and a blocking wait here would hang `acquire` on whatever holds it. A held
+    // marker already reads as live to an old binary, which is the whole point.
+    match file.try_lock() {
+        Ok(()) => Some(file),
+        Err(e) => {
+            logline!(
+                "clauth: upgrade-compat marker {} not lockable: {e}",
+                path.display()
+            );
+            None
+        }
+    }
+}
+
 /// The liveness marker a session holds, addressed by the three things its
 /// registry row carries. The layout lives here so no other module rebuilds it —
 /// `crate::live_sessions` tests a row's liveness through this, and would go
@@ -220,60 +300,103 @@ fn profiles_root_dir() -> Result<PathBuf> {
 }
 
 /// Every marker dir under the profile: each live session's own
-/// `sessions[-isolated]-<sid>` plus a legacy bare `sessions`/`sessions-isolated`.
-/// A missing or unreadable profile dir yields nothing.
-fn session_marker_dirs(name: &str) -> Vec<PathBuf> {
-    let Ok(profile) = profile_dir(name) else {
-        return Vec::new();
+/// `sessions[-isolated]-<sid>`, the legacy bare `sessions`/`sessions-isolated`,
+/// and the upgrade-compat markers [`stamp_legacy_marker`] puts in the latter.
+///
+/// `None` when the profile dir could not be enumerated for any reason OTHER than
+/// being absent — a caller must read that as "cannot rule out a live session".
+/// Unlike the old fixed `<profile>/sessions` probe, this dir exists for every
+/// profile that was ever configured, so its unreadability is not the idle case;
+/// a transient EMFILE that read as "no sessions" would unblock a rotation
+/// against a live session and burn its chain.
+///
+/// The filter stays the LOOSE prefix test on purpose, where GC's uses the strict
+/// [`is_sessions_dir_name`]: a name this misses is a live session the rotation
+/// gate cannot see, while a name GC's misses is only a dir left uncollected.
+fn session_marker_dirs(name: &str) -> Option<Vec<PathBuf>> {
+    let profile = profile_dir(name).ok()?;
+    let entries = match std::fs::read_dir(&profile) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Some(Vec::new()),
+        Err(_) => return None,
     };
-    let Ok(entries) = std::fs::read_dir(&profile) else {
-        return Vec::new();
-    };
-    entries
-        .flatten()
-        .filter(|e| {
-            e.file_name()
-                .to_str()
-                .is_some_and(|n| n.starts_with(SESSIONS_STEM))
-        })
-        .map(|e| e.path())
-        .collect()
+    let mut dirs = Vec::new();
+    for entry in entries {
+        let entry = entry.ok()?;
+        if entry
+            .file_name()
+            .to_str()
+            .is_some_and(|n| n.starts_with(SESSIONS_STEM))
+        {
+            dirs.push(entry.path());
+        }
+    }
+    Some(dirs)
 }
 
 /// True iff the profile has at least one live `clauth start` session, in ANY of
-/// its per-session marker dirs and of either flavor. Gates token rotation, so a
-/// false negative burns the chain: it would spend a single-use refresh token a
-/// live session still holds. Enumerating the profile dir (rather than probing a
-/// fixed pair of names) is what keeps that true as sessions come and go. A
-/// missing or unreadable dir counts as idle.
+/// its marker dirs and of either flavor. Gates token rotation, so a false
+/// negative burns the chain: it would spend a single-use refresh token a live
+/// session still holds. Every unknown therefore reads as LIVE — a spurious true
+/// costs one skipped rotation, retried next tick, and the asymmetry is total.
+/// Only a dir that is genuinely absent counts as idle.
 pub(crate) fn has_live_session(name: &str) -> bool {
-    session_marker_dirs(name)
-        .iter()
-        .any(|dir| live_sessions_at(dir) > 0)
+    match session_marker_dirs(name) {
+        None => true,
+        Some(dirs) => dirs
+            .iter()
+            .any(|dir| live_sessions_at(dir).is_none_or(|n| n > 0)),
+    }
 }
 
-/// Count of live `clauth start` sessions for the profile across every marker dir.
-/// Additive sibling of [`has_live_session`]; a missing or unreadable dir counts
-/// as zero.
+/// Count of live `clauth start` sessions for the profile, deduped by marker NAME
+/// across every marker dir: one session holds its own `sessions-<sid>/<sid>` and
+/// an upgrade-compat `sessions/<sid>`, and the shared session id is what makes
+/// those one session rather than two. Reports 1 on an unknown, so it never
+/// contradicts [`has_live_session`] within a tick.
 pub(crate) fn live_session_count(name: &str) -> usize {
-    session_marker_dirs(name)
-        .iter()
-        .map(|dir| live_sessions_at(dir))
-        .sum()
+    let Some(dirs) = session_marker_dirs(name) else {
+        return 1;
+    };
+    let mut ids: HashSet<std::ffi::OsString> = HashSet::new();
+    for dir in &dirs {
+        match live_marker_names(dir) {
+            Some(names) => ids.extend(names),
+            None => return 1,
+        }
+    }
+    ids.len()
 }
 
-/// Live sessions holding a marker in `sessions`; zero when the dir is absent.
+/// Names of the markers currently flock-held in `sessions`. `None` when the dir
+/// could not be read for any reason other than being absent, or an entry could
+/// not be read — never fold either into a zero, per [`has_live_session`].
+///
 /// Read-only (unlike [`prune_stale_sessions`], it drops nothing), so it needs no
 /// state lock — a caller reading its own dir always counts ITSELF, since a second
 /// fd's `try_lock` conflicts with the one `acquire` holds.
-pub(crate) fn live_sessions_at(sessions: &Path) -> usize {
-    let Ok(entries) = std::fs::read_dir(sessions) else {
-        return 0;
+fn live_marker_names(sessions: &Path) -> Option<Vec<std::ffi::OsString>> {
+    let entries = match std::fs::read_dir(sessions) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Some(Vec::new()),
+        Err(_) => return None,
     };
-    entries
-        .flatten()
-        .filter(|e| is_session_alive(&e.path()))
-        .count()
+    let mut names = Vec::new();
+    for entry in entries {
+        let entry = entry.ok()?;
+        if is_session_alive(&entry.path()) {
+            names.push(entry.file_name());
+        }
+    }
+    Some(names)
+}
+
+/// How many live sessions hold a marker in `sessions`. `Some(0)` only when the
+/// dir is genuinely absent; `None` when the probe could not tell. Callers choose
+/// which way an unknown falls, because the safe direction differs: the rotation
+/// gate must read it as live, and so must anything moving state out of a runtime.
+pub(crate) fn live_sessions_at(sessions: &Path) -> Option<usize> {
+    live_marker_names(sessions).map(|names| names.len())
 }
 
 /// Best-effort sweep removing runtime trees whose owning session died without
@@ -303,13 +426,22 @@ pub(crate) fn gc_stale_runtimes() {
             let Some(child_name) = file_name.to_str() else {
                 continue;
             };
-            if let Some(sessions) = paired_sessions_name(child_name) {
+            // Strict predicates, not the loose pairing split: this loop hands
+            // `remove_dir_all` whatever it matches, so a future `runtime_state`
+            // or `sessions.json` under a profile must fall through untouched.
+            if is_runtime_dir_name(child_name)
+                && let Some(sessions) = paired_sessions_name(child_name)
+            {
                 let _ = gc_one_pair(&child.path(), &profile.join(sessions));
-            } else if let Some(runtime) = paired_runtime_name(child_name) {
+            } else if is_sessions_dir_name(child_name)
+                && let Some(runtime) = paired_runtime_name(child_name)
+            {
                 // A marker dir with no runtime sibling. `acquire` mints it before
                 // it builds the tree, so a crash in that window strands one — and
                 // per-session keying makes that a fresh empty dir every time
-                // rather than a reused one.
+                // rather than a reused one. A legacy `sessions/` holding only
+                // upgrade-compat markers lands here too, and is spared until the
+                // last of them is released.
                 let runtime = profile.join(runtime);
                 if runtime.symlink_metadata().is_err() {
                     let _ = gc_one_pair(&runtime, &child.path());
@@ -386,8 +518,11 @@ pub(crate) fn shared_runtime_dirs() -> Vec<PathBuf> {
     out
 }
 
-/// Every profile with a live isolated session, paired with its own
-/// `runtime-isolated/projects/` dir. An isolated runtime's transcripts live
+/// Every live isolated SESSION, paired with its own `runtime-isolated-<sid>/
+/// projects/` dir — so a profile running two isolated sessions appears twice,
+/// once per store. A consumer keying by profile name must expect that.
+///
+/// An isolated runtime's transcripts live
 /// ONLY in this throwaway tree (never symlinked to the global store) and are
 /// discarded on teardown/GC, so the session index can reach them only while the
 /// session is live. Gated on a live *isolated* session specifically (not
@@ -426,7 +561,7 @@ pub(crate) fn live_isolated_stores() -> Vec<(String, PathBuf)> {
             let Some(sessions) = paired_sessions_name(child_name) else {
                 continue;
             };
-            if live_sessions_at(&profile_path.join(sessions)) == 0 {
+            if live_sessions_at(&profile_path.join(sessions)).is_some_and(|n| n == 0) {
                 continue;
             }
             let projects = child.path().join("projects");
@@ -515,6 +650,9 @@ pub(crate) struct ProfileRuntime {
     session: SessionId,
     runtime: PathBuf,
     pid_file: PathBuf,
+    /// Upgrade-compat marker path; see [`stamp_legacy_marker`] for its lifetime
+    /// and the release at which both it and this field go away.
+    legacy_marker: PathBuf,
     claude_home: PathBuf,
     canonical: PathBuf,
     sessions: PathBuf,
@@ -523,6 +661,9 @@ pub(crate) struct ProfileRuntime {
     /// Held for the lifetime of the session so a sibling process's
     /// `try_lock` reveals we're still alive.
     _pid_lock: File,
+    /// The same signal at the pre-per-session path, for a still-running clauth
+    /// that predates this layout. `None` when it could not be stamped.
+    legacy_lock: Option<File>,
     /// Wrapped in Option so Drop can take() it before joining the watchdog,
     /// signalling the thread to exit.
     watchdog_signal: Option<Sender<()>>,
@@ -544,18 +685,19 @@ impl ProfileRuntime {
         let runtime = runtime_dir(name, isolation, &session)?;
         let sessions = sessions_dir(name, isolation, &session)?;
         let pid_file = sessions.join(session.as_str());
+        let legacy_marker = legacy_marker_path(name, isolation, &session)?;
         let canonical = canonical_credentials(name)?;
 
         // Hold the per-profile rotation lock across the session-stamp window so
         // a concurrent `oauth::rotate_one_inner` for this profile cannot spend the
         // single-use refresh token while we are starting up. Ordering rule
         // (matches `oauth::rotate_one_inner`): RotationGuard OUTERMOST, then the
-        // state flock inside. Dropped right after the PID file is locked — from
-        // then on the PID flock itself signals liveness, and rotate's in-lock
-        // `has_live_session` re-check observes it.
+        // state flock inside. Held to the end of this function — everything past
+        // the marker flock only needs the marker itself, but the guard costs
+        // nothing to keep and a shorter scope would need re-proving.
         let _rotation_guard = RotationGuard::acquire(name)?;
 
-        let (pid_lock, mode) = with_state_lock(|| {
+        let (pid_lock, legacy_lock, mode) = with_state_lock(|| {
             crate::profile::mkdir_700(&sessions)
                 .with_context(|| format!("failed to create {}", sessions.display()))?;
             let active = prune_stale_sessions(&sessions)?;
@@ -583,21 +725,25 @@ impl ProfileRuntime {
                 .with_context(|| format!("failed to open {}", pid_file.display()))?;
             file.lock()
                 .with_context(|| format!("failed to lock {}", pid_file.display()))?;
-            Ok::<_, anyhow::Error>((file, mode))
-        })?;
+            let legacy_lock = stamp_legacy_marker(&legacy_marker);
 
-        // Register only now: the marker is flock-held, so the row can never exist
-        // without a liveness signal for GC to test it by. A registry failure is
-        // reported and stepped over — the session itself is already sound, and
-        // failing it here would trade a missing row for a dead session.
-        let row = crate::live_sessions::LiveSession::starting(
-            &session,
-            name,
-            isolation == Isolation::Isolated,
-        );
-        if let Err(e) = crate::live_sessions::register(&row) {
-            logline!("clauth: registering the live session failed: {e}");
-        }
+            // Register inside this same hold, once the marker is flock-held: the
+            // row can then never exist without a liveness signal for GC to test
+            // it by, and `register`'s own `with_state_lock` takes the reentrant
+            // path instead of a second 25s-bounded flock acquisition. A registry
+            // failure is reported and stepped over — the session itself is
+            // already sound, and failing here would trade a missing row for a
+            // dead session.
+            let row = crate::live_sessions::LiveSession::starting(
+                &session,
+                name,
+                isolation == Isolation::Isolated,
+            );
+            if let Err(e) = crate::live_sessions::register(&row) {
+                logline!("clauth: registering the live session failed: {e}");
+            }
+            Ok::<_, anyhow::Error>((file, legacy_lock, mode))
+        })?;
 
         let (tx, rx) = channel::<()>();
         let watchdog_runtime = runtime.clone();
@@ -643,12 +789,14 @@ impl ProfileRuntime {
             session,
             runtime,
             pid_file,
+            legacy_marker,
             claude_home,
             canonical,
             sessions,
             mode,
             isolation,
             _pid_lock: pid_lock,
+            legacy_lock,
             watchdog_signal: Some(tx),
             watchdog_handle: Some(watchdog_handle),
         })
@@ -695,15 +843,30 @@ impl Drop for ProfileRuntime {
             logline!("clauth: final settings.json sync failed: {e}");
         }
 
-        if let Err(e) = crate::live_sessions::unregister(self.session.as_str()) {
-            logline!("clauth: unregistering the live session failed: {e}");
-        }
-
+        // One hold for the whole teardown. `unregister` takes the state lock
+        // itself, so calling it out here would be a second top-level acquisition
+        // — two 25s-bounded flock waits back to back, with a window between them
+        // where the row is gone but the marker is not.
+        let legacy_lock = self.legacy_lock.take();
         if let Err(e) = with_state_lock(|| {
+            if let Err(e) = crate::live_sessions::unregister(self.session.as_str()) {
+                logline!("clauth: unregistering the live session failed: {e}");
+            }
             if let Err(e) = std::fs::remove_file(&self.pid_file)
                 && e.kind() != std::io::ErrorKind::NotFound
             {
                 logline!("clauth: remove pid file failed: {e}");
+            }
+            // Release the upgrade-compat flock before unlinking, so a sibling
+            // session's `prune_stale_sessions` never reads a removed path.
+            drop(legacy_lock);
+            let _ = std::fs::remove_file(&self.legacy_marker);
+            // The compat dir is shared by every session of this profile+flavor,
+            // so it goes only once the last of them has released.
+            if let Some(legacy_dir) = self.legacy_marker.parent()
+                && prune_stale_sessions(legacy_dir).unwrap_or(1) == 0
+            {
+                let _ = std::fs::remove_dir(legacy_dir);
             }
             let still_active = prune_stale_sessions(&self.sessions).unwrap_or(1);
             if still_active == 0 {

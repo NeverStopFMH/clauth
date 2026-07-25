@@ -54,7 +54,10 @@ pub(crate) fn rescue_effective(rescue_override: Option<bool>, auto_rescue: bool)
 /// otherwise pull `shell-snapshots/` out from under a live Claude Code
 /// mid-session. Self holds its own marker, hence `> 1`.
 fn rescue_teardown(iso_root: &Path, sessions: &Path, claude_home: &Path) -> (usize, usize) {
-    if crate::runtime::live_sessions_at(sessions) > 1 {
+    // An unreadable marker dir falls to "do not move": this leg pulls
+    // `shell-snapshots/` out from under whatever is reading the tree, so an
+    // unknown has to read the same way a live sibling does.
+    if crate::runtime::live_sessions_at(sessions).is_none_or(|live| live > 1) {
         logline!("clauth: skipping rescue, another isolated session is still live");
         return (0, 0);
     }

@@ -765,6 +765,14 @@ fn sid_of(runtime: &Path) -> String {
         .unwrap_or_else(|| panic!("{} is not a per-session runtime dir", runtime.display()))
 }
 
+/// A live session's id, read back off its own marker dir — which holds exactly
+/// one marker, named for the session. Flavor-agnostic, unlike [`sid_of`].
+fn live_sid(rt: &ProfileRuntime) -> String {
+    let mut names = dir_entry_names(rt.sessions_dir());
+    assert_eq!(names.len(), 1, "a marker dir holds exactly one marker");
+    names.remove(0)
+}
+
 /// Sorted file names directly under `dir`.
 fn dir_entry_names(dir: &Path) -> Vec<String> {
     let mut names: Vec<String> = fs::read_dir(dir)
@@ -1640,6 +1648,113 @@ fn two_shared_sessions_get_independent_trees() {
     });
 }
 
+/// THE UPGRADE GATE. A clauth process built before the per-session layout probes
+/// exactly `<profile>/sessions[-isolated]`. Without a marker there its
+/// `has_live_session` reads a live new-layout session as idle, and its rotation
+/// leg spends the single-use refresh token that session still holds — chain dead.
+/// Post-upgrade that old binary is the DEFAULT supervisor until the next restart
+/// (`clauth daemon --replace` exists for exactly that).
+///
+/// The `live_sessions_at` assertion below IS the old binary's predicate, applied
+/// to the old binary's path.
+#[test]
+fn acquire_stamps_the_pre_upgrade_liveness_marker_for_both_flavors() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        fake_claude_home(tmp.path());
+
+        for (name, isolation, legacy_dir) in [
+            ("upgrade-shared", Isolation::Shared, "sessions"),
+            ("upgrade-iso", Isolation::Isolated, "sessions-isolated"),
+        ] {
+            let profile = make_profile(name);
+            let rt = ProfileRuntime::acquire(&profile, isolation, &[]).expect("acquire");
+            let sid = live_sid(&rt);
+
+            let legacy = tmp
+                .path()
+                .join(".clauth")
+                .join("profiles")
+                .join(name)
+                .join(legacy_dir);
+            let legacy_marker = legacy.join(&sid);
+            assert!(
+                legacy_marker.is_file(),
+                "no upgrade-compat marker at {}",
+                legacy_marker.display()
+            );
+            assert!(
+                is_session_alive(&legacy_marker),
+                "the upgrade-compat marker must be flock-held for the session's life"
+            );
+            assert_eq!(
+                live_sessions_at(&legacy),
+                Some(1),
+                "a pre-upgrade clauth probes exactly {legacy_dir} and must see this session"
+            );
+            assert_eq!(
+                live_session_count(name),
+                1,
+                "the compat marker and the per-session marker are ONE session, not two"
+            );
+
+            drop(rt);
+
+            assert!(
+                !legacy_marker.exists(),
+                "teardown must drop the upgrade-compat marker"
+            );
+            assert!(
+                !legacy.exists(),
+                "the last session out removes the shared compat dir"
+            );
+            assert_eq!(live_session_count(name), 0);
+        }
+    });
+}
+
+/// Two same-profile sessions share the one compat dir, so it may only go when
+/// the last of them releases.
+#[test]
+fn the_pre_upgrade_marker_dir_survives_until_the_last_session_leaves() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        fake_claude_home(tmp.path());
+        let profile = make_profile("upgrade-twin");
+        let legacy = tmp
+            .path()
+            .join(".clauth")
+            .join("profiles")
+            .join("upgrade-twin")
+            .join("sessions");
+
+        let a = ProfileRuntime::acquire(&profile, Isolation::Shared, &[]).expect("first acquire");
+        let b = ProfileRuntime::acquire(&profile, Isolation::Shared, &[]).expect("second acquire");
+
+        assert_eq!(
+            live_sessions_at(&legacy),
+            Some(2),
+            "both sessions must be visible to a pre-upgrade probe"
+        );
+        assert_eq!(
+            live_session_count("upgrade-twin"),
+            2,
+            "two sessions, four markers, still two sessions"
+        );
+
+        drop(b);
+        assert_eq!(live_sessions_at(&legacy), Some(1));
+        assert!(
+            legacy.is_dir(),
+            "the compat dir is shared — it must survive"
+        );
+        assert_eq!(live_session_count("upgrade-twin"), 1);
+
+        drop(a);
+        assert!(!legacy.exists());
+    });
+}
+
 /// Teardown is per session: dropping one of two same-profile shared sessions
 /// discards only its own tree and marker.
 #[test]
@@ -2036,6 +2151,125 @@ fn has_live_session_sees_a_per_session_dir_of_either_flavor() {
             }
             assert!(!has_live_session(profile));
             assert_eq!(live_session_count(profile), 0);
+        }
+    });
+}
+
+/// The gate's fail-open must not cover the ENUMERATION step. `<profile>/` exists
+/// for every configured profile (it holds `config.toml`, `credentials.json`,
+/// `rotation.lock`), so its unreadability is not the idle case — a transient
+/// EMFILE/EACCES reading as "no sessions" would unblock a rotation against a live
+/// session. Only a genuinely absent dir is idle.
+#[cfg(unix)]
+#[test]
+fn an_unreadable_profile_dir_reads_as_live_not_idle() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let profile = tmp
+            .path()
+            .join(".clauth")
+            .join("profiles")
+            .join("unreadable");
+        let sessions = profile.join("sessions-9001-0");
+        fs::create_dir_all(&sessions).expect("mkdir sessions");
+        fs::write(sessions.join("9001-0"), b"").expect("dead marker");
+
+        // Control: readable and genuinely idle.
+        assert!(!has_live_session("unreadable"));
+        // Control: never configured at all is still idle, not unknown.
+        assert!(!has_live_session("never-started"));
+
+        fs::set_permissions(&profile, fs::Permissions::from_mode(0o000)).expect("chmod");
+        if fs::read_dir(&profile).is_ok() {
+            // Running with rights that ignore the mode (root); the probe cannot
+            // be posed, so assert nothing rather than pass vacuously.
+            fs::set_permissions(&profile, fs::Permissions::from_mode(0o700)).expect("restore");
+            return;
+        }
+
+        assert!(
+            has_live_session("unreadable"),
+            "an unreadable profile dir must read as live — a spurious false burns the chain"
+        );
+        assert_eq!(
+            live_session_count("unreadable"),
+            1,
+            "the count must not contradict the gate within a tick"
+        );
+
+        fs::set_permissions(&profile, fs::Permissions::from_mode(0o700)).expect("restore");
+    });
+}
+
+/// Same rule one level down: `live_sessions_at` distinguishes "absent" from
+/// "could not tell", so each caller picks which way an unknown falls.
+#[cfg(unix)]
+#[test]
+fn live_sessions_at_reports_unknown_separately_from_zero() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let sessions = tmp.path().join("sessions-9002-0");
+    fs::create_dir_all(&sessions).expect("mkdir sessions");
+
+    assert_eq!(live_sessions_at(&tmp.path().join("absent")), Some(0));
+    assert_eq!(live_sessions_at(&sessions), Some(0));
+
+    fs::set_permissions(&sessions, fs::Permissions::from_mode(0o000)).expect("chmod");
+    if fs::read_dir(&sessions).is_ok() {
+        fs::set_permissions(&sessions, fs::Permissions::from_mode(0o700)).expect("restore");
+        return;
+    }
+
+    assert_eq!(
+        live_sessions_at(&sessions),
+        None,
+        "an unreadable marker dir is unknown, never zero"
+    );
+
+    fs::set_permissions(&sessions, fs::Permissions::from_mode(0o700)).expect("restore");
+}
+
+/// GC hands `remove_dir_all` whatever it pairs, so it gates on the strict name
+/// predicate. A profile child that merely starts with `runtime`/`sessions` is not
+/// a runtime tree and must survive.
+#[test]
+fn gc_leaves_profile_children_that_only_look_like_runtime_dirs() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let profile = tmp
+            .path()
+            .join(".clauth")
+            .join("profiles")
+            .join("bystander");
+        fs::create_dir_all(&profile).expect("mkdir profile");
+
+        let bystanders = [
+            "runtime_state.json",
+            "runtimes",
+            "sessions.json",
+            "runtime-isolatedish",
+            "runtime-4242-x",
+        ];
+        for name in bystanders {
+            let path = profile.join(name);
+            if name.contains('.') {
+                fs::write(&path, b"{}").expect("write bystander file");
+            } else {
+                fs::create_dir_all(&path).expect("mkdir bystander");
+                fs::write(path.join("keep"), b"x").expect("seed bystander");
+            }
+        }
+
+        gc_stale_runtimes();
+
+        for name in bystanders {
+            assert!(
+                profile.join(name).exists(),
+                "{name} is not a runtime tree and must not be collected"
+            );
         }
     });
 }

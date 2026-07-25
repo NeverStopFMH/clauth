@@ -1584,25 +1584,56 @@ fn a_narrow_chain_row_drops_the_live_tally_before_the_reason_marker() {
     app.live_sessions =
         crate::live_sessions::LiveTally::of([live_row("4242-0", "nnnnnn", true, None)]);
 
-    // 60-69 is this NAME's own collision band: below it the tally never fit
-    // anyway, above it both fit, and only inside does dropping the `reserved`
-    // term change what renders (measured, and the whole band shares one pane
-    // width because `master_detail` clamps the selector at 20). Without
-    // `reserved` the row reads `❯  #1 nnnnnn  1⇄` and the `⊖` is appended past
-    // `w`, where ratatui throws it away — the badge silently eating the marker.
-    for w in 60u16..=69 {
+    // This NAME's real collision band is terminal 60..=73, and it holds exactly
+    // two pane shapes: `master_detail` clamps the selector to 20 cells through
+    // 69 and 21 through 73, so those are the only two renders in it — anything
+    // else in the range is a duplicate, not coverage. Inside the band the
+    // shipped row keeps `⊖` and drops the tally; without `reserved` it renders
+    // `nnnnnn  1⇄` and appends `⊖` past `w`, where ratatui throws it away. At 74
+    // the pane finally holds both, which is what makes this a BAND rather than a
+    // floor — pinned below so a change that merely moved the cutoff still reds.
+    let expected = |w: u16| -> Vec<String> {
+        let (top, row, blank, bottom) = if w <= 69 {
+            (
+                "╭ CHAIN ───────────╮",
+                "│ ❯  #1 nnnnnn   ⊖ │",
+                "│                  │",
+                "╰──────────────────╯",
+            )
+        } else {
+            (
+                "╭ CHAIN ────────────╮",
+                "│ ❯  #1 nnnnnn    ⊖ │",
+                "│                   │",
+                "╰───────────────────╯",
+            )
+        };
+        vec![
+            top.to_string(),
+            row.to_string(),
+            blank.to_string(),
+            bottom.to_string(),
+        ]
+    };
+    for w in 60u16..=73 {
         assert_eq!(
-            chain_selector_pane(&app, w, 5),
-            vec![
-                "╭ CHAIN ───────────╮".to_string(),
-                "│ ❯  #1 nnnnnn   ⊖ │".to_string(),
-                "│                  │".to_string(),
-                "│                  │".to_string(),
-                "╰──────────────────╯".to_string(),
-            ],
+            chain_selector_pane(&app, w, 4),
+            expected(w),
             "at {w} cols the marker keeps the row and the tally gives way"
         );
     }
+
+    // One column past the band both fit, so the tally is being WITHHELD for lack
+    // of room rather than never rendered on a blocked row at all.
+    assert_eq!(
+        chain_selector_pane(&app, 74, 4),
+        vec![
+            "╭ CHAIN ─────────────╮".to_string(),
+            "│ ❯  #1 nnnnnn  1⇄ ⊖ │".to_string(),
+            "│                    │".to_string(),
+            "╰────────────────────╯".to_string(),
+        ],
+    );
 }
 
 /// A leg nothing calls is a leg that passes every unit test and ships nothing:

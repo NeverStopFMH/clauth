@@ -1269,7 +1269,7 @@ fn the_overview_column_budget_never_pays_for_a_new_column_with_an_old_one() {
         // (name length, first bar, first reset, 7d bar, 7d reset)
         (8, 68, 85, 106, 106),
         (16, 68, 85, 106, 106),
-        (22, 68, 85, 106, 107),
+        (22, 68, 85, 106, 108),
     ];
 
     for (name_len, first_bar, first_reset, seven_bar, seven_reset) in BUDGET {
@@ -1277,11 +1277,17 @@ fn the_overview_column_budget_never_pays_for_a_new_column_with_an_old_one() {
         let mut profile = oauth(&name, 40.0, 60.0, false);
         let now = crate::usage::now_epoch_secs();
         if let Some(u) = profile.usage.as_mut() {
+            // Both resets sit MID-unit, deliberately. `humanize_duration` narrows
+            // by a cell the moment a countdown crosses a unit boundary (`3h 0m` →
+            // `2h 59m`, `4d 0h` → `3d 23h`), and `reset_suffix` fit-checks the
+            // stamp — so a fixture pinned exactly ON a boundary decides a column
+            // boundary by which second the render lands in. That shipped as a
+            // 28%-flaky pin at the 22-char row's 107th column.
             if let Some(w) = u.five_hour.as_mut() {
-                w.resets_at = Some(crate::usage::epoch_secs_to_iso(now + 3 * 3600));
+                w.resets_at = Some(crate::usage::epoch_secs_to_iso(now + 3 * 3600 + 1800));
             }
             if let Some(w) = u.seven_day.as_mut() {
-                w.resets_at = Some(crate::usage::epoch_secs_to_iso(now + 4 * 86400));
+                w.resets_at = Some(crate::usage::epoch_secs_to_iso(now + 4 * 86400 + 43200));
             }
         }
         let mut app = App::new(AppConfig {

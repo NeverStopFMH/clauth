@@ -1713,6 +1713,85 @@ fn acquire_stamps_the_pre_upgrade_liveness_marker_for_both_flavors() {
     });
 }
 
+/// `stamp_legacy_marker` must decline rather than block when the marker is
+/// already held, and leave the file exactly as it found it.
+#[test]
+fn stamp_legacy_marker_declines_a_marker_another_holder_owns() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let marker = tmp.path().join("sessions").join("4242-0");
+    fs::create_dir_all(marker.parent().expect("parent")).expect("mkdir sessions");
+    let held = open_pid_file(&marker).expect("open marker");
+    held.lock().expect("lock marker");
+
+    assert!(
+        stamp_legacy_marker(&marker).is_none(),
+        "a marker another holder owns must not be adopted"
+    );
+    assert!(marker.is_file(), "declining must not disturb the file");
+    assert!(
+        is_session_alive(&marker),
+        "the holder's flock must survive the decline"
+    );
+
+    drop(held);
+    assert!(
+        stamp_legacy_marker(&marker).is_some(),
+        "an unlocked marker is free to take"
+    );
+}
+
+/// Teardown must not unlink a marker this session never owned. `stamp_legacy_marker`
+/// yields `None` when `try_lock` loses to a live process that minted the same sid,
+/// and unlinking on that path deletes a FOREIGN session's liveness signal — the
+/// same rotation burn the compat marker exists to prevent.
+#[test]
+fn teardown_leaves_a_pre_upgrade_marker_it_never_owned() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        fake_claude_home(tmp.path());
+
+        // `acquire` mints exactly one `SessionId`, and `with_fake_home` holds the
+        // lock that is the only way into `acquire`, so the counter cannot move
+        // between this probe and the acquire below. The assert after the acquire
+        // is what catches that arithmetic going stale.
+        let probe = SessionId::mint();
+        let (pid, seq) = probe.as_str().split_once('-').expect("<pid>-<seq>");
+        let foreign_sid = format!("{pid}-{}", seq.parse::<u64>().expect("seq") + 1);
+
+        let legacy = tmp
+            .path()
+            .join(".clauth")
+            .join("profiles")
+            .join("foreign")
+            .join("sessions");
+        fs::create_dir_all(&legacy).expect("mkdir legacy sessions");
+        let foreign_marker = legacy.join(&foreign_sid);
+        let held = open_pid_file(&foreign_marker).expect("open foreign marker");
+        held.lock().expect("lock foreign marker");
+
+        let profile = make_profile("foreign");
+        let rt = ProfileRuntime::acquire(&profile, Isolation::Shared, &[]).expect("acquire");
+        assert_eq!(
+            live_sid(&rt),
+            foreign_sid,
+            "sid arithmetic drifted — `acquire` no longer mints exactly one id, \
+             so this test is no longer posing the collision it claims to"
+        );
+
+        drop(rt);
+
+        assert!(
+            foreign_marker.is_file(),
+            "teardown unlinked a liveness marker owned by another live process"
+        );
+        assert!(
+            is_session_alive(&foreign_marker),
+            "the foreign holder's flock must be untouched"
+        );
+        drop(held);
+    });
+}
+
 /// Two same-profile sessions share the one compat dir, so it may only go when
 /// the last of them releases.
 #[test]

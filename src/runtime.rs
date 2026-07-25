@@ -263,9 +263,12 @@ fn stamp_legacy_marker(path: &Path) -> Option<File> {
             return None;
         }
     };
-    // `try_lock`, not `lock`: this path is shared across sessions of the profile,
-    // and a blocking wait here would hang `acquire` on whatever holds it. A held
-    // marker already reads as live to an old binary, which is the whole point.
+    // `try_lock`, not `lock`. The DIR here is shared across the profile's
+    // sessions but this FILE is `sessions/<sid>`, so contention needs a second
+    // live process that minted the same `<pid>-<seq>` — a shared `~/.clauth`
+    // across pid namespaces, or an NFS home. Rare, and a blocking wait would hang
+    // `acquire` inside the state lock; a `None` here is also what keeps teardown
+    // from unlinking a marker this session never owned.
     match file.try_lock() {
         Ok(()) => Some(file),
         Err(e) => {
@@ -432,6 +435,10 @@ pub(crate) fn gc_stale_runtimes() {
             if is_runtime_dir_name(child_name)
                 && let Some(sessions) = paired_sessions_name(child_name)
             {
+                // A stale pre-upgrade `runtime/` pairs with the same `sessions/`
+                // the compat markers live in, so it is spared while ANY session of
+                // the profile runs and only collected once the last one leaves.
+                // Delayed cleanup, not a leak.
                 let _ = gc_one_pair(&child.path(), &profile.join(sessions));
             } else if is_sessions_dir_name(child_name)
                 && let Some(runtime) = paired_runtime_name(child_name)
@@ -857,10 +864,16 @@ impl Drop for ProfileRuntime {
             {
                 logline!("clauth: remove pid file failed: {e}");
             }
-            // Release the upgrade-compat flock before unlinking, so a sibling
-            // session's `prune_stale_sessions` never reads a removed path.
-            drop(legacy_lock);
-            let _ = std::fs::remove_file(&self.legacy_marker);
+            // Only unlink a marker this session actually owns. `legacy_lock` is
+            // `None` when `try_lock` lost to a live process that minted the same
+            // sid — unlinking there would delete a FOREIGN session's liveness
+            // signal, which is the same rotation-burn this marker exists to
+            // prevent. Release before unlinking, so a sibling's
+            // `prune_stale_sessions` never reads a removed path.
+            if legacy_lock.is_some() {
+                drop(legacy_lock);
+                let _ = std::fs::remove_file(&self.legacy_marker);
+            }
             // The compat dir is shared by every session of this profile+flavor,
             // so it goes only once the last of them has released.
             if let Some(legacy_dir) = self.legacy_marker.parent()

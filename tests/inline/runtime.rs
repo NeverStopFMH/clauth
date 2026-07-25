@@ -714,6 +714,11 @@ fn copy_file_visible_state_is_never_torn() {
 
 #[test]
 fn detect_link_mode_returns_real_on_unix() {
+    // Same lock every `with_link_mode` test holds, so a parallel override can
+    // never leak into the probe this test exists to check.
+    let _lock = crate::profile::HOME_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     let tmp = tempfile::tempdir().expect("tempdir");
     let mode = detect_link_mode(tmp.path()).expect("detect");
     #[cfg(unix)] // Unix CI always grants symlinks; Windows depends on dev mode
@@ -740,6 +745,23 @@ fn with_fake_home<T>(root: &Path, f: impl FnOnce() -> T) -> T {
         }
     }
     crate::profile::set_home_override(root.to_path_buf());
+    let _clear = ClearOnDrop;
+    f()
+}
+
+/// Force [`detect_link_mode`] to report `mode` for the duration of `f`.
+/// `try_real_symlink` always succeeds on unix, so the fake-symlink transport —
+/// and the shared bare-stem tree it selects — is otherwise unreachable from a
+/// Linux/macOS run. Call INSIDE [`with_fake_home`]: its `HOME_TEST_LOCK` hold is
+/// what serializes this process-global override.
+fn with_link_mode<T>(mode: LinkMode, f: impl FnOnce() -> T) -> T {
+    struct ClearOnDrop;
+    impl Drop for ClearOnDrop {
+        fn drop(&mut self) {
+            clear_link_mode_override();
+        }
+    }
+    set_link_mode_override(mode);
     let _clear = ClearOnDrop;
     f()
 }
@@ -1879,6 +1901,287 @@ fn dropping_one_shared_session_leaves_the_sibling_intact() {
         drop(a);
         assert!(!a_runtime.exists());
         assert!(!a_sessions.exists());
+    });
+}
+
+// ── LinkMode::Fake keeps the shared (profile, flavor) tree ────────────────────
+
+/// The naming rule as a unit. `LinkMode::Real` keys each session's pair by its
+/// own `<sid>`; `LinkMode::Fake` returns the bare stem every session of that
+/// profile+flavor shares. In all four cases the two names must satisfy the
+/// module's one layout rule (`runtime<rest>` ↔ `sessions<rest>`) and both strict
+/// predicates, so no enumeration can miss a dir the naming produced.
+#[test]
+fn paired_dir_names_key_on_link_mode() {
+    let sid = "4242-7";
+    let cases = [
+        (Isolation::Shared, LinkMode::Fake, "runtime", "sessions"),
+        (
+            Isolation::Isolated,
+            LinkMode::Fake,
+            "runtime-isolated",
+            "sessions-isolated",
+        ),
+        (
+            Isolation::Shared,
+            LinkMode::Real,
+            "runtime-4242-7",
+            "sessions-4242-7",
+        ),
+        (
+            Isolation::Isolated,
+            LinkMode::Real,
+            "runtime-isolated-4242-7",
+            "sessions-isolated-4242-7",
+        ),
+    ];
+    for (isolation, mode, want_runtime, want_sessions) in cases {
+        let (runtime, sessions) = paired_dir_names(isolation, sid, mode);
+        assert_eq!(runtime, want_runtime, "{isolation:?}/{mode:?} runtime name");
+        assert_eq!(
+            sessions, want_sessions,
+            "{isolation:?}/{mode:?} sessions name"
+        );
+        assert_eq!(
+            paired_sessions_name(&runtime).as_deref(),
+            Some(sessions.as_str()),
+            "{runtime} must pair with {sessions}"
+        );
+        assert_eq!(
+            paired_runtime_name(&sessions).as_deref(),
+            Some(runtime.as_str()),
+            "{sessions} must pair back to {runtime}"
+        );
+        assert!(is_runtime_dir_name(&runtime), "GC must reach {runtime}");
+        assert!(is_sessions_dir_name(&sessions), "GC must reach {sessions}");
+        assert_eq!(
+            is_shared_runtime_dir_name(&runtime),
+            isolation == Isolation::Shared,
+            "{runtime} flavor must be readable off the name alone"
+        );
+    }
+}
+
+/// Under `LinkMode::Fake` the tree is a recursive COPY of `~/.claude/`, so two
+/// shared sessions of one profile land on ONE bare-stem tree. The real-symlink
+/// counterpart — where they must NOT — is
+/// `two_shared_sessions_get_independent_trees`.
+#[test]
+fn fake_mode_shares_one_tree_across_two_sessions() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        with_link_mode(LinkMode::Fake, || {
+            fake_claude_home(tmp.path());
+            let profile = make_profile("faketwin");
+
+            let a =
+                ProfileRuntime::acquire(&profile, Isolation::Shared, &[]).expect("first acquire");
+            let b =
+                ProfileRuntime::acquire(&profile, Isolation::Shared, &[]).expect("second acquire");
+
+            let profile_dir = tmp.path().join(".clauth").join("profiles").join("faketwin");
+            assert_eq!(a.config_dir(), profile_dir.join("runtime"));
+            assert_eq!(b.config_dir(), profile_dir.join("runtime"));
+            assert_eq!(a.sessions_dir(), profile_dir.join("sessions"));
+            assert_eq!(b.sessions_dir(), profile_dir.join("sessions"));
+
+            let mut want = vec![
+                a.session.as_str().to_string(),
+                b.session.as_str().to_string(),
+            ];
+            want.sort();
+            assert_ne!(want[0], want[1], "the two sessions must still be distinct");
+            assert_eq!(
+                dir_entry_names(a.sessions_dir()),
+                want,
+                "one shared marker dir carrying both sessions' markers"
+            );
+
+            drop(b);
+            drop(a);
+        });
+    });
+}
+
+/// Session 2 must neither wipe nor rebuild the tree session 1 is using — that is
+/// the whole point of sharing it. The sentinel exists ONLY in the runtime tree,
+/// so nothing can re-materialize it: if the second acquire wiped the tree, it is
+/// gone for good.
+#[test]
+fn fake_mode_second_session_does_not_rebuild_the_tree() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        with_link_mode(LinkMode::Fake, || {
+            let claude_home = fake_claude_home(tmp.path());
+            let profile = make_profile("fakecopy");
+
+            let a =
+                ProfileRuntime::acquire(&profile, Isolation::Shared, &[]).expect("first acquire");
+
+            let sentinel = "session-one-was-here.txt";
+            assert!(
+                !claude_home.join(sentinel).exists(),
+                "the sentinel must be absent from ~/.claude, or a rebuild would restore it \
+                 and this test would prove nothing"
+            );
+            fs::write(a.config_dir().join(sentinel), b"do not re-copy me").expect("seed sentinel");
+
+            let b =
+                ProfileRuntime::acquire(&profile, Isolation::Shared, &[]).expect("second acquire");
+
+            assert_eq!(
+                b.config_dir(),
+                a.config_dir(),
+                "the second session must reuse the first's tree, not pay a second copy"
+            );
+            assert_eq!(
+                fs::read(a.config_dir().join(sentinel)).expect("read sentinel"),
+                b"do not re-copy me",
+                "the second acquire wiped or rebuilt a tree a live sibling is using"
+            );
+
+            drop(b);
+            drop(a);
+        });
+    });
+}
+
+/// The rotation gate over a shared marker dir. A `has_live_session` false
+/// negative spends a single-use refresh token a live session still holds, so the
+/// count must stay per SESSION even though two sessions share one dir — and the
+/// tree may only be discarded by the last one out.
+#[test]
+fn fake_mode_rotation_gate_counts_both_shared_sessions() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        with_link_mode(LinkMode::Fake, || {
+            fake_claude_home(tmp.path());
+            let profile = make_profile("fakegate");
+
+            let a =
+                ProfileRuntime::acquire(&profile, Isolation::Shared, &[]).expect("first acquire");
+            let b =
+                ProfileRuntime::acquire(&profile, Isolation::Shared, &[]).expect("second acquire");
+            let tree = a.config_dir().to_path_buf();
+            let markers = a.sessions_dir().to_path_buf();
+
+            assert!(has_live_session("fakegate"));
+            assert_eq!(live_session_count("fakegate"), 2);
+            assert_eq!(
+                dir_entry_names(&markers).len(),
+                2,
+                "one shared marker dir must carry a marker per session"
+            );
+
+            drop(b);
+            assert!(has_live_session("fakegate"));
+            assert_eq!(live_session_count("fakegate"), 1);
+            assert!(
+                tree.is_dir(),
+                "the shared tree must survive while a sibling still holds it"
+            );
+
+            drop(a);
+            assert!(!has_live_session("fakegate"));
+            assert_eq!(live_session_count("fakegate"), 0);
+            assert!(!tree.exists(), "the last session out discards the tree");
+            assert!(!markers.exists());
+        });
+    });
+}
+
+/// A registry row carries the profile, the flavor, and the session id — but NOT
+/// the transport. Probing only the per-session marker path drops every fake-mode
+/// row the first time any sweep runs, while its session is live.
+#[test]
+fn fake_mode_registry_row_survives_gc() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        with_link_mode(LinkMode::Fake, || {
+            fake_claude_home(tmp.path());
+            let profile = make_profile("fakerow");
+
+            let rt = ProfileRuntime::acquire(&profile, Isolation::Shared, &[]).expect("acquire");
+            let sid = rt.session.as_str().to_string();
+
+            gc_stale_runtimes();
+
+            let left: Vec<String> = crate::live_sessions::list()
+                .into_iter()
+                .map(|r| r.session_id)
+                .collect();
+            assert_eq!(
+                left,
+                vec![sid],
+                "GC reaped a LIVE fake-mode session's registry row"
+            );
+            assert!(
+                rt.config_dir().is_dir(),
+                "GC must spare the live shared tree too"
+            );
+
+            drop(rt);
+        });
+    });
+}
+
+/// Under `LinkMode::Fake` the session's own marker ALREADY sits at the
+/// pre-per-session path a pre-layout clauth probes, so there is no second marker
+/// to stamp. Stamping one anyway would `try_lock` that same path against this
+/// process's own fd, fail, and log "not lockable" on every fake-mode start. The
+/// absence is structural: `legacy_marker` is `None`, so the stamp is never
+/// reached.
+#[test]
+fn fake_mode_stamps_no_second_compat_marker() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        with_link_mode(LinkMode::Fake, || {
+            fake_claude_home(tmp.path());
+
+            for (name, isolation, legacy_dir) in [
+                ("fakecompat-shared", Isolation::Shared, "sessions"),
+                ("fakecompat-iso", Isolation::Isolated, "sessions-isolated"),
+            ] {
+                let profile = make_profile(name);
+                let rt = ProfileRuntime::acquire(&profile, isolation, &[]).expect("acquire");
+
+                assert_eq!(
+                    rt.legacy_marker, None,
+                    "{name}: a shared-tree session's own marker IS the compat marker"
+                );
+                assert!(
+                    rt.legacy_lock.is_none(),
+                    "{name}: nothing to lock when nothing is stamped"
+                );
+
+                let legacy = tmp
+                    .path()
+                    .join(".clauth")
+                    .join("profiles")
+                    .join(name)
+                    .join(legacy_dir);
+                assert_eq!(
+                    rt.sessions_dir(),
+                    legacy,
+                    "{name}: the session's marker dir must BE the pre-upgrade path"
+                );
+                assert_eq!(
+                    live_sessions_at(&legacy),
+                    Some(1),
+                    "{name}: a pre-upgrade clauth probes exactly {legacy_dir} and must see this session"
+                );
+                assert_eq!(
+                    live_session_count(name),
+                    1,
+                    "{name}: one marker, one session"
+                );
+
+                drop(rt);
+
+                assert!(!legacy.exists(), "{name}: the last session out removes it");
+                assert_eq!(live_session_count(name), 0);
+            }
+        });
     });
 }
 

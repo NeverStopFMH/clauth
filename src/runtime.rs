@@ -13,7 +13,14 @@
 //! pre-per-session `runtime`/`sessions` pair an earlier release left on disk, so
 //! liveness and GC reach a legacy tree with no migration step.
 //!
-//! Two transport modes, picked per profile at acquire time:
+//! Per-session keying is for REAL symlinks only. Under [`LinkMode::Fake`] the
+//! tree is a recursive copy, so both flavors fall back to the bare stem
+//! ([`paired_dir_names`]) and every session of that profile+flavor shares one
+//! tree. The accepted consequence is that Windows without symlink privilege
+//! cannot host independent per-session credentials.
+//!
+//! Two transport modes, probed per profile at acquire time BEFORE the tree name
+//! is chosen, since the mode decides that name:
 //!
 //! - **Real symlinks** (Unix, plus Windows with developer mode or admin):
 //!   the runtime tree is a forest of symlinks into `~/.claude/`, and
@@ -27,8 +34,8 @@
 //!   "latest mtime wins" so a re-login on either side propagates to the
 //!   other before another session can pick up a stale refresh token.
 //!
-//! Liveness lives in the paired `sessions-<sid>/` directory: the session creates
-//! the marker `sessions-<sid>/<sid>` and holds an exclusive `flock(2)` on it for
+//! Liveness lives in the paired sessions directory: the session creates the
+//! marker `<sessions dir>/<sid>` and holds an exclusive `flock(2)` on it for
 //! its lifetime, so any other process reads liveness without cooperation. Token
 //! rotation gates on a live marker in ANY of a profile's sessions dirs
 //! ([`has_live_session`]) — missing one would spend a single-use refresh token a
@@ -78,9 +85,9 @@ enum LinkMode {
 
 /// Whether a session inherits the operator's full `~/.claude/` (memory,
 /// plugins, hooks, commands, agents) or runs authenticated-but-clean. Both
-/// flavors get their own per-session tree; the flavor decides only what is
-/// materialized into it, since every session shares the profile's canonical
-/// credentials and rotation lock either way.
+/// flavors are keyed identically (see [`paired_dir_names`]); the flavor decides
+/// only what is materialized into the tree, since every session shares the
+/// profile's canonical credentials and rotation lock either way.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Isolation {
     /// Full mirror of `~/.claude/`: the session behaves like the operator's.
@@ -205,24 +212,64 @@ fn paired_runtime_name(sessions_name: &str) -> Option<String> {
         .map(|rest| format!("{RUNTIME_STEM}{rest}"))
 }
 
-fn runtime_dir(name: &str, isolation: Isolation, session: &SessionId) -> Result<PathBuf> {
-    profile_subpath(
-        name,
-        &format!("{}-{}", isolation.runtime_stem(), session.as_str()),
+/// The `(runtime, sessions)` dir names a session of this flavor uses under this
+/// transport. Returned as a pair so the module's `runtime<rest>` ↔
+/// `sessions<rest>` rule is structural rather than two call sites agreeing.
+///
+/// [`LinkMode::Real`] keys each session's pair by its own `<sid>`, so sessions
+/// are independent. [`LinkMode::Fake`] returns the BARE stem, shared by every
+/// session of the profile+flavor: that tree is built by recursive COPY of
+/// `~/.claude/`, so per-session keying would charge sessions 2..N a full copy
+/// each (multiple GB apiece on a real install) and make the fake-mode watchdog
+/// re-walk `~/.claude/` once per session per second instead of once per profile.
+/// The accepted cost is that a fake-symlink host cannot give its sessions
+/// independent credentials.
+///
+/// `session` is a [`SessionId`]'s string — digits and one `-`, which is what
+/// keeps a per-session name from spelling the `isolated` flavor stem.
+fn paired_dir_names(isolation: Isolation, session: &str, mode: LinkMode) -> (String, String) {
+    let suffix = match mode {
+        LinkMode::Real => format!("-{session}"),
+        LinkMode::Fake => String::new(),
+    };
+    (
+        format!("{}{suffix}", isolation.runtime_stem()),
+        format!("{}{suffix}", isolation.sessions_stem()),
     )
 }
 
-fn sessions_dir(name: &str, isolation: Isolation, session: &SessionId) -> Result<PathBuf> {
-    profile_subpath(
-        name,
-        &format!("{}-{}", isolation.sessions_stem(), session.as_str()),
-    )
+/// Every path one session addresses, resolved as a unit once its [`LinkMode`] is
+/// known — the mode decides the dir names, so nothing here can be computed
+/// before the probe.
+struct SessionPaths {
+    runtime: PathBuf,
+    sessions: PathBuf,
+    pid_file: PathBuf,
+    /// The upgrade-compat marker, and `None` when the session's own `pid_file`
+    /// already sits at that path — which is exactly the shared-tree case. See
+    /// [`stamp_legacy_marker`].
+    legacy_marker: Option<PathBuf>,
 }
 
-/// This session's marker at the PRE-per-session path,
-/// `<profile>/sessions[-isolated]/<sid>`. See [`stamp_legacy_marker`].
-fn legacy_marker_path(name: &str, isolation: Isolation, session: &SessionId) -> Result<PathBuf> {
-    Ok(profile_subpath(name, isolation.sessions_stem())?.join(session.as_str()))
+impl SessionPaths {
+    fn resolve(
+        name: &str,
+        isolation: Isolation,
+        session: &SessionId,
+        mode: LinkMode,
+    ) -> Result<Self> {
+        let (runtime_name, sessions_name) = paired_dir_names(isolation, session.as_str(), mode);
+        let sessions = profile_subpath(name, &sessions_name)?;
+        let pid_file = sessions.join(session.as_str());
+        // The PRE-per-session marker path, `<profile>/sessions[-isolated]/<sid>`.
+        let legacy = profile_subpath(name, isolation.sessions_stem())?.join(session.as_str());
+        Ok(Self {
+            runtime: profile_subpath(name, &runtime_name)?,
+            legacy_marker: (legacy != pid_file).then_some(legacy),
+            sessions,
+            pid_file,
+        })
+    }
 }
 
 /// Stamp and hold this session's upgrade-compat marker, returning the fd whose
@@ -236,6 +283,12 @@ fn legacy_marker_path(name: &str, isolation: Isolation, session: &SessionId) -> 
 /// the DEFAULT state right after an upgrade: `clauth daemon --replace` exists
 /// precisely because the running daemon is otherwise the old binary until the
 /// next restart.
+///
+/// Under the shared bare-stem tree the session's OWN marker already sits at that
+/// path, so a second marker would be the same file: `open` + `try_lock` from this
+/// process conflicts with the fd `acquire` holds and fails. Hence
+/// [`SessionPaths::legacy_marker`] is an `Option` — there is no second marker to
+/// stamp, and this is unreachable rather than failing every start.
 ///
 /// Best-effort: failing to stamp costs upgrade safety, not the session, so it is
 /// logged and stepped over rather than propagated.
@@ -281,21 +334,29 @@ fn stamp_legacy_marker(path: &Path) -> Option<File> {
     }
 }
 
-/// The liveness marker a session holds, addressed by the three things its
-/// registry row carries. The layout lives here so no other module rebuilds it —
+/// Both paths at which the session a registry row names could hold its liveness
+/// marker. The layout lives here so no other module rebuilds it —
 /// `crate::live_sessions` tests a row's liveness through this, and would go
 /// silently stale if it spelled the path itself.
-fn session_marker_path(profile: &str, isolated: bool, session_id: &str) -> Result<PathBuf> {
+///
+/// A row carries the profile, the flavor, and the session id but NOT the
+/// transport, and the two layouts put the marker in different dirs. So both are
+/// derived from [`paired_dir_names`] and a caller treats the row as live if
+/// EITHER is held — the fail-safe direction, matching [`session_marker_dirs`]'s
+/// deliberately loose filter: a row reaped under a live session is a live
+/// session nothing can be pointed at again, while probing an absent path costs
+/// one `open` that fails.
+fn session_marker_paths(profile: &str, isolated: bool, session_id: &str) -> Result<[PathBuf; 2]> {
     let isolation = if isolated {
         Isolation::Isolated
     } else {
         Isolation::Shared
     };
-    Ok(profile_subpath(
-        profile,
-        &format!("{}-{session_id}", isolation.sessions_stem()),
-    )?
-    .join(session_id))
+    let marker = |mode| -> Result<PathBuf> {
+        let (_, sessions_name) = paired_dir_names(isolation, session_id, mode);
+        Ok(profile_subpath(profile, &sessions_name)?.join(session_id))
+    };
+    Ok([marker(LinkMode::Real)?, marker(LinkMode::Fake)?])
 }
 
 fn profiles_root_dir() -> Result<PathBuf> {
@@ -459,18 +520,18 @@ pub(crate) fn gc_stale_runtimes() {
     gc_live_session_rows();
 }
 
-/// Drop registry rows whose owning session is gone. A row is dead iff the marker
-/// its own fields name is no longer flock-held — the same signal the sweep above
-/// and teardown use, so a row can neither outlive its session nor be reaped ahead
-/// of one. Folded in here rather than given its own entry point so every existing
-/// `gc_stale_runtimes` caller gets it.
+/// Drop registry rows whose owning session is gone. A row is dead iff NEITHER
+/// marker its own fields could name is flock-held — the same signal the sweep
+/// above and teardown use, so a row can neither outlive its session nor be reaped
+/// ahead of one. Folded in here rather than given its own entry point so every
+/// existing `gc_stale_runtimes` caller gets it.
 fn gc_live_session_rows() {
     for row in crate::live_sessions::list() {
-        let Ok(marker) = session_marker_path(&row.start_profile, row.isolated, &row.session_id)
+        let Ok(markers) = session_marker_paths(&row.start_profile, row.isolated, &row.session_id)
         else {
             continue;
         };
-        if !is_session_alive(&marker)
+        if !markers.iter().any(|marker| is_session_alive(marker))
             && let Err(e) = crate::live_sessions::unregister(&row.session_id)
         {
             logline!("clauth: dropping stale live-session row failed: {e}");
@@ -657,9 +718,11 @@ pub(crate) struct ProfileRuntime {
     session: SessionId,
     runtime: PathBuf,
     pid_file: PathBuf,
-    /// Upgrade-compat marker path; see [`stamp_legacy_marker`] for its lifetime
-    /// and the release at which both it and this field go away.
-    legacy_marker: PathBuf,
+    /// Upgrade-compat marker path, `None` when this session's own `pid_file`
+    /// already sits there and there is nothing separate to stamp. See
+    /// [`stamp_legacy_marker`] for its lifetime and the release at which both it
+    /// and this field go away.
+    legacy_marker: Option<PathBuf>,
     claude_home: PathBuf,
     canonical: PathBuf,
     sessions: PathBuf,
@@ -689,11 +752,8 @@ impl ProfileRuntime {
             anyhow::bail!("~/.claude not found; install Claude Code first");
         }
         let session = SessionId::mint();
-        let runtime = runtime_dir(name, isolation, &session)?;
-        let sessions = sessions_dir(name, isolation, &session)?;
-        let pid_file = sessions.join(session.as_str());
-        let legacy_marker = legacy_marker_path(name, isolation, &session)?;
         let canonical = canonical_credentials(name)?;
+        let profile_root = profile_dir(name)?;
 
         // Hold the per-profile rotation lock across the session-stamp window so
         // a concurrent `oauth::rotate_one_inner` for this profile cannot spend the
@@ -704,23 +764,40 @@ impl ProfileRuntime {
         // nothing to keep and a shorter scope would need re-proving.
         let _rotation_guard = RotationGuard::acquire(name)?;
 
-        let (pid_lock, legacy_lock, mode) = with_state_lock(|| {
-            crate::profile::mkdir_700(&sessions)
+        let (paths, pid_lock, legacy_lock, mode) = with_state_lock(|| {
+            // The transport is probed FIRST: under `LinkMode::Fake` the tree is
+            // shared under the bare stem, so the mode decides every path below.
+            // The profile dir is the probe site because it exists independently
+            // of the tree — created here rather than assumed, so nothing rests on
+            // `RotationGuard::acquire` having made it.
+            crate::profile::mkdir_700(&profile_root)
+                .with_context(|| format!("failed to create {}", profile_root.display()))?;
+            let mode = detect_link_mode(&profile_root)?;
+            let paths = SessionPaths::resolve(name, isolation, &session, mode)?;
+            let SessionPaths {
+                runtime,
+                sessions,
+                pid_file,
+                legacy_marker,
+            } = &paths;
+
+            crate::profile::mkdir_700(sessions)
                 .with_context(|| format!("failed to create {}", sessions.display()))?;
-            let active = prune_stale_sessions(&sessions)?;
-            // Nothing live in this session's own marker dir, yet a tree already
-            // sits at its path: a dead session's leftovers under a recycled pid.
+            let active = prune_stale_sessions(sessions)?;
+            // Nothing live in this session's marker dir, yet a tree already sits
+            // at its path: a dead session's leftovers under a recycled pid, or —
+            // under the shared tree — a whole profile's worth nobody is using.
             // Rebuild from scratch so stale symlinks/copies to entries that have
-            // since vanished from ~/.claude/ don't carry over.
+            // since vanished from ~/.claude/ don't carry over. A live sibling
+            // holds a marker here, so its tree is never the one wiped.
             if active == 0 && runtime.symlink_metadata().is_ok() {
-                std::fs::remove_dir_all(&runtime)
+                std::fs::remove_dir_all(runtime)
                     .with_context(|| format!("failed to clear {}", runtime.display()))?;
             }
-            crate::profile::mkdir_700(&runtime)
+            crate::profile::mkdir_700(runtime)
                 .with_context(|| format!("failed to create {}", runtime.display()))?;
-            let mode = detect_link_mode(&runtime)?;
             build_runtime_dir_with_active_env(
-                &runtime,
+                runtime,
                 &claude_home,
                 profile,
                 &canonical,
@@ -728,11 +805,11 @@ impl ProfileRuntime {
                 isolation,
                 active_env_keys,
             )?;
-            let file = open_pid_file(&pid_file)
+            let file = open_pid_file(pid_file)
                 .with_context(|| format!("failed to open {}", pid_file.display()))?;
             file.lock()
                 .with_context(|| format!("failed to lock {}", pid_file.display()))?;
-            let legacy_lock = stamp_legacy_marker(&legacy_marker);
+            let legacy_lock = legacy_marker.as_deref().and_then(stamp_legacy_marker);
 
             // Register inside this same hold, once the marker is flock-held: the
             // row can then never exist without a liveness signal for GC to test
@@ -749,8 +826,14 @@ impl ProfileRuntime {
             if let Err(e) = crate::live_sessions::register(&row) {
                 logline!("clauth: registering the live session failed: {e}");
             }
-            Ok::<_, anyhow::Error>((file, legacy_lock, mode))
+            Ok::<_, anyhow::Error>((paths, file, legacy_lock, mode))
         })?;
+        let SessionPaths {
+            runtime,
+            sessions,
+            pid_file,
+            legacy_marker,
+        } = paths;
 
         let (tx, rx) = channel::<()>();
         let watchdog_runtime = runtime.clone();
@@ -864,22 +947,27 @@ impl Drop for ProfileRuntime {
             {
                 logline!("clauth: remove pid file failed: {e}");
             }
-            // Only unlink a marker this session actually owns. `legacy_lock` is
-            // `None` when `try_lock` lost to a live process that minted the same
-            // sid — unlinking there would delete a FOREIGN session's liveness
-            // signal, which is the same rotation-burn this marker exists to
-            // prevent. Release before unlinking, so a sibling's
-            // `prune_stale_sessions` never reads a removed path.
-            if legacy_lock.is_some() {
-                drop(legacy_lock);
-                let _ = std::fs::remove_file(&self.legacy_marker);
-            }
-            // The compat dir is shared by every session of this profile+flavor,
-            // so it goes only once the last of them has released.
-            if let Some(legacy_dir) = self.legacy_marker.parent()
-                && prune_stale_sessions(legacy_dir).unwrap_or(1) == 0
-            {
-                let _ = std::fs::remove_dir(legacy_dir);
+            // A `None` marker is a session whose own `pid_file` IS the compat
+            // path, already unlinked above — there is no second file, so this
+            // whole leg is skipped rather than special-cased inside it.
+            if let Some(legacy_marker) = self.legacy_marker.as_deref() {
+                // Only unlink a marker this session actually owns. `legacy_lock`
+                // is `None` when `try_lock` lost to a live process that minted
+                // the same sid — unlinking there would delete a FOREIGN session's
+                // liveness signal, which is the same rotation-burn this marker
+                // exists to prevent. Release before unlinking, so a sibling's
+                // `prune_stale_sessions` never reads a removed path.
+                if legacy_lock.is_some() {
+                    drop(legacy_lock);
+                    let _ = std::fs::remove_file(legacy_marker);
+                }
+                // The compat dir is shared by every session of this
+                // profile+flavor, so it goes only once the last has released.
+                if let Some(legacy_dir) = legacy_marker.parent()
+                    && prune_stale_sessions(legacy_dir).unwrap_or(1) == 0
+                {
+                    let _ = std::fs::remove_dir(legacy_dir);
+                }
             }
             let still_active = prune_stale_sessions(&self.sessions).unwrap_or(1);
             if still_active == 0 {
@@ -981,12 +1069,43 @@ pub(crate) fn claude_command() -> std::process::Command {
     std::process::Command::new("claude")
 }
 
-/// Probe the OS by attempting a real symlink in the runtime root. Anything
-/// other than success — privilege denial, unsupported filesystem, the
+/// Test-only [`detect_link_mode`] override. `try_real_symlink` always succeeds
+/// on unix, so the fake-symlink transport — and the shared bare-stem tree it
+/// selects — is otherwise unreachable from a Linux/macOS test run. Serialized by
+/// `profile::HOME_TEST_LOCK`, which every test that sets it already holds via
+/// `with_fake_home`. Never compiled into the binary.
+#[cfg(test)]
+static LINK_MODE_OVERRIDE: std::sync::Mutex<Option<LinkMode>> = std::sync::Mutex::new(None);
+
+#[cfg(test)]
+fn set_link_mode_override(mode: LinkMode) {
+    if let Ok(mut guard) = LINK_MODE_OVERRIDE.lock() {
+        *guard = Some(mode);
+    }
+}
+
+#[cfg(test)]
+fn clear_link_mode_override() {
+    if let Ok(mut guard) = LINK_MODE_OVERRIDE.lock() {
+        *guard = None;
+    }
+}
+
+/// Probe the OS by attempting a real symlink in `probe_dir`. Anything other than
+/// success — privilege denial, unsupported filesystem, the
 /// `cfg(not(any(unix, windows)))` fallback — drops to fake-symlink mode.
-fn detect_link_mode(runtime: &Path) -> Result<LinkMode> {
-    let probe_target = runtime.join(".clauth-probe-target");
-    let probe_link = runtime.join(".clauth-probe-link");
+///
+/// Pointed at the PROFILE dir, not the runtime tree: the mode decides the tree's
+/// name ([`paired_dir_names`]), so it has to be known before that dir exists. The
+/// two dotfiles below match no `runtime*`/`sessions*` predicate, so GC and every
+/// enumeration step over them.
+fn detect_link_mode(probe_dir: &Path) -> Result<LinkMode> {
+    #[cfg(test)]
+    if let Some(mode) = LINK_MODE_OVERRIDE.lock().ok().and_then(|guard| *guard) {
+        return Ok(mode);
+    }
+    let probe_target = probe_dir.join(".clauth-probe-target");
+    let probe_link = probe_dir.join(".clauth-probe-link");
     let _ = std::fs::remove_file(&probe_target);
     let _ = std::fs::remove_file(&probe_link);
     std::fs::write(&probe_target, b"")

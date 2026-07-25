@@ -220,6 +220,76 @@ fn runtime_check_summarizes_profiles() {
     assert!(check.detail.iter().any(|l| l == "link: \u{2014}"));
 }
 
+/// A session that swapped A→B holds BOTH accounts' liveness markers: B's
+/// because that is what it authenticates as, A's because the chain the child
+/// still holds in memory must not rotate underneath it
+/// (`docs/plan/multi-session-fallback.md` §14). Summing per-profile marker
+/// counts therefore reports one child as two sessions and names an account
+/// nothing authenticates as — A is the wrong answer, not a changed one. Only the
+/// registry can tell the two apart.
+#[test]
+fn runtime_check_counts_a_swapped_session_once_on_the_member_it_moved_to() {
+    use crate::profile::{AppConfig, AppState, Profile};
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = App::new(AppConfig {
+        state: AppState::default(),
+        profiles: vec![
+            Profile::new("swap-a".to_string(), None, None),
+            Profile::new("swap-b".to_string(), None, None),
+        ],
+    });
+
+    let sid = "4242-0";
+    let row = crate::live_sessions::LiveSession {
+        session_id: sid.to_string(),
+        start_profile: "swap-a".to_string(),
+        pid: 4242,
+        started_at: 1_700_000_000_000,
+        cwd: None,
+        isolated: false,
+        follows_chain: true,
+        intended_member: None,
+        chain_cursor: None,
+        current_member: Some("swap-b".to_string()),
+        last_swap_at: Some(1_700_000_060_000),
+    };
+    crate::live_sessions::register(&row).expect("register row");
+    // Both markers, exactly as a swapped session holds them.
+    let _launch = crate::runtime::hold_session_row_marker("swap-a", false, sid)
+        .expect("hold the launch member's marker");
+    let _landed = crate::runtime::hold_session_row_marker("swap-b", false, sid)
+        .expect("hold the swapped-onto member's marker");
+
+    super::recompute_plugin_checks(&mut app, false);
+
+    let check = app
+        .plugin
+        .checks
+        .iter()
+        .find(|c| c.label == "runtime")
+        .expect("runtime check");
+    assert_eq!(
+        check
+            .detail
+            .iter()
+            .find(|l| l.starts_with("sessions:"))
+            .map(String::as_str),
+        Some("sessions: 1 live across 1"),
+        "one child is one session on one account, got {:?}",
+        check.detail
+    );
+    assert!(
+        check.detail.iter().any(|l| l == "  swap-b"),
+        "the account the session moved ONTO is the one it runs as, got {:?}",
+        check.detail
+    );
+    assert!(
+        !check.detail.iter().any(|l| l == "  swap-a"),
+        "nothing authenticates as the launch member any more, got {:?}",
+        check.detail
+    );
+}
+
 #[test]
 fn config_rows_login_and_delete_creds_visibility() {
     use super::{ConfigRow, config_rows};

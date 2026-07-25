@@ -3048,7 +3048,7 @@ fn recompute_plugin_checks(app: &mut App, refresh_version: bool) {
 
     // runtime — fold every profile's live sessions / credential link / token
     // freshness into one summary row. Snapshot the names under the config lock,
-    // then drop it before the FS reads (`live_session_count`,
+    // then drop it before the FS reads (the live tally,
     // `classify_credentials_link`) so no lock is held across I/O.
     struct Snap {
         name: String,
@@ -3083,8 +3083,16 @@ fn recompute_plugin_checks(app: &mut App, refresh_version: bool) {
     let mut active_fix: Option<PluginFix> = None;
     let mut active_bad = false; // diverged / missing / unknown link
 
+    // One registry read for the whole fleet. `runtime::live_session_count`
+    // cannot answer this: it dedupes markers by name WITHIN a profile but not
+    // across them, so a session that swapped A→B is counted under both and named
+    // twice — and A is a wrong answer, not a changed one, since nothing
+    // authenticates as it (`docs/plan/multi-session-fallback.md` §14). Its other
+    // consumers ask "does a session own this account's chain", which stays true
+    // under both markers.
+    let tally = crate::live_sessions::LiveTally::collect();
     for snap in snaps {
-        let instances = crate::runtime::live_session_count(&snap.name);
+        let instances = tally.member(&snap.name).sessions;
         live_sessions += instances;
         if instances > 0 {
             live_profiles += 1;

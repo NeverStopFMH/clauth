@@ -119,6 +119,62 @@ impl SessionFields<'_> {
     }
 }
 
+/// Live sessions tallied by the account each one is CURRENTLY running as.
+///
+/// Built from the registry rather than from per-profile marker counts: a session
+/// that swapped A→B holds B's marker AND keeps A's (nothing can observe the live
+/// child dropping A's tokens, so A must not rotate), which makes a marker sum
+/// report one child as two sessions on two accounts.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct LiveTally(std::collections::BTreeMap<String, MemberSessions>);
+
+/// One account's slice of a [`LiveTally`]. All-zero for an account hosting none.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct MemberSessions {
+    pub(crate) sessions: usize,
+    /// How many of `sessions` the fallback chain is allowed to move.
+    pub(crate) following: usize,
+    /// The newest swap ONTO this account. `None` when no session here has ever
+    /// swapped, which is also what says no `current_member` pickup lag applies
+    /// (`docs/plan/multi-session-fallback.md` §12).
+    pub(crate) last_swap_at: Option<u64>,
+}
+
+impl LiveTally {
+    /// Read the registry and drop rows whose session is gone. Row GC runs from
+    /// `runtime::gc_stale_runtimes` at daemon STARTUP, not per tick, so a
+    /// SIGKILLed session's row outlives it for the whole daemon run. Gates on
+    /// the same predicate the decision leg does, so a row cannot be live for one
+    /// and dead for the other.
+    pub(crate) fn collect() -> Self {
+        Self::from_live_rows(list().into_iter().filter(|row| {
+            crate::runtime::session_row_is_live(&row.start_profile, row.isolated, &row.session_id)
+        }))
+    }
+
+    /// Tally rows already known to be live. Attribution is `current_member`,
+    /// which the executor writes only on a session's FIRST swap — so a session
+    /// that never moved (every pinned one, and every follower before it swaps)
+    /// is still running as the account it launched on.
+    fn from_live_rows(rows: impl IntoIterator<Item = LiveSession>) -> Self {
+        let mut per_member: std::collections::BTreeMap<String, MemberSessions> =
+            std::collections::BTreeMap::new();
+        for row in rows {
+            let member = row.current_member.unwrap_or(row.start_profile);
+            let slot = per_member.entry(member).or_default();
+            slot.sessions += 1;
+            slot.following += usize::from(row.follows_chain);
+            slot.last_swap_at = slot.last_swap_at.max(row.last_swap_at);
+        }
+        Self(per_member)
+    }
+
+    /// One account's sessions.
+    pub(crate) fn member(&self, name: &str) -> MemberSessions {
+        self.0.get(name).copied().unwrap_or_default()
+    }
+}
+
 fn registry_dir() -> Result<PathBuf> {
     Ok(clauth_dir()?.join("live_sessions"))
 }

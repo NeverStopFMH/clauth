@@ -180,3 +180,97 @@ fn a_malformed_session_id_is_refused() {
         );
     }
 }
+
+// ── live tally ───────────────────────────────────────────────────────────────
+
+/// `current_member` is written only by a session's FIRST swap, so a session that
+/// never moved — every pinned one, and every opted-in one before it swaps — is
+/// running as the account it launched on. Reading `current_member` alone leaves
+/// the overwhelmingly common case attributed to nobody.
+#[test]
+fn a_session_that_never_swapped_counts_on_the_account_it_launched_on() {
+    let tally = LiveTally::from_live_rows([row("4242-0", "work")]);
+
+    assert_eq!(tally.member("work").sessions, 1);
+}
+
+/// The other direction: once a session has swapped, the launch account is a
+/// place nothing authenticates as, and counting it there is the exact defect
+/// that made the Plugin tab report one child as two.
+#[test]
+fn a_swapped_session_counts_on_its_current_member_and_not_its_launch_one() {
+    let mut swapped = row("4242-0", "work");
+    swapped.current_member = Some("spare".to_string());
+
+    let tally = LiveTally::from_live_rows([swapped]);
+
+    assert_eq!(tally.member("spare").sessions, 1);
+    assert_eq!(tally.member("work").sessions, 0);
+}
+
+/// `follows_chain` is what separates a session the chain can move from a pinned
+/// one — both hold the account's marker and burn its window, so both are
+/// counted, and only the follower earns the `⇄` the render layers put on it.
+#[test]
+fn only_opted_in_sessions_count_as_following_the_chain() {
+    let pinned = row("4242-0", "work");
+    let mut follower = row("4242-1", "work");
+    follower.follows_chain = true;
+
+    let tally = LiveTally::from_live_rows([pinned, follower]);
+
+    assert_eq!(tally.member("work").sessions, 2);
+    assert_eq!(tally.member("work").following, 1);
+}
+
+/// The card names when a session last landed here, so the newest swap onto an
+/// account wins over an older one; a session that never swapped contributes no
+/// stamp at all, which is also what tells the render layer no pickup lag applies.
+#[test]
+fn the_newest_swap_onto_an_account_is_the_one_reported() {
+    let mut old = row("4242-0", "work");
+    old.current_member = Some("spare".to_string());
+    old.last_swap_at = Some(1_700_000_010_000);
+    let mut new = row("4242-1", "work");
+    new.current_member = Some("spare".to_string());
+    new.last_swap_at = Some(1_700_000_020_000);
+    let never = row("4242-2", "work");
+
+    // Newest FIRST: `list()` reads rows back in readdir order, so a tally that
+    // simply kept the last row it saw would agree with this fixture in ascending
+    // order and disagree with production at random.
+    let tally = LiveTally::from_live_rows([new, old, never]);
+
+    assert_eq!(tally.member("spare").last_swap_at, Some(1_700_000_020_000));
+    assert_eq!(tally.member("work").last_swap_at, None);
+}
+
+/// An account hosting nothing reports zeroes, never a missing-key panic — the
+/// render layers ask about every configured account, most of which host none.
+#[test]
+fn an_account_with_no_sessions_tallies_empty() {
+    let tally = LiveTally::from_live_rows([row("4242-0", "work")]);
+
+    assert_eq!(tally.member("idle"), MemberSessions::default());
+}
+
+/// Row GC runs from `gc_stale_runtimes` at daemon STARTUP, not per tick, so a
+/// SIGKILLed session's row sits on disk for the whole daemon run. A tally that
+/// trusted the file would keep showing a session that is gone.
+#[test]
+fn collect_drops_a_row_whose_session_is_no_longer_running() {
+    let _home = HomeSandbox::new();
+
+    let live = row("4242-0", "work");
+    let dead = row("4242-1", "work");
+    register(&live).expect("register the live row");
+    register(&dead).expect("register the dead row");
+    let _marker = crate::runtime::hold_session_row_marker(&live.start_profile, false, "4242-0")
+        .expect("hold the live session's marker");
+
+    assert_eq!(
+        LiveTally::collect().member("work").sessions,
+        1,
+        "only the row whose marker is still held is a live session"
+    );
+}

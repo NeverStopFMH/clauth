@@ -461,6 +461,16 @@ pub(crate) fn has_live_session(name: &str) -> bool {
 /// an upgrade-compat `sessions/<sid>`, and the shared session id is what makes
 /// those one session rather than two. Reports 1 on an unknown, so it never
 /// contradicts [`has_live_session`] within a tick.
+///
+/// No production caller left: its one consumer (the Plugin tab's fleet tally)
+/// moved to `live_sessions::LiveTally`, because this dedupes markers WITHIN a
+/// profile but not across them and so reports a swapped session twice. The
+/// name-dedupe exists for the upgrade-compat marker, so removing this belongs
+/// with that shim's removal in v0.16, not with the tally that orphaned it.
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "removed with the v0.16 compat-marker shim")
+)]
 pub(crate) fn live_session_count(name: &str) -> usize {
     let Some(dirs) = session_marker_dirs(name) else {
         return 1;

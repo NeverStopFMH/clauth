@@ -24,6 +24,7 @@
 //! - rotation/save sites: `config` → state flock → `activity`.
 //! - `/profile` TTL clock: `rotation` → `profile_ttl` (post-401 retry) and
 //!   `config` → `profile_ttl` (the account-swap actions that expire it).
+//! - per-session swap: `rotation` → state flock → `swap_cell`.
 //!
 //! Standalone leaves (`refetch_queue`, the `pending_*` sets) are never nested
 //! with another tracked lock; they are ranked above the rest so that a future
@@ -139,6 +140,14 @@ pub(crate) mod rank {
         ProfileTtl = 450;
         /// `with_state_lock` (cross-process state flock). Inner of `config`.
         State = 500;
+        /// `runtime::SessionSwap`'s cell: the member a live session's credential
+        /// link resolves to, plus the liveness markers of every member it has run
+        /// on. A true leaf — take-read/take-publish-release, with the file IO the
+        /// swap does outside it — ranked INSIDE `State` because both its writer
+        /// (the swap's publish step) and its reader (the watchdog tick's
+        /// credential leg) take it under `with_state_lock`, which is what makes
+        /// the marker move and the link repoint one atomic step.
+        SwapCell = 550;
         Activity = 600;
         // Standalone leaves — never nested with another tracked lock.
         NextRefresh = 1100;

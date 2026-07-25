@@ -185,6 +185,16 @@ fn read_row(path: &Path) -> Option<LiveSession> {
     serde_json::from_slice(&std::fs::read(path).ok()?).ok()
 }
 
+/// One session's own row, or `None` when it is absent or unparseable. Read
+/// WITHOUT the state lock, which is sound because [`write_row`] renames over the
+/// path: a reader sees the whole old row or the whole new one. A caller that
+/// intends to WRITE what it read must go through [`update`] instead — a
+/// load-here/store-later pair reverts whatever the other writer landed in
+/// between.
+pub(crate) fn get(session_id: &str) -> Option<LiveSession> {
+    read_row(&row_path(session_id).ok()?)
+}
+
 /// The one mutation path: load a FRESH row inside the state lock, edit it
 /// through a borrow that cannot escape the hold, store it before releasing. A
 /// missing row is an error naming the id, never a silent no-op.

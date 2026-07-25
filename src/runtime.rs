@@ -721,12 +721,484 @@ pub(crate) fn open_pid_file(path: &Path) -> std::io::Result<File> {
     crate::profile::open_state_file(path)
 }
 
+/// Why this host cannot execute a per-session credential swap at all. Both arms
+/// are structural rather than unfinished work, and both must REFUSE loudly: a
+/// swap that silently leaves the session on its launch account is the one outcome
+/// the live-Claude-Code probe exists to prevent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SwapUnsupported {
+    /// [`LinkMode::Fake`] shares ONE runtime tree across every session of the
+    /// profile+flavor, so repointing its credential file would move every session
+    /// of that profile at once.
+    SharedRuntimeTree,
+    /// macOS resolves credentials Keychain-FIRST and deletes the plaintext file
+    /// once it has migrated them, so a swapped-in file is inert until the
+    /// per-`CLAUDE_CONFIG_DIR` Keychain item is written alongside it.
+    KeychainFirst,
+}
+
+impl std::fmt::Display for SwapUnsupported {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::SharedRuntimeTree => {
+                f.write_str("this host shares one runtime tree across the profile's sessions")
+            }
+            Self::KeychainFirst => f.write_str("this host resolves credentials keychain-first"),
+        }
+    }
+}
+
+/// The transport/platform gate, kept PURE so both refusals are exercised from a
+/// Linux test run — reading `cfg!(target_os = "macos")` is the caller's job.
+fn swap_support(mode: LinkMode, is_macos: bool) -> Result<(), SwapUnsupported> {
+    if mode == LinkMode::Fake {
+        return Err(SwapUnsupported::SharedRuntimeTree);
+    }
+    if is_macos {
+        return Err(SwapUnsupported::KeychainFirst);
+    }
+    Ok(())
+}
+
+/// Why a swap onto a named member did not happen. A VALUE rather than an error:
+/// each arm is a decision the executor takes deliberately, and each is logged,
+/// because a silent refusal leaves the session authenticating as its launch
+/// account with nothing reporting it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum SwapRefused {
+    Unsupported(SwapUnsupported),
+    /// Teardown has begun. `Drop` joins the watchdog, so a swap started now would
+    /// hold session exit for the state-lock timeout plus an unbounded
+    /// rotation-flock wait.
+    ShuttingDown,
+    /// The link already resolves to this member.
+    AlreadyCurrent,
+    ProfileUnreadable(String),
+    /// Carries a `base_url`: a different endpoint, not the same account elsewhere.
+    NotOauth,
+    Disabled,
+    /// `settings.json` env reaches Claude Code's `process.env` only at STARTUP,
+    /// so a member with different env is a genuinely different transport.
+    EnvDiffers,
+    ModelsDiffers,
+    ApiKeyDiffers,
+    /// Nothing at `install_source_path` — there is no login to swap onto.
+    NoCredentialStore,
+    /// A live process holds the marker this session would need on the intended
+    /// member, so the rotation gate could not see the session there.
+    MarkerNotLockable,
+}
+
+impl std::fmt::Display for SwapRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unsupported(why) => write!(f, "{why}"),
+            Self::ShuttingDown => f.write_str("the session is shutting down"),
+            Self::AlreadyCurrent => f.write_str("the link already resolves to it"),
+            Self::ProfileUnreadable(e) => write!(f, "its profile could not be read: {e}"),
+            Self::NotOauth => f.write_str("it carries a custom endpoint"),
+            Self::Disabled => f.write_str("it is disabled"),
+            Self::EnvDiffers => f.write_str("its custom env differs from the launch snapshot"),
+            Self::ModelsDiffers => {
+                f.write_str("its model routing differs from the launch snapshot")
+            }
+            Self::ApiKeyDiffers => {
+                f.write_str("its api-key state differs from the launch snapshot")
+            }
+            Self::NoCredentialStore => f.write_str("it has no stored login"),
+            Self::MarkerNotLockable => {
+                f.write_str("its liveness marker is held by another process")
+            }
+        }
+    }
+}
+
+/// What one swap attempt did. Genuine IO failures propagate as an
+/// [`anyhow::Error`]; a refusal is a value, since it is a decision rather than a
+/// fault.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum SwapOutcome {
+    Swapped,
+    Refused(SwapRefused),
+}
+
+/// The transport a session's Claude Code actually booted with. Compared against
+/// the INTENDED member rather than against a re-read of the current one, because
+/// this snapshot is what is live in the child's `process.env`: `settings.json`
+/// env is applied at startup only.
+#[derive(Debug, Clone, PartialEq)]
+struct LaunchTransport {
+    env: std::collections::BTreeMap<String, String>,
+    models: crate::profile::ModelSettings,
+    has_api_key: bool,
+}
+
+impl LaunchTransport {
+    fn of(profile: &Profile) -> Self {
+        Self {
+            env: profile.env.clone(),
+            models: profile.models.clone(),
+            has_api_key: profile.api_key.is_some(),
+        }
+    }
+}
+
+/// A precondition-cleared swap target, minted ONLY by
+/// [`SessionSwap::precondition`] — which gets here by way of
+/// `profile::load_profile`, and THAT load is what adopts-or-discards a
+/// `credentials.json.pending` sidecar and then removes it.
+///
+/// [`touch_store`] takes one of these as its argument for exactly that reason:
+/// moving the store's mtime while a sidecar still sat beside it makes the store
+/// strictly newer, and `recover_pending_credentials` discards a sidecar older than
+/// the store — losing a refresh pair that may be the only live one. There is no
+/// other constructor, so the touch cannot be reached without the load.
+struct SwapPlan {
+    member: String,
+    store: PathBuf,
+}
+
+/// Move the mtime of the store the credential link now resolves to.
+///
+/// Claude Code stats the symlink's TARGET at the head of every request and clears
+/// its process-wide token memo only when that value CHANGED, so an
+/// mtime-preserving repoint is a silent no-op: the session keeps authenticating as
+/// the old member and nothing anywhere reports a problem.
+fn touch_store(plan: &SwapPlan) -> Result<()> {
+    let file = OpenOptions::new()
+        .write(true)
+        .open(&plan.store)
+        .with_context(|| format!("failed to open {}", plan.store.display()))?;
+    let now = SystemTime::now();
+    // A store already stamped at or ahead of the clock — a coarse-granularity
+    // filesystem, a restored backup — would keep its value and defeat the step.
+    let stamped = match file.metadata().ok().and_then(|m| m.modified().ok()) {
+        Some(prev) if prev >= now => prev + Duration::from_secs(1),
+        _ => now,
+    };
+    file.set_times(std::fs::FileTimes::new().set_modified(stamped))
+        .with_context(|| format!("failed to touch {}", plan.store.display()))
+}
+
+/// One swapped-onto member's liveness markers, held for the session's life.
+struct SwappedMarkers {
+    pid_file: PathBuf,
+    pid_lock: File,
+    /// The upgrade-compat marker, `None` exactly as in [`ProfileRuntime`]: there
+    /// is no second path to stamp. Its lock is `None` when [`stamp_legacy_marker`]
+    /// lost `try_lock` to a live process holding a colliding sid, which is what
+    /// keeps teardown from unlinking a file this session never owned.
+    legacy_marker: Option<PathBuf>,
+    legacy_lock: Option<File>,
+}
+
+/// Stamp and hold the intended member's liveness markers, BOTH layouts.
+///
+/// The per-session one is the rotation gate every current binary reads; the
+/// compat one is what a clauth predating the per-session layout reads, and right
+/// after an upgrade that old binary is the running daemon. Missing either lets a
+/// rotation spend the single-use refresh token the live Claude Code child is
+/// authenticating with.
+///
+/// `None` when the per-session marker is held by something else, so the caller
+/// refuses the swap: moving a session onto a member the rotation gate cannot see
+/// there is the exact burn this step exists to prevent.
+fn stamp_swapped_markers(paths: &SessionPaths) -> Result<Option<SwappedMarkers>> {
+    crate::profile::mkdir_700(&paths.sessions)
+        .with_context(|| format!("failed to create {}", paths.sessions.display()))?;
+    let pid_lock = open_pid_file(&paths.pid_file)
+        .with_context(|| format!("failed to open {}", paths.pid_file.display()))?;
+    // `try_lock`, not `lock`: this runs inside the state flock, where a blocking
+    // wait on a foreign holder would park the watchdog thread.
+    if pid_lock.try_lock().is_err() {
+        return Ok(None);
+    }
+    let legacy_lock = paths.legacy_marker.as_deref().and_then(stamp_legacy_marker);
+    Ok(Some(SwappedMarkers {
+        pid_file: paths.pid_file.clone(),
+        pid_lock,
+        legacy_marker: paths.legacy_marker.clone(),
+        legacy_lock,
+    }))
+}
+
+/// The member a live session's credential link resolves to, and the markers of
+/// every member it has run on.
+struct SwapCell {
+    member: String,
+    canonical: PathBuf,
+    /// Markers stamped by swaps, in visit order. NEVER released mid-session: the
+    /// live Claude Code child still holds every refresh token it has been handed
+    /// and nothing can observe when it stops using one.
+    held: Vec<SwappedMarkers>,
+    /// The last refusal announced, so a stuck `intended_member` states its reason
+    /// once instead of once per watchdog tick.
+    last_refusal: Option<(String, SwapRefused)>,
+}
+
+/// The per-session credential swap executor: a live `clauth start` session moving
+/// from the account it launched on to another chain member, without a restart and
+/// without letting a rotation spend a single-use refresh token the live Claude
+/// Code child still holds.
+///
+/// Shared between that session's watchdog thread — which executes swaps and reads
+/// the current member on its credential leg — and its [`ProfileRuntime`], whose
+/// final tick reads the same cell and whose teardown releases what a swap
+/// stamped. A plain field could not serve either: both hold a MOVED CLONE of the
+/// canonical path, so mutating one is invisible to the other and the next tick
+/// would relink the session back onto its launch member AND write the new
+/// member's tokens into the old member's store.
+pub(crate) struct SessionSwap {
+    session: SessionId,
+    isolation: Isolation,
+    mode: LinkMode,
+    /// This session's own `CLAUDE_CONFIG_DIR`; its `.credentials.json` is what a
+    /// swap repoints.
+    runtime: PathBuf,
+    launch: LaunchTransport,
+    cell: crate::lockorder::RankedMutex<SwapCell, crate::lockorder::rank::SwapCell>,
+    /// Set before `Drop` signals the watchdog, so a swap is never STARTED once
+    /// teardown has begun.
+    shutdown: std::sync::atomic::AtomicBool,
+}
+
+impl SessionSwap {
+    fn new(
+        session: SessionId,
+        isolation: Isolation,
+        mode: LinkMode,
+        runtime: PathBuf,
+        launch: &Profile,
+        canonical: PathBuf,
+    ) -> Self {
+        Self {
+            session,
+            isolation,
+            mode,
+            runtime,
+            launch: LaunchTransport::of(launch),
+            cell: crate::lockorder::RankedMutex::new(SwapCell {
+                member: launch.name.as_str().to_string(),
+                canonical,
+                held: Vec::new(),
+                last_refusal: None,
+            }),
+            shutdown: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    fn cell(&self) -> crate::lockorder::RankedGuard<'_, SwapCell> {
+        self.cell.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// The member this session's credential link resolves to.
+    fn member(&self) -> String {
+        self.cell().member.clone()
+    }
+
+    /// The credential store the link resolves to. The watchdog's credential leg
+    /// and `Drop`'s final tick both reach it through here, inside the same
+    /// `with_state_lock` hold a swap publishes under.
+    fn canonical(&self) -> PathBuf {
+        self.cell().canonical.clone()
+    }
+
+    /// Stop starting swaps. Called before `Drop` signals the watchdog.
+    fn begin_shutdown(&self) {
+        self.shutdown
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    /// The swap leg of this session's own watchdog tick: execute a move when the
+    /// daemon has named a member that differs from the one the link resolves to.
+    /// Nothing writes `intended_member` yet, so the leg is inert by construction
+    /// until the decision leg lands.
+    fn poll(&self) {
+        let Some(intended) = crate::live_sessions::get(self.session.as_str())
+            .and_then(|row| row.intended_member)
+            .filter(|intended| *intended != self.member())
+        else {
+            return;
+        };
+        let sid = self.session.as_str();
+        match self.swap_to(&intended) {
+            Ok(SwapOutcome::Swapped) => {
+                logline!("clauth: session {sid} swapped onto {intended}");
+            }
+            Ok(SwapOutcome::Refused(why)) => self.announce_refusal(&intended, why),
+            Err(e) => logline!("clauth: session {sid} could not swap onto {intended}: {e:#}"),
+        }
+    }
+
+    /// Log a refusal once per (member, reason) pair. The trigger re-fires every
+    /// tick, so announcing unconditionally would write one line per second for as
+    /// long as the daemon's intent stands — but a refusal that says nothing at all
+    /// leaves the session on its launch account invisibly.
+    fn announce_refusal(&self, intended: &str, why: SwapRefused) {
+        let announced = {
+            let mut cell = self.cell();
+            let seen = cell.last_refusal.as_ref();
+            let fresh = seen != Some(&(intended.to_string(), why.clone()));
+            if fresh {
+                cell.last_refusal = Some((intended.to_string(), why.clone()));
+            }
+            fresh
+        };
+        if announced {
+            logline!(
+                "clauth: session {} stays on {}: {intended} is not swappable ({why})",
+                self.session.as_str(),
+                self.member()
+            );
+        }
+    }
+
+    /// Step 0. Every arm refuses distinctly, so the log names the cause. The
+    /// [`SwapPlan`] it returns is the touch step's only key: `load_profile` below
+    /// is what clears a crash-staged credential sidecar, and moving the store's
+    /// mtime before that clearing would discard the sidecar for good.
+    fn precondition(&self, intended: &str) -> Result<SwapPlan, SwapRefused> {
+        if self.shutdown.load(std::sync::atomic::Ordering::Acquire) {
+            return Err(SwapRefused::ShuttingDown);
+        }
+        swap_support(self.mode, cfg!(target_os = "macos")).map_err(SwapRefused::Unsupported)?;
+        if intended == self.member() {
+            return Err(SwapRefused::AlreadyCurrent);
+        }
+        let profile = crate::profile::load_profile(intended)
+            .map_err(|e| SwapRefused::ProfileUnreadable(format!("{e:#}")))?;
+        if !profile.is_oauth() {
+            return Err(SwapRefused::NotOauth);
+        }
+        if profile.is_disabled() {
+            return Err(SwapRefused::Disabled);
+        }
+        if profile.env != self.launch.env {
+            return Err(SwapRefused::EnvDiffers);
+        }
+        if profile.models != self.launch.models {
+            return Err(SwapRefused::ModelsDiffers);
+        }
+        if profile.api_key.is_some() != self.launch.has_api_key {
+            return Err(SwapRefused::ApiKeyDiffers);
+        }
+        let store = crate::claude::install_source_path(intended)
+            .map_err(|e| SwapRefused::ProfileUnreadable(format!("{e:#}")))?;
+        if !store.exists() {
+            return Err(SwapRefused::NoCredentialStore);
+        }
+        Ok(SwapPlan {
+            member: intended.to_string(),
+            store,
+        })
+    }
+
+    /// Move this session onto `intended`.
+    ///
+    /// ONE rotation guard: `RankGuard::enter` asserts a strictly greater rank and
+    /// `Rotation` is the outermost, so a second guard panics in debug and in
+    /// release degrades into a genuine ABBA deadlock on flocks that have no
+    /// deadline. ONE state-lock hold spans the drain, the stamp, the publish, the
+    /// repoint and the registry write: a marker saying the new member while the
+    /// link still resolves to the old one, for even a single watchdog tick, lets a
+    /// rotation burn the old member's chain under the live session.
+    fn swap_to(&self, intended: &str) -> Result<SwapOutcome> {
+        let plan = match self.precondition(intended) {
+            Ok(plan) => plan,
+            Err(refused) => return Ok(SwapOutcome::Refused(refused)),
+        };
+        let _rotation = RotationGuard::acquire(&plan.member)?;
+        let link = self.runtime.join(".credentials.json");
+        with_state_lock(|| {
+            // DRAIN. A Claude Code re-login sitting in the runtime file belongs to
+            // the member the link STILL resolves to; once canonical moves, the
+            // next tick would write those bytes into the new member's store and
+            // its refresh token would be gone.
+            sync_credentials_unlocked(&link, &self.canonical())?;
+
+            let paths =
+                SessionPaths::resolve(&plan.member, self.isolation, &self.session, self.mode)?;
+            let Some(markers) = stamp_swapped_markers(&paths)? else {
+                return Ok(SwapOutcome::Refused(SwapRefused::MarkerNotLockable));
+            };
+            {
+                let mut cell = self.cell();
+                cell.member = plan.member.clone();
+                cell.canonical = plan.store.clone();
+                // Step 8: the previous member's markers stay held for the
+                // session's life, so pushing never replaces.
+                cell.held.push(markers);
+                cell.last_refusal = None;
+            }
+            relink_to_canonical(&link, &plan.store)?;
+            touch_store(&plan)?;
+
+            // A freshly loaded row, edited through the session's own field view:
+            // a row read before the swap and stored after would revert an
+            // `intended_member` the daemon wrote in between.
+            crate::live_sessions::update_as_session(self.session.as_str(), |fields| {
+                fields.set_current_member(plan.member.as_str());
+                fields.set_last_swap_at(crate::usage::now_ms());
+            })?;
+            Ok(SwapOutcome::Swapped)
+        })
+    }
+
+    /// Release and unlink everything the swaps stamped. Called from `Drop`'s
+    /// single teardown hold, and the mirror of the launch member's own leg: only a
+    /// marker whose flock this session holds is unlinked, and a dir shared with
+    /// other sessions goes only once the last of them has left.
+    fn release_swapped_markers(&self) {
+        // Taken out from under the cell first: the IO below acquires nothing, and
+        // the rank is a true leaf only while it stays that way.
+        let held = std::mem::take(&mut self.cell().held);
+        for markers in held {
+            let SwappedMarkers {
+                pid_file,
+                pid_lock,
+                legacy_marker,
+                legacy_lock,
+            } = markers;
+            // Release before unlinking, so a sibling's `prune_stale_sessions`
+            // never reads a removed path.
+            drop(pid_lock);
+            if let Err(e) = std::fs::remove_file(&pid_file)
+                && e.kind() != std::io::ErrorKind::NotFound
+            {
+                logline!(
+                    "clauth: remove swapped marker {} failed: {e}",
+                    pid_file.display()
+                );
+            }
+            if let Some(legacy_marker) = legacy_marker {
+                // `None` is a marker a live foreign process holds — unlinking it
+                // would delete THEIR liveness signal.
+                if legacy_lock.is_some() {
+                    drop(legacy_lock);
+                    let _ = std::fs::remove_file(&legacy_marker);
+                }
+                if let Some(dir) = legacy_marker.parent()
+                    && prune_stale_sessions(dir).unwrap_or(1) == 0
+                {
+                    let _ = std::fs::remove_dir(dir);
+                }
+            }
+            if let Some(dir) = pid_file.parent()
+                && prune_stale_sessions(dir).unwrap_or(1) == 0
+            {
+                let _ = std::fs::remove_dir(dir);
+            }
+        }
+    }
+}
+
 /// Live-session guard. On drop: stops the watchdog, runs a final sync
 /// (errors surface to stderr), drops the PID file, and discards this session's
 /// own runtime tree.
 pub(crate) struct ProfileRuntime {
-    session: SessionId,
-    runtime: PathBuf,
+    /// Shared with the watchdog thread: the member the credential link resolves
+    /// to, which a swap moves, plus everything that swap needs.
+    swap: std::sync::Arc<SessionSwap>,
     pid_file: PathBuf,
     /// Upgrade-compat marker path, `None` when this session's own `pid_file`
     /// already sits there and there is nothing separate to stamp. See
@@ -734,10 +1206,7 @@ pub(crate) struct ProfileRuntime {
     /// and this field go away.
     legacy_marker: Option<PathBuf>,
     claude_home: PathBuf,
-    canonical: PathBuf,
     sessions: PathBuf,
-    mode: LinkMode,
-    isolation: Isolation,
     /// Held for the lifetime of the session so a sibling process's
     /// `try_lock` reveals we're still alive.
     _pid_lock: File,
@@ -861,9 +1330,12 @@ impl ProfileRuntime {
             legacy_marker,
         } = paths;
 
+        let swap = std::sync::Arc::new(SessionSwap::new(
+            session, isolation, mode, runtime, profile, canonical,
+        ));
+
         let (tx, rx) = channel::<()>();
-        let watchdog_runtime = runtime.clone();
-        let watchdog_canonical = canonical.clone();
+        let watchdog_swap = std::sync::Arc::clone(&swap);
         let watchdog_claude_home = claude_home.clone();
         #[allow(clippy::expect_used, reason = "thread spawn failure is unrecoverable")]
         let watchdog_handle = thread::Builder::new()
@@ -887,30 +1359,23 @@ impl ProfileRuntime {
                     until_cred -= 1;
                     if until_cred == 0 {
                         until_cred = cred_every;
-                        if let Err(e) = tick(
-                            mode,
-                            isolation,
-                            &watchdog_runtime,
-                            &watchdog_claude_home,
-                            &watchdog_canonical,
-                        ) {
+                        if let Err(e) = tick(&watchdog_claude_home, &watchdog_swap) {
                             logline!("clauth: watchdog tick failed: {e}");
                         }
+                        // After the credential leg, so a swap always starts from a
+                        // reconciled link.
+                        watchdog_swap.poll();
                     }
                 }
             })
             .expect("failed to spawn watchdog thread");
 
         Ok(Self {
-            session,
-            runtime,
+            swap,
             pid_file,
             legacy_marker,
             claude_home,
-            canonical,
             sessions,
-            mode,
-            isolation,
             _pid_lock: pid_lock,
             legacy_lock,
             watchdog_signal: Some(tx),
@@ -919,7 +1384,15 @@ impl ProfileRuntime {
     }
 
     pub(crate) fn config_dir(&self) -> &Path {
-        &self.runtime
+        &self.swap.runtime
+    }
+
+    /// This session's swap executor. Production reaches it through the watchdog
+    /// thread's own clone; this accessor exists so a test can drive one leg at a
+    /// time instead of racing a 1 Hz tick.
+    #[cfg(test)]
+    fn swap(&self) -> &SessionSwap {
+        &self.swap
     }
 
     /// This session's liveness-marker dir. Holds only its own marker under real
@@ -938,19 +1411,17 @@ impl ProfileRuntime {
 
 impl Drop for ProfileRuntime {
     fn drop(&mut self) {
+        // Before the signal, not after: the watchdog may be mid-tick, and a swap
+        // STARTED from here would hold this join for the state-lock timeout plus
+        // an unbounded rotation-flock wait.
+        self.swap.begin_shutdown();
         // Drop the sender to signal the watchdog, then join.
         drop(self.watchdog_signal.take());
         if let Some(h) = self.watchdog_handle.take() {
             let _ = h.join();
         }
 
-        if let Err(e) = tick(
-            self.mode,
-            self.isolation,
-            &self.runtime,
-            &self.claude_home,
-            &self.canonical,
-        ) {
+        if let Err(e) = tick(&self.claude_home, &self.swap) {
             logline!("clauth: final sync failed: {e}");
         }
 
@@ -970,7 +1441,7 @@ impl Drop for ProfileRuntime {
         // where the row is gone but the marker is not.
         let legacy_lock = self.legacy_lock.take();
         if let Err(e) = with_state_lock(|| {
-            if let Err(e) = crate::live_sessions::unregister(self.session.as_str()) {
+            if let Err(e) = crate::live_sessions::unregister(self.swap.session.as_str()) {
                 logline!("clauth: unregistering the live session failed: {e}");
             }
             if let Err(e) = std::fs::remove_file(&self.pid_file)
@@ -1000,9 +1471,13 @@ impl Drop for ProfileRuntime {
                     let _ = std::fs::remove_dir(legacy_dir);
                 }
             }
+            // Every member a swap moved this session onto holds markers of its
+            // own, in both layouts. A dead session that keeps one blocks rotation
+            // on an account nothing is using.
+            self.swap.release_swapped_markers();
             let still_active = prune_stale_sessions(&self.sessions).unwrap_or(1);
             if still_active == 0 {
-                let _ = std::fs::remove_dir_all(&self.runtime);
+                let _ = std::fs::remove_dir_all(&self.swap.runtime);
                 let _ = std::fs::remove_dir(&self.sessions);
             }
             Ok::<_, anyhow::Error>(())
@@ -1577,20 +2052,21 @@ fn copy_tree(src: &Path, dst: &Path) -> Result<()> {
 /// mirror is skipped so it never re-seeds the operator memory/plugins the
 /// isolated runtime deliberately omits (`mirror_tree` is additive and would
 /// copy `~/.claude/CLAUDE.md` back in). Credentials still reconcile.
-fn tick(
-    mode: LinkMode,
-    isolation: Isolation,
-    runtime: &Path,
-    claude_home: &Path,
-    canonical: &Path,
-) -> Result<()> {
-    match mode {
-        LinkMode::Real => {
-            let _ = sync_credentials(runtime, canonical)?;
-            Ok(())
-        }
-        LinkMode::Fake if isolation == Isolation::Isolated => {
-            with_state_lock(|| mirror_credentials(&runtime.join(".credentials.json"), canonical))
+///
+/// Which member's store the credentials reconcile AGAINST is read from `swap`'s
+/// cell inside the same `with_state_lock` hold that does the reconciling, so a
+/// session that moved member cannot be relinked back onto the one it launched on
+/// — nor have the new member's tokens written into the old member's store.
+fn tick(claude_home: &Path, swap: &SessionSwap) -> Result<()> {
+    let runtime = swap.runtime.as_path();
+    let link = runtime.join(".credentials.json");
+    match swap.mode {
+        LinkMode::Real => with_state_lock(|| {
+            sync_credentials_unlocked(&link, &swap.canonical())?;
+            Ok::<_, anyhow::Error>(())
+        }),
+        LinkMode::Fake if swap.isolation == Isolation::Isolated => {
+            with_state_lock(|| mirror_credentials(&link, &swap.canonical()))
         }
         LinkMode::Fake => {
             // Bulk tree walk + copies run WITHOUT the state lock: on a large
@@ -1607,7 +2083,7 @@ fn tick(
             // (must not interleave with acquire/switch credential writes) stays
             // under the lock.
             mirror_tree(claude_home, runtime)?;
-            with_state_lock(|| mirror_credentials(&runtime.join(".credentials.json"), canonical))
+            with_state_lock(|| mirror_credentials(&link, &swap.canonical()))
         }
     }
 }
@@ -1616,12 +2092,9 @@ fn tick(
 /// a regular file, copy its bytes into canonical creds and swap the file back to
 /// a symlink so canonical stays the single source of truth. Returns `true` when
 /// bytes were written. Real-symlink mode only — fake mode uses
-/// [`mirror_credentials`].
-pub(crate) fn sync_credentials(runtime: &Path, canonical: &Path) -> Result<bool> {
-    let link_path = runtime.join(".credentials.json");
-    with_state_lock(|| sync_credentials_unlocked(&link_path, canonical))
-}
-
+/// [`mirror_credentials`]. Callers hold the state lock: the swap executor runs
+/// this as its drain step inside the one hold that also moves the marker and the
+/// link, and the watchdog's own leg takes the lock in [`tick`].
 fn sync_credentials_unlocked(link_path: &Path, canonical: &Path) -> Result<bool> {
     let Ok(meta) = link_path.symlink_metadata() else {
         return Ok(false);

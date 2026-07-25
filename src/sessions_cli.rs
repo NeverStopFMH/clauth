@@ -98,7 +98,9 @@ pub(crate) fn run_resume(target: &str, profile_flag: Option<&str>) -> Result<()>
     let resume_args = vec!["--resume".to_string(), id];
     // Shared isolation: a resume adopts the chosen account against the shared
     // store, the same lifecycle a bare `clauth start <name>` uses. Rescue is
-    // isolated-only, so `None` (no per-run override) never rescues here.
+    // isolated-only, so `None` (no per-run override) never rescues here, and a
+    // resume never opts into the fallback chain — there is no `--with-fallback`
+    // on this surface to ask for it.
     crate::start::run(
         &config,
         &canonical,
@@ -106,6 +108,7 @@ pub(crate) fn run_resume(target: &str, profile_flag: Option<&str>) -> Result<()>
         Isolation::Shared,
         Some(workspace),
         None,
+        false,
     )
 }
 

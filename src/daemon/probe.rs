@@ -172,11 +172,12 @@ impl StandbySlot {
 }
 
 /// How many times a non-[`Claim::Active`] outcome is re-tried before it stands.
-/// **All three presence probes TAKE the flock they test** — [`daemon_health`]
-/// (TUI header, 1 Hz), [`singleton_held`] (`clauth daemon --status`, at whatever
-/// rate a supervisor polls) and [`standby_waiting`] (the slot file) try-lock a
-/// free file and release it microseconds later — so a single lost try-lock does
-/// not prove a daemon is there. A real holder keeps its lock for the process
+/// **Every presence probe TAKES the flock it tests** — [`daemon_health`] (TUI
+/// header, 1 Hz), [`singleton_held`] (`clauth daemon --status` at whatever rate a
+/// supervisor polls, plus once per `clauth start --with-fallback`, which refuses
+/// when no daemon is there to decide its switches) and [`standby_waiting`] (the
+/// slot file) try-lock a free file and release it microseconds later — so a single
+/// lost try-lock does not prove a daemon is there. A real holder keeps its lock for the process
 /// lifetime, so anything that clears on the next attempt was a reader. Without
 /// this, a µs-long probe could push a starting daemon into `Redundant`, and
 /// under launchd `KeepAlive{SuccessfulExit=false}` that clean exit is never
@@ -596,6 +597,29 @@ impl FetchLease {
             Err(std::fs::TryLockError::Error(_)) => false,
         }
     }
+}
+
+/// Where the daemon singleton's flock lives. Test-only, so a module outside
+/// `daemon` can pose a held or unreadable lock without [`super::LOCK_FILE`]
+/// leaving the subsystem that owns it.
+#[cfg(test)]
+pub(crate) fn daemon_lock_path() -> std::path::PathBuf {
+    clauth_dir().expect("clauth dir").join(super::LOCK_FILE)
+}
+
+/// Open + exclusively lock the daemon singleton, standing in for a live daemon.
+/// Test-only, and shared by every module that needs one: it goes through
+/// [`crate::profile::open_state_file`] exactly as [`claim_once`] does, so a
+/// fixture cannot drift from the file mode production creates. The handle must
+/// stay in scope — the flock releases when it drops.
+#[cfg(test)]
+pub(crate) fn hold_daemon_lock() -> File {
+    let dir = clauth_dir().expect("clauth dir");
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    let file =
+        crate::profile::open_state_file(&dir.join(super::LOCK_FILE)).expect("open the daemon lock");
+    file.try_lock().expect("acquire the free daemon lock");
+    file
 }
 
 #[cfg(test)]

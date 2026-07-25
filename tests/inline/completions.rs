@@ -42,6 +42,59 @@ fn every_shell_completes_start_isolated_flag() {
     assert!(ZSH.contains("--json") && ZSH.contains("--base-url") && ZSH.contains("--force"));
 }
 
+/// Every shell's script must offer `--with-fallback` under `start`, gated to
+/// that subcommand. The tree walk below catches a missing token, but it is
+/// context-blind — it only proves the pair appears SOMEWHERE in the script — so
+/// the branch each shell spells is pinned here.
+#[test]
+fn every_shell_completes_start_with_fallback_flag() {
+    let cases = [
+        (BASH, "--isolated --rescue --no-rescue --with-fallback"),
+        // Anchored on the preceding sibling INSIDE the backslash-continued
+        // block. zsh's describe entry is position-free on its own, so a needle
+        // made only of it stays green while the line is moved under another
+        // subcommand's branch and the flag stops being offered under `start`.
+        (
+            ZSH,
+            "'--no-rescue[isolated only: discard the isolated store]' \\\n            \
+             '--with-fallback[follow the fallback chain",
+        ),
+        (
+            FISH,
+            "__fish_seen_subcommand_from start\" -a --with-fallback",
+        ),
+    ];
+    for (script, gated) in cases {
+        assert!(
+            script.contains("--with-fallback"),
+            "script must offer --with-fallback",
+        );
+        assert!(
+            script.contains(gated),
+            "the --with-fallback completion must be gated to `start`, missing {gated:?}",
+        );
+    }
+}
+
+/// `clauth start --with-fallback <TAB>` is the canonical shape — clap only sees
+/// the flag before the profile name — so the profile list has to follow it in the
+/// two position-sensitive shells. `--rescue`/`--no-rescue` set no precedent here:
+/// both `requires = "isolated"`, so neither is ever the only flag before the name.
+/// fish matches on the subcommand alone and is unaffected.
+#[test]
+fn bash_and_zsh_complete_a_profile_after_start_with_fallback() {
+    assert!(
+        BASH.contains(
+            r#"[ "$prev" = "--isolated" ] || [ "$prev" = "--with-fallback" ] || [ "$prev" = "--profile" ]"#
+        ),
+        "bash must list profiles after --with-fallback, not only after --isolated",
+    );
+    assert!(
+        ZSH.contains(r#""${words[2]}" == start && "${words[3]}" == (--isolated|--with-fallback)"#),
+        "zsh's fourth-word profile arm must accept --with-fallback as the third word",
+    );
+}
+
 /// Every shell must offer `--setup-token` under the `login` subcommand — the
 /// long-lived-token capture flow (#53), gated to login like the other login
 /// flags. Mirrors the `--isolated` coverage above.

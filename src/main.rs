@@ -130,6 +130,7 @@ fn dispatch(cli: Cli) -> Result<()> {
             &a.claude_args,
             a.isolation(),
             a.rescue_override(),
+            a.with_fallback,
         ),
         Command::Login(a) => cmd_login(a),
         Command::Delete {
@@ -214,13 +215,22 @@ fn cmd_start(
     rest: &[String],
     isolation: Isolation,
     rescue_override: Option<bool>,
+    follows_chain: bool,
 ) -> Result<()> {
     platform::init();
     runtime::gc_stale_runtimes();
     let config = load_config()?;
     let canonical = resolve_or_bail(&config, name)?;
     refuse_if_disabled(&config, &canonical)?;
-    start::run(&config, &canonical, rest, isolation, None, rescue_override)
+    start::run(
+        &config,
+        &canonical,
+        rest,
+        isolation,
+        None,
+        rescue_override,
+        follows_chain,
+    )
 }
 
 /// Where `clauth login <name>` lands. An EXISTING profile (matched

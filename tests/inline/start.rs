@@ -2,6 +2,8 @@ use super::*;
 use std::fs;
 use std::process::Command;
 
+use crate::profile::{AppState, Profile};
+use crate::runtime::SwapUnsupported;
 use crate::testutil::HomeSandbox;
 
 #[cfg(unix)]
@@ -295,5 +297,309 @@ fn sidecar_failure_leaves_teardown_and_transcript_rescue_intact() {
     assert!(
         iso.join("file-history/sess-a/edit-1.json").exists(),
         "a failed move leaves its source in place, to be discarded"
+    );
+}
+
+// ── `--with-fallback` eligibility ───────────────────────────────────────────
+
+/// A config eligible for `--with-fallback` in every respect: OAuth, enabled, and
+/// a fallback-chain member with somewhere to go. Each refusal below breaks exactly
+/// ONE of those and keeps the passing twin, so an assertion cannot pass because
+/// the setup was wrong and the call refused for some other reason.
+///
+/// The chain carries a SECOND member on purpose: a chain whose only entry is this
+/// profile is one `walk_chain` can never move off, so building the eligible twin
+/// that way would make every positive control a setup that ships the very defect
+/// the gates exist to refuse.
+fn chain_ready_config(name: &str) -> AppConfig {
+    AppConfig {
+        state: AppState {
+            fallback_chain: vec![name.into(), "spare".into()],
+            ..AppState::default()
+        },
+        profiles: vec![
+            Profile::new(name.to_string(), None, None),
+            Profile::new("spare".to_string(), None, None),
+        ],
+    }
+}
+
+/// The profile dir a `--with-fallback` start's transport probe would materialize.
+/// Nothing else in these tests creates it, so its absence is what proves the probe
+/// never ran.
+fn profile_dir_of(name: &str) -> std::path::PathBuf {
+    crate::profile::profile_dir(name).expect("profile dir")
+}
+
+/// Both unsupported-host arms' copy, as literals. `cfg!(target_os = "macos")`
+/// and `LinkMode::Fake` are each unreachable through the gate from a Linux run,
+/// so the render is pinned here and the wiring by the test below it.
+#[test]
+fn the_unsupported_host_refusal_names_each_cause() {
+    assert_eq!(
+        unsupported_host_refusal("acme", SwapUnsupported::KeychainFirst),
+        "'acme': --with-fallback needs a per-session credential swap, but this host \
+         resolves credentials keychain-first; start without it"
+    );
+    assert_eq!(
+        unsupported_host_refusal("acme", SwapUnsupported::SharedRuntimeTree),
+        "'acme': --with-fallback needs a per-session credential swap, but this host \
+         shares one runtime tree across the profile's sessions; start without it"
+    );
+}
+
+/// macOS reads credentials Keychain-first and DELETES the plaintext file once it
+/// has migrated them, so the swap the flag promises is inert there until the
+/// per-config-dir Keychain item is written alongside it. Refused before
+/// `acquire`, since the platform is known at compile time.
+#[test]
+fn with_fallback_refuses_a_keychain_first_host() {
+    let _sb = HomeSandbox::new();
+    let _daemon = crate::daemon::hold_daemon_lock();
+    let config = chain_ready_config("macish");
+    let profile = config.find("macish").expect("fixture profile");
+
+    let err = refuse_unless_chain_eligible(&config, profile, Isolation::Shared, true)
+        .expect_err("a keychain-first host must refuse");
+    assert_eq!(
+        err.to_string(),
+        "'macish': --with-fallback needs a per-session credential swap, but this host \
+         resolves credentials keychain-first; start without it"
+    );
+
+    refuse_unless_chain_eligible(&config, profile, Isolation::Shared, false)
+        .expect("the same profile off a keychain-first host is eligible");
+}
+
+/// The freshness gate the decision leg runs reads only the OAuth store, which is
+/// sound ONLY because a third-party-launched session gets a chain the walk cannot
+/// move it off. Without this refusal such a session opts in and then silently
+/// never follows anything.
+#[test]
+fn with_fallback_refuses_a_non_oauth_profile() {
+    let _sb = HomeSandbox::new();
+    let _daemon = crate::daemon::hold_daemon_lock();
+    let mut third_party = chain_ready_config("thirdparty");
+    third_party.profiles[0].base_url = Some("https://api.example.com".to_string());
+    let profile = third_party.find("thirdparty").expect("fixture profile");
+
+    let err = refuse_unless_chain_eligible(&third_party, profile, Isolation::Shared, false)
+        .expect_err("a custom endpoint must refuse");
+    assert_eq!(
+        err.to_string(),
+        "'thirdparty': --with-fallback needs an OAuth account, but this one carries \
+         a custom endpoint; start without it"
+    );
+
+    let oauth = chain_ready_config("thirdparty");
+    let profile = oauth.find("thirdparty").expect("fixture profile");
+    refuse_unless_chain_eligible(&oauth, profile, Isolation::Shared, false)
+        .expect("the same profile without an endpoint is eligible");
+}
+
+/// A session's chain snapshot returns `None` for a member outside the chain, so
+/// the row would be skipped every tick with nothing said. The flag names the fix
+/// instead of shipping a silent no-op.
+#[test]
+fn with_fallback_refuses_a_profile_outside_the_fallback_chain() {
+    let _sb = HomeSandbox::new();
+    let _daemon = crate::daemon::hold_daemon_lock();
+    let mut loner = chain_ready_config("loner");
+    loner.state.fallback_chain.clear();
+    let profile = loner.find("loner").expect("fixture profile");
+
+    let err = refuse_unless_chain_eligible(&loner, profile, Isolation::Shared, false)
+        .expect_err("a non-member must refuse");
+    assert_eq!(
+        err.to_string(),
+        "'loner': --with-fallback needs a fallback-chain member; add 'loner' on the \
+         fallback tab, or start without it"
+    );
+
+    let member = chain_ready_config("loner");
+    let profile = member.find("loner").expect("fixture profile");
+    refuse_unless_chain_eligible(&member, profile, Isolation::Shared, false)
+        .expect("the same profile inside the chain is eligible");
+}
+
+/// Nothing writes a session's `intended_member` but the daemon's decision leg, so
+/// without a daemon the flag is inert and the session sits on its launch account
+/// with nothing saying so. Refused rather than auto-spawned: a detached daemon
+/// started behind the user's back is a process they never asked for.
+#[test]
+fn with_fallback_refuses_when_no_daemon_is_running() {
+    let _sb = HomeSandbox::new();
+    let config = chain_ready_config("undaemoned");
+    let profile = config.find("undaemoned").expect("fixture profile");
+
+    let err = refuse_unless_chain_eligible(&config, profile, Isolation::Shared, false)
+        .expect_err("no daemon must refuse");
+    assert_eq!(
+        err.to_string(),
+        "'undaemoned': --with-fallback needs a running daemon to decide switches, \
+         run `clauth daemon`"
+    );
+
+    let _daemon = crate::daemon::hold_daemon_lock();
+    refuse_unless_chain_eligible(&config, profile, Isolation::Shared, false)
+        .expect("a held singleton is the whole requirement");
+}
+
+/// `singleton_held` separates "nobody there" from "can't tell" precisely so a
+/// decision path can refuse on the second. A host whose lock file cannot be read
+/// cannot run the decider on it either, so allowing the flag there ships exactly
+/// the silent non-switch the gate exists to prevent.
+#[test]
+fn with_fallback_refuses_when_the_daemon_lock_cannot_be_read() {
+    let _sb = HomeSandbox::new();
+    // A directory where the lock file belongs: `open` fails EISDIR, which is the
+    // "can't tell" `singleton_held` reports as an error rather than a `no`.
+    let lock_path = crate::daemon::daemon_lock_path();
+    fs::create_dir_all(&lock_path).expect("mkdir over the lock path");
+    let config = chain_ready_config("unreadable");
+    let profile = config.find("unreadable").expect("fixture profile");
+
+    let err = refuse_unless_chain_eligible(&config, profile, Isolation::Shared, false)
+        .expect_err("an unreadable daemon lock must refuse");
+    assert_eq!(
+        err.to_string(),
+        "'unreadable': --with-fallback needs a running daemon and this host could \
+         not be checked for one"
+    );
+
+    fs::remove_dir(&lock_path).expect("clear the lock path");
+    let _daemon = crate::daemon::hold_daemon_lock();
+    refuse_unless_chain_eligible(&config, profile, Isolation::Shared, false)
+        .expect("a readable, held lock is eligible");
+}
+
+/// A chain whose only member is this profile is accepted by a bare membership
+/// check and then cannot move: `next_auto_switch_target` has nowhere to point, so
+/// the leg writes nothing and the session stays put every tick. Same user-visible
+/// silence as the non-member case, which is why it gets the same refusal.
+#[test]
+fn with_fallback_refuses_a_chain_with_nowhere_to_go() {
+    let _sb = HomeSandbox::new();
+    let _daemon = crate::daemon::hold_daemon_lock();
+    let mut lone = chain_ready_config("onlyone");
+    lone.state
+        .fallback_chain
+        .retain(|n| n.as_str() == "onlyone");
+    let profile = lone.find("onlyone").expect("fixture profile");
+
+    let err = refuse_unless_chain_eligible(&lone, profile, Isolation::Shared, false)
+        .expect_err("a chain of one must refuse");
+    assert_eq!(
+        err.to_string(),
+        "'onlyone': --with-fallback needs a second account in the fallback chain to \
+         move to; add one on the fallback tab, or start without it"
+    );
+
+    let paired = chain_ready_config("onlyone");
+    let profile = paired.find("onlyone").expect("fixture profile");
+    refuse_unless_chain_eligible(&paired, profile, Isolation::Shared, false)
+        .expect("the same profile in a chain with a second member is eligible");
+}
+
+/// `--isolated` is refused by clap, which is where the user meets it. But `run` is
+/// the authoritative chokepoint every session-spawn path inherits, and
+/// `chain_opt_in_survives` drops an isolated opt-in SILENTLY — so a new caller
+/// passing both would get exactly the no-op the other gates exist to prevent.
+#[test]
+fn with_fallback_refuses_an_isolated_session() {
+    let _sb = HomeSandbox::new();
+    let _daemon = crate::daemon::hold_daemon_lock();
+    let config = chain_ready_config("throwaway");
+    let profile = config.find("throwaway").expect("fixture profile");
+
+    let err = refuse_unless_chain_eligible(&config, profile, Isolation::Isolated, false)
+        .expect_err("an isolated session must refuse");
+    assert_eq!(
+        err.to_string(),
+        "'throwaway': --with-fallback cannot be combined with --isolated, since an \
+         isolated session follows no chain"
+    );
+
+    refuse_unless_chain_eligible(&config, profile, Isolation::Shared, false)
+        .expect("the same profile as a shared session is eligible");
+}
+
+/// Every gate that can answer without the disk runs BEFORE the transport probe,
+/// which is the only leg that writes. So a start refused for a cause the user can
+/// act on never materializes a profile dir for an account that never launched —
+/// and the compile-time macOS verdict never arrives as a lock timeout or an IO
+/// error from a probe it did not need.
+#[test]
+fn a_refused_with_fallback_start_never_probes_the_disk() {
+    let _sb = HomeSandbox::new();
+    // No daemon held: the last pure gate refuses.
+    let config = chain_ready_config("untouched");
+    let profile = config.find("untouched").expect("fixture profile");
+    let err = refuse_unless_chain_eligible(&config, profile, Isolation::Shared, false)
+        .expect_err("no daemon must refuse");
+    // WHICH gate refused is the whole subject here: a fixture that drifted into
+    // refusing at the oauth or membership gate would leave the dir absent too and
+    // stop proving that the LAST pure gate still precedes the probe.
+    assert_eq!(
+        err.to_string(),
+        "'untouched': --with-fallback needs a running daemon to decide switches, \
+         run `clauth daemon`"
+    );
+    assert!(
+        !profile_dir_of("untouched").exists(),
+        "a refusal the user can act on must not create the profile dir"
+    );
+
+    // macOS is known at compile time, so it must not reach the probe either.
+    let _daemon = crate::daemon::hold_daemon_lock();
+    let err = refuse_unless_chain_eligible(&config, profile, Isolation::Shared, true)
+        .expect_err("a keychain-first host must refuse");
+    assert_eq!(
+        err.to_string(),
+        "'untouched': --with-fallback needs a per-session credential swap, but this host \
+         resolves credentials keychain-first; start without it"
+    );
+    assert!(
+        !profile_dir_of("untouched").exists(),
+        "a statically-known verdict must not be gated behind a fallible probe"
+    );
+
+    // The eligible path DOES probe — otherwise the assertions above pass for a
+    // gate that simply never runs the probe at all.
+    refuse_unless_chain_eligible(&config, profile, Isolation::Shared, false)
+        .expect("the eligible setup passes");
+    assert!(
+        profile_dir_of("untouched").is_dir(),
+        "the transport probe runs once everything else has cleared"
+    );
+}
+
+/// The gate has to be WIRED into the one chokepoint every session-spawn path
+/// funnels through, and only for a session that asked for the chain. Both halves
+/// stop before `claude` is spawned, so the errors are what tells them apart:
+/// the opted-in run dies on its own refusal, the bare one gets all the way to
+/// `acquire` and dies on the missing `~/.claude` this sandbox has no business
+/// creating.
+#[test]
+fn run_applies_the_chain_gate_only_to_an_opted_in_start() {
+    let _sb = HomeSandbox::new();
+    let _daemon = crate::daemon::hold_daemon_lock();
+    let mut loner = chain_ready_config("wired");
+    loner.state.fallback_chain.clear();
+
+    let err = run(&loner, "wired", &[], Isolation::Shared, None, None, true)
+        .expect_err("an opted-in start must be gated");
+    assert_eq!(
+        err.to_string(),
+        "'wired': --with-fallback needs a fallback-chain member; add 'wired' on the \
+         fallback tab, or start without it"
+    );
+
+    let err = run(&loner, "wired", &[], Isolation::Shared, None, None, false)
+        .expect_err("the sandbox has no ~/.claude to launch against");
+    assert_eq!(
+        err.to_string(),
+        "~/.claude not found; install Claude Code first",
+        "a bare start must skip the gate entirely"
     );
 }

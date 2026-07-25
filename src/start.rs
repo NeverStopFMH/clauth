@@ -82,6 +82,93 @@ fn rescue_teardown(iso_root: &Path, sessions: &Path, claude_home: &Path) -> (usi
     (moved, sidecars)
 }
 
+/// The refusal a `--with-fallback` start gets on a host that structurally cannot
+/// execute a per-session credential swap. Split from the gate so BOTH causes are
+/// exercised from a Linux run: `cfg!(target_os = "macos")` and [`LinkMode::Fake`]
+/// are each unreachable there.
+fn unsupported_host_refusal(name: &str, why: crate::runtime::SwapUnsupported) -> String {
+    format!(
+        "'{name}': --with-fallback needs a per-session credential swap, but {why}; start without it"
+    )
+}
+
+/// Every reason `--with-fallback` cannot be honored for `name`, refused before
+/// `acquire` builds a tree and long before `claude` is spawned. A flag that
+/// silently leaves the session on its launch account is the one outcome the live
+/// Claude Code probe exists to prevent, so none of these is a warning.
+///
+/// Every gate that can answer WITHOUT the disk runs first, in unfixable-first
+/// order, and the transport probe runs last. That ordering is load-bearing twice
+/// over: a start refused for a cause the user can act on never materializes a
+/// profile dir for an account that never launched, and the compile-time macOS
+/// verdict never arrives as a state-lock timeout or an IO error from a probe it
+/// did not need. `is_macos` is the caller's `cfg!`, so the keychain arm is
+/// testable off a Mac.
+fn refuse_unless_chain_eligible(
+    config: &AppConfig,
+    profile: &crate::profile::Profile,
+    isolation: Isolation,
+    is_macos: bool,
+) -> Result<()> {
+    let name = profile.name.as_str();
+    // clap already refuses the flag pair, so this is for a caller that bypasses
+    // it: `chain_opt_in_survives` drops an isolated opt-in silently, which is the
+    // one outcome every gate here exists to prevent.
+    if isolation == Isolation::Isolated {
+        anyhow::bail!(
+            "'{name}': --with-fallback cannot be combined with --isolated, since an \
+             isolated session follows no chain"
+        );
+    }
+    if let Some(why) = crate::runtime::unsupported_swap_platform(is_macos) {
+        anyhow::bail!("{}", unsupported_host_refusal(name, why));
+    }
+    // The decision leg's freshness gate reads only the OAuth status store. That
+    // is sound because a third-party-launched session gets a chain the walk
+    // cannot move it off — so an opted-in one would follow nothing, in silence.
+    if !profile.is_oauth() {
+        anyhow::bail!(
+            "'{name}': --with-fallback needs an OAuth account, but this one carries \
+             a custom endpoint; start without it"
+        );
+    }
+    // `snapshot_session_chain` returns `None` for a member outside the chain, so
+    // the row is skipped every tick with nothing said.
+    if !config.state.fallback_chain.iter().any(|n| n == name) {
+        anyhow::bail!(
+            "'{name}': --with-fallback needs a fallback-chain member; add '{name}' on \
+             the fallback tab, or start without it"
+        );
+    }
+    // Membership alone is not enough: a chain holding only this profile gives
+    // `next_auto_switch_target` nowhere to point, and both `Off` and a stay-put
+    // `None` write nothing on the session path. Same silence as a non-member.
+    if !config.state.fallback_chain.iter().any(|n| n != name) {
+        anyhow::bail!(
+            "'{name}': --with-fallback needs a second account in the fallback chain to \
+             move to; add one on the fallback tab, or start without it"
+        );
+    }
+    // Only the daemon's decision leg writes `intended_member`, so with no daemon
+    // the flag is inert. `singleton_held` is the decision-side reader: it
+    // separates "nobody there" from "can't tell", and a host that cannot be
+    // checked cannot run the decider on it either, so both refuse.
+    let held = crate::daemon::singleton_held().with_context(|| {
+        format!("'{name}': --with-fallback needs a running daemon and this host could not be checked for one")
+    })?;
+    if !held {
+        anyhow::bail!(
+            "'{name}': --with-fallback needs a running daemon to decide switches, \
+             run `clauth daemon`"
+        );
+    }
+    // Last, because it is the only gate that touches disk.
+    if let Some(why) = crate::runtime::unsupported_swap_transport(name)? {
+        anyhow::bail!("{}", unsupported_host_refusal(name, why));
+    }
+    Ok(())
+}
+
 pub(crate) fn run(
     config: &AppConfig,
     name: &str,
@@ -89,6 +176,7 @@ pub(crate) fn run(
     isolation: Isolation,
     workspace: Option<&Path>,
     rescue_override: Option<bool>,
+    follows_chain: bool,
 ) -> Result<()> {
     // Authoritative "never a live session for a disabled account" gate — every
     // caller (`cmd_start`, `sessions_cli::run_resume`) inherits it here, before
@@ -97,6 +185,9 @@ pub(crate) fn run(
     // caller that forgets to check.
     crate::refuse_if_disabled(config, name)?;
     let profile = config.find(name).context("profile not found")?;
+    if follows_chain {
+        refuse_unless_chain_eligible(config, profile, isolation, cfg!(target_os = "macos"))?;
+    }
 
     // Strip the active profile's custom env from the inherited base so a
     // `clauth start <other>` session doesn't inherit it. The live
@@ -112,7 +203,7 @@ pub(crate) fn run(
 
     let runtime = {
         let _spinner = Spinner::start("clauth: preparing runtime");
-        ProfileRuntime::acquire(profile, isolation, &active_env_keys)?
+        ProfileRuntime::acquire(profile, isolation, &active_env_keys, follows_chain)?
     };
 
     #[cfg(unix)]

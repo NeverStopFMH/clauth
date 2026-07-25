@@ -29,22 +29,6 @@ fn write_status(generated_at: &str) {
     .expect("write status");
 }
 
-/// Opens + exclusively locks the daemon lock file, standing in for a live
-/// daemon. The returned handle must stay alive for the duration of the probe.
-fn hold_daemon_lock() -> std::fs::File {
-    let dir = clauth_dir().expect("clauth dir");
-    std::fs::create_dir_all(&dir).expect("mkdir");
-    let f = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(dir.join(super::super::LOCK_FILE))
-        .expect("open lock");
-    f.try_lock().expect("acquire test lock");
-    f
-}
-
 // ── status_is_fresh (pure half) ──────────────────────────────────────────────
 
 #[test]

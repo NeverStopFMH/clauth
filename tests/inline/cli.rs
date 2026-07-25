@@ -190,6 +190,46 @@ fn start_last_rescue_spelling_wins() {
     assert_eq!(b.rescue_override(), Some(true));
 }
 
+/// `--with-fallback` is the whole opt-in: it is the only thing that sets a
+/// registry row's `follows_chain`, and the decision leg is gated on that field.
+/// Off by default, or landing the flag would move every already-running session
+/// off the account it launched on.
+#[test]
+fn start_with_fallback_flag_parses_and_defaults_off() {
+    let Command::Start(on) = command(&["start", "--with-fallback", "acme"]) else {
+        panic!("must parse");
+    };
+    assert!(on.with_fallback, "the flag must reach StartArgs");
+    assert_eq!(on.profile, "acme");
+
+    let Command::Start(off) = command(&["start", "acme"]) else {
+        panic!("must parse");
+    };
+    assert!(
+        !off.with_fallback,
+        "a bare start must not opt into the chain"
+    );
+}
+
+/// An `--isolated` run gets a throwaway tree deliberately outside every chain,
+/// and the swap executor refuses it at its own chokepoint. Rejected by the
+/// parser so the user hears it instead of getting a flag that does nothing.
+#[test]
+fn start_with_fallback_conflicts_with_isolated() {
+    for args in [
+        ["start", "--with-fallback", "--isolated", "acme"].as_slice(),
+        ["start", "--isolated", "--with-fallback", "acme"].as_slice(),
+    ] {
+        let err = parse(args).expect_err("--with-fallback with --isolated must be refused");
+        assert_eq!(err.exit_code(), 2, "a bad flag combination exits 2");
+        let text = err.to_string();
+        assert!(
+            text.contains("--with-fallback") && text.contains("--isolated"),
+            "the error must name both flags, got: {err}"
+        );
+    }
+}
+
 /// Rescue lifts a throwaway isolated store into the global one; a shared start
 /// already writes there, so the flags without `--isolated` are a user error,
 /// rejected rather than silently no-op'd.
@@ -236,6 +276,7 @@ fn start_args_accessors_map_flags_to_the_runtime_types() {
         isolated: false,
         rescue: false,
         no_rescue: false,
+        with_fallback: false,
         profile: "acme".into(),
         claude_args: Vec::new(),
     };
@@ -246,6 +287,7 @@ fn start_args_accessors_map_flags_to_the_runtime_types() {
         isolated: true,
         rescue: true,
         no_rescue: false,
+        with_fallback: false,
         profile: "acme".into(),
         claude_args: Vec::new(),
     };
@@ -883,7 +925,7 @@ mod disabled_target_refusal {
         let home = HomeSandbox::new();
         seed_disabled_profile("off");
 
-        let err = cmd_start("off", &[], crate::runtime::Isolation::Shared, None)
+        let err = cmd_start("off", &[], crate::runtime::Isolation::Shared, None, false)
             .expect_err("a disabled target must be refused");
         assert_eq!(
             err.to_string(),

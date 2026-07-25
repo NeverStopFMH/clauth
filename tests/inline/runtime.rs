@@ -1581,7 +1581,7 @@ fn acquire_creates_runtime_and_pid_file() {
         fake_claude_home(tmp.path());
         let profile = make_profile("lifecycle");
 
-        let rt = ProfileRuntime::acquire(&profile, Isolation::Shared, &[]).expect("acquire");
+        let rt = ProfileRuntime::acquire(&profile, Isolation::Shared, &[], false).expect("acquire");
 
         assert!(
             rt.config_dir().is_dir(),
@@ -1659,7 +1659,7 @@ fn acquire_isolates_credentials_from_real_home() {
             .expect("mkdir profile dir");
         fs::write(&canonical, CREDS_V2).expect("write canonical");
 
-        let rt = ProfileRuntime::acquire(&profile, Isolation::Shared, &[]).expect("acquire");
+        let rt = ProfileRuntime::acquire(&profile, Isolation::Shared, &[], false).expect("acquire");
         let runtime_creds = rt.config_dir().join(".credentials.json");
 
         // The runtime's credentials resolve to the profile's OWN chain (V2),
@@ -1711,10 +1711,11 @@ fn acquire_twice_same_process_counts_two_sessions() {
         fake_claude_home(tmp.path());
         let profile = make_profile("concurrent");
 
-        let rt1 = ProfileRuntime::acquire(&profile, Isolation::Shared, &[]).expect("first acquire");
+        let rt1 = ProfileRuntime::acquire(&profile, Isolation::Shared, &[], false)
+            .expect("first acquire");
         // Pre-fix this second acquire blocks forever on the shared PID flock.
-        let rt2 =
-            ProfileRuntime::acquire(&profile, Isolation::Shared, &[]).expect("second acquire");
+        let rt2 = ProfileRuntime::acquire(&profile, Isolation::Shared, &[], false)
+            .expect("second acquire");
 
         assert_eq!(
             live_session_count("concurrent"),
@@ -1749,8 +1750,10 @@ fn two_shared_sessions_get_independent_trees() {
         fake_claude_home(tmp.path());
         let profile = make_profile("twin");
 
-        let a = ProfileRuntime::acquire(&profile, Isolation::Shared, &[]).expect("first acquire");
-        let b = ProfileRuntime::acquire(&profile, Isolation::Shared, &[]).expect("second acquire");
+        let a = ProfileRuntime::acquire(&profile, Isolation::Shared, &[], false)
+            .expect("first acquire");
+        let b = ProfileRuntime::acquire(&profile, Isolation::Shared, &[], false)
+            .expect("second acquire");
 
         assert_ne!(
             a.config_dir(),
@@ -1808,7 +1811,7 @@ fn acquire_stamps_the_pre_upgrade_liveness_marker_for_both_flavors() {
             ("upgrade-iso", Isolation::Isolated, "sessions-isolated"),
         ] {
             let profile = make_profile(name);
-            let rt = ProfileRuntime::acquire(&profile, isolation, &[]).expect("acquire");
+            let rt = ProfileRuntime::acquire(&profile, isolation, &[], false).expect("acquire");
             let sid = live_sid(&rt);
 
             let legacy = tmp
@@ -1910,7 +1913,7 @@ fn teardown_leaves_a_pre_upgrade_marker_it_never_owned() {
         held.lock().expect("lock foreign marker");
 
         let profile = make_profile("foreign");
-        let rt = ProfileRuntime::acquire(&profile, Isolation::Shared, &[]).expect("acquire");
+        let rt = ProfileRuntime::acquire(&profile, Isolation::Shared, &[], false).expect("acquire");
         assert_eq!(
             live_sid(&rt),
             foreign_sid,
@@ -1947,8 +1950,10 @@ fn the_pre_upgrade_marker_dir_survives_until_the_last_session_leaves() {
             .join("upgrade-twin")
             .join("sessions");
 
-        let a = ProfileRuntime::acquire(&profile, Isolation::Shared, &[]).expect("first acquire");
-        let b = ProfileRuntime::acquire(&profile, Isolation::Shared, &[]).expect("second acquire");
+        let a = ProfileRuntime::acquire(&profile, Isolation::Shared, &[], false)
+            .expect("first acquire");
+        let b = ProfileRuntime::acquire(&profile, Isolation::Shared, &[], false)
+            .expect("second acquire");
 
         assert_eq!(
             live_sessions_at(&legacy),
@@ -1983,8 +1988,10 @@ fn dropping_one_shared_session_leaves_the_sibling_intact() {
         fake_claude_home(tmp.path());
         let profile = make_profile("survivor");
 
-        let a = ProfileRuntime::acquire(&profile, Isolation::Shared, &[]).expect("first acquire");
-        let b = ProfileRuntime::acquire(&profile, Isolation::Shared, &[]).expect("second acquire");
+        let a = ProfileRuntime::acquire(&profile, Isolation::Shared, &[], false)
+            .expect("first acquire");
+        let b = ProfileRuntime::acquire(&profile, Isolation::Shared, &[], false)
+            .expect("second acquire");
 
         let a_runtime = a.config_dir().to_path_buf();
         let a_sessions = a.sessions_dir().to_path_buf();
@@ -2092,10 +2099,10 @@ fn fake_mode_shares_one_tree_across_two_sessions() {
             fake_claude_home(tmp.path());
             let profile = make_profile("faketwin");
 
-            let a =
-                ProfileRuntime::acquire(&profile, Isolation::Shared, &[]).expect("first acquire");
-            let b =
-                ProfileRuntime::acquire(&profile, Isolation::Shared, &[]).expect("second acquire");
+            let a = ProfileRuntime::acquire(&profile, Isolation::Shared, &[], false)
+                .expect("first acquire");
+            let b = ProfileRuntime::acquire(&profile, Isolation::Shared, &[], false)
+                .expect("second acquire");
 
             let profile_dir = tmp.path().join(".clauth").join("profiles").join("faketwin");
             assert_eq!(a.config_dir(), profile_dir.join("runtime"));
@@ -2133,8 +2140,8 @@ fn fake_mode_second_session_does_not_rebuild_the_tree() {
             let claude_home = fake_claude_home(tmp.path());
             let profile = make_profile("fakecopy");
 
-            let a =
-                ProfileRuntime::acquire(&profile, Isolation::Shared, &[]).expect("first acquire");
+            let a = ProfileRuntime::acquire(&profile, Isolation::Shared, &[], false)
+                .expect("first acquire");
 
             let sentinel = "session-one-was-here.txt";
             assert!(
@@ -2144,8 +2151,8 @@ fn fake_mode_second_session_does_not_rebuild_the_tree() {
             );
             fs::write(a.config_dir().join(sentinel), b"do not re-copy me").expect("seed sentinel");
 
-            let b =
-                ProfileRuntime::acquire(&profile, Isolation::Shared, &[]).expect("second acquire");
+            let b = ProfileRuntime::acquire(&profile, Isolation::Shared, &[], false)
+                .expect("second acquire");
 
             assert_eq!(
                 b.config_dir(),
@@ -2176,10 +2183,10 @@ fn fake_mode_rotation_gate_counts_both_shared_sessions() {
             fake_claude_home(tmp.path());
             let profile = make_profile("fakegate");
 
-            let a =
-                ProfileRuntime::acquire(&profile, Isolation::Shared, &[]).expect("first acquire");
-            let b =
-                ProfileRuntime::acquire(&profile, Isolation::Shared, &[]).expect("second acquire");
+            let a = ProfileRuntime::acquire(&profile, Isolation::Shared, &[], false)
+                .expect("first acquire");
+            let b = ProfileRuntime::acquire(&profile, Isolation::Shared, &[], false)
+                .expect("second acquire");
             let tree = a.config_dir().to_path_buf();
             let markers = a.sessions_dir().to_path_buf();
 
@@ -2219,7 +2226,8 @@ fn fake_mode_registry_row_survives_gc() {
             fake_claude_home(tmp.path());
             let profile = make_profile("fakerow");
 
-            let rt = ProfileRuntime::acquire(&profile, Isolation::Shared, &[]).expect("acquire");
+            let rt =
+                ProfileRuntime::acquire(&profile, Isolation::Shared, &[], false).expect("acquire");
             let sid = rt.swap.session.as_str().to_string();
 
             gc_stale_runtimes();
@@ -2261,7 +2269,7 @@ fn fake_mode_stamps_no_second_compat_marker() {
                 ("fakecompat-iso", Isolation::Isolated, "sessions-isolated"),
             ] {
                 let profile = make_profile(name);
-                let rt = ProfileRuntime::acquire(&profile, isolation, &[]).expect("acquire");
+                let rt = ProfileRuntime::acquire(&profile, isolation, &[], false).expect("acquire");
 
                 assert_eq!(
                     rt.legacy_marker, None,
@@ -3113,7 +3121,7 @@ fn acquire_registers_a_row_and_teardown_removes_it() {
         fake_claude_home(tmp.path());
         let profile = make_profile("registered");
 
-        let rt = ProfileRuntime::acquire(&profile, Isolation::Shared, &[]).expect("acquire");
+        let rt = ProfileRuntime::acquire(&profile, Isolation::Shared, &[], false).expect("acquire");
         let sid = sid_of(rt.config_dir());
 
         let rows = crate::live_sessions::list();
@@ -3246,6 +3254,7 @@ fn lone_session(
         &session,
         name,
         isolation == Isolation::Isolated,
+        false,
     );
     crate::live_sessions::register(&row).expect("register row");
     let swap = std::sync::Arc::new(SessionSwap::new(
@@ -3276,6 +3285,132 @@ fn a_registered_session_is_opted_out_of_the_chain() {
             !row.follows_chain,
             "registration must not opt a session into the fallback chain"
         );
+    });
+}
+
+/// `--with-fallback` is the only thing that sets `follows_chain`, so the flag has
+/// to survive the whole way to the on-disk row: the decision leg reads that field
+/// and nothing else decides whether a session is steerable.
+#[test]
+fn an_opted_in_session_registers_as_following_the_chain() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        fake_claude_home(tmp.path());
+        let profile = make_profile("optin-flag");
+
+        let opted =
+            ProfileRuntime::acquire(&profile, Isolation::Shared, &[], true).expect("acquire");
+        let opted_row =
+            crate::live_sessions::get(&sid_of(opted.config_dir())).expect("the opted-in row");
+        drop(opted);
+
+        let plain =
+            ProfileRuntime::acquire(&profile, Isolation::Shared, &[], false).expect("acquire");
+        let plain_row =
+            crate::live_sessions::get(&sid_of(plain.config_dir())).expect("the opted-out row");
+        drop(plain);
+
+        assert!(
+            opted_row.follows_chain,
+            "--with-fallback must reach the registry row"
+        );
+        assert!(
+            !plain_row.follows_chain,
+            "a bare start must stay on its launch account"
+        );
+    });
+}
+
+/// The transport mode is known only INSIDE `acquire`'s state-lock hold, which is
+/// also where the row is written. So the structural floor under the CLI refusal
+/// lives there: a row claiming to follow the chain on a host whose executor
+/// refuses every swap would collect daemon intents nothing can execute, each
+/// announced exactly once into a log nobody is reading.
+#[test]
+fn a_fake_mode_host_never_registers_a_session_as_following_the_chain() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        fake_claude_home(tmp.path());
+        let profile = make_profile("optin-fake");
+        with_link_mode(LinkMode::Fake, || {
+            let rt = ProfileRuntime::acquire(&profile, Isolation::Shared, &[], true)
+                .expect("acquire under the shared fake-mode tree");
+            let rows = crate::live_sessions::list();
+            drop(rt);
+
+            assert_eq!(rows.len(), 1, "exactly this session is registered");
+            assert!(
+                !rows[0].follows_chain,
+                "a fake-mode row must never claim to follow the chain"
+            );
+        });
+    });
+}
+
+/// The predicate behind that floor, spelled once and exercised on every arm —
+/// `Isolated` and macOS are each unreachable through `acquire` from a Linux run,
+/// and all three arms are refusals the executor also makes at its own chokepoint.
+#[test]
+fn a_chain_opt_in_survives_only_where_the_executor_can_swap() {
+    assert!(
+        chain_opt_in_survives(true, Isolation::Shared, LinkMode::Real, false),
+        "a shared session on a real-symlink non-mac host is the supported case"
+    );
+    assert!(
+        !chain_opt_in_survives(false, Isolation::Shared, LinkMode::Real, false),
+        "nothing opts a session in but the flag"
+    );
+    assert!(
+        !chain_opt_in_survives(true, Isolation::Isolated, LinkMode::Real, false),
+        "an isolated session follows no chain"
+    );
+    assert!(
+        !chain_opt_in_survives(true, Isolation::Shared, LinkMode::Fake, false),
+        "a shared runtime tree cannot hold a per-session credential"
+    );
+    assert!(
+        !chain_opt_in_survives(true, Isolation::Shared, LinkMode::Real, true),
+        "macOS resolves credentials keychain-first, so a file swap is inert"
+    );
+}
+
+/// The platform arm answers with no disk at all, so `start::run` can refuse a
+/// statically-known verdict without a probe that could time out on the state flock
+/// or fail on IO. Pinned as a pure call because `cfg!(target_os = "macos")` makes
+/// the arm unreachable from a Linux run any other way.
+#[test]
+fn the_swap_platform_verdict_needs_no_probe() {
+    assert_eq!(
+        unsupported_swap_platform(true),
+        Some(SwapUnsupported::KeychainFirst),
+        "macOS is refused off a compile-time constant"
+    );
+    assert_eq!(
+        unsupported_swap_platform(false),
+        None,
+        "every other platform leaves the verdict to the transport probe"
+    );
+}
+
+/// The pre-`acquire` transport half: `start::run` needs the verdict BEFORE a tree
+/// is built or `claude` is spawned, and it can only get one by probing the profile
+/// dir the way `acquire` does.
+#[test]
+fn the_swap_host_probe_names_each_unsupported_transport() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        assert_eq!(
+            unsupported_swap_transport("probe-host").expect("probe"),
+            None,
+            "a real-symlink host supports the swap"
+        );
+        with_link_mode(LinkMode::Fake, || {
+            assert_eq!(
+                unsupported_swap_transport("probe-host").expect("probe"),
+                Some(SwapUnsupported::SharedRuntimeTree),
+                "a fake-symlink host shares one tree across the profile's sessions"
+            );
+        });
     });
 }
 
@@ -3665,7 +3800,7 @@ fn a_swap_leaves_both_members_out_of_rotation() {
         member_store(&launch);
         member_store(&intended);
 
-        let rt = ProfileRuntime::acquire(&launch, Isolation::Shared, &[]).expect("acquire");
+        let rt = ProfileRuntime::acquire(&launch, Isolation::Shared, &[], false).expect("acquire");
         let sid = live_sid(&rt);
         assert_eq!(
             rt.swap().swap_to("rot-b").expect("swap"),
@@ -3851,7 +3986,7 @@ fn teardown_removes_every_marker_a_swap_stamped() {
         member_store(&launch);
         member_store(&intended);
 
-        let rt = ProfileRuntime::acquire(&launch, Isolation::Shared, &[]).expect("acquire");
+        let rt = ProfileRuntime::acquire(&launch, Isolation::Shared, &[], false).expect("acquire");
         let sid = live_sid(&rt);
         assert_eq!(
             rt.swap().swap_to("down-b").expect("swap"),
@@ -3898,7 +4033,7 @@ fn teardown_leaves_a_swapped_compat_marker_it_never_owned() {
         member_store(&launch);
         member_store(&intended);
 
-        let rt = ProfileRuntime::acquire(&launch, Isolation::Shared, &[]).expect("acquire");
+        let rt = ProfileRuntime::acquire(&launch, Isolation::Shared, &[], false).expect("acquire");
         let sid = live_sid(&rt);
 
         // A live foreign holder already owns the compat path on the member we are

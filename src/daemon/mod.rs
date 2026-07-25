@@ -21,7 +21,9 @@ mod types;
 use probe::{Claim, DaemonLock, StandbySlot, claim_singleton};
 /// The single-fetcher lease + the header dot's daemon presence/health probe
 /// (dual-scheduler dedup, #27).
-pub(crate) use probe::{DaemonHealth, FetchLease, daemon_health};
+pub(crate) use probe::{DaemonHealth, FetchLease, daemon_health, singleton_held};
+#[cfg(test)]
+pub(crate) use probe::{daemon_lock_path, hold_daemon_lock};
 /// Small daemon state types + the backoff schedule, re-exported so callers keep
 /// referencing them as `super::…` after the extraction.
 pub(crate) use types::{SwitchBackoff, switch_backoff_ms};

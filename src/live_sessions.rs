@@ -69,7 +69,12 @@ pub(crate) struct LiveSession {
 impl LiveSession {
     /// A row for a session starting now. Pid, start time, and cwd are read here
     /// rather than passed in, so every registration reports them the same way.
-    pub(crate) fn starting(session_id: &SessionId, start_profile: &str, isolated: bool) -> Self {
+    pub(crate) fn starting(
+        session_id: &SessionId,
+        start_profile: &str,
+        isolated: bool,
+        follows_chain: bool,
+    ) -> Self {
         Self {
             session_id: session_id.as_str().to_string(),
             start_profile: start_profile.to_string(),
@@ -77,9 +82,7 @@ impl LiveSession {
             started_at: crate::usage::now_ms(),
             cwd: std::env::current_dir().ok(),
             isolated,
-            // Phase 3's `--with-fallback` is what will pass this in; until then
-            // the decision leg is inert in production by construction.
-            follows_chain: false,
+            follows_chain,
             intended_member: None,
             chain_cursor: None,
             current_member: None,

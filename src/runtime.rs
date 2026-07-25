@@ -795,6 +795,62 @@ fn swap_support(mode: LinkMode, is_macos: bool) -> Result<(), SwapUnsupported> {
     Ok(())
 }
 
+/// Whether a requested `--with-fallback` opt-in survives to the registry row.
+///
+/// The row must never claim a session follows the chain where the executor
+/// structurally refuses ([`swap_support`], [`SwapRefused::IsolatedSession`]): a
+/// daemon tick landing on such a row writes an intent nothing can execute, and
+/// the executor's refusal dedupe is per `(member, reason)`, so it says so exactly
+/// once into a log nobody is reading. The transport mode is known only inside
+/// [`ProfileRuntime::acquire`]'s state-lock hold — the same hold that writes the
+/// row — so this is where the two are kept consistent. The USER-facing refusal is
+/// `start::run`'s, before a tree is built or `claude` is spawned; this is the
+/// floor under it, not a substitute for it.
+fn chain_opt_in_survives(
+    requested: bool,
+    isolation: Isolation,
+    mode: LinkMode,
+    is_macos: bool,
+) -> bool {
+    requested && isolation == Isolation::Shared && swap_support(mode, is_macos).is_ok()
+}
+
+/// [`swap_support`]'s PLATFORM arm alone, answerable with no disk: the mode is
+/// pinned to the supported transport, so only `is_macos` can fire. `start::run`
+/// asks this before anything fallible, because a verdict fixed at compile time
+/// must not reach the user as a state-lock timeout or an IO error from a probe it
+/// never needed.
+///
+/// Deliberate consequence: on a macOS host that ALSO runs [`LinkMode::Fake`] the
+/// user hears the keychain cause rather than the shared-tree one, inverting
+/// `swap_support`'s own arm precedence. Both arms are unfixable dead ends and the
+/// executor's arm order is untouched, so this only picks which of the two is named.
+pub(crate) fn unsupported_swap_platform(is_macos: bool) -> Option<SwapUnsupported> {
+    swap_support(LinkMode::Real, is_macos).err()
+}
+
+/// [`swap_support`]'s TRANSPORT arm, which is only knowable by probing. Run LAST
+/// among the `--with-fallback` gates: it is the one leg that writes, so a start
+/// refused for any other cause never materializes a profile dir for an account
+/// that never launched.
+///
+/// Probes the profile dir exactly as [`ProfileRuntime::acquire`] does, under the
+/// same state lock, so two concurrent starts cannot interleave their probe
+/// dotfiles and read a spurious [`LinkMode::Fake`]. `is_macos` is pinned false
+/// because [`unsupported_swap_platform`] already owns that arm.
+///
+/// `Ok(None)` is the supported host. An IO failure propagates rather than reading
+/// as either answer — a probe that could not run says nothing about the host.
+pub(crate) fn unsupported_swap_transport(name: &str) -> Result<Option<SwapUnsupported>> {
+    let profile_root = profile_dir(name)?;
+    let mode = with_state_lock(|| {
+        crate::profile::mkdir_700(&profile_root)
+            .with_context(|| format!("failed to create {}", profile_root.display()))?;
+        detect_link_mode(&profile_root)
+    })?;
+    Ok(swap_support(mode, false).err())
+}
+
 /// Why a swap onto a named member did not happen. A VALUE rather than an error:
 /// each arm is a decision the executor takes deliberately, and each is logged,
 /// because a silent refusal leaves the session authenticating as its launch
@@ -1397,6 +1453,7 @@ impl ProfileRuntime {
         profile: &Profile,
         isolation: Isolation,
         active_env_keys: &[String],
+        follows_chain: bool,
     ) -> Result<Self> {
         let name = &profile.name;
         let claude_home = claude_dir()?;
@@ -1486,10 +1543,23 @@ impl ProfileRuntime {
             // failure is reported and stepped over — the session itself is
             // already sound, and failing here would trade a missing row for a
             // dead session.
+            let opt_in =
+                chain_opt_in_survives(follows_chain, isolation, mode, cfg!(target_os = "macos"));
+            // A clamp here means the opt-in asked for something this host's probed
+            // mode cannot support, so the session runs without the chain its caller
+            // asked for — the silent non-switch the flag exists to prevent. Say so
+            // rather than dropping it quietly.
+            if follows_chain && !opt_in {
+                logline!(
+                    "clauth: '{name}' cannot follow the fallback chain on this host; \
+                     the session stays on its launch account"
+                );
+            }
             let row = crate::live_sessions::LiveSession::starting(
                 &session,
                 name,
                 isolation == Isolation::Isolated,
+                opt_in,
             );
             if let Err(e) = crate::live_sessions::register(&row) {
                 logline!("clauth: registering the live session failed: {e}");

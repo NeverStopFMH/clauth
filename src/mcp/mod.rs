@@ -741,7 +741,9 @@ fn run_delegate(opts: DelegateOpts<'_>) -> std::result::Result<serde_json::Value
         .unwrap_or_default();
 
     // Guard kept alive across spawn+wait; dropped on return for RAII teardown.
-    let runtime = ProfileRuntime::acquire(target, opts.isolation, &active_env_keys)
+    // A delegate is a one-shot headless run against a named account, so it never
+    // follows the chain — moving it mid-prompt would change who answered.
+    let runtime = ProfileRuntime::acquire(target, opts.isolation, &active_env_keys, false)
         .map_err(|e| format!("failed to acquire runtime: {e}"))?;
 
     let mut command = crate::runtime::claude_command();

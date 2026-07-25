@@ -1482,6 +1482,14 @@ pub(crate) struct App {
     /// clock ticking past expiry never needs a re-read — only an add / delete /
     /// re-mint does, which `reload_fingerprint` now catches.
     pub(crate) session_tokens: HashMap<String, crate::claude::SessionTokenStatus>,
+    /// Live `clauth start` sessions per account, for the Overview `active`
+    /// column and the Fallback tab's compact equivalent. Cached because
+    /// collecting it is a readdir plus an `open` + `try_lock` per row per marker
+    /// layout, and both surfaces read it every frame. Refreshed by
+    /// [`poll_live_sessions`] rather than on a config reload: sessions come and
+    /// go without touching config.
+    pub(crate) live_sessions: crate::live_sessions::LiveTally,
+    last_live_sessions_refresh: Instant,
 }
 
 /// Read every named profile's long-lived-token status for the Overview cache.
@@ -1733,6 +1741,8 @@ impl App {
             history_cache,
             history_mtimes,
             session_tokens,
+            live_sessions: crate::live_sessions::LiveTally::collect(),
+            last_live_sessions_refresh: Instant::now(),
         }
     }
 
@@ -7261,6 +7271,7 @@ pub(crate) fn on_tick(app: &mut App) {
 
     poll_credentials_divergence(app);
     poll_plugin_refresh(app);
+    poll_live_sessions(app);
     poll_daemon_health(app);
 
     update_banner(app);
@@ -7277,6 +7288,20 @@ fn poll_daemon_health(app: &mut App) {
     }
     app.last_daemon_probe = Instant::now();
     app.daemon_health = crate::daemon::daemon_health();
+}
+
+/// Re-tally the live-session registry for the Overview `active` column and the
+/// Fallback tab, at most once a second — a readdir plus an `open` + `try_lock`
+/// per row is cheap but not per-frame cheap, and a session starting or exiting
+/// is a human-timescale event. Ungated by tab: two tabs read it, and a snapshot
+/// a second stale on arrival would show the wrong fleet for that second.
+fn poll_live_sessions(app: &mut App) {
+    const LIVE_SESSIONS_INTERVAL: Duration = Duration::from_secs(1);
+    if app.last_live_sessions_refresh.elapsed() < LIVE_SESSIONS_INTERVAL {
+        return;
+    }
+    app.last_live_sessions_refresh = Instant::now();
+    app.live_sessions = crate::live_sessions::LiveTally::collect();
 }
 
 /// Plugin tab live refresh: re-run the cheap local checks (session counts + link

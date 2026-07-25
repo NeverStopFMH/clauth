@@ -4983,3 +4983,51 @@ fn startup_overwrite_default_routes_a_shell_through_the_guarded_sink() {
         "Overwrite relinks the live slot to the stored login, replacing the shell",
     );
 }
+
+/// Two render surfaces read `App::live_sessions` every frame, so the leg that
+/// refills it has to actually run on the tick — a snapshot seeded once at
+/// construct would show the fleet as it was when the TUI opened, forever, and
+/// every unit test of the collector would stay green saying so.
+#[test]
+fn a_tick_re_tallies_live_sessions_that_appeared_after_startup() {
+    use crate::profile::{AppConfig, AppState, Profile};
+    use std::time::{Duration, Instant};
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = App::new(AppConfig {
+        state: AppState::default(),
+        profiles: vec![Profile::new("late".to_string(), None, None)],
+    });
+    assert_eq!(
+        app.live_sessions.member("late").sessions,
+        0,
+        "the sandbox starts with an empty registry"
+    );
+    // Nothing must spawn a bootstrap thread out of this tick.
+    app.bootstrap_started = true;
+
+    let sid = "4242-7";
+    let row = crate::live_sessions::LiveSession {
+        session_id: sid.to_string(),
+        start_profile: "late".to_string(),
+        pid: 4242,
+        started_at: 1_700_000_000_000,
+        cwd: None,
+        isolated: false,
+        follows_chain: false,
+        intended_member: None,
+        chain_cursor: None,
+        current_member: None,
+        last_swap_at: None,
+    };
+    crate::live_sessions::register(&row).expect("register row");
+    let _marker = crate::runtime::hold_session_row_marker("late", false, sid)
+        .expect("hold the session's marker");
+
+    // Past the refresh interval, which `App::new` starts the clock on.
+    app.last_live_sessions_refresh = Instant::now()
+        .checked_sub(Duration::from_secs(5))
+        .expect("a clock 5s in the past");
+    super::on_tick(&mut app);
+
+    assert_eq!(app.live_sessions.member("late").sessions, 1);
+}

@@ -1236,6 +1236,65 @@ fn usage_tab_reset_follows_the_reset_display_setting() {
     );
 }
 
+/// The overview accounts table's width budget, pinned at the FRAME across every
+/// tier boundary the column algorithm has. Every new column plays by the reset
+/// column's rule — it may spend leftover slack and it may be dropped whole, but
+/// it may never cost a bar or a reset at any width — and the only way to catch a
+/// breach is to count what a real render puts on screen.
+///
+/// The expected counts are the behavior BEFORE the `active` column existed, so a
+/// column that pays for itself out of a tier instead of out of slack reds here
+/// rather than silently deleting a bar at some width nobody tests by hand (which
+/// is exactly what the 2026-07-19 reset-column cut did).
+#[test]
+fn the_overview_column_budget_never_pays_for_a_new_column_with_an_old_one() {
+    use crate::tui::app::Tab;
+
+    let mut profile = oauth("a", 40.0, 60.0, false);
+    let now = crate::usage::now_epoch_secs();
+    if let Some(u) = profile.usage.as_mut() {
+        if let Some(w) = u.five_hour.as_mut() {
+            w.resets_at = Some(crate::usage::epoch_secs_to_iso(now + 3 * 3600));
+        }
+        if let Some(w) = u.seven_day.as_mut() {
+            w.resets_at = Some(crate::usage::epoch_secs_to_iso(now + 4 * 86400));
+        }
+    }
+    let mut app = App::new(AppConfig {
+        state: AppState::default(),
+        profiles: vec![profile],
+    });
+    app.tab = Tab::Overview;
+
+    // A bar is 10 interior cells in brackets, always trailed by its percentage —
+    // specific enough that no pill or chip elsewhere in the frame can match it.
+    let bar = regex::Regex::new(r"\[[^\[\]]{10}\] +\d+%").expect("valid pattern");
+    let reset_cell = regex::Regex::new(r"% \([^)]+\)").expect("valid pattern");
+
+    // Pre-change behavior as a function of TERMINAL width (the accounts area is
+    // narrower by the frame's own chrome, so these are not the column tiers
+    // spelled in `OverviewWidths`). The 5h bar arrives first, then its reset,
+    // then the 7d column brings its bar and reset together.
+    const FIRST_BAR: u16 = 68;
+    const FIRST_RESET: u16 = 85;
+    const SEVEN_DAY: u16 = 106;
+
+    for width in 34u16..=200 {
+        let frame = dump(&app, width, 20);
+        let bars = usize::from(width >= FIRST_BAR) + usize::from(width >= SEVEN_DAY);
+        let resets = usize::from(width >= FIRST_RESET) + usize::from(width >= SEVEN_DAY);
+        assert_eq!(
+            (
+                bar.find_iter(&frame).count(),
+                reset_cell.find_iter(&frame).count()
+            ),
+            (bars, resets),
+            "the accounts row at {width} cols must still carry {bars} bars and \
+             {resets} resets:\n{frame}"
+        );
+    }
+}
+
 /// The overview column is the one reset surface with a width budget, and no
 /// frame test covered it — which is how a first cut shipped that DELETED the
 /// countdown (and the 7d bar with it) at widths between the old and new tiers.

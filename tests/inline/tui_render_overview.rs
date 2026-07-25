@@ -599,14 +599,15 @@ fn gap_widening_never_clips_the_row() {
     let app = App::new(config);
     for width in 34u16..=200 {
         let w = OverviewWidths::new(width, &app);
-        let min = fixed_overview_width(w.name, w.kind, w.five_hour, w.seven_day, 2) + TIMER_SLOT;
+        let min = fixed_overview_width(w.name, w.kind, w.five_hour, w.seven_day, w.active, 2)
+            + TIMER_SLOT;
         if min > width as usize {
             // Below this the shrink loop has already bottomed out and the row
             // deliberately overflows-and-clips; gap widening isn't the cause.
             continue;
         }
-        let used =
-            fixed_overview_width(w.name, w.kind, w.five_hour, w.seven_day, w.gap) + TIMER_SLOT;
+        let used = fixed_overview_width(w.name, w.kind, w.five_hour, w.seven_day, w.active, w.gap)
+            + TIMER_SLOT;
         assert!(
             used <= width as usize,
             "row overflows at width {width}: used {used} (gap {})",
@@ -1241,4 +1242,160 @@ fn fallback_panel_marks_a_blocked_member() {
         joined.contains('×'),
         "blocked member shows × in the panel:\n{joined}"
     );
+}
+
+// ── live-session `active` column ─────────────────────────────────────────────
+
+/// One live session's registry row. `start_profile` doubles as the account it is
+/// on: a session that never swapped runs where it launched, and the swap
+/// attribution itself is pinned in `live_sessions.rs`'s own tests.
+fn live_row(
+    session_id: &str,
+    member: &str,
+    follows_chain: bool,
+) -> crate::live_sessions::LiveSession {
+    crate::live_sessions::LiveSession {
+        session_id: session_id.to_string(),
+        start_profile: member.to_string(),
+        pid: 4242,
+        started_at: 1_700_000_000_000,
+        cwd: None,
+        isolated: false,
+        follows_chain,
+        intended_member: None,
+        chain_cursor: None,
+        current_member: None,
+        last_swap_at: None,
+    }
+}
+
+/// The cell sitting under the `active` header on `row`, padding included, so the
+/// pin is an exact value AND proves the cell is aligned under its own header.
+fn active_cell_text(widths: &OverviewWidths, row: &Line<'static>) -> String {
+    let header = line_text(&overview_header(widths));
+    let col = header
+        .find("active")
+        .expect("the accounts table carries an `active` header");
+    line_text(row).chars().skip(col).collect()
+}
+
+/// The column answers "how many `clauth start` sessions are on this account",
+/// with `⇄` marking that at least one of them can be moved by the chain. It is
+/// DISTINCT from the leading `●`, which marks the one profile a bare `claude`
+/// authenticates as — an account can carry either, both, or neither.
+#[test]
+fn the_active_column_counts_live_sessions_and_marks_chain_followers() {
+    let mut app = App::new(config_with(
+        vec![
+            profile("main", 95.0, 10.0, 3600),
+            profile("spare", 95.0, 20.0, 3600),
+        ],
+        Some("main"),
+        vec![],
+    ));
+    app.live_sessions = crate::live_sessions::LiveTally::of([
+        live_row("4242-0", "main", true),
+        live_row("4242-1", "main", false),
+        live_row("4242-2", "spare", false),
+    ]);
+
+    let widths = OverviewWidths::new(160, &app);
+    let main = render_overview_row(&app, 0, &widths, false, false);
+    let spare = render_overview_row(&app, 1, &widths, false, false);
+
+    assert_eq!(
+        active_cell_text(&widths, &main),
+        "2⇄    ",
+        "two sessions, one of them steerable"
+    );
+    assert_eq!(
+        active_cell_text(&widths, &spare),
+        "1     ",
+        "a pinned session still holds the account and burns its window, but no `⇄`"
+    );
+}
+
+/// Zero renders as nothing — cloudy-tui hides a zero count rather than printing
+/// it, and a table full of `0`s would drown the accounts that do host something.
+#[test]
+fn an_account_with_no_live_sessions_renders_a_blank_active_cell() {
+    let mut app = App::new(config_with(
+        vec![profile("main", 95.0, 10.0, 3600)],
+        Some("main"),
+        vec![],
+    ));
+    app.live_sessions = crate::live_sessions::LiveTally::of([live_row("4242-0", "other", true)]);
+
+    let widths = OverviewWidths::new(160, &app);
+    let row = render_overview_row(&app, 0, &widths, false, false);
+
+    assert_eq!(active_cell_text(&widths, &row), "      ");
+}
+
+/// The column is budgeted on WIDTH alone. Were it budgeted on whether anything
+/// is live, the whole table would reflow the moment someone ran `clauth start`
+/// and reflow back when that session exited — so an empty fleet must lay the
+/// table out exactly as a busy one does.
+#[test]
+fn the_active_column_holds_its_place_while_nothing_is_live() {
+    let mut app = App::new(config_with(
+        vec![profile("main", 95.0, 10.0, 3600)],
+        Some("main"),
+        vec![],
+    ));
+
+    let idle_widths = OverviewWidths::new(160, &app);
+    let idle_header = line_text(&overview_header(&idle_widths));
+    let idle_row = line_text(&render_overview_row(&app, 0, &idle_widths, false, false));
+
+    app.live_sessions = crate::live_sessions::LiveTally::of([live_row("4242-0", "main", true)]);
+    let busy_widths = OverviewWidths::new(160, &app);
+    let busy_header = line_text(&overview_header(&busy_widths));
+    let busy_row = line_text(&render_overview_row(&app, 0, &busy_widths, false, false));
+
+    assert_eq!(idle_header, busy_header, "the header must not move");
+    let col = idle_header.find("active").expect("an `active` header");
+    assert_eq!(
+        idle_row.chars().take(col).collect::<String>(),
+        busy_row.chars().take(col).collect::<String>(),
+        "no column left of `active` may shift when a session appears"
+    );
+}
+
+/// A column that overflows its row is not dropped, it is CLIPPED — and the
+/// clipping is invisible from a bar/reset count, because the tail ratatui throws
+/// away is this column itself. So the fit gate needs its own pin: below the
+/// width that pays for it the column must be absent, and above it the assembled
+/// row must still fit.
+#[test]
+fn the_active_column_is_dropped_rather_than_clipped_when_it_does_not_fit() {
+    let mut app = App::new(config_with(
+        vec![profile("main", 95.0, 10.0, 3600)],
+        Some("main"),
+        vec![],
+    ));
+    app.live_sessions = crate::live_sessions::LiveTally::of([live_row("4242-0", "main", true)]);
+
+    for width in 34u16..=200 {
+        let widths = OverviewWidths::new(width, &app);
+        let header = line_text(&overview_header(&widths));
+        if widths.active == 0 {
+            assert!(
+                !header.contains("active"),
+                "no column means no header at {width} cols: {header:?}"
+            );
+            continue;
+        }
+        let row = line_text(&render_overview_row(&app, 0, &widths, false, false));
+        assert!(
+            header.chars().count() <= width as usize,
+            "the header overflows at {width} cols ({} cells): {header:?}",
+            header.chars().count()
+        );
+        assert!(
+            row.chars().count() <= width as usize,
+            "the row overflows at {width} cols ({} cells): {row:?}",
+            row.chars().count()
+        );
+    }
 }

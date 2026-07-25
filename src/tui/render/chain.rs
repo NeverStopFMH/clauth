@@ -100,10 +100,23 @@ fn draw_chain_selector(frame: &mut Frame<'_>, area: Rect, app: &App, focused: bo
                             bold_when(name_color(cfg.is_active(&name)), selected && focused)
                         };
                         let mut spans = vec![rail, Span::styled(name.clone(), ns)];
-                        if let Some(reason) = cfg
+                        let reason = cfg
                             .find(&name)
-                            .and_then(|p| blocked_reason(&cfg, p, kick_lifts.get(&name).copied()))
-                        {
+                            .and_then(|p| blocked_reason(&cfg, p, kick_lifts.get(&name).copied()));
+                        // The Overview `active` column's compact half: it rides
+                        // the member's own row rather than the pane edge, so it
+                        // reads as part of the data it counts. Dropped whole
+                        // when the row cannot hold it AND the reason marker
+                        // plus a cell of air — the marker is the persistent
+                        // block signal and outranks an ambient tally.
+                        if let Some(tally) = live_session_span(app.live_sessions.member(&name)) {
+                            let used: usize = spans.iter().map(|s| s.width()).sum();
+                            let reserved = usize::from(reason.is_some()) + 1;
+                            if used + tally.width() + reserved <= w as usize {
+                                spans.push(tally);
+                            }
+                        }
+                        if let Some(reason) = reason {
                             // Right-align the 1-cell blocked-reason marker at the
                             // row's last content column (the scrollbar owns the
                             // padding cell beyond it, so they never collide).
@@ -179,6 +192,7 @@ fn draw_chain_detail(frame: &mut Frame<'_>, area: Rect, app: &App) {
                     app.fallback_weekly_draft.as_ref(),
                     inner_w,
                     kick_lift,
+                    app.live_sessions.member(&name),
                 );
                 (name, true, lines, rows_start)
             }
@@ -381,6 +395,70 @@ fn reason_fix(reason: &BlockedReason, name: &str) -> String {
     }
 }
 
+/// The chain row's live-session tally — the Overview `active` cell compressed
+/// onto one span, leading gap included so a caller can measure it whole. `None`
+/// for an account hosting nothing, which is what keeps a chain of idle accounts
+/// free of a column of zeroes.
+fn live_session_span(sessions: crate::live_sessions::MemberSessions) -> Option<Span<'static>> {
+    if sessions.sessions == 0 {
+        return None;
+    }
+    let follows = if sessions.following > 0 { "⇄" } else { "" };
+    Some(Span::styled(
+        format!("  {}{follows}", sessions.sessions),
+        theme::faint(),
+    ))
+}
+
+/// The member card's live-session block: how many `clauth start` sessions are
+/// running as THIS member and how many of them the chain may move, plus — only
+/// once one of them has actually swapped — when that happened and the caveat
+/// that makes the figure honest.
+///
+/// Claude Code re-reads its credentials on its NEXT REQUEST, an mtime `stat` on
+/// the request path with no watcher behind it
+/// (`docs/plan/multi-session-fallback.md` §12), so a session that just swapped
+/// keeps authenticating as the old member until it next talks. `current_member`
+/// is therefore where clauth PUT the link, not who is being billed this second,
+/// and nothing in the registry can observe the pickup — hence a caveat rather
+/// than an invented "not yet picked up" state. A session that never swapped has
+/// no repointed link and so gets no caveat.
+fn live_session_lines(
+    sessions: crate::live_sessions::MemberSessions,
+    width: usize,
+) -> Vec<Line<'static>> {
+    if sessions.sessions == 0 {
+        return Vec::new();
+    }
+    let value = if sessions.following > 0 {
+        format!("{} ({} following)", sessions.sessions, sessions.following)
+    } else {
+        sessions.sessions.to_string()
+    };
+    let mut lines = vec![Line::from(vec![
+        Span::styled(key_cell("sessions", KEY_W, KEY_GUTTER), theme::label()),
+        Span::styled(value, theme::dim()),
+    ])];
+    let Some(at) = sessions.last_swap_at else {
+        return lines;
+    };
+    // `max(1)` keeps a swap that landed this same second out of
+    // `humanize_duration`'s "now", which would read "now ago".
+    let ago = (crate::usage::now_ms().saturating_sub(at) / 1000).max(1);
+    lines.push(Line::from(vec![
+        Span::styled(key_cell("last swap", KEY_W, KEY_GUTTER), theme::label()),
+        Span::styled(
+            format!("{} ago", humanize_duration(ago as i64)),
+            theme::dim(),
+        ),
+    ]));
+    lines.extend(help_tooltip_lines(
+        "picked up on the session's next request",
+        width,
+    ));
+    lines
+}
+
 /// The blocked-reason pill block: each pill on its own row with its `└` fix
 /// line, connected into one `├│└` rail when 2+ stack (cloudy-tui Stacked
 /// hints). The first row carries the `status` key so the rail has a column to
@@ -428,6 +506,7 @@ fn member_detail(
     weekly_editing: Option<&InputState>,
     width: usize,
     kick_lift: Option<i64>,
+    sessions: crate::live_sessions::MemberSessions,
 ) -> (Vec<Line<'static>>, usize) {
     let Some(profile) = cfg.find(name) else {
         return (
@@ -493,6 +572,7 @@ fn member_detail(
         Span::raw(" ".repeat(KEY_W + KEY_GUTTER)),
         Span::styled(figure, theme::faint()),
     ]));
+    lines.extend(live_session_lines(sessions, width));
     lines.push(Line::from(""));
 
     // Where the FALLBACK_ROWS loop starts, taken from the buffer itself rather

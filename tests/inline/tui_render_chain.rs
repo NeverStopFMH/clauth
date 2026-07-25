@@ -72,11 +72,37 @@ fn all_exhausted_shows_resumes_hint_under_any_selected_member() {
     let b = profile("b", 95.0, 100.0, 1800);
     let cfg = config_with(vec![a, b], Some("a"), vec!["a", "b"]);
 
-    let on_a = member_detail(&cfg, "a", false, 0, false, None, None, None, 60, None).0;
+    let on_a = member_detail(
+        &cfg,
+        "a",
+        false,
+        0,
+        false,
+        None,
+        None,
+        None,
+        60,
+        None,
+        Default::default(),
+    )
+    .0;
     let hint_a = resumes_line(&on_a).expect("resumes hint renders while viewing member a");
     assert!(hint_a.contains("resumes: b in ~"), "{hint_a}");
 
-    let on_b = member_detail(&cfg, "b", false, 0, false, None, None, None, 60, None).0;
+    let on_b = member_detail(
+        &cfg,
+        "b",
+        false,
+        0,
+        false,
+        None,
+        None,
+        None,
+        60,
+        None,
+        Default::default(),
+    )
+    .0;
     let hint_b = resumes_line(&on_b).expect("resumes hint renders while viewing member b");
     assert!(hint_b.contains("resumes: b in ~"), "{hint_b}");
 }
@@ -88,7 +114,20 @@ fn partially_exhausted_chain_hides_resumes_hint() {
     let b = profile("b", 95.0, 20.0, 3600);
     let cfg = config_with(vec![a, b], Some("a"), vec!["a", "b"]);
 
-    let lines = member_detail(&cfg, "a", false, 0, false, None, None, None, 60, None).0;
+    let lines = member_detail(
+        &cfg,
+        "a",
+        false,
+        0,
+        false,
+        None,
+        None,
+        None,
+        60,
+        None,
+        Default::default(),
+    )
+    .0;
     assert!(
         resumes_line(&lines).is_none(),
         "must not show when the chain isn't fully exhausted"
@@ -110,7 +149,20 @@ fn last_resort_hint_wraps_on_a_narrow_pane() {
         .iter()
         .position(|r| *r == FallbackRow::LastResort)
         .unwrap();
-    let lines = member_detail(&cfg, "a", true, lr, false, None, None, None, 28, None).0;
+    let lines = member_detail(
+        &cfg,
+        "a",
+        true,
+        lr,
+        false,
+        None,
+        None,
+        None,
+        28,
+        None,
+        Default::default(),
+    )
+    .0;
     let texts: Vec<String> = lines.iter().map(line_text).collect();
     let lead = texts
         .iter()
@@ -138,7 +190,20 @@ fn last_resort_hint_names_the_currently_marked_member() {
     b.last_resort = true;
     let cfg = config_with(vec![a, b], Some("a"), vec!["a", "b"]);
 
-    let lines = member_detail(&cfg, "a", true, 4, false, None, None, None, 80, None).0;
+    let lines = member_detail(
+        &cfg,
+        "a",
+        true,
+        4,
+        false,
+        None,
+        None,
+        None,
+        80,
+        None,
+        Default::default(),
+    )
+    .0;
     let hint = lines
         .iter()
         .map(line_text)
@@ -153,11 +218,23 @@ fn last_resort_hint_names_the_currently_marked_member() {
 fn usage_gate_rows_hint_the_current_state() {
     let texts = |p: Profile, cursor: usize| -> Vec<String> {
         let cfg = config_with(vec![p], Some("a"), vec!["a"]);
-        member_detail(&cfg, "a", true, cursor, false, None, None, None, 80, None)
-            .0
-            .iter()
-            .map(line_text)
-            .collect()
+        member_detail(
+            &cfg,
+            "a",
+            true,
+            cursor,
+            false,
+            None,
+            None,
+            None,
+            80,
+            None,
+            Default::default(),
+        )
+        .0
+        .iter()
+        .map(line_text)
+        .collect()
     };
 
     // FALLBACK_ROWS[2] == CheckWeekly.
@@ -211,7 +288,20 @@ fn scoped_spent_pill_names_the_window_and_respects_the_gate() {
     };
 
     let cfg = config_with(vec![scoped(true)], Some("a"), vec!["a"]);
-    let lines = member_detail(&cfg, "a", false, 0, false, None, None, None, 80, None).0;
+    let lines = member_detail(
+        &cfg,
+        "a",
+        false,
+        0,
+        false,
+        None,
+        None,
+        None,
+        80,
+        None,
+        Default::default(),
+    )
+    .0;
     let pill = lines
         .iter()
         .map(line_text)
@@ -220,7 +310,20 @@ fn scoped_spent_pill_names_the_window_and_respects_the_gate() {
     assert!(pill.contains("other models ok"), "{pill}");
 
     let cfg = config_with(vec![scoped(false)], Some("a"), vec!["a"]);
-    let lines = member_detail(&cfg, "a", false, 0, false, None, None, None, 80, None).0;
+    let lines = member_detail(
+        &cfg,
+        "a",
+        false,
+        0,
+        false,
+        None,
+        None,
+        None,
+        80,
+        None,
+        Default::default(),
+    )
+    .0;
     assert!(
         !lines.iter().map(line_text).any(|t| t.contains("7d fable")),
         "gate off must drop the scoped pill"
@@ -290,11 +393,23 @@ fn value_col(key: &str, rendered: &str) -> usize {
 fn last_resort_value_aligns_with_other_rows() {
     let a = profile("a", 95.0, 20.0, 3600);
     let cfg = config_with(vec![a], Some("a"), vec!["a"]);
-    let texts: Vec<String> = member_detail(&cfg, "a", true, 1, false, None, None, None, 60, None)
-        .0
-        .iter()
-        .map(line_text)
-        .collect();
+    let texts: Vec<String> = member_detail(
+        &cfg,
+        "a",
+        true,
+        1,
+        false,
+        None,
+        None,
+        None,
+        60,
+        None,
+        Default::default(),
+    )
+    .0
+    .iter()
+    .map(line_text)
+    .collect();
 
     let rotate = texts
         .iter()
@@ -339,12 +454,24 @@ fn last_resort_value_aligns_with_other_rows() {
 fn max_spend_row_renders_off_at_zero_and_dollars_when_set() {
     let cfg = config_with(vec![profile("a", 95.0, 20.0, 3600)], Some("a"), vec!["a"]);
     let row = |c: &crate::profile::AppConfig| -> String {
-        member_detail(c, "a", true, 1, false, None, None, None, 60, None)
-            .0
-            .iter()
-            .map(line_text)
-            .find(|t| t.contains("max spend"))
-            .expect("max spend row")
+        member_detail(
+            c,
+            "a",
+            true,
+            1,
+            false,
+            None,
+            None,
+            None,
+            60,
+            None,
+            Default::default(),
+        )
+        .0
+        .iter()
+        .map(line_text)
+        .find(|t| t.contains("max spend"))
+        .expect("max spend row")
     };
     assert!(
         row(&cfg).contains("off"),
@@ -527,7 +654,20 @@ fn blocked_reason_never_reports_disabled_for_the_active_profile() {
 #[test]
 fn blocked_member_shows_the_worst_reason_pill() {
     let cfg = config_with(vec![profile("a", 95.0, 97.0, 7200)], Some("a"), vec!["a"]);
-    let lines = member_detail(&cfg, "a", false, 0, false, None, None, None, 60, None).0;
+    let lines = member_detail(
+        &cfg,
+        "a",
+        false,
+        0,
+        false,
+        None,
+        None,
+        None,
+        60,
+        None,
+        Default::default(),
+    )
+    .0;
     let pill = line_text(&lines[0]);
     assert!(pill.contains('['), "renders as a status pill: {pill:?}");
     assert!(
@@ -561,6 +701,7 @@ fn kick_rejected_member_shows_the_claude_code_blocked_pill() {
         None,
         60,
         Some(until),
+        Default::default(),
     )
     .0;
     let pill = line_text(&lines[0]);
@@ -599,7 +740,20 @@ fn canceled_member_shows_the_short_shared_label() {
 #[test]
 fn headroom_member_shows_no_reason_pill() {
     let cfg = config_with(vec![profile("a", 95.0, 40.0, 7200)], Some("a"), vec!["a"]);
-    let lines = member_detail(&cfg, "a", false, 0, false, None, None, None, 60, None).0;
+    let lines = member_detail(
+        &cfg,
+        "a",
+        false,
+        0,
+        false,
+        None,
+        None,
+        None,
+        60,
+        None,
+        Default::default(),
+    )
+    .0;
     let first = line_text(&lines[0]);
     assert!(
         !first.contains('['),
@@ -623,8 +777,19 @@ fn headroom_member_shows_no_reason_pill() {
 #[test]
 fn member_detail_rows_start_indexes_the_first_fallback_row_at_every_header_height() {
     let at_width = |cfg: &AppConfig, width: usize| -> (usize, usize) {
-        let (lines, rows_start) =
-            member_detail(cfg, "a", false, 0, false, None, None, None, width, None);
+        let (lines, rows_start) = member_detail(
+            cfg,
+            "a",
+            false,
+            0,
+            false,
+            None,
+            None,
+            None,
+            width,
+            None,
+            Default::default(),
+        );
         let first_row_at = lines
             .iter()
             .position(|l| line_text(l).contains("rotate at"))
@@ -826,7 +991,19 @@ fn member_detail_stacks_the_health_pill_under_disabled() {
     // Both pills on one `├│└` rail, each with its own fix line. The first row
     // carries the `status` key so the rail has a column to anchor against; the
     // second bridges with `│` at col 0 while the rail is still open.
-    let (lines, _) = member_detail(&cfg, "a", false, 0, false, None, None, None, 60, None);
+    let (lines, _) = member_detail(
+        &cfg,
+        "a",
+        false,
+        0,
+        false,
+        None,
+        None,
+        None,
+        60,
+        None,
+        Default::default(),
+    );
     let block: Vec<String> = lines.iter().take(4).map(line_text).collect();
     assert_eq!(
         block,
@@ -844,7 +1021,19 @@ fn member_detail_stacks_the_health_pill_under_disabled() {
     e.disabled = false;
     let mut enabled = config_with(vec![e], Some("other"), vec!["a"]);
     enabled.state.auth_broken.push("a".into());
-    let (lines, _) = member_detail(&enabled, "a", false, 0, false, None, None, None, 60, None);
+    let (lines, _) = member_detail(
+        &enabled,
+        "a",
+        false,
+        0,
+        false,
+        None,
+        None,
+        None,
+        60,
+        None,
+        Default::default(),
+    );
     assert_eq!(
         lines.iter().take(2).map(line_text).collect::<Vec<_>>(),
         vec![
@@ -977,7 +1166,20 @@ fn max_spend_dims_when_spend_budget_is_off() {
     let mut cfg = config_with(vec![profile("a", 95.0, 40.0, 3600)], Some("a"), vec!["a"]);
     cfg.profiles[0].max_auto_spend = Some(25.0);
 
-    let off = member_detail(&cfg, "a", true, 2, false, None, None, None, 60, None).0;
+    let off = member_detail(
+        &cfg,
+        "a",
+        true,
+        2,
+        false,
+        None,
+        None,
+        None,
+        60,
+        None,
+        Default::default(),
+    )
+    .0;
     let off_val = off
         .iter()
         .find_map(|l| span_style(l, "$25.00"))
@@ -989,7 +1191,20 @@ fn max_spend_dims_when_spend_budget_is_off() {
     );
 
     cfg.state.spend_budget_switching = true;
-    let on = member_detail(&cfg, "a", true, 2, false, None, None, None, 60, None).0;
+    let on = member_detail(
+        &cfg,
+        "a",
+        true,
+        2,
+        false,
+        None,
+        None,
+        None,
+        60,
+        None,
+        Default::default(),
+    )
+    .0;
     let on_val = on
         .iter()
         .find_map(|l| span_style(l, "$25.00"))
@@ -1008,11 +1223,23 @@ fn max_spend_dims_when_spend_budget_is_off() {
 fn weekly_at_row_distinguishes_default_override_and_gated_off() {
     let row_texts = |p: Profile| -> Vec<String> {
         let cfg = config_with(vec![p], Some("a"), vec!["a"]);
-        member_detail(&cfg, "a", true, 1, false, None, None, None, 80, None)
-            .0
-            .iter()
-            .map(line_text)
-            .collect()
+        member_detail(
+            &cfg,
+            "a",
+            true,
+            1,
+            false,
+            None,
+            None,
+            None,
+            80,
+            None,
+            Default::default(),
+        )
+        .0
+        .iter()
+        .map(line_text)
+        .collect()
     };
 
     let unset = row_texts(profile("a", 95.0, 20.0, 3600));
@@ -1067,11 +1294,23 @@ fn weekly_at_row_distinguishes_default_override_and_gated_off() {
 fn weekly_at_default_reminder_only_shows_when_value_differs_from_default() {
     let row_texts = |p: Profile| -> Vec<String> {
         let cfg = config_with(vec![p], Some("a"), vec!["a"]);
-        member_detail(&cfg, "a", true, 1, false, None, None, None, 80, None)
-            .0
-            .iter()
-            .map(line_text)
-            .collect()
+        member_detail(
+            &cfg,
+            "a",
+            true,
+            1,
+            false,
+            None,
+            None,
+            None,
+            80,
+            None,
+            Default::default(),
+        )
+        .0
+        .iter()
+        .map(line_text)
+        .collect()
     };
 
     // Chain-wide default is 98% (`DEFAULT_WEEKLY_SWITCH_PCT`); an override set
@@ -1134,5 +1373,235 @@ fn edit_glyph_is_bold_like_the_selection_caret() {
         glyph.style.fg,
         theme::accent().fg,
         "edit glyph stays accent"
+    );
+}
+
+// ── live sessions on the chain ───────────────────────────────────────────────
+
+/// One live session's registry row, running as the account it launched on. The
+/// swap attribution itself is pinned in `live_sessions.rs`'s own tests.
+fn live_row(
+    session_id: &str,
+    member: &str,
+    follows_chain: bool,
+    last_swap_at: Option<u64>,
+) -> crate::live_sessions::LiveSession {
+    crate::live_sessions::LiveSession {
+        session_id: session_id.to_string(),
+        start_profile: member.to_string(),
+        pid: 4242,
+        started_at: 1_700_000_000_000,
+        cwd: None,
+        isolated: false,
+        follows_chain,
+        intended_member: None,
+        chain_cursor: None,
+        current_member: None,
+        last_swap_at,
+    }
+}
+
+/// The selector's compact half of the Overview `active` column: a count plus the
+/// `⇄` follower mark, riding the member's own row rather than flying out to the
+/// pane edge. It must not collide with the right-aligned blocked-reason marker
+/// or push it off the row.
+#[test]
+fn a_chain_row_carries_its_live_session_count_beside_the_blocked_reason_marker() {
+    let mut app = App::new(config_with(
+        vec![
+            profile("busy", 95.0, 10.0, 3600),
+            profile("idle", 95.0, 10.0, 3600),
+        ],
+        None,
+        vec!["busy", "idle"],
+    ));
+    app.live_sessions = crate::live_sessions::LiveTally::of([
+        live_row("4242-0", "busy", true, None),
+        live_row("4242-1", "busy", false, None),
+    ]);
+
+    let (w, h) = (100u16, 14u16);
+    let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+    term.draw(|f| super::draw(f, f.area(), &app)).unwrap();
+    let rows = crate::testutil::buffer_rows(term.backend().buffer());
+
+    let selector_row = |name: &str| -> String {
+        rows.iter()
+            .find(|r| r.contains(&format!(" {name}")) && r.contains('#'))
+            .unwrap_or_else(|| panic!("no selector row for {name}:\n{}", rows.join("\n")))
+            .clone()
+    };
+    assert!(
+        selector_row("busy").contains("busy  2⇄"),
+        "the tally rides the member's own row:\n{}",
+        selector_row("busy")
+    );
+    assert!(
+        !selector_row("idle").contains('⇄'),
+        "an account hosting nothing carries no tally:\n{}",
+        selector_row("idle")
+    );
+}
+
+/// Text of every line in the member card, trimmed, for exact-vec assertions.
+fn card_texts(lines: &[Line<'static>]) -> Vec<String> {
+    lines
+        .iter()
+        .map(|l| {
+            l.spans
+                .iter()
+                .map(|s| s.content.as_ref())
+                .collect::<String>()
+                .trim_end()
+                .to_string()
+        })
+        .collect()
+}
+
+/// The card carries the nuance the Overview column has no room for. A session
+/// that never swapped needs no caveat — its credential link was never repointed,
+/// so nothing is lagging — and so gets the count alone.
+#[test]
+fn the_member_card_names_live_sessions_without_a_caveat_until_one_has_swapped() {
+    let cfg = config_with(vec![profile("a", 95.0, 10.0, 3600)], None, vec!["a"]);
+    let sessions = crate::live_sessions::LiveTally::of([
+        live_row("4242-0", "a", true, None),
+        live_row("4242-1", "a", false, None),
+    ])
+    .member("a");
+
+    let lines = member_detail(
+        &cfg, "a", false, 0, false, None, None, None, 60, None, sessions,
+    )
+    .0;
+    let texts = card_texts(&lines);
+
+    assert!(
+        texts.contains(&"sessions     2 (1 following)".to_string()),
+        "the card counts every live session and how many the chain can move:\n{texts:#?}"
+    );
+    assert!(
+        !texts.iter().any(|t| t.contains("last swap")),
+        "nothing has swapped, so there is no swap to date:\n{texts:#?}"
+    );
+    assert!(
+        !texts.iter().any(|t| t.contains("next request")),
+        "no repointed link means no pickup lag to warn about:\n{texts:#?}"
+    );
+}
+
+/// Once a session HAS swapped onto this member, `current_member` stops being an
+/// instantaneous fact: Claude Code re-reads its credentials on its next request
+/// and nothing observes the pickup (`docs/plan/multi-session-fallback.md` §12).
+/// The card says so rather than inventing a "not yet picked up" state the
+/// registry cannot see.
+#[test]
+fn the_member_card_dates_the_last_swap_and_says_when_it_is_picked_up() {
+    let cfg = config_with(vec![profile("a", 95.0, 10.0, 3600)], None, vec!["a"]);
+    let swapped_at = crate::usage::now_ms().saturating_sub(12_000);
+    let sessions =
+        crate::live_sessions::LiveTally::of([live_row("4242-0", "a", true, Some(swapped_at))])
+            .member("a");
+
+    let lines = member_detail(
+        &cfg, "a", false, 0, false, None, None, None, 60, None, sessions,
+    )
+    .0;
+    let texts = card_texts(&lines);
+
+    assert!(
+        texts.contains(&"sessions     1 (1 following)".to_string()),
+        "{texts:#?}"
+    );
+    assert!(
+        texts.contains(&"last swap    12s ago".to_string()),
+        "the swap is dated relative, like every other stamp in the app:\n{texts:#?}"
+    );
+    assert!(
+        texts.contains(&" └ picked up on the session's next request".to_string()),
+        "the pickup caveat rides the card's own hint grammar:\n{texts:#?}"
+    );
+}
+
+/// An account hosting nothing says nothing — the block is absent entirely rather
+/// than reading `sessions 0`, matching the Overview cell's blank.
+#[test]
+fn the_member_card_omits_the_session_block_when_nothing_is_live() {
+    let cfg = config_with(vec![profile("a", 95.0, 10.0, 3600)], None, vec!["a"]);
+
+    let lines = member_detail(
+        &cfg,
+        "a",
+        false,
+        0,
+        false,
+        None,
+        None,
+        None,
+        60,
+        None,
+        crate::live_sessions::MemberSessions::default(),
+    )
+    .0;
+
+    assert!(
+        !card_texts(&lines).iter().any(|t| t.contains("sessions")),
+        "no live session means no session row at all"
+    );
+}
+
+/// The tally is ambient; the blocked-reason marker is the persistent signal that
+/// this member is out of rotation. A row too narrow for both drops the tally and
+/// keeps the marker — never the other way round, and never by overflowing the
+/// row so ratatui clips whichever lands last.
+#[test]
+fn a_narrow_chain_row_drops_the_live_tally_before_the_reason_marker() {
+    let mut disabled = profile("acct-twelve1", 95.0, 10.0, 3600);
+    disabled.disabled = true;
+    let mut app = App::new(config_with(vec![disabled], None, vec!["acct-twelve1"]));
+    app.live_sessions =
+        crate::live_sessions::LiveTally::of([live_row("4242-0", "acct-twelve1", true, None)]);
+
+    let (w, h) = (80u16, 14u16);
+    let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+    term.draw(|f| super::draw(f, f.area(), &app)).unwrap();
+    let rows = crate::testutil::buffer_rows(term.backend().buffer());
+
+    let row = rows
+        .iter()
+        .find(|r| r.contains("acct-twelve1") && r.contains('#'))
+        .unwrap_or_else(|| panic!("no selector row:\n{}", rows.join("\n")));
+    assert!(
+        row.contains('⊖'),
+        "the blocked-reason marker survives a narrow row:\n{row}"
+    );
+    assert!(
+        !row.contains('⇄'),
+        "the tally gives way rather than crowding the marker:\n{row}"
+    );
+}
+
+/// A leg nothing calls is a leg that passes every unit test and ships nothing:
+/// both Fallback surfaces have to read the app's own tally, not a default.
+#[test]
+fn the_fallback_tab_reads_the_apps_live_session_tally() {
+    let mut app = App::new(config_with(
+        vec![profile("busy", 95.0, 10.0, 3600)],
+        None,
+        vec!["busy"],
+    ));
+    app.live_sessions =
+        crate::live_sessions::LiveTally::of([live_row("4242-0", "busy", true, None)]);
+
+    let (w, h) = (120u16, 20u16);
+    let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+    term.draw(|f| super::draw(f, f.area(), &app)).unwrap();
+    let rows = crate::testutil::buffer_rows(term.backend().buffer());
+
+    assert!(
+        rows.iter()
+            .any(|r| r.contains("sessions     1 (1 following)")),
+        "the member card renders the tally the app holds:\n{}",
+        rows.join("\n")
     );
 }

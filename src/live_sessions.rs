@@ -169,6 +169,14 @@ impl LiveTally {
         Self(per_member)
     }
 
+    /// A tally straight from rows, for tests in other modules that need a fleet
+    /// without laying registry files down. Skips the liveness filter, which is
+    /// the half [`LiveTally::collect`] adds and this module's own tests pin.
+    #[cfg(test)]
+    pub(crate) fn of(rows: impl IntoIterator<Item = LiveSession>) -> Self {
+        Self::from_live_rows(rows)
+    }
+
     /// One account's sessions.
     pub(crate) fn member(&self, name: &str) -> MemberSessions {
         self.0.get(name).copied().unwrap_or_default()

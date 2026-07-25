@@ -104,18 +104,10 @@ impl DaemonFields<'_> {
 pub(crate) struct SessionFields<'a>(&'a mut LiveSession);
 
 impl SessionFields<'_> {
-    #[allow(
-        dead_code,
-        reason = "written by the phase-1 swap executor; the registry lands first"
-    )]
     pub(crate) fn set_current_member(&mut self, member: impl Into<String>) {
         self.0.current_member = Some(member.into());
     }
 
-    #[allow(
-        dead_code,
-        reason = "written by the phase-1 swap executor; the registry lands first"
-    )]
     pub(crate) fn set_last_swap_at(&mut self, at: u64) {
         self.0.last_swap_at = Some(at);
     }
@@ -224,10 +216,6 @@ pub(crate) fn update_as_daemon(
 }
 
 /// Edit the session-owned fields of one row. Mirror of [`update_as_daemon`].
-#[allow(
-    dead_code,
-    reason = "called by the phase-1 swap executor; the registry lands first"
-)]
 pub(crate) fn update_as_session(
     session_id: &str,
     edit: impl FnOnce(&mut SessionFields<'_>),

@@ -773,6 +773,9 @@ pub(crate) enum SwapRefused {
     ShuttingDown,
     /// The link already resolves to this member.
     AlreadyCurrent,
+    /// An `--isolated` session: a throwaway tree, deliberately not part of any
+    /// chain.
+    IsolatedSession,
     ProfileUnreadable(String),
     /// Carries a `base_url`: a different endpoint, not the same account elsewhere.
     NotOauth,
@@ -795,6 +798,7 @@ impl std::fmt::Display for SwapRefused {
             Self::Unsupported(why) => write!(f, "{why}"),
             Self::ShuttingDown => f.write_str("the session is shutting down"),
             Self::AlreadyCurrent => f.write_str("the link already resolves to it"),
+            Self::IsolatedSession => f.write_str("an isolated session follows no chain"),
             Self::ProfileUnreadable(e) => write!(f, "its profile could not be read: {e}"),
             Self::NotOauth => f.write_str("it carries a custom endpoint"),
             Self::Disabled => f.write_str("it is disabled"),
@@ -858,26 +862,39 @@ struct SwapPlan {
     store: PathBuf,
 }
 
-/// Move the mtime of the store the credential link now resolves to.
+/// Move the mtime of the store the credential link is about to resolve to.
 ///
 /// Claude Code stats the symlink's TARGET at the head of every request and clears
-/// its process-wide token memo only when that value CHANGED, so an
-/// mtime-preserving repoint is a silent no-op: the session keeps authenticating as
-/// the old member and nothing anywhere reports a problem.
-fn touch_store(plan: &SwapPlan) -> Result<()> {
+/// its process-wide token memo only when that value differs from the one it
+/// MEMOIZED — which is the mtime of the target it last stat'd, i.e. `memoized`
+/// here. So what has to change is the new store's mtime relative to the OLD
+/// store's, not relative to the new store's own previous value; an
+/// mtime-preserving repoint is a silent no-op, the session keeps authenticating as
+/// the old member, and nothing anywhere reports a problem.
+///
+/// Runs BEFORE the repoint, so a failure here leaves nothing moved.
+fn touch_store(plan: &SwapPlan, memoized: Option<SystemTime>) -> Result<()> {
     let file = OpenOptions::new()
         .write(true)
         .open(&plan.store)
         .with_context(|| format!("failed to open {}", plan.store.display()))?;
     let now = SystemTime::now();
-    // A store already stamped at or ahead of the clock — a coarse-granularity
-    // filesystem, a restored backup — would keep its value and defeat the step.
-    let stamped = match file.metadata().ok().and_then(|m| m.modified().ok()) {
-        Some(prev) if prev >= now => prev + Duration::from_secs(1),
+    // `now` is below a memoized value stamped ahead of the clock (a restored
+    // backup, a skewed network mount), and a coarse-granularity filesystem could
+    // truncate it onto that value exactly. Both leave the swap invisible, so pass
+    // it — accepting a stamp up to a second ahead of the clock, which only arises
+    // when the old store was already ahead of it.
+    let stamped = match memoized {
+        Some(memoized) if memoized >= now => memoized + Duration::from_secs(1),
         _ => now,
     };
     file.set_times(std::fs::FileTimes::new().set_modified(stamped))
         .with_context(|| format!("failed to touch {}", plan.store.display()))
+}
+
+/// A file's mtime, or `None` when it has none to read.
+fn file_mtime(path: &Path) -> Option<SystemTime> {
+    std::fs::metadata(path).ok()?.modified().ok()
 }
 
 /// One swapped-onto member's liveness markers, held for the session's life.
@@ -892,6 +909,20 @@ struct SwappedMarkers {
     legacy_lock: Option<File>,
 }
 
+/// What claiming a member's liveness markers found.
+enum MarkerClaim {
+    /// Freshly stamped; hold for the session's life.
+    Stamped(SwappedMarkers),
+    /// This session already holds them — a member it has run on before. `flock`
+    /// locks the open file description, so a second `open` + `try_lock` from THIS
+    /// process is denied by our own lock; without recognizing that, every swap back
+    /// onto a recovered member would read as a foreign holder and be refused,
+    /// which removes the chain's whole recovery half.
+    AlreadyOurs,
+    /// A live process that is not this one holds it.
+    Foreign,
+}
+
 /// Stamp and hold the intended member's liveness markers, BOTH layouts.
 ///
 /// The per-session one is the rotation gate every current binary reads; the
@@ -902,7 +933,9 @@ struct SwappedMarkers {
 ///
 /// `None` when the per-session marker is held by something else, so the caller
 /// refuses the swap: moving a session onto a member the rotation gate cannot see
-/// there is the exact burn this step exists to prevent.
+/// there is the exact burn this step exists to prevent. Callers go through
+/// [`SessionSwap::claim_markers`], which separates a foreign holder from this
+/// session's own earlier claim first.
 fn stamp_swapped_markers(paths: &SessionPaths) -> Result<Option<SwappedMarkers>> {
     crate::profile::mkdir_700(&paths.sessions)
         .with_context(|| format!("failed to create {}", paths.sessions.display()))?;
@@ -956,6 +989,11 @@ pub(crate) struct SessionSwap {
     /// swap repoints.
     runtime: PathBuf,
     launch: LaunchTransport,
+    /// The launch member's per-session marker path. `ProfileRuntime` owns that fd
+    /// for the session's life; the PATH lives here so a swap back onto the launch
+    /// member recognizes the marker as this session's own rather than as a foreign
+    /// holder — see [`MarkerClaim::AlreadyOurs`].
+    launch_marker: PathBuf,
     cell: crate::lockorder::RankedMutex<SwapCell, crate::lockorder::rank::SwapCell>,
     /// Set before `Drop` signals the watchdog, so a swap is never STARTED once
     /// teardown has begun.
@@ -963,20 +1001,23 @@ pub(crate) struct SessionSwap {
 }
 
 impl SessionSwap {
+    /// `paths` is the LAUNCH member's resolved paths, so the runtime dir and the
+    /// marker this session already holds come from one source and cannot disagree.
     fn new(
         session: SessionId,
         isolation: Isolation,
         mode: LinkMode,
-        runtime: PathBuf,
         launch: &Profile,
         canonical: PathBuf,
+        paths: &SessionPaths,
     ) -> Self {
         Self {
             session,
             isolation,
             mode,
-            runtime,
+            runtime: paths.runtime.clone(),
             launch: LaunchTransport::of(launch),
+            launch_marker: paths.pid_file.clone(),
             cell: crate::lockorder::RankedMutex::new(SwapCell {
                 member: launch.name.as_str().to_string(),
                 canonical,
@@ -1001,6 +1042,43 @@ impl SessionSwap {
     /// `with_state_lock` hold a swap publishes under.
     fn canonical(&self) -> PathBuf {
         self.cell().canonical.clone()
+    }
+
+    /// Claim `paths`'s markers for this session, separating a marker this session
+    /// already holds from one a foreign process does. The two are
+    /// indistinguishable to `try_lock`, and conflating them is what would refuse
+    /// every swap back onto a member the session has already run on.
+    fn claim_markers(&self, paths: &SessionPaths) -> Result<MarkerClaim> {
+        let ours = paths.pid_file == self.launch_marker
+            || self
+                .cell()
+                .held
+                .iter()
+                .any(|held| held.pid_file == paths.pid_file);
+        if ours {
+            return Ok(MarkerClaim::AlreadyOurs);
+        }
+        Ok(match stamp_swapped_markers(paths)? {
+            Some(markers) => MarkerClaim::Stamped(markers),
+            None => MarkerClaim::Foreign,
+        })
+    }
+
+    /// Whether this refusal is news. The trigger re-fires every tick, so
+    /// announcing unconditionally writes one line per second for as long as the
+    /// daemon's intent stands — while a refusal nothing ever says leaves the
+    /// session on its launch account invisibly. Records what it returns `true` for.
+    fn should_announce(&self, intended: &str, why: &SwapRefused) -> bool {
+        let mut cell = self.cell();
+        if cell
+            .last_refusal
+            .as_ref()
+            .is_some_and(|(member, seen)| member == intended && seen == why)
+        {
+            return false;
+        }
+        cell.last_refusal = Some((intended.to_string(), why.clone()));
+        true
     }
 
     /// Stop starting swaps. Called before `Drop` signals the watchdog.
@@ -1035,16 +1113,7 @@ impl SessionSwap {
     /// long as the daemon's intent stands — but a refusal that says nothing at all
     /// leaves the session on its launch account invisibly.
     fn announce_refusal(&self, intended: &str, why: SwapRefused) {
-        let announced = {
-            let mut cell = self.cell();
-            let seen = cell.last_refusal.as_ref();
-            let fresh = seen != Some(&(intended.to_string(), why.clone()));
-            if fresh {
-                cell.last_refusal = Some((intended.to_string(), why.clone()));
-            }
-            fresh
-        };
-        if announced {
+        if self.should_announce(intended, &why) {
             logline!(
                 "clauth: session {} stays on {}: {intended} is not swappable ({why})",
                 self.session.as_str(),
@@ -1062,6 +1131,13 @@ impl SessionSwap {
             return Err(SwapRefused::ShuttingDown);
         }
         swap_support(self.mode, cfg!(target_os = "macos")).map_err(SwapRefused::Unsupported)?;
+        // `--isolated` and fallback-following are mutually exclusive (a throwaway
+        // tree versus swappable managed credentials). Enforced at the executor
+        // because it is the one chokepoint every caller goes through, rather than
+        // re-remembered by the decision leg and the flag separately.
+        if self.isolation == Isolation::Isolated {
+            return Err(SwapRefused::IsolatedSession);
+        }
         if intended == self.member() {
             return Err(SwapRefused::AlreadyCurrent);
         }
@@ -1098,10 +1174,18 @@ impl SessionSwap {
     /// ONE rotation guard: `RankGuard::enter` asserts a strictly greater rank and
     /// `Rotation` is the outermost, so a second guard panics in debug and in
     /// release degrades into a genuine ABBA deadlock on flocks that have no
-    /// deadline. ONE state-lock hold spans the drain, the stamp, the publish, the
-    /// repoint and the registry write: a marker saying the new member while the
-    /// link still resolves to the old one, for even a single watchdog tick, lets a
-    /// rotation burn the old member's chain under the live session.
+    /// deadline. ONE state-lock hold spans the drain, the stamp, the repoint and
+    /// the publish: a marker saying the new member while the link still resolves to
+    /// the old one, for even a single watchdog tick, lets a rotation burn the old
+    /// member's chain under the live session.
+    ///
+    /// Inside that hold the order is chosen so every failure lands on one side or
+    /// the other and never between them. Everything that can fail runs BEFORE the
+    /// link moves; the cell is published only once it has. A cell naming a member
+    /// the link never reached would be permanent — `poll` filters on
+    /// `member()` equality, so nothing retries — and it would have the next tick
+    /// treat an interactive `/login` belonging to one member as the other's,
+    /// writing it over a chain the session never authenticated as.
     fn swap_to(&self, intended: &str) -> Result<SwapOutcome> {
         let plan = match self.precondition(intended) {
             Ok(plan) => plan,
@@ -1110,36 +1194,61 @@ impl SessionSwap {
         let _rotation = RotationGuard::acquire(&plan.member)?;
         let link = self.runtime.join(".credentials.json");
         with_state_lock(|| {
+            let current = self.canonical();
             // DRAIN. A Claude Code re-login sitting in the runtime file belongs to
             // the member the link STILL resolves to; once canonical moves, the
             // next tick would write those bytes into the new member's store and
             // its refresh token would be gone.
-            sync_credentials_unlocked(&link, &self.canonical())?;
+            sync_credentials_unlocked(&link, &current)?;
 
             let paths =
                 SessionPaths::resolve(&plan.member, self.isolation, &self.session, self.mode)?;
-            let Some(markers) = stamp_swapped_markers(&paths)? else {
+            let claim = self.claim_markers(&paths)?;
+            if matches!(claim, MarkerClaim::Foreign) {
                 return Ok(SwapOutcome::Refused(SwapRefused::MarkerNotLockable));
-            };
+            }
+            // Re-checked in the hold, where it means something: both paths that
+            // remove a stored login (`clear_profile_credentials`, `delete_profile`)
+            // do the removal inside their own `with_state_lock`, so this cannot go
+            // stale while we hold it. Without the re-check, `relink_to_canonical`
+            // takes its store-is-gone branch and UNLINKS the live session's
+            // credential file.
+            if !plan.store.exists() {
+                return Ok(SwapOutcome::Refused(SwapRefused::NoCredentialStore));
+            }
+            touch_store(&plan, file_mtime(&current))?;
+            relink_to_canonical(&link, &plan.store)?;
+
+            // Past here the session IS on the new member, so nothing may report
+            // otherwise. Publish, then let a registry failure be logged rather
+            // than propagated as a swap that did not happen — the same line
+            // `acquire` takes for `register`, and for the same reason.
             {
                 let mut cell = self.cell();
                 cell.member = plan.member.clone();
                 cell.canonical = plan.store.clone();
-                // Step 8: the previous member's markers stay held for the
-                // session's life, so pushing never replaces.
-                cell.held.push(markers);
+                // Step 8: every member the session has run on keeps its markers
+                // for the session's life, so a claim never replaces one.
+                if let MarkerClaim::Stamped(markers) = claim {
+                    cell.held.push(markers);
+                }
                 cell.last_refusal = None;
             }
-            relink_to_canonical(&link, &plan.store)?;
-            touch_store(&plan)?;
-
             // A freshly loaded row, edited through the session's own field view:
             // a row read before the swap and stored after would revert an
             // `intended_member` the daemon wrote in between.
-            crate::live_sessions::update_as_session(self.session.as_str(), |fields| {
-                fields.set_current_member(plan.member.as_str());
-                fields.set_last_swap_at(crate::usage::now_ms());
-            })?;
+            if let Err(e) =
+                crate::live_sessions::update_as_session(self.session.as_str(), |fields| {
+                    fields.set_current_member(plan.member.as_str());
+                    fields.set_last_swap_at(crate::usage::now_ms());
+                })
+            {
+                logline!(
+                    "clauth: session {} swapped onto {} but its row did not update: {e:#}",
+                    self.session.as_str(),
+                    plan.member
+                );
+            }
             Ok(SwapOutcome::Swapped)
         })
     }
@@ -1323,16 +1432,18 @@ impl ProfileRuntime {
             }
             Ok::<_, anyhow::Error>((paths, file, legacy_lock, mode))
         })?;
+        // Built from `paths` rather than from locals moved out of it, so the
+        // runtime dir the swap repoints and the marker it must recognize as its
+        // own come from one source.
+        let swap = std::sync::Arc::new(SessionSwap::new(
+            session, isolation, mode, profile, canonical, &paths,
+        ));
         let SessionPaths {
-            runtime,
             sessions,
             pid_file,
             legacy_marker,
+            ..
         } = paths;
-
-        let swap = std::sync::Arc::new(SessionSwap::new(
-            session, isolation, mode, runtime, profile, canonical,
-        ));
 
         let (tx, rx) = channel::<()>();
         let watchdog_swap = std::sync::Arc::clone(&swap);
@@ -2092,10 +2203,24 @@ fn tick(claude_home: &Path, swap: &SessionSwap) -> Result<()> {
 /// a regular file, copy its bytes into canonical creds and swap the file back to
 /// a symlink so canonical stays the single source of truth. Returns `true` when
 /// bytes were written. Real-symlink mode only — fake mode uses
-/// [`mirror_credentials`]. Callers hold the state lock: the swap executor runs
-/// this as its drain step inside the one hold that also moves the marker and the
-/// link, and the watchdog's own leg takes the lock in [`tick`].
+/// [`mirror_credentials`].
+///
+/// Running this outside the state flock races the credential writes of a
+/// concurrent `acquire` or switch, which is what that flock exists to serialize.
+/// `with_state_lock` takes a bare closure, so there is no witness type to demand
+/// in the signature; the rank stack is the next best check.
+///
+/// Ceiling: the assert is off under `cfg(test)`, because 20 inline tests drive
+/// this and `mirror_credentials` as units with no home sandbox, so taking the
+/// flock there would lock the operator's REAL `~/.clauth` and expose hermetic
+/// tests to the 25s state-lock timeout against a live daemon. Upgrade path: give
+/// those tests a `HomeSandbox`, then drop the `not(test)`.
 fn sync_credentials_unlocked(link_path: &Path, canonical: &Path) -> Result<bool> {
+    debug_assert!(
+        cfg!(test) || crate::lockorder::holds::<crate::lockorder::rank::State>(),
+        "sync_credentials_unlocked without the state flock races acquire/switch \
+         credential writes"
+    );
     let Ok(meta) = link_path.symlink_metadata() else {
         return Ok(false);
     };
@@ -2226,6 +2351,12 @@ fn relink_to_canonical(link_path: &Path, canonical: &Path) -> Result<()> {
 /// creds: "latest mtime wins", newer side copied over older. Skips partial
 /// writes (invalid JSON). Fake-symlink mode only.
 fn mirror_credentials(runtime_path: &Path, canonical: &Path) -> Result<()> {
+    // Same flock requirement and same test ceiling as `sync_credentials_unlocked`.
+    debug_assert!(
+        cfg!(test) || crate::lockorder::holds::<crate::lockorder::rank::State>(),
+        "mirror_credentials without the state flock races acquire/switch \
+         credential writes"
+    );
     let runtime_meta = runtime_path.metadata().ok();
     let canonical_meta = canonical.metadata().ok();
 

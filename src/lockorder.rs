@@ -205,6 +205,25 @@ impl RankGuard {
     }
 }
 
+/// Whether the current thread holds rank `R`. Lets a function whose correctness
+/// depends on a lock its own signature cannot express assert that rather than say
+/// it in a comment — the state flock's holders are the case that needs it, since
+/// `with_state_lock` takes a bare closure and so has no witness to hand out.
+///
+/// Always `true` in release: the rank stack is `cfg(debug_assertions)`-only, so a
+/// caller must use this inside a `debug_assert!` and never as real control flow.
+#[inline]
+pub(crate) fn holds<R: Rank>() -> bool {
+    #[cfg(debug_assertions)]
+    {
+        HELD.with(|h| h.borrow().contains(&R::VALUE))
+    }
+    #[cfg(not(debug_assertions))]
+    {
+        true
+    }
+}
+
 impl Drop for RankGuard {
     #[inline]
     fn drop(&mut self) {

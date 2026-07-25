@@ -3218,28 +3218,44 @@ fn member_store(profile: &Profile) -> PathBuf {
     crate::claude::install_source_path(profile.name.as_str()).expect("install source")
 }
 
-/// A swap executor with NO watchdog thread behind it, so every credential leg is
+/// A live session with NO watchdog thread behind it, so every credential leg is
 /// driven explicitly: a test asserting which leg moved which bytes can never be
 /// won by a background tick landing first. `acquire` is used only where the
-/// launch session's own markers or its teardown are part of the assertion.
-fn lone_session(launch: &Profile) -> std::sync::Arc<SessionSwap> {
+/// launch session's teardown is part of the assertion.
+///
+/// It stamps and HOLDS the launch member's markers exactly as `acquire` does. A
+/// fixture that skipped them would let a swap back onto the launch member claim a
+/// marker no production session could, so the returned locks are part of the
+/// fixture, not litter.
+fn lone_session(
+    launch: &Profile,
+    isolation: Isolation,
+) -> (std::sync::Arc<SessionSwap>, SwappedMarkers) {
     let name = launch.name.as_str();
     let session = SessionId::mint();
     let store = crate::claude::install_source_path(name).expect("install source");
-    let runtime = crate::profile::profile_subpath(name, &format!("runtime-{}", session.as_str()))
-        .expect("runtime path");
-    crate::profile::mkdir_700(&runtime).expect("mkdir runtime");
-    create_symlink(&store, &runtime.join(".credentials.json")).expect("link creds");
-    let row = crate::live_sessions::LiveSession::starting(&session, name, false);
+    let paths =
+        SessionPaths::resolve(name, isolation, &session, LinkMode::Real).expect("session paths");
+    crate::profile::mkdir_700(&paths.runtime).expect("mkdir runtime");
+    create_symlink(&store, &paths.runtime.join(".credentials.json")).expect("link creds");
+    let markers = stamp_swapped_markers(&paths)
+        .expect("stamp launch markers")
+        .expect("the launch member's markers must be free in a fresh sandbox");
+    let row = crate::live_sessions::LiveSession::starting(
+        &session,
+        name,
+        isolation == Isolation::Isolated,
+    );
     crate::live_sessions::register(&row).expect("register row");
-    std::sync::Arc::new(SessionSwap::new(
+    let swap = std::sync::Arc::new(SessionSwap::new(
         session,
-        Isolation::Shared,
+        isolation,
         LinkMode::Real,
-        runtime,
         launch,
         store,
-    ))
+        &paths,
+    ));
+    (swap, markers)
 }
 
 /// Every member in one config, each carrying a refresh token, so only the
@@ -3277,7 +3293,7 @@ fn a_swap_moves_the_mtime_of_the_store_it_repoints_to() {
         let intended = member("mtime-b");
         let launch_store = member_store(&launch);
         let intended_store = member_store(&intended);
-        let swap = lone_session(&launch);
+        let (swap, _launch_markers) = lone_session(&launch, Isolation::Shared);
 
         // ONE shared mtime — the pathological case the live probe found, where
         // repointing the link changes nothing Claude Code can observe.
@@ -3313,7 +3329,7 @@ fn a_swap_adopts_a_crash_staged_sidecar_before_moving_the_store_mtime() {
         let intended = member("stage-b");
         member_store(&launch);
         let intended_store = member_store(&intended);
-        let swap = lone_session(&launch);
+        let (swap, _launch_markers) = lone_session(&launch, Isolation::Shared);
 
         // A rotation that staged its new pair and died before the commit.
         let staged = ClaudeCredentials {
@@ -3382,7 +3398,7 @@ fn the_precondition_refuses_a_member_whose_transport_differs() {
     with_fake_home(tmp.path(), || {
         let launch = member("pre-launch");
         member_store(&launch);
-        let swap = lone_session(&launch);
+        let (swap, _launch_markers) = lone_session(&launch, Isolation::Shared);
 
         let twin = member("pre-twin");
         member_store(&twin);
@@ -3436,7 +3452,7 @@ fn a_swap_holds_both_of_the_intended_members_liveness_markers() {
         let intended = member("marker-b");
         member_store(&launch);
         member_store(&intended);
-        let swap = lone_session(&launch);
+        let (swap, _launch_markers) = lone_session(&launch, Isolation::Shared);
         let sid = swap.session.as_str().to_string();
 
         assert_eq!(
@@ -3474,7 +3490,7 @@ fn a_swap_refuses_a_member_whose_marker_another_process_holds() {
         let intended = member("held-b");
         let launch_store = member_store(&launch);
         member_store(&intended);
-        let swap = lone_session(&launch);
+        let (swap, _launch_markers) = lone_session(&launch, Isolation::Shared);
         let sid = swap.session.as_str().to_string();
 
         // A live foreign process already owns the per-session marker path.
@@ -3556,7 +3572,7 @@ fn a_swap_repoints_the_runtime_link_at_the_intended_store() {
         let intended = member("link-b");
         member_store(&launch);
         let intended_store = member_store(&intended);
-        let swap = lone_session(&launch);
+        let (swap, _launch_markers) = lone_session(&launch, Isolation::Shared);
         let link = swap.runtime.join(".credentials.json");
 
         assert_eq!(swap.swap_to("link-b").expect("swap"), SwapOutcome::Swapped);
@@ -3584,7 +3600,7 @@ fn a_swap_drains_a_pending_relogin_into_the_launch_store() {
         let intended = member("drain-b");
         let launch_store = member_store(&launch);
         let intended_store = member_store(&intended);
-        let swap = lone_session(&launch);
+        let (swap, _launch_markers) = lone_session(&launch, Isolation::Shared);
 
         let intended_before = fs::read(&intended_store).expect("read intended store");
         set_mtime(&launch_store, SystemTime::now() - Duration::from_secs(60));
@@ -3618,7 +3634,7 @@ fn the_tick_after_a_swap_drains_into_the_intended_store() {
         let intended = member("tick-b");
         let launch_store = member_store(&launch);
         let intended_store = member_store(&intended);
-        let swap = lone_session(&launch);
+        let (swap, _launch_markers) = lone_session(&launch, Isolation::Shared);
 
         assert_eq!(swap.swap_to("tick-b").expect("swap"), SwapOutcome::Swapped);
 
@@ -3658,7 +3674,7 @@ fn gc_spares_a_swapped_members_marker_dir_while_the_session_lives() {
         let intended = member("gc-b");
         member_store(&launch);
         member_store(&intended);
-        let swap = lone_session(&launch);
+        let (swap, _launch_markers) = lone_session(&launch, Isolation::Shared);
         let sid = swap.session.as_str().to_string();
 
         assert_eq!(swap.swap_to("gc-b").expect("swap"), SwapOutcome::Swapped);
@@ -3788,7 +3804,7 @@ fn a_swap_onto_the_member_already_current_changes_nothing() {
     with_fake_home(tmp.path(), || {
         let launch = member("noop-a");
         let launch_store = member_store(&launch);
-        let swap = lone_session(&launch);
+        let (swap, _launch_markers) = lone_session(&launch, Isolation::Shared);
         let sid = swap.session.as_str().to_string();
 
         let before = SystemTime::now() - Duration::from_secs(60);
@@ -3807,10 +3823,11 @@ fn a_swap_onto_the_member_already_current_changes_nothing() {
             before,
             "a no-op swap must not move the store's mtime"
         );
-        let profile_dir = crate::profile::profile_dir("noop-a").expect("profile dir");
+        // The launch member's markers are the fixture's, so what proves the swap
+        // stamped nothing is that it claimed nothing.
         assert!(
-            !profile_dir.join(format!("sessions-{sid}")).exists(),
-            "a no-op swap must not stamp a marker"
+            swap.cell().held.is_empty(),
+            "a no-op swap must not claim a marker"
         );
         let row = crate::live_sessions::get(&sid).expect("row");
         assert_eq!(
@@ -3833,7 +3850,7 @@ fn a_swap_preserves_a_daemon_written_intended_member() {
         let intended = member("row-b");
         member_store(&launch);
         member_store(&intended);
-        let swap = lone_session(&launch);
+        let (swap, _launch_markers) = lone_session(&launch, Isolation::Shared);
         let sid = swap.session.as_str().to_string();
 
         crate::live_sessions::update_as_daemon(&sid, |d| {
@@ -3867,7 +3884,7 @@ fn a_swap_does_not_start_once_teardown_has_begun() {
         let intended = member("bye-b");
         member_store(&launch);
         let intended_store = member_store(&intended);
-        let swap = lone_session(&launch);
+        let (swap, _launch_markers) = lone_session(&launch, Isolation::Shared);
 
         let before = SystemTime::now() - Duration::from_secs(60);
         set_mtime(&intended_store, before);
@@ -3888,6 +3905,304 @@ fn a_swap_does_not_start_once_teardown_has_begun() {
                 .expect("mtime"),
             before,
             "a refused swap must touch nothing"
+        );
+    });
+}
+
+/// THE RECOVERY HALF OF THE CHAIN. `flock` locks the open file description, so a
+/// second `open` + `try_lock` from THIS process is denied by our OWN lock — and
+/// this session never releases a marker (step 8). So a swap back onto a member it
+/// has already run on has to recognize the marker as already ours; reading it as a
+/// foreign holder would refuse every recovery hop for the session's whole life,
+/// after exactly one log line.
+#[test]
+fn a_swap_back_onto_a_member_the_session_already_ran_on_succeeds() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let launch = member("back-a");
+        let intended = member("back-b");
+        let launch_store = member_store(&launch);
+        let intended_store = member_store(&intended);
+        let (swap, _launch_markers) = lone_session(&launch, Isolation::Shared);
+        let link = swap.runtime.join(".credentials.json");
+
+        assert_eq!(swap.swap_to("back-b").expect("out"), SwapOutcome::Swapped);
+        let away = SystemTime::now() - Duration::from_secs(60);
+        set_mtime(&launch_store, away);
+
+        assert_eq!(
+            swap.swap_to("back-a").expect("back"),
+            SwapOutcome::Swapped,
+            "a member this session already holds a marker on is not a foreign holder"
+        );
+
+        assert_eq!(
+            fs::read_link(&link).expect("read link"),
+            launch_store,
+            "the link must resolve back to the recovered member's store"
+        );
+        assert!(
+            fs::metadata(&launch_store)
+                .expect("meta")
+                .modified()
+                .expect("mtime")
+                > away,
+            "the recovered store's mtime must move, or Claude Code never re-reads it"
+        );
+        for name in ["back-a", "back-b"] {
+            assert!(
+                has_live_session(name),
+                "{name} must stay rotation-blocked: the child still holds its chain"
+            );
+        }
+        assert!(
+            fs::metadata(&intended_store).is_ok(),
+            "fixture: the member swapped away from keeps its own store"
+        );
+    });
+}
+
+/// A repoint that fails leaves the session authenticating as the member its link
+/// still resolves to, so the cell must not have moved: a cell pointing at the
+/// intended member while the link resolves to the launch one is §12's silent
+/// no-op reached through an error path, permanent (`poll` filters on
+/// `member()` equality) and reported by one log line.
+#[cfg(unix)]
+#[test]
+fn a_failed_repoint_leaves_the_session_on_the_member_its_link_resolves_to() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let claude_home = fake_claude_home(tmp.path());
+        let launch = member("fail-a");
+        let intended = member("fail-b");
+        let launch_store = member_store(&launch);
+        let intended_store = member_store(&intended);
+        let (swap, _launch_markers) = lone_session(&launch, Isolation::Shared);
+
+        // The repoint stages a temp symlink INSIDE the runtime dir, so a
+        // write-denied dir is what makes `relink_to_canonical` fail.
+        fs::set_permissions(&swap.runtime, fs::Permissions::from_mode(0o500)).expect("chmod");
+        if create_symlink(&launch_store, &swap.runtime.join(".probe")).is_ok() {
+            // Running with rights that ignore the mode (root): the probe cannot be
+            // posed, so assert nothing rather than pass vacuously.
+            let _ = fs::remove_file(swap.runtime.join(".probe"));
+            fs::set_permissions(&swap.runtime, fs::Permissions::from_mode(0o700)).expect("restore");
+            return;
+        }
+
+        assert!(
+            swap.swap_to("fail-b").is_err(),
+            "fixture: the repoint must actually fail for this test to pose anything"
+        );
+        fs::set_permissions(&swap.runtime, fs::Permissions::from_mode(0o700)).expect("restore");
+
+        assert_eq!(
+            swap.canonical(),
+            launch_store,
+            "the cell moved onto a member the link never reached"
+        );
+
+        // The consequence, if it had moved: an interactive `/login` in the session
+        // belongs to the LAUNCH account, and the tick would write it over the
+        // intended member's store, destroying a chain nothing ever used.
+        let intended_before = fs::read(&intended_store).expect("read intended");
+        set_mtime(&launch_store, SystemTime::now() - Duration::from_secs(60));
+        cc_relogin(&swap.runtime, CREDS_V2, SystemTime::now());
+        tick(&claude_home, &swap).expect("tick");
+
+        assert_eq!(
+            fs::read(&launch_store).expect("read launch"),
+            CREDS_V2,
+            "the re-login belongs to the member the link resolved to"
+        );
+        assert_eq!(
+            fs::read(&intended_store).expect("read intended"),
+            intended_before,
+            "a member the session never authenticated as must keep its own chain"
+        );
+    });
+}
+
+/// What Claude Code compares is the value it stats through the link against the
+/// one it MEMOIZED for the previous target — so the mtime the swap writes has to
+/// differ from the OLD store's, not from the new store's own previous value.
+#[test]
+fn the_touched_mtime_differs_from_the_store_the_link_came_from() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let launch = member("ahead-a");
+        let intended = member("ahead-b");
+        let launch_store = member_store(&launch);
+        let intended_store = member_store(&intended);
+        let (swap, _launch_markers) = lone_session(&launch, Isolation::Shared);
+
+        // A store stamped ahead of the clock — a restored backup, a skewed NFS
+        // mount. Stamping the new target at `now` would land BELOW it, and on a
+        // coarse-granularity filesystem could land exactly on it.
+        let ahead = SystemTime::now() + Duration::from_secs(3_600);
+        set_mtime(&launch_store, ahead);
+
+        assert_eq!(swap.swap_to("ahead-b").expect("out"), SwapOutcome::Swapped);
+
+        let after = fs::metadata(&intended_store)
+            .expect("meta")
+            .modified()
+            .expect("mtime");
+        assert!(
+            after > ahead,
+            "the new target's mtime must differ from the one CC memoized for the old target"
+        );
+    });
+}
+
+/// `--isolated` and fallback-following are mutually exclusive (settled). The
+/// executor is the single chokepoint every phase goes through, so the refusal
+/// lives here rather than being re-remembered by the decision leg and the flag.
+#[test]
+fn an_isolated_session_never_swaps() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let launch = member("iso-a");
+        let intended = member("iso-b");
+        member_store(&launch);
+        let intended_store = member_store(&intended);
+        let (swap, _launch_markers) = lone_session(&launch, Isolation::Isolated);
+
+        let before = SystemTime::now() - Duration::from_secs(60);
+        set_mtime(&intended_store, before);
+
+        let outcome = swap.swap_to("iso-b").expect("out");
+        assert_eq!(
+            fs::metadata(&intended_store)
+                .expect("meta")
+                .modified()
+                .expect("mtime"),
+            before,
+            "a refused swap must touch nothing"
+        );
+        assert_eq!(outcome, SwapOutcome::Refused(SwapRefused::IsolatedSession));
+    });
+}
+
+// ── the watchdog's swap leg (`poll`) ─────────────────────────────────────────
+
+/// The shipped inertness: nothing writes `intended_member` until the decision leg
+/// lands, so `poll` must be a no-op on every tick of every session today.
+#[test]
+fn poll_does_nothing_until_the_daemon_names_a_member() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let launch = member("poll-a");
+        let intended = member("poll-b");
+        member_store(&launch);
+        let intended_store = member_store(&intended);
+        let (swap, _launch_markers) = lone_session(&launch, Isolation::Shared);
+        let sid = swap.session.as_str().to_string();
+
+        let before = SystemTime::now() - Duration::from_secs(60);
+        set_mtime(&intended_store, before);
+
+        swap.poll();
+
+        assert_eq!(swap.member(), "poll-a", "no intent, no move");
+        assert_eq!(
+            fs::metadata(&intended_store)
+                .expect("meta")
+                .modified()
+                .expect("mtime"),
+            before
+        );
+        assert_eq!(
+            crate::live_sessions::get(&sid).expect("row").current_member,
+            None
+        );
+
+        // An intent naming the member the link already resolves to is the steady
+        // state, not a refusal — it must stay silent too.
+        crate::live_sessions::update_as_daemon(&sid, |d| d.set_intended_member("poll-a"))
+            .expect("daemon write");
+        swap.poll();
+        assert_eq!(swap.member(), "poll-a");
+        assert_eq!(
+            crate::live_sessions::get(&sid).expect("row").current_member,
+            None,
+            "an intent equal to the current member must not write the row"
+        );
+        assert!(
+            swap.cell().last_refusal.is_none(),
+            "the steady state is not a refusal — routing it through one would log \
+             a line per tick for as long as the intent stands"
+        );
+    });
+}
+
+/// The production trigger: the session's own tick reads its own row and executes.
+#[test]
+fn poll_executes_the_member_the_daemon_named() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let launch = member("polled-a");
+        let intended = member("polled-b");
+        member_store(&launch);
+        let intended_store = member_store(&intended);
+        let (swap, _launch_markers) = lone_session(&launch, Isolation::Shared);
+        let sid = swap.session.as_str().to_string();
+
+        crate::live_sessions::update_as_daemon(&sid, |d| d.set_intended_member("polled-b"))
+            .expect("daemon write");
+
+        swap.poll();
+
+        assert_eq!(swap.member(), "polled-b");
+        assert_eq!(
+            fs::read_link(swap.runtime.join(".credentials.json")).expect("read link"),
+            intended_store
+        );
+        let row = crate::live_sessions::get(&sid).expect("row");
+        assert_eq!(row.current_member.as_deref(), Some("polled-b"));
+        assert_eq!(row.intended_member.as_deref(), Some("polled-b"));
+    });
+}
+
+/// A standing intent the executor refuses re-fires every tick, so announcing
+/// unconditionally writes one line per second for as long as it stands — but a
+/// refusal nothing ever says leaves the session on its launch account invisibly.
+#[test]
+fn a_standing_refusal_is_announced_once_per_reason() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let launch = member("say-a");
+        let intended = member("say-b");
+        member_store(&launch);
+        member_store(&intended);
+        let (swap, _launch_markers) = lone_session(&launch, Isolation::Shared);
+
+        assert!(
+            swap.should_announce("say-b", &SwapRefused::NotOauth),
+            "the first refusal must be said"
+        );
+        assert!(
+            !swap.should_announce("say-b", &SwapRefused::NotOauth),
+            "the same refusal, standing, must not repeat every tick"
+        );
+        assert!(
+            swap.should_announce("say-b", &SwapRefused::Disabled),
+            "a changed reason is news"
+        );
+        assert!(
+            swap.should_announce("say-c", &SwapRefused::Disabled),
+            "a changed member is news"
+        );
+
+        // A landed swap resets it: the next refusal on that member is new
+        // information, not a repeat.
+        assert!(!swap.should_announce("say-c", &SwapRefused::Disabled));
+        assert_eq!(swap.swap_to("say-b").expect("out"), SwapOutcome::Swapped);
+        assert!(
+            swap.should_announce("say-c", &SwapRefused::Disabled),
+            "a swap clears the announced state"
         );
     });
 }

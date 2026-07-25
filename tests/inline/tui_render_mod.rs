@@ -1382,3 +1382,43 @@ fn overview_reset_column_never_loses_ground_to_the_clock_setting() {
         "a 160-col overview stamps both the 5h and 7d resets:\n{wide}"
     );
 }
+
+/// Where the `active` column exists, exactly, as a function of name length and
+/// terminal width — the presence map `docs/tui-design.md` publishes.
+///
+/// The fit gate's own comparison had no pin: `<= total` → `< total` shifts every
+/// arrival by one column and the whole suite stayed green, because the only test
+/// watching presence reads `widths.active` and then checks the render agrees with
+/// it, which is true however the gate is written. This asserts the map instead,
+/// so the boundary is a fact rather than a self-consistency check.
+///
+/// Presence is NOT monotonic and there is no single cutoff: the column takes what
+/// the name clamp and the kind / 5h / 7d tiers leave, so every tier bump reclaims
+/// its cells and widening the terminal can REMOVE it. That is why the expectation
+/// is a set of ranges and not a threshold.
+#[test]
+fn the_active_column_exists_exactly_where_the_other_columns_left_room() {
+    use crate::tui::app::Tab;
+
+    // (name length, inclusive terminal-width ranges carrying the column)
+    const PRESENCE: &[(usize, &[(u16, u16)])] = &[
+        (8, &[(50, 200)]),
+        (11, &[(53, 69), (71, 200)]),
+        (16, &[(58, 61), (65, 67), (76, 96), (101, 105), (110, 200)]),
+    ];
+
+    for (name_len, ranges) in PRESENCE {
+        let name = "n".repeat(*name_len);
+        let mut app = App::new(AppConfig {
+            state: AppState::default(),
+            profiles: vec![oauth(&name, 40.0, 60.0, false)],
+        });
+        app.tab = Tab::Overview;
+
+        let present: Vec<u16> = (34u16..=200)
+            .filter(|w| dump(&app, *w, 20).contains("active"))
+            .collect();
+        let expected: Vec<u16> = ranges.iter().flat_map(|(lo, hi)| *lo..=*hi).collect();
+        assert_eq!(present, expected, "the {name_len}-char presence map moved");
+    }
+}

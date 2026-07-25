@@ -1587,7 +1587,9 @@ fn a_narrow_chain_row_drops_the_live_tally_before_the_reason_marker() {
     // This NAME's real collision band is terminal 60..=73, and it holds exactly
     // two pane shapes: `master_detail` clamps the selector to 20 cells through
     // 69 and 21 through 73, so those are the only two renders in it — anything
-    // else in the range is a duplicate, not coverage. Inside the band the
+    // else in the range is a duplicate, not coverage. The lower edge is
+    // `panes::NARROW_BODY_W`, where the layout stops stacking, rather than a
+    // collision floor: below it there is no side-by-side selector to crowd. Inside the band the
     // shipped row keeps `⊖` and drops the tally; without `reserved` it renders
     // `nnnnnn  1⇄` and appends `⊖` past `w`, where ratatui throws it away. At 74
     // the pane finally holds both, which is what makes this a BAND rather than a

@@ -331,11 +331,21 @@ fn source_maps_to_wire_strings() {
     );
 }
 
+/// Tier 2 keys on the config dir's NAME, so per-session runtime dirs have to
+/// resolve too — otherwise `clauth which` and `session_auth` stop recognizing
+/// every `clauth start` session, with nothing failing loudly. The legacy
+/// unsuffixed path must keep resolving alongside it.
 #[test]
 fn session_profile_extracted_from_runtime_path() {
     assert_eq!(
         session_profile_from_config_dir(std::path::Path::new(
             "/home/u/.clauth/profiles/work/runtime"
+        )),
+        Some("work".to_string())
+    );
+    assert_eq!(
+        session_profile_from_config_dir(std::path::Path::new(
+            "/home/u/.clauth/profiles/work/runtime-4242-0"
         )),
         Some("work".to_string())
     );
@@ -351,4 +361,16 @@ fn session_profile_none_for_non_runtime_path() {
         session_profile_from_config_dir(std::path::Path::new("/home/u/.clauth/profiles/work")),
         None
     );
+    // The isolated flavor was never attributable through this tier; widening the
+    // name check must not start attributing it.
+    for isolated in [
+        "/home/u/.clauth/profiles/work/runtime-isolated",
+        "/home/u/.clauth/profiles/work/runtime-isolated-4242-0",
+    ] {
+        assert_eq!(
+            session_profile_from_config_dir(std::path::Path::new(isolated)),
+            None,
+            "{isolated} must not resolve to a profile"
+        );
+    }
 }

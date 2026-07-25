@@ -29,10 +29,10 @@
 //!   symmetric [`key_role`] rule gives for free.
 //!
 //! With no live `clauth start` session there is nothing to reconcile and nothing
-//! to lose: teardown removes `runtime/`, so the base is the only surviving
-//! member and the engine's `members.len() < 2` short-circuit makes a sync a
-//! no-op. That is why this runs on the session watchdog and needs no daemon
-//! tick — a headless box has no runtime copy that could diverge.
+//! to lose: teardown discards each session's runtime tree, so the base is the
+//! only surviving member and the engine's `members.len() < 2` short-circuit makes
+//! a sync a no-op. That is why this runs on the session watchdog and needs no
+//! daemon tick — a headless box has no runtime copy that could diverge.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -134,25 +134,26 @@ fn key_role(path: KeyPath<'_>, custom_env: &BTreeSet<String>) -> KeyRule {
 }
 
 /// Every `settings.json` clauth reconciles: the operator's own
-/// `~/.claude/settings.json` plus each profile's SHARED runtime copy.
+/// `~/.claude/settings.json` plus each SHARED per-session runtime copy. The
+/// members are enumerated through [`crate::runtime::shared_runtime_dirs`], since
+/// every session owns its own `runtime-<sid>` — a fixed `<profile>/runtime` path
+/// would find nothing while every session ran, and reconcile nothing.
 ///
-/// `runtime-isolated/settings.json` is deliberately absent. An isolated runtime
-/// is built from an EMPTY base (`runtime::write_merged_settings`), so it carries
-/// none of the operator's hooks, permissions, or statusline; letting it win a
-/// newest-wins race would delete all of them from the base and from every shared
-/// copy, and letting it receive would defeat the isolation it exists for. The
-/// two flavors live in separate directories (`runtime/` vs `runtime-isolated/`),
-/// so excluding it is an exact path check, not a heuristic.
+/// An isolated runtime's copy is deliberately absent. It is built from an EMPTY
+/// base (`runtime::write_merged_settings`), so it carries none of the operator's
+/// hooks, permissions, or statusline; letting it win a newest-wins race would
+/// delete all of them from the base and from every shared copy, and letting it
+/// receive would defeat the isolation it exists for. The flavors are separated by
+/// a dir-name rule, not a substring guess: a shared dir is `runtime` or
+/// `runtime-<sid>` with `<sid>` digits and one `-`, which no
+/// `runtime-isolated…` name can satisfy.
 fn known_paths() -> Result<Vec<PathBuf>> {
     let mut paths = vec![claude_dir()?.join("settings.json")];
-    let profiles = clauth_dir()?.join("profiles");
-    if let Ok(entries) = std::fs::read_dir(&profiles) {
-        for entry in entries.flatten() {
-            if entry.file_type().is_ok_and(|t| t.is_dir()) {
-                paths.push(entry.path().join("runtime").join("settings.json"));
-            }
-        }
-    }
+    paths.extend(
+        crate::runtime::shared_runtime_dirs()
+            .into_iter()
+            .map(|dir| dir.join("settings.json")),
+    );
     Ok(paths)
 }
 

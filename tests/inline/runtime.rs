@@ -755,6 +755,27 @@ fn make_profile(name: &str) -> crate::profile::Profile {
     crate::profile::Profile::new(name.to_string(), None, None)
 }
 
+/// The `<sid>` keying a live session's dirs, read back off its runtime path.
+fn sid_of(runtime: &Path) -> String {
+    runtime
+        .file_name()
+        .and_then(|n| n.to_str())
+        .and_then(|n| n.strip_prefix("runtime-"))
+        .map(str::to_owned)
+        .unwrap_or_else(|| panic!("{} is not a per-session runtime dir", runtime.display()))
+}
+
+/// Sorted file names directly under `dir`.
+fn dir_entry_names(dir: &Path) -> Vec<String> {
+    let mut names: Vec<String> = fs::read_dir(dir)
+        .unwrap_or_else(|e| panic!("read {}: {e}", dir.display()))
+        .flatten()
+        .filter_map(|e| e.file_name().to_str().map(str::to_owned))
+        .collect();
+    names.sort();
+    names
+}
+
 #[test]
 fn build_runtime_dir_writes_settings_not_symlink() {
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -1419,38 +1440,31 @@ fn acquire_creates_runtime_and_pid_file() {
             "runtime dir must exist after acquire"
         );
 
-        let sessions = tmp
-            .path()
-            .join(".clauth")
-            .join("profiles")
-            .join("lifecycle")
-            .join("sessions");
-        let session_files: Vec<PathBuf> = fs::read_dir(&sessions)
-            .expect("read sessions")
-            .flatten()
-            .map(|e| e.path())
-            .collect();
-        assert_eq!(session_files.len(), 1, "exactly one PID file");
-        let pid_file = &session_files[0];
+        let sessions = rt.sessions_dir().to_path_buf();
+        let sid = sid_of(rt.config_dir());
+        assert_eq!(
+            dir_entry_names(&sessions),
+            vec![sid.clone()],
+            "exactly one marker, named for this session"
+        );
+        let pid_file = sessions.join(&sid);
         assert!(
-            pid_file
-                .file_name()
-                .and_then(|n| n.to_str())
-                .is_some_and(|n| n.starts_with(&format!("{}-", std::process::id()))),
-            "session file must carry the `<pid>-` prefix"
+            sid.starts_with(&format!("{}-", std::process::id())),
+            "the session id must carry the `<pid>-` prefix, got {sid}"
         );
         assert!(
-            is_session_alive(pid_file),
+            is_session_alive(&pid_file),
             "PID file must be flock-held while runtime is alive"
         );
 
-        let expected_runtime = tmp
+        let profile_dir = tmp
             .path()
             .join(".clauth")
             .join("profiles")
-            .join("lifecycle")
-            .join("runtime");
+            .join("lifecycle");
+        let expected_runtime = profile_dir.join(format!("runtime-{sid}"));
         assert_eq!(rt.config_dir(), expected_runtime);
+        assert_eq!(sessions, profile_dir.join(format!("sessions-{sid}")));
 
         assert!(
             rt.config_dir().join("settings.json").exists(),
@@ -1541,8 +1555,7 @@ fn acquire_isolates_credentials_from_real_home() {
 /// profile+flavor must not collide on the session file. Before the per-acquire
 /// `-<n>` suffix both keyed `sessions/<pid>`, so the second `acquire` blocked
 /// forever on the first's `flock(2)` — the background-`delegate` hang where a
-/// second same-profile job never spawned a session. Both must register live,
-/// and teardown must wait for the last drop.
+/// second same-profile job never spawned a session. Both must register live.
 #[test]
 fn acquire_twice_same_process_counts_two_sessions() {
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -1561,25 +1574,117 @@ fn acquire_twice_same_process_counts_two_sessions() {
             "two concurrent same-process sessions must both register live"
         );
 
-        let runtime = tmp
-            .path()
-            .join(".clauth")
-            .join("profiles")
-            .join("concurrent")
-            .join("runtime");
+        let rt1_runtime = rt1.config_dir().to_path_buf();
 
         drop(rt2);
         assert!(
-            runtime.exists(),
-            "runtime must survive while a sibling session is still live"
+            rt1_runtime.is_dir(),
+            "the surviving session's runtime is untouched by a sibling's teardown"
         );
         assert_eq!(live_session_count("concurrent"), 1);
 
         drop(rt1);
         assert!(
-            !runtime.exists(),
-            "runtime torn down once the last session drops"
+            !rt1_runtime.exists(),
+            "runtime torn down once its own session drops"
         );
+    });
+}
+
+/// Every `clauth start` session gets its OWN tree — the shared flavor included,
+/// which two same-profile sessions used to share. Pins the exact per-session
+/// names and the `runtime<rest>` ↔ `sessions<rest>` pairing they rest on.
+#[test]
+fn two_shared_sessions_get_independent_trees() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        fake_claude_home(tmp.path());
+        let profile = make_profile("twin");
+
+        let a = ProfileRuntime::acquire(&profile, Isolation::Shared, &[]).expect("first acquire");
+        let b = ProfileRuntime::acquire(&profile, Isolation::Shared, &[]).expect("second acquire");
+
+        assert_ne!(
+            a.config_dir(),
+            b.config_dir(),
+            "two shared sessions of one profile must not share a runtime tree"
+        );
+        assert_ne!(
+            a.sessions_dir(),
+            b.sessions_dir(),
+            "two shared sessions of one profile must not share a marker dir"
+        );
+
+        let profile_dir = tmp.path().join(".clauth").join("profiles").join("twin");
+        for rt in [&a, &b] {
+            let sid = sid_of(rt.config_dir());
+            assert_eq!(rt.config_dir(), profile_dir.join(format!("runtime-{sid}")));
+            assert_eq!(
+                rt.sessions_dir(),
+                profile_dir.join(format!("sessions-{sid}"))
+            );
+            assert_eq!(
+                dir_entry_names(rt.sessions_dir()),
+                vec![sid],
+                "a marker dir holds this session's marker and no other's"
+            );
+            assert!(
+                rt.config_dir().join("settings.json").is_file(),
+                "each tree is built independently, not shared"
+            );
+        }
+        assert_eq!(live_session_count("twin"), 2);
+
+        drop(b);
+        drop(a);
+    });
+}
+
+/// Teardown is per session: dropping one of two same-profile shared sessions
+/// discards only its own tree and marker.
+#[test]
+fn dropping_one_shared_session_leaves_the_sibling_intact() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        fake_claude_home(tmp.path());
+        let profile = make_profile("survivor");
+
+        let a = ProfileRuntime::acquire(&profile, Isolation::Shared, &[]).expect("first acquire");
+        let b = ProfileRuntime::acquire(&profile, Isolation::Shared, &[]).expect("second acquire");
+
+        let a_runtime = a.config_dir().to_path_buf();
+        let a_sessions = a.sessions_dir().to_path_buf();
+        let a_marker = a_sessions.join(sid_of(&a_runtime));
+        let b_runtime = b.config_dir().to_path_buf();
+        let b_sessions = b.sessions_dir().to_path_buf();
+        fs::write(a_runtime.join("survivor.txt"), b"keep me").expect("seed a's tree");
+
+        drop(b);
+
+        assert!(
+            !b_runtime.exists(),
+            "the dropped session's tree is discarded"
+        );
+        assert!(
+            !b_sessions.exists(),
+            "the dropped session's marker dir goes with it"
+        );
+        assert!(a_runtime.is_dir(), "the sibling's tree must survive");
+        assert_eq!(
+            fs::read(a_runtime.join("survivor.txt")).expect("read sibling file"),
+            b"keep me",
+            "the sibling's tree contents must be untouched"
+        );
+        assert_eq!(dir_entry_names(&a_sessions), vec![sid_of(&a_runtime)]);
+        assert!(
+            is_session_alive(&a_marker),
+            "the sibling's marker must still be flock-held"
+        );
+        assert_eq!(live_session_count("survivor"), 1);
+
+        drop(a);
+        assert!(!a_runtime.exists());
+        assert!(!a_sessions.exists());
     });
 }
 
@@ -1897,6 +2002,44 @@ fn build_runtime_dir_prunes_dangling_symlink() {
 
 // ── isolation liveness + GC ──────────────────────────────────────────────────
 
+/// THE ROTATION GATE. Every session now keys its marker dir by session id, so
+/// the gate has to enumerate the profile dir rather than probe two fixed names.
+/// A false negative here spends a single-use refresh token a live session still
+/// holds and burns the whole chain, so both flavors are pinned.
+#[test]
+fn has_live_session_sees_a_per_session_dir_of_either_flavor() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let profiles = tmp.path().join(".clauth").join("profiles");
+        for (profile, sessions_name, sid) in [
+            ("gate-shared", "sessions-31337-0", "31337-0"),
+            ("gate-iso", "sessions-isolated-31337-1", "31337-1"),
+        ] {
+            let sessions = profiles.join(profile).join(sessions_name);
+            fs::create_dir_all(&sessions).expect("mkdir sessions");
+            let marker = open_pid_file(&sessions.join(sid)).expect("open marker");
+            marker.lock().expect("lock marker");
+
+            assert!(
+                has_live_session(profile),
+                "a live marker in {sessions_name} must gate rotation"
+            );
+            assert_eq!(live_session_count(profile), 1);
+
+            drop(marker);
+            // The probe is deliberately fail-alive (any try_lock I/O error reads
+            // as "alive" — see `is_session_alive`), so only a PERSISTENTLY-alive
+            // reading after the holder dropped is a regression.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while has_live_session(profile) && std::time::Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            assert!(!has_live_session(profile));
+            assert_eq!(live_session_count(profile), 0);
+        }
+    });
+}
+
 /// An isolated session must register as live so rotation never spends a token
 /// it still holds — `has_live_session` unions both flavors.
 #[test]
@@ -1930,7 +2073,10 @@ fn has_live_session_sees_isolated_session() {
 }
 
 /// GC removes a runtime tree left by a crashed session (no live PID), and never
-/// touches one with a live session.
+/// touches one with a live session. All fixtures here are the LEGACY unsuffixed
+/// layout a pre-per-session release left on disk: the `runtime<rest>` ↔
+/// `sessions<rest>` pairing rule must reach it, which is the whole migration
+/// path.
 #[test]
 fn gc_removes_stale_runtime_but_spares_live() {
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -1944,6 +2090,14 @@ fn gc_removes_stale_runtime_but_spares_live() {
         fs::create_dir_all(&stale_sessions).expect("mkdir stale sessions");
         fs::write(stale_runtime.join("settings.json"), b"{}").expect("seed runtime");
         fs::write(stale_sessions.join("99999"), b"").expect("dead pid");
+
+        // Stale, isolated flavor: the same legacy shape one dir name over.
+        let stale_iso_runtime = profiles.join("staleiso").join("runtime-isolated");
+        let stale_iso_sessions = profiles.join("staleiso").join("sessions-isolated");
+        fs::create_dir_all(&stale_iso_runtime).expect("mkdir stale iso runtime");
+        fs::create_dir_all(&stale_iso_sessions).expect("mkdir stale iso sessions");
+        fs::write(stale_iso_runtime.join(".claude.json"), b"{}").expect("seed iso runtime");
+        fs::write(stale_iso_sessions.join("88888"), b"").expect("dead iso pid");
 
         // Live: an isolated runtime with a flock-held pid file.
         let live_runtime = profiles.join("live").join("runtime-isolated");
@@ -1964,10 +2118,111 @@ fn gc_removes_stale_runtime_but_spares_live() {
             "stale sessions dir cleaned alongside"
         );
         assert!(
+            !stale_iso_runtime.exists(),
+            "a legacy isolated pair must be collected the same way"
+        );
+        assert!(!stale_iso_sessions.exists());
+        assert!(
             live_runtime.exists(),
             "a live session's runtime must be spared"
         );
         drop(held);
+    });
+}
+
+/// Per-session dirs are collected by the same pairing rule, both flavors, and a
+/// held marker still spares its own pair.
+#[test]
+fn gc_collects_a_dead_per_session_pair_and_spares_a_held_one() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let profiles = tmp.path().join(".clauth").join("profiles");
+
+        // Dead: both flavors, marker present but unlocked.
+        let mut dead = Vec::new();
+        for (profile, runtime_name, sid) in [
+            ("psdead", "runtime-4242-0", "4242-0"),
+            ("psdeadiso", "runtime-isolated-4242-1", "4242-1"),
+        ] {
+            let runtime = profiles.join(profile).join(runtime_name);
+            let sessions = profiles.join(profile).join(
+                runtime_name
+                    .strip_prefix("runtime")
+                    .map(|rest| format!("sessions{rest}"))
+                    .expect("paired name"),
+            );
+            fs::create_dir_all(&runtime).expect("mkdir runtime");
+            fs::create_dir_all(&sessions).expect("mkdir sessions");
+            fs::write(runtime.join(".claude.json"), b"{}").expect("seed runtime");
+            fs::write(sessions.join(sid), b"").expect("dead marker");
+            dead.push((runtime, sessions));
+        }
+
+        // Held: a per-session pair whose marker is flock-held.
+        let held_runtime = profiles.join("pslive").join("runtime-777-3");
+        let held_sessions = profiles.join("pslive").join("sessions-777-3");
+        fs::create_dir_all(&held_runtime).expect("mkdir held runtime");
+        fs::create_dir_all(&held_sessions).expect("mkdir held sessions");
+        fs::write(held_runtime.join(".claude.json"), b"{}").expect("seed held runtime");
+        let marker = open_pid_file(&held_sessions.join("777-3")).expect("open held marker");
+        marker.lock().expect("lock held marker");
+
+        gc_stale_runtimes();
+
+        for (runtime, sessions) in &dead {
+            assert!(
+                !runtime.exists(),
+                "{} must be collected — its marker is unlocked",
+                runtime.display()
+            );
+            assert!(!sessions.exists(), "{} must go with it", sessions.display());
+        }
+        assert!(
+            held_runtime.join(".claude.json").is_file(),
+            "a held marker must spare its own runtime tree and its contents"
+        );
+        assert!(held_sessions.join("777-3").is_file());
+        drop(marker);
+    });
+}
+
+/// `acquire` mints a marker dir before it builds the tree, so a crash in that
+/// window strands one with no runtime sibling — a fresh empty dir every session
+/// under per-session keying. GC must collect it, and must still leave one whose
+/// marker is held.
+#[test]
+fn gc_collects_an_orphaned_sessions_dir_with_no_runtime_sibling() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let profiles = tmp.path().join(".clauth").join("profiles");
+
+        let orphan = profiles.join("orphan").join("sessions-5150-0");
+        fs::create_dir_all(&orphan).expect("mkdir orphan");
+        fs::write(orphan.join("5150-0"), b"").expect("dead marker");
+
+        let orphan_empty = profiles.join("orphan").join("sessions-5150-1");
+        fs::create_dir_all(&orphan_empty).expect("mkdir empty orphan");
+
+        let held = profiles.join("orphan").join("sessions-5150-2");
+        fs::create_dir_all(&held).expect("mkdir held orphan");
+        let marker = open_pid_file(&held.join("5150-2")).expect("open held marker");
+        marker.lock().expect("lock held marker");
+
+        gc_stale_runtimes();
+
+        assert!(
+            !orphan.exists(),
+            "an orphaned marker dir with a dead marker must be collected"
+        );
+        assert!(
+            !orphan_empty.exists(),
+            "an orphaned marker dir with no marker at all must be collected"
+        );
+        assert!(
+            held.join("5150-2").is_file(),
+            "a still-held marker dir must be spared even with no runtime sibling"
+        );
+        drop(marker);
     });
 }
 

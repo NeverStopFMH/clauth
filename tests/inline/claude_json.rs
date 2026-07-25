@@ -398,3 +398,46 @@ fn strip_home_oauth_account_skips_missing_file() {
 
     assert!(!path.exists(), "a missing file must never be created");
 }
+
+/// Regression for a break that compiles clean: every session now runs out of its
+/// own `runtime-<sid>/`, so a discovery hardcoded to `<profile>/runtime` finds
+/// nothing and cross-profile `.claude.json` reconciliation silently dies for
+/// every live session. Isolated copies stay excluded, as they were.
+#[test]
+fn known_paths_reach_per_session_copies_and_still_exclude_isolated() {
+    let home = HomeSandbox::new();
+    let global = home.home().join(".claude.json");
+    let profiles = home.home().join(".clauth/profiles");
+    let legacy = profiles.join("p1/runtime/.claude.json");
+    let session = profiles.join("p1/runtime-4242-0/.claude.json");
+    let sibling = profiles.join("p2/runtime-4242-1/.claude.json");
+    let isolated = profiles.join("p1/runtime-isolated-4242-2/.claude.json");
+    for path in [&global, &legacy, &session, &sibling, &isolated] {
+        fs::create_dir_all(path.parent().expect("has parent")).expect("mkdir");
+        write_json(path, &json!({}));
+    }
+
+    let paths = known_paths().expect("known paths");
+
+    assert!(
+        paths.contains(&global),
+        "the global file is always a member"
+    );
+    assert!(
+        paths.contains(&session),
+        "a live session's own runtime-<sid> copy must be a sync member"
+    );
+    assert!(
+        paths.contains(&sibling),
+        "another profile's session copy must be a member too"
+    );
+    assert!(
+        paths.contains(&legacy),
+        "a legacy unsuffixed runtime/ copy must stay a member"
+    );
+    assert!(
+        !paths.contains(&isolated),
+        "an isolated per-session copy must not be a sync member"
+    );
+    assert_eq!(paths.len(), 4, "no member beyond those four: {paths:#?}");
+}

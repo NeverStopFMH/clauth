@@ -1,10 +1,17 @@
-//! Per-profile persistent `CLAUDE_CONFIG_DIR` used by `clauth start`.
+//! Per-session `CLAUDE_CONFIG_DIR` trees used by `clauth start`.
 //!
-//! All `clauth start <profile>` sessions for the same profile share a
-//! runtime tree at `~/.clauth/profiles/<profile>/runtime/`. Its
-//! `.credentials.json` mirrors the profile's canonical creds so concurrent
-//! sessions observe a single chain of refresh tokens. A watchdog thread in
-//! each parent process keeps the runtime tree and canonical state in sync.
+//! Every `clauth start <profile>` session gets its OWN runtime tree, keyed by a
+//! session id (`<pid>-<seq>`): `~/.clauth/profiles/<profile>/runtime-<sid>/`, or
+//! `runtime-isolated-<sid>/` for an isolated run. Its `.credentials.json` still
+//! resolves to the profile's canonical creds, so concurrent sessions of one
+//! profile observe a single chain of refresh tokens. A watchdog thread in each
+//! parent process keeps the runtime tree and canonical state in sync.
+//!
+//! The layout rests on ONE rule, which every enumeration below applies instead
+//! of a hardcoded name list: a runtime dir named `runtime<rest>` pairs with the
+//! sessions dir named `sessions<rest>`. It covers both flavors and also the
+//! pre-per-session `runtime`/`sessions` pair an earlier release left on disk, so
+//! liveness and GC reach a legacy tree with no migration step.
 //!
 //! Two transport modes, picked per profile at acquire time:
 //!
@@ -20,13 +27,14 @@
 //!   "latest mtime wins" so a re-login on either side propagates to the
 //!   other before another session can pick up a stale refresh token.
 //!
-//! Reference counting lives in a sibling `sessions/` directory: each
-//! session creates `sessions/<pid>-<n>` and holds an exclusive `flock(2)` on
-//! it for its lifetime. The `-<n>` suffix keeps the file unique per acquire,
-//! so one process holding several concurrent sessions of the same profile
-//! (the `clauth mcp` server running overlapping `delegate`s) never collides
-//! on a single path. New sessions prune entries whose lock is free (previous
-//! holder died) and tear the runtime tree down when no live sessions remain.
+//! Liveness lives in the paired `sessions-<sid>/` directory: the session creates
+//! the marker `sessions-<sid>/<sid>` and holds an exclusive `flock(2)` on it for
+//! its lifetime, so any other process reads liveness without cooperation. Token
+//! rotation gates on a live marker in ANY of a profile's sessions dirs
+//! ([`has_live_session`]) — missing one would spend a single-use refresh token a
+//! live session still holds. Teardown drops the marker and discards that
+//! session's own tree; [`gc_stale_runtimes`] collects what a crashed session
+//! left behind, of either flavor and in either layout.
 
 use std::collections::HashSet;
 use std::fs::{File, OpenOptions};
@@ -43,7 +51,7 @@ use crate::lock::with_state_lock;
 use crate::logline::logline;
 use crate::profile::{
     ClaudeCredentials, Profile, atomic_write, atomic_write_600, claude_dir, clauth_dir, home_dir,
-    profile_subpath,
+    profile_dir, profile_subpath,
 };
 
 /// Watchdog tick. 1s instead of a longer interval because fake-symlink mode
@@ -69,10 +77,10 @@ enum LinkMode {
 }
 
 /// Whether a session inherits the operator's full `~/.claude/` (memory,
-/// plugins, hooks, commands, agents) or runs authenticated-but-clean. An
-/// isolated session gets its OWN `runtime-isolated/` + `sessions-isolated/`
-/// trees so it never collides with a shared session of the same profile, while
-/// sharing the profile's canonical credentials and rotation lock.
+/// plugins, hooks, commands, agents) or runs authenticated-but-clean. Both
+/// flavors get their own per-session tree; the flavor decides only what is
+/// materialized into it, since every session shares the profile's canonical
+/// credentials and rotation lock either way.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Isolation {
     /// Full mirror of `~/.claude/`: the session behaves like the operator's.
@@ -82,79 +90,162 @@ pub(crate) enum Isolation {
     Isolated,
 }
 
+/// Directory-name stems. A per-session dir appends `-<sid>`; the bare stem is
+/// the pre-per-session layout, which the pairing rule still covers.
+const RUNTIME_STEM: &str = "runtime";
+const SESSIONS_STEM: &str = "sessions";
+const ISOLATED_RUNTIME_STEM: &str = "runtime-isolated";
+const ISOLATED_SESSIONS_STEM: &str = "sessions-isolated";
+
 impl Isolation {
-    fn runtime_subdir(self) -> &'static str {
+    fn runtime_stem(self) -> &'static str {
         match self {
-            Isolation::Shared => "runtime",
-            Isolation::Isolated => "runtime-isolated",
+            Isolation::Shared => RUNTIME_STEM,
+            Isolation::Isolated => ISOLATED_RUNTIME_STEM,
         }
     }
-    fn sessions_subdir(self) -> &'static str {
+    fn sessions_stem(self) -> &'static str {
         match self {
-            Isolation::Shared => "sessions",
-            Isolation::Isolated => "sessions-isolated",
+            Isolation::Shared => SESSIONS_STEM,
+            Isolation::Isolated => ISOLATED_SESSIONS_STEM,
         }
     }
 }
 
-/// The two runtime flavors a profile can hold concurrently. Liveness and GC
-/// must consider both so a rotation never spends a token an isolated session
-/// still holds.
-const SESSION_ISOLATIONS: [Isolation; 2] = [Isolation::Shared, Isolation::Isolated];
-
-/// Per-process counter making each `acquire`'s session file unique. A single
+/// Per-process counter making each `acquire`'s [`SessionId`] unique. A single
 /// process can hold several live sessions of the same profile+flavor at once —
-/// the `clauth mcp` server firing overlapping `delegate`s. Keying only on
-/// `sessions/<pid>` would make the second acquire block forever on the first's
-/// `flock(2)` (an exclusive lock on a second fd of the same path waits), hanging
-/// the delegate in `acquire` with no session ever spawned. The suffix gives each
-/// acquire its own liveness marker.
+/// the `clauth mcp` server firing overlapping `delegate`s. Keying only on the
+/// pid would make the second acquire block forever on the first's `flock(2)` (an
+/// exclusive lock on a second fd of the same path waits), hanging the delegate in
+/// `acquire` with no session ever spawned.
 static SESSION_SEQ: AtomicU64 = AtomicU64::new(0);
 
-fn runtime_dir(name: &str, isolation: Isolation) -> Result<PathBuf> {
-    profile_subpath(name, isolation.runtime_subdir())
+/// A session's process-unique id, `<pid>-<seq>`: the name of its liveness marker
+/// file AND the suffix keying its own runtime + sessions dirs. Digits and one
+/// `-` only, which is what makes a session id unable to spell the `isolated`
+/// flavor stem — the property [`is_shared_runtime_dir_name`] relies on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SessionId(String);
+
+impl SessionId {
+    /// Mint the next id for this process.
+    fn mint() -> Self {
+        Self(format!(
+            "{}-{}",
+            std::process::id(),
+            SESSION_SEQ.fetch_add(1, Ordering::Relaxed)
+        ))
+    }
+
+    fn as_str(&self) -> &str {
+        &self.0
+    }
 }
 
-fn sessions_dir(name: &str, isolation: Isolation) -> Result<PathBuf> {
-    profile_subpath(name, isolation.sessions_subdir())
+/// True iff `s` has the `<pid>-<seq>` shape [`SessionId::mint`] produces.
+fn is_session_id_str(s: &str) -> bool {
+    s.split_once('-').is_some_and(|(pid, seq)| {
+        !pid.is_empty()
+            && !seq.is_empty()
+            && pid.bytes().all(|b| b.is_ascii_digit())
+            && seq.bytes().all(|b| b.is_ascii_digit())
+    })
+}
+
+/// True for a SHARED runtime dir name — a per-session `runtime-<sid>` or the
+/// legacy bare `runtime` — and false for the isolated flavor or any unrelated
+/// name. Callers that must reach only shared copies (both config reconcilers,
+/// `clauth which`) key on this rather than an exact name, and stay exact by
+/// construction: `<sid>` is digits and one `-`, so `runtime-isolated…` can never
+/// parse as one.
+pub(crate) fn is_shared_runtime_dir_name(name: &str) -> bool {
+    match name.strip_prefix(RUNTIME_STEM) {
+        Some("") => true,
+        Some(rest) => rest.strip_prefix('-').is_some_and(is_session_id_str),
+        None => false,
+    }
+}
+
+/// The sessions dir paired with a runtime dir of this name, per the module's one
+/// layout rule: `runtime<rest>` ↔ `sessions<rest>`.
+fn paired_sessions_name(runtime_name: &str) -> Option<String> {
+    runtime_name
+        .strip_prefix(RUNTIME_STEM)
+        .map(|rest| format!("{SESSIONS_STEM}{rest}"))
+}
+
+/// Inverse of [`paired_sessions_name`].
+fn paired_runtime_name(sessions_name: &str) -> Option<String> {
+    sessions_name
+        .strip_prefix(SESSIONS_STEM)
+        .map(|rest| format!("{RUNTIME_STEM}{rest}"))
+}
+
+fn runtime_dir(name: &str, isolation: Isolation, session: &SessionId) -> Result<PathBuf> {
+    profile_subpath(
+        name,
+        &format!("{}-{}", isolation.runtime_stem(), session.as_str()),
+    )
+}
+
+fn sessions_dir(name: &str, isolation: Isolation, session: &SessionId) -> Result<PathBuf> {
+    profile_subpath(
+        name,
+        &format!("{}-{}", isolation.sessions_stem(), session.as_str()),
+    )
 }
 
 fn profiles_root_dir() -> Result<PathBuf> {
     Ok(clauth_dir()?.join("profiles"))
 }
 
-/// True iff the profile has at least one live `clauth start` session, of either
-/// flavor (shared or isolated). Gates token rotation, so it MUST see an isolated
-/// session too — otherwise a rotation could spend a refresh token the isolated
-/// session still holds. A missing or unreadable sessions dir counts as idle.
-pub(crate) fn has_live_session(name: &str) -> bool {
-    SESSION_ISOLATIONS
-        .iter()
-        .any(|&iso| live_sessions_in(name, iso) > 0)
-}
-
-/// Count of live `clauth start` sessions for the profile across both flavors.
-/// Additive sibling of [`has_live_session`]; a missing or unreadable sessions
-/// dir counts as zero.
-pub(crate) fn live_session_count(name: &str) -> usize {
-    SESSION_ISOLATIONS
-        .iter()
-        .map(|&iso| live_sessions_in(name, iso))
-        .sum()
-}
-
-/// Live-session count for one isolation flavor; zero when the dir is absent.
-fn live_sessions_in(name: &str, isolation: Isolation) -> usize {
-    let Ok(dir) = sessions_dir(name, isolation) else {
-        return 0;
+/// Every marker dir under the profile: each live session's own
+/// `sessions[-isolated]-<sid>` plus a legacy bare `sessions`/`sessions-isolated`.
+/// A missing or unreadable profile dir yields nothing.
+fn session_marker_dirs(name: &str) -> Vec<PathBuf> {
+    let Ok(profile) = profile_dir(name) else {
+        return Vec::new();
     };
-    live_sessions_at(&dir)
+    let Ok(entries) = std::fs::read_dir(&profile) else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .filter(|e| {
+            e.file_name()
+                .to_str()
+                .is_some_and(|n| n.starts_with(SESSIONS_STEM))
+        })
+        .map(|e| e.path())
+        .collect()
+}
+
+/// True iff the profile has at least one live `clauth start` session, in ANY of
+/// its per-session marker dirs and of either flavor. Gates token rotation, so a
+/// false negative burns the chain: it would spend a single-use refresh token a
+/// live session still holds. Enumerating the profile dir (rather than probing a
+/// fixed pair of names) is what keeps that true as sessions come and go. A
+/// missing or unreadable dir counts as idle.
+pub(crate) fn has_live_session(name: &str) -> bool {
+    session_marker_dirs(name)
+        .iter()
+        .any(|dir| live_sessions_at(dir) > 0)
+}
+
+/// Count of live `clauth start` sessions for the profile across every marker dir.
+/// Additive sibling of [`has_live_session`]; a missing or unreadable dir counts
+/// as zero.
+pub(crate) fn live_session_count(name: &str) -> usize {
+    session_marker_dirs(name)
+        .iter()
+        .map(|dir| live_sessions_at(dir))
+        .sum()
 }
 
 /// Live sessions holding a marker in `sessions`; zero when the dir is absent.
 /// Read-only (unlike [`prune_stale_sessions`], it drops nothing), so it needs no
-/// state lock — a caller reading its own flavor's dir always counts ITSELF,
-/// since a second fd's `try_lock` conflicts with the one `acquire` holds.
+/// state lock — a caller reading its own dir always counts ITSELF, since a second
+/// fd's `try_lock` conflicts with the one `acquire` holds.
 pub(crate) fn live_sessions_at(sessions: &Path) -> usize {
     let Ok(entries) = std::fs::read_dir(sessions) else {
         return 0;
@@ -166,10 +257,15 @@ pub(crate) fn live_sessions_at(sessions: &Path) -> usize {
 }
 
 /// Best-effort sweep removing runtime trees whose owning session died without
-/// running teardown (SIGKILL/crash leaves `runtime/` + a stale `sessions/<pid>`).
-/// Safe at any entry point: each removal re-checks liveness under the state lock
-/// (the same teardown gate `Drop` uses), so a profile with a live session — or
-/// one mid-acquire holding the lock — is never collected.
+/// running teardown (SIGKILL/crash strands the pair). With one tree per session
+/// this is load-bearing, not housekeeping: every crashed session would otherwise
+/// leak a 0600 `.claude.json` carrying that account's billing caches, forever.
+///
+/// Enumerates the real subdirs of each profile and pairs them by name, so it
+/// reaches per-session dirs of both flavors and the legacy pre-upgrade pair
+/// alike. Safe at any entry point: each removal re-checks liveness under the
+/// state lock (the same teardown gate `Drop` uses), so a live session — or one
+/// mid-acquire holding the lock — is never collected.
 pub(crate) fn gc_stale_runtimes() {
     let Ok(root) = profiles_root_dir() else {
         return;
@@ -177,29 +273,77 @@ pub(crate) fn gc_stale_runtimes() {
     let Ok(entries) = std::fs::read_dir(&root) else {
         return;
     };
-    for entry in entries.flatten() {
-        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+    for profile in entries.flatten() {
+        let profile = profile.path();
+        let Ok(children) = std::fs::read_dir(&profile) else {
             continue;
         };
-        for iso in SESSION_ISOLATIONS {
-            let _ = gc_one_runtime(&name, iso);
+        for child in children.flatten() {
+            let file_name = child.file_name();
+            let Some(child_name) = file_name.to_str() else {
+                continue;
+            };
+            if let Some(sessions) = paired_sessions_name(child_name) {
+                let _ = gc_one_pair(&child.path(), &profile.join(sessions));
+            } else if let Some(runtime) = paired_runtime_name(child_name) {
+                // A marker dir with no runtime sibling. `acquire` mints it before
+                // it builds the tree, so a crash in that window strands one — and
+                // per-session keying makes that a fresh empty dir every time
+                // rather than a reused one.
+                let runtime = profile.join(runtime);
+                if runtime.symlink_metadata().is_err() {
+                    let _ = gc_one_pair(&runtime, &child.path());
+                }
+            }
         }
     }
 }
 
-fn gc_one_runtime(name: &str, isolation: Isolation) -> Result<()> {
-    let runtime = runtime_dir(name, isolation)?;
-    if runtime.symlink_metadata().is_err() {
-        return Ok(()); // nothing left behind for this flavor
-    }
-    let sessions = sessions_dir(name, isolation)?;
+/// Collect one paired (`runtime<rest>`, `sessions<rest>`) tree when nothing holds
+/// a marker in it. The two go together; a `runtime` path that does not exist
+/// collects the orphaned marker dir alone.
+fn gc_one_pair(runtime: &Path, sessions: &Path) -> Result<()> {
     with_state_lock(|| {
-        if prune_stale_sessions(&sessions).unwrap_or(0) == 0 {
-            let _ = std::fs::remove_dir_all(&runtime);
-            let _ = std::fs::remove_dir(&sessions);
+        if prune_stale_sessions(sessions).unwrap_or(0) == 0 {
+            let _ = std::fs::remove_dir_all(runtime);
+            let _ = std::fs::remove_dir(sessions);
         }
         Ok::<_, anyhow::Error>(())
     })
+}
+
+/// Every profile's SHARED runtime dirs: each live session's `runtime-<sid>` plus
+/// a legacy bare `runtime` an earlier release left behind. Isolated dirs are
+/// excluded — both config reconcilers walk this, and neither may reach an
+/// isolated copy (each states why at its own `known_paths`). Fail-soft: an
+/// unreadable root or profile contributes nothing. Runs on the ~10 Hz watchdog
+/// tick, so it allocates only the paths it returns.
+pub(crate) fn shared_runtime_dirs() -> Vec<PathBuf> {
+    let Ok(root) = profiles_root_dir() else {
+        return Vec::new();
+    };
+    let Ok(entries) = std::fs::read_dir(&root) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for profile in entries.flatten() {
+        if !profile.file_type().is_ok_and(|t| t.is_dir()) {
+            continue;
+        }
+        let Ok(children) = std::fs::read_dir(profile.path()) else {
+            continue;
+        };
+        for child in children.flatten() {
+            if child
+                .file_name()
+                .to_str()
+                .is_some_and(is_shared_runtime_dir_name)
+            {
+                out.push(child.path());
+            }
+        }
+    }
+    out
 }
 
 /// Every profile with a live isolated session, paired with its own
@@ -222,19 +366,33 @@ pub(crate) fn live_isolated_stores() -> Vec<(String, PathBuf)> {
         return Vec::new();
     };
     let mut out = Vec::new();
-    for entry in entries.flatten() {
-        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+    for profile in entries.flatten() {
+        let profile_name = profile.file_name();
+        let Some(profile_name) = profile_name.to_str() else {
             continue;
         };
-        if live_sessions_in(&name, Isolation::Isolated) == 0 {
-            continue;
-        }
-        let Ok(projects) = runtime_dir(&name, Isolation::Isolated).map(|d| d.join("projects"))
-        else {
+        let profile_path = profile.path();
+        let Ok(children) = std::fs::read_dir(&profile_path) else {
             continue;
         };
-        if projects.is_dir() {
-            out.push((name, projects));
+        for child in children.flatten() {
+            let file_name = child.file_name();
+            let Some(child_name) = file_name.to_str() else {
+                continue;
+            };
+            if !child_name.starts_with(ISOLATED_RUNTIME_STEM) {
+                continue;
+            }
+            let Some(sessions) = paired_sessions_name(child_name) else {
+                continue;
+            };
+            if live_sessions_at(&profile_path.join(sessions)) == 0 {
+                continue;
+            }
+            let projects = child.path().join("projects");
+            if projects.is_dir() {
+                out.push((profile_name.to_string(), projects));
+            }
         }
     }
     out
@@ -270,8 +428,8 @@ fn rotation_lock_path(name: &str) -> Result<PathBuf> {
 ///   so rotate's in-lock `has_live_session` re-check sees the live session and
 ///   skips (the token is never spent).
 ///
-/// Distinct from `~/.clauth/.lock` (global state) and `sessions/<pid>`
-/// (per-session liveness). Blocking `flock`; the holder window is short.
+/// Distinct from `~/.clauth/.lock` (global state) and a session's own marker
+/// file (per-session liveness). Blocking `flock`; the holder window is short.
 #[must_use]
 pub(crate) struct RotationGuard {
     // Drops before `_rank` (declaration order): the flock releases, then the
@@ -282,8 +440,8 @@ pub(crate) struct RotationGuard {
 
 impl RotationGuard {
     /// Acquire the per-profile rotation lock, blocking until any in-flight
-    /// rotation or acquire for this profile releases it. Creates the directory
-    /// if missing (a profile with no session yet has no `sessions/`).
+    /// rotation or acquire for this profile releases it. Creates the profile
+    /// directory if missing (a profile that was never started has none).
     pub(crate) fn acquire(name: &str) -> Result<Self> {
         let path = rotation_lock_path(name)?;
         if let Some(parent) = path.parent() {
@@ -311,8 +469,8 @@ pub(crate) fn open_pid_file(path: &Path) -> std::io::Result<File> {
 }
 
 /// Live-session guard. On drop: stops the watchdog, runs a final sync
-/// (errors surface to stderr), drops the PID file, and tears the runtime
-/// down when this was the last session for the profile.
+/// (errors surface to stderr), drops the PID file, and discards this session's
+/// own runtime tree.
 pub(crate) struct ProfileRuntime {
     runtime: PathBuf,
     pid_file: PathBuf,
@@ -341,10 +499,10 @@ impl ProfileRuntime {
         if !claude_home.exists() {
             anyhow::bail!("~/.claude not found; install Claude Code first");
         }
-        let runtime = runtime_dir(name, isolation)?;
-        let sessions = sessions_dir(name, isolation)?;
-        let seq = SESSION_SEQ.fetch_add(1, Ordering::Relaxed);
-        let pid_file = sessions.join(format!("{}-{seq}", std::process::id()));
+        let session = SessionId::mint();
+        let runtime = runtime_dir(name, isolation, &session)?;
+        let sessions = sessions_dir(name, isolation, &session)?;
+        let pid_file = sessions.join(session.as_str());
         let canonical = canonical_credentials(name)?;
 
         // Hold the per-profile rotation lock across the session-stamp window so
@@ -360,8 +518,10 @@ impl ProfileRuntime {
             crate::profile::mkdir_700(&sessions)
                 .with_context(|| format!("failed to create {}", sessions.display()))?;
             let active = prune_stale_sessions(&sessions)?;
-            // No live siblings — rebuild from scratch so stale symlinks/copies
-            // to entries that have since vanished from ~/.claude/ don't carry over.
+            // Nothing live in this session's own marker dir, yet a tree already
+            // sits at its path: a dead session's leftovers under a recycled pid.
+            // Rebuild from scratch so stale symlinks/copies to entries that have
+            // since vanished from ~/.claude/ don't carry over.
             if active == 0 && runtime.symlink_metadata().is_ok() {
                 std::fs::remove_dir_all(&runtime)
                     .with_context(|| format!("failed to clear {}", runtime.display()))?;
@@ -443,10 +603,10 @@ impl ProfileRuntime {
         &self.runtime
     }
 
-    /// This session's liveness-marker dir. Its live count gates anything that
-    /// MOVES state out of `config_dir`: the runtime tree is shared by every
-    /// session of this profile+flavor (`runtime_dir` carries no pid), and only
-    /// the last one out sees it discarded.
+    /// This session's liveness-marker dir, holding its marker and no other's.
+    /// Its live count still gates anything that MOVES state out of `config_dir`:
+    /// the count, not the keying, is what proves no Claude Code is reading the
+    /// tree being emptied.
     pub(crate) fn sessions_dir(&self) -> &Path {
         &self.sessions
     }
@@ -657,10 +817,10 @@ fn is_session_alive(pid_file: &Path) -> bool {
 
 /// Build or incrementally update the runtime tree.
 ///
-/// Called on every `acquire`, including when `active > 0` (siblings already
-/// built the tree). The walk always runs; entries whose runtime counterpart
-/// already exists are skipped, so `~/.claude/` additions after the first build
-/// are picked up without disturbing the rest.
+/// The walk is additive rather than a clean build: entries whose runtime
+/// counterpart already exists are skipped. That keeps it correct over a tree the
+/// acquire above declined to wipe, and keeps a rebuild after a `~/.claude/`
+/// addition from disturbing the rest.
 ///
 /// Shared vs. per-profile layout:
 /// - **Shared via symlink/copy across all profiles:** every top-level entry
@@ -786,11 +946,11 @@ fn prune_dangling_links(runtime: &Path) -> Result<()> {
 }
 
 /// Compute this profile's merged `settings.json` and write it into the runtime
-/// tree only when absent or byte-different. Concurrent sessions on the same
-/// profile each compute the same merge, so a byte-identical result needn't win
-/// a last-writer race and stomp a sibling's write. Isolated mode builds from an
-/// empty base (no operator hooks/permissions/statusline/plugin config), keeping
-/// only the profile's own env + model routing.
+/// tree only when absent or byte-different, so a rebuild over an existing tree
+/// leaves an already-correct file's mtime alone (the reconcilers below key on
+/// it). Isolated mode builds from an empty base (no operator
+/// hooks/permissions/statusline/plugin config), keeping only the profile's own
+/// env + model routing.
 ///
 /// `active_env_keys` (the live-active profile's custom env) are stripped from
 /// the shared base first, so a `clauth start <other>` session does not inherit

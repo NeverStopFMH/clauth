@@ -5,9 +5,9 @@
 //! profile's `refreshToken` — the clauth symlink layout keeps the live file
 //! and the matching profile's file byte-identical across rotations. (2) Inside
 //! a `clauth start` runtime, fall back to the profile named by
-//! `CLAUDE_CONFIG_DIR` (`profiles/<name>/runtime`): the runtime tree is
-//! per-profile, so that profile owns the session even before its first login
-//! is stored. (3) Otherwise, attribute to the credential-less active profile
+//! `CLAUDE_CONFIG_DIR` (`profiles/<name>/runtime-<sid>`): a runtime tree belongs
+//! to exactly one profile, so that profile owns the session even before its
+//! first login is stored. (3) Otherwise, attribute to the credential-less active profile
 //! (an API-key/endpoint profile, whose creds file is absent after a switch, or
 //! a fresh OAuth login not yet snapshotted).
 //!
@@ -109,9 +109,16 @@ fn credentials_path(config_dir: Option<&Path>) -> Result<PathBuf> {
 }
 
 /// Extract the `<name>` from a `clauth start` runtime path
-/// (`~/.clauth/profiles/<name>/runtime`). Returns `None` for any other shape.
+/// (`~/.clauth/profiles/<name>/runtime-<sid>`, or a legacy bare `runtime`).
+/// Returns `None` for any other shape, an isolated runtime included: that tier
+/// has never covered the isolated flavor, and an isolated session's stored creds
+/// are already reached by the `refreshToken` match above.
 fn session_profile_from_config_dir(dir: &Path) -> Option<String> {
-    if dir.file_name()? != "runtime" {
+    if !dir
+        .file_name()?
+        .to_str()
+        .is_some_and(crate::runtime::is_shared_runtime_dir_name)
+    {
         return None;
     }
     let profile_dir = dir.parent()?;

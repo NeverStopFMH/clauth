@@ -1,6 +1,6 @@
-//! `clauth start <name>` — spawn `claude` against the profile's persistent
-//! runtime directory. See [`crate::runtime`] for the shared-runtime design;
-//! this module is just the thin wrapper that owns the lifetime guard.
+//! `clauth start <name>` — spawn `claude` against this session's own runtime
+//! directory. See [`crate::runtime`] for the per-session runtime design; this
+//! module is just the thin wrapper that owns the lifetime guard.
 
 use std::path::{Path, PathBuf};
 use std::process::ExitStatus;
@@ -47,17 +47,12 @@ pub(crate) fn rescue_effective(rescue_override: Option<bool>, auto_rescue: bool)
 /// `(transcripts, sidecar files)` moved. Best-effort throughout: an error is
 /// logged, never fails the run.
 ///
-/// Gated on being the last live session in `sessions`. The runtime tree is
-/// shared by every session of this profile+flavor, and the discard it races is
-/// refcounted the same way, so an exit while a sibling still runs must move
-/// NOTHING — the sidecar leg would otherwise pull `shell-snapshots/` out from
-/// under a live Claude Code mid-session. Self holds its own marker, hence `> 1`.
-///
-/// The count and the move are not atomic: a sibling can `acquire` in between and
-/// start writing the tree we are moving out of (its own `active == 1` build is
-/// additive, so it does not wipe first). That window is milliseconds against a
-/// whole session, and closing it would mean holding the state flock across
-/// tree-sized IO — the one thing every other path here avoids.
+/// Gated on being the only live marker in `sessions`. Each session owns its own
+/// runtime tree and marker dir, so the count is this session alone and the guard
+/// does not fire today; it stays because the count, not the keying, is what
+/// proves nothing is reading the tree being emptied — the sidecar leg would
+/// otherwise pull `shell-snapshots/` out from under a live Claude Code
+/// mid-session. Self holds its own marker, hence `> 1`.
 fn rescue_teardown(iso_root: &Path, sessions: &Path, claude_home: &Path) -> (usize, usize) {
     if crate::runtime::live_sessions_at(sessions) > 1 {
         logline!("clauth: skipping rescue, another isolated session is still live");

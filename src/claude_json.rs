@@ -28,7 +28,7 @@ use anyhow::{Context, Result};
 use serde_json::Value;
 
 use crate::jsonsync::{KeyPath, KeyRule};
-use crate::profile::{atomic_write, clauth_dir, home_dir};
+use crate::profile::{atomic_write, home_dir};
 
 /// Account-specific keys that must never propagate between profiles.
 const PER_PROFILE_FIELDS: &[&str] = &[
@@ -61,16 +61,20 @@ const PER_PROFILE_FIELDS: &[&str] = &[
 /// where no file is newer — no reads, parses, or writes.
 static LAST_SYNCED: Mutex<Option<SystemTime>> = Mutex::new(None);
 
+/// Every `.claude.json` clauth reconciles: the global file plus each SHARED
+/// per-session runtime copy. Enumerated through
+/// [`crate::runtime::shared_runtime_dirs`] rather than a fixed
+/// `<profile>/runtime` path — every session owns its own `runtime-<sid>`, so a
+/// fixed path would reconcile nothing while every session ran. Isolated copies
+/// stay out for the same reason they do in `settings_sync`: an isolated runtime
+/// is built from an empty base and must neither win nor receive.
 fn known_paths() -> Result<Vec<PathBuf>> {
     let mut paths = vec![home_dir()?.join(".claude.json")];
-    let profiles = clauth_dir()?.join("profiles");
-    if let Ok(entries) = std::fs::read_dir(&profiles) {
-        for entry in entries.flatten() {
-            if entry.file_type().is_ok_and(|t| t.is_dir()) {
-                paths.push(entry.path().join("runtime").join(".claude.json"));
-            }
-        }
-    }
+    paths.extend(
+        crate::runtime::shared_runtime_dirs()
+            .into_iter()
+            .map(|dir| dir.join(".claude.json")),
+    );
     Ok(paths)
 }
 

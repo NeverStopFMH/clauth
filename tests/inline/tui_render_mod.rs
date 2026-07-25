@@ -1250,48 +1250,60 @@ fn usage_tab_reset_follows_the_reset_display_setting() {
 fn the_overview_column_budget_never_pays_for_a_new_column_with_an_old_one() {
     use crate::tui::app::Tab;
 
-    let mut profile = oauth("a", 40.0, 60.0, false);
-    let now = crate::usage::now_epoch_secs();
-    if let Some(u) = profile.usage.as_mut() {
-        if let Some(w) = u.five_hour.as_mut() {
-            w.resets_at = Some(crate::usage::epoch_secs_to_iso(now + 3 * 3600));
-        }
-        if let Some(w) = u.seven_day.as_mut() {
-            w.resets_at = Some(crate::usage::epoch_secs_to_iso(now + 4 * 86400));
-        }
-    }
-    let mut app = App::new(AppConfig {
-        state: AppState::default(),
-        profiles: vec![profile],
-    });
-    app.tab = Tab::Overview;
-
     // A bar is 10 interior cells in brackets, always trailed by its percentage —
     // specific enough that no pill or chip elsewhere in the frame can match it.
     let bar = regex::Regex::new(r"\[[^\[\]]{10}\] +\d+%").expect("valid pattern");
     let reset_cell = regex::Regex::new(r"% \([^)]+\)").expect("valid pattern");
 
-    // Pre-change behavior as a function of TERMINAL width (the accounts area is
-    // narrower by the frame's own chrome, so these are not the column tiers
-    // spelled in `OverviewWidths`). The 5h bar arrives first, then its reset,
-    // then the 7d column brings its bar and reset together.
-    const FIRST_BAR: u16 = 68;
-    const FIRST_RESET: u16 = 85;
-    const SEVEN_DAY: u16 = 106;
+    // Pre-column behavior as a function of TERMINAL width, per NAME LENGTH. The
+    // name sweep is what makes this pin able to fail: `OverviewWidths` clamps
+    // `max_name` to 8 at the low end, so a one-profile-named-"a" fixture never
+    // enters the shrink loop's name arm and never reaches the width where the 7d
+    // column is what gives way. 16 and 22 do both.
+    //
+    // Boundaries are terminal widths, not the tiers spelled in `OverviewWidths`
+    // (the accounts area is narrower by the frame's own chrome). The 5h bar
+    // arrives, then its reset, then the 7d column brings its own pair — one
+    // column later for a 22-char name, which is the shrink loop trading.
+    const BUDGET: &[(usize, u16, u16, u16, u16)] = &[
+        // (name length, first bar, first reset, 7d bar, 7d reset)
+        (8, 68, 85, 106, 106),
+        (16, 68, 85, 106, 106),
+        (22, 68, 85, 106, 107),
+    ];
 
-    for width in 34u16..=200 {
-        let frame = dump(&app, width, 20);
-        let bars = usize::from(width >= FIRST_BAR) + usize::from(width >= SEVEN_DAY);
-        let resets = usize::from(width >= FIRST_RESET) + usize::from(width >= SEVEN_DAY);
-        assert_eq!(
-            (
-                bar.find_iter(&frame).count(),
-                reset_cell.find_iter(&frame).count()
-            ),
-            (bars, resets),
-            "the accounts row at {width} cols must still carry {bars} bars and \
-             {resets} resets:\n{frame}"
-        );
+    for (name_len, first_bar, first_reset, seven_bar, seven_reset) in BUDGET {
+        let name = "n".repeat(*name_len);
+        let mut profile = oauth(&name, 40.0, 60.0, false);
+        let now = crate::usage::now_epoch_secs();
+        if let Some(u) = profile.usage.as_mut() {
+            if let Some(w) = u.five_hour.as_mut() {
+                w.resets_at = Some(crate::usage::epoch_secs_to_iso(now + 3 * 3600));
+            }
+            if let Some(w) = u.seven_day.as_mut() {
+                w.resets_at = Some(crate::usage::epoch_secs_to_iso(now + 4 * 86400));
+            }
+        }
+        let mut app = App::new(AppConfig {
+            state: AppState::default(),
+            profiles: vec![profile],
+        });
+        app.tab = Tab::Overview;
+
+        for width in 34u16..=200 {
+            let frame = dump(&app, width, 20);
+            let bars = usize::from(width >= *first_bar) + usize::from(width >= *seven_bar);
+            let resets = usize::from(width >= *first_reset) + usize::from(width >= *seven_reset);
+            assert_eq!(
+                (
+                    bar.find_iter(&frame).count(),
+                    reset_cell.find_iter(&frame).count()
+                ),
+                (bars, resets),
+                "a {name_len}-char name at {width} cols must still carry {bars} bars \
+                 and {resets} resets:\n{frame}"
+            );
+        }
     }
 }
 

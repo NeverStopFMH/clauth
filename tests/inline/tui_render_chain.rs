@@ -1420,27 +1420,40 @@ fn a_chain_row_carries_its_live_session_count_beside_the_blocked_reason_marker()
         live_row("4242-1", "busy", false, None),
     ]);
 
-    let (w, h) = (100u16, 14u16);
-    let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
-    term.draw(|f| super::draw(f, f.area(), &app)).unwrap();
-    let rows = crate::testutil::buffer_rows(term.backend().buffer());
+    // The whole pane, exactly: `idle`'s row has to be pinned as the ABSENCE of
+    // any tally, not merely the absence of `⇄` — dropping the count's zero guard
+    // grows a stray `  0` on every account hosting nothing, which is most rows of
+    // a typical chain, and a `!contains('⇄')` passes that clean.
+    assert_eq!(
+        chain_selector_pane(&app, 100, 8),
+        vec![
+            "╭ CHAIN ─────────────────────╮".to_string(),
+            "│ ❯  #1 busy  2⇄             │".to_string(),
+            "│    #2 idle                 │".to_string(),
+            "│                            │".to_string(),
+            "│                            │".to_string(),
+            "│                            │".to_string(),
+            "│                            │".to_string(),
+            "╰────────────────────────────╯".to_string(),
+        ],
+    );
+}
 
-    let selector_row = |name: &str| -> String {
-        rows.iter()
-            .find(|r| r.contains(&format!(" {name}")) && r.contains('#'))
-            .unwrap_or_else(|| panic!("no selector row for {name}:\n{}", rows.join("\n")))
-            .clone()
-    };
-    assert!(
-        selector_row("busy").contains("busy  2⇄"),
-        "the tally rides the member's own row:\n{}",
-        selector_row("busy")
-    );
-    assert!(
-        !selector_row("idle").contains('⇄'),
-        "an account hosting nothing carries no tally:\n{}",
-        selector_row("idle")
-    );
+/// Every row of the Fallback tab's chain selector pane, borders included, sliced
+/// off the rendered frame at the pane's own width. Returned whole so a pin is an
+/// exact vec rather than a substring probe — a `.contains` on one row cannot see
+/// a glyph that got appended past the pane and clipped.
+fn chain_selector_pane(app: &App, w: u16, h: u16) -> Vec<String> {
+    let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+    term.draw(|f| super::draw(f, f.area(), app)).unwrap();
+    let rows = crate::testutil::buffer_rows(term.backend().buffer());
+    let pane_w = rows
+        .iter()
+        .find_map(|r| r.find('╮').map(|b| r[..b].chars().count() + 1))
+        .expect("the chain pane's top-right corner");
+    rows.iter()
+        .map(|r| r.chars().take(pane_w).collect())
+        .collect()
 }
 
 /// Text of every line in the member card, trimmed, for exact-vec assertions.
@@ -1458,35 +1471,21 @@ fn card_texts(lines: &[Line<'static>]) -> Vec<String> {
         .collect()
 }
 
-/// The card carries the nuance the Overview column has no room for. A session
-/// that never swapped needs no caveat — its credential link was never repointed,
-/// so nothing is lagging — and so gets the count alone.
+/// The block, whole, for a member hosting sessions none of which has swapped:
+/// the count plus how many the chain may move, and NOTHING else. A session that
+/// never swapped has no repointed credential link, so §12's pickup lag does not
+/// apply to it and claiming it would over-warn in the other direction.
 #[test]
-fn the_member_card_names_live_sessions_without_a_caveat_until_one_has_swapped() {
-    let cfg = config_with(vec![profile("a", 95.0, 10.0, 3600)], None, vec!["a"]);
+fn the_session_block_counts_live_sessions_and_carries_no_caveat_until_one_has_swapped() {
     let sessions = crate::live_sessions::LiveTally::of([
         live_row("4242-0", "a", true, None),
         live_row("4242-1", "a", false, None),
     ])
     .member("a");
 
-    let lines = member_detail(
-        &cfg, "a", false, 0, false, None, None, None, 60, None, sessions,
-    )
-    .0;
-    let texts = card_texts(&lines);
-
-    assert!(
-        texts.contains(&"sessions     2 (1 following)".to_string()),
-        "the card counts every live session and how many the chain can move:\n{texts:#?}"
-    );
-    assert!(
-        !texts.iter().any(|t| t.contains("last swap")),
-        "nothing has swapped, so there is no swap to date:\n{texts:#?}"
-    );
-    assert!(
-        !texts.iter().any(|t| t.contains("next request")),
-        "no repointed link means no pickup lag to warn about:\n{texts:#?}"
+    assert_eq!(
+        card_texts(&live_session_lines(sessions, 60)),
+        vec!["sessions     2 (1 following)".to_string()],
     );
 }
 
@@ -1496,57 +1495,80 @@ fn the_member_card_names_live_sessions_without_a_caveat_until_one_has_swapped() 
 /// The card says so rather than inventing a "not yet picked up" state the
 /// registry cannot see.
 #[test]
-fn the_member_card_dates_the_last_swap_and_says_when_it_is_picked_up() {
-    let cfg = config_with(vec![profile("a", 95.0, 10.0, 3600)], None, vec!["a"]);
+fn the_session_block_dates_the_last_swap_and_says_when_it_is_picked_up() {
     let swapped_at = crate::usage::now_ms().saturating_sub(12_000);
     let sessions =
         crate::live_sessions::LiveTally::of([live_row("4242-0", "a", true, Some(swapped_at))])
             .member("a");
 
-    let lines = member_detail(
-        &cfg, "a", false, 0, false, None, None, None, 60, None, sessions,
-    )
-    .0;
-    let texts = card_texts(&lines);
-
-    assert!(
-        texts.contains(&"sessions     1 (1 following)".to_string()),
-        "{texts:#?}"
-    );
-    assert!(
-        texts.contains(&"last swap    12s ago".to_string()),
-        "the swap is dated relative, like every other stamp in the app:\n{texts:#?}"
-    );
-    assert!(
-        texts.contains(&" └ picked up on the session's next request".to_string()),
-        "the pickup caveat rides the card's own hint grammar:\n{texts:#?}"
+    assert_eq!(
+        card_texts(&live_session_lines(sessions, 60)),
+        vec![
+            "sessions     1 (1 following)".to_string(),
+            "last swap    12s ago".to_string(),
+            " └ picked up on the session's next request".to_string(),
+        ],
     );
 }
 
-/// An account hosting nothing says nothing — the block is absent entirely rather
-/// than reading `sessions 0`, matching the Overview cell's blank.
+/// A swap that landed inside the second the card renders would otherwise reach
+/// `humanize_duration`'s zero arm and read `now ago`, which is not a phrase.
 #[test]
-fn the_member_card_omits_the_session_block_when_nothing_is_live() {
-    let cfg = config_with(vec![profile("a", 95.0, 10.0, 3600)], None, vec!["a"]);
-
-    let lines = member_detail(
-        &cfg,
+fn a_swap_this_very_second_reads_as_one_second_rather_than_now_ago() {
+    let sessions = crate::live_sessions::LiveTally::of([live_row(
+        "4242-0",
         "a",
         false,
-        0,
-        false,
-        None,
-        None,
-        None,
-        60,
-        None,
-        crate::live_sessions::MemberSessions::default(),
-    )
-    .0;
+        Some(crate::usage::now_ms()),
+    )])
+    .member("a");
 
-    assert!(
-        !card_texts(&lines).iter().any(|t| t.contains("sessions")),
-        "no live session means no session row at all"
+    assert_eq!(
+        card_texts(&live_session_lines(sessions, 60)),
+        vec![
+            "sessions     1".to_string(),
+            "last swap    1s ago".to_string(),
+            " └ picked up on the session's next request".to_string(),
+        ],
+    );
+}
+
+/// An account hosting nothing says nothing — no row at all rather than
+/// `sessions 0`, matching the Overview cell's blank and the selector's.
+#[test]
+fn the_session_block_is_absent_when_nothing_is_live() {
+    assert_eq!(
+        card_texts(&live_session_lines(
+            crate::live_sessions::MemberSessions::default(),
+            60
+        )),
+        Vec::<String>::new(),
+    );
+}
+
+/// Position, not just presence: the block sits between the 5h headroom figure
+/// and the blank row that opens `FALLBACK_ROWS`, and `rows_start` is read off
+/// the buffer, so a block inserted anywhere else would move the native caret off
+/// every row it points at.
+#[test]
+fn the_member_card_places_the_session_block_between_the_headroom_figure_and_the_rows() {
+    let cfg = config_with(vec![profile("a", 95.0, 10.0, 3600)], None, vec!["a"]);
+    let sessions =
+        crate::live_sessions::LiveTally::of([live_row("4242-0", "a", true, None)]).member("a");
+
+    let (lines, rows_start) = member_detail(
+        &cfg, "a", false, 0, false, None, None, None, 60, None, sessions,
+    );
+    let texts = card_texts(&lines);
+
+    assert_eq!(
+        &texts[..rows_start],
+        [
+            "5h usage     ██░░░░░░░░░░░░░░░░░░░│  10% used",
+            "             85% until rotate",
+            "sessions     1 (1 following)",
+            "",
+        ],
     );
 }
 
@@ -1556,29 +1578,31 @@ fn the_member_card_omits_the_session_block_when_nothing_is_live() {
 /// row so ratatui clips whichever lands last.
 #[test]
 fn a_narrow_chain_row_drops_the_live_tally_before_the_reason_marker() {
-    let mut disabled = profile("acct-twelve1", 95.0, 10.0, 3600);
+    let mut disabled = profile("nnnnnn", 95.0, 10.0, 3600);
     disabled.disabled = true;
-    let mut app = App::new(config_with(vec![disabled], None, vec!["acct-twelve1"]));
+    let mut app = App::new(config_with(vec![disabled], None, vec!["nnnnnn"]));
     app.live_sessions =
-        crate::live_sessions::LiveTally::of([live_row("4242-0", "acct-twelve1", true, None)]);
+        crate::live_sessions::LiveTally::of([live_row("4242-0", "nnnnnn", true, None)]);
 
-    let (w, h) = (80u16, 14u16);
-    let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
-    term.draw(|f| super::draw(f, f.area(), &app)).unwrap();
-    let rows = crate::testutil::buffer_rows(term.backend().buffer());
-
-    let row = rows
-        .iter()
-        .find(|r| r.contains("acct-twelve1") && r.contains('#'))
-        .unwrap_or_else(|| panic!("no selector row:\n{}", rows.join("\n")));
-    assert!(
-        row.contains('⊖'),
-        "the blocked-reason marker survives a narrow row:\n{row}"
-    );
-    assert!(
-        !row.contains('⇄'),
-        "the tally gives way rather than crowding the marker:\n{row}"
-    );
+    // 60-69 is this NAME's own collision band: below it the tally never fit
+    // anyway, above it both fit, and only inside does dropping the `reserved`
+    // term change what renders (measured, and the whole band shares one pane
+    // width because `master_detail` clamps the selector at 20). Without
+    // `reserved` the row reads `❯  #1 nnnnnn  1⇄` and the `⊖` is appended past
+    // `w`, where ratatui throws it away — the badge silently eating the marker.
+    for w in 60u16..=69 {
+        assert_eq!(
+            chain_selector_pane(&app, w, 5),
+            vec![
+                "╭ CHAIN ───────────╮".to_string(),
+                "│ ❯  #1 nnnnnn   ⊖ │".to_string(),
+                "│                  │".to_string(),
+                "│                  │".to_string(),
+                "╰──────────────────╯".to_string(),
+            ],
+            "at {w} cols the marker keeps the row and the tally gives way"
+        );
+    }
 }
 
 /// A leg nothing calls is a leg that passes every unit test and ships nothing:
@@ -1593,15 +1617,32 @@ fn the_fallback_tab_reads_the_apps_live_session_tally() {
     app.live_sessions =
         crate::live_sessions::LiveTally::of([live_row("4242-0", "busy", true, None)]);
 
-    let (w, h) = (120u16, 20u16);
-    let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+    // Both surfaces at once: the selector pane exactly, and the card's own row
+    // exactly. Either one reading `Default::default()` instead of the app's
+    // tally leaves every unit test above it green.
+    assert_eq!(
+        chain_selector_pane(&app, 120, 6),
+        vec![
+            "╭ CHAIN ───────────────────────────╮".to_string(),
+            "│ ❯  #1 busy  1⇄                   │".to_string(),
+            "│                                  │".to_string(),
+            "│                                  │".to_string(),
+            "│                                  │".to_string(),
+            "╰──────────────────────────────────╯".to_string(),
+        ],
+    );
+
+    let mut term = Terminal::new(TestBackend::new(120, 20)).unwrap();
     term.draw(|f| super::draw(f, f.area(), &app)).unwrap();
     let rows = crate::testutil::buffer_rows(term.backend().buffer());
-
-    assert!(
-        rows.iter()
-            .any(|r| r.contains("sessions     1 (1 following)")),
-        "the member card renders the tally the app holds:\n{}",
-        rows.join("\n")
+    let card = rows
+        .iter()
+        .find(|r| r.contains("sessions"))
+        .unwrap_or_else(|| panic!("the card carries no session row:\n{}", rows.join("\n")));
+    assert_eq!(
+        card.split('│')
+            .find(|seg| seg.contains("sessions"))
+            .map(str::trim_end),
+        Some(" sessions     1 (1 following)"),
     );
 }

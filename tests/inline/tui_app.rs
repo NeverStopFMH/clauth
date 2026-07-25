@@ -5023,11 +5023,25 @@ fn a_tick_re_tallies_live_sessions_that_appeared_after_startup() {
     let _marker = crate::runtime::hold_session_row_marker("late", false, sid)
         .expect("hold the session's marker");
 
-    // Past the refresh interval, which `App::new` starts the clock on.
-    app.last_live_sessions_refresh = Instant::now()
-        .checked_sub(Duration::from_secs(5))
-        .expect("a clock 5s in the past");
-    super::on_tick(&mut app);
+    // From EVERY tab, not just whichever one `App::new` defaults to. The leg is
+    // deliberately ungated: two surfaces read the tally, and a tab gate added
+    // later to save the per-tick FS read would freeze the Fallback badge and
+    // member card at their construct-time value for the process lifetime while
+    // the whole suite stayed green — which is exactly what a test that never
+    // touched `app.tab` could not see.
+    for tab in super::Tab::ALL {
+        app.tab = tab;
+        app.live_sessions = crate::live_sessions::LiveTally::default();
+        // Past the refresh interval, which `App::new` starts the clock on.
+        app.last_live_sessions_refresh = Instant::now()
+            .checked_sub(Duration::from_secs(5))
+            .expect("a clock 5s in the past");
+        super::on_tick(&mut app);
 
-    assert_eq!(app.live_sessions.member("late").sessions, 1);
+        assert_eq!(
+            app.live_sessions.member("late").sessions,
+            1,
+            "the tally must refresh on the {tab:?} tab too"
+        );
+    }
 }

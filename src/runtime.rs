@@ -299,8 +299,10 @@ impl SessionPaths {
 ///
 /// Ceiling: an upgrade-window shim, added 2026-07-25. Delete it — with
 /// `ProfileRuntime::legacy_marker` and the count dedupe it forces in
-/// [`live_session_count`] — a few releases after the per-session layout ships,
-/// once no pre-layout binary can still be supervising a live install.
+/// `live_session_count` (unlinked: that one is `cfg(test)` now, so an intra-doc
+/// link to it would not resolve in a doc build) — a few releases after the
+/// per-session layout ships, once no pre-layout binary can still be supervising
+/// a live install.
 fn stamp_legacy_marker(path: &Path) -> Option<File> {
     let dir = path.parent()?;
     if let Err(e) = crate::profile::mkdir_700(dir) {
@@ -462,15 +464,18 @@ pub(crate) fn has_live_session(name: &str) -> bool {
 /// those one session rather than two. Reports 1 on an unknown, so it never
 /// contradicts [`has_live_session`] within a tick.
 ///
-/// No production caller left: its one consumer (the Plugin tab's fleet tally)
-/// moved to `live_sessions::LiveTally`, because this dedupes markers WITHIN a
-/// profile but not across them and so reports a swapped session twice. The
-/// name-dedupe exists for the upgrade-compat marker, so removing this belongs
-/// with that shim's removal in v0.16, not with the tally that orphaned it.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "removed with the v0.16 compat-marker shim")
-)]
+/// TEST-ONLY since 2026-07-25. Its one production consumer, the Plugin tab's
+/// fleet tally, moved to `live_sessions::LiveTally`: this dedupes markers WITHIN
+/// a profile but not across them, so a session that swapped A→B read as two
+/// sessions on two accounts, and only the registry can tell those apart.
+///
+/// Kept rather than deleted because the marker-layout tests need the COUNT, and
+/// [`has_live_session`] cannot supply it — it is a boolean `.any()`, so it reads
+/// one session and two identically, which is exactly the distinction phase 0b's
+/// two-sessions-on-one-profile keying rests on. Same shape as
+/// [`hold_session_row_marker`]: a test-only observation of a layout this module
+/// owns, so nothing outside it rebuilds the paths.
+#[cfg(test)]
 pub(crate) fn live_session_count(name: &str) -> usize {
     let Some(dirs) = session_marker_dirs(name) else {
         return 1;

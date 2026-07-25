@@ -806,10 +806,9 @@ impl ProfileRuntime {
             // since vanished from ~/.claude/ don't carry over. A live sibling
             // holds a marker here, so its tree is never the one wiped.
             //
-            // The converse does NOT hold, and mixed mode is reachable without
-            // anyone changing a setting (an elevated Windows shell has
-            // `SeCreateSymbolicLinkPrivilege`, a normal one does not, so two
-            // concurrent starts can land on different modes). A live REAL
+            // The converse does NOT hold, and two concurrent starts on one
+            // Windows host can land on different modes (what decides it is in
+            // `docs/domain-knowledge.md`). A live REAL
             // session's compat marker sits in this same shared dir, so it makes
             // `active` nonzero for a Fake acquire and suppresses the wipe of a
             // bare `runtime/` that session does not use. A stale pre-upgrade tree

@@ -12,6 +12,7 @@ mod jsonsync;
 #[cfg(target_os = "macos")]
 mod keychain;
 mod list;
+mod live_sessions;
 mod lock;
 mod lockorder;
 mod logline;

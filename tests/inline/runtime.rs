@@ -2226,6 +2226,92 @@ fn gc_collects_an_orphaned_sessions_dir_with_no_runtime_sibling() {
     });
 }
 
+/// Registry rows ride the same sweep as the dirs, keyed off the marker their own
+/// fields name: a row whose marker is unlocked is dead, one whose marker is held
+/// is not.
+#[test]
+fn gc_drops_a_registry_row_whose_marker_is_unlocked_and_keeps_a_held_one() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let profiles = tmp.path().join(".clauth").join("profiles");
+
+        // Dead: marker file present but unlocked.
+        let dead_markers = profiles.join("rowdead").join("sessions-6001-0");
+        fs::create_dir_all(&dead_markers).expect("mkdir dead markers");
+        fs::write(dead_markers.join("6001-0"), b"").expect("dead marker");
+
+        // Held, isolated flavor — the marker path is derived from `isolated`.
+        let held_markers = profiles.join("rowlive").join("sessions-isolated-6001-1");
+        fs::create_dir_all(&held_markers).expect("mkdir held markers");
+        let marker = open_pid_file(&held_markers.join("6001-1")).expect("open held marker");
+        marker.lock().expect("lock held marker");
+
+        let mut dead = crate::live_sessions::LiveSession {
+            session_id: "6001-0".into(),
+            start_profile: "rowdead".into(),
+            pid: 6001,
+            started_at: 1,
+            cwd: None,
+            isolated: false,
+            intended_member: None,
+            chain_cursor: None,
+            current_member: None,
+            last_swap_at: None,
+        };
+        crate::live_sessions::register(&dead).expect("register dead");
+        dead.session_id = "6001-1".into();
+        dead.start_profile = "rowlive".into();
+        dead.isolated = true;
+        crate::live_sessions::register(&dead).expect("register live");
+
+        gc_stale_runtimes();
+
+        let left: Vec<String> = crate::live_sessions::list()
+            .into_iter()
+            .map(|r| r.session_id)
+            .collect();
+        assert_eq!(
+            left,
+            vec!["6001-1".to_string()],
+            "only the row whose marker is still flock-held may survive"
+        );
+        drop(marker);
+    });
+}
+
+/// The wiring, end to end: a real `acquire` files a row carrying this session's
+/// own identity, and its teardown takes the row with it.
+#[test]
+fn acquire_registers_a_row_and_teardown_removes_it() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        fake_claude_home(tmp.path());
+        let profile = make_profile("registered");
+
+        let rt = ProfileRuntime::acquire(&profile, Isolation::Shared, &[]).expect("acquire");
+        let sid = sid_of(rt.config_dir());
+
+        let rows = crate::live_sessions::list();
+        assert_eq!(rows.len(), 1, "acquire must file exactly one row");
+        let registered = &rows[0];
+        assert_eq!(registered.session_id, sid);
+        assert_eq!(registered.start_profile, "registered");
+        assert_eq!(registered.pid, std::process::id());
+        assert!(!registered.isolated);
+        assert_eq!(registered.intended_member, None);
+        assert_eq!(registered.current_member, None);
+        assert_eq!(registered.chain_cursor, None);
+        assert_eq!(registered.last_swap_at, None);
+
+        drop(rt);
+
+        assert!(
+            crate::live_sessions::list().is_empty(),
+            "teardown must take the session's row with it"
+        );
+    });
+}
+
 #[test]
 fn scrub_profile_env_drops_managed_and_active_custom_keys() {
     // `clauth start <B>` from a session running profile A must not inherit A's

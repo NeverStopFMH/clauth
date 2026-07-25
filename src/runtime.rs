@@ -125,10 +125,11 @@ static SESSION_SEQ: AtomicU64 = AtomicU64::new(0);
 /// `-` only, which is what makes a session id unable to spell the `isolated`
 /// flavor stem — the property [`is_shared_runtime_dir_name`] relies on.
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct SessionId(String);
+pub(crate) struct SessionId(String);
 
 impl SessionId {
-    /// Mint the next id for this process.
+    /// Mint the next id for this process. Private: an id exists only because a
+    /// session was acquired, so nothing else can conjure one.
     fn mint() -> Self {
         Self(format!(
             "{}-{}",
@@ -137,13 +138,15 @@ impl SessionId {
         ))
     }
 
-    fn as_str(&self) -> &str {
+    pub(crate) fn as_str(&self) -> &str {
         &self.0
     }
 }
 
-/// True iff `s` has the `<pid>-<seq>` shape [`SessionId::mint`] produces.
-fn is_session_id_str(s: &str) -> bool {
+/// True iff `s` has the `<pid>-<seq>` shape [`SessionId::mint`] produces. The
+/// registry validates ids it reads back off disk against this before joining
+/// them into a path.
+pub(crate) fn is_session_id(s: &str) -> bool {
     s.split_once('-').is_some_and(|(pid, seq)| {
         !pid.is_empty()
             && !seq.is_empty()
@@ -161,7 +164,7 @@ fn is_session_id_str(s: &str) -> bool {
 pub(crate) fn is_shared_runtime_dir_name(name: &str) -> bool {
     match name.strip_prefix(RUNTIME_STEM) {
         Some("") => true,
-        Some(rest) => rest.strip_prefix('-').is_some_and(is_session_id_str),
+        Some(rest) => rest.strip_prefix('-').is_some_and(is_session_id),
         None => false,
     }
 }
@@ -193,6 +196,23 @@ fn sessions_dir(name: &str, isolation: Isolation, session: &SessionId) -> Result
         name,
         &format!("{}-{}", isolation.sessions_stem(), session.as_str()),
     )
+}
+
+/// The liveness marker a session holds, addressed by the three things its
+/// registry row carries. The layout lives here so no other module rebuilds it —
+/// `crate::live_sessions` tests a row's liveness through this, and would go
+/// silently stale if it spelled the path itself.
+fn session_marker_path(profile: &str, isolated: bool, session_id: &str) -> Result<PathBuf> {
+    let isolation = if isolated {
+        Isolation::Isolated
+    } else {
+        Isolation::Shared
+    };
+    Ok(profile_subpath(
+        profile,
+        &format!("{}-{session_id}", isolation.sessions_stem()),
+    )?
+    .join(session_id))
 }
 
 fn profiles_root_dir() -> Result<PathBuf> {
@@ -295,6 +315,26 @@ pub(crate) fn gc_stale_runtimes() {
                     let _ = gc_one_pair(&runtime, &child.path());
                 }
             }
+        }
+    }
+    gc_live_session_rows();
+}
+
+/// Drop registry rows whose owning session is gone. A row is dead iff the marker
+/// its own fields name is no longer flock-held — the same signal the sweep above
+/// and teardown use, so a row can neither outlive its session nor be reaped ahead
+/// of one. Folded in here rather than given its own entry point so every existing
+/// `gc_stale_runtimes` caller gets it.
+fn gc_live_session_rows() {
+    for row in crate::live_sessions::list() {
+        let Ok(marker) = session_marker_path(&row.start_profile, row.isolated, &row.session_id)
+        else {
+            continue;
+        };
+        if !is_session_alive(&marker)
+            && let Err(e) = crate::live_sessions::unregister(&row.session_id)
+        {
+            logline!("clauth: dropping stale live-session row failed: {e}");
         }
     }
 }
@@ -472,6 +512,7 @@ pub(crate) fn open_pid_file(path: &Path) -> std::io::Result<File> {
 /// (errors surface to stderr), drops the PID file, and discards this session's
 /// own runtime tree.
 pub(crate) struct ProfileRuntime {
+    session: SessionId,
     runtime: PathBuf,
     pid_file: PathBuf,
     claude_home: PathBuf,
@@ -545,6 +586,19 @@ impl ProfileRuntime {
             Ok::<_, anyhow::Error>((file, mode))
         })?;
 
+        // Register only now: the marker is flock-held, so the row can never exist
+        // without a liveness signal for GC to test it by. A registry failure is
+        // reported and stepped over — the session itself is already sound, and
+        // failing it here would trade a missing row for a dead session.
+        let row = crate::live_sessions::LiveSession::starting(
+            &session,
+            name,
+            isolation == Isolation::Isolated,
+        );
+        if let Err(e) = crate::live_sessions::register(&row) {
+            logline!("clauth: registering the live session failed: {e}");
+        }
+
         let (tx, rx) = channel::<()>();
         let watchdog_runtime = runtime.clone();
         let watchdog_canonical = canonical.clone();
@@ -586,6 +640,7 @@ impl ProfileRuntime {
             .expect("failed to spawn watchdog thread");
 
         Ok(Self {
+            session,
             runtime,
             pid_file,
             claude_home,
@@ -638,6 +693,10 @@ impl Drop for ProfileRuntime {
         }
         if let Err(e) = crate::settings_sync::sync_once() {
             logline!("clauth: final settings.json sync failed: {e}");
+        }
+
+        if let Err(e) = crate::live_sessions::unregister(self.session.as_str()) {
+            logline!("clauth: unregistering the live session failed: {e}");
         }
 
         if let Err(e) = with_state_lock(|| {

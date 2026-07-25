@@ -1,0 +1,230 @@
+//! Registry of live `clauth start` sessions.
+//!
+//! One file per session at `~/.clauth/live_sessions/<sid>.json`, mirroring the
+//! `~/.clauth/jobs/` convention ([`crate::mcp::jobs`]): a row is keyed by a
+//! session id nobody else writes, so the file needs no ownership arbitration of
+//! its own. Rows are filed by SESSION, never under the profile they launched on
+//! — a session that swaps member would be misfiled the moment it moved.
+//!
+//! Two writers share a row, and both constraints they need are structural rather
+//! than written down:
+//!
+//! - **The read is inside the lock, not just the write.** [`update`] is the only
+//!   mutation path and it loads a FRESH row under [`with_state_lock`], hands the
+//!   caller a borrow that cannot outlive the hold, and stores before releasing.
+//!   There is deliberately no public load/store pair: a row read before a swap
+//!   and written after would silently revert whatever the other writer put there
+//!   in between.
+//! - **Field ownership is a type, not a comment.** The daemon reaches its two
+//!   fields through [`DaemonFields`] and the session its two through
+//!   [`SessionFields`]; neither view can name the other's. Each still stores the
+//!   whole freshly-loaded row, so writing one side preserves the other's.
+//!
+//! Liveness is the session's flock, exactly as for its runtime tree: a row is
+//! dead once the marker named by its own `start_profile` + `isolated` +
+//! `session_id` is no longer held, and `runtime::gc_stale_runtimes` reaps it
+//! there (that module owns the marker layout; this one never rebuilds it).
+
+use std::path::{Path, PathBuf};
+
+use anyhow::{Context, Result};
+use serde::{Deserialize, Serialize};
+
+use crate::lock::with_state_lock;
+use crate::profile::{atomic_write_600, clauth_dir, mkdir_700};
+use crate::runtime::{SessionId, is_session_id};
+
+/// One live session's row. Every field is written by exactly one of the two
+/// writers; which one is enforced by the mutator views, not by this listing.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct LiveSession {
+    pub(crate) session_id: String,
+    pub(crate) start_profile: String,
+    pub(crate) pid: u32,
+    pub(crate) started_at: u64,
+    pub(crate) cwd: Option<PathBuf>,
+    pub(crate) isolated: bool,
+    /// Daemon-owned: the member the decision leg wants this session on.
+    #[serde(default)]
+    pub(crate) intended_member: Option<String>,
+    /// Daemon-owned: this session's position in the shared `fallback_chain`.
+    #[serde(default)]
+    pub(crate) chain_cursor: Option<usize>,
+    /// Session-owned: the member this session's credential link resolves to.
+    #[serde(default)]
+    pub(crate) current_member: Option<String>,
+    /// Session-owned: when this session last executed a swap.
+    #[serde(default)]
+    pub(crate) last_swap_at: Option<u64>,
+}
+
+impl LiveSession {
+    /// A row for a session starting now. Pid, start time, and cwd are read here
+    /// rather than passed in, so every registration reports them the same way.
+    pub(crate) fn starting(session_id: &SessionId, start_profile: &str, isolated: bool) -> Self {
+        Self {
+            session_id: session_id.as_str().to_string(),
+            start_profile: start_profile.to_string(),
+            pid: std::process::id(),
+            started_at: crate::usage::now_ms(),
+            cwd: std::env::current_dir().ok(),
+            isolated,
+            intended_member: None,
+            chain_cursor: None,
+            current_member: None,
+            last_swap_at: None,
+        }
+    }
+}
+
+/// The daemon's view of a row under [`update_as_daemon`]: the decision fields
+/// and nothing else.
+pub(crate) struct DaemonFields<'a>(&'a mut LiveSession);
+
+impl DaemonFields<'_> {
+    #[allow(
+        dead_code,
+        reason = "written by the phase-2 decision leg; the registry lands first"
+    )]
+    pub(crate) fn set_intended_member(&mut self, member: impl Into<String>) {
+        self.0.intended_member = Some(member.into());
+    }
+
+    #[allow(
+        dead_code,
+        reason = "written by the phase-2 decision leg; the registry lands first"
+    )]
+    pub(crate) fn set_chain_cursor(&mut self, cursor: usize) {
+        self.0.chain_cursor = Some(cursor);
+    }
+}
+
+/// The session's view of a row under [`update_as_session`]: the execution fields
+/// and nothing else.
+pub(crate) struct SessionFields<'a>(&'a mut LiveSession);
+
+impl SessionFields<'_> {
+    #[allow(
+        dead_code,
+        reason = "written by the phase-1 swap executor; the registry lands first"
+    )]
+    pub(crate) fn set_current_member(&mut self, member: impl Into<String>) {
+        self.0.current_member = Some(member.into());
+    }
+
+    #[allow(
+        dead_code,
+        reason = "written by the phase-1 swap executor; the registry lands first"
+    )]
+    pub(crate) fn set_last_swap_at(&mut self, at: u64) {
+        self.0.last_swap_at = Some(at);
+    }
+}
+
+fn registry_dir() -> Result<PathBuf> {
+    Ok(clauth_dir()?.join("live_sessions"))
+}
+
+/// Path of one session's row. The id shape is validated first: `list` reads ids
+/// back off disk and the phase-2 legs pass them around, so this join must never
+/// take a `..` or a separator from a file someone else wrote.
+fn row_path(session_id: &str) -> Result<PathBuf> {
+    anyhow::ensure!(
+        is_session_id(session_id),
+        "not a session id: {session_id:?}"
+    );
+    Ok(registry_dir()?.join(format!("{session_id}.json")))
+}
+
+/// Owner-only like every `~/.clauth` write: a row carries the session's cwd and
+/// which account it is running as.
+fn write_row(row: &LiveSession) -> Result<()> {
+    let path = row_path(&row.session_id)?;
+    if let Some(parent) = path.parent() {
+        mkdir_700(parent).with_context(|| format!("failed to create {}", parent.display()))?;
+    }
+    let bytes = serde_json::to_vec(row)?;
+    atomic_write_600(&path, &bytes).with_context(|| format!("failed to write {}", path.display()))
+}
+
+/// File a starting session's row. Called once the session's liveness marker is
+/// flock-held, so a row never exists without something for GC to test it by.
+pub(crate) fn register(row: &LiveSession) -> Result<()> {
+    with_state_lock(|| write_row(row))
+}
+
+/// Drop a session's row. Idempotent — a row already reaped by GC is not an
+/// error. Takes the state lock so it cannot land between an [`update`]'s load and
+/// its store and leave the row resurrected.
+pub(crate) fn unregister(session_id: &str) -> Result<()> {
+    let path = row_path(session_id)?;
+    with_state_lock(|| match std::fs::remove_file(&path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e).with_context(|| format!("failed to remove {}", path.display())),
+    })
+}
+
+/// Snapshot of every registered row. Read-only: the returned rows are owned
+/// copies, so nothing a caller does to one reaches disk. An unreadable or
+/// unparseable file is skipped rather than failing the sweep.
+pub(crate) fn list() -> Vec<LiveSession> {
+    let Ok(dir) = registry_dir() else {
+        return Vec::new();
+    };
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .filter_map(|entry| read_row(&entry.path()))
+        .collect()
+}
+
+fn read_row(path: &Path) -> Option<LiveSession> {
+    serde_json::from_slice(&std::fs::read(path).ok()?).ok()
+}
+
+/// The one mutation path: load a FRESH row inside the state lock, edit it
+/// through a borrow that cannot escape the hold, store it before releasing. A
+/// missing row is an error naming the id, never a silent no-op.
+fn update(session_id: &str, edit: impl FnOnce(&mut LiveSession)) -> Result<()> {
+    let path = row_path(session_id)?;
+    with_state_lock(|| {
+        let bytes = std::fs::read(&path)
+            .with_context(|| format!("no live-session row for {session_id}"))?;
+        let mut row: LiveSession = serde_json::from_slice(&bytes)
+            .with_context(|| format!("unreadable live-session row for {session_id}"))?;
+        edit(&mut row);
+        write_row(&row)
+    })
+}
+
+/// Edit the daemon-owned fields of one row. The session's own fields are carried
+/// through untouched by construction: the row is reloaded here, not supplied.
+#[allow(
+    dead_code,
+    reason = "called by the phase-2 decision leg; the registry lands first"
+)]
+pub(crate) fn update_as_daemon(
+    session_id: &str,
+    edit: impl FnOnce(&mut DaemonFields<'_>),
+) -> Result<()> {
+    update(session_id, |row| edit(&mut DaemonFields(row)))
+}
+
+/// Edit the session-owned fields of one row. Mirror of [`update_as_daemon`].
+#[allow(
+    dead_code,
+    reason = "called by the phase-1 swap executor; the registry lands first"
+)]
+pub(crate) fn update_as_session(
+    session_id: &str,
+    edit: impl FnOnce(&mut SessionFields<'_>),
+) -> Result<()> {
+    update(session_id, |row| edit(&mut SessionFields(row)))
+}
+
+#[cfg(test)]
+#[path = "../tests/inline/live_sessions.rs"]
+mod tests;

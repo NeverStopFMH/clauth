@@ -3301,6 +3301,7 @@ fn a_swap_moves_the_mtime_of_the_store_it_repoints_to() {
         set_mtime(&launch_store, shared);
         set_mtime(&intended_store, shared);
 
+        let before_swap = SystemTime::now();
         assert_eq!(swap.swap_to("mtime-b").expect("swap"), SwapOutcome::Swapped);
 
         let after = fs::metadata(&intended_store)
@@ -3311,6 +3312,13 @@ fn a_swap_moves_the_mtime_of_the_store_it_repoints_to() {
             after > shared,
             "the store CC stats through the link kept its mtime, \
              so this swap is a silent no-op"
+        );
+        // WHICH mechanism moved it, not just that something did: the swap stamps
+        // the CLOCK. A value derived from the old store's mtime clears the assert
+        // above too, while carrying that store's skew onto this one.
+        assert!(
+            after >= before_swap,
+            "the new store's mtime must come from the clock, not from the old store"
         );
     });
 }
@@ -3823,8 +3831,9 @@ fn a_swap_onto_the_member_already_current_changes_nothing() {
             before,
             "a no-op swap must not move the store's mtime"
         );
-        // The launch member's markers are the fixture's, so what proves the swap
-        // stamped nothing is that it claimed nothing.
+        // Not evidence on its own — a same-member swap would resolve to the
+        // launch marker and claim nothing anyway. It pins the narrower thing: a
+        // `claim_markers` that stamped unconditionally.
         assert!(
             swap.cell().held.is_empty(),
             "a no-op swap must not claim a marker"
@@ -4025,11 +4034,15 @@ fn a_failed_repoint_leaves_the_session_on_the_member_its_link_resolves_to() {
     });
 }
 
-/// What Claude Code compares is the value it stats through the link against the
-/// one it MEMOIZED for the previous target — so the mtime the swap writes has to
-/// differ from the OLD store's, not from the new store's own previous value.
+/// What Claude Code compares is EQUALITY against the mtime it memoized for the
+/// previous target (`if(e!==Oeu)`), so the swap only has to make the new store's
+/// value DIFFER — and must not reach that by importing the old store's clock
+/// skew. A store left ahead of the clock makes `recover_pending_credentials`
+/// discard every later crash-staged sidecar and `resolve_credential_winner`
+/// discard every later re-login, on a member whose mtime was healthy until the
+/// swap touched it.
 #[test]
-fn the_touched_mtime_differs_from_the_store_the_link_came_from() {
+fn a_swap_moves_the_mtime_without_importing_the_old_stores_skew() {
     let tmp = tempfile::tempdir().expect("tempdir");
     with_fake_home(tmp.path(), || {
         let launch = member("ahead-a");
@@ -4038,9 +4051,8 @@ fn the_touched_mtime_differs_from_the_store_the_link_came_from() {
         let intended_store = member_store(&intended);
         let (swap, _launch_markers) = lone_session(&launch, Isolation::Shared);
 
-        // A store stamped ahead of the clock — a restored backup, a skewed NFS
-        // mount. Stamping the new target at `now` would land BELOW it, and on a
-        // coarse-granularity filesystem could land exactly on it.
+        // The store the link came from is stamped an hour ahead of the clock — a
+        // restored backup, a skewed network mount.
         let ahead = SystemTime::now() + Duration::from_secs(3_600);
         set_mtime(&launch_store, ahead);
 
@@ -4050,9 +4062,14 @@ fn the_touched_mtime_differs_from_the_store_the_link_came_from() {
             .expect("meta")
             .modified()
             .expect("mtime");
+        assert_ne!(
+            after, ahead,
+            "the new target's mtime must differ from the one CC memoized"
+        );
         assert!(
-            after > ahead,
-            "the new target's mtime must differ from the one CC memoized for the old target"
+            after <= SystemTime::now(),
+            "the swap stamped the new member's store ahead of the clock, which \
+             discards its later sidecars and re-logins for as long as it stands"
         );
     });
 }

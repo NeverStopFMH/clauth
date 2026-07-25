@@ -251,6 +251,11 @@ The **Fallback** tab holds an ordered chain of profiles clauth hops between when
       ...
 ```
 
+The `-<sid>` suffix is there only where the OS grants symlinks. Windows without
+symlink privilege builds the tree by copying `~/.claude/`, so every session of a
+profile shares one unsuffixed `runtime/` + `sessions/` pair instead of paying a
+full copy each.
+
 </details>
 
 ## Claude Code plugin

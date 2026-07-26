@@ -499,3 +499,41 @@ fn stale_window_fades_only_fill_and_percent() {
         "reset suffix unchanged"
     );
 }
+
+/// The 30-day arm edge of `relative_age`, which the ladder pin in
+/// `tui_render_chain.rs` walks straight past: it steps 30s / 5m30 / 2h30 /
+/// 3d12h / 12d and then jumps to a fixed 2023 epoch, so nothing sits near the
+/// cutover and `days < 30` is free to become `days < 31`.
+///
+/// Both fixtures sit HALF A DAY off the boundary, so the wall clock cannot walk
+/// either across it between building the fixture and rendering it. The date
+/// arm is asserted by SHAPE rather than by a recomputed ISO string — deriving
+/// the expected date through the same `epoch_secs_to_iso` the code calls would
+/// only confirm the copy is faithful. The literal ISO output is already pinned
+/// against a fixed epoch by `the_last_swap_age_renders_one_unit_and_a_date_past_
+/// thirty_days`; what this owns is the branch.
+///
+/// `relative_age` also feeds the status tab's incident ages
+/// (`status.rs` `started` row + the detail timeline), so the arm protects three
+/// surfaces, not one.
+#[test]
+fn relative_age_switches_to_a_date_at_thirty_days() {
+    const DAY_MS: u64 = 86_400_000;
+    const HALF_DAY_MS: u64 = 43_200_000;
+    let ago = |ms: u64| crate::usage::now_ms().saturating_sub(ms);
+
+    // 29d12h — the last age still inside the relative arm, floored to 4 weeks.
+    assert_eq!(relative_age(ago(29 * DAY_MS + HALF_DAY_MS)), "4w ago");
+
+    // 30d12h — the first age past it. `days < 31` renders `4w ago` here.
+    let dated = relative_age(ago(30 * DAY_MS + HALF_DAY_MS));
+    let bytes = dated.as_bytes();
+    assert!(
+        !dated.ends_with(" ago")
+            && bytes.len() == 10
+            && bytes[4] == b'-'
+            && bytes[7] == b'-'
+            && bytes.iter().filter(|b| b.is_ascii_digit()).count() == 8,
+        "30d12h must take the ISO date arm, got {dated:?}"
+    );
+}

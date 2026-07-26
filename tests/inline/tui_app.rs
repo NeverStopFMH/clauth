@@ -215,7 +215,14 @@ fn runtime_check_summarizes_profiles() {
     assert_eq!(check.health, super::Health::Idle);
     assert!(check.fix.is_none());
     assert!(check.detail.iter().any(|l| l == "profiles: 1"));
-    assert!(check.detail.iter().any(|l| l == "sessions: 0"));
+    // A zero count prints NOTHING — no row, and specifically not `sessions: 0`
+    // or a `—` placeholder. The Overview cell and the Fallback card both hide
+    // their zero; this row was the one surface still announcing it.
+    assert!(
+        !check.detail.iter().any(|l| l.starts_with("sessions:")),
+        "an idle fleet says nothing about sessions, got {:?}",
+        check.detail
+    );
     assert!(check.detail.iter().any(|l| l == "active: \u{2014}"));
     assert!(check.detail.iter().any(|l| l == "link: \u{2014}"));
 }

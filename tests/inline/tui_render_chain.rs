@@ -1502,7 +1502,9 @@ fn the_session_block_counts_live_sessions_and_carries_no_caveat_until_one_has_sw
 /// registry cannot see.
 #[test]
 fn the_session_block_dates_the_last_swap_and_says_when_it_is_picked_up() {
-    let swapped_at = crate::usage::now_ms().saturating_sub(12_000);
+    // Mid-unit (3h30m), so the wall clock cannot walk the fixture across a
+    // `relative_age` boundary between building it and rendering it.
+    let swapped_at = crate::usage::now_ms().saturating_sub(3 * 3_600_000 + 1_800_000);
     let sessions =
         crate::live_sessions::LiveTally::of([live_row("4242-0", "a", true, Some(swapped_at))])
             .member("a");
@@ -1512,16 +1514,17 @@ fn the_session_block_dates_the_last_swap_and_says_when_it_is_picked_up() {
         vec![
             String::new(),
             "sessions     1 (1 following)".to_string(),
-            "last swap    12s ago".to_string(),
+            "last swap    3h ago".to_string(),
             " └ picked up on the session's next request".to_string(),
         ],
     );
 }
 
-/// A swap that landed inside the second the card renders would otherwise reach
-/// `humanize_duration`'s zero arm and read `now ago`, which is not a phrase.
+/// A swap that landed inside the second the card renders reads `just now`.
+/// `relative_age` owns that arm, which is what retired the `max(1)` guard the
+/// old two-unit formatter needed to keep from rendering the phrase `now ago`.
 #[test]
-fn a_swap_this_very_second_reads_as_one_second_rather_than_now_ago() {
+fn a_swap_this_very_second_reads_as_just_now() {
     let sessions = crate::live_sessions::LiveTally::of([live_row(
         "4242-0",
         "a",
@@ -1535,10 +1538,44 @@ fn a_swap_this_very_second_reads_as_one_second_rather_than_now_ago() {
         vec![
             String::new(),
             "sessions     1".to_string(),
-            "last swap    1s ago".to_string(),
+            "last swap    just now".to_string(),
             " └ picked up on the session's next request".to_string(),
         ],
     );
+}
+
+/// The age line follows the cloudy-tui Time-formatting contract: ONE unit, the
+/// largest that is at least 1, and an absolute ISO date at 30 days and beyond.
+/// The two-unit `humanize_duration` the countdowns use would render `1d 4h ago`
+/// here and never reach a date at all — it stays on the countdowns, where a
+/// duration is what is being shown.
+///
+/// Every relative fixture sits MID-unit so the wall clock cannot walk it across
+/// a boundary mid-test; the ISO case uses a fixed epoch, so its expectation is a
+/// literal rather than a date recomputed from the code under test.
+#[test]
+fn the_last_swap_age_renders_one_unit_and_a_date_past_thirty_days() {
+    let age_line = |at: u64| -> String {
+        let sessions =
+            crate::live_sessions::LiveTally::of([live_row("4242-0", "a", false, Some(at))])
+                .member("a");
+        card_texts(&live_session_lines(sessions, 60))
+            .into_iter()
+            .find(|t| t.starts_with("last swap"))
+            .expect("the block dates a swap")
+            .trim_start_matches("last swap")
+            .trim()
+            .to_string()
+    };
+    let ago = |ms: u64| crate::usage::now_ms().saturating_sub(ms);
+
+    assert_eq!(age_line(ago(30_000)), "just now");
+    assert_eq!(age_line(ago(5 * 60_000 + 30_000)), "5m ago");
+    assert_eq!(age_line(ago(2 * 3_600_000 + 1_800_000)), "2h ago");
+    assert_eq!(age_line(ago(3 * 86_400_000 + 43_200_000)), "3d ago");
+    assert_eq!(age_line(ago(12 * 86_400_000)), "1w ago");
+    // 2023-11-14T22:13:20Z — permanently past 30 days, so the arm is the date.
+    assert_eq!(age_line(1_700_000_000_000), "2023-11-14");
 }
 
 /// An account hosting nothing says nothing — no row at all rather than

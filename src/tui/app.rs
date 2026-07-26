@@ -3198,11 +3198,6 @@ fn recompute_plugin_checks(app: &mut App, refresh_version: bool) {
         Health::Idle
     };
 
-    let sessions_line = if live_sessions == 0 {
-        "0".to_string()
-    } else {
-        format!("{live_sessions} live across {live_profiles}")
-    };
     let link_line = match &active_name {
         Some(_) if active_expires != "\u{2014}" => format!("{active_link} · {active_expires}"),
         Some(_) => active_link.to_string(),
@@ -3211,10 +3206,14 @@ fn recompute_plugin_checks(app: &mut App, refresh_version: bool) {
     // Runtime health only — config (type / model / overrides) lives on the Setup
     // tab. This row answers "how many live sessions, is the active credential link
     // healthy, and how fresh is its token?".
-    let mut runtime_detail = vec![
-        format!("profiles: {total}"),
-        format!("sessions: {sessions_line}"),
-    ];
+    let mut runtime_detail = vec![format!("profiles: {total}")];
+    // A zero is hidden rather than printed, matching the Overview cell and the
+    // Fallback card — the row says nothing when there is nothing to say.
+    if live_sessions > 0 {
+        runtime_detail.push(format!(
+            "sessions: {live_sessions} live across {live_profiles}"
+        ));
+    }
     // Name each profile carrying a live session as an indented sub-line, so
     // "live across N" is concrete rather than just a tally.
     for name in &live_names {

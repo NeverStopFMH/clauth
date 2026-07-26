@@ -22,7 +22,7 @@ use super::super::app::{
     chain_items, parse_max_spend, parse_threshold, parse_weekly_override,
 };
 use super::super::theme;
-use super::format::{ResetFmt, reset_pill, reset_resume};
+use super::format::{ResetFmt, relative_age, reset_pill, reset_resume};
 use super::global_config::default_reminder;
 use super::panes::{
     DIAG_AUTH_BROKEN, DIAG_BUDGET_SPENT, DIAG_CANCELED, DIAG_DISABLED, DIAG_KICK, bold_when,
@@ -422,15 +422,12 @@ fn live_session_lines(
     let Some(at) = sessions.last_swap_at else {
         return lines;
     };
-    // `max(1)` keeps a swap that landed this same second out of
-    // `humanize_duration`'s "now", which would read "now ago".
-    let ago = (crate::usage::now_ms().saturating_sub(at) / 1000).max(1);
+    // An AGE, so it reads through `relative_age` (single largest unit, ISO date
+    // past 30 days) rather than the two-unit `humanize_duration` the countdowns
+    // use — a countdown is a duration, this is a point in the past.
     lines.push(Line::from(vec![
         Span::styled(key_cell("last swap", KEY_W, KEY_GUTTER), theme::label()),
-        Span::styled(
-            format!("{} ago", humanize_duration(ago as i64)),
-            theme::dim(),
-        ),
+        Span::styled(relative_age(at), theme::dim()),
     ]));
     lines.extend(help_tooltip_lines(
         "picked up on the session's next request",

@@ -90,6 +90,18 @@ fn single_profile_config(name: &str, refresh_token: &str) -> AppConfig {
 
 use crate::testutil::HomeSandbox;
 
+/// Simulate a live `clauth start` session for `name`: a locked marker in its
+/// sessions dir reads as alive via `has_live_session`. The caller must hold the
+/// returned file for as long as the session should read as live — dropping it
+/// releases the flock.
+fn arm_live_session(name: &str) -> std::fs::File {
+    let sessions = profile_dir(name).expect("profile_dir").join("sessions");
+    std::fs::create_dir_all(&sessions).expect("create sessions dir");
+    let file = open_pid_file(&sessions.join("test-pid")).expect("open pid file");
+    file.lock().expect("lock pid file");
+    file
+}
+
 #[test]
 fn no_live_session_included_with_force_false() {
     let config = single_profile_config("test-oauth-no-session-force-false", "rt-abc");
@@ -108,40 +120,35 @@ fn no_live_session_included_with_force_true() {
 }
 
 #[test]
-fn live_session_excluded_when_force_false() {
+fn live_session_included_when_force_false() {
     let _home = HomeSandbox::new();
     let name = "test-oauth-live-session-guard";
-    let sessions = profile_dir(name).expect("profile_dir").join("sessions");
-    std::fs::create_dir_all(&sessions).expect("create sessions dir");
-    let pid_file = sessions.join("test-pid");
-    let file = open_pid_file(&pid_file).expect("open pid file");
-    file.lock().expect("lock pid file");
+    let file = arm_live_session(name);
 
     let config = single_profile_config(name, "rt-ghi");
     let candidates = rotation_candidates(&config, false);
-    assert!(
-        candidates.is_empty(),
-        "force=false should exclude a profile with a live session"
+    assert_eq!(
+        candidates,
+        vec![(name.to_string(), "rt-ghi".to_string())],
+        "a live session shares one credential file with clauth, so it follows a \
+         rotation instead of being burned by one"
     );
 
     drop(file);
 }
 
 #[test]
-fn live_session_excluded_even_with_force_true() {
+fn live_session_included_with_force_true() {
     let _home = HomeSandbox::new();
     let name = "test-oauth-live-session-force";
-    let sessions = profile_dir(name).expect("profile_dir").join("sessions");
-    std::fs::create_dir_all(&sessions).expect("create sessions dir");
-    let pid_file = sessions.join("test-pid");
-    let file = open_pid_file(&pid_file).expect("open pid file");
-    file.lock().expect("lock pid file");
+    let file = arm_live_session(name);
 
     let config = single_profile_config(name, "rt-jkl");
     let candidates = rotation_candidates(&config, true);
-    assert!(
-        candidates.is_empty(),
-        "a live session owns its single-use chain — never rotated, even under force"
+    assert_eq!(
+        candidates,
+        vec![(name.to_string(), "rt-jkl".to_string())],
+        "liveness is not a rotation gate in either force mode"
     );
 
     drop(file);
@@ -217,80 +224,6 @@ fn rotate_one_no_stamp_when_no_refresh_token() {
         is_idle(&activity, "test-rotate-one-no-rt"),
         "activity slot must remain Idle when rotation short-circuits at no-token"
     );
-}
-
-/// `rotate_one_inner` must never rotate a profile with a live `clauth start`
-/// session: its single-use chain is owned by that session, so our stored token
-/// is stale and a refresh would 400. It skips silently — `Persisted(false)`,
-/// activity Idle, no `OpResult` (the single-rotate caller messages up front).
-#[test]
-fn rotate_one_inner_skips_live_session() {
-    use std::collections::BTreeMap;
-    use std::sync::mpsc;
-
-    let _home = HomeSandbox::new();
-    let name = "test-rotate-one-live-session";
-    let sessions = profile_dir(name).expect("profile_dir").join("sessions");
-    std::fs::create_dir_all(&sessions).expect("create sessions dir");
-    let pid_file = sessions.join("test-pid");
-    let file = open_pid_file(&pid_file).expect("open pid file");
-    file.lock().expect("lock pid file");
-
-    let profile = Profile {
-        name: name.into(),
-        base_url: None,
-        api_key: None,
-        auto_start: false,
-        env: BTreeMap::new(),
-        models: Default::default(),
-        fallback_threshold: None,
-        weekly_threshold: None,
-        last_resort: false,
-        max_auto_spend: None,
-        check_weekly: true,
-        check_scoped: true,
-        bell_threshold: None,
-        disabled: false,
-        credentials: Some(ClaudeCredentials {
-            claude_ai_oauth: Some(OAuthToken {
-                access_token: "at".to_string(),
-                refresh_token: Some("rt-live".to_string()),
-                expires_at: None,
-                scopes: None,
-                subscription_type: None,
-            }),
-        }),
-        usage: None,
-        fetch_status: None,
-        provider: None,
-        third_party_usage: None,
-    };
-    let mut config = AppConfig {
-        state: AppState::default(),
-        profiles: vec![profile],
-    };
-    config.state.profiles.push(name.into());
-
-    let config = Arc::new(RankedMutex::new(config));
-    let activity: ActivityStore = Arc::new(RankedMutex::new(std::collections::HashMap::new()));
-    let (tx, rx) = mpsc::channel();
-
-    let result = rotate_one_inner(&config, name, Some(&activity), &tx);
-
-    assert!(
-        matches!(result, RotateOutcome::Persisted(false)),
-        "a live session must skip rotation (no stale-token refresh)"
-    );
-    assert!(
-        is_idle(&activity, name),
-        "a skipped rotation must leave the activity slot Idle"
-    );
-    assert!(
-        rx.try_recv().is_err(),
-        "the silent live-session skip must not emit an OpResult"
-    );
-
-    drop(file);
 }
 
 #[test]
@@ -488,6 +421,47 @@ fn gate_valid_token_ready_without_refresh() {
         ensure_installable(&handle, name, never_refresh),
         AuthGate::Ready
     ));
+}
+
+/// A live `clauth start` session no longer short-circuits the switch gate to
+/// `Ready`. That refusal installed the STALE token as-is; the session reads the
+/// same credential file, so refreshing here hands it a fresh pair instead of
+/// racing it. Offline: the refresher is injected, and it running at all is the
+/// assertion — under the old gate it was unreachable.
+#[test]
+fn gate_refreshes_an_expiring_token_under_a_live_session() {
+    let _home = HomeSandbox::new();
+    let name = "test-gate-live-session";
+    let file = arm_live_session(name);
+    let handle = Arc::new(RankedMutex::new(oauth_config(
+        name,
+        Some("rt-old"),
+        Some(past_expiry()),
+    )));
+    let refresher = |_rt: &str, _scopes: Option<&str>| {
+        Ok(TokenResponse {
+            access_token: "at-new".to_string(),
+            refresh_token: "rt-new".to_string(),
+            expires_in: 3600,
+            scope: None,
+        })
+    };
+    assert!(
+        matches!(
+            ensure_installable(&handle, name, refresher),
+            AuthGate::Refreshed
+        ),
+        "a live session must not downgrade the gate to installing a spent token"
+    );
+    #[allow(clippy::expect_used, reason = "test")]
+    let stored = handle
+        .lock()
+        .expect("config lock")
+        .find(name)
+        .and_then(|p| p.access_token().map(str::to_string));
+    assert_eq!(stored.as_deref(), Some("at-new"));
+
+    drop(file);
 }
 
 /// Expired-but-refreshable → rotated tokens minted, persisted, installed.

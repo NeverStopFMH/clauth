@@ -386,13 +386,15 @@ pub(crate) struct AppState {
         skip_serializing_if = "is_true"
     )]
     pub(crate) switch_off_when_budget_spent: bool,
-    /// Opt-in: rotate the ACTIVE, Keychain-installed profile ahead of its
-    /// access-token expiry instead of waiting for a 401 (rotation coherence,
-    /// #1). Off by default — stock clauth stays strictly lazy. Adoption plus
-    /// mirror-on-rotate already provide the correctness; the early refresh is
-    /// an optimization (fewer live-mirror adopt events) some setups may want.
-    /// See `usage::scheduler::proactive_rotation_due`.
-    #[serde(default, skip_serializing_if = "is_false")]
+    /// Rotate a profile ahead of its access-token expiry instead of waiting for
+    /// a 401. Default ON: the lead clears the running `claude`'s own refresh
+    /// threshold, so clauth's stored pair stays the live one instead of lagging
+    /// a chain the session advanced. Off falls back to rotating only on
+    /// rejection. See `usage::scheduler::proactive_rotation_due`.
+    #[serde(
+        default = "default_preemptive_rotation",
+        skip_serializing_if = "is_true"
+    )]
     pub(crate) preemptive_rotation: bool,
     /// Opt-in: on an `--isolated` `clauth start`, lift the run's transcripts out
     /// of the throwaway `runtime-isolated/projects/` store into the global
@@ -531,6 +533,10 @@ fn default_switch_off_when_budget_spent() -> bool {
     true
 }
 
+fn default_preemptive_rotation() -> bool {
+    true
+}
+
 fn is_true(b: &bool) -> bool {
     *b
 }
@@ -602,7 +608,7 @@ impl Default for AppState {
             burn_aware_switching: false,
             spend_budget_switching: false,
             switch_off_when_budget_spent: default_switch_off_when_budget_spent(),
-            preemptive_rotation: false,
+            preemptive_rotation: default_preemptive_rotation(),
             auto_rescue: false,
             refresh_spent_accounts: true,
             theme: None,

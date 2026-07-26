@@ -1114,15 +1114,13 @@ fn overview_switch_request_never_opens_a_confirm_for_a_disabled_account() {
     );
 }
 
-/// Rotating a profile a live `clauth start` session owns must not dead-end on a
-/// toast (the old behavior): it arms an acknowledge notice explaining the block,
-/// and confirming is a no-op — the running session owns rotation, and rotating
-/// its already-spent stored token would 400 (`docs/internals.md`, 2026-06-17).
+/// A live `clauth start` session no longer blocks the rotate: it reads the same
+/// credential file clauth writes, so it picks the rotated pair up on its next
+/// request. The action arms the ordinary rotate confirm, exactly as an idle
+/// profile does — no acknowledge notice, no pre-refusal.
 #[test]
-fn rotate_tokens_with_live_session_arms_acknowledge_modal() {
-    use super::{
-        ActionMenuAction, ConfirmAction, Modal, dispatch_action_menu_action, run_confirm_action,
-    };
+fn rotate_tokens_with_live_session_arms_the_rotate_confirm() {
+    use super::{ActionMenuAction, ConfirmAction, Modal, dispatch_action_menu_action};
     use crate::profile::Profile;
     let home = crate::testutil::HomeSandbox::new();
 
@@ -1138,22 +1136,44 @@ fn rotate_tokens_with_live_session_arms_acknowledge_modal() {
             Modal::Confirm(s) => Some(s),
             _ => None,
         })
-        .expect("a live session arms a confirm modal");
+        .expect("a live session still arms a confirm modal");
     assert!(
-        matches!(confirm.on_confirm, ConfirmAction::Acknowledge),
-        "a live-session rotate arms an acknowledge notice, not a rotate action"
+        matches!(&confirm.on_confirm, ConfirmAction::RotateOne(n) if n == "busy"),
+        "a live-session rotate carries RotateOne, not an acknowledge notice: {:?}",
+        confirm.on_confirm
     );
+}
 
-    let action = confirm.on_confirm.clone();
-    run_confirm_action(&mut app, action);
-    assert!(
-        app.config().find("busy").is_some(),
-        "acknowledging the notice leaves the profile untouched"
+/// Arming the confirm is only half the path — `run_confirm_action` carried its
+/// OWN live-session refusal, so the modal could arm and the rotate still be
+/// dropped on the floor. Confirming under a live session must reach the rotate
+/// and say so. The fixture profile holds no refresh token, so the spawned
+/// worker short-circuits before any HTTP.
+#[test]
+fn confirming_a_rotate_under_a_live_session_reaches_the_rotate() {
+    use super::{ConfirmAction, ToastKind, run_confirm_action};
+    use crate::profile::Profile;
+    let home = crate::testutil::HomeSandbox::new();
+
+    let mut app = app_with(vec![Profile::new("busy".to_string(), None, None)]);
+    app.profile_cursor = 0;
+    let _pid_guard = arm_live_session(home.home(), "busy");
+
+    run_confirm_action(&mut app, ConfirmAction::RotateOne("busy".to_string()));
+
+    let toast = app
+        .toasts
+        .back()
+        .expect("confirming a rotate says something");
+    assert_eq!(
+        (toast.kind, toast.body.as_str()),
+        (ToastKind::Info, "rotating 'busy'"),
+        "a live session must not turn the rotate into a refusal"
     );
 }
 
 /// No live session: the rotate action arms the normal rotate confirm carrying the
-/// per-profile `RotateOne`, not the acknowledge notice.
+/// per-profile `RotateOne`.
 #[test]
 fn rotate_tokens_without_live_session_arms_rotate_confirm() {
     use super::{ActionMenuAction, ConfirmAction, Modal, dispatch_action_menu_action};
@@ -2579,7 +2599,7 @@ fn money_spent_is_inert_through_the_top_level_router() {
 // ── preemptive rotation (rotation coherence #1) ─────────────────────────────
 
 #[test]
-fn preemptive_rotation_space_toggles_on_macos_inert_elsewhere() {
+fn preemptive_rotation_space_toggles_on_every_platform() {
     let _home = crate::testutil::HomeSandbox::new();
     let mut app = bare_app();
     app.tab = Tab::Config;
@@ -2588,39 +2608,35 @@ fn preemptive_rotation_space_toggles_on_macos_inert_elsewhere() {
         .position(|r| *r == GlobalConfigRow::PreemptiveRotation)
         .unwrap();
     assert!(
+        app.config().state.preemptive_rotation,
+        "on by default — proactive rotation is the shipped behavior"
+    );
+
+    // The lead is a clock margin, not a Keychain concern, so the row is live
+    // on every platform rather than dimmed off macOS.
+    super::handle_global_config_key(&mut app, key(KeyCode::Char(' ')));
+    assert!(
         !app.config().state.preemptive_rotation,
-        "off by default — stock stays strictly lazy"
+        "space toggles the mode off"
+    );
+    // Persisted to profiles.toml — the scheduler reads the flag off the shared
+    // config, but a relaunch must pick it up from disk too. An explicit off is
+    // the direction that regresses if the key is skipped on serialize.
+    let reloaded: crate::profile::AppState = toml::from_str(
+        &std::fs::read_to_string(crate::profile::clauth_dir().unwrap().join("profiles.toml"))
+            .expect("read profiles.toml"),
+    )
+    .expect("parse profiles.toml");
+    assert!(
+        !reloaded.preemptive_rotation,
+        "the off toggle persists to disk"
     );
 
     super::handle_global_config_key(&mut app, key(KeyCode::Char(' ')));
-
-    // Off macOS the Keychain mirror is never live, so preemptive rotation can't
-    // fire and the row is a disabled no-op; on macOS the toggle works + persists.
-    if cfg!(target_os = "macos") {
-        assert!(
-            app.config().state.preemptive_rotation,
-            "space toggles the mode on"
-        );
-        // Persisted to profiles.toml — the scheduler reads the flag off the
-        // shared config, but a relaunch must pick it up from disk too.
-        let reloaded: crate::profile::AppState = toml::from_str(
-            &std::fs::read_to_string(crate::profile::clauth_dir().unwrap().join("profiles.toml"))
-                .expect("read profiles.toml"),
-        )
-        .expect("parse profiles.toml");
-        assert!(reloaded.preemptive_rotation, "toggle persists to disk");
-
-        super::handle_global_config_key(&mut app, key(KeyCode::Char(' ')));
-        assert!(
-            !app.config().state.preemptive_rotation,
-            "space toggles the mode back off"
-        );
-    } else {
-        assert!(
-            !app.config().state.preemptive_rotation,
-            "inert off macOS — space must not toggle a row that can't fire"
-        );
-    }
+    assert!(
+        app.config().state.preemptive_rotation,
+        "space toggles the mode back on"
+    );
 }
 
 // ── refresh interval custom value ──────────────────────────────────────────

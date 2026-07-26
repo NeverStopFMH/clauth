@@ -324,11 +324,10 @@ pub(crate) enum GlobalConfigRow {
     /// staying costs nothing, and this one answers "the money ran out", where
     /// staying is the spending.
     SwitchOffWhenBudgetSpent,
-    /// Opt-in preemptive rotation (`AppState.preemptive_rotation`, rotation
-    /// coherence #1) — off by default (stock stays strictly lazy: rotate only
-    /// on 401). Rotates the ACTIVE Keychain-installed profile ahead of token
-    /// expiry; an optimization over adopt + mirror-on-rotate, not a
-    /// correctness mechanism.
+    /// Preemptive rotation (`AppState.preemptive_rotation`) — ON by default.
+    /// Rotates a profile ahead of token expiry rather than waiting for a 401,
+    /// with enough lead that the running `claude` never reaches its own
+    /// refresh threshold. Off falls back to rotating only on rejection.
     PreemptiveRotation,
     /// Whether the background usage fetch still polls spent (100%-capped)
     /// accounts (`AppState.refresh_spent_accounts`, default on). Off skips a
@@ -481,11 +480,6 @@ pub(crate) enum ConfirmAction {
     /// guard in `delete_profile` refuses this, so confirm the deauth risk here
     /// and re-run the delete with `force`.
     DeleteLiveSession(String),
-    /// Info-only modal: an action the user asked for is blocked for a reason
-    /// they should read (e.g. rotating a profile a live session owns, which
-    /// would 400 — see `docs/internals.md`). Confirming just dismisses;
-    /// `run_confirm_action` does nothing.
-    Acknowledge,
 }
 
 #[derive(Debug, Clone)]
@@ -825,7 +819,7 @@ pub(crate) struct Toast {
 }
 
 const ROTATE_ALL_MSG: &str = "rotate all access tokens?";
-const ROTATE_ALL_DETAIL: &str = "accounts with a live session are skipped.";
+const ROTATE_ALL_DETAIL: &str = "running sessions pick up the new tokens on their next request.";
 const TOAST_CAPACITY: usize = 3;
 const TOAST_TTL_NORMAL: Duration = Duration::from_secs(3);
 const TOAST_TTL_DANGER: Duration = Duration::from_secs(6);
@@ -3676,14 +3670,7 @@ fn run_global_config_row(app: &mut App, row: GlobalConfigRow) {
                 toggle_budget_wrap_off(app);
             }
         }
-        // Inert off macOS (rendered dimmed): preemptive rotation only fires
-        // while the Keychain mirror is live (`scheduler::keychain_live`), which
-        // is macOS-only, so the key is a no-op elsewhere.
-        GlobalConfigRow::PreemptiveRotation => {
-            if cfg!(target_os = "macos") {
-                toggle_preemptive_rotation(app);
-            }
-        }
+        GlobalConfigRow::PreemptiveRotation => toggle_preemptive_rotation(app),
         GlobalConfigRow::RefreshSpentAccounts => toggle_refresh_spent_accounts(app),
     }
 }
@@ -5008,20 +4995,6 @@ fn dispatch_action_menu_action(app: &mut App, action: ActionMenuAction) {
             None => {}
         },
         ActionMenuAction::RotateTokens => match focused_account(app) {
-            // A live `clauth start` session owns this profile's single-use OAuth
-            // chain and rotates it itself, so our stored token is already spent —
-            // rotating from here would 400 (docs/internals.md, 2026-06-17). Explain
-            // the block in an acknowledge modal instead of a dead-end toast.
-            Some((name, true, _)) if crate::runtime::has_live_session(&name) => {
-                app.modals.push(Modal::Confirm(ConfirmState {
-                    message: format!("'{name}' is in use by a running session"),
-                    detail: Some(
-                        "it manages its own tokens; rotating here would fail.".to_string(),
-                    ),
-                    choice: true,
-                    on_confirm: ConfirmAction::Acknowledge,
-                }));
-            }
             Some((name, true, _)) => {
                 app.modals.push(Modal::Confirm(ConfirmState {
                     message: format!("rotate access token for '{name}'?"),
@@ -6580,21 +6553,6 @@ fn run_confirm_action(app: &mut App, action: ConfirmAction) {
             app.toast(ToastKind::Info, "rotating all tokens");
         }
         ConfirmAction::RotateOne(name) => {
-            // A live `clauth start` session owns this profile's single-use OAuth
-            // chain and refreshes it itself, so our stored token is stale —
-            // rotating it would 400 ("refresh token not found or invalid").
-            // Refuse up front with a clear message; the in-guard `has_live_session`
-            // skip in `rotate_one_inner` is the authoritative backstop for a
-            // session that starts between this check and the rotation.
-            if crate::runtime::has_live_session(&name) {
-                app.toast(
-                    ToastKind::Warning,
-                    format!(
-                        "'{name}' is in use by a running session\nits tokens are managed there"
-                    ),
-                );
-                return;
-            }
             // The per-profile RotationGuard inside rotate_one serialises against a
             // live session's own refresh, so unlike RotateAll this doesn't need the
             // global any_busy gate — a busy guard surfaces as a Danger toast.
@@ -6652,7 +6610,6 @@ fn run_confirm_action(app: &mut App, action: ConfirmAction) {
         }
         ConfirmAction::RestartLogin(name, is_new) => start_login(app, name, is_new),
         ConfirmAction::DeleteLiveSession(name) => finish_delete(app, &name, true),
-        ConfirmAction::Acknowledge => {}
     }
 }
 

@@ -35,7 +35,7 @@ const FEATURE_MAP: &[(&str, &[&str])] = &[
         "Automatic token refresh",
         &[
             "rotate_one",
-            "live_session_excluded",
+            "live_session_included",
             "force_true_bypasses",
             "rotation_guard_is_independent",
         ],

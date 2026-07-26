@@ -1793,10 +1793,11 @@ fn two_shared_sessions_get_independent_trees() {
 
 /// THE UPGRADE GATE. A clauth process built before the per-session layout probes
 /// exactly `<profile>/sessions[-isolated]`. Without a marker there its
-/// `has_live_session` reads a live new-layout session as idle, and its rotation
-/// leg spends the single-use refresh token that session still holds — chain dead.
-/// Post-upgrade that old binary is the DEFAULT supervisor until the next restart
-/// (`clauth daemon --replace` exists for exactly that).
+/// `has_live_session` reads a live new-layout session as idle. That old binary
+/// still gates rotation on liveness, so it would spend the single-use refresh
+/// token the session holds — costing that session one failed refresh, not the
+/// account. Post-upgrade the old binary is the DEFAULT supervisor until the next
+/// restart (`clauth daemon --replace` exists for exactly that).
 ///
 /// The `live_sessions_at` assertion below IS the old binary's predicate, applied
 /// to the old binary's path.
@@ -2171,12 +2172,12 @@ fn fake_mode_second_session_does_not_rebuild_the_tree() {
     });
 }
 
-/// The rotation gate over a shared marker dir. A `has_live_session` false
-/// negative spends a single-use refresh token a live session still holds, so the
-/// count must stay per SESSION even though two sessions share one dir — and the
-/// tree may only be discarded by the last one out.
+/// Liveness over a shared marker dir. A `has_live_session` false negative lets
+/// a delete or disable through against a running session, so the count must
+/// stay per SESSION even though two sessions share one dir — and the tree may
+/// only be discarded by the last one out.
 #[test]
-fn fake_mode_rotation_gate_counts_both_shared_sessions() {
+fn fake_mode_liveness_counts_both_shared_sessions() {
     let tmp = tempfile::tempdir().expect("tempdir");
     with_fake_home(tmp.path(), || {
         with_link_mode(LinkMode::Fake, || {
@@ -2625,10 +2626,10 @@ fn build_runtime_dir_prunes_dangling_symlink() {
 
 // ── isolation liveness + GC ──────────────────────────────────────────────────
 
-/// THE ROTATION GATE. Every session now keys its marker dir by session id, so
-/// the gate has to enumerate the profile dir rather than probe two fixed names.
-/// A false negative here spends a single-use refresh token a live session still
-/// holds and burns the whole chain, so both flavors are pinned.
+/// THE LIVENESS GATE behind delete and disable. Every session now keys its
+/// marker dir by session id, so the gate has to enumerate the profile dir
+/// rather than probe two fixed names. A false negative here pulls an account
+/// out from under a running session, so both flavors are pinned.
 #[test]
 fn has_live_session_sees_a_per_session_dir_of_either_flavor() {
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -3788,10 +3789,11 @@ fn a_swap_refuses_a_member_whose_marker_another_process_holds() {
 
 /// §11 step 8: the previous member's marker is NEVER dropped, because the live
 /// Claude Code child still holds its refresh token in memory and nothing can
-/// observe when it stops. So the correct assertion is that a rotate of the OLD
-/// member still SKIPS — both members stay out of the candidate list.
+/// observe when it stops. The marker is liveness bookkeeping the destructive
+/// guards read — it is NOT a rotation gate, so both members stay rotatable
+/// throughout. A swapped session follows whichever pair clauth writes.
 #[test]
-fn a_swap_leaves_both_members_out_of_rotation() {
+fn a_swap_keeps_both_members_marked_live_and_still_rotatable() {
     let tmp = tempfile::tempdir().expect("tempdir");
     with_fake_home(tmp.path(), || {
         fake_claude_home(tmp.path());
@@ -3820,13 +3822,19 @@ fn a_swap_leaves_both_members_out_of_rotation() {
         }
 
         let config = config_of(&[&launch, &intended]);
-        assert!(
-            crate::oauth::rotation_candidates(&config, false).is_empty(),
-            "neither the launch nor the swapped-onto member may be rotated"
+        let want = vec![
+            ("rot-a".to_string(), "rt-rot-a".to_string()),
+            ("rot-b".to_string(), "rt-rot-b".to_string()),
+        ];
+        assert_eq!(
+            crate::oauth::rotation_candidates(&config, false),
+            want,
+            "a live marker is not a rotation gate — both members stay candidates"
         );
-        assert!(
-            crate::oauth::rotation_candidates(&config, true).is_empty(),
-            "force does not widen the live-session skip"
+        assert_eq!(
+            crate::oauth::rotation_candidates(&config, true),
+            want,
+            "force changes nothing here; liveness never excluded either member"
         );
         drop(rt);
     });

@@ -404,17 +404,16 @@ fn burn_tunables_dim_when_burn_aware_is_off() {
     }
 }
 
-// ── preemptive rotation dims where it can't fire (off macOS) ──────────────────
+// ── preemptive rotation is live on every platform ────────────────────────────
 
-/// Preemptive rotation only fires while the macOS Keychain mirror is live
-/// (`scheduler::keychain_live`), so off macOS the `rotation` row renders as a
-/// cloudy-tui disabled row and its hint names the platform reason — it can't do
-/// anything there.
-#[cfg(not(target_os = "macos"))]
+/// The rotation lead is a clock margin against the running `claude`'s own
+/// refresh threshold, which is platform-independent — so the `rotation` row is
+/// an editable `cycle_row` everywhere, never a dimmed one, and its hint states
+/// the behavior rather than a platform caveat.
 #[test]
-fn rotation_dims_off_macos() {
+fn rotation_row_is_live_on_every_platform() {
     let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
-    let dimmed = detail_row(
+    let row = detail_row(
         GlobalConfigRow::PreemptiveRotation,
         false,
         toggles(),
@@ -426,24 +425,35 @@ fn rotation_dims_off_macos() {
         None,
     );
     assert!(
-        dimmed
-            .spans
+        row.spans
             .iter()
-            .all(|s| s.content.trim().is_empty() || s.style.fg == theme::faint().fg),
-        "rotation must render fully faint off macOS: {:?}",
-        dimmed.spans,
+            .any(|s| !s.content.trim().is_empty() && s.style.fg != theme::faint().fg),
+        "an editable row must carry at least one non-faint span: {:?}",
+        row.spans,
     );
-    let hint = row_hint(
-        GlobalConfigRow::PreemptiveRotation,
-        None,
-        toggles(),
-        90_000,
-        98.0,
-        98.0,
-        60_000,
-    )
-    .expect("the dimmed rotation row carries a reason");
-    assert!(hint.contains("macos"), "names the platform reason: {hint}");
+
+    let mut on = toggles();
+    on.preemptive = true;
+    for (state, want) in [(toggles(), "rejects"), (on, "before it expires")] {
+        let hint = row_hint(
+            GlobalConfigRow::PreemptiveRotation,
+            None,
+            state,
+            90_000,
+            98.0,
+            98.0,
+            60_000,
+        )
+        .expect("the rotation row carries a hint");
+        assert!(
+            hint.contains(want),
+            "the hint must state the live behavior, wanted {want:?}, got {hint:?}"
+        );
+        assert!(
+            !hint.contains("macos"),
+            "no platform caveat survives on a cross-platform row: {hint}"
+        );
+    }
 }
 
 // ── concern bands + their eyebrow headers ────────────────────────────────────

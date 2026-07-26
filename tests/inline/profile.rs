@@ -166,30 +166,40 @@ fn burn_aware_switching_round_trips_and_is_omitted_when_off() {
     );
 }
 
-// `preemptive_rotation` (rotation coherence #1) shares `burn_aware_switching`'s
-// serde contract exactly: absent from old state files → false (stock stays
-// strictly lazy), on renders explicitly, off is omitted.
+// `preemptive_rotation` defaults ON, so it takes `refresh_spent_accounts`'s
+// default-true serde contract, not `burn_aware_switching`'s: a state file
+// written before the key existed must read as ON (`serde(default)` alone would
+// hand back `false` whatever `AppState::default()` says), and an explicitly-OFF
+// toggle must be WRITTEN — `skip_serializing_if = "is_false"` would drop the
+// key and the next load would silently turn it back on.
 #[test]
-fn preemptive_rotation_defaults_false_and_round_trips() {
+fn preemptive_rotation_defaults_true_and_an_explicit_off_survives_a_round_trip() {
     let state: AppState = toml::from_str("profiles = []\n").expect("parse state");
-    assert!(!state.preemptive_rotation);
+    assert!(
+        state.preemptive_rotation,
+        "a state file predating the key must read as the new default (on)"
+    );
+    assert!(AppState::default().preemptive_rotation);
 
-    let on = AppState {
-        preemptive_rotation: true,
+    let off = AppState {
+        preemptive_rotation: false,
         ..AppState::default()
     };
-    let rendered_on = toml::to_string_pretty(&on).expect("render on state");
+    let rendered_off = toml::to_string_pretty(&off).expect("render off state");
     assert!(
-        rendered_on.contains("preemptive_rotation = true"),
-        "on must render explicitly, got:\n{rendered_on}"
+        rendered_off.contains("preemptive_rotation = false"),
+        "off must render explicitly or the next load reverts it to on, got:\n{rendered_off}"
     );
-    let reparsed: AppState = toml::from_str(&rendered_on).expect("reparse on state");
-    assert!(reparsed.preemptive_rotation);
-
-    let rendered_off = toml::to_string_pretty(&AppState::default()).expect("render default state");
+    let reparsed: AppState = toml::from_str(&rendered_off).expect("reparse off state");
     assert!(
-        !rendered_off.contains("preemptive_rotation"),
-        "off (default) must be omitted, got:\n{rendered_off}"
+        !reparsed.preemptive_rotation,
+        "the operator's off must survive save + reload"
+    );
+
+    let rendered_on = toml::to_string_pretty(&AppState::default()).expect("render default state");
+    assert!(
+        !rendered_on.contains("preemptive_rotation"),
+        "on (default) must be omitted, got:\n{rendered_on}"
     );
 }
 

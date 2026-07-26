@@ -3351,21 +3351,18 @@ fn pre_rotation_other_errors_bail_to_cache() {
     ));
 }
 
-// `proactive_rotation_due` decides whether the ACTIVE Keychain-installed profile
-// rotates AHEAD of expiry (rotation coherence, #1) instead of waiting for a
-// 401. Opt-in via `AppState.preemptive_rotation` — adoption plus
-// mirror-on-rotate carry the correctness; the early rotate is an optimization.
+// `proactive_rotation_due` decides whether a profile rotates AHEAD of expiry
+// instead of waiting for a 401. Two inputs only: the `preemptive_rotation`
+// toggle (default ON) and whether the stored expiry sits inside the lead
+// window. Liveness, active-ness and the Keychain are NOT inputs — every
+// non-isolated session reads the same credential file clauth rotates.
 
 #[test]
-fn preemptive_rotation_is_opt_in_and_off_by_default() {
-    // Stock clauth stays strictly lazy: with the toggle off, even a token
-    // deep inside the lead window (active + Keychain live) never rotates
-    // ahead of expiry.
-    assert!(!crate::profile::AppState::default().preemptive_rotation);
+fn preemptive_rotation_is_on_by_default_and_the_toggle_still_disables_it() {
+    assert!(crate::profile::AppState::default().preemptive_rotation);
+    // Toggled off, a token deep inside the lead window stays lazy.
     assert!(!super::proactive_rotation_due(
         false,
-        true,
-        true,
         Some(10_000),
         10_000,
         90_000
@@ -3375,12 +3372,10 @@ fn preemptive_rotation_is_opt_in_and_off_by_default() {
 #[test]
 fn proactive_rotation_fires_only_inside_the_lead_window() {
     let interval = 90_000u64;
-    let lead = super::active_rotate_lead_ms(interval);
-    // At or inside the lead window → rotate now, keeping the Keychain token
-    // from ever expiring under the running claude.
+    let lead = super::rotate_lead_ms(interval);
+    // At or inside the lead window → rotate now, so the token never reaches
+    // the 5-minute mark where the running claude would refresh it itself.
     assert!(super::proactive_rotation_due(
-        true,
-        true,
         true,
         Some(10_000 + lead),
         10_000,
@@ -3388,16 +3383,12 @@ fn proactive_rotation_fires_only_inside_the_lead_window() {
     ));
     assert!(super::proactive_rotation_due(
         true,
-        true,
-        true,
         Some(10_000),
         10_000,
         interval
     ));
     // Beyond the lead window → plain poll; nothing at stake yet.
     assert!(!super::proactive_rotation_due(
-        true,
-        true,
         true,
         Some(10_000 + lead + 1),
         10_000,
@@ -3408,44 +3399,63 @@ fn proactive_rotation_fires_only_inside_the_lead_window() {
 #[test]
 fn proactive_lead_scales_with_the_poll_interval_with_a_floor() {
     // The lead is derived from the cadence (3 polls' worth of rotation
-    // opportunities before expiry), not a magic race margin — and it never
-    // drops below the floor even on an aggressive interval.
-    assert_eq!(super::active_rotate_lead_ms(90_000), 270_000);
-    assert_eq!(
-        super::active_rotate_lead_ms(10_000),
-        super::ACTIVE_ROTATE_LEAD_FLOOR_MS
-    );
+    // opportunities before expiry) and never drops below the floor.
+    assert_eq!(super::ROTATE_LEAD_FLOOR_MS, 900_000);
+    assert_eq!(super::rotate_lead_ms(400_000), 1_200_000);
+    assert_eq!(super::rotate_lead_ms(10_000), super::ROTATE_LEAD_FLOOR_MS);
 }
 
+/// The whole point of the floor: Claude Code refreshes its own OAuth token
+/// once it is within 5 MINUTES of expiry (`docs/domain-knowledge.md`,
+/// measured against CC's shipped bundle). At the SHIPPED 90 s cadence the
+/// `3 × interval` term is only 4.5 min, which loses that race every time —
+/// the floor is what carries it. Reds if anyone drops the floor back under
+/// `300_000` or lowers it below the shipped interval's own term.
 #[test]
-fn proactive_rotation_requires_active_and_keychain() {
-    // Inactive profile: its chain is not the live login — reactive only.
-    assert!(!super::proactive_rotation_due(
-        true,
-        false,
-        true,
-        Some(0),
-        10_000,
-        90_000
-    ));
-    // No Keychain mirror (other OSes / disabled): the symlinked profile file IS
-    // the live credential — there is no second chain to race.
-    assert!(!super::proactive_rotation_due(
-        true,
-        true,
-        false,
-        Some(0),
-        10_000,
-        90_000
-    ));
+fn the_rotation_lead_clears_claude_codes_own_five_minute_refresh_threshold() {
+    const CC_REFRESH_THRESHOLD_MS: i64 = 300_000;
+    let shipped = crate::profile::DEFAULT_REFRESH_INTERVAL_MS;
+    assert_eq!(shipped, 90_000, "the cadence this margin is sized against");
+    assert!(
+        super::rotate_lead_ms(shipped) > CC_REFRESH_THRESHOLD_MS,
+        "clauth must rotate before CC's own threshold, got {} ms vs {CC_REFRESH_THRESHOLD_MS} ms",
+        super::rotate_lead_ms(shipped)
+    );
+    // The floor, not the cadence term, is what clears it at the shipped rate.
+    assert!(
+        (shipped as i64).saturating_mul(3) < CC_REFRESH_THRESHOLD_MS,
+        "if the cadence term alone cleared 5 min the floor would be untested"
+    );
 }
 
 #[test]
 fn proactive_rotation_never_fires_on_unknown_expiry() {
     // Never spend a single-use refresh on a token whose expiry we can't prove.
-    assert!(!super::proactive_rotation_due(
-        true, true, true, None, 10_000, 90_000
-    ));
+    assert!(!super::proactive_rotation_due(true, None, 10_000, 90_000));
+}
+
+/// Liveness is not an input. Under the old gate a running `clauth start`
+/// session froze rotation on that account; it shares the credential file, so
+/// the predicate must not care either way — there is no session parameter left
+/// to pass, and this pins that the same inputs still decide.
+#[test]
+fn proactive_rotation_decides_on_the_toggle_and_the_clock_alone() {
+    let interval = 90_000u64;
+    let lead = super::rotate_lead_ms(interval);
+    for now in [0i64, 10_000, 1_700_000_000_000] {
+        assert!(super::proactive_rotation_due(
+            true,
+            Some(now + lead),
+            now,
+            interval
+        ));
+        assert!(!super::proactive_rotation_due(
+            false,
+            Some(now + lead),
+            now,
+            interval
+        ));
+    }
 }
 
 // ── stand-down hydrate (a live daemon owns the loop) ─────────────────────────

@@ -38,10 +38,11 @@
 //!
 //! Liveness lives in the paired sessions directory: the session creates the
 //! marker `<sessions dir>/<sid>` and holds an exclusive `flock(2)` on it for
-//! its lifetime, so any other process reads liveness without cooperation. Token
-//! rotation gates on a live marker in ANY of a profile's sessions dirs
-//! ([`has_live_session`]) — missing one would spend a single-use refresh token a
-//! live session still holds. Teardown drops the marker and discards the tree —
+//! its lifetime, so any other process reads liveness without cooperation.
+//! [`has_live_session`] unions every `sessions*` dir under the profile, so an
+//! isolated session counts the same as a shared one; the destructive account
+//! actions (delete, disable) gate on it. Token rotation does NOT — a session
+//! reads the very credential file a rotation writes. Teardown drops the marker and discards the tree —
 //! its own under real symlinks, the shared one under [`LinkMode::Fake`] and only
 //! once the last session of the profile has left; [`gc_stale_runtimes`] collects
 //! what a crashed session left behind, of either flavor and in either layout.
@@ -416,12 +417,12 @@ fn profiles_root_dir() -> Result<PathBuf> {
 /// being absent — a caller must read that as "cannot rule out a live session".
 /// Unlike the old fixed `<profile>/sessions` probe, this dir exists for every
 /// profile that was ever configured, so its unreadability is not the idle case;
-/// a transient EMFILE that read as "no sessions" would unblock a rotation
-/// against a live session and burn its chain.
+/// a transient EMFILE that read as "no sessions" would let a delete or disable
+/// through against a running session.
 ///
 /// The filter stays the LOOSE prefix test on purpose, where GC's uses the strict
-/// [`is_sessions_dir_name`]: a name this misses is a live session the rotation
-/// gate cannot see, while a name GC's misses is only a dir left uncollected.
+/// [`is_sessions_dir_name`]: a name this misses is a live session the destructive
+/// guards cannot see, while a name GC's misses is only a dir left uncollected.
 fn session_marker_dirs(name: &str) -> Option<Vec<PathBuf>> {
     let profile = profile_dir(name).ok()?;
     let entries = match std::fs::read_dir(&profile) {
@@ -444,11 +445,12 @@ fn session_marker_dirs(name: &str) -> Option<Vec<PathBuf>> {
 }
 
 /// True iff the profile has at least one live `clauth start` session, in ANY of
-/// its marker dirs and of either flavor. Gates token rotation, so a false
-/// negative burns the chain: it would spend a single-use refresh token a live
-/// session still holds. Every unknown therefore reads as LIVE — a spurious true
-/// costs one skipped rotation, retried next tick, and the asymmetry is total.
-/// Only a dir that is genuinely absent counts as idle.
+/// its marker dirs and of either flavor. Gates the destructive account actions
+/// (delete, disable), so a false negative pulls an account out from under a
+/// running session. Every unknown therefore reads as LIVE — a spurious true
+/// costs one refused action the user can retry, and the asymmetry is total.
+/// Only a dir that is genuinely absent counts as idle. NOT a rotation gate:
+/// a session reads the very credential file a rotation writes.
 pub(crate) fn has_live_session(name: &str) -> bool {
     match session_marker_dirs(name) {
         None => true,

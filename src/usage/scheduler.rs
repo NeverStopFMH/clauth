@@ -451,50 +451,46 @@ fn rotation_bail_context(unmask_429: Option<Option<Duration>>) -> (FetchStatus, 
     }
 }
 
-/// Floor (ms) for [`active_rotate_lead_ms`] — even on a very short refresh
-/// interval, leave a couple of minutes of margin.
-const ACTIVE_ROTATE_LEAD_FLOOR_MS: i64 = 180_000;
+/// Floor (ms) for [`rotate_lead_ms`], and the term that actually carries the
+/// margin at the shipped cadence: `3 × 90 s` is 4.5 min, which LOSES to Claude
+/// Code's own 5-minute refresh threshold every time. 15 min is 3× that
+/// threshold and still leaves ~10 min of slack for a daemon restart or a run
+/// of missed polls.
+const ROTATE_LEAD_FLOOR_MS: i64 = 900_000;
 
-/// How early the poller rotates the ACTIVE, Keychain-installed profile ahead
-/// of its clock expiry — only with the opt-in `preemptive_rotation` toggle
-/// (rotation coherence, #1).
+/// How early the poller rotates a profile ahead of its clock expiry, with the
+/// `preemptive_rotation` toggle on (the default).
 ///
-/// The invariant this maintains is NOT "beat Claude Code's refresh schedule"
-/// (any fixed margin would silently lose to a future CC that refreshes
-/// earlier): it is **"the Keychain never holds an expired token while the
-/// poller is alive."** CC re-reads the Keychain per request and refreshes
-/// only when the token it just read looks spent; keep the item fresh and CC
-/// has no reason to refresh at all. Three poll intervals (with a floor)
-/// guarantees multiple rotation opportunities before expiry, whatever the
-/// configured cadence. And correctness never depends on winning: if CC does
-/// refresh first — schedule change, clauth downtime, lost race — the poller
-/// ADOPTS CC's fresher pair from the live file mirror instead of fighting
-/// for the chain (`oauth::try_adopt_live_rotation`).
-fn active_rotate_lead_ms(interval_ms: u64) -> i64 {
-    ((interval_ms as i64).saturating_mul(3)).max(ACTIVE_ROTATE_LEAD_FLOOR_MS)
+/// Claude Code refreshes its own OAuth token once it is within **5 minutes**
+/// of expiry — one predicate gates its whole demand path, measured against its
+/// shipped bundle (`docs/domain-knowledge.md`). Rotating outside that window
+/// means CC never has a reason to refresh, so clauth's stored pair stays the
+/// live one instead of lagging a chain CC advanced. Three poll intervals give
+/// multiple rotation opportunities before expiry whatever the cadence, and the
+/// floor is what clears CC's threshold at the shipped 90 s rate.
+///
+/// Correctness still does not depend on winning that race: when CC refreshes
+/// first — clauth downtime, a lost race — the poller ADOPTS CC's fresher pair
+/// rather than fighting for the chain (`oauth::try_adopt_live_rotation`), and
+/// a double-spend costs one failed request, not the account.
+fn rotate_lead_ms(interval_ms: u64) -> i64 {
+    ((interval_ms as i64).saturating_mul(3)).max(ROTATE_LEAD_FLOOR_MS)
 }
 
 /// Whether this poll should rotate ahead of expiry instead of waiting for a
-/// 401: only with the opt-in `preemptive_rotation` toggle (`enabled`, off by
-/// default — stock behavior stays strictly lazy; adoption + mirror-on-rotate
-/// carry the correctness, this is an optimization), only for the ACTIVE
-/// profile, only while the Keychain mirror is live (elsewhere the live
-/// credential IS the profile file via the symlink, so there is no second
-/// chain to race), and only inside the lead window. An unknown expiry never
-/// rotates proactively (never spend a single-use refresh on a token whose
-/// expiry we can't prove).
+/// 401: the `preemptive_rotation` toggle (`enabled`, on by default) and the
+/// stored expiry sitting inside the lead window. Nothing else — a live session
+/// and a bare `claude` both read the very credential file a rotation writes,
+/// so neither is a reason to hold off. An unknown expiry never rotates
+/// proactively (never spend a single-use refresh on a token whose expiry we
+/// can't prove).
 fn proactive_rotation_due(
     enabled: bool,
-    active: bool,
-    keychain_live: bool,
     access_expires_at: Option<i64>,
     now_ms: i64,
     interval_ms: u64,
 ) -> bool {
-    enabled
-        && active
-        && keychain_live
-        && access_expires_at.is_some_and(|exp| now_ms + active_rotate_lead_ms(interval_ms) >= exp)
+    enabled && access_expires_at.is_some_and(|exp| now_ms + rotate_lead_ms(interval_ms) >= exp)
 }
 
 /// Whether the macOS Keychain mirror is live — `false` under `cfg(test)` and
@@ -595,10 +591,10 @@ fn classify_pre_rotation(
 /// `from_fetch` provenance flag, and the 429 `retry-after` hint that
 /// [`apply_outcome`] turns into a deferred next-fetch slot.
 ///
-/// A second exception to "rotate only on a rejected token": with the opt-in
-/// `preemptive_rotation` toggle, the ACTIVE, Keychain-installed profile
-/// rotates ahead of expiry (see [`active_rotate_lead_ms`]) so the running
-/// `claude` never spends the single-use chain.
+/// A second exception to "rotate only on a rejected token": with the
+/// `preemptive_rotation` toggle on (the default), a profile rotates ahead of
+/// expiry (see [`rotate_lead_ms`]) so the running `claude` reads a pair clauth
+/// already refreshed rather than refreshing it itself.
 fn fetch_with_rotation(
     config: &crate::profile::ConfigHandle,
     entry: &TokenEntry,
@@ -627,14 +623,8 @@ fn fetch_with_rotation(
             )
         })
         .unwrap_or((false, None, 90_000, false));
-    let proactive = proactive_rotation_due(
-        preemptive,
-        is_active,
-        keychain_live(),
-        access_expires_at,
-        now_ms() as i64,
-        interval_ms,
-    );
+    let proactive =
+        proactive_rotation_due(preemptive, access_expires_at, now_ms() as i64, interval_ms);
     let mut unmask_429: Option<Option<Duration>> = None;
     if !proactive {
         let result = fetch_raw(name, access_token, prev_plan.clone(), false, Some(activity));
@@ -701,6 +691,10 @@ fn fetch_with_rotation(
     // OUR single-use refresh token against a family it just superseded.
     // Queue a refetch so the next tick polls with the adopted token; disk
     // cache serves this tick.
+    // Ceiling: keyed on the macOS Keychain, so a `LinkMode::Fake` host (Windows
+    // without symlink privilege) keeps a second on-disk chain this never
+    // recovers from. Widening it needs a credential watcher on that copy, not a
+    // looser gate here.
     if is_active
         && keychain_live()
         && let Some(adopted) =
@@ -718,13 +712,6 @@ fn fetch_with_rotation(
     let Some(rt) = refresh_token else {
         return bail_unrotated();
     };
-    // Re-check liveness under the guard: a live session owns the chain and will
-    // refresh it itself — rotating here would double-spend the single-use token.
-    // The guard makes this authoritative (winner stamped its PID file first).
-    // `partition_due` excludes Refreshing/Switching but not live external sessions.
-    if crate::runtime::has_live_session(name) {
-        return bail_unrotated();
-    }
     mark_activity(activity, name, ProfileActivity::Refreshing);
     // `refresh_result` (not `refresh`) so the RefreshError variant survives — the
     // poll needs to tell a dead token (quarantine) from a transient blip (retry).

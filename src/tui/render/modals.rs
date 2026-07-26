@@ -189,12 +189,6 @@ fn modal_block(title: impl Into<String>) -> Block<'static> {
 }
 
 fn draw_confirm(frame: &mut Frame<'_>, area: Rect, state: &ConfirmState) {
-    let title = match state.on_confirm {
-        // The one non-confirm modal: an in-use account can't be acted on.
-        ConfirmAction::Acknowledge => "IN USE",
-        _ => "CONFIRM",
-    };
-
     // Destructive/global ops carry a DANGER cue on their confirm button.
     // `CaptureOverwrite` replaces an existing profile's credentials in
     // place — irreversible like the other destructive actions here.
@@ -217,15 +211,9 @@ fn draw_confirm(frame: &mut Frame<'_>, area: Rect, state: &ConfirmState) {
         lines.push(Line::from(Span::styled(detail.clone(), theme::dim())));
     }
     lines.push(Line::from(""));
-    // An acknowledge-only notice has nothing to cancel — a single focused `ok`.
-    let buttons = if matches!(state.on_confirm, ConfirmAction::Acknowledge) {
-        Line::from(modal_button(" ok ", true))
-    } else {
-        choice_buttons(state.choice, destructive)
-    };
-    lines.push(buttons.alignment(Alignment::Right));
+    lines.push(choice_buttons(state.choice, destructive).alignment(Alignment::Right));
 
-    draw_modal(frame, area, title, lines);
+    draw_modal(frame, area, "CONFIRM", lines);
 }
 
 fn choice_buttons(choice: bool, destructive_confirm: bool) -> Line<'static> {

@@ -508,7 +508,7 @@ fn disabled_and_canceled_share_the_marker_shape_and_split_on_hue() {
 }
 
 /// A disabled chain member — still configured in `fallback_chain` on disk,
-/// only the walk skips it (see `Profile::is_disabled` / `docs/internals.md`)
+/// only the walk skips it (see `Profile::is_disabled` / `docs/fallback.md`)
 /// — dims its name in the Fallback selector and carries the `⊖` blocked-reason
 /// marker, with the `[ disabled ]` label reaching the operator through the
 /// detail card's `reason_pill`. The add-picker exclusion (a disabled account
@@ -1401,12 +1401,16 @@ fn live_row(
     }
 }
 
-/// The selector's compact half of the Overview `active` column: a count plus the
-/// `⇄` follower mark, riding the member's own row rather than flying out to the
-/// pane edge. It must not collide with the right-aligned blocked-reason marker
-/// or push it off the row.
+/// The tally renders in the DETAIL PANE ONLY (owner call, 2026-07-26): it used
+/// to ride the selector row too, so one number appeared twice on one screen and
+/// the compact copy was the one that could not explain itself. The selector row
+/// carries the member's name and its blocked-reason marker, nothing else.
+///
+/// This is a DELETION pin, so presence assertions cannot guard it: a retargeted
+/// `.contains` stays green the moment the span comes back. The pane is asserted
+/// whole, plus an explicit absence of the follower glyph.
 #[test]
-fn a_chain_row_carries_its_live_session_count_beside_the_blocked_reason_marker() {
+fn a_chain_row_carries_no_live_session_tally() {
     let mut app = App::new(config_with(
         vec![
             profile("busy", 95.0, 10.0, 3600),
@@ -1420,15 +1424,12 @@ fn a_chain_row_carries_its_live_session_count_beside_the_blocked_reason_marker()
         live_row("4242-1", "busy", false, None),
     ]);
 
-    // The whole pane, exactly: `idle`'s row has to be pinned as the ABSENCE of
-    // any tally, not merely the absence of `⇄` — dropping the count's zero guard
-    // grows a stray `  0` on every account hosting nothing, which is most rows of
-    // a typical chain, and a `!contains('⇄')` passes that clean.
+    let pane = chain_selector_pane(&app, 100, 8);
     assert_eq!(
-        chain_selector_pane(&app, 100, 8),
+        pane,
         vec![
             "╭ CHAIN ─────────────────────╮".to_string(),
-            "│ ❯  #1 busy  2⇄             │".to_string(),
+            "│ ❯  #1 busy                 │".to_string(),
             "│    #2 idle                 │".to_string(),
             "│                            │".to_string(),
             "│                            │".to_string(),
@@ -1436,6 +1437,11 @@ fn a_chain_row_carries_its_live_session_count_beside_the_blocked_reason_marker()
             "│                            │".to_string(),
             "╰────────────────────────────╯".to_string(),
         ],
+    );
+    assert!(
+        !pane.iter().any(|row| row.contains('⇄')),
+        "the follower mark belongs to the detail pane alone:\n{}",
+        pane.join("\n")
     );
 }
 
@@ -1485,7 +1491,7 @@ fn the_session_block_counts_live_sessions_and_carries_no_caveat_until_one_has_sw
 
     assert_eq!(
         card_texts(&live_session_lines(sessions, 60)),
-        vec!["sessions     2 (1 following)".to_string()],
+        vec![String::new(), "sessions     2 (1 following)".to_string()],
     );
 }
 
@@ -1504,6 +1510,7 @@ fn the_session_block_dates_the_last_swap_and_says_when_it_is_picked_up() {
     assert_eq!(
         card_texts(&live_session_lines(sessions, 60)),
         vec![
+            String::new(),
             "sessions     1 (1 following)".to_string(),
             "last swap    12s ago".to_string(),
             " └ picked up on the session's next request".to_string(),
@@ -1526,6 +1533,7 @@ fn a_swap_this_very_second_reads_as_one_second_rather_than_now_ago() {
     assert_eq!(
         card_texts(&live_session_lines(sessions, 60)),
         vec![
+            String::new(),
             "sessions     1".to_string(),
             "last swap    1s ago".to_string(),
             " └ picked up on the session's next request".to_string(),
@@ -1566,80 +1574,69 @@ fn the_member_card_places_the_session_block_between_the_headroom_figure_and_the_
         [
             "5h usage     ██░░░░░░░░░░░░░░░░░░░│  10% used",
             "             85% until rotate",
+            "",
             "sessions     1 (1 following)",
             "",
         ],
     );
 }
 
-/// The tally is ambient; the blocked-reason marker is the persistent signal that
-/// this member is out of rotation. A row too narrow for both drops the tally and
-/// keeps the marker — never the other way round, and never by overflowing the
-/// row so ratatui clips whichever lands last.
+/// The gap above `sessions` belongs to the session block, not to an accident.
+/// It used to come from the `% until rotate` continuation line being pushed
+/// unconditionally and holding an empty string when the account had no 5h
+/// reading — so the ONLY cards with a gap there were the ones with no data.
+/// Both shapes now open the block the same way, and `rows_start` (read off the
+/// buffer, and where the native edit caret is anchored) still lands on the row
+/// straight after the block's own trailing blank.
 #[test]
-fn a_narrow_chain_row_drops_the_live_tally_before_the_reason_marker() {
-    let mut disabled = profile("nnnnnn", 95.0, 10.0, 3600);
-    disabled.disabled = true;
-    let mut app = App::new(config_with(vec![disabled], None, vec!["nnnnnn"]));
-    app.live_sessions =
-        crate::live_sessions::LiveTally::of([live_row("4242-0", "nnnnnn", true, None)]);
+fn the_session_block_opens_the_same_way_with_and_without_a_five_hour_reading() {
+    let sessions =
+        crate::live_sessions::LiveTally::of([live_row("4242-0", "a", true, None)]).member("a");
+    let mut blind = profile("a", 95.0, 10.0, 3600);
+    blind.usage = None;
 
-    // This NAME's real collision band is terminal 60..=73, and it holds exactly
-    // two pane shapes: `master_detail` clamps the selector to 20 cells through
-    // 69 and 21 through 73, so those are the only two renders in it — anything
-    // else in the range is a duplicate, not coverage. The lower edge is
-    // `panes::NARROW_BODY_W`, where the layout stops stacking, rather than a
-    // collision floor: below it there is no side-by-side selector to crowd. Inside the band the
-    // shipped row keeps `⊖` and drops the tally; without `reserved` it renders
-    // `nnnnnn  1⇄` and appends `⊖` past `w`, where ratatui throws it away. At 74
-    // the pane finally holds both, which is what makes this a BAND rather than a
-    // floor — pinned below so a change that merely moved the cutoff still reds.
-    let expected = |w: u16| -> Vec<String> {
-        let (top, row, blank, bottom) = if w <= 69 {
-            (
-                "╭ CHAIN ───────────╮",
-                "│ ❯  #1 nnnnnn   ⊖ │",
-                "│                  │",
-                "╰──────────────────╯",
-            )
-        } else {
-            (
-                "╭ CHAIN ────────────╮",
-                "│ ❯  #1 nnnnnn    ⊖ │",
-                "│                   │",
-                "╰───────────────────╯",
-            )
-        };
-        vec![
-            top.to_string(),
-            row.to_string(),
-            blank.to_string(),
-            bottom.to_string(),
-        ]
-    };
-    for w in 60u16..=73 {
-        assert_eq!(
-            chain_selector_pane(&app, w, 4),
-            expected(w),
-            "at {w} cols the marker keeps the row and the tally gives way"
+    let card = |p: Profile| {
+        let cfg = config_with(vec![p], None, vec!["a"]);
+        let (lines, rows_start) = member_detail(
+            &cfg, "a", false, 0, false, None, None, None, 60, None, sessions,
         );
-    }
+        (card_texts(&lines), rows_start)
+    };
 
-    // One column past the band both fit, so the tally is being WITHHELD for lack
-    // of room rather than never rendered on a blocked row at all.
+    let (with_data, with_start) = card(profile("a", 95.0, 10.0, 3600));
+    let (no_data, no_start) = card(blind);
+
+    // The two headers differ only in the headroom figure the reading produces.
     assert_eq!(
-        chain_selector_pane(&app, 74, 4),
-        vec![
-            "╭ CHAIN ─────────────╮".to_string(),
-            "│ ❯  #1 nnnnnn  1⇄ ⊖ │".to_string(),
-            "│                    │".to_string(),
-            "╰────────────────────╯".to_string(),
+        &with_data[..with_start],
+        [
+            "5h usage     ██░░░░░░░░░░░░░░░░░░░│  10% used",
+            "             85% until rotate",
+            "",
+            "sessions     1 (1 following)",
+            "",
         ],
+    );
+    assert_eq!(
+        &no_data[..no_start],
+        [
+            "5h usage     ░░░░░░░░░░░░░░░░░░░░░│  no data yet",
+            "",
+            "sessions     1 (1 following)",
+            "",
+        ],
+    );
+    // Same rhythm around the block on both: one blank before, one after.
+    assert_eq!(
+        &with_data[with_start - 3..with_start],
+        &no_data[no_start - 3..no_start],
     );
 }
 
 /// A leg nothing calls is a leg that passes every unit test and ships nothing:
-/// both Fallback surfaces have to read the app's own tally, not a default.
+/// the member card has to read the app's own tally, not a default. The selector
+/// pane is asserted alongside it so the tally's absence there is pinned on the
+/// SAME fixture that proves the tally is non-empty.
 #[test]
 fn the_fallback_tab_reads_the_apps_live_session_tally() {
     let mut app = App::new(config_with(
@@ -1650,14 +1647,14 @@ fn the_fallback_tab_reads_the_apps_live_session_tally() {
     app.live_sessions =
         crate::live_sessions::LiveTally::of([live_row("4242-0", "busy", true, None)]);
 
-    // Both surfaces at once: the selector pane exactly, and the card's own row
-    // exactly. Either one reading `Default::default()` instead of the app's
-    // tally leaves every unit test above it green.
+    // The selector pane exactly, and the card's own row exactly. The card
+    // reading `Default::default()` instead of the app's tally leaves every unit
+    // test above it green.
     assert_eq!(
         chain_selector_pane(&app, 120, 6),
         vec![
             "╭ CHAIN ───────────────────────────╮".to_string(),
-            "│ ❯  #1 busy  1⇄                   │".to_string(),
+            "│ ❯  #1 busy                       │".to_string(),
             "│                                  │".to_string(),
             "│                                  │".to_string(),
             "│                                  │".to_string(),

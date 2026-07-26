@@ -103,19 +103,6 @@ fn draw_chain_selector(frame: &mut Frame<'_>, area: Rect, app: &App, focused: bo
                         let reason = cfg
                             .find(&name)
                             .and_then(|p| blocked_reason(&cfg, p, kick_lifts.get(&name).copied()));
-                        // The Overview `active` column's compact half: it rides
-                        // the member's own row rather than the pane edge, so it
-                        // reads as part of the data it counts. Dropped whole
-                        // when the row cannot hold it AND the reason marker
-                        // plus a cell of air — the marker is the persistent
-                        // block signal and outranks an ambient tally.
-                        if let Some(tally) = live_session_span(app.live_sessions.member(&name)) {
-                            let used: usize = spans.iter().map(|s| s.width()).sum();
-                            let reserved = usize::from(reason.is_some()) + 1;
-                            if used + tally.width() + reserved <= w as usize {
-                                spans.push(tally);
-                            }
-                        }
                         if let Some(reason) = reason {
                             // Right-align the 1-cell blocked-reason marker at the
                             // row's last content column (the scrollbar owns the
@@ -395,25 +382,15 @@ fn reason_fix(reason: &BlockedReason, name: &str) -> String {
     }
 }
 
-/// The chain row's live-session tally — the Overview `active` cell compressed
-/// onto one span, leading gap included so a caller can measure it whole. `None`
-/// for an account hosting nothing, which is what keeps a chain of idle accounts
-/// free of a column of zeroes.
-fn live_session_span(sessions: crate::live_sessions::MemberSessions) -> Option<Span<'static>> {
-    if sessions.sessions == 0 {
-        return None;
-    }
-    let follows = if sessions.following > 0 { "⇄" } else { "" };
-    Some(Span::styled(
-        format!("  {}{follows}", sessions.sessions),
-        theme::faint(),
-    ))
-}
-
 /// The member card's live-session block: how many `clauth start` sessions are
 /// running as THIS member and how many of them the chain may move, plus — only
 /// once one of them has actually swapped — when that happened and the caveat
 /// that makes the figure honest.
+///
+/// Leads with its own blank line so the gap above `sessions` is deliberate and
+/// present either way. It used to come from the `% until rotate` continuation
+/// line rendering empty, which meant an account with no 5h data got the gap and
+/// an account with data did not.
 ///
 /// Claude Code re-reads its credentials on its NEXT REQUEST, an mtime `stat` on
 /// the request path with no watcher behind it
@@ -435,10 +412,13 @@ fn live_session_lines(
     } else {
         sessions.sessions.to_string()
     };
-    let mut lines = vec![Line::from(vec![
-        Span::styled(key_cell("sessions", KEY_W, KEY_GUTTER), theme::label()),
-        Span::styled(value, theme::dim()),
-    ])];
+    let mut lines = vec![
+        Line::from(""),
+        Line::from(vec![
+            Span::styled(key_cell("sessions", KEY_W, KEY_GUTTER), theme::label()),
+            Span::styled(value, theme::dim()),
+        ]),
+    ];
     let Some(at) = sessions.last_swap_at else {
         return lines;
     };
@@ -564,14 +544,17 @@ fn member_detail(
     }
     lines.push(Line::from(gauge_spans));
 
-    let figure = match pct {
-        Some(v) => format!("{:.0}% until rotate", (threshold - v).max(0.0)),
-        None => String::new(),
-    };
-    lines.push(Line::from(vec![
-        Span::raw(" ".repeat(KEY_W + KEY_GUTTER)),
-        Span::styled(figure, theme::faint()),
-    ]));
+    // No 5h reading means no headroom figure — an empty continuation line here
+    // read as a deliberate gap on exactly the accounts that had nothing to say.
+    if let Some(v) = pct {
+        lines.push(Line::from(vec![
+            Span::raw(" ".repeat(KEY_W + KEY_GUTTER)),
+            Span::styled(
+                format!("{:.0}% until rotate", (threshold - v).max(0.0)),
+                theme::faint(),
+            ),
+        ]));
+    }
     lines.extend(live_session_lines(sessions, width));
     lines.push(Line::from(""));
 

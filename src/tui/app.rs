@@ -480,6 +480,11 @@ pub(crate) enum ConfirmAction {
     /// guard in `delete_profile` refuses this, so confirm the deauth risk here
     /// and re-run the delete with `force`.
     DeleteLiveSession(String),
+    /// Info-only modal: an action the user asked for is refused for a reason
+    /// they should read (rotating a macOS profile whose running session holds
+    /// its login in a Keychain entry clauth cannot write). Confirming just
+    /// dismisses; `run_confirm_action` does nothing.
+    Acknowledge,
 }
 
 #[derive(Debug, Clone)]
@@ -825,6 +830,18 @@ const ROTATE_ALL_MSG: &str = "rotate all access tokens?";
 const ROTATE_ALL_DETAIL: &str = "accounts with a running session are skipped.";
 #[cfg(not(target_os = "macos"))]
 const ROTATE_ALL_DETAIL: &str = "running sessions pick up the new tokens on their next request.";
+
+/// The macOS-only single-rotate refusal, in both the shapes it is surfaced in:
+/// an acknowledge modal from the action menu, and a toast if a session starts
+/// between arming the confirm and running it.
+///
+/// Defined on every platform though only macOS reads them (the branch is
+/// `cfg!`, so it still compiles here) — that keeps the strings reviewable and
+/// exact-match pinnable from a Linux run.
+const ROTATE_LIVE_SESSION_MSG: &str = "has a running session";
+const ROTATE_LIVE_SESSION_DETAIL: &str = "macos keeps its login in a keychain entry clauth can't write, so rotating would sign the \
+     session out.";
+const ROTATE_LIVE_SESSION_TOAST: &str = "macos keeps its login where clauth can't rotate it";
 const TOAST_CAPACITY: usize = 3;
 const TOAST_TTL_NORMAL: Duration = Duration::from_secs(3);
 const TOAST_TTL_DANGER: Duration = Duration::from_secs(6);
@@ -5000,6 +5017,18 @@ fn dispatch_action_menu_action(app: &mut App, action: ActionMenuAction) {
             None => {}
         },
         ActionMenuAction::RotateTokens => match focused_account(app) {
+            // macOS refuses this rotation (`runtime::rotation_blocked_for`), so
+            // say why up front instead of arming a confirm that no-ops.
+            Some((name, true, _))
+                if cfg!(target_os = "macos") && crate::runtime::has_live_session(&name) =>
+            {
+                app.modals.push(Modal::Confirm(ConfirmState {
+                    message: format!("'{name}' {ROTATE_LIVE_SESSION_MSG}"),
+                    detail: Some(ROTATE_LIVE_SESSION_DETAIL.to_string()),
+                    choice: true,
+                    on_confirm: ConfirmAction::Acknowledge,
+                }));
+            }
             Some((name, true, _)) => {
                 app.modals.push(Modal::Confirm(ConfirmState {
                     message: format!("rotate access token for '{name}'?"),
@@ -6558,6 +6587,19 @@ fn run_confirm_action(app: &mut App, action: ConfirmAction) {
             app.toast(ToastKind::Info, "rotating all tokens");
         }
         ConfirmAction::RotateOne(name) => {
+            // Backstop for a session that started between arming the confirm and
+            // running it: on macOS `rotate_one_inner` refuses, and an unguarded
+            // "rotating 'X'" toast would be a success-shaped message for a no-op.
+            if cfg!(target_os = "macos") && crate::runtime::has_live_session(&name) {
+                app.toast(
+                    ToastKind::Warning,
+                    format!("'{name}' {ROTATE_LIVE_SESSION_MSG}\n{ROTATE_LIVE_SESSION_TOAST}"),
+                );
+                return;
+            }
+            // Backstop for a session that started between arming the confirm and
+            // running it: on macOS `rotate_one_inner` refuses, and an unguarded
+            // "rotating 'X'" toast would be a success-shaped message for a no-op.
             // The per-profile RotationGuard inside rotate_one serialises against a
             // live session's own refresh, so unlike RotateAll this doesn't need the
             // global any_busy gate — a busy guard surfaces as a Danger toast.
@@ -6615,6 +6657,7 @@ fn run_confirm_action(app: &mut App, action: ConfirmAction) {
         }
         ConfirmAction::RestartLogin(name, is_new) => start_login(app, name, is_new),
         ConfirmAction::DeleteLiveSession(name) => finish_delete(app, &name, true),
+        ConfirmAction::Acknowledge => {}
     }
 }
 

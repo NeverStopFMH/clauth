@@ -1114,10 +1114,11 @@ fn overview_switch_request_never_opens_a_confirm_for_a_disabled_account() {
     );
 }
 
-/// A live `clauth start` session no longer blocks the rotate: it reads the same
-/// credential file clauth writes, so it picks the rotated pair up on its next
-/// request. The action arms the ordinary rotate confirm, exactly as an idle
-/// profile does — no acknowledge notice, no pre-refusal.
+/// Off macOS a live `clauth start` session no longer blocks the rotate: it reads
+/// the same credential file clauth writes, so it picks the rotated pair up on
+/// its next request. The action arms the ordinary rotate confirm, exactly as an
+/// idle profile does — no acknowledge notice, no pre-refusal.
+#[cfg(not(target_os = "macos"))]
 #[test]
 fn rotate_tokens_with_live_session_arms_the_rotate_confirm() {
     use super::{ActionMenuAction, ConfirmAction, Modal, dispatch_action_menu_action};
@@ -1144,6 +1145,84 @@ fn rotate_tokens_with_live_session_arms_the_rotate_confirm() {
     );
 }
 
+/// The macOS arm: `rotate_one_inner` refuses there, so the action menu must say
+/// so up front rather than arm a confirm whose only outcome is a silent no-op
+/// behind a "rotating 'X'" toast.
+#[cfg(target_os = "macos")]
+#[test]
+fn rotate_tokens_with_live_session_arms_an_acknowledge_notice_on_macos() {
+    use super::{
+        ActionMenuAction, ConfirmAction, Modal, dispatch_action_menu_action, run_confirm_action,
+    };
+    use crate::profile::Profile;
+    let home = crate::testutil::HomeSandbox::new();
+
+    let mut app = app_with(vec![Profile::new("busy".to_string(), None, None)]);
+    app.profile_cursor = 0;
+    let _pid_guard = arm_live_session(home.home(), "busy");
+
+    dispatch_action_menu_action(&mut app, ActionMenuAction::RotateTokens);
+    let confirm = app
+        .modals
+        .last()
+        .and_then(|m| match m {
+            Modal::Confirm(s) => Some(s),
+            _ => None,
+        })
+        .expect("a live session arms a modal");
+    assert!(
+        matches!(confirm.on_confirm, ConfirmAction::Acknowledge),
+        "macOS arms an acknowledge notice, not a rotate that cannot run"
+    );
+    assert_eq!(confirm.message, "'busy' has a running session");
+    assert_eq!(
+        confirm.detail.as_deref(),
+        Some(super::ROTATE_LIVE_SESSION_DETAIL)
+    );
+
+    let action = confirm.on_confirm.clone();
+    run_confirm_action(&mut app, action);
+    assert!(
+        app.config().find("busy").is_some(),
+        "acknowledging the notice leaves the profile untouched"
+    );
+}
+
+/// The macOS backstop: a session that starts between arming the confirm and
+/// running it must get the refusal, never the success-shaped "rotating 'X'".
+#[cfg(target_os = "macos")]
+#[test]
+fn confirming_a_rotate_under_a_live_session_is_refused_on_macos() {
+    use super::{ConfirmAction, ToastKind, join_test_workers, run_confirm_action};
+    use crate::profile::Profile;
+    let home = crate::testutil::HomeSandbox::new();
+
+    let mut app = app_with(vec![Profile::new("busy".to_string(), None, None)]);
+    app.profile_cursor = 0;
+    let _pid_guard = arm_live_session(home.home(), "busy");
+
+    run_confirm_action(&mut app, ConfirmAction::RotateOne("busy".to_string()));
+    join_test_workers();
+
+    let toast = app.toasts.back().expect("the refusal is surfaced");
+    assert_eq!(toast.kind, ToastKind::Warning);
+    assert_eq!(
+        toast.body,
+        format!(
+            "'busy' {}\n{}",
+            super::ROTATE_LIVE_SESSION_MSG,
+            super::ROTATE_LIVE_SESSION_TOAST
+        )
+    );
+    assert!(
+        !home
+            .home()
+            .join(".clauth/profiles/busy/rotation.lock")
+            .exists(),
+        "the refusal must land BEFORE the rotate worker is spawned"
+    );
+}
+
 /// Arming the confirm is only half the path — `run_confirm_action` carried its
 /// OWN live-session refusal, so the modal could arm and the rotate still be
 /// dropped on the floor. Confirming under a live session must reach the rotate
@@ -1153,6 +1232,7 @@ fn rotate_tokens_with_live_session_arms_the_rotate_confirm() {
 /// `join_test_workers` is load-bearing, not hygiene: `spawn_worker` detaches, and
 /// a worker still running when `HomeSandbox` drops resolves the operator's REAL
 /// `$HOME` and takes real locks under `~/.clauth`.
+#[cfg(not(target_os = "macos"))]
 #[test]
 fn confirming_a_rotate_under_a_live_session_reaches_the_rotate() {
     use super::{ConfirmAction, ToastKind, join_test_workers, run_confirm_action};
@@ -1197,6 +1277,25 @@ fn rotate_all_detail_promises_what_the_host_actually_does() {
         "running sessions pick up the new tokens on their next request."
     };
     assert_eq!(super::ROTATE_ALL_DETAIL, want);
+}
+
+/// The single-rotate refusal copy. These strings assert a MECHANISM (clauth
+/// cannot write the keychain entry that session's Claude Code reads), not the
+/// old and now-false "the session manages its own tokens" theory, so a drift
+/// back toward the old wording is a drift back to a wrong explanation. Pinned
+/// from every platform even though only macOS renders them.
+#[test]
+fn the_live_session_rotate_refusal_names_the_keychain_mechanism() {
+    assert_eq!(super::ROTATE_LIVE_SESSION_MSG, "has a running session");
+    assert_eq!(
+        super::ROTATE_LIVE_SESSION_DETAIL,
+        "macos keeps its login in a keychain entry clauth can't write, so rotating would sign \
+         the session out."
+    );
+    assert_eq!(
+        super::ROTATE_LIVE_SESSION_TOAST,
+        "macos keeps its login where clauth can't rotate it"
+    );
 }
 
 /// No live session: the rotate action arms the normal rotate confirm carrying the

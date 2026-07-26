@@ -81,3 +81,104 @@ fn fallback_tab_key_grammar_rows_pin_exact_order_and_copy() {
         ],
     );
 }
+
+/// The help modal's GLYPHS legend, rendered whole. It is the only place the
+/// account surfaces' 1-cell marks are explained, and two of them carry two
+/// meanings apiece split on HUE alone (`⊖` disabled/canceled, `⊘` aggregate/
+/// scoped week), so the pin asserts each row's text AND its mark's color — a
+/// legend that lost a hue would read as a duplicate entry and sail past a
+/// text-only check.
+///
+/// Driven through `draw_help` rather than `glyph_rows`, so it pins what a user
+/// actually sees: the section's placement, its alignment against the key rows,
+/// and that nothing clipped it.
+#[test]
+fn the_help_modal_legend_names_every_marker_and_its_hue() {
+    use ratatui::backend::TestBackend;
+    use ratatui::{Terminal, style::Color};
+
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let app = empty_app(Tab::Overview);
+    let mut term = Terminal::new(TestBackend::new(100, 60)).unwrap();
+    term.draw(|f| draw_help(f, f.area(), &app)).unwrap();
+    let buf = term.backend().buffer().clone();
+    let rows = crate::testutil::buffer_rows(&buf);
+    // Slice each row to the modal's own columns so the pin is the modal alone,
+    // not its centering offset within the terminal.
+    let (left, right) = rows
+        .iter()
+        .find_map(|row| {
+            let chars: Vec<char> = row.chars().collect();
+            Some((
+                chars.iter().position(|c| *c == '\u{256d}')?,
+                chars.iter().position(|c| *c == '\u{256e}')?,
+            ))
+        })
+        .expect("the help modal's top border");
+    let slice =
+        |row: &String| -> String { row.chars().skip(left).take(right - left + 1).collect() };
+
+    let head = rows
+        .iter()
+        .position(|r| r.contains("GLYPHS"))
+        .unwrap_or_else(|| panic!("the legend renders:\n{}", rows.join("\n")));
+    // The section header, its blank, and one row per mark.
+    assert_eq!(
+        rows[head..head + 14].iter().map(slice).collect::<Vec<_>>(),
+        vec![
+            "│  GLYPHS                                                                 │"
+                .to_string(),
+            "│                                                                         │"
+                .to_string(),
+            "│    ●                   the active account                               │"
+                .to_string(),
+            "│    ⇄                   a live session here follows the fallback chain   │"
+                .to_string(),
+            "│    ⊖                   disabled                                         │"
+                .to_string(),
+            "│    ⊖                   canceled                                         │"
+                .to_string(),
+            "│    ×                   auth broken                                      │"
+                .to_string(),
+            "│    ⊘                   weekly spent                                     │"
+                .to_string(),
+            "│    ⧗                   claude code blocked                              │"
+                .to_string(),
+            "│    $                   extra usage spent                                │"
+                .to_string(),
+            "│    ◔                   5h window spent                                  │"
+                .to_string(),
+            "│    ⊘                   one model's week spent, other models ok          │"
+                .to_string(),
+            "│    ~                   past the weekly switch line, still serving       │"
+                .to_string(),
+            "│    ⋯                   stale data                                       │"
+                .to_string(),
+        ],
+    );
+
+    // Every mark's own hue, read off the rendered cell. The two repeated glyphs
+    // are the whole point: same shape, different color, different meaning.
+    let expected: [Color; 12] = [
+        crate::tui::theme::accent_2_color(),
+        crate::tui::theme::text_dim_color(),
+        crate::tui::theme::text_faint_color(),
+        crate::tui::theme::danger_color(),
+        crate::tui::theme::danger_color(),
+        crate::tui::theme::danger_color(),
+        crate::tui::theme::warning_color(),
+        crate::tui::theme::warning_color(),
+        crate::tui::theme::warning_color(),
+        crate::tui::theme::warning_color(),
+        crate::tui::theme::warning_color(),
+        crate::tui::theme::text_faint_color(),
+    ];
+    // `left + 5`: the modal border, its 2-cell padding, and the row's own
+    // 2-space gutter all sit ahead of the mark.
+    let glyph_x = left + 5;
+    let stride = buf.area.width as usize;
+    let got: Vec<Color> = (0..12)
+        .map(|i| buf.content[(head + 2 + i) * stride + glyph_x].fg)
+        .collect();
+    assert_eq!(got, expected.to_vec());
+}

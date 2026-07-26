@@ -14,8 +14,13 @@ use super::super::app::{
     DivergenceTargetForm, EnvCollisionChoice, EnvCollisionForm, InputState, LoginStage, Modal, Tab,
 };
 use super::super::theme;
+use super::chain::reason_marker;
 use super::format::spinner_frame;
-use super::panes::{bold_when, head_cols, key_cell};
+use super::panes::{
+    DIAG_AUTH_BROKEN, DIAG_BUDGET_SPENT, DIAG_CANCELED, DIAG_DISABLED, DIAG_KICK, bold_when,
+    head_cols, key_cell,
+};
+use crate::fallback::BlockedReason;
 
 pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App, modal: &Modal) {
     match modal {
@@ -582,18 +587,66 @@ fn draw_help(frame: &mut Frame<'_>, area: Rect, app: &App) {
         lines.extend(key_section(section, entries));
     }
     lines.extend(key_section("global", &global));
+    // Last, so the keys survive on a terminal too short for the whole modal —
+    // `draw_modal` clamps the height and drops the tail rather than scrolling.
+    lines.extend(glyph_section("glyphs", glyph_rows()));
     lines.pop(); // trim trailing blank from last section
     draw_modal(frame, area, title, lines);
 }
 
+/// Legend for the 1-cell marks the account surfaces carry, with no key of their
+/// own to document them: the Overview row's leading `●` and `⇄`, and every
+/// blocked-reason marker on the Fallback chain.
+///
+/// Each blocked-reason row takes its glyph AND its hue from [`reason_marker`]
+/// itself, so the legend cannot drift from what the chain renders. `⊖` and `⊘`
+/// each appear twice because they split their two senses on hue alone (see
+/// `chain::reason_marker` for why), and a legend naming one sense per glyph
+/// would be worse than none.
+fn glyph_rows() -> Vec<(Span<'static>, &'static str)> {
+    let reason = |r: BlockedReason, desc| (reason_marker(&r), desc);
+    vec![
+        (
+            Span::styled("\u{25cf}", Style::default().fg(theme::accent_2_color())),
+            "the active account",
+        ),
+        (
+            Span::styled("\u{21c4}", theme::dim()),
+            "a live session here follows the fallback chain",
+        ),
+        reason(BlockedReason::Disabled, DIAG_DISABLED),
+        reason(BlockedReason::Canceled, DIAG_CANCELED),
+        reason(BlockedReason::AuthBroken, DIAG_AUTH_BROKEN),
+        reason(
+            BlockedReason::WeeklySpent { resets_in: None },
+            "weekly spent",
+        ),
+        reason(BlockedReason::KickRejected { lifts_in: 0 }, DIAG_KICK),
+        reason(BlockedReason::BudgetSpent, DIAG_BUDGET_SPENT),
+        reason(
+            BlockedReason::FiveHour {
+                pct: 0.0,
+                resets_in: None,
+            },
+            "5h window spent",
+        ),
+        reason(
+            BlockedReason::ScopedSpent {
+                label: String::new(),
+                pct: 0.0,
+            },
+            "one model's week spent, other models ok",
+        ),
+        reason(
+            BlockedReason::WeeklySoft { pct: 0.0 },
+            "past the weekly switch line, still serving",
+        ),
+        reason(BlockedReason::Stale, "stale data"),
+    ]
+}
+
 fn key_section(title: &str, pairs: &[(&str, &str)]) -> Vec<Line<'static>> {
-    let mut lines = vec![
-        Line::from(Span::styled(
-            title.to_uppercase(),
-            Style::default().fg(theme::text_dim_color()),
-        )),
-        Line::from(""),
-    ];
+    let mut lines = section_head(title);
     for (key, desc) in pairs {
         lines.push(help_row(key, desc));
     }
@@ -601,14 +654,45 @@ fn key_section(title: &str, pairs: &[(&str, &str)]) -> Vec<Line<'static>> {
     lines
 }
 
+fn glyph_section(title: &str, rows: Vec<(Span<'static>, &'static str)>) -> Vec<Line<'static>> {
+    let mut lines = section_head(title);
+    lines.extend(rows.into_iter().map(|(mark, desc)| glyph_row(mark, desc)));
+    lines.push(Line::from(""));
+    lines
+}
+
+fn section_head(title: &str) -> Vec<Line<'static>> {
+    vec![
+        Line::from(Span::styled(
+            title.to_uppercase(),
+            Style::default().fg(theme::text_dim_color()),
+        )),
+        Line::from(""),
+    ]
+}
+
+const HELP_KEY_W: usize = 18;
+const HELP_KEY_GUTTER: usize = 2;
+
 fn help_row(key: &str, desc: &str) -> Line<'static> {
-    const KEY_W: usize = 18;
-    const KEY_GUTTER: usize = 2;
     Line::from(vec![
         Span::styled(
-            format!("  {}", key_cell(key, KEY_W, KEY_GUTTER)),
+            format!("  {}", key_cell(key, HELP_KEY_W, HELP_KEY_GUTTER)),
             Style::default().fg(theme::accent_color()).bold(),
         ),
+        Span::styled(desc.to_string(), Style::default().fg(theme::text_color())),
+    ])
+}
+
+/// A legend row, aligned to the same description column the key rows open at.
+/// The mark keeps the style its renderer gave it — a hue-split glyph read in
+/// the accent every other key row wears would document the wrong thing.
+fn glyph_row(mark: Span<'static>, desc: &str) -> Line<'static> {
+    Line::from(vec![
+        Span::raw("  "),
+        mark,
+        // The mark already spent one of the key cell's columns.
+        Span::raw(key_cell("", HELP_KEY_W - 1, HELP_KEY_GUTTER)),
         Span::styled(desc.to_string(), Style::default().fg(theme::text_color())),
     ])
 }

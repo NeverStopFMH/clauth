@@ -1238,8 +1238,8 @@ impl SessionSwap {
     /// The swap leg of this session's own watchdog tick: execute a move when the
     /// daemon has named a member that differs from the one the link resolves to.
     /// The daemon writes `intended_member` only for a row whose `follows_chain` is
-    /// set, and nothing sets it yet, so the leg is inert by construction until the
-    /// `--with-fallback` flag lands.
+    /// set, which `clauth start --with-fallback` is the only thing that requests, so
+    /// a plain `start` session polls and finds nothing to do.
     fn poll(&self) {
         let Some(intended) = crate::live_sessions::get(self.session.as_str())
             .and_then(|row| row.intended_member)

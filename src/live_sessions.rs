@@ -188,8 +188,8 @@ fn registry_dir() -> Result<PathBuf> {
 }
 
 /// Path of one session's row. The id shape is validated first: `list` reads ids
-/// back off disk and the phase-2 legs pass them around, so this join must never
-/// take a `..` or a separator from a file someone else wrote.
+/// back off disk and the daemon's decision leg passes them around, so this join
+/// must never take a `..` or a separator from a file someone else wrote.
 fn row_path(session_id: &str) -> Result<PathBuf> {
     anyhow::ensure!(
         is_session_id(session_id),

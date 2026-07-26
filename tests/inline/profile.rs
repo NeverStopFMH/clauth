@@ -500,7 +500,7 @@ fn oauth_credentials() -> ClaudeCredentials {
 /// Out-of-band per-profile thresholds are CLAMPED to the band at load, while the
 /// app-level weekly line RESETS TO DEFAULT (pinned separately by
 /// `weekly_switch_threshold_out_of_band_resets_to_default_at_load`). Two
-/// deliberately different normalizations, one line apart in `docs/internals.md`
+/// deliberately different normalizations, one line apart in `docs/fallback.md`
 /// and one line apart in the source — exactly the shape a well-meaning "unify
 /// the threshold handling" refactor collapses into one rule, silently moving
 /// every hand-edited config to the wrong value. A garbage `fallback_threshold`
@@ -714,7 +714,7 @@ fn base_url_dropped_only_when_a_stored_pair_could_leak() {
 //
 // `stage_rotated_credentials` writes a rotated pair to `credentials.json.pending`
 // BEFORE `save_profile`, so a crash between the OAuth response and the commit
-// can't lose a single-use refresh token (`docs/internals.md`, crash-durable
+// can't lose a single-use refresh token (`docs/oauth.md`, crash-durable
 // rotation). That guarantee reduces to ONE mtime compare in
 // `recover_pending_credentials`, and until now only the sidecar's file *mode* was
 // tested — never the decision. Both ways of getting it wrong are silent and

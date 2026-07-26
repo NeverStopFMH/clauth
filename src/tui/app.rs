@@ -226,7 +226,7 @@ pub(crate) enum ConfigRow {
     /// Drop this account's stored OAuth credentials, keeping the profile shell.
     DeleteCreds,
     /// User-disabled account-action row (`Profile::disabled`, see
-    /// `docs/internals.md`), same class as `Delete`: enabling fires the shared
+    /// `docs/fallback.md`), same class as `Delete`: enabling fires the shared
     /// `actions::enable_profile` immediately (harmless), disabling arms on the
     /// first Space/⏎ and confirms on the second, via `actions::disable_profile`.
     /// Dimmed and inert while the account is active or holds a live `clauth

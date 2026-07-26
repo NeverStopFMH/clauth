@@ -505,7 +505,7 @@ fn build_settings_clears_stale_model_knobs() {
 // top-level `apiKeyHelper` when a profile carries an api_key, so the raw key
 // leaves the settings.json `env` block and the spawned CC process's env. CC
 // runs the helper per request and sends its stdout as both `X-Api-Key` and
-// `Authorization: Bearer` (see `docs/internals.md`).
+// `Authorization: Bearer` (see `docs/security.md`).
 
 /// An api-key profile writes `apiKeyHelper` at the top level (NOT under `env`),
 /// keeps the raw key out of the rendered JSON, and clears `env.ANTHROPIC_AUTH_TOKEN`.

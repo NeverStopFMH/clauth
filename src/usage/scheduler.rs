@@ -2490,7 +2490,7 @@ pub(crate) fn spawn_refresher(
     // hammering. Must happen here, not inside the spawned closure below:
     // nothing joins that thread, so a home-derived path resolved on it could
     // outlive a test's `HOME_OVERRIDE` and read the operator's real home. See
-    // the 2026-06-06 convention in docs/internals.md.
+    // the 2026-06-06 convention in docs/architecture.md.
     let names: Vec<String> = tokens
         .lock()
         .map(|t| t.iter().map(|e| e.name.clone()).collect())

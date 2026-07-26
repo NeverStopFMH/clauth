@@ -448,7 +448,7 @@ fn is_exhausted_projected(
 /// in-memory rate; this function never reads disk itself, see
 /// [`is_exhausted_active_from_usage`] for the disk-reading scheduler twin —
 /// feeds [`is_exhausted_projected`]. Deliberately never applied to the target
-/// walk's candidates or `soonest_resume` — see docs/internals.md's auto-switch
+/// walk's candidates or `soonest_resume` — see docs/fallback.md's auto-switch
 /// asymmetry; this only ever changes whether the ACTIVE profile itself is
 /// judged exhausted.
 pub(crate) fn is_exhausted_active(

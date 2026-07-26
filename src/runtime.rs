@@ -460,6 +460,39 @@ pub(crate) fn has_live_session(name: &str) -> bool {
     }
 }
 
+/// Whether a live `clauth start` session must block rotating this profile's
+/// chain. Kept PURE (the caller reads `cfg!`) so both arms run from a Linux
+/// test, like [`swap_support`].
+///
+/// macOS only, and NOT for the double-spend reason the pre-2026-07-26 code gave
+/// — a double-spend costs one failed request, not the account. The real
+/// mechanism is that clauth cannot reach the credential a `clauth start`
+/// session's Claude Code actually reads. That child runs with
+/// `CLAUDE_CONFIG_DIR=<runtime>`, and CC namespaces its Keychain item per config
+/// dir (`Claude Code-credentials-<sha256(dir)[0:8]>`, `docs/domain-knowledge.md`)
+/// while [`crate::keychain`] writes only the UNSUFFIXED `Claude Code-credentials`.
+/// So a rotation leaves that CC holding the old refresh token; its own
+/// re-read-and-compare sees its item unchanged and detects no race, and the
+/// `invalid_grant` that follows passes its CAS guard — which also compares
+/// against its own item — so it BLANKS the pair and signs the session out
+/// mid-task.
+///
+/// A bare `claude` is deliberately NOT covered: it reads the unsuffixed item
+/// clauth does write, so rotating it propagates normally. [`has_live_session`]
+/// counts only `clauth start` sessions, so it already draws that line.
+///
+/// This dissolves the moment [`crate::keychain`] derives the namespaced service
+/// name (`docs/todo.md`, "#1 macOS follow-ups"); nothing else here changes.
+fn rotation_blocked_by_live_session(has_live_session: bool, is_macos: bool) -> bool {
+    is_macos && has_live_session
+}
+
+/// [`rotation_blocked_by_live_session`] against the live host and marker state —
+/// what every rotation leg calls.
+pub(crate) fn rotation_blocked_for(name: &str) -> bool {
+    rotation_blocked_by_live_session(has_live_session(name), cfg!(target_os = "macos"))
+}
+
 /// Count of live `clauth start` sessions for the profile, deduped by marker NAME
 /// across every marker dir: one session holds its own `sessions-<sid>/<sid>` and
 /// an upgrade-compat `sessions/<sid>`, and the shared session id is what makes
@@ -732,8 +765,10 @@ fn rotation_lock_path(name: &str) -> Result<PathBuf> {
 /// - rotate wins the race → acquire blocks until the new pair is persisted,
 ///   then the session starts against the rotated token;
 /// - acquire wins the race → it creates its session PID file before releasing,
-///   so rotate's in-lock `has_live_session` re-check sees the live session and
-///   skips (the token is never spent).
+///   so a macOS rotate's in-lock [`rotation_blocked_by_live_session`] check sees
+///   the live session and skips. Off macOS the rotate proceeds and the session
+///   picks the new pair up on its next request, so what the lock buys there is
+///   ordering alone: the two rotations serialize instead of double-spending.
 ///
 /// Distinct from `~/.clauth/.lock` (global state) and a session's own marker
 /// file (per-session liveness). Blocking `flock`; the holder window is short.
@@ -898,7 +933,9 @@ pub(crate) enum SwapRefused {
     /// Nothing at `install_source_path` — there is no login to swap onto.
     NoCredentialStore,
     /// A live process holds the marker this session would need on the intended
-    /// member, so the rotation gate could not see the session there.
+    /// member — a colliding session id. Claiming it anyway would leave two
+    /// sessions sharing one marker identity, and teardown unlinks only what it
+    /// owns, so the survivor would be reported dead while it runs.
     MarkerNotLockable,
 }
 
@@ -1077,15 +1114,22 @@ enum MarkerClaim {
 
 /// Stamp and hold the intended member's liveness markers, BOTH layouts.
 ///
-/// The per-session one is the rotation gate every current binary reads; the
-/// compat one is what a clauth predating the per-session layout reads, and right
-/// after an upgrade that old binary is the running daemon. Missing either lets a
-/// rotation spend the single-use refresh token the live Claude Code child is
-/// authenticating with.
+/// The per-session one makes the swapped-onto member read live to
+/// [`has_live_session`], which is what stops a delete or disable landing on the
+/// account this session is now running as. It is NOT a rotation gate on this
+/// platform: rotation refuses only on macOS
+/// ([`rotation_blocked_by_live_session`]), and [`swap_support`] refuses to swap
+/// there at all, so no swapped session ever meets that refusal.
+///
+/// The compat one is what a clauth predating the per-session layout reads, and
+/// right after an upgrade that old binary is the running daemon. That binary DOES
+/// still gate rotation on liveness, so missing it costs the live child one failed
+/// refresh until the daemon is replaced.
 ///
 /// `None` when the per-session marker is held by something else, so the caller
-/// refuses the swap: moving a session onto a member the rotation gate cannot see
-/// there is the exact burn this step exists to prevent. Callers go through
+/// refuses the swap. A foreign holder means a colliding session id, and marker
+/// ownership is what teardown keys on — unlinking a marker another session minted
+/// would report that session dead while it runs. Callers go through
 /// [`SessionSwap::claim_markers`], which separates a foreign holder from this
 /// session's own earlier claim first.
 fn stamp_swapped_markers(paths: &SessionPaths) -> Result<Option<SwappedMarkers>> {

@@ -49,6 +49,42 @@ impl Drop for HomeSandbox {
     }
 }
 
+/// RAII pin redirecting every Anthropic endpoint the rotation legs touch —
+/// `/usage`, the token endpoint, and the `/v1/messages` kick — at one loopback
+/// listener, and clearing them on drop even if the test panics. Also resets the
+/// per-host request spacing, or the second request in a leg sleeps out
+/// `REQUEST_SPACING_MS`.
+///
+/// Rotation decisions all sit BEHIND an HTTP call, so without this the refusals
+/// in `fetch_with_rotation` / `auto_start_kick` / `rotate_one_inner` are covered
+/// by nothing. Requires a live `HomeSandbox` (the overrides are serialized by the
+/// same `HOME_TEST_LOCK`).
+pub(crate) struct EndpointSandbox;
+
+impl EndpointSandbox {
+    /// Point every endpoint at `base` (an `http://127.0.0.1:PORT` listener).
+    pub(crate) fn new(base: &str) -> Self {
+        crate::oauth::set_endpoint_overrides(
+            &format!("{base}/v1/oauth/token"),
+            &format!("{base}/v1/messages?beta=true"),
+        );
+        crate::usage::set_usage_endpoint_override(
+            &format!("{base}/api/oauth/usage"),
+            &format!("{base}/api/oauth/profile"),
+        );
+        crate::usage::reset_request_slots();
+        Self
+    }
+}
+
+impl Drop for EndpointSandbox {
+    fn drop(&mut self) {
+        crate::oauth::clear_endpoint_overrides();
+        crate::usage::clear_usage_endpoint_override();
+        crate::usage::reset_request_slots();
+    }
+}
+
 /// RAII tier pin: acquires `TIER_TEST_LOCK` and forces the process-global color
 /// tier for its lifetime, putting the previous pin back on drop (even on panic).
 /// Required for any test asserting on a tier-dependent style, since the tier is

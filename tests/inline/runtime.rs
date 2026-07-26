@@ -3580,6 +3580,22 @@ fn swap_support_refuses_a_shared_tree_and_a_keychain_first_host() {
     assert_eq!(swap_support(LinkMode::Real, false), Ok(()));
 }
 
+/// The rotation refusal is macOS-ONLY and pure, so both arms run from a Linux
+/// box. It exists because clauth cannot write the Keychain item a `clauth start`
+/// session's Claude Code reads (that item is namespaced per `CLAUDE_CONFIG_DIR`;
+/// `keychain::SERVICE` is the unsuffixed one), so a rotation there signs the
+/// session out rather than propagating to it.
+#[test]
+fn rotation_is_blocked_by_a_live_session_only_on_macos() {
+    // macOS: a live `clauth start` session is the whole refusal.
+    assert!(rotation_blocked_by_live_session(true, true));
+    assert!(!rotation_blocked_by_live_session(false, true));
+    // Everywhere else the session shares the credential FILE clauth rotates,
+    // so it follows the new pair on its next request.
+    assert!(!rotation_blocked_by_live_session(true, false));
+    assert!(!rotation_blocked_by_live_session(false, false));
+}
+
 /// The profile-comparison half of the precondition, as a pure function the
 /// daemon's per-session walk shares. It exists so the two cannot drift: a
 /// candidate the executor refuses on CONFIG grounds has to be walked PAST, or the

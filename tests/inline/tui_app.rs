@@ -1149,9 +1149,13 @@ fn rotate_tokens_with_live_session_arms_the_rotate_confirm() {
 /// dropped on the floor. Confirming under a live session must reach the rotate
 /// and say so. The fixture profile holds no refresh token, so the spawned
 /// worker short-circuits before any HTTP.
+///
+/// `join_test_workers` is load-bearing, not hygiene: `spawn_worker` detaches, and
+/// a worker still running when `HomeSandbox` drops resolves the operator's REAL
+/// `$HOME` and takes real locks under `~/.clauth`.
 #[test]
 fn confirming_a_rotate_under_a_live_session_reaches_the_rotate() {
-    use super::{ConfirmAction, ToastKind, run_confirm_action};
+    use super::{ConfirmAction, ToastKind, join_test_workers, run_confirm_action};
     use crate::profile::Profile;
     let home = crate::testutil::HomeSandbox::new();
 
@@ -1160,6 +1164,8 @@ fn confirming_a_rotate_under_a_live_session_reaches_the_rotate() {
     let _pid_guard = arm_live_session(home.home(), "busy");
 
     run_confirm_action(&mut app, ConfirmAction::RotateOne("busy".to_string()));
+    // Before any assertion, and above all before `home` drops.
+    join_test_workers();
 
     let toast = app
         .toasts
@@ -1170,6 +1176,27 @@ fn confirming_a_rotate_under_a_live_session_reaches_the_rotate() {
         (ToastKind::Info, "rotating 'busy'"),
         "a live session must not turn the rotate into a refusal"
     );
+    // The worker ran to completion inside the sandbox, so its guard landed there.
+    assert!(
+        home.home()
+            .join(".clauth/profiles/busy/rotation.lock")
+            .exists(),
+        "the rotate must have taken its guard under the SANDBOX home"
+    );
+}
+
+/// The rotate-all confirm's detail line is a PROMISE about what happens to a
+/// running session, and the two hosts keep different ones — macOS skips such an
+/// account, everywhere else the session follows the new pair. Unpinned in both
+/// directions until now, so a copy edit could quietly invert it.
+#[test]
+fn rotate_all_detail_promises_what_the_host_actually_does() {
+    let want = if cfg!(target_os = "macos") {
+        "accounts with a running session are skipped."
+    } else {
+        "running sessions pick up the new tokens on their next request."
+    };
+    assert_eq!(super::ROTATE_ALL_DETAIL, want);
 }
 
 /// No live session: the rotate action arms the normal rotate confirm carrying the

@@ -622,7 +622,16 @@ fn fetch_with_rotation(
                 c.state.preemptive_rotation,
             )
         })
-        .unwrap_or((false, None, 90_000, false));
+        // Poisoned-lock fallback. The `None` expiry alone already forces the
+        // lazy path, so the other three are unreachable rather than chosen —
+        // they still mirror the shipped defaults so a future reader isn't told
+        // preemptive rotation is off by default.
+        .unwrap_or((
+            false,
+            None,
+            crate::profile::DEFAULT_REFRESH_INTERVAL_MS,
+            true,
+        ));
     let proactive =
         proactive_rotation_due(preemptive, access_expires_at, now_ms() as i64, interval_ms);
     let mut unmask_429: Option<Option<Duration>> = None;
@@ -712,6 +721,11 @@ fn fetch_with_rotation(
     let Some(rt) = refresh_token else {
         return bail_unrotated();
     };
+    // macOS only: clauth can't write the Keychain item this session's CC reads,
+    // so rotating would sign it out (`runtime::rotation_blocked_by_live_session`).
+    if crate::runtime::rotation_blocked_for(name) {
+        return bail_unrotated();
+    }
     mark_activity(activity, name, ProfileActivity::Refreshing);
     // `refresh_result` (not `refresh`) so the RefreshError variant survives — the
     // poll needs to tell a dead token (quarantine) from a transient blip (retry).

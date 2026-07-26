@@ -819,6 +819,11 @@ pub(crate) struct Toast {
 }
 
 const ROTATE_ALL_MSG: &str = "rotate all access tokens?";
+/// macOS refuses to rotate an account with a running session (it can't reach the
+/// credential that session reads), so the two hosts promise different things.
+#[cfg(target_os = "macos")]
+const ROTATE_ALL_DETAIL: &str = "accounts with a running session are skipped.";
+#[cfg(not(target_os = "macos"))]
 const ROTATE_ALL_DETAIL: &str = "running sessions pick up the new tokens on their next request.";
 const TOAST_CAPACITY: usize = 3;
 const TOAST_TTL_NORMAL: Duration = Duration::from_secs(3);
@@ -3964,10 +3969,10 @@ fn toggle_budget_wrap_off(app: &mut App) {
     app.last_reload_fp = reload_fingerprint();
 }
 
-/// Flip the opt-in preemptive rotation of the ACTIVE profile (rotation
-/// coherence #1). Same persistence shape as `toggle_burn_aware_switching`;
-/// the scheduler reads the flag off the shared config each rotation-leg entry,
-/// so no separate propagation is needed.
+/// Flip preemptive rotation (on by default, and profile-wide — not per-account).
+/// Same persistence shape as `toggle_burn_aware_switching`; the scheduler reads
+/// the flag off the shared config each rotation-leg entry, so no separate
+/// propagation is needed.
 fn toggle_preemptive_rotation(app: &mut App) {
     {
         let mut cfg = app.config();
@@ -7585,15 +7590,45 @@ impl Drop for BootstrapDoneGuard {
     }
 }
 
+/// Handles of every [`spawn_worker`] thread, so a test can join them BEFORE its
+/// `HomeSandbox` drops. `HOME_OVERRIDE` is a process-global cleared on that drop,
+/// so a detached worker that outlives it resolves the operator's REAL `$HOME` and
+/// takes real locks under `~/.clauth` — `RotationGuard::acquire` alone does
+/// `mkdir_700` + a blocking flock. Serialized by `profile::HOME_TEST_LOCK`, which
+/// every sandboxed test holds, so the registry is effectively exclusive.
+/// Never compiled into the binary.
+#[cfg(test)]
+static TEST_WORKERS: std::sync::Mutex<Vec<std::thread::JoinHandle<()>>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// Join every worker spawned so far. Any test whose action reaches
+/// [`spawn_worker`] must call this while its sandbox is still alive.
+#[cfg(test)]
+pub(crate) fn join_test_workers() {
+    let handles: Vec<_> = TEST_WORKERS
+        .lock()
+        .map(|mut w| std::mem::take(&mut *w))
+        .unwrap_or_default();
+    for handle in handles {
+        let _ = handle.join();
+    }
+}
+
 /// Spawn a background worker, catching panics so a single thread crash never
 /// takes down the process. Callers clone only the Arcs their closure needs.
 fn spawn_worker<F>(f: F)
 where
     F: FnOnce() + Send + 'static,
 {
-    std::thread::spawn(move || {
+    let handle = std::thread::spawn(move || {
         let _ = catch_unwind(AssertUnwindSafe(f));
     });
+    #[cfg(test)]
+    if let Ok(mut workers) = TEST_WORKERS.lock() {
+        workers.push(handle);
+    }
+    #[cfg(not(test))]
+    drop(handle);
 }
 
 // ── Shutdown ──────────────────────────────────────────────────────────────────

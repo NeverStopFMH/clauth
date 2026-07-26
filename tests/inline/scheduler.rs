@@ -5056,3 +5056,271 @@ fn the_retention_trim_reruns_on_its_cadence_not_only_at_startup() {
         "the run must reset the clock, not re-trim every tick from here on"
     );
 }
+
+// ── the rotation legs, driven offline ────────────────────────────────────────
+//
+// Every rotation decision sits BEHIND an HTTP call, so until `EndpointSandbox`
+// existed a refusal deleted from `fetch_with_rotation` or `auto_start_kick` was
+// caught by nothing at all (a mutation restoring one stayed green across the
+// whole suite). These point all three Anthropic endpoints at one loopback
+// listener and assert which of them a leg actually reaches.
+
+/// A loopback stand-in for the Anthropic hosts, answering by request PATH so a
+/// leg's request ORDER isn't baked into the fixture. Serves at most `count`
+/// requests, then returns the path of each one it saw, in order.
+///
+/// The listener is NON-BLOCKING with a wall-clock deadline on purpose. A leg
+/// that refuses early makes fewer requests than the fixture expects, and a
+/// blocking `accept` would hang the suite there instead of failing it — which
+/// is exactly the shape a restored refusal has, so the harness would swallow the
+/// very mutation it exists to catch.
+fn serve_endpoints(
+    count: usize,
+    reply: impl Fn(&str, usize) -> (u16, String) + Send + 'static,
+) -> (String, std::thread::JoinHandle<Vec<String>>) {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+
+    let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind loopback");
+    let port = listener.local_addr().expect("local_addr").port();
+    listener
+        .set_nonblocking(true)
+        .expect("nonblocking listener");
+    let handle = std::thread::spawn(move || {
+        let mut seen = Vec::new();
+        // Generous: the legs sleep on request pacing (5s) and the kick's own
+        // step delay (2s) between calls, so this bounds a WEDGE, not a slow run.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(45);
+        for i in 0..count {
+            let mut sock = loop {
+                if std::time::Instant::now() > deadline {
+                    return seen;
+                }
+                match listener.accept() {
+                    Ok((sock, _)) => break sock,
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(std::time::Duration::from_millis(20));
+                    }
+                    Err(_) => return seen,
+                }
+            };
+            sock.set_nonblocking(false).ok();
+            sock.set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                .ok();
+            // Drain headers AND any Content-Length body before replying: a
+            // close with unread bytes RSTs the client on Windows.
+            let mut req = Vec::new();
+            let mut tmp = [0u8; 1024];
+            loop {
+                match sock.read(&mut tmp) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        req.extend_from_slice(&tmp[..n]);
+                        if let Some(h) = req.windows(4).position(|w| w == b"\r\n\r\n") {
+                            let len = String::from_utf8_lossy(&req[..h])
+                                .lines()
+                                .find_map(|l| {
+                                    l.to_ascii_lowercase()
+                                        .strip_prefix("content-length:")
+                                        .map(|v| v.trim().parse::<usize>().unwrap_or(0))
+                                })
+                                .unwrap_or(0);
+                            if req.len() >= h + 4 + len {
+                                break;
+                            }
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+            let text = String::from_utf8_lossy(&req).into_owned();
+            let path = text
+                .lines()
+                .next()
+                .and_then(|l| l.split_whitespace().nth(1))
+                .unwrap_or("")
+                .to_string();
+            let (status, body) = reply(&path, i);
+            let _ = sock.write_all(
+                format!(
+                    "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\n\
+                     Content-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                )
+                .as_bytes(),
+            );
+            let _ = sock.write_all(body.as_bytes());
+            let _ = sock.shutdown(std::net::Shutdown::Write);
+            seen.push(path);
+        }
+        seen
+    });
+    (format!("http://127.0.0.1:{port}"), handle)
+}
+
+/// A minimal well-formed `/usage` body.
+fn usage_body() -> String {
+    r#"{"limits":[{"kind":"session","percent":12,
+       "resets_at":"2099-01-01T00:00:00+00:00"}]}"#
+        .to_string()
+}
+
+fn rotation_test_config(name: &str) -> crate::profile::ConfigHandle {
+    let mut profile = crate::testutil::blank_profile(name);
+    profile.credentials = Some(crate::profile::ClaudeCredentials {
+        claude_ai_oauth: Some(crate::profile::OAuthToken {
+            access_token: "at-old".into(),
+            refresh_token: Some("rt-old".into()),
+            // Far outside the lead window, so the leg is REACTIVE: the 401 is
+            // what drives it, not the proactive predicate.
+            expires_at: Some(crate::usage::now_ms() as i64 + 86_400_000),
+            scopes: None,
+            subscription_type: None,
+        }),
+    });
+    crate::profile::save_profile(&profile).expect("save profile");
+    let mut config = crate::profile::AppConfig {
+        state: crate::profile::AppState::default(),
+        profiles: vec![profile],
+    };
+    config.state.profiles.push(name.into());
+    config.state.active_profile = Some(name.into());
+    Arc::new(RankedMutex::new(config))
+}
+
+/// THE ROW'S HEADLINE BEHAVIOUR. Under the old gate a live `clauth start`
+/// session made this leg bail to disk cache on every 401, so such an account
+/// served stale usage forever and never recovered its login. Off macOS it must
+/// now rotate through the 401 and re-poll with the new token.
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn a_401_under_a_live_session_rotates_and_retries() {
+    let home = crate::testutil::HomeSandbox::new();
+    let name = "rot-live";
+    // usage 401 (the dead token) → token 200 → usage 200 → profile 200 (the
+    // plan pull that rides the post-rotation retry).
+    let (base, server) = serve_endpoints(4, |path, i| {
+        if path.starts_with("/v1/oauth/token") {
+            (
+                200,
+                r#"{"access_token":"at-new","refresh_token":"rt-new","expires_in":28800}"#
+                    .to_string(),
+            )
+        } else if path.starts_with("/api/oauth/usage") {
+            // Only the FIRST poll is rejected; the retry runs on the new token.
+            if i == 0 {
+                (401, r#"{"error":"unauthorized"}"#.to_string())
+            } else {
+                (200, usage_body())
+            }
+        } else if path.starts_with("/api/oauth/profile") {
+            (200, r#"{"account":{"uuid":"uuid-1"}}"#.to_string())
+        } else {
+            (404, "{}".to_string())
+        }
+    });
+    let _endpoints = crate::testutil::EndpointSandbox::new(&base);
+    let _pid = {
+        let sessions = crate::profile::profile_dir(name)
+            .expect("profile dir")
+            .join("sessions");
+        std::fs::create_dir_all(&sessions).expect("mkdir sessions");
+        let f = crate::runtime::open_pid_file(&sessions.join("99999")).expect("pid");
+        f.lock().expect("lock pid");
+        f
+    };
+    assert!(
+        crate::runtime::has_live_session(name),
+        "fixture must actually read as live, or this proves nothing"
+    );
+
+    let config = rotation_test_config(name);
+    let entry = super::TokenEntry {
+        name: name.to_string(),
+        access_token: "at-old".into(),
+        refresh_token: Some("rt-old".into()),
+        auto_start: false,
+        access_expires_at: Some(crate::usage::now_ms() as i64 + 86_400_000),
+        auth_broken: false,
+    };
+    let refetch: super::RefetchQueue = Arc::new(RankedMutex::new(HashSet::new()));
+    let activity: super::ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
+
+    let outcome = super::fetch_with_rotation(&config, &entry, None, &refetch, &activity);
+    let seen = server.join().expect("listener");
+
+    assert!(
+        seen.iter().any(|p| p.starts_with("/v1/oauth/token")),
+        "the leg must REACH the token endpoint — a live session no longer bails: {seen:?}"
+    );
+    assert_eq!(
+        outcome.rotated,
+        Some(("at-new".to_string(), Some("rt-new".to_string()))),
+        "the rotated pair must come back for the TokenList sync"
+    );
+    #[allow(clippy::expect_used, reason = "test")]
+    let stored = config
+        .lock()
+        .expect("config lock")
+        .find(name)
+        .and_then(|p| p.access_token().map(str::to_string));
+    assert_eq!(stored.as_deref(), Some("at-new"), "the pair persisted");
+    // The whole point: the account is serving LIVE usage again, not the stale
+    // disk cache the old gate pinned it to forever.
+    assert_eq!(outcome.status, super::FetchStatus::Fresh);
+    assert!(
+        outcome.from_fetch,
+        "a live body, not a cache fallback: {:?}",
+        outcome.status
+    );
+    drop(home);
+}
+
+/// `auto_start_kick`'s refusal sits AFTER its first kick, so only a real
+/// listener reaches it. Off macOS a 401 kick on a live-session account must
+/// rotate and retry the kick rather than giving up.
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn auto_start_kick_rotates_under_a_live_session() {
+    let home = crate::testutil::HomeSandbox::new();
+    let name = "kick-live";
+    // messages 401 → token 200 → messages 200
+    let (base, server) = serve_endpoints(3, |path, _| {
+        if path.starts_with("/v1/oauth/token") {
+            (
+                200,
+                r#"{"access_token":"at-new","refresh_token":"rt-new","expires_in":28800}"#
+                    .to_string(),
+            )
+        } else if path.starts_with("/v1/messages") {
+            (401, r#"{"error":"unauthorized"}"#.to_string())
+        } else {
+            (404, "{}".to_string())
+        }
+    });
+    let _endpoints = crate::testutil::EndpointSandbox::new(&base);
+    let _pid = {
+        let sessions = crate::profile::profile_dir(name)
+            .expect("profile dir")
+            .join("sessions");
+        std::fs::create_dir_all(&sessions).expect("mkdir sessions");
+        let f = crate::runtime::open_pid_file(&sessions.join("99999")).expect("pid");
+        f.lock().expect("lock pid");
+        f
+    };
+    let config = rotation_test_config(name);
+
+    let result = crate::oauth::auto_start_kick(&config, name, "at-old", Some("rt-old"), None, None);
+    let seen = server.join().expect("listener");
+
+    assert!(
+        seen.iter().any(|p| p.starts_with("/v1/oauth/token")),
+        "the kick's rotation leg must run under a live session: {seen:?}"
+    );
+    assert_eq!(
+        result.rotated,
+        Some(("at-new".to_string(), Some("rt-new".to_string()))),
+        "a minted pair must always propagate to the caller"
+    );
+    drop(home);
+}

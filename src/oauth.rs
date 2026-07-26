@@ -23,6 +23,59 @@ use crate::usage::{
 /// `oauth_login`.
 const TOKEN_ENDPOINT: &str = "https://platform.claude.com/v1/oauth/token";
 
+/// Test-only [`TOKEN_ENDPOINT`] / [`MESSAGES_ENDPOINT`] overrides, so a loopback
+/// listener can stand in for both and the rotation legs run offline. Without
+/// them `fetch_with_rotation`, `auto_start_kick` and `rotate_one_inner` are
+/// reachable by no test: each one's decision sits BEHIND an HTTP call, so a
+/// refusal removed from any of them stays green. Serialized by
+/// `profile::HOME_TEST_LOCK`, which every test that sets them already holds via
+/// `HomeSandbox`. Never compiled into the binary.
+#[cfg(test)]
+static TOKEN_ENDPOINT_OVERRIDE: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+#[cfg(test)]
+static MESSAGES_ENDPOINT_OVERRIDE: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+#[cfg(test)]
+pub(crate) fn set_endpoint_overrides(token: &str, messages: &str) {
+    if let Ok(mut guard) = TOKEN_ENDPOINT_OVERRIDE.lock() {
+        *guard = Some(token.to_string());
+    }
+    if let Ok(mut guard) = MESSAGES_ENDPOINT_OVERRIDE.lock() {
+        *guard = Some(messages.to_string());
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn clear_endpoint_overrides() {
+    if let Ok(mut guard) = TOKEN_ENDPOINT_OVERRIDE.lock() {
+        *guard = None;
+    }
+    if let Ok(mut guard) = MESSAGES_ENDPOINT_OVERRIDE.lock() {
+        *guard = None;
+    }
+}
+
+fn token_endpoint() -> std::borrow::Cow<'static, str> {
+    #[cfg(test)]
+    if let Some(url) = TOKEN_ENDPOINT_OVERRIDE.lock().ok().and_then(|g| g.clone()) {
+        return std::borrow::Cow::Owned(url);
+    }
+    std::borrow::Cow::Borrowed(TOKEN_ENDPOINT)
+}
+
+fn messages_endpoint() -> std::borrow::Cow<'static, str> {
+    #[cfg(test)]
+    if let Some(url) = MESSAGES_ENDPOINT_OVERRIDE
+        .lock()
+        .ok()
+        .and_then(|g| g.clone())
+    {
+        return std::borrow::Cow::Owned(url);
+    }
+    std::borrow::Cow::Borrowed(MESSAGES_ENDPOINT)
+}
+
 /// `User-Agent` + `Accept` Claude Code's axios client sends on every token-endpoint
 /// request. Mimicked so a refresh/exchange is byte-indistinguishable from CC's
 /// (the version string is axios's, not ours, and will drift with CC's bundle).
@@ -235,7 +288,7 @@ pub(crate) fn refresh_result(
         refresh_body(refresh_token, scopes).map_err(|e| RefreshError::Transient(e.into()))?;
 
     let mut response = AGENT
-        .post(TOKEN_ENDPOINT)
+        .post(token_endpoint().as_ref())
         .header("Content-Type", "application/json")
         .header("Accept", TOKEN_ACCEPT)
         .header("User-Agent", TOKEN_USER_AGENT)
@@ -307,7 +360,7 @@ pub(crate) fn exchange_code(
     let body = exchange_body(code, code_verifier, redirect_uri, state)?;
 
     let mut response = AGENT
-        .post(TOKEN_ENDPOINT)
+        .post(token_endpoint().as_ref())
         .header("Content-Type", "application/json")
         .header("Accept", TOKEN_ACCEPT)
         .header("User-Agent", TOKEN_USER_AGENT)
@@ -400,7 +453,7 @@ fn kick_rate_limit_at(
 /// request-spacing slot so a same-instant multi-profile window-reset doesn't burst
 /// `/v1/messages`.
 fn kick(access_token: &str) -> std::result::Result<(), KickError> {
-    kick_to(MESSAGES_ENDPOINT, access_token)
+    kick_to(messages_endpoint().as_ref(), access_token)
 }
 
 /// The kick's actual work, with the target `url` parameterized so a loopback
@@ -551,6 +604,11 @@ pub(crate) fn auto_start_kick(
     let Ok(rotation_guard) = RotationGuard::acquire(name) else {
         return KickResult::not_opened_with(first_rl);
     };
+    // macOS only: clauth can't write the Keychain item this session's CC reads,
+    // so rotating would sign it out (`runtime::rotation_blocked_by_live_session`).
+    if crate::runtime::rotation_blocked_for(name) {
+        return KickResult::not_opened_with(first_rl);
+    }
 
     // Refresh spinner during the round trip, then back to Fetching for the retry
     // kick + the caller's fetch (the kick runs inside the scheduler's fetch leg).
@@ -648,11 +706,17 @@ fn rotate_one_inner(
         #[allow(clippy::expect_used, reason = "mutex poisoning is unrecoverable")]
         let cfg = config.lock().expect("config mutex poisoned");
         with_state_lock(|| {
+            // macOS only: clauth can't write the Keychain item this session's CC
+            // reads, so rotating would sign it out. Skipping returns
+            // Persisted(false) (`runtime::rotation_blocked_by_live_session`).
+            if crate::runtime::rotation_blocked_for(name) {
+                return Ok::<_, anyhow::Error>(None);
+            }
             let Some(rt) = cfg
                 .find(name)
                 .and_then(|p| p.refresh_token().map(str::to_string))
             else {
-                return Ok::<_, anyhow::Error>(None);
+                return Ok(None);
             };
             // Granted scopes read under the SAME lock as the refresh token so the
             // refresh body echoes them exactly (matches Claude Code's wire shape).
@@ -1290,6 +1354,14 @@ pub(crate) fn ensure_installable(
             "'{name}' rotation lock busy; retry after the in-flight refresh"
         ));
     };
+    // macOS only, same mechanism as the other rotation legs: a switch TARGET can
+    // carry its own live `clauth start` session, and refreshing here would spend
+    // the chain that session's CC holds in an item clauth can't write — signing
+    // it out. Install as-is instead
+    // (`runtime::rotation_blocked_by_live_session`).
+    if crate::runtime::rotation_blocked_for(name) {
+        return AuthGate::Ready;
+    }
     gate_under_guard(config, name, refresher, &guard)
 }
 

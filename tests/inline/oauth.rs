@@ -423,11 +423,14 @@ fn gate_valid_token_ready_without_refresh() {
     ));
 }
 
-/// A live `clauth start` session no longer short-circuits the switch gate to
-/// `Ready`. That refusal installed the STALE token as-is; the session reads the
-/// same credential file, so refreshing here hands it a fresh pair instead of
-/// racing it. Offline: the refresher is injected, and it running at all is the
-/// assertion — under the old gate it was unreachable.
+/// Off macOS a live `clauth start` session no longer short-circuits the switch
+/// gate to `Ready` (which installed the STALE token as-is): the session reads
+/// the same credential file, so refreshing hands it a fresh pair. On macOS the
+/// refusal stands — clauth can't write the Keychain item that session's CC
+/// reads, so a refresh signs it out
+/// (`runtime::rotation_blocked_by_live_session`). Offline: the refresher is
+/// injected, and whether it runs at all is the assertion.
+#[cfg(not(target_os = "macos"))]
 #[test]
 fn gate_refreshes_an_expiring_token_under_a_live_session() {
     let _home = HomeSandbox::new();
@@ -460,6 +463,31 @@ fn gate_refreshes_an_expiring_token_under_a_live_session() {
         .find(name)
         .and_then(|p| p.access_token().map(str::to_string));
     assert_eq!(stored.as_deref(), Some("at-new"));
+
+    drop(file);
+}
+
+/// The macOS arm of the above: the gate installs the expiring token as-is rather
+/// than refreshing a chain it cannot hand to that session's Claude Code.
+/// `never_refresh` panics if the refusal is ever lifted here.
+#[cfg(target_os = "macos")]
+#[test]
+fn gate_installs_as_is_under_a_live_session_on_macos() {
+    let _home = HomeSandbox::new();
+    let name = "test-gate-live-session-macos";
+    let file = arm_live_session(name);
+    let handle = Arc::new(RankedMutex::new(oauth_config(
+        name,
+        Some("rt-old"),
+        Some(past_expiry()),
+    )));
+    assert!(
+        matches!(
+            ensure_installable(&handle, name, never_refresh),
+            AuthGate::Ready
+        ),
+        "macOS must install as-is rather than sign the session out"
+    );
 
     drop(file);
 }

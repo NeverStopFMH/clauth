@@ -15,6 +15,59 @@ use super::scheduler::{ActivityStore, ProfileActivity, mark_activity};
 const USAGE_ENDPOINT: &str = "https://api.anthropic.com/api/oauth/usage";
 const PROFILE_ENDPOINT: &str = "https://api.anthropic.com/api/oauth/profile";
 
+/// Test-only [`USAGE_ENDPOINT`] override, the `/usage` half of the offline
+/// rotation-leg harness (`oauth::set_endpoint_overrides` owns the token and
+/// messages halves). `fetch_with_rotation` decides whether to rotate from what
+/// this endpoint answers, so its 401 leg is unreachable without it. Serialized by
+/// `profile::HOME_TEST_LOCK`. Never compiled into the binary.
+#[cfg(test)]
+static USAGE_ENDPOINT_OVERRIDE: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+/// `/profile` rides along on the retry after a rotation, so it needs redirecting
+/// too — otherwise the test's successful re-poll escapes to the real host.
+#[cfg(test)]
+static PROFILE_ENDPOINT_OVERRIDE: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+#[cfg(test)]
+pub(crate) fn set_usage_endpoint_override(usage: &str, profile: &str) {
+    if let Ok(mut guard) = USAGE_ENDPOINT_OVERRIDE.lock() {
+        *guard = Some(usage.to_string());
+    }
+    if let Ok(mut guard) = PROFILE_ENDPOINT_OVERRIDE.lock() {
+        *guard = Some(profile.to_string());
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn clear_usage_endpoint_override() {
+    if let Ok(mut guard) = USAGE_ENDPOINT_OVERRIDE.lock() {
+        *guard = None;
+    }
+    if let Ok(mut guard) = PROFILE_ENDPOINT_OVERRIDE.lock() {
+        *guard = None;
+    }
+}
+
+fn usage_endpoint() -> std::borrow::Cow<'static, str> {
+    #[cfg(test)]
+    if let Some(url) = USAGE_ENDPOINT_OVERRIDE.lock().ok().and_then(|g| g.clone()) {
+        return std::borrow::Cow::Owned(url);
+    }
+    std::borrow::Cow::Borrowed(USAGE_ENDPOINT)
+}
+
+fn profile_endpoint() -> std::borrow::Cow<'static, str> {
+    #[cfg(test)]
+    if let Some(url) = PROFILE_ENDPOINT_OVERRIDE
+        .lock()
+        .ok()
+        .and_then(|g| g.clone())
+    {
+        return std::borrow::Cow::Owned(url);
+    }
+    std::borrow::Cow::Borrowed(PROFILE_ENDPOINT)
+}
+
 /// Re-fetch `/profile` (plan / rate-limit tier) at most once per hour per
 /// profile. The tier rarely changes, so the steady usage poll reuses the cached
 /// plan and only hits `/profile` on first load, after a 401 rotation, once the
@@ -1038,7 +1091,7 @@ fn fetch_profile_plan(
         return None;
     }
     let text = get_json(
-        PROFILE_ENDPOINT,
+        profile_endpoint().as_ref(),
         access_token,
         activity,
         name,
@@ -1101,7 +1154,7 @@ pub(super) fn fetch_raw(
     activity: Option<&ActivityStore>,
 ) -> std::result::Result<UsageInfo, FetchError> {
     let usage = get_json(
-        USAGE_ENDPOINT,
+        usage_endpoint().as_ref(),
         access_token,
         activity,
         name,
@@ -1193,7 +1246,7 @@ fn login_profile_from_raw(p: RawProfile) -> LoginProfile {
 /// caller can surface it.
 pub(crate) fn probe_login_profile(access_token: &str) -> anyhow::Result<LoginProfile> {
     let text = get_json(
-        PROFILE_ENDPOINT,
+        profile_endpoint().as_ref(),
         access_token,
         None,
         "login",
@@ -1230,7 +1283,7 @@ pub(crate) fn seed_login_anchor(name: &str, account_uuid: Option<&str>) {
 /// shape drift) — callers must treat that as "identity unproven" and refuse.
 pub(crate) fn fetch_account_uuid(access_token: &str) -> Option<String> {
     let text = get_json(
-        PROFILE_ENDPOINT,
+        profile_endpoint().as_ref(),
         access_token,
         None,
         "identity",

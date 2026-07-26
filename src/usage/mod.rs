@@ -35,6 +35,10 @@ pub(crate) use scheduler::ACTIVE_CAP_MAX_STREAK;
 // driving a builder through `await_request_slot` doesn't sleep out the window.
 #[cfg(test)]
 pub(crate) use fetch::reset_request_slots;
+// Test-only: point `/usage` at a loopback listener so `fetch_with_rotation`'s
+// 401-then-rotate leg — and the refusal inside it — can run offline.
+#[cfg(test)]
+pub(crate) use fetch::{clear_usage_endpoint_override, set_usage_endpoint_override};
 // The `/profile` TTL decision itself, re-exported for the account-swap tests in
 // `actions`: asserting through the real decision proves a swap expired BOTH
 // halves of the clock (memo + durable stamp), which no fixture of it would.

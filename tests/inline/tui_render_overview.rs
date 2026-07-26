@@ -599,14 +599,14 @@ fn gap_widening_never_clips_the_row() {
     let app = App::new(config);
     for width in 34u16..=200 {
         let w = OverviewWidths::new(width, &app);
-        let min = fixed_overview_width(w.name, w.kind, w.five_hour, w.seven_day, w.active, 2)
-            + TIMER_SLOT;
+        let min =
+            fixed_overview_width(w.name, w.kind, w.five_hour, w.seven_day, w.live, 2) + TIMER_SLOT;
         if min > width as usize {
             // Below this the shrink loop has already bottomed out and the row
             // deliberately overflows-and-clips; gap widening isn't the cause.
             continue;
         }
-        let used = fixed_overview_width(w.name, w.kind, w.five_hour, w.seven_day, w.active, w.gap)
+        let used = fixed_overview_width(w.name, w.kind, w.five_hour, w.seven_day, w.live, w.gap)
             + TIMER_SLOT;
         assert!(
             used <= width as usize,
@@ -1269,22 +1269,23 @@ fn live_row(
     }
 }
 
-/// The cell sitting under the `active` header on `row`, padding included, so the
+/// The cell sitting under the `live` header on `row`, padding included, so the
 /// pin is an exact value AND proves the cell is aligned under its own header.
-fn active_cell_text(widths: &OverviewWidths, row: &Line<'static>) -> String {
+fn live_cell_text(widths: &OverviewWidths, row: &Line<'static>) -> String {
     let header = line_text(&overview_header(widths));
     let col = header
-        .find("active")
-        .expect("the accounts table carries an `active` header");
+        .find("live")
+        .expect("the accounts table carries a `live` header");
     line_text(row).chars().skip(col).collect()
 }
 
 /// The column answers "how many `clauth start` sessions are on this account",
 /// with `⇄` marking that at least one of them can be moved by the chain. It is
 /// DISTINCT from the leading `●`, which marks the one profile a bare `claude`
-/// authenticates as — an account can carry either, both, or neither.
+/// authenticates as — an account can carry either, both, or neither. That split
+/// is why the header reads `live`: `active` is the `●` sense app-wide.
 #[test]
-fn the_active_column_counts_live_sessions_and_marks_chain_followers() {
+fn the_live_column_counts_live_sessions_and_marks_chain_followers() {
     let mut app = App::new(config_with(
         vec![
             profile("main", 95.0, 10.0, 3600),
@@ -1304,13 +1305,13 @@ fn the_active_column_counts_live_sessions_and_marks_chain_followers() {
     let spare = render_overview_row(&app, 1, &widths, false, false);
 
     assert_eq!(
-        active_cell_text(&widths, &main),
-        "2⇄    ",
+        live_cell_text(&widths, &main),
+        "2⇄  ",
         "two sessions, one of them steerable"
     );
     assert_eq!(
-        active_cell_text(&widths, &spare),
-        "1     ",
+        live_cell_text(&widths, &spare),
+        "1   ",
         "a pinned session still holds the account and burns its window, but no `⇄`"
     );
 }
@@ -1318,7 +1319,7 @@ fn the_active_column_counts_live_sessions_and_marks_chain_followers() {
 /// Zero renders as nothing — cloudy-tui hides a zero count rather than printing
 /// it, and a table full of `0`s would drown the accounts that do host something.
 #[test]
-fn an_account_with_no_live_sessions_renders_a_blank_active_cell() {
+fn an_account_with_no_live_sessions_renders_a_blank_live_cell() {
     let mut app = App::new(config_with(
         vec![profile("main", 95.0, 10.0, 3600)],
         Some("main"),
@@ -1329,7 +1330,7 @@ fn an_account_with_no_live_sessions_renders_a_blank_active_cell() {
     let widths = OverviewWidths::new(160, &app);
     let row = render_overview_row(&app, 0, &widths, false, false);
 
-    assert_eq!(active_cell_text(&widths, &row), "      ");
+    assert_eq!(live_cell_text(&widths, &row), "    ");
 }
 
 /// The column is budgeted on WIDTH alone. Were it budgeted on whether anything
@@ -1337,7 +1338,7 @@ fn an_account_with_no_live_sessions_renders_a_blank_active_cell() {
 /// and reflow back when that session exited — so an empty fleet must lay the
 /// table out exactly as a busy one does.
 #[test]
-fn the_active_column_holds_its_place_while_nothing_is_live() {
+fn the_live_column_holds_its_place_while_nothing_is_live() {
     let mut app = App::new(config_with(
         vec![profile("main", 95.0, 10.0, 3600)],
         Some("main"),
@@ -1354,11 +1355,11 @@ fn the_active_column_holds_its_place_while_nothing_is_live() {
     let busy_row = line_text(&render_overview_row(&app, 0, &busy_widths, false, false));
 
     assert_eq!(idle_header, busy_header, "the header must not move");
-    let col = idle_header.find("active").expect("an `active` header");
+    let col = idle_header.find("live").expect("a `live` header");
     assert_eq!(
         idle_row.chars().take(col).collect::<String>(),
         busy_row.chars().take(col).collect::<String>(),
-        "no column left of `active` may shift when a session appears"
+        "no column left of `live` may shift when a session appears"
     );
 }
 
@@ -1368,7 +1369,7 @@ fn the_active_column_holds_its_place_while_nothing_is_live() {
 /// width that pays for it the column must be absent, and above it the assembled
 /// row must still fit.
 #[test]
-fn the_active_column_is_dropped_rather_than_clipped_when_it_does_not_fit() {
+fn the_live_column_is_dropped_rather_than_clipped_when_it_does_not_fit() {
     let mut app = App::new(config_with(
         vec![profile("main", 95.0, 10.0, 3600)],
         Some("main"),
@@ -1379,9 +1380,9 @@ fn the_active_column_is_dropped_rather_than_clipped_when_it_does_not_fit() {
     for width in 34u16..=200 {
         let widths = OverviewWidths::new(width, &app);
         let header = line_text(&overview_header(&widths));
-        if widths.active == 0 {
+        if widths.live == 0 {
             assert!(
-                !header.contains("active"),
+                !header.contains("live"),
                 "no column means no header at {width} cols: {header:?}"
             );
             continue;

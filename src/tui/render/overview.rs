@@ -113,15 +113,16 @@ struct OverviewWidths {
     kind: usize,
     five_hour: usize,
     seven_day: usize,
-    /// `ACTIVE_W` when the live-session column fits, `0` when it is dropped.
-    active: usize,
+    /// `LIVE_W` when the live-session column fits, `0` when it is dropped.
+    live: usize,
     gap: usize,
 }
 
-/// Width of the live-session column. Its own header text is the floor, and the
-/// cells live inside it; it never widens for a big count, because the column is
-/// budgeted on width alone and its cost has to be constant for that to hold.
-const ACTIVE_W: usize = 6;
+/// Width of the live-session column: its `live` header text, which is also the
+/// widest cell any real count reaches (`99⇄`). It never widens for a bigger
+/// count, because the column is budgeted on width alone and its cost has to be
+/// constant for that to hold.
+const LIVE_W: usize = 4;
 
 impl OverviewWidths {
     fn new(width: u16, app: &App) -> Self {
@@ -208,18 +209,19 @@ impl OverviewWidths {
         //
         // Gated on WIDTH ALONE, never on whether anything is live: a column that
         // appeared the moment someone ran `clauth start` would reflow the entire
-        // table under the operator and reflow it back on exit.
-        let active = if fixed_overview_width(name, kind, five_hour, seven_day, ACTIVE_W, gap_min)
+        // table under the operator and reflow it back on exit. Same reason the
+        // cell is fixed-width rather than sized to the count it holds.
+        let live = if fixed_overview_width(name, kind, five_hour, seven_day, LIVE_W, gap_min)
             + TIMER_SLOT
             <= total
         {
-            ACTIVE_W
+            LIVE_W
         } else {
             0
         };
 
-        let base = fixed_overview_width(name, kind, five_hour, seven_day, active, gap_min);
-        let column_count = 3 + usize::from(seven_day > 0) + usize::from(active > 0);
+        let base = fixed_overview_width(name, kind, five_hour, seven_day, live, gap_min);
+        let column_count = 3 + usize::from(seven_day > 0) + usize::from(live > 0);
         let gap_slots = column_count.saturating_sub(1).max(1);
         // `fixed_overview_width` omits the TIMER_SLOT the row always renders;
         // widening gaps from that undercounted figure overflows the row at
@@ -232,7 +234,7 @@ impl OverviewWidths {
             kind,
             five_hour,
             seven_day,
-            active,
+            live,
             gap,
         }
     }
@@ -243,15 +245,15 @@ fn fixed_overview_width(
     kind: usize,
     five_hour: usize,
     seven_day: usize,
-    active: usize,
+    live: usize,
     gap: usize,
 ) -> usize {
-    let column_count = 3 + usize::from(seven_day > 0) + usize::from(active > 0);
+    let column_count = 3 + usize::from(seven_day > 0) + usize::from(live > 0);
     // 2 = cursor prefix. Timer slot is in the gap before 5h, not a column.
     // kind→timer gap is 4 chars narrower than standard (min 1).
     let narrow = gap.saturating_sub(4).max(1);
     let standard_gaps = column_count.saturating_sub(2);
-    4 + name + kind + five_hour + seven_day + active + standard_gaps * gap + narrow
+    4 + name + kind + five_hour + seven_day + live + standard_gaps * gap + narrow
 }
 
 fn overview_header(widths: &OverviewWidths) -> Line<'static> {
@@ -274,9 +276,9 @@ fn overview_header(widths: &OverviewWidths) -> Line<'static> {
             theme::label(),
         ));
     }
-    if widths.active > 0 {
+    if widths.live > 0 {
         spans.push(gap(widths));
-        spans.push(Span::styled(fixed("active", widths.active), theme::label()));
+        spans.push(Span::styled(fixed("live", widths.live), theme::label()));
     }
     Line::from(spans)
 }
@@ -482,12 +484,9 @@ fn render_overview_row(
         spans.extend(seven_spans);
         spans.push(Span::raw(" ".repeat(seven_pad)));
     }
-    if widths.active > 0 {
+    if widths.live > 0 {
         spans.push(gap(widths));
-        spans.push(active_cell(
-            app.live_sessions.member(&name_str),
-            widths.active,
-        ));
+        spans.push(live_cell(app.live_sessions.member(&name_str), widths.live));
     }
 
     Line::from(spans)
@@ -499,9 +498,10 @@ fn render_overview_row(
 ///
 /// Distinct from the row's leading `●`, which marks the one profile a bare
 /// `claude` authenticates as; an account can carry either, both, or neither.
-/// Already the `TEXT_DIM` tier a disabled row flattens to, so it needs no `hue`
-/// pass of its own.
-fn active_cell(sessions: crate::live_sessions::MemberSessions, width: usize) -> Span<'static> {
+/// That is why the header reads `live` and not `active` — `active` is the `●`
+/// sense app-wide. Already the `TEXT_DIM` tier a disabled row flattens to, so it
+/// needs no `hue` pass of its own.
+fn live_cell(sessions: crate::live_sessions::MemberSessions, width: usize) -> Span<'static> {
     if sessions.sessions == 0 {
         return Span::raw(" ".repeat(width));
     }

@@ -1242,7 +1242,7 @@ fn usage_tab_reset_follows_the_reset_display_setting() {
 /// it may never cost a bar or a reset at any width — and the only way to catch a
 /// breach is to count what a real render puts on screen.
 ///
-/// The expected counts are the behavior BEFORE the `active` column existed, so a
+/// The expected counts are the behavior BEFORE the `live` column existed, so a
 /// column that pays for itself out of a tier instead of out of slack reds here
 /// rather than silently deleting a bar at some width nobody tests by hand (which
 /// is exactly what the 2026-07-19 reset-column cut did).
@@ -1383,12 +1383,34 @@ fn overview_reset_column_never_loses_ground_to_the_clock_setting() {
     );
 }
 
-/// Where the `active` column exists, exactly, as a function of name length and
+/// Whether a real frame carries the accounts table's live-session column, read
+/// off the table's own HEADER ROW rather than the whole frame.
+///
+/// A frame-wide `.contains("live")` would be vacuous: `live` is a four-character
+/// needle and the chain panel, the captions and the footer are all prose on the
+/// same screen, so any of them saying "live" would report the column present at
+/// every width, green. The header row is located by the two labels that always
+/// precede this one (`account` and `type`, both of which survive the narrowest
+/// tier), and a missing row PANICS rather than reading as absence — an absence
+/// claim from a probe that never ran is worth nothing.
+fn live_column_present(app: &App, width: u16) -> bool {
+    let frame = dump(app, width, 20);
+    let header = frame
+        .lines()
+        .find(|row| row.contains("account") && row.contains("type"))
+        .unwrap_or_else(|| panic!("no accounts-table header at {width} cols:\n{frame}"));
+    // Whole-token, so a column clipped mid-label ("liv") reads as absent — which
+    // is the point: the tail ratatui discards IS this column. Tokenizing also
+    // steps over the panel's own `│` border cells, which sit on the same row.
+    header.split_whitespace().any(|cell| cell == "live")
+}
+
+/// Where the `live` column exists, exactly, as a function of name length and
 /// terminal width — the presence map `docs/tui-design.md` publishes.
 ///
 /// The fit gate's own comparison had no pin: `<= total` → `< total` shifts every
 /// arrival by one column and the whole suite stayed green, because the only test
-/// watching presence reads `widths.active` and then checks the render agrees with
+/// watching presence reads `widths.live` and then checks the render agrees with
 /// it, which is true however the gate is written. This asserts the map instead,
 /// so the boundary is a fact rather than a self-consistency check.
 ///
@@ -1397,14 +1419,14 @@ fn overview_reset_column_never_loses_ground_to_the_clock_setting() {
 /// its cells and widening the terminal can REMOVE it. That is why the expectation
 /// is a set of ranges and not a threshold.
 #[test]
-fn the_active_column_exists_exactly_where_the_other_columns_left_room() {
+fn the_live_column_exists_exactly_where_the_other_columns_left_room() {
     use crate::tui::app::Tab;
 
     // (name length, inclusive terminal-width ranges carrying the column)
     const PRESENCE: &[(usize, &[(u16, u16)])] = &[
-        (8, &[(50, 200)]),
-        (11, &[(53, 69), (71, 200)]),
-        (16, &[(58, 61), (65, 67), (76, 96), (101, 105), (110, 200)]),
+        (8, &[(48, 200)]),
+        (11, &[(51, 200)]),
+        (16, &[(56, 61), (63, 69), (74, 96), (99, 105), (108, 200)]),
     ];
 
     for (name_len, ranges) in PRESENCE {
@@ -1416,7 +1438,7 @@ fn the_active_column_exists_exactly_where_the_other_columns_left_room() {
         app.tab = Tab::Overview;
 
         let present: Vec<u16> = (34u16..=200)
-            .filter(|w| dump(&app, *w, 20).contains("active"))
+            .filter(|w| live_column_present(&app, *w))
             .collect();
         let expected: Vec<u16> = ranges.iter().flat_map(|(lo, hi)| *lo..=*hi).collect();
         assert_eq!(present, expected, "the {name_len}-char presence map moved");

@@ -5197,3 +5197,68 @@ fn a_tick_re_tallies_live_sessions_that_appeared_after_startup() {
         );
     }
 }
+
+/// Two `clauth start` children on one account plus a third on another — the only
+/// shape that reaches BOTH the summary line's plural and the per-account
+/// sub-line's `·` count. Every other `runtime_check_*` fixture is single-session,
+/// so `instances > 1` never executed and the `{name} · {instances}` sub-line
+/// shipped with no pin: reverting it left the suite fully green. The summary's
+/// `account`/`accounts` split needs two hosting accounts for the same reason,
+/// and only this fixture has them, so one test carries both.
+#[test]
+fn runtime_check_names_a_multi_session_account_with_its_count() {
+    use crate::profile::{AppConfig, AppState, Profile};
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = App::new(AppConfig {
+        state: AppState::default(),
+        profiles: vec![
+            Profile::new("busy".to_string(), None, None),
+            Profile::new("solo".to_string(), None, None),
+        ],
+    });
+
+    let mut markers = Vec::new();
+    for (name, sid) in [("busy", "4242-0"), ("busy", "4242-1"), ("solo", "4343-0")] {
+        crate::live_sessions::register(&crate::live_sessions::LiveSession {
+            session_id: sid.to_string(),
+            start_profile: name.to_string(),
+            pid: 4242,
+            started_at: 1_700_000_000_000,
+            cwd: None,
+            isolated: false,
+            follows_chain: false,
+            intended_member: None,
+            chain_cursor: None,
+            current_member: None,
+            last_swap_at: None,
+        })
+        .expect("register row");
+        markers.push(
+            crate::runtime::hold_session_row_marker(name, false, sid).expect("hold the marker"),
+        );
+    }
+
+    super::recompute_plugin_checks(&mut app, false);
+
+    let check = app
+        .plugin
+        .checks
+        .iter()
+        .find(|c| c.label == "runtime")
+        .expect("runtime check");
+    assert_eq!(
+        check
+            .detail
+            .iter()
+            .filter(|l| l.starts_with("live:") || l.starts_with("  "))
+            .cloned()
+            .collect::<Vec<_>>(),
+        vec![
+            "live: 3 across 2 accounts".to_string(),
+            "  busy · 2".to_string(),
+            "  solo".to_string(),
+        ],
+        "got {:?}",
+        check.detail
+    );
+}

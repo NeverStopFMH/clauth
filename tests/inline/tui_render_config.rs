@@ -334,26 +334,40 @@ fn disable_button_dims_while_gated_and_ignores_a_stale_arm() {
 /// first (checked ahead of the plain on/off state, since a gate can only ever
 /// bite the not-yet-disabled state), then the on/off state describes what the
 /// toggle does from here.
+///
+/// Every arm is pinned WHOLE, not by a fragment. A `.contains` here let the
+/// active-account gate carry an em-dash — the one separator cloudy-tui bans and
+/// this repo has already swept out of shipped prose — and stay green through
+/// the fix and past a revert of it. The house separator (`·` or a comma) and
+/// the app-wide `live session` noun both live in these four strings.
 #[test]
 fn disabled_hint_follows_the_gate_then_the_value() {
     let mut snap = Snap::blank("a");
 
-    let off = row_hint(ConfigRow::Disabled, &snap).unwrap();
-    assert!(off.contains("removes this account"), "{off}");
+    assert_eq!(
+        row_hint(ConfigRow::Disabled, &snap).as_deref(),
+        Some("removes this account from auto-switch, usage polling, and status until re-enabled"),
+    );
 
     snap.disabled = true;
-    let on = row_hint(ConfigRow::Disabled, &snap).unwrap();
-    assert!(on.contains("excluded from auto-switch"), "{on}");
+    assert_eq!(
+        row_hint(ConfigRow::Disabled, &snap).as_deref(),
+        Some("excluded from auto-switch, usage polling, and status until re-enabled"),
+    );
 
     snap.disabled = false;
     snap.has_live_session = true;
-    let session = row_hint(ConfigRow::Disabled, &snap).unwrap();
-    assert!(session.contains("live session"), "{session}");
+    assert_eq!(
+        row_hint(ConfigRow::Disabled, &snap).as_deref(),
+        Some("has a live session, close it before disabling"),
+    );
 
     // The active-account gate outranks the live-session gate.
     snap.is_active = true;
-    let active = row_hint(ConfigRow::Disabled, &snap).unwrap();
-    assert!(active.contains("active account"), "{active}");
+    assert_eq!(
+        row_hint(ConfigRow::Disabled, &snap).as_deref(),
+        Some("the active account can't be disabled · switch away first"),
+    );
 }
 
 /// A disabled account's row in the Setup account list carries the dim name and

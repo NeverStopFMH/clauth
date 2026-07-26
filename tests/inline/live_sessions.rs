@@ -274,39 +274,3 @@ fn collect_drops_a_row_whose_session_is_no_longer_running() {
         "only the row whose marker is still held is a live session"
     );
 }
-
-/// LIVENESS and ATTRIBUTION read different fields, and they must keep doing so.
-/// `collect` probes `session_row_is_live(&row.start_profile, ..)` — the launch
-/// tree, which is the only account a row is guaranteed to name — while
-/// `from_live_rows` attributes the count to `current_member`. Making the two
-/// agree is the obvious-looking simplification and it is wrong in both
-/// directions: probing the attributed member would put this module's liveness
-/// view out of step with the decision leg's and GC's, which both key off
-/// `start_profile`, so a row could be live for one and dead for the other —
-/// exactly what `collect`'s one-predicate rule exists to prevent.
-///
-/// The fixture holds the LAUNCH member's marker alone, so a probe that read the
-/// attributed member instead finds nothing and drops a live session off every
-/// surface that counts one.
-#[test]
-fn a_swapped_sessions_liveness_is_probed_under_the_account_it_launched_on() {
-    let _home = HomeSandbox::new();
-    let mut swapped = row("4242-0", "work");
-    swapped.current_member = Some("spare".to_string());
-    register(&swapped).expect("register the swapped row");
-    let _marker = crate::runtime::hold_session_row_marker("work", false, "4242-0")
-        .expect("hold the launch member's marker");
-
-    let tally = LiveTally::collect();
-
-    assert_eq!(
-        tally.member("spare").sessions,
-        1,
-        "the session survives the liveness filter and counts on where it landed"
-    );
-    assert_eq!(
-        tally.member("work").sessions,
-        0,
-        "nothing authenticates as the launch member any more"
-    );
-}

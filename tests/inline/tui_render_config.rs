@@ -348,7 +348,7 @@ fn disabled_hint_follows_the_gate_then_the_value() {
     snap.disabled = false;
     snap.has_live_session = true;
     let session = row_hint(ConfigRow::Disabled, &snap).unwrap();
-    assert!(session.contains("open session"), "{session}");
+    assert!(session.contains("live session"), "{session}");
 
     // The active-account gate outranks the live-session gate.
     snap.is_active = true;

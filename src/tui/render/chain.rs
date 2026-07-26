@@ -383,9 +383,14 @@ fn reason_fix(reason: &BlockedReason, name: &str) -> String {
 }
 
 /// The member card's live-session block: how many `clauth start` sessions are
-/// running as THIS member and how many of them the chain may move, plus — only
-/// once one of them has actually swapped — when that happened and the caveat
-/// that makes the figure honest.
+/// running as THIS member, plus — only once one of them has actually swapped —
+/// when that happened and the caveat that makes the figure honest.
+///
+/// `live` is the one word every surface counting sessions uses (the Overview
+/// column header, the Plugin runtime row), so the count reads the same wherever
+/// the operator meets it. The follower split the value used to carry
+/// (`3 (2 following)`) lives on the Overview cell's `⇄` mark alone —
+/// `MemberSessions::following` still feeds that.
 ///
 /// Leads with its own blank line so the gap above `sessions` is deliberate and
 /// present either way. It used to come from the `% until rotate` continuation
@@ -407,16 +412,11 @@ fn live_session_lines(
     if sessions.sessions == 0 {
         return Vec::new();
     }
-    let value = if sessions.following > 0 {
-        format!("{} ({} following)", sessions.sessions, sessions.following)
-    } else {
-        sessions.sessions.to_string()
-    };
     let mut lines = vec![
         Line::from(""),
         Line::from(vec![
-            Span::styled(key_cell("sessions", KEY_W, KEY_GUTTER), theme::label()),
-            Span::styled(value, theme::dim()),
+            Span::styled(key_cell("live", KEY_W, KEY_GUTTER), theme::label()),
+            Span::styled(sessions.sessions.to_string(), theme::dim()),
         ]),
     ];
     let Some(at) = sessions.last_swap_at else {

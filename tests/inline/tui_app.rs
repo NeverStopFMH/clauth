@@ -214,12 +214,12 @@ fn runtime_check_summarizes_profiles() {
     // sessions → a neutral dot (not green) and no fix.
     assert_eq!(check.health, super::Health::Idle);
     assert!(check.fix.is_none());
-    assert!(check.detail.iter().any(|l| l == "profiles: 1"));
-    // A zero count prints NOTHING — no row, and specifically not `sessions: 0`
+    assert!(check.detail.iter().any(|l| l == "accounts: 1"));
+    // A zero count prints NOTHING — no row, and specifically not `live: 0`
     // or a `—` placeholder. The Overview cell and the Fallback card both hide
     // their zero; this row was the one surface still announcing it.
     assert!(
-        !check.detail.iter().any(|l| l.starts_with("sessions:")),
+        !check.detail.iter().any(|l| l.starts_with("live:")),
         "an idle fleet says nothing about sessions, got {:?}",
         check.detail
     );
@@ -279,9 +279,9 @@ fn runtime_check_counts_a_swapped_session_once_on_the_member_it_moved_to() {
         check
             .detail
             .iter()
-            .find(|l| l.starts_with("sessions:"))
+            .find(|l| l.starts_with("live:"))
             .map(String::as_str),
-        Some("sessions: 1 live across 1"),
+        Some("live: 1 across 1 accounts"),
         "one child is one session on one account, got {:?}",
         check.detail
     );

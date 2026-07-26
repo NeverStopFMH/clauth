@@ -460,14 +460,16 @@ fn row_hint(row: ConfigRow, snap: &Snap) -> Option<String> {
         ConfigRow::SubagentModel => "model forced for every subagent in this account",
         ConfigRow::EnvEntry(_) => "env var set for claude code while this account is active",
         ConfigRow::EnvAdd => "add an env var for this account",
-        // Gate reasons mirror the CLI's own refusal copy (`actions::disable_
-        // profile`), then the on/off state — checked in that order since a
-        // gate can only ever bite the OFF (not-yet-disabled) state.
+        // Gate reasons name the same blockers as the CLI's own refusal copy
+        // (`actions::disable_profile`), then the on/off state — checked in that
+        // order since a gate can only ever bite the OFF (not-yet-disabled)
+        // state. `live session` is the app-wide noun for a running `clauth
+        // start`; the CLI's wording is its own.
         ConfigRow::Disabled if snap.is_active => {
-            "the active account can't be disabled — switch away first"
+            "the active account can't be disabled · switch away first"
         }
         ConfigRow::Disabled if snap.has_live_session => {
-            "has an open session — close it before disabling"
+            "has a live session, close it before disabling"
         }
         ConfigRow::Disabled if snap.disabled => {
             "excluded from auto-switch, usage polling, and status until re-enabled"

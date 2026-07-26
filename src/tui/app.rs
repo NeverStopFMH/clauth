@@ -3123,7 +3123,7 @@ fn recompute_plugin_checks(app: &mut App, refresh_version: bool) {
         if instances > 0 {
             live_profiles += 1;
             live_names.push(if instances > 1 {
-                format!("{} ({instances})", snap.name)
+                format!("{} · {instances}", snap.name)
             } else {
                 snap.name.clone()
             });
@@ -3206,16 +3206,18 @@ fn recompute_plugin_checks(app: &mut App, refresh_version: bool) {
     // Runtime health only — config (type / model / overrides) lives on the Setup
     // tab. This row answers "how many live sessions, is the active credential link
     // healthy, and how fresh is its token?".
-    let mut runtime_detail = vec![format!("profiles: {total}")];
+    let mut runtime_detail = vec![format!("accounts: {total}")];
     // A zero is hidden rather than printed, matching the Overview cell and the
-    // Fallback card — the row says nothing when there is nothing to say.
+    // Fallback card — the row says nothing when there is nothing to say. `live`
+    // is the one noun every session-counting surface uses (the Overview column
+    // header, the Fallback card's key), so the figure reads the same everywhere.
     if live_sessions > 0 {
         runtime_detail.push(format!(
-            "sessions: {live_sessions} live across {live_profiles}"
+            "live: {live_sessions} across {live_profiles} accounts"
         ));
     }
-    // Name each profile carrying a live session as an indented sub-line, so
-    // "live across N" is concrete rather than just a tally.
+    // Name each account carrying a live session as an indented sub-line, so the
+    // spread is concrete rather than just a tally.
     for name in &live_names {
         runtime_detail.push(format!("  {name}"));
     }

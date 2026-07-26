@@ -1478,7 +1478,9 @@ fn card_texts(lines: &[Line<'static>]) -> Vec<String> {
 }
 
 /// The block, whole, for a member hosting sessions none of which has swapped:
-/// the count plus how many the chain may move, and NOTHING else. A session that
+/// the bare count under the app-wide `live` key, and NOTHING else. The fixture
+/// mixes a follower with a pinned session so a follower qualifier coming back
+/// reds this — that split lives on the Overview cell's `⇄` alone. A session that
 /// never swapped has no repointed credential link, so §12's pickup lag does not
 /// apply to it and claiming it would over-warn in the other direction.
 #[test]
@@ -1491,7 +1493,7 @@ fn the_session_block_counts_live_sessions_and_carries_no_caveat_until_one_has_sw
 
     assert_eq!(
         card_texts(&live_session_lines(sessions, 60)),
-        vec![String::new(), "sessions     2 (1 following)".to_string()],
+        vec![String::new(), "live         2".to_string()],
     );
 }
 
@@ -1513,7 +1515,7 @@ fn the_session_block_dates_the_last_swap_and_says_when_it_is_picked_up() {
         card_texts(&live_session_lines(sessions, 60)),
         vec![
             String::new(),
-            "sessions     1 (1 following)".to_string(),
+            "live         1".to_string(),
             "last swap    3h ago".to_string(),
             " └ picked up on the session's next request".to_string(),
         ],
@@ -1537,7 +1539,7 @@ fn a_swap_this_very_second_reads_as_just_now() {
         card_texts(&live_session_lines(sessions, 60)),
         vec![
             String::new(),
-            "sessions     1".to_string(),
+            "live         1".to_string(),
             "last swap    just now".to_string(),
             " └ picked up on the session's next request".to_string(),
         ],
@@ -1612,7 +1614,7 @@ fn the_member_card_places_the_session_block_between_the_headroom_figure_and_the_
             "5h usage     ██░░░░░░░░░░░░░░░░░░░│  10% used",
             "             85% until rotate",
             "",
-            "sessions     1 (1 following)",
+            "live         1",
             "",
         ],
     );
@@ -1650,7 +1652,7 @@ fn the_session_block_opens_the_same_way_with_and_without_a_five_hour_reading() {
             "5h usage     ██░░░░░░░░░░░░░░░░░░░│  10% used",
             "             85% until rotate",
             "",
-            "sessions     1 (1 following)",
+            "live         1",
             "",
         ],
     );
@@ -1659,7 +1661,7 @@ fn the_session_block_opens_the_same_way_with_and_without_a_five_hour_reading() {
         [
             "5h usage     ░░░░░░░░░░░░░░░░░░░░░│  no data yet",
             "",
-            "sessions     1 (1 following)",
+            "live         1",
             "",
         ],
     );
@@ -1702,14 +1704,17 @@ fn the_fallback_tab_reads_the_apps_live_session_tally() {
     let mut term = Terminal::new(TestBackend::new(120, 20)).unwrap();
     term.draw(|f| super::draw(f, f.area(), &app)).unwrap();
     let rows = crate::testutil::buffer_rows(term.backend().buffer());
+    // The padded key cell, not the bare word: `live` is short enough that a
+    // frame-wide search for it would match any prose on the screen.
+    const KEY: &str = "live         ";
     let card = rows
         .iter()
-        .find(|r| r.contains("sessions"))
+        .find(|r| r.contains(KEY))
         .unwrap_or_else(|| panic!("the card carries no session row:\n{}", rows.join("\n")));
     assert_eq!(
         card.split('│')
-            .find(|seg| seg.contains("sessions"))
+            .find(|seg| seg.contains(KEY))
             .map(str::trim_end),
-        Some(" sessions     1 (1 following)"),
+        Some(" live         1"),
     );
 }

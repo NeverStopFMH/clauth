@@ -233,7 +233,7 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
     // The count + gauge are left-aligned together; the status dot is the
     // only thing right-aligned, with an elastic gap in between.
     let row1_width = rows[1].width as usize;
-    let prefix = format!("{n} account{}", plural(n));
+    let prefix = format!("{n} account{}", crate::format::plural(n));
     let feed = "status.claude.ai";
     let status_head = "● ";
     let status_w = status_head.chars().count() + feed.chars().count();
@@ -279,10 +279,6 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
 
     // ── Row 2: tabs ──────────────────────────────────────────────────────
     super::tabs::draw(frame, rows[2], app);
-}
-
-fn plural(n: usize) -> &'static str {
-    if n == 1 { "" } else { "s" }
 }
 
 fn status_dot_color(app: &App) -> ratatui::style::Color {

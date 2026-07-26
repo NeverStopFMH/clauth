@@ -71,6 +71,11 @@ pub(crate) fn refresh_transient(name: &str, err: &str) -> Message {
 /// TUI, never a bare "the TUI" (which reads as some other UI).
 pub(crate) const RESOLVE_IN_TUI: &str = "resolve the divergence in the clauth TUI";
 
+/// The `s` a count needs, per cloudy-tui's counts rule: singular at one.
+pub(crate) fn plural(n: usize) -> &'static str {
+    if n == 1 { "" } else { "s" }
+}
+
 /// Trailing-ellipsis truncation to `max` chars (counts `char`s, not bytes).
 pub(crate) fn truncate(s: &str, max: usize) -> String {
     if s.chars().count() <= max {

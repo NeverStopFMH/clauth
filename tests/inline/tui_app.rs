@@ -281,7 +281,7 @@ fn runtime_check_counts_a_swapped_session_once_on_the_member_it_moved_to() {
             .iter()
             .find(|l| l.starts_with("live:"))
             .map(String::as_str),
-        Some("live: 1 across 1 accounts"),
+        Some("live: 1 across 1 account"),
         "one child is one session on one account, got {:?}",
         check.detail
     );

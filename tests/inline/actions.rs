@@ -1261,7 +1261,7 @@ fn disable_refuses_the_active_profile() {
     let err = disable_profile(&mut config, "acme").expect_err("active profile must be refused");
     assert_eq!(
         err.to_string(),
-        "'acme' is the active account — switch away first"
+        "'acme' is the active account, switch away first"
     );
     assert!(
         !config.find("acme").unwrap().is_disabled(),
@@ -1291,10 +1291,7 @@ fn disable_refuses_a_profile_with_a_live_session() {
     pid.lock().expect("lock pid");
 
     let err = disable_profile(&mut config, "busy").expect_err("a live session must be refused");
-    assert_eq!(
-        err.to_string(),
-        "'busy' has an open session — close it first"
-    );
+    assert_eq!(err.to_string(), "'busy' has a live session, close it first");
     assert!(
         !config.find("busy").unwrap().is_disabled(),
         "a refused disable must leave the flag untouched"

@@ -395,9 +395,12 @@ fn reason_fix(reason: &BlockedReason, name: &str) -> String {
 /// running as THIS member, plus — only once one of them has actually swapped —
 /// when that happened and the caveat that makes the figure honest.
 ///
-/// `live` is the one word every surface counting sessions uses (the Overview
-/// column header, the Plugin runtime row), so the count reads the same wherever
-/// the operator meets it. The follower split the value used to carry
+/// `live` is the one word every TUI surface counting sessions uses (the
+/// Overview column header, the Plugin runtime row, the Setup tab's disable
+/// gate), so the count reads the same wherever the operator meets it on screen.
+/// The CLI's refusals share the noun but not the phrasing — they answer a
+/// different question (why a command was refused), so they word it their own
+/// way. The follower split the value used to carry
 /// (`3 (2 following)`) lives on the Overview cell's `⇄` mark alone —
 /// `MemberSessions::following` still feeds that.
 ///

@@ -3213,7 +3213,8 @@ fn recompute_plugin_checks(app: &mut App, refresh_version: bool) {
     // header, the Fallback card's key), so the figure reads the same everywhere.
     if live_sessions > 0 {
         runtime_detail.push(format!(
-            "live: {live_sessions} across {live_profiles} accounts"
+            "live: {live_sessions} across {live_profiles} account{}",
+            crate::format::plural(live_profiles)
         ));
     }
     // Name each account carrying a live session as an indented sub-line, so the

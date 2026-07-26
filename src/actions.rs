@@ -590,10 +590,10 @@ pub(crate) fn disable_profile(config: &mut AppConfig, name: &str) -> Result<bool
             return Ok(false);
         }
         if config.is_active(name) {
-            bail!("'{name}' is the active account — switch away first");
+            bail!("'{name}' is the active account, switch away first");
         }
         if crate::runtime::has_live_session(name) {
-            bail!("'{name}' has an open session — close it first");
+            bail!("'{name}' has a live session, close it first");
         }
         let profile = config.find_mut(name).context("profile not found")?;
         profile.disabled = true;

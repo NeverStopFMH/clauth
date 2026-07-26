@@ -717,8 +717,10 @@ fn rotation_lock_path(name: &str) -> Result<PathBuf> {
 /// `clauth start` session acquire for the SAME profile.
 ///
 /// A refresh token is single-use: once `oauth::refresh` spends it the server
-/// kills it, and a second refresh of the same token 401s and burns the whole
-/// chain. The global state flock (`with_state_lock`) cannot guard this because
+/// kills it, and a second refresh of the same token returns `invalid_grant`,
+/// costing the losing caller its token (not the account — the pair minted by
+/// the first spend survives, measured; see `docs/domain-knowledge.md`).
+/// The global state flock (`with_state_lock`) cannot guard this because
 /// it must be released across the network round trip; the per-PID session
 /// flocks only track liveness, not "a rotation is in flight". This lock is
 /// held for the FULL rotate HTTP window (which `with_state_lock` cannot be),

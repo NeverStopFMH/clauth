@@ -1724,24 +1724,13 @@ fn the_fallback_tab_reads_the_apps_live_session_tally() {
     );
 }
 
-/// The blocked-reason marker owns the row's LAST content column, and nothing
-/// else pins that. Both surviving `chain_selector_pane` assertions run on
-/// fixtures whose members are all healthy, so `if let Some(reason)` never
-/// executes in either and `pad = w - (used + 1)` is free to drift; the pin that
-/// covered it incidentally went out with its own subject in `94e0245`.
-///
-/// The pane is asserted WHOLE at two widths, because a `.contains` on a row
-/// cannot see a marker that got appended past the pane and clipped. The wide
-/// case is where a drift reads as a column shift. The narrow case is where the
-/// budget runs out: an 11-char name leaves `pad == 0`, the marker lands past the
-/// pane, ratatui discards it, and a BLOCKED account renders identically to a
-/// healthy one — pinned here as CURRENT behavior, not as the desired one, so a
-/// fix that keeps the marker by clamping the name reds this and rewrites it.
-#[test]
-fn the_blocked_reason_marker_holds_the_rows_last_content_column() {
+/// Three members, one healthy and active, one disabled, one out of 5h headroom
+/// — the fixture both marker pins run on. `blockedname` is 11 chars so it
+/// overruns the narrow pane's name budget while `hot` still fits it.
+fn marker_app() -> App {
     let mut off = profile("blockedname", 95.0, 10.0, 7200);
     off.disabled = true;
-    let app = App::new(config_with(
+    App::new(config_with(
         vec![
             profile("ok", 95.0, 10.0, 7200),
             off,
@@ -1749,12 +1738,25 @@ fn the_blocked_reason_marker_holds_the_rows_last_content_column() {
         ],
         Some("ok"),
         vec!["ok", "blockedname", "hot"],
-    ));
+    ))
+}
 
+/// The blocked-reason marker owns the row's LAST content column, and nothing
+/// else pins that. Both surviving `chain_selector_pane` assertions run on
+/// fixtures whose members are all healthy, so `if let Some(reason)` never
+/// executes in either and the right-align arithmetic is free to drift; the pin
+/// that covered it incidentally went out with its own subject in `94e0245`.
+///
+/// The pane is asserted WHOLE, because a `.contains` on a row cannot see a
+/// marker that got appended past the pane and clipped. This is the wide case,
+/// where every name fits and a drift reads as a column shift; the narrow case
+/// is its own pin below.
+#[test]
+fn the_blocked_reason_marker_holds_the_rows_last_content_column() {
     // 26 content cells: `⊖` and `◔` both sit one cell in from the pane's right
     // border, and the healthy active member carries no marker at all.
     assert_eq!(
-        chain_selector_pane(&app, 100, 8),
+        chain_selector_pane(&marker_app(), 100, 8),
         vec![
             "╭ CHAIN ─────────────────────╮".to_string(),
             "│ ❯  #1 ok                   │".to_string(),
@@ -1766,15 +1768,25 @@ fn the_blocked_reason_marker_holds_the_rows_last_content_column() {
             "╰────────────────────────────╯".to_string(),
         ],
     );
+}
 
-    // 16 content cells: `hot` still gets its `◔`, `blockedname` loses BOTH the
-    // tail of its name and its marker, so the disabled member reads as healthy.
+/// The narrow counterpart: a name too long for the row gives up the cells the
+/// marker needs, rather than the marker being appended past the pane for
+/// ratatui to discard — which rendered a BLOCKED account identically to a
+/// healthy one. The clamp is charged ONLY to rows carrying a marker, so
+/// `blockedname` truncates at 8 cells while unmarked names keep their full
+/// width; that is why the name column's width tracks blocked state.
+#[test]
+fn a_narrow_pane_clamps_a_marked_members_name_rather_than_dropping_its_marker() {
+    // 16 content cells: the rail eats 6, the marker and its gap 2, leaving 8 for
+    // the name — so `blockedname` truncates with `…` and keeps its `⊖`, while
+    // `hot` fits with room to spare.
     assert_eq!(
-        chain_selector_pane(&app, 60, 8),
+        chain_selector_pane(&marker_app(), 60, 8),
         vec![
             "╭ CHAIN ───────────╮".to_string(),
             "│ ❯  #1 ok         │".to_string(),
-            "│    #2 blockednam │".to_string(),
+            "│    #2 blocked… ⊖ │".to_string(),
             "│    #3 hot      ◔ │".to_string(),
             "│                  │".to_string(),
             "│                  │".to_string(),

@@ -22,7 +22,7 @@ use super::super::app::{
     chain_items, parse_max_spend, parse_threshold, parse_weekly_override,
 };
 use super::super::theme;
-use super::format::{ResetFmt, relative_age, reset_pill, reset_resume};
+use super::format::{ResetFmt, fixed_split, relative_age, reset_pill, reset_resume};
 use super::global_config::default_reminder;
 use super::panes::{
     DIAG_AUTH_BROKEN, DIAG_BUDGET_SPENT, DIAG_CANCELED, DIAG_DISABLED, DIAG_KICK, bold_when,
@@ -99,20 +99,29 @@ fn draw_chain_selector(frame: &mut Frame<'_>, area: Rect, app: &App, focused: bo
                         } else {
                             bold_when(name_color(cfg.is_active(&name)), selected && focused)
                         };
-                        let mut spans = vec![rail, Span::styled(name.clone(), ns)];
                         let reason = cfg
                             .find(&name)
                             .and_then(|p| blocked_reason(&cfg, p, kick_lifts.get(&name).copied()));
-                        if let Some(reason) = reason {
-                            // Right-align the 1-cell blocked-reason marker at the
-                            // row's last content column (the scrollbar owns the
-                            // padding cell beyond it, so they never collide).
-                            let used: usize = spans.iter().map(|s| s.width()).sum();
-                            let pad = (w as usize).saturating_sub(used + 1);
-                            if pad > 0 {
-                                spans.push(Span::raw(" ".repeat(pad)));
+                        let rail_w = rail.width();
+                        let mut spans = vec![rail];
+                        match &reason {
+                            // The 1-cell marker is right-aligned at the row's last
+                            // content column (the scrollbar owns the padding cell
+                            // beyond it, so they never collide), and the name is
+                            // clamped to whatever that leaves. Unclamped, a long
+                            // enough name pushed the marker past the pane and
+                            // ratatui dropped it, so a blocked account rendered
+                            // identically to a healthy one. Only a row that
+                            // actually carries a marker pays the clamp — the name
+                            // column's width therefore tracks blocked state.
+                            Some(reason) => {
+                                let name_w = (w as usize).saturating_sub(rail_w + 2);
+                                let (text, pad) = fixed_split(&name, name_w);
+                                spans.push(Span::styled(text, ns));
+                                spans.push(Span::raw(format!("{pad} ")));
+                                spans.push(reason_marker(reason));
                             }
-                            spans.push(reason_marker(&reason));
+                            None => spans.push(Span::styled(name.clone(), ns)),
                         }
                         Line::from(spans)
                     }

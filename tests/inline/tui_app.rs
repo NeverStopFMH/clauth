@@ -1174,7 +1174,7 @@ fn rotate_tokens_with_live_session_arms_an_acknowledge_notice_on_macos() {
         matches!(confirm.on_confirm, ConfirmAction::Acknowledge),
         "macOS arms an acknowledge notice, not a rotate that cannot run"
     );
-    assert_eq!(confirm.message, "'busy' has a running session");
+    assert_eq!(confirm.message, "'busy' has a live clauth start session");
     assert_eq!(
         confirm.detail.as_deref(),
         Some(super::ROTATE_LIVE_SESSION_DETAIL)
@@ -1272,7 +1272,7 @@ fn confirming_a_rotate_under_a_live_session_reaches_the_rotate() {
 #[test]
 fn rotate_all_detail_promises_what_the_host_actually_does() {
     let want = if cfg!(target_os = "macos") {
-        "accounts with a running session are skipped."
+        "accounts with a live clauth start session are skipped."
     } else {
         "running sessions pick up the new tokens on their next request."
     };
@@ -1286,7 +1286,10 @@ fn rotate_all_detail_promises_what_the_host_actually_does() {
 /// from every platform even though only macOS renders them.
 #[test]
 fn the_live_session_rotate_refusal_names_the_keychain_mechanism() {
-    assert_eq!(super::ROTATE_LIVE_SESSION_MSG, "has a running session");
+    assert_eq!(
+        super::ROTATE_LIVE_SESSION_MSG,
+        "has a live clauth start session"
+    );
     assert_eq!(
         super::ROTATE_LIVE_SESSION_DETAIL,
         "macos keeps its login in a keychain entry clauth can't write, so rotating would sign \

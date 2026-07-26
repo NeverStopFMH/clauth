@@ -45,8 +45,156 @@ impl HomeSandbox {
 
 impl Drop for HomeSandbox {
     fn drop(&mut self) {
+        // Join BEFORE clearing the override, not after and not per-test. A
+        // detached `spawn_worker` still running when `HOME_OVERRIDE` clears
+        // resolves the operator's REAL `$HOME` and takes real locks under
+        // `~/.clauth` (`RotationGuard::acquire` alone does `mkdir_700` + a
+        // blocking flock). Doing it here rather than asking each test to call
+        // `join_test_workers` covers the tests that never thought about it —
+        // which is every test that will ever be added.
+        crate::tui::join_test_workers();
         crate::profile::clear_home_override();
     }
+}
+
+// ── offline rotation-leg harness ─────────────────────────────────────────────
+//
+// Every rotation decision sits BEHIND an HTTP call, so a refusal deleted from
+// `fetch_with_rotation`, `auto_start_kick` or `rotate_one_inner` is invisible to
+// any test that cannot answer that call. These live here rather than beside one
+// test module because both the scheduler and the oauth suites drive those legs.
+
+/// A loopback stand-in for the Anthropic hosts, answering by request PATH so a
+/// leg's request ORDER isn't baked into the fixture. Serves up to `max` requests
+/// and returns the path of each one it saw, in order.
+///
+/// `max` must be set ABOVE what a correct run makes, never equal to it. A
+/// must-NOT-call assertion (`!seen.contains(token_endpoint)`) is only meaningful
+/// if the listener would have accepted and recorded that call — a `max` sized to
+/// the happy path makes the forbidden request invisible and the assertion passes
+/// no matter what the code does. That exact fixture bug let a deleted refusal
+/// stay green here once already.
+///
+/// The listener is NON-BLOCKING with two deadlines. A leg that refuses early
+/// makes fewer requests than `max`, and a blocking `accept` would hang the suite
+/// instead of failing it — the shape a restored refusal has, so the harness
+/// would swallow the very mutation it exists to catch. `IDLE_GRACE` is what
+/// bounds the "nothing more is coming" case, and must stay above the 5s per-host
+/// request spacing or a paced follow-up reads as absent.
+pub(crate) fn serve_endpoints(
+    max: usize,
+    reply: impl Fn(&str, usize) -> (u16, String) + Send + 'static,
+) -> (String, std::thread::JoinHandle<Vec<String>>) {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::time::{Duration, Instant};
+
+    /// Long enough for a leg that sleeps on pacing before its FIRST request.
+    const FIRST_WAIT: Duration = Duration::from_secs(45);
+    /// Above `REQUEST_SPACING_MS` (5s) plus the kick's 2s step delay.
+    const IDLE_GRACE: Duration = Duration::from_secs(12);
+
+    let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind loopback");
+    let port = listener.local_addr().expect("local_addr").port();
+    listener
+        .set_nonblocking(true)
+        .expect("nonblocking listener");
+    let handle = std::thread::spawn(move || {
+        let mut seen: Vec<String> = Vec::new();
+        for i in 0..max {
+            let deadline = Instant::now()
+                + if seen.is_empty() {
+                    FIRST_WAIT
+                } else {
+                    IDLE_GRACE
+                };
+            let mut sock = loop {
+                if Instant::now() > deadline {
+                    return seen;
+                }
+                match listener.accept() {
+                    Ok((sock, _)) => break sock,
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(20));
+                    }
+                    Err(_) => return seen,
+                }
+            };
+            sock.set_nonblocking(false).ok();
+            sock.set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                .ok();
+            // Drain headers AND any Content-Length body before replying: a
+            // close with unread bytes RSTs the client on Windows.
+            let mut req = Vec::new();
+            let mut tmp = [0u8; 1024];
+            loop {
+                match sock.read(&mut tmp) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        req.extend_from_slice(&tmp[..n]);
+                        if let Some(h) = req.windows(4).position(|w| w == b"\r\n\r\n") {
+                            let len = String::from_utf8_lossy(&req[..h])
+                                .lines()
+                                .find_map(|l| {
+                                    l.to_ascii_lowercase()
+                                        .strip_prefix("content-length:")
+                                        .map(|v| v.trim().parse::<usize>().unwrap_or(0))
+                                })
+                                .unwrap_or(0);
+                            if req.len() >= h + 4 + len {
+                                break;
+                            }
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+            let text = String::from_utf8_lossy(&req).into_owned();
+            let path = text
+                .lines()
+                .next()
+                .and_then(|l| l.split_whitespace().nth(1))
+                .unwrap_or("")
+                .to_string();
+            let (status, body) = reply(&path, i);
+            let _ = sock.write_all(
+                format!(
+                    "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\n\
+                     Content-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                )
+                .as_bytes(),
+            );
+            let _ = sock.write_all(body.as_bytes());
+            let _ = sock.shutdown(std::net::Shutdown::Write);
+            seen.push(path);
+        }
+        seen
+    });
+    (format!("http://127.0.0.1:{port}"), handle)
+}
+
+pub(crate) fn rotation_fixture_config(name: &str) -> crate::profile::ConfigHandle {
+    let mut profile = blank_profile(name);
+    profile.credentials = Some(crate::profile::ClaudeCredentials {
+        claude_ai_oauth: Some(crate::profile::OAuthToken {
+            access_token: "at-old".into(),
+            refresh_token: Some("rt-old".into()),
+            // Far outside the lead window, so the leg is REACTIVE: the 401 is
+            // what drives it, not the proactive predicate.
+            expires_at: Some(crate::usage::now_ms() as i64 + 86_400_000),
+            scopes: None,
+            subscription_type: None,
+        }),
+    });
+    crate::profile::save_profile(&profile).expect("save profile");
+    let mut config = crate::profile::AppConfig {
+        state: crate::profile::AppState::default(),
+        profiles: vec![profile],
+    };
+    config.state.profiles.push(name.into());
+    config.state.active_profile = Some(name.into());
+    std::sync::Arc::new(crate::lockorder::RankedMutex::new(config))
 }
 
 /// RAII pin redirecting every Anthropic endpoint the rotation legs touch —
@@ -57,13 +205,18 @@ impl Drop for HomeSandbox {
 ///
 /// Rotation decisions all sit BEHIND an HTTP call, so without this the refusals
 /// in `fetch_with_rotation` / `auto_start_kick` / `rotate_one_inner` are covered
-/// by nothing. Requires a live `HomeSandbox` (the overrides are serialized by the
-/// same `HOME_TEST_LOCK`).
-pub(crate) struct EndpointSandbox;
+/// by nothing.
+///
+/// It BORROWS the [`HomeSandbox`] rather than documenting "outlive me": the
+/// overrides are process-globals serialized by `HOME_TEST_LOCK`, which the home
+/// sandbox holds, so dropping the home first would release that lock while the
+/// overrides are still set and let the next test run against them. As a borrow
+/// that inversion is E0505 at compile time instead of a race nothing checks.
+pub(crate) struct EndpointSandbox<'a>(std::marker::PhantomData<&'a HomeSandbox>);
 
-impl EndpointSandbox {
+impl<'a> EndpointSandbox<'a> {
     /// Point every endpoint at `base` (an `http://127.0.0.1:PORT` listener).
-    pub(crate) fn new(base: &str) -> Self {
+    pub(crate) fn new(_home: &'a HomeSandbox, base: &str) -> Self {
         crate::oauth::set_endpoint_overrides(
             &format!("{base}/v1/oauth/token"),
             &format!("{base}/v1/messages?beta=true"),
@@ -73,11 +226,11 @@ impl EndpointSandbox {
             &format!("{base}/api/oauth/profile"),
         );
         crate::usage::reset_request_slots();
-        Self
+        Self(std::marker::PhantomData)
     }
 }
 
-impl Drop for EndpointSandbox {
+impl Drop for EndpointSandbox<'_> {
     fn drop(&mut self) {
         crate::oauth::clear_endpoint_overrides();
         crate::usage::clear_usage_endpoint_override();

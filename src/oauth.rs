@@ -1355,10 +1355,17 @@ pub(crate) fn ensure_installable(
         ));
     };
     // macOS only, same mechanism as the other rotation legs: a switch TARGET can
-    // carry its own live `clauth start` session, and refreshing here would spend
-    // the chain that session's CC holds in an item clauth can't write — signing
-    // it out. Install as-is instead
-    // (`runtime::rotation_blocked_by_live_session`).
+    // carry its own live `clauth start` session whose CC reads a Keychain item
+    // clauth can't write (`runtime::rotation_blocked_by_live_session`).
+    //
+    // This RELOCATES the spend, it does not avoid it. Reaching this line means
+    // the token is inside the 60s grace or `auth_broken`, so installing as-is
+    // starts a Claude Code that is already past its own 5-minute threshold: it
+    // refreshes on its first request and spends the very chain the other session
+    // holds. What the refusal buys is that the spend happens in a process that
+    // CAN write the item its reader consults, so the loser is a token rather
+    // than a signed-out session. Keep it for that, not for a spend that isn't
+    // happening.
     if crate::runtime::rotation_blocked_for(name) {
         return AuthGate::Ready;
     }

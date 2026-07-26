@@ -1591,3 +1591,96 @@ fn gate_session_token_ready_even_when_auth_broken() {
         AuthGate::Ready
     ));
 }
+
+// ── rotate_one_inner, driven offline ─────────────────────────────────────────
+//
+// This leg feeds both the action-menu single rotate and every `refresh_all`
+// worker, so it is the most direct user-reachable path to the macOS sign-out.
+// It was unpinned in BOTH directions until now: its decision sits above the
+// HTTP call, so nothing that stops short of answering that call can see it.
+
+/// A live-session profile whose stored pair the leg would spend.
+fn live_rotate_fixture(name: &str) -> (crate::profile::ConfigHandle, std::fs::File) {
+    let pid = arm_live_session(name);
+    (crate::testutil::rotation_fixture_config(name), pid)
+}
+
+/// Off macOS the session shares the credential file, so the leg MUST rotate:
+/// it reaches the token endpoint and persists the minted pair.
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn rotate_one_inner_rotates_under_a_live_session() {
+    use std::sync::mpsc;
+    let home = HomeSandbox::new();
+    let name = "rotate-one-live";
+    let (base, server) = crate::testutil::serve_endpoints(3, |_, _| {
+        (
+            200,
+            r#"{"access_token":"at-new","refresh_token":"rt-new","expires_in":28800}"#.to_string(),
+        )
+    });
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    let (config, pid) = live_rotate_fixture(name);
+    let activity: ActivityStore = Arc::new(RankedMutex::new(std::collections::HashMap::new()));
+    let (tx, rx) = mpsc::channel();
+
+    let result = rotate_one_inner(&config, name, Some(&activity), &tx);
+    let seen = server.join().expect("listener");
+
+    assert_eq!(
+        seen,
+        vec!["/v1/oauth/token".to_string()],
+        "the leg must reach the token endpoint off macOS"
+    );
+    assert!(matches!(result, RotateOutcome::Persisted(true)));
+    assert!(
+        rx.try_recv().is_ok(),
+        "a rotation that ran emits an OpResult"
+    );
+    drop(pid);
+}
+
+/// On macOS it must NOT: spending the chain here strands the running session,
+/// whose Claude Code reads a Keychain item clauth cannot write. A skip is
+/// silent — `Persisted(false)`, activity Idle, no `OpResult`.
+#[cfg(target_os = "macos")]
+#[test]
+fn rotate_one_inner_does_not_rotate_under_a_live_session_on_macos() {
+    use std::sync::mpsc;
+    let home = HomeSandbox::new();
+    let name = "rotate-one-live-mac";
+    // Zero expected requests: reaching the listener at all is the failure.
+    let (base, server) = crate::testutil::serve_endpoints(2, |_, _| {
+        (
+            200,
+            r#"{"access_token":"at-LEAK","refresh_token":"rt-LEAK","expires_in":28800}"#
+                .to_string(),
+        )
+    });
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    let (config, pid) = live_rotate_fixture(name);
+    let activity: ActivityStore = Arc::new(RankedMutex::new(std::collections::HashMap::new()));
+    let (tx, rx) = mpsc::channel();
+
+    let result = rotate_one_inner(&config, name, Some(&activity), &tx);
+    let seen = server.join().expect("listener");
+
+    assert!(
+        seen.is_empty(),
+        "macOS must not spend the chain a live session holds: {seen:?}"
+    );
+    assert!(matches!(result, RotateOutcome::Persisted(false)));
+    assert!(
+        is_idle(&activity, name),
+        "a skipped rotation stamps nothing"
+    );
+    assert!(rx.try_recv().is_err(), "the silent skip emits no OpResult");
+    #[allow(clippy::expect_used, reason = "test")]
+    let stored = config
+        .lock()
+        .expect("config lock")
+        .find(name)
+        .and_then(|p| p.access_token().map(str::to_string));
+    assert_eq!(stored.as_deref(), Some("at-old"), "the pair is untouched");
+    drop(pid);
+}

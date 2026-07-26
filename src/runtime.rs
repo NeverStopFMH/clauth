@@ -41,8 +41,11 @@
 //! its lifetime, so any other process reads liveness without cooperation.
 //! [`has_live_session`] unions every `sessions*` dir under the profile, so an
 //! isolated session counts the same as a shared one; the destructive account
-//! actions (delete, disable) gate on it. Token rotation does NOT — a session
-//! reads the very credential file a rotation writes. Teardown drops the marker and discards the tree —
+//! actions (delete, disable) gate on it everywhere. Token rotation gates on it
+//! only on macOS ([`rotation_blocked_for`]): elsewhere the session reads the
+//! very credential file a rotation writes and simply follows it, while on macOS
+//! its Claude Code reads a Keychain item namespaced per `CLAUDE_CONFIG_DIR` that
+//! clauth cannot write. Teardown drops the marker and discards the tree —
 //! its own under real symlinks, the shared one under [`LinkMode::Fake`] and only
 //! once the last session of the profile has left; [`gc_stale_runtimes`] collects
 //! what a crashed session left behind, of either flavor and in either layout.
@@ -446,11 +449,18 @@ fn session_marker_dirs(name: &str) -> Option<Vec<PathBuf>> {
 
 /// True iff the profile has at least one live `clauth start` session, in ANY of
 /// its marker dirs and of either flavor. Gates the destructive account actions
-/// (delete, disable), so a false negative pulls an account out from under a
-/// running session. Every unknown therefore reads as LIVE — a spurious true
-/// costs one refused action the user can retry, and the asymmetry is total.
-/// Only a dir that is genuinely absent counts as idle. NOT a rotation gate:
-/// a session reads the very credential file a rotation writes.
+/// (delete, disable) everywhere, and on macOS every rotation leg too
+/// ([`rotation_blocked_for`]).
+///
+/// Every unknown reads as LIVE, and that asymmetry is no longer free. A false
+/// negative pulls an account out from under a running session or signs it out.
+/// A spurious true costs a refused delete the user can retry — but on macOS it
+/// ALSO freezes all four rotation legs for that profile, so a marker dir that
+/// stays unreadable means the chain never rotates and the access token simply
+/// dies at its 8h mark. Fail-closed is still the right direction (a wrongly
+/// deleted account is unrecoverable, an unrotated one is not), but the cost is
+/// a stalled profile, not an inconvenience. Only a dir that is genuinely absent
+/// counts as idle.
 pub(crate) fn has_live_session(name: &str) -> bool {
     match session_marker_dirs(name) {
         None => true,
@@ -482,15 +492,23 @@ pub(crate) fn has_live_session(name: &str) -> bool {
 /// counts only `clauth start` sessions, so it already draws that line.
 ///
 /// This dissolves the moment [`crate::keychain`] derives the namespaced service
-/// name (`docs/todo.md`, "#1 macOS follow-ups"); nothing else here changes.
+/// name (`docs/todo.md`, "#1 macOS follow-ups"). Every site that refuses goes
+/// through [`rotation_blocked_for`], so that fix is a one-line change here and
+/// nowhere else — keep it that way rather than re-deriving `cfg!(macos) &&
+/// has_live_session` at a call site.
 fn rotation_blocked_by_live_session(has_live_session: bool, is_macos: bool) -> bool {
     is_macos && has_live_session
 }
 
 /// [`rotation_blocked_by_live_session`] against the live host and marker state —
-/// what every rotation leg calls.
+/// what every rotation leg and both TUI pre-refusals call.
+///
+/// `cfg!` is tested FIRST so the marker probe short-circuits away off macOS:
+/// [`has_live_session`] is a `read_dir` plus an `open` + `try_lock` per marker,
+/// and passing it as an argument would pay that on every Linux poll of every
+/// profile for a value the predicate discards.
 pub(crate) fn rotation_blocked_for(name: &str) -> bool {
-    rotation_blocked_by_live_session(has_live_session(name), cfg!(target_os = "macos"))
+    cfg!(target_os = "macos") && rotation_blocked_by_live_session(has_live_session(name), true)
 }
 
 /// Count of live `clauth start` sessions for the profile, deduped by marker NAME

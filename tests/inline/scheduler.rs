@@ -5065,129 +5065,6 @@ fn the_retention_trim_reruns_on_its_cadence_not_only_at_startup() {
 // whole suite). These point all three Anthropic endpoints at one loopback
 // listener and assert which of them a leg actually reaches.
 
-/// A loopback stand-in for the Anthropic hosts, answering by request PATH so a
-/// leg's request ORDER isn't baked into the fixture. Serves at most `count`
-/// requests, then returns the path of each one it saw, in order.
-///
-/// The listener is NON-BLOCKING with a wall-clock deadline on purpose. A leg
-/// that refuses early makes fewer requests than the fixture expects, and a
-/// blocking `accept` would hang the suite there instead of failing it — which
-/// is exactly the shape a restored refusal has, so the harness would swallow the
-/// very mutation it exists to catch.
-fn serve_endpoints(
-    count: usize,
-    reply: impl Fn(&str, usize) -> (u16, String) + Send + 'static,
-) -> (String, std::thread::JoinHandle<Vec<String>>) {
-    use std::io::{Read, Write};
-    use std::net::TcpListener;
-
-    let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind loopback");
-    let port = listener.local_addr().expect("local_addr").port();
-    listener
-        .set_nonblocking(true)
-        .expect("nonblocking listener");
-    let handle = std::thread::spawn(move || {
-        let mut seen = Vec::new();
-        // Generous: the legs sleep on request pacing (5s) and the kick's own
-        // step delay (2s) between calls, so this bounds a WEDGE, not a slow run.
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(45);
-        for i in 0..count {
-            let mut sock = loop {
-                if std::time::Instant::now() > deadline {
-                    return seen;
-                }
-                match listener.accept() {
-                    Ok((sock, _)) => break sock,
-                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                        std::thread::sleep(std::time::Duration::from_millis(20));
-                    }
-                    Err(_) => return seen,
-                }
-            };
-            sock.set_nonblocking(false).ok();
-            sock.set_read_timeout(Some(std::time::Duration::from_secs(5)))
-                .ok();
-            // Drain headers AND any Content-Length body before replying: a
-            // close with unread bytes RSTs the client on Windows.
-            let mut req = Vec::new();
-            let mut tmp = [0u8; 1024];
-            loop {
-                match sock.read(&mut tmp) {
-                    Ok(0) => break,
-                    Ok(n) => {
-                        req.extend_from_slice(&tmp[..n]);
-                        if let Some(h) = req.windows(4).position(|w| w == b"\r\n\r\n") {
-                            let len = String::from_utf8_lossy(&req[..h])
-                                .lines()
-                                .find_map(|l| {
-                                    l.to_ascii_lowercase()
-                                        .strip_prefix("content-length:")
-                                        .map(|v| v.trim().parse::<usize>().unwrap_or(0))
-                                })
-                                .unwrap_or(0);
-                            if req.len() >= h + 4 + len {
-                                break;
-                            }
-                        }
-                    }
-                    Err(_) => break,
-                }
-            }
-            let text = String::from_utf8_lossy(&req).into_owned();
-            let path = text
-                .lines()
-                .next()
-                .and_then(|l| l.split_whitespace().nth(1))
-                .unwrap_or("")
-                .to_string();
-            let (status, body) = reply(&path, i);
-            let _ = sock.write_all(
-                format!(
-                    "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\n\
-                     Content-Length: {}\r\nConnection: close\r\n\r\n",
-                    body.len()
-                )
-                .as_bytes(),
-            );
-            let _ = sock.write_all(body.as_bytes());
-            let _ = sock.shutdown(std::net::Shutdown::Write);
-            seen.push(path);
-        }
-        seen
-    });
-    (format!("http://127.0.0.1:{port}"), handle)
-}
-
-/// A minimal well-formed `/usage` body.
-fn usage_body() -> String {
-    r#"{"limits":[{"kind":"session","percent":12,
-       "resets_at":"2099-01-01T00:00:00+00:00"}]}"#
-        .to_string()
-}
-
-fn rotation_test_config(name: &str) -> crate::profile::ConfigHandle {
-    let mut profile = crate::testutil::blank_profile(name);
-    profile.credentials = Some(crate::profile::ClaudeCredentials {
-        claude_ai_oauth: Some(crate::profile::OAuthToken {
-            access_token: "at-old".into(),
-            refresh_token: Some("rt-old".into()),
-            // Far outside the lead window, so the leg is REACTIVE: the 401 is
-            // what drives it, not the proactive predicate.
-            expires_at: Some(crate::usage::now_ms() as i64 + 86_400_000),
-            scopes: None,
-            subscription_type: None,
-        }),
-    });
-    crate::profile::save_profile(&profile).expect("save profile");
-    let mut config = crate::profile::AppConfig {
-        state: crate::profile::AppState::default(),
-        profiles: vec![profile],
-    };
-    config.state.profiles.push(name.into());
-    config.state.active_profile = Some(name.into());
-    Arc::new(RankedMutex::new(config))
-}
-
 /// THE ROW'S HEADLINE BEHAVIOUR. Under the old gate a live `clauth start`
 /// session made this leg bail to disk cache on every 401, so such an account
 /// served stale usage forever and never recovered its login. Off macOS it must
@@ -5199,7 +5076,7 @@ fn a_401_under_a_live_session_rotates_and_retries() {
     let name = "rot-live";
     // usage 401 (the dead token) → token 200 → usage 200 → profile 200 (the
     // plan pull that rides the post-rotation retry).
-    let (base, server) = serve_endpoints(4, |path, i| {
+    let (base, server) = crate::testutil::serve_endpoints(6, |path, i| {
         if path.starts_with("/v1/oauth/token") {
             (
                 200,
@@ -5211,7 +5088,12 @@ fn a_401_under_a_live_session_rotates_and_retries() {
             if i == 0 {
                 (401, r#"{"error":"unauthorized"}"#.to_string())
             } else {
-                (200, usage_body())
+                (
+                    200,
+                    r#"{"limits":[{"kind":"session","percent":12,
+                   "resets_at":"2099-01-01T00:00:00+00:00"}]}"#
+                        .to_string(),
+                )
             }
         } else if path.starts_with("/api/oauth/profile") {
             (200, r#"{"account":{"uuid":"uuid-1"}}"#.to_string())
@@ -5219,7 +5101,7 @@ fn a_401_under_a_live_session_rotates_and_retries() {
             (404, "{}".to_string())
         }
     });
-    let _endpoints = crate::testutil::EndpointSandbox::new(&base);
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
     let _pid = {
         let sessions = crate::profile::profile_dir(name)
             .expect("profile dir")
@@ -5234,7 +5116,7 @@ fn a_401_under_a_live_session_rotates_and_retries() {
         "fixture must actually read as live, or this proves nothing"
     );
 
-    let config = rotation_test_config(name);
+    let config = crate::testutil::rotation_fixture_config(name);
     let entry = super::TokenEntry {
         name: name.to_string(),
         access_token: "at-old".into(),
@@ -5273,7 +5155,6 @@ fn a_401_under_a_live_session_rotates_and_retries() {
         "a live body, not a cache fallback: {:?}",
         outcome.status
     );
-    drop(home);
 }
 
 /// `auto_start_kick`'s refusal sits AFTER its first kick, so only a real
@@ -5285,7 +5166,7 @@ fn auto_start_kick_rotates_under_a_live_session() {
     let home = crate::testutil::HomeSandbox::new();
     let name = "kick-live";
     // messages 401 → token 200 → messages 200
-    let (base, server) = serve_endpoints(3, |path, _| {
+    let (base, server) = crate::testutil::serve_endpoints(5, |path, _| {
         if path.starts_with("/v1/oauth/token") {
             (
                 200,
@@ -5298,7 +5179,7 @@ fn auto_start_kick_rotates_under_a_live_session() {
             (404, "{}".to_string())
         }
     });
-    let _endpoints = crate::testutil::EndpointSandbox::new(&base);
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
     let _pid = {
         let sessions = crate::profile::profile_dir(name)
             .expect("profile dir")
@@ -5308,7 +5189,7 @@ fn auto_start_kick_rotates_under_a_live_session() {
         f.lock().expect("lock pid");
         f
     };
-    let config = rotation_test_config(name);
+    let config = crate::testutil::rotation_fixture_config(name);
 
     let result = crate::oauth::auto_start_kick(&config, name, "at-old", Some("rt-old"), None, None);
     let seen = server.join().expect("listener");
@@ -5322,5 +5203,117 @@ fn auto_start_kick_rotates_under_a_live_session() {
         Some(("at-new".to_string(), Some("rt-new".to_string()))),
         "a minted pair must always propagate to the caller"
     );
-    drop(home);
+}
+
+/// The macOS counterpart: the same 401, the same live session, and the leg must
+/// NOT reach the token endpoint. This is the sign-out the refusal exists to
+/// prevent — clauth cannot hand the rotated pair to that session's Claude Code,
+/// so spending the chain would strand it. Serving cache here is the correct
+/// outcome, not a degradation.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_401_under_a_live_session_does_not_rotate_on_macos() {
+    let home = crate::testutil::HomeSandbox::new();
+    let name = "rot-live-mac";
+    let (base, server) = crate::testutil::serve_endpoints(3, |path, _| {
+        if path.starts_with("/api/oauth/usage") {
+            (401, r#"{"error":"unauthorized"}"#.to_string())
+        } else {
+            (
+                200,
+                r#"{"access_token":"at-LEAK","refresh_token":"rt-LEAK","expires_in":28800}"#
+                    .to_string(),
+            )
+        }
+    });
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    let _pid = {
+        let sessions = crate::profile::profile_dir(name)
+            .expect("profile dir")
+            .join("sessions");
+        std::fs::create_dir_all(&sessions).expect("mkdir sessions");
+        let f = crate::runtime::open_pid_file(&sessions.join("99999")).expect("pid");
+        f.lock().expect("lock pid");
+        f
+    };
+    assert!(
+        crate::runtime::has_live_session(name),
+        "fixture must read live"
+    );
+
+    let config = crate::testutil::rotation_fixture_config(name);
+    let entry = super::TokenEntry {
+        name: name.to_string(),
+        access_token: "at-old".into(),
+        refresh_token: Some("rt-old".into()),
+        auto_start: false,
+        access_expires_at: Some(crate::usage::now_ms() as i64 + 86_400_000),
+        auth_broken: false,
+    };
+    let refetch: super::RefetchQueue = Arc::new(RankedMutex::new(HashSet::new()));
+    let activity: super::ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
+
+    let outcome = super::fetch_with_rotation(&config, &entry, None, &refetch, &activity);
+    let seen = server.join().expect("listener");
+
+    assert!(
+        !seen.iter().any(|p| p.starts_with("/v1/oauth/token")),
+        "macOS must not spend the chain a live session holds: {seen:?}"
+    );
+    assert_eq!(outcome.rotated, None, "nothing may be rotated");
+    #[allow(clippy::expect_used, reason = "test")]
+    let stored = config
+        .lock()
+        .expect("config lock")
+        .find(name)
+        .and_then(|p| p.access_token().map(str::to_string));
+    assert_eq!(
+        stored.as_deref(),
+        Some("at-old"),
+        "the stored pair is untouched"
+    );
+}
+
+/// The macOS counterpart for the kick leg: a 401 kick on a live-session account
+/// must stop at the kick, never rotate.
+#[cfg(target_os = "macos")]
+#[test]
+fn auto_start_kick_does_not_rotate_under_a_live_session_on_macos() {
+    let home = crate::testutil::HomeSandbox::new();
+    let name = "kick-live-mac";
+    let (base, server) = crate::testutil::serve_endpoints(3, |path, _| {
+        if path.starts_with("/v1/messages") {
+            (401, r#"{"error":"unauthorized"}"#.to_string())
+        } else {
+            (
+                200,
+                r#"{"access_token":"at-LEAK","refresh_token":"rt-LEAK","expires_in":28800}"#
+                    .to_string(),
+            )
+        }
+    });
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    let _pid = {
+        let sessions = crate::profile::profile_dir(name)
+            .expect("profile dir")
+            .join("sessions");
+        std::fs::create_dir_all(&sessions).expect("mkdir sessions");
+        let f = crate::runtime::open_pid_file(&sessions.join("99999")).expect("pid");
+        f.lock().expect("lock pid");
+        f
+    };
+    let config = crate::testutil::rotation_fixture_config(name);
+
+    let result = crate::oauth::auto_start_kick(&config, name, "at-old", Some("rt-old"), None, None);
+    let seen = server.join().expect("listener");
+
+    assert!(
+        !seen.iter().any(|p| p.starts_with("/v1/oauth/token")),
+        "macOS must not rotate the chain a live session holds: {seen:?}"
+    );
+    assert_eq!(result.rotated, None, "nothing may be rotated");
+    assert!(
+        !result.opened,
+        "the window stays shut; the kick could not recover"
+    );
 }

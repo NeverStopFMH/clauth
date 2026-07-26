@@ -827,7 +827,7 @@ const ROTATE_ALL_MSG: &str = "rotate all access tokens?";
 /// macOS refuses to rotate an account with a running session (it can't reach the
 /// credential that session reads), so the two hosts promise different things.
 #[cfg(target_os = "macos")]
-const ROTATE_ALL_DETAIL: &str = "accounts with a running session are skipped.";
+const ROTATE_ALL_DETAIL: &str = "accounts with a live clauth start session are skipped.";
 #[cfg(not(target_os = "macos"))]
 const ROTATE_ALL_DETAIL: &str = "running sessions pick up the new tokens on their next request.";
 
@@ -838,7 +838,7 @@ const ROTATE_ALL_DETAIL: &str = "running sessions pick up the new tokens on thei
 /// Defined on every platform though only macOS reads them (the branch is
 /// `cfg!`, so it still compiles here) — that keeps the strings reviewable and
 /// exact-match pinnable from a Linux run.
-const ROTATE_LIVE_SESSION_MSG: &str = "has a running session";
+const ROTATE_LIVE_SESSION_MSG: &str = "has a live clauth start session";
 const ROTATE_LIVE_SESSION_DETAIL: &str = "macos keeps its login in a keychain entry clauth can't write, so rotating would sign the \
      session out.";
 const ROTATE_LIVE_SESSION_TOAST: &str = "macos keeps its login where clauth can't rotate it";
@@ -5019,9 +5019,7 @@ fn dispatch_action_menu_action(app: &mut App, action: ActionMenuAction) {
         ActionMenuAction::RotateTokens => match focused_account(app) {
             // macOS refuses this rotation (`runtime::rotation_blocked_for`), so
             // say why up front instead of arming a confirm that no-ops.
-            Some((name, true, _))
-                if cfg!(target_os = "macos") && crate::runtime::has_live_session(&name) =>
-            {
+            Some((name, true, _)) if crate::runtime::rotation_blocked_for(&name) => {
                 app.modals.push(Modal::Confirm(ConfirmState {
                     message: format!("'{name}' {ROTATE_LIVE_SESSION_MSG}"),
                     detail: Some(ROTATE_LIVE_SESSION_DETAIL.to_string()),
@@ -6590,16 +6588,13 @@ fn run_confirm_action(app: &mut App, action: ConfirmAction) {
             // Backstop for a session that started between arming the confirm and
             // running it: on macOS `rotate_one_inner` refuses, and an unguarded
             // "rotating 'X'" toast would be a success-shaped message for a no-op.
-            if cfg!(target_os = "macos") && crate::runtime::has_live_session(&name) {
+            if crate::runtime::rotation_blocked_for(&name) {
                 app.toast(
                     ToastKind::Warning,
                     format!("'{name}' {ROTATE_LIVE_SESSION_MSG}\n{ROTATE_LIVE_SESSION_TOAST}"),
                 );
                 return;
             }
-            // Backstop for a session that started between arming the confirm and
-            // running it: on macOS `rotate_one_inner` refuses, and an unguarded
-            // "rotating 'X'" toast would be a success-shaped message for a no-op.
             // The per-profile RotationGuard inside rotate_one serialises against a
             // live session's own refresh, so unlike RotateAll this doesn't need the
             // global any_busy gate — a busy guard surfaces as a Danger toast.

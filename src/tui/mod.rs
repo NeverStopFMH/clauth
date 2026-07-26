@@ -70,3 +70,9 @@ fn run_loop(terminal: &mut DefaultTerminal, config: AppConfig) -> Result<()> {
 #[cfg(test)]
 #[path = "../../tests/inline/showcase.rs"]
 mod showcase;
+
+// Test-only: `HomeSandbox::drop` joins detached `spawn_worker` threads before it
+// clears `HOME_OVERRIDE`, so a worker can never resolve the operator's real
+// `$HOME` and lock under their `~/.clauth`.
+#[cfg(test)]
+pub(crate) use app::join_test_workers;

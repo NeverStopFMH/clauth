@@ -774,6 +774,11 @@ fn headroom_member_shows_no_reason_pill() {
 /// `rows_start == position_of("rotate at")` is the whole contract in one
 /// equality — and it stays honest through a header-block change, unlike the
 /// hand-maintained `ROWS_BEFORE` it replaced.
+///
+/// PILL heights only: this sweep hands `member_detail` a default
+/// `MemberSessions`, so `live_session_lines` early-returns and the session
+/// block never enters it. That axis is
+/// `member_detail_rows_start_clears_the_session_block_at_every_height`.
 #[test]
 fn member_detail_rows_start_indexes_the_first_fallback_row_at_every_header_height() {
     let at_width = |cfg: &AppConfig, width: usize| -> (usize, usize) {
@@ -1716,5 +1721,127 @@ fn the_fallback_tab_reads_the_apps_live_session_tally() {
             .find(|seg| seg.contains(KEY))
             .map(str::trim_end),
         Some(" live         1"),
+    );
+}
+
+/// The blocked-reason marker owns the row's LAST content column, and nothing
+/// else pins that. Both surviving `chain_selector_pane` assertions run on
+/// fixtures whose members are all healthy, so `if let Some(reason)` never
+/// executes in either and `pad = w - (used + 1)` is free to drift; the pin that
+/// covered it incidentally went out with its own subject in `94e0245`.
+///
+/// The pane is asserted WHOLE at two widths, because a `.contains` on a row
+/// cannot see a marker that got appended past the pane and clipped. The wide
+/// case is where a drift reads as a column shift. The narrow case is where the
+/// budget runs out: an 11-char name leaves `pad == 0`, the marker lands past the
+/// pane, ratatui discards it, and a BLOCKED account renders identically to a
+/// healthy one — pinned here as CURRENT behavior, not as the desired one, so a
+/// fix that keeps the marker by clamping the name reds this and rewrites it.
+#[test]
+fn the_blocked_reason_marker_holds_the_rows_last_content_column() {
+    let mut off = profile("blockedname", 95.0, 10.0, 7200);
+    off.disabled = true;
+    let app = App::new(config_with(
+        vec![
+            profile("ok", 95.0, 10.0, 7200),
+            off,
+            profile("hot", 50.0, 99.0, 7200),
+        ],
+        Some("ok"),
+        vec!["ok", "blockedname", "hot"],
+    ));
+
+    // 26 content cells: `⊖` and `◔` both sit one cell in from the pane's right
+    // border, and the healthy active member carries no marker at all.
+    assert_eq!(
+        chain_selector_pane(&app, 100, 8),
+        vec![
+            "╭ CHAIN ─────────────────────╮".to_string(),
+            "│ ❯  #1 ok                   │".to_string(),
+            "│    #2 blockedname        ⊖ │".to_string(),
+            "│    #3 hot                ◔ │".to_string(),
+            "│                            │".to_string(),
+            "│                            │".to_string(),
+            "│                            │".to_string(),
+            "╰────────────────────────────╯".to_string(),
+        ],
+    );
+
+    // 16 content cells: `hot` still gets its `◔`, `blockedname` loses BOTH the
+    // tail of its name and its marker, so the disabled member reads as healthy.
+    assert_eq!(
+        chain_selector_pane(&app, 60, 8),
+        vec![
+            "╭ CHAIN ───────────╮".to_string(),
+            "│ ❯  #1 ok         │".to_string(),
+            "│    #2 blockednam │".to_string(),
+            "│    #3 hot      ◔ │".to_string(),
+            "│                  │".to_string(),
+            "│                  │".to_string(),
+            "│                  │".to_string(),
+            "╰──────────────────╯".to_string(),
+        ],
+    );
+}
+
+/// `rows_start` against the SESSION BLOCK, which the header-height sweep above
+/// cannot see: it passes a default `MemberSessions`, so `live_session_lines`
+/// early-returns and contributes nothing. The block is pushed immediately
+/// BEFORE `rows_start` is read, so its 2-to-5 lines move the anchor as surely as
+/// a pill does — and a caret on the wrong row is invisible to every text
+/// assertion, which is the whole reason `rows_start` is read off the buffer.
+///
+/// Three heights, one per thing the block can add: the count alone, the count
+/// plus a dated swap and its always-on caveat, and that caveat WRAPPED on a
+/// narrow pane. The swap stamp sits mid-unit so the wall clock cannot walk the
+/// fixture across a `relative_age` boundary mid-test.
+#[test]
+fn member_detail_rows_start_clears_the_session_block_at_every_height() {
+    let cfg = config_with(vec![profile("a", 95.0, 10.0, 7200)], None, vec!["a"]);
+    let start_and_first_row =
+        |sessions: crate::live_sessions::MemberSessions, width: usize| -> (usize, usize, usize) {
+            let (lines, rows_start) = member_detail(
+                &cfg, "a", false, 0, false, None, None, None, width, None, sessions,
+            );
+            let first_row_at = lines
+                .iter()
+                .position(|l| line_text(l).contains("rotate at"))
+                .expect("the first FALLBACK_ROWS row renders");
+            (rows_start, first_row_at, lines.len())
+        };
+
+    // Baseline: no live session, so the block contributes nothing.
+    let (bare, row, _) = start_and_first_row(Default::default(), 60);
+    assert_eq!(bare, row, "no sessions: rows_start indexes the first row");
+    assert_eq!(bare, 3, "gauge + headroom + blank");
+
+    // Count only: the block's own leading blank plus the `live` row.
+    let counted =
+        crate::live_sessions::LiveTally::of([live_row("4242-0", "a", true, None)]).member("a");
+    let (start, row, _) = start_and_first_row(counted, 60);
+    assert_eq!(start, row, "count only: rows_start indexes the first row");
+    assert_eq!(start, bare + 2, "blank + the `live` row");
+
+    // Plus a dated swap, which always drags its caveat line.
+    let swapped_at = crate::usage::now_ms().saturating_sub(3 * 3_600_000 + 1_800_000);
+    let dated =
+        crate::live_sessions::LiveTally::of([live_row("4242-0", "a", true, Some(swapped_at))])
+            .member("a");
+    let (start, row, _) = start_and_first_row(dated, 60);
+    assert_eq!(start, row, "dated swap: rows_start indexes the first row");
+    assert_eq!(start, bare + 4, "blank + `live` + `last swap` + the caveat");
+
+    // The caveat wrapped: the SAME tally must push the rows further down on a
+    // narrow pane, which is what makes `rows_start` load-bearing rather than a
+    // function of the block's shape.
+    let (narrow, narrow_row, _) = start_and_first_row(dated, 30);
+    assert_eq!(
+        narrow, narrow_row,
+        "wrapped caveat: rows_start still indexes the first row"
+    );
+    assert!(
+        narrow > start,
+        "a 30-col pane must wrap the caveat and push the rows down \
+         (wide={start}, narrow={narrow}) — otherwise nothing here tests wrapping"
     );
 }

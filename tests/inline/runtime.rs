@@ -4262,7 +4262,7 @@ fn a_swap_back_onto_a_member_the_session_already_ran_on_succeeds() {
 /// intended member while the link resolves to the launch one is §12's silent
 /// no-op reached through an error path, permanent (`poll` filters on
 /// `member()` equality) and reported by one log line.
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "macos")))]
 #[test]
 fn a_failed_repoint_leaves_the_session_on_the_member_its_link_resolves_to() {
     use std::os::unix::fs::PermissionsExt;

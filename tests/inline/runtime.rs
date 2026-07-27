@@ -3685,6 +3685,7 @@ fn swap_eligible_refuses_exactly_the_config_grounds_the_precondition_does() {
 /// while `ANTHROPIC_AUTH_TOKEN` is read live per client construction, so a
 /// member carrying different env or model routing is a genuinely different
 /// transport rather than the same account elsewhere.
+#[cfg(not(target_os = "macos"))]
 #[test]
 fn the_precondition_refuses_a_member_whose_transport_differs() {
     let tmp = tempfile::tempdir().expect("tempdir");

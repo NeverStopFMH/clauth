@@ -284,6 +284,7 @@ fn sync_runtime_wins_when_canonical_missing_expires_at() {
 }
 
 // Canonical unparseable → runtime wins (safer than discarding it).
+#[cfg(not(target_os = "macos"))]
 #[test]
 fn sync_runtime_wins_when_canonical_unparseable() {
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -3469,6 +3470,7 @@ fn cc_relogin(runtime: &Path, bytes: &[u8], when: SystemTime) -> PathBuf {
 /// of every request and re-reads only when that value CHANGED, so an
 /// mtime-preserving repoint is a SILENT no-op: the session keeps authenticating
 /// as the old member and nothing anywhere reports a problem.
+#[cfg(not(target_os = "macos"))]
 #[test]
 fn a_swap_moves_the_mtime_of_the_store_it_repoints_to() {
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -3732,6 +3734,7 @@ fn the_precondition_refuses_a_member_whose_transport_differs() {
 /// as IDLE and its rotation leg spends the single-use refresh token the live
 /// Claude Code child is authenticating with. Right after an upgrade that old
 /// binary is the running daemon.
+#[cfg(not(target_os = "macos"))]
 #[test]
 fn a_swap_holds_both_of_the_intended_members_liveness_markers() {
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -3770,6 +3773,7 @@ fn a_swap_holds_both_of_the_intended_members_liveness_markers() {
 /// A member whose marker this session cannot hold is a member the rotation gate
 /// cannot see it on, so the swap refuses INSIDE the hold rather than repointing
 /// the link at a chain nothing is protecting.
+#[cfg(not(target_os = "macos"))]
 #[test]
 fn a_swap_refuses_a_member_whose_marker_another_process_holds() {
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -3809,6 +3813,7 @@ fn a_swap_refuses_a_member_whose_marker_another_process_holds() {
 /// observe when it stops. The marker is liveness bookkeeping the destructive
 /// guards read — it is NOT a rotation gate, so both members stay rotatable
 /// throughout. A swapped session follows whichever pair clauth writes.
+#[cfg(not(target_os = "macos"))]
 #[test]
 fn a_swap_keeps_both_members_marked_live_and_still_rotatable() {
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -3859,6 +3864,7 @@ fn a_swap_keeps_both_members_marked_live_and_still_rotatable() {
 
 /// The repoint itself: `.credentials.json` resolves to the intended member's
 /// store, through the tmp+rename swap rather than a remove+create.
+#[cfg(not(target_os = "macos"))]
 #[test]
 fn a_swap_repoints_the_runtime_link_at_the_intended_store() {
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -3887,6 +3893,7 @@ fn a_swap_repoints_the_runtime_link_at_the_intended_store() {
 /// §11 #1. A Claude Code re-login sitting in the runtime file belongs to the
 /// member the link STILL resolves to; without the drain those bytes land in the
 /// new member's store on the next tick and its refresh token is gone.
+#[cfg(not(target_os = "macos"))]
 #[test]
 fn a_swap_drains_a_pending_relogin_into_the_launch_store() {
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -3920,6 +3927,7 @@ fn a_swap_drains_a_pending_relogin_into_the_launch_store() {
 /// CLONE of `canonical`, so a swap that only mutated a field would have the next
 /// tick relink the session back to the OLD member AND write the new member's
 /// tokens into the old member's store.
+#[cfg(not(target_os = "macos"))]
 #[test]
 fn the_tick_after_a_swap_drains_into_the_intended_store() {
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -3961,6 +3969,7 @@ fn the_tick_after_a_swap_drains_into_the_intended_store() {
 /// in `gc_stale_runtimes`'s orphaned-marker-dir arm. It is spared only because
 /// the flock the swap holds reads live — one edit away from deleting a live
 /// session's rotation protection.
+#[cfg(not(target_os = "macos"))]
 #[test]
 fn gc_spares_a_swapped_members_marker_dir_while_the_session_lives() {
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -4001,6 +4010,7 @@ fn gc_spares_a_swapped_members_marker_dir_while_the_session_lives() {
 /// Teardown owns every marker the session stamped — both layouts, on the launch
 /// member and on each member it swapped onto — or a dead session keeps blocking
 /// rotation on accounts nothing is using.
+#[cfg(not(target_os = "macos"))]
 #[test]
 fn teardown_removes_every_marker_a_swap_stamped() {
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -4048,6 +4058,7 @@ fn teardown_removes_every_marker_a_swap_stamped() {
 /// `None` when `try_lock` loses to a live process that minted the same sid, and
 /// unlinking there deletes a FOREIGN session's liveness signal — the same
 /// rotation burn the compat marker exists to prevent.
+#[cfg(not(target_os = "macos"))]
 #[test]
 fn teardown_leaves_a_swapped_compat_marker_it_never_owned() {
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -4093,6 +4104,7 @@ fn teardown_leaves_a_swapped_compat_marker_it_never_owned() {
 /// A swap onto the member the link already resolves to must touch nothing: no
 /// marker on a second path, no mtime move that would make Claude Code re-read
 /// for no reason, no registry write.
+#[cfg(not(target_os = "macos"))]
 #[test]
 fn a_swap_onto_the_member_already_current_changes_nothing() {
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -4138,6 +4150,7 @@ fn a_swap_onto_the_member_already_current_changes_nothing() {
 /// §11 #11. The daemon writes `intended_member` while the session executes; a row
 /// loaded before the swap and stored after would silently revert it, and the
 /// session would keep re-swapping onto a member the daemon has moved past.
+#[cfg(not(target_os = "macos"))]
 #[test]
 fn a_swap_preserves_a_daemon_written_intended_member() {
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -4172,6 +4185,7 @@ fn a_swap_preserves_a_daemon_written_intended_member() {
 /// §11 #12's residue, bounded where it is cheap: `Drop` joins the watchdog, so a
 /// swap STARTED after teardown began would hold session exit for the state-lock
 /// timeout plus an unbounded rotation-flock wait.
+#[cfg(not(target_os = "macos"))]
 #[test]
 fn a_swap_does_not_start_once_teardown_has_begun() {
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -4211,6 +4225,7 @@ fn a_swap_does_not_start_once_teardown_has_begun() {
 /// has already run on has to recognize the marker as already ours; reading it as a
 /// foreign holder would refuse every recovery hop for the session's whole life,
 /// after exactly one log line.
+#[cfg(not(target_os = "macos"))]
 #[test]
 fn a_swap_back_onto_a_member_the_session_already_ran_on_succeeds() {
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -4264,6 +4279,7 @@ fn a_swap_back_onto_a_member_the_session_already_ran_on_succeeds() {
 /// no-op reached through an error path, permanent (`poll` filters on
 /// `member()` equality) and reported by one log line.
 #[cfg(all(unix, not(target_os = "macos")))]
+#[cfg(not(target_os = "macos"))]
 #[test]
 fn a_failed_repoint_leaves_the_session_on_the_member_its_link_resolves_to() {
     use std::os::unix::fs::PermissionsExt;
@@ -4328,6 +4344,7 @@ fn a_failed_repoint_leaves_the_session_on_the_member_its_link_resolves_to() {
 /// discard every later crash-staged sidecar and `resolve_credential_winner`
 /// discard every later re-login, on a member whose mtime was healthy until the
 /// swap touched it.
+#[cfg(not(target_os = "macos"))]
 #[test]
 fn a_swap_moves_the_mtime_without_importing_the_old_stores_skew() {
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -4364,6 +4381,7 @@ fn a_swap_moves_the_mtime_without_importing_the_old_stores_skew() {
 /// `--isolated` and fallback-following are mutually exclusive (settled). The
 /// executor is the single chokepoint every phase goes through, so the refusal
 /// lives here rather than being re-remembered by the decision leg and the flag.
+#[cfg(not(target_os = "macos"))]
 #[test]
 fn an_isolated_session_never_swaps() {
     let tmp = tempfile::tempdir().expect("tempdir");

@@ -9,8 +9,12 @@
 //! (`keychain::enabled()` is false under `cfg(test)`), so `cargo test` never
 //! touches the Keychain.
 
-use super::{delete_at, read_at, run_with_deadline, security_quote, write_at};
+use super::{
+    delete_at, keychain_service_for_config_dir, read_at, run_with_deadline, security_quote,
+    write_at,
+};
 use crate::profile::{ClaudeCredentials, OAuthToken};
+use std::path::Path;
 
 fn sample_creds(access: &str, refresh: &str) -> ClaudeCredentials {
     ClaudeCredentials {
@@ -164,4 +168,50 @@ fn security_quote_refuses_embedded_newlines() {
     // second command. Refusal must be loud, never a silent truncation.
     assert!(security_quote("a\nb").is_err());
     assert!(security_quote("a\rb").is_err());
+}
+
+// ── Namespaced Keychain service name (hash computation, no Keychain touched) ──
+
+#[test]
+fn keychain_service_name_is_deterministic() {
+    let name1 = keychain_service_for_config_dir(Path::new("/tmp")).expect("first");
+    let name2 = keychain_service_for_config_dir(Path::new("/tmp")).expect("second");
+    assert_eq!(name1, name2, "same path must produce the same service name");
+}
+
+#[test]
+fn keychain_service_name_differs_for_different_paths() {
+    let name1 = keychain_service_for_config_dir(Path::new("/tmp")).expect("tmp");
+    let name2 = keychain_service_for_config_dir(Path::new("/")).expect("root");
+    assert_ne!(name1, name2, "different paths must produce different names");
+}
+
+#[test]
+fn keychain_service_suffix_is_8_hex_chars() {
+    let name = keychain_service_for_config_dir(Path::new("/tmp")).expect("name");
+    let suffix = name
+        .strip_prefix("Claude Code-credentials-")
+        .expect("prefix matches");
+    assert_eq!(suffix.len(), 8, "suffix must be exactly 8 characters");
+    assert!(
+        suffix
+            .chars()
+            .all(|c| c.is_ascii_lowercase() && c.is_ascii_hexdigit()),
+        "suffix must be lowercase hexadecimal: got {suffix}"
+    );
+}
+
+#[test]
+fn keychain_service_canonicalization_resolves_dot_dot() {
+    // A path with `..` must resolve to the same name as the direct path.
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let sub = tmp.path().join("sub");
+    std::fs::create_dir(&sub).expect("create sub dir");
+
+    let via_dotdot = keychain_service_for_config_dir(&sub.join("..")).expect("via dotdot");
+    let direct = keychain_service_for_config_dir(tmp.path()).expect("direct");
+    assert_eq!(
+        via_dotdot, direct,
+        "`sub/..` must canonicalize to the parent directory"
+    );
 }

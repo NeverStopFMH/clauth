@@ -374,8 +374,11 @@ fn session_marker_paths(profile: &str, isolated: bool, session_id: &str) -> Resu
 /// dead silently freezes that session out of the chain (or, for GC, reaps a live
 /// session's row).
 ///
-/// One predicate for both consumers — GC's reap and the decision leg's per-row
-/// gate — so a row can never be alive for one and dead for the other.
+/// Callers choose WHICH profile to probe: the tally, GC, and the decision leg all
+/// probe `current_member` first (where a swapped session holds its markers) and
+/// fall back to `start_profile` (where a session that never moved lives), so a row
+/// can never be alive for one consumer and dead for another. A caller MUST use the
+/// same fallback the tally uses, or GC would reap what the tally counts.
 pub(crate) fn session_row_is_live(start_profile: &str, isolated: bool, session_id: &str) -> bool {
     let Ok(markers) = session_marker_paths(start_profile, isolated, session_id) else {
         return true;
@@ -721,14 +724,17 @@ fn gc_bare_markers() {
     });
 }
 
-/// Drop registry rows whose owning session is gone. A row is dead iff NEITHER
-/// marker its own fields could name is flock-held — the same signal the sweep
-/// above and teardown use, so a row can neither outlive its session nor be reaped
-/// ahead of one. Folded in here rather than given its own entry point so every
-/// existing `gc_stale_runtimes` caller gets it.
+/// Drop registry rows whose owning session is gone. A row is dead iff no marker
+/// the session could still hold is flock-held: the attributed member first (a
+/// swapped session runs there), then the launch member. This keeps GC aligned
+/// with [`crate::live_sessions::LiveTally::collect`] — a row can never be alive in
+/// the tally and dead to GC, which is what would silently reap a live swapped row
+/// after a force-delete of its launch profile. Folded in here rather than given
+/// its own entry point so every existing `gc_stale_runtimes` caller gets it.
 fn gc_live_session_rows() {
     for row in crate::live_sessions::list() {
-        if !session_row_is_live(&row.start_profile, row.isolated, &row.session_id)
+        let probe = row.current_member.as_deref().unwrap_or(&row.start_profile);
+        if !session_row_is_live(probe, row.isolated, &row.session_id)
             && let Err(e) = crate::live_sessions::unregister(&row.session_id)
         {
             logline!("clauth: dropping stale live-session row failed: {e}");
@@ -1525,6 +1531,12 @@ impl SessionSwap {
                 }
                 cell.last_refusal = None;
             }
+            debug_assert!(
+                is_session_alive(&self.launch_marker),
+                "the launch member's marker must still be held after publishing a swap — \
+                 marker lifetime must not be shortened, or collect() probing current_member \
+                 would read an alive session as dead"
+            );
             // A freshly loaded row, edited through the session's own field view:
             // a row read before the swap and stored after would revert an
             // `intended_member` the daemon wrote in between.

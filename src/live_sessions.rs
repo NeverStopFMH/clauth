@@ -148,7 +148,8 @@ impl LiveTally {
     /// and dead for the other.
     pub(crate) fn collect(config: &AppConfig) -> Self {
         let mut tally = Self::from_live_rows(list().into_iter().filter(|row| {
-            crate::runtime::session_row_is_live(&row.start_profile, row.isolated, &row.session_id)
+            let probe = row.current_member.as_deref().unwrap_or(&row.start_profile);
+            crate::runtime::session_row_is_live(probe, row.isolated, &row.session_id)
         }));
         tally.add_bare_sessions(config);
         tally

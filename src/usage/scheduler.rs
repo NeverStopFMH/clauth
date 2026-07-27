@@ -2778,11 +2778,17 @@ fn scan_session_switches(
                 // `gc_stale_runtimes` reaps rows at daemon STARTUP, not per tick,
                 // so a SIGKILLed session's row outlives the whole daemon run and
                 // would keep taking decisions nothing can execute.
-                && crate::runtime::session_row_is_live(
-                    &row.start_profile,
-                    row.isolated,
-                    &row.session_id,
-                )
+                && {
+                    let probe = row
+                        .current_member
+                        .as_deref()
+                        .unwrap_or(&row.start_profile);
+                    crate::runtime::session_row_is_live(
+                        probe,
+                        row.isolated,
+                        &row.session_id,
+                    )
+                }
         })
         .collect();
     if rows.is_empty() {

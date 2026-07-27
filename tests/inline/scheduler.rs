@@ -1828,7 +1828,8 @@ fn session_row(session_id: &str, start_profile: &str) -> crate::live_sessions::L
 #[must_use]
 fn register_live_row(row: &crate::live_sessions::LiveSession) -> std::fs::File {
     crate::live_sessions::register(row).expect("register row");
-    crate::runtime::hold_session_row_marker(&row.start_profile, row.isolated, &row.session_id)
+    let probe = row.current_member.as_deref().unwrap_or(&row.start_profile);
+    crate::runtime::hold_session_row_marker(probe, row.isolated, &row.session_id)
         .expect("hold the row's liveness marker")
 }
 

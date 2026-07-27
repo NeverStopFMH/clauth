@@ -277,6 +277,64 @@ fn collect_drops_a_row_whose_session_is_no_longer_running() {
     );
 }
 
+/// After `clauth delete <launch_profile> --force`, the launch profile's marker
+/// dir is gone — but the session keeps running on `current_member` and holds
+/// that member's marker. The probe must look at `current_member`, not
+/// `start_profile`, to find it.
+#[test]
+fn a_swapped_session_counts_on_current_member_after_its_launch_marker_is_removed() {
+    let _home = HomeSandbox::new();
+
+    let swapped = LiveSession {
+        start_profile: "work".to_string(),
+        current_member: Some("spare".to_string()),
+        ..row("4242-0", "work")
+    };
+    register(&swapped).expect("register the swapped row");
+    // Hold the marker for `current_member` ("spare"), not `start_profile`
+    // ("work"). The procedure `clauth delete work --force` removed the
+    // work markers, so only the spare marker exists.
+    let _marker = crate::runtime::hold_session_row_marker("spare", false, "4242-0")
+        .expect("hold the spare member's marker");
+
+    let config = config_with(vec![], "work");
+    assert_eq!(
+        LiveTally::collect(&config).member("spare").sessions,
+        1,
+        "the swapped session must count on current_member when its \
+         start_profile marker is absent"
+    );
+    assert_eq!(
+        LiveTally::collect(&config).member("work").sessions,
+        0,
+        "the swapped session must not count on the launch account"
+    );
+}
+
+/// Mirror: a session that never swapped has no `current_member`, so the probe
+/// falls back to `start_profile` — the only marker dir that exists.
+#[test]
+fn a_session_that_never_swapped_probes_start_profile_in_collect() {
+    let _home = HomeSandbox::new();
+
+    let never = LiveSession {
+        current_member: None,
+        ..row("4242-0", "work")
+    };
+    register(&never).expect("register the row");
+    // Only the start_profile marker exists.
+    let _marker = crate::runtime::hold_session_row_marker("work", false, "4242-0")
+        .expect("hold the start_profile marker");
+
+    assert_eq!(
+        LiveTally::collect(&config_with(vec![], "work"))
+            .member("work")
+            .sessions,
+        1,
+        "a session that never swapped must count on the launch account"
+    );
+}
+
 // ── bare `claude` sessions ───────────────────────────────────────────────────
 
 fn oauth_profile(name: &str, refresh: &str) -> crate::profile::Profile {

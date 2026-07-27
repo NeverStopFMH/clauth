@@ -23,10 +23,12 @@
 //! *that* (unchanging) binary, so it sticks permanently and survives clauth
 //! rebuilds — no code-signing dance required. (This is CCSwitcher's approach.)
 
+use std::path::Path;
 use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
+use sha2::{Digest, Sha256};
 
 use crate::profile::ClaudeCredentials;
 
@@ -266,6 +268,41 @@ pub(crate) fn keychain_write(creds: &ClaudeCredentials) -> Result<()> {
 /// Remove Claude Code's live OAuth login from the Keychain (idempotent).
 pub(crate) fn keychain_delete() -> Result<()> {
     delete_at(SERVICE, &account()?)
+}
+
+/// Derive the Keychain service name for a given `CLAUDE_CONFIG_DIR`.
+///
+/// Claude Code on macOS namespaces its Keychain item per config directory:
+/// `Claude Code-credentials-<sha256(dir)[0:8]>`. A bare (non-clauth) `claude`
+/// uses the unsuffixed `Claude Code-credentials` because its config dir IS
+/// `~/.claude`; a `clauth start` session sets `CLAUDE_CONFIG_DIR` to its
+/// per-session runtime tree, so CC there reads a namespaced item that clauth
+/// never wrote — and on its first token write, CC migrates credentials INTO
+/// the namespaced item and DELETES the plaintext file, after which clauth's
+/// stored refresh token goes stale.
+///
+/// This function returns the namespaced service name exactly as CC computes it.
+/// Callers that write credentials for a per-session config dir must write to
+/// THIS service, not the bare [`SERVICE`], or the session's CC never reads them.
+///
+/// The suffix is the first 8 hex chars of the SHA-256 of the canonicalized
+/// directory path, matching CC's `sha256(configDir).toString('hex').slice(0, 8)`.
+pub(crate) fn keychain_service_for_config_dir(config_dir: &Path) -> Result<String> {
+    // Canonicalize: CC resolves symlinks before hashing, and a relative path
+    // would produce a different hash than the absolute one CC computes.
+    let canonical = std::fs::canonicalize(config_dir).with_context(|| {
+        format!(
+            "failed to canonicalize config dir: {}",
+            config_dir.display()
+        )
+    })?;
+    let path_str = canonical.to_string_lossy();
+    let hash = Sha256::digest(path_str.as_bytes());
+    let suffix = format!(
+        "{:02x}{:02x}{:02x}{:02x}",
+        hash[0], hash[1], hash[2], hash[3]
+    );
+    Ok(format!("{SERVICE}-{suffix}"))
 }
 
 #[cfg(test)]

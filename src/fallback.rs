@@ -878,24 +878,26 @@ fn build_chain_snapshot(
         .state
         .fallback_chain
         .iter()
-        // A disabled NON-active member is invisible to the scheduler-side walk
-        // (`next_auto_switch_target`) — dropped here rather than carried as a
-        // `ChainMember` flag, so the freshness pass built from `.chain` below
-        // never considers it either. The active slot must stay RESOLVABLE
-        // regardless of its own `disabled` bit — `next_auto_switch_target`
-        // indexes into this vec by `position(|m| m.name == snapshot.active)`,
-        // so dropping a disabled active here would make that `?` return `None`
-        // every tick, wedging auto-switch permanently instead of just skipping
-        // it as a candidate (mirrors `next_target`'s skip closure, which never
-        // skips `chain[i] == active` either — `disabled` is a candidate-only
-        // exclusion, same as `broken`/`canceled`).
+        // A disabled or unresolvable NON-active member is invisible to both
+        // chain walks — dropped here rather than carried as a `ChainMember`
+        // flag, so the freshness pass built from `.chain` below never considers
+        // it either. The active slot must stay RESOLVABLE regardless of its own
+        // `disabled` bit — `next_auto_switch_target` indexes into this vec by
+        // `position(|m| m.name == snapshot.active)`, so dropping a disabled
+        // active here would make that `?` return `None` every tick, wedging
+        // auto-switch permanently instead of just skipping it as a candidate
+        // (mirrors `next_target`'s skip closure, which never skips `chain[i] ==
+        // active` either — `disabled` and unresolvable are candidate-only
+        // exclusions, same as `broken`/`canceled`).
         .filter(|name| {
             // Bound once: `find` is a linear scan and `skip_candidate`'s argument is
             // evaluated eagerly, so spelling it twice here charged the GLOBAL path a
             // third scan per member for a closure that is `|_| false` there.
             let profile = config.find(name);
             name.as_str() == active.as_str()
-                || (!profile.is_some_and(Profile::is_disabled) && !skip_candidate(profile))
+                || (profile.is_some()
+                    && !profile.is_some_and(Profile::is_disabled)
+                    && !skip_candidate(profile))
         })
         .map(|name| {
             let profile = config.find(name);

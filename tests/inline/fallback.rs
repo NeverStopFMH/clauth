@@ -432,8 +432,8 @@ fn a_session_snapshot_drops_a_member_the_executor_would_refuse() {
         "a member carrying an endpoint, and one with no profile at all, are both \
          members the executor refuses"
     );
-    // The global builder keeps both — this skip is per-session, not a change to the
-    // single-active path.
+    // The global builder drops the unresolvable name (ghost) but keeps the
+    // endpoint-refused member — the latter is a per-session skip only.
     let global = snapshot_chain(&config).expect("global snapshot");
     assert_eq!(
         global
@@ -441,7 +441,7 @@ fn a_session_snapshot_drops_a_member_the_executor_would_refuse() {
             .iter()
             .map(|m| m.name.as_str())
             .collect::<Vec<_>>(),
-        vec!["a", "b", "c", "ghost"]
+        vec!["a", "b", "c"]
     );
 }
 
@@ -562,6 +562,45 @@ fn auto_switch_missing_util_is_not_exhausted() {
     let snap = snapshot_chain(&config).expect("snapshot");
     let store = store_with_utils(&[("b", 10.0)]); // active absent from store → not exhausted → no switch
     assert_eq!(next_auto_switch_target(&snap, &store), None);
+}
+
+/// An unresolvable name in the chain (no profile on disk, i.e. a hand-edited
+/// `state.json` or a profile that failed to load) must not be a switch candidate
+/// for the scheduler walk, lockstep with `next_target` which excludes it via
+/// `walk_excluded → p.is_none()`. The unresolvable non-active entry is dropped
+/// at snapshot build time, so it never reaches `next_auto_switch_target_with_usage`
+/// where the absence of a usage-store entry would misleadingly read as infinite
+/// headroom.
+#[test]
+fn auto_switch_skips_unresolvable_chain_entry() {
+    let mut config = config_with_chain(
+        vec![
+            profile_with_util("a", Some(95.0), Some(100.0)),
+            profile_with_util("c", Some(95.0), Some(10.0)),
+        ],
+        "a",
+    );
+    // Insert a ghost name between a and c — unresolvable, no profile on disk.
+    config.state.fallback_chain.insert(1, "ghost".into());
+
+    let snap = snapshot_chain(&config).expect("snapshot");
+    // The ghost is dropped at build time; the chain walk sees only resolvable members.
+    assert_eq!(
+        snap.chain
+            .iter()
+            .map(|m| m.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["a", "c"],
+        "unresolvable non-active chain entry must not be in the snapshot"
+    );
+
+    let store = store_with_utils(&[("a", 100.0), ("c", 10.0)]);
+    // a is exhausted → walk should pick c (the viable member past the ghost).
+    assert_eq!(
+        next_auto_switch_target(&snap, &store),
+        Some(SwitchAction::To("c".to_string())),
+        "scheduler walk must pick the viable member, not the ghost"
+    );
 }
 
 // ── wrap-off mode ───────────────────────────────────────────────────────────

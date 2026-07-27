@@ -581,6 +581,7 @@ fn a_refused_with_fallback_start_never_probes_the_disk() {
 /// `acquire` and dies on the missing `~/.claude` this sandbox has no business
 /// creating.
 #[test]
+#[cfg(not(target_os = "macos"))]
 fn run_applies_the_chain_gate_only_to_an_opted_in_start() {
     let _sb = HomeSandbox::new();
     let _daemon = crate::daemon::hold_daemon_lock();

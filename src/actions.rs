@@ -521,7 +521,7 @@ pub(crate) fn delete_profile(config: &mut AppConfig, name: &str, force: bool) ->
         // delete is a clean no-op. `--yes` skips the confirm prompt but does NOT
         // override this; only `force` does.
         if !force && crate::runtime::has_live_session(name) {
-            bail!("'{name}' is running a session, pass --force to delete it anyway");
+            bail!("'{name}' has a live session, pass --force to delete it anyway");
         }
 
         let was_active = config.is_active(name);

@@ -1229,10 +1229,14 @@ fn delete_refuses_live_session_unless_forced() {
     let pid = crate::runtime::open_pid_file(&sessions.join("99999")).expect("open pid");
     pid.lock().expect("lock pid");
 
-    let refused = delete_profile(&mut config, "busy", false);
-    assert!(
-        refused.is_err(),
-        "a live session must block an unforced delete"
+    let err = delete_profile(&mut config, "busy", false)
+        .expect_err("a live session must block an unforced delete");
+    // Exact, and worded off the same `live session` noun as the `disable`
+    // sibling below: one predicate (`has_live_session`) refusing in two nouns
+    // is what sent an operator looking for two different conditions.
+    assert_eq!(
+        err.to_string(),
+        "'busy' has a live session, pass --force to delete it anyway"
     );
     assert!(
         config.find("busy").is_some(),

@@ -470,6 +470,50 @@ fn wait_for_active_times_out_while_the_lock_stays_held() {
     );
 }
 
+/// A transient reader of the singleton lock (TUI header dot at 1 Hz,
+/// `clauth daemon --status`) holds the flock for microseconds and releases it.
+/// Without retry, `claim_by_replacing_with`'s fast path reads this as a daemon,
+/// falls through to `holder_pid` (which returns `None` for a reader with no pid
+/// sidecar), and bails naming a daemon that isn't there. The retry clears it.
+#[test]
+fn replace_retries_past_a_transient_lock_reader() {
+    let _home = HomeSandbox::new();
+    let dir = sandbox_dir();
+
+    // A transient probe holds the singleton lock briefly, then releases.
+    let probe = probe_holding_both(&dir, PROBE_HOLD);
+
+    // Positive control: a one-shot (no retry) reads the probe as a held daemon
+    // and fails because the transient reader has no pid sidecar.
+    let err = claim_by_replacing_retry_with(
+        &dir,
+        std::time::Duration::from_millis(50),
+        std::time::Duration::from_millis(10),
+        1,
+        std::time::Duration::ZERO,
+    )
+    .expect_err("one-shot reads the transient probe as a daemon and bails on the missing pid");
+    assert!(
+        err.to_string().contains("unreadable"),
+        "the bail names the unreadable pid, got {err}"
+    );
+
+    // With the production retry schedule: the probe clears by the second
+    // attempt and `--replace` takes the free lock as a clean start.
+    let claim = claim_by_replacing_with(
+        &dir,
+        std::time::Duration::from_millis(50),
+        std::time::Duration::from_millis(10),
+    )
+    .expect("replace retries past the transient probe");
+    assert!(
+        matches!(claim, Claim::Active(_)),
+        "the retry cleared the transient and claimed the lock"
+    );
+
+    probe.join().expect("probe thread");
+}
+
 // ── FetchLease (single-fetcher lease over usage-fetch.lock) ───────────────────
 
 #[test]

@@ -289,13 +289,37 @@ pub(crate) fn claim_by_replacing(dir: &Path) -> Result<Claim> {
 /// Always yields [`Claim::Active`] on success; every failure mode is an `Err`,
 /// never a silent [`Claim::Redundant`] that would log-and-exit-0 on the caller.
 pub(crate) fn claim_by_replacing_with(dir: &Path, wait: Duration, poll: Duration) -> Result<Claim> {
-    // Fast path: no daemon → a normal start. If a daemon wins the lock in the
-    // instant between the presence check and the claim, fall through and replace
-    // it rather than returning a silent `Redundant` (which `serve` would log and
-    // exit 0 on, leaving the operator's upgrade un-started).
-    if !singleton_held()?
-        && let Claim::Active(lock) = claim_once(dir, false)?
-    {
+    claim_by_replacing_retry_with(dir, wait, poll, CLAIM_ATTEMPTS, CLAIM_RETRY)
+}
+
+/// [`claim_by_replacing_with`] with the retry schedule injected, so a test can
+/// pin the probe-collision recovery without sleeping for it.
+pub(crate) fn claim_by_replacing_retry_with(
+    dir: &Path,
+    wait: Duration,
+    poll: Duration,
+    attempts: u32,
+    retry: Duration,
+) -> Result<Claim> {
+    // Fast path: no daemon → a normal start. Retry past transient probe holds
+    // (TUI header at 1 Hz, clauth daemon --status) that take the flock and
+    // release it microseconds later — a real holder keeps its lock for the
+    // process lifetime, so anything that clears on retry was a reader.
+    let mut held = true;
+    for attempt in 0..attempts.max(1) {
+        held = singleton_held()?;
+        if !held {
+            break;
+        }
+        if attempt + 1 < attempts.max(1) {
+            std::thread::sleep(retry);
+        }
+    }
+    // If the retry cleared the transient, try a normal claim. If a daemon wins
+    // the lock in the instant between the presence check and the claim, fall
+    // through and replace it rather than returning a silent `Redundant` (which
+    // `serve` would log and exit 0 on, leaving the operator's upgrade un-started).
+    if !held && let Claim::Active(lock) = claim_once(dir, false)? {
         return Ok(Claim::Active(lock));
     }
     let Some(pid) = holder_pid() else {

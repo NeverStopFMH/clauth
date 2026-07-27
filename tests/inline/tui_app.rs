@@ -5381,3 +5381,63 @@ fn runtime_check_names_a_multi_session_account_with_its_count() {
         check.detail
     );
 }
+
+/// The singular half of the same summary line, which the fixture above cannot
+/// reach: at 3 sessions across 2 accounts BOTH counts pluralize, so swapping
+/// the `plural()` argument from the account count to the session count changes
+/// nothing and the mutant ships green. Two sessions on ONE account is the
+/// smallest shape where the two counts disagree, so it is the only shape that
+/// proves the suffix tracks the accounts.
+#[test]
+fn runtime_check_says_one_account_when_every_live_session_shares_it() {
+    use crate::profile::{AppConfig, AppState, Profile};
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = App::new(AppConfig {
+        state: AppState::default(),
+        profiles: vec![Profile::new("busy".to_string(), None, None)],
+    });
+
+    let mut markers = Vec::new();
+    for sid in ["5151-0", "5151-1"] {
+        crate::live_sessions::register(&crate::live_sessions::LiveSession {
+            session_id: sid.to_string(),
+            start_profile: "busy".to_string(),
+            pid: 5151,
+            started_at: 1_700_000_000_000,
+            cwd: None,
+            isolated: false,
+            follows_chain: false,
+            intended_member: None,
+            chain_cursor: None,
+            current_member: None,
+            last_swap_at: None,
+        })
+        .expect("register row");
+        markers.push(
+            crate::runtime::hold_session_row_marker("busy", false, sid).expect("hold the marker"),
+        );
+    }
+
+    super::recompute_plugin_checks(&mut app, false);
+
+    let check = app
+        .plugin
+        .checks
+        .iter()
+        .find(|c| c.label == "runtime")
+        .expect("runtime check");
+    assert_eq!(
+        check
+            .detail
+            .iter()
+            .filter(|l| l.starts_with("live:") || l.starts_with("  "))
+            .cloned()
+            .collect::<Vec<_>>(),
+        vec![
+            "live: 2 across 1 account".to_string(),
+            "  busy · 2".to_string()
+        ],
+        "got {:?}",
+        check.detail
+    );
+}

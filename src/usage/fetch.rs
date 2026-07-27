@@ -5,6 +5,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 
 use crate::lockorder::{RankedMutex, rank};
+use crate::profile::AccountId;
 use crate::profile_cache::{
     ACCOUNT_ID_CACHE_FILE, PROFILE_FETCHED_CACHE_FILE, load_profile_cache, remove_profile_cache,
     write_profile_cache,
@@ -998,7 +999,8 @@ fn forget_profile_memo(name: &str) {
 /// drift, never an identity — same contract as [`seed_identity_anchor`] and
 /// [`fetch_account_uuid`].
 fn has_identity_anchor(name: &str) -> bool {
-    load_profile_cache::<String>(name, ACCOUNT_ID_CACHE_FILE).is_some_and(|u| !u.trim().is_empty())
+    load_profile_cache::<AccountId>(name, ACCOUNT_ID_CACHE_FILE)
+        .is_some_and(|u| !u.as_str().trim().is_empty())
 }
 
 /// The last `/profile` attempt stamp for `name`, honouring the durable stamp only
@@ -1190,8 +1192,8 @@ fn seed_identity_anchor(name: &str, profile: &RawProfile) {
     else {
         return;
     };
-    if load_profile_cache::<String>(name, ACCOUNT_ID_CACHE_FILE).is_none() {
-        write_profile_cache(name, ACCOUNT_ID_CACHE_FILE, &uuid.to_string());
+    if load_profile_cache::<AccountId>(name, ACCOUNT_ID_CACHE_FILE).is_none() {
+        write_profile_cache(name, ACCOUNT_ID_CACHE_FILE, &AccountId::from(uuid));
     }
 }
 
@@ -1202,7 +1204,7 @@ fn seed_identity_anchor(name: &str, profile: &RawProfile) {
 /// other still yields what it has.
 pub(crate) struct LoginProfile {
     pub(crate) subscription_type: Option<String>,
-    pub(crate) account_uuid: Option<String>,
+    pub(crate) account_uuid: Option<AccountId>,
 }
 
 /// Pull both login values out of an already-parsed `/profile` response. Split
@@ -1231,7 +1233,8 @@ fn login_profile_from_raw(p: RawProfile) -> LoginProfile {
         account_uuid: p
             .account
             .and_then(|a| a.uuid)
-            .filter(|u| !u.trim().is_empty()),
+            .filter(|u| !u.trim().is_empty())
+            .map(AccountId::from),
     }
 }
 
@@ -1281,7 +1284,7 @@ pub(crate) fn seed_login_anchor(name: &str, account_uuid: Option<&str>) {
 /// (`oauth::try_adopt_live_rotation`): two tokens belong to the same account
 /// iff their uuids match. Best-effort `None` on any failure (network, 401,
 /// shape drift) — callers must treat that as "identity unproven" and refuse.
-pub(crate) fn fetch_account_uuid(access_token: &str) -> Option<String> {
+pub(crate) fn fetch_account_uuid(access_token: &str) -> Option<AccountId> {
     let text = get_json(
         profile_endpoint().as_ref(),
         access_token,
@@ -1298,6 +1301,7 @@ pub(crate) fn fetch_account_uuid(access_token: &str) -> Option<String> {
         // blanks comparing equal must never prove two tokens are the same
         // account (the None contract above).
         .filter(|u| !u.trim().is_empty())
+        .map(AccountId::from)
 }
 
 pub(crate) fn now_ms() -> u64 {

@@ -1353,7 +1353,7 @@ fn login_creds(refresh: &str) -> crate::profile::ClaudeCredentials {
 fn login_outcome(refresh: &str, uuid: Option<&str>) -> crate::oauth_login::LoginOutcome {
     crate::oauth_login::LoginOutcome {
         credentials: login_creds(refresh),
-        account_uuid: uuid.map(str::to_string),
+        account_uuid: uuid.map(crate::profile::AccountId::from),
     }
 }
 

@@ -19,7 +19,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use sha2::{Digest, Sha256};
 
-use crate::profile::{ClaudeCredentials, OAuthToken};
+use crate::profile::{AccountId, ClaudeCredentials, OAuthToken};
 use crate::usage::now_ms;
 
 /// Claude Code's authorize endpoint for a Pro/Max **subscription** login
@@ -406,7 +406,7 @@ fn credentials_from_token(token: crate::oauth::TokenResponse) -> ClaudeCredentia
 #[derive(Debug, Clone)]
 pub(crate) struct LoginOutcome {
     pub(crate) credentials: ClaudeCredentials,
-    pub(crate) account_uuid: Option<String>,
+    pub(crate) account_uuid: Option<AccountId>,
 }
 
 /// Run the full interactive login: open the browser, catch the loopback

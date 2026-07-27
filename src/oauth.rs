@@ -8,7 +8,8 @@ use crate::claude::{LinkState, classify_credentials_link};
 use crate::lock::with_state_lock;
 use crate::logline::logline;
 use crate::profile::{
-    AppConfig, OAuthToken, clear_staged_credentials, save_profile, stage_rotated_credentials,
+    AccountId, AppConfig, OAuthToken, clear_staged_credentials, save_profile,
+    stage_rotated_credentials,
 };
 use crate::runtime::RotationGuard;
 use crate::usage::{
@@ -1108,7 +1109,7 @@ pub(crate) fn try_adopt_live_rotation(
     config: &crate::profile::ConfigHandle,
     name: &str,
     _rotation_guard: &crate::runtime::RotationGuard,
-    identity: &dyn Fn(&str) -> Option<String>,
+    identity: &dyn Fn(&str) -> Option<AccountId>,
 ) -> Option<(String, Option<String>)> {
     use crate::profile_cache::{ACCOUNT_ID_CACHE_FILE, load_profile_cache, write_profile_cache};
 
@@ -1146,7 +1147,7 @@ pub(crate) fn try_adopt_live_rotation(
 
     // Identity anchor: cached uuid, else the stored token's own uuid while it
     // still authenticates. No anchor → refuse (identity unprovable).
-    let expected: Option<String> = load_profile_cache::<String>(name, ACCOUNT_ID_CACHE_FILE)
+    let expected: Option<AccountId> = load_profile_cache::<AccountId>(name, ACCOUNT_ID_CACHE_FILE)
         .or_else(|| {
             let alive = (now_ms() as i64) < stored_expires;
             match (&stored_access, alive) {

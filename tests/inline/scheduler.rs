@@ -4148,7 +4148,7 @@ fn the_identity_memo_resolves_each_token_once() {
     let calls = std::cell::RefCell::new(Vec::<String>::new());
     let probe = |tok: &str| {
         calls.borrow_mut().push(tok.to_string());
-        Some(format!("uuid-of-{tok}"))
+        Some(crate::profile::AccountId::from(format!("uuid-of-{tok}")))
     };
     let identity = memoized_identity(&probe);
 
@@ -4176,7 +4176,7 @@ fn the_identity_memo_never_caches_a_failed_probe() {
     // Fails the first time, succeeds after — the mirror catching up mid-tick.
     let probe = |_tok: &str| {
         *calls.borrow_mut() += 1;
-        (*calls.borrow() > 1).then(|| "uuid-late".to_string())
+        (*calls.borrow() > 1).then(|| crate::profile::AccountId::from("uuid-late"))
     };
     let identity = memoized_identity(&probe);
 

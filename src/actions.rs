@@ -18,7 +18,7 @@ use crate::lock::with_state_lock;
 use crate::lockorder::RankedMutex;
 use crate::oauth;
 use crate::profile::{
-    AppConfig, ClaudeCredentials, DivergenceChoice, ModelSettings, Profile, profile_dir,
+    AccountId, AppConfig, ClaudeCredentials, DivergenceChoice, ModelSettings, Profile, profile_dir,
     save_app_state, save_profile,
 };
 use crate::providers::Provider;
@@ -714,12 +714,11 @@ pub(crate) fn identify_live_login_owner(config: &AppConfig) -> Option<String> {
     // can't recognize, so match CC's cached identity against the anchor instead.
     let live_uuid = crate::claude_json::home_oauth_account_uuid()?;
     config.profiles.iter().find_map(|p| {
-        let anchor = crate::profile_cache::load_profile_cache::<String>(
+        let anchor = crate::profile_cache::load_profile_cache::<AccountId>(
             &p.name,
             crate::profile_cache::ACCOUNT_ID_CACHE_FILE,
         )?;
-        let anchor = anchor.trim();
-        (!anchor.is_empty() && anchor == live_uuid.as_str()).then(|| p.name.as_str().to_string())
+        (!anchor.trim().is_empty() && anchor == live_uuid).then(|| p.name.as_str().to_string())
     })
 }
 
@@ -750,7 +749,7 @@ pub(crate) struct CaptureSnapshot {
     /// proven identity (a probe failure, or [`capture_snapshot`] reading live
     /// credentials off disk); that seeds nothing and leaves any existing anchor
     /// alone, exactly as before.
-    pub(crate) account_uuid: Option<String>,
+    pub(crate) account_uuid: Option<AccountId>,
 }
 
 pub(crate) fn capture_snapshot() -> Result<CaptureSnapshot> {
@@ -808,7 +807,7 @@ pub(crate) fn create_profile_from_login(
     name: String,
     model: Option<String>,
     credentials: ClaudeCredentials,
-    account_uuid: Option<String>,
+    account_uuid: Option<AccountId>,
 ) -> Result<()> {
     let seed_name = name.clone();
     with_state_lock(|| {

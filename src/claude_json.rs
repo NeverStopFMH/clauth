@@ -28,7 +28,7 @@ use anyhow::{Context, Result};
 use serde_json::Value;
 
 use crate::jsonsync::{KeyPath, KeyRule};
-use crate::profile::{atomic_write, home_dir};
+use crate::profile::{AccountId, atomic_write, home_dir};
 
 /// Account-specific keys that must never propagate between profiles.
 const PER_PROFILE_FIELDS: &[&str] = &[
@@ -115,7 +115,7 @@ fn sync_paths(paths: &[PathBuf]) -> Result<()> {
 /// untouched rather than clobbered. CC trusts this cached block and does not
 /// re-derive it from a swapped credentials file — so a hit is "CC's last booted
 /// identity", not fresh proof of the live token's account.
-pub(crate) fn home_oauth_account_uuid() -> Option<String> {
+pub(crate) fn home_oauth_account_uuid() -> Option<AccountId> {
     let path = home_dir().ok()?.join(".claude.json");
     let Ok(bytes) = std::fs::read(&path) else {
         return None; // missing — never create
@@ -128,7 +128,7 @@ pub(crate) fn home_oauth_account_uuid() -> Option<String> {
         .and_then(|v| v.as_str())
         .map(str::trim)
         .filter(|u| !u.is_empty())
-        .map(str::to_string)
+        .map(AccountId::from)
 }
 
 /// Delete the stale `oauthAccount` identity block from the home

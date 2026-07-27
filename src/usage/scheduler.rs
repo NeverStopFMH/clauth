@@ -515,9 +515,10 @@ fn keychain_live() -> bool {
 /// live mirror may have surfaced a fresh pair since the first attempt — memoizing
 /// the failure would quietly turn that second adopt into a no-op.
 fn memoized_identity<'a>(
-    probe: &'a dyn Fn(&str) -> Option<String>,
-) -> impl Fn(&str) -> Option<String> + 'a {
-    let seen: std::cell::RefCell<HashMap<String, String>> = std::cell::RefCell::new(HashMap::new());
+    probe: &'a dyn Fn(&str) -> Option<crate::profile::AccountId>,
+) -> impl Fn(&str) -> Option<crate::profile::AccountId> + 'a {
+    let seen: std::cell::RefCell<HashMap<String, crate::profile::AccountId>> =
+        std::cell::RefCell::new(HashMap::new());
     move |tok: &str| {
         if let Some(hit) = seen.borrow().get(tok).cloned() {
             return Some(hit);

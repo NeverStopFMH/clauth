@@ -899,7 +899,7 @@ fn login_snapshot(refresh: &str, account_uuid: Option<&str>) -> CaptureSnapshot 
         }),
         base_url: None,
         api_key: None,
-        account_uuid: account_uuid.map(str::to_string),
+        account_uuid: account_uuid.map(crate::profile::AccountId::from),
     }
 }
 

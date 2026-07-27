@@ -287,6 +287,10 @@ pub(crate) fn keychain_delete() -> Result<()> {
 ///
 /// The suffix is the first 8 hex chars of the SHA-256 of the canonicalized
 /// directory path, matching CC's `sha256(configDir).toString('hex').slice(0, 8)`.
+#[allow(
+    dead_code,
+    reason = "caller lands with the macOS swap-executor Keychain write"
+)]
 pub(crate) fn keychain_service_for_config_dir(config_dir: &Path) -> Result<String> {
     // Canonicalize: CC resolves symlinks before hashing, and a relative path
     // would produce a different hash than the absolute one CC computes.

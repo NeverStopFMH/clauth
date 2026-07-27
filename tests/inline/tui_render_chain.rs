@@ -1483,13 +1483,12 @@ fn card_texts(lines: &[Line<'static>]) -> Vec<String> {
 }
 
 /// The block, whole, for a member hosting sessions none of which has swapped:
-/// the bare count under the app-wide `live` key, and NOTHING else. The fixture
-/// mixes a follower with a pinned session so a follower qualifier coming back
-/// reds this — that split lives on the Overview cell's `⇄` alone. A session that
-/// never swapped has no repointed credential link, so §12's pickup lag does not
-/// apply to it and claiming it would over-warn in the other direction.
+/// the count under the app-wide `live` key with the follower qualifier (since
+/// one of the two rides the chain), and NOTHING else. A session that never
+/// swapped has no repointed credential link, so §12's pickup lag does not apply
+/// to it and claiming it would over-warn in the other direction.
 #[test]
-fn the_session_block_counts_live_sessions_and_carries_no_caveat_until_one_has_swapped() {
+fn the_session_block_emits_the_follower_qualifier_when_one_session_follows() {
     let sessions = crate::live_sessions::LiveTally::of([
         live_row("4242-0", "a", true, None),
         live_row("4242-1", "a", false, None),
@@ -1498,7 +1497,24 @@ fn the_session_block_counts_live_sessions_and_carries_no_caveat_until_one_has_sw
 
     assert_eq!(
         card_texts(&live_session_lines(sessions, 60)),
-        vec![String::new(), "live         2".to_string()],
+        vec!["live         2, 1 with fallback".to_string()],
+    );
+}
+
+/// A pure-pinned count has no movable split to name, so the qualifier stays
+/// off. `following > 0` is the gate, not `sessions > 1`. Pairs with the
+/// mixed-fixture test above to pin both arms of the branch.
+#[test]
+fn the_session_block_omits_the_qualifier_when_no_session_follows() {
+    let sessions = crate::live_sessions::LiveTally::of([
+        live_row("4242-0", "a", false, None),
+        live_row("4242-1", "a", false, None),
+    ])
+    .member("a");
+
+    assert_eq!(
+        card_texts(&live_session_lines(sessions, 60)),
+        vec!["live         2".to_string()],
     );
 }
 
@@ -1519,8 +1535,7 @@ fn the_session_block_dates_the_last_swap_and_says_when_it_is_picked_up() {
     assert_eq!(
         card_texts(&live_session_lines(sessions, 60)),
         vec![
-            String::new(),
-            "live         1".to_string(),
+            "live         1, 1 with fallback".to_string(),
             "last swap    3h ago".to_string(),
             " └ picked up on the session's next request".to_string(),
         ],
@@ -1543,7 +1558,6 @@ fn a_swap_this_very_second_reads_as_just_now() {
     assert_eq!(
         card_texts(&live_session_lines(sessions, 60)),
         vec![
-            String::new(),
             "live         1".to_string(),
             "last swap    just now".to_string(),
             " └ picked up on the session's next request".to_string(),
@@ -1598,12 +1612,12 @@ fn the_session_block_is_absent_when_nothing_is_live() {
     );
 }
 
-/// Position, not just presence: the block sits between the 5h headroom figure
-/// and the blank row that opens `FALLBACK_ROWS`, and `rows_start` is read off
-/// the buffer, so a block inserted anywhere else would move the native caret off
-/// every row it points at.
+/// Position and rhythm: the block sits ABOVE the 5h gauge with its own
+/// trailing blank separating the two. `rows_start` is read off the buffer, so
+/// a block inserted anywhere else would move the native caret off every row
+/// it points at.
 #[test]
-fn the_member_card_places_the_session_block_between_the_headroom_figure_and_the_rows() {
+fn the_member_card_places_the_session_block_above_the_five_hour_gauge() {
     let cfg = config_with(vec![profile("a", 95.0, 10.0, 3600)], None, vec!["a"]);
     let sessions =
         crate::live_sessions::LiveTally::of([live_row("4242-0", "a", true, None)]).member("a");
@@ -1616,64 +1630,12 @@ fn the_member_card_places_the_session_block_between_the_headroom_figure_and_the_
     assert_eq!(
         &texts[..rows_start],
         [
+            "live         1, 1 with fallback",
+            "",
             "5h usage     ██░░░░░░░░░░░░░░░░░░░│  10% used",
             "             85% until rotate",
             "",
-            "live         1",
-            "",
         ],
-    );
-}
-
-/// The gap above `sessions` belongs to the session block, not to an accident.
-/// It used to come from the `% until rotate` continuation line being pushed
-/// unconditionally and holding an empty string when the account had no 5h
-/// reading — so the ONLY cards with a gap there were the ones with no data.
-/// Both shapes now open the block the same way, and `rows_start` (read off the
-/// buffer, and where the native edit caret is anchored) still lands on the row
-/// straight after the block's own trailing blank.
-#[test]
-fn the_session_block_opens_the_same_way_with_and_without_a_five_hour_reading() {
-    let sessions =
-        crate::live_sessions::LiveTally::of([live_row("4242-0", "a", true, None)]).member("a");
-    let mut blind = profile("a", 95.0, 10.0, 3600);
-    blind.usage = None;
-
-    let card = |p: Profile| {
-        let cfg = config_with(vec![p], None, vec!["a"]);
-        let (lines, rows_start) = member_detail(
-            &cfg, "a", false, 0, false, None, None, None, 60, None, sessions,
-        );
-        (card_texts(&lines), rows_start)
-    };
-
-    let (with_data, with_start) = card(profile("a", 95.0, 10.0, 3600));
-    let (no_data, no_start) = card(blind);
-
-    // The two headers differ only in the headroom figure the reading produces.
-    assert_eq!(
-        &with_data[..with_start],
-        [
-            "5h usage     ██░░░░░░░░░░░░░░░░░░░│  10% used",
-            "             85% until rotate",
-            "",
-            "live         1",
-            "",
-        ],
-    );
-    assert_eq!(
-        &no_data[..no_start],
-        [
-            "5h usage     ░░░░░░░░░░░░░░░░░░░░░│  no data yet",
-            "",
-            "live         1",
-            "",
-        ],
-    );
-    // Same rhythm around the block on both: one blank before, one after.
-    assert_eq!(
-        &with_data[with_start - 3..with_start],
-        &no_data[no_start - 3..no_start],
     );
 }
 
@@ -1720,7 +1682,7 @@ fn the_fallback_tab_reads_the_apps_live_session_tally() {
         card.split('│')
             .find(|seg| seg.contains(KEY))
             .map(str::trim_end),
-        Some(" live         1"),
+        Some(" live         1, 1 with fallback"),
     );
 }
 

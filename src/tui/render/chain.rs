@@ -400,14 +400,19 @@ fn reason_fix(reason: &BlockedReason, name: &str) -> String {
 /// gate), so the count reads the same wherever the operator meets it on screen.
 /// The CLI's refusals share the noun but not the phrasing — they answer a
 /// different question (why a command was refused), so they word it their own
-/// way. The follower split the value used to carry
-/// (`3 (2 following)`) lives on the Overview cell's `⇄` mark alone —
-/// `MemberSessions::following` still feeds that.
+/// way.
 ///
-/// Leads with its own blank line so the gap above `sessions` is deliberate and
-/// present either way. It used to come from the `% until rotate` continuation
-/// line rendering empty, which meant an account with no 5h data got the gap and
-/// an account with data did not.
+/// The follower qualifier (`N, M with fallback`) returned to this card on
+/// 2026-07-27 after a one-day removal: `⇄` on the Overview cell still carries
+/// the same split for the column view, but this card is where the chain facts
+/// live. A glyph alone could not say "1 of these is movable" next to rows
+/// that already spell out every other chain fact. Shown only when
+/// `following > 0`. A pure-pinned count has no split to name. Both surfaces
+/// read the same `MemberSessions::following` field.
+///
+/// No leading blank: the caller owns the gaps around the block (post-pill
+/// blank above, post-live blank below), so where it sits in the card is the
+/// caller's decision and stays consistent whether or not 5h data exists.
 ///
 /// Claude Code re-reads its credentials on its NEXT REQUEST, an mtime `stat` on
 /// the request path with no watcher behind it
@@ -424,13 +429,18 @@ fn live_session_lines(
     if sessions.sessions == 0 {
         return Vec::new();
     }
-    let mut lines = vec![
-        Line::from(""),
-        Line::from(vec![
-            Span::styled(key_cell("live", KEY_W, KEY_GUTTER), theme::label()),
-            Span::styled(sessions.sessions.to_string(), theme::dim()),
-        ]),
-    ];
+    let count = if sessions.following > 0 {
+        format!(
+            "{}, {} with fallback",
+            sessions.sessions, sessions.following
+        )
+    } else {
+        sessions.sessions.to_string()
+    };
+    let mut lines = vec![Line::from(vec![
+        Span::styled(key_cell("live", KEY_W, KEY_GUTTER), theme::label()),
+        Span::styled(count, theme::dim()),
+    ])];
     let Some(at) = sessions.last_swap_at else {
         return lines;
     };
@@ -480,7 +490,7 @@ fn pill_block(pills: Vec<(Vec<Span<'static>>, String)>, width: usize) -> Vec<Lin
     lines
 }
 
-/// Priority, 5h gauge with threshold tick, headroom figure, and the
+/// Live-session count, 5h gauge with threshold tick, headroom figure, and the
 /// inline `rotate at` threshold stepper/editor + `last resort` toggle + `remove` rows.
 /// Caret only when focused.
 #[allow(clippy::too_many_arguments)]
@@ -538,6 +548,16 @@ fn member_detail(
         lines.push(Line::from(""));
     }
 
+    // Live-session block above the 5h gauge, so the chain-movable count reads
+    // ahead of the gauge that decides when it moves. The block owns no padding:
+    // the gap above is the post-pill blank (when pills exist); the gap below is
+    // the trailing blank emitted here when the block is non-empty.
+    let live_lines = live_session_lines(sessions, width);
+    if !live_lines.is_empty() {
+        lines.extend(live_lines);
+        lines.push(Line::from(""));
+    }
+
     // `5h usage` — gauge lives on the kv key row (matching the `rotate at`
     // grammar), headroom figure indented beneath it. Two lines, not three:
     // the standalone eyebrow is folded into the key.
@@ -564,7 +584,6 @@ fn member_detail(
             ),
         ]));
     }
-    lines.extend(live_session_lines(sessions, width));
     lines.push(Line::from(""));
 
     // Where the FALLBACK_ROWS loop starts, taken from the buffer itself rather

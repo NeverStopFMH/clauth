@@ -17,8 +17,8 @@ use super::super::theme;
 use super::chain::reason_marker;
 use super::format::spinner_frame;
 use super::panes::{
-    DIAG_AUTH_BROKEN, DIAG_BUDGET_SPENT, DIAG_CANCELED, DIAG_DISABLED, DIAG_KICK, bold_when,
-    draw_scrolled_lines, head_cols, key_cell,
+    DIAG_AUTH_BROKEN, DIAG_BUDGET_SPENT, DIAG_CANCELED, DIAG_DISABLED, DIAG_KICK, DIAG_STALE,
+    DIAG_WEEKLY_SOFT, DIAG_WEEKLY_SPENT, bold_when, draw_scrolled_lines, head_cols, key_cell,
 };
 use crate::fallback::BlockedReason;
 
@@ -679,7 +679,7 @@ fn glyph_rows() -> Vec<(Span<'static>, &'static str)> {
         reason(BlockedReason::AuthBroken, DIAG_AUTH_BROKEN),
         reason(
             BlockedReason::WeeklySpent { resets_in: None },
-            "weekly spent",
+            DIAG_WEEKLY_SPENT,
         ),
         reason(BlockedReason::KickRejected { lifts_in: 0 }, DIAG_KICK),
         reason(BlockedReason::BudgetSpent, DIAG_BUDGET_SPENT),
@@ -697,11 +697,8 @@ fn glyph_rows() -> Vec<(Span<'static>, &'static str)> {
             },
             "one model's week spent, other models ok",
         ),
-        reason(
-            BlockedReason::WeeklySoft { pct: 0.0 },
-            "past the weekly switch line, still serving",
-        ),
-        reason(BlockedReason::Stale, "stale data"),
+        reason(BlockedReason::WeeklySoft { pct: 0.0 }, DIAG_WEEKLY_SOFT),
+        reason(BlockedReason::Stale, DIAG_STALE),
     ]
 }
 

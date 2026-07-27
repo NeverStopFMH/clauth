@@ -25,10 +25,10 @@ use super::super::theme;
 use super::format::{ResetFmt, fixed_split, relative_age, reset_pill, reset_resume};
 use super::global_config::default_reminder;
 use super::panes::{
-    DIAG_AUTH_BROKEN, DIAG_BUDGET_SPENT, DIAG_CANCELED, DIAG_DISABLED, DIAG_KICK, bold_when,
-    draw_selector_list, head_cols, help_tooltip_lines, highlight_row, invalid_tooltip_lines,
-    key_cell, label_style, master_detail, name_color, pill, rail_hint_lines, section_box,
-    section_box_verbatim, select_line, wrap_words,
+    DIAG_AUTH_BROKEN, DIAG_BUDGET_SPENT, DIAG_CANCELED, DIAG_DISABLED, DIAG_KICK, DIAG_STALE,
+    DIAG_WEEKLY_SOFT, DIAG_WEEKLY_SPENT, bold_when, draw_selector_list, head_cols,
+    help_tooltip_lines, highlight_row, invalid_tooltip_lines, key_cell, label_style, master_detail,
+    name_color, pill, rail_hint_lines, section_box, section_box_verbatim, select_line, wrap_words,
 };
 use crate::fallback::{
     BlockedReason, DEFAULT_THRESHOLD, blocked_reason, health_blocked_reason, soonest_resume,
@@ -330,7 +330,7 @@ fn reason_pill_spans(reason: &BlockedReason, fmt: ResetFmt) -> Vec<Span<'static>
         BlockedReason::Canceled => (DIAG_CANCELED.to_string(), theme::danger().bold(), None),
         BlockedReason::AuthBroken => (DIAG_AUTH_BROKEN.to_string(), theme::danger().bold(), None),
         BlockedReason::WeeklySpent { resets_in } => (
-            "weekly spent".to_string(),
+            DIAG_WEEKLY_SPENT.to_string(),
             theme::danger().bold(),
             resets_in.as_ref().map(|s| reset_pill(*s, fmt)),
         ),
@@ -357,7 +357,7 @@ fn reason_pill_spans(reason: &BlockedReason, fmt: ResetFmt) -> Vec<Span<'static>
             theme::warning().bold(),
             Some("still serving".to_string()),
         ),
-        BlockedReason::Stale => ("stale data".to_string(), theme::dim().bold(), None),
+        BlockedReason::Stale => (DIAG_STALE.to_string(), theme::dim().bold(), None),
     };
     let mut spans = pill(label, style);
     if let Some(suffix) = suffix {
@@ -384,9 +384,7 @@ fn reason_fix(reason: &BlockedReason, name: &str) -> String {
         BlockedReason::ScopedSpent { .. } => {
             "that model's weekly window is spent, other models still serve".to_string()
         }
-        BlockedReason::WeeklySoft { .. } => {
-            "past the weekly switch line, still serving".to_string()
-        }
+        BlockedReason::WeeklySoft { .. } => DIAG_WEEKLY_SOFT.to_string(),
         BlockedReason::Stale => "last usage check failed".to_string(),
     }
 }

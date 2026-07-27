@@ -162,6 +162,9 @@ pub(super) const DIAG_CANCELED: &str = "canceled";
 pub(super) const DIAG_AUTH_BROKEN: &str = "auth broken";
 pub(super) const DIAG_BUDGET_SPENT: &str = "extra usage spent";
 pub(super) const DIAG_KICK: &str = "claude code blocked";
+pub(super) const DIAG_WEEKLY_SPENT: &str = "weekly spent";
+pub(super) const DIAG_WEEKLY_SOFT: &str = "past the weekly switch line, still serving";
+pub(super) const DIAG_STALE: &str = "stale data";
 
 /// cloudy-tui status pill `[ label ]`: brackets in `TEXT_DIM`, the label in the
 /// caller's semantic style (bold for a charged state). Returns the three spans

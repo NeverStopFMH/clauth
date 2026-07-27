@@ -150,8 +150,13 @@ impl OverviewWidths {
         } else {
             12
         };
+        // One wider than 5h: `humanize_duration` hits 7 chars (`10h 20m`,
+        // `23h 59m`) inside the 7d countdown's 10h–23h band, and the 26-cell
+        // tier was sized for the 6-char ceiling. The bare-suffix fit check in
+        // `reset_suffix` deliberately does not clamp the countdown itself, so
+        // the column has to absorb the extra cell or it leaks into `live`.
         let mut seven_day = if total >= 102 {
-            26
+            27
         } else if total >= 93 {
             17
         } else if total >= 58 {
@@ -196,7 +201,7 @@ impl OverviewWidths {
             if five_hour == 26 {
                 five_hour += CLOCK_COLS.min(slack(five_hour, seven_day));
             }
-            if seven_day == 26 {
+            if seven_day == 27 {
                 seven_day += CLOCK_COLS.min(slack(five_hour, seven_day));
             }
         }
@@ -505,9 +510,12 @@ fn live_cell(sessions: crate::live_sessions::MemberSessions, width: usize) -> Sp
     if sessions.sessions == 0 {
         return Span::raw(" ".repeat(width));
     }
-    let follows = if sessions.following > 0 { "⇄" } else { "" };
+    // `⇄` goes at the trailing cell so the count column is shared across rows
+    // and the marker lines up at the right edge.
+    let marker = if sessions.following > 0 { "⇄" } else { " " };
+    let count_w = width.saturating_sub(1);
     Span::styled(
-        fixed(&format!("{}{follows}", sessions.sessions), width),
+        format!("{}{marker}", fixed(&sessions.sessions.to_string(), count_w)),
         theme::dim(),
     )
 }

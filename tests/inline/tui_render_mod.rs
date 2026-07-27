@@ -1426,7 +1426,7 @@ fn the_live_column_exists_exactly_where_the_other_columns_left_room() {
     const PRESENCE: &[(usize, &[(u16, u16)])] = &[
         (8, &[(48, 200)]),
         (11, &[(51, 200)]),
-        (16, &[(56, 61), (63, 69), (74, 96), (99, 105), (108, 200)]),
+        (16, &[(56, 61), (63, 69), (74, 96), (99, 105), (109, 200)]),
     ];
 
     for (name_len, ranges) in PRESENCE {

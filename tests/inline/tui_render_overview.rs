@@ -1306,13 +1306,42 @@ fn the_live_column_counts_live_sessions_and_marks_chain_followers() {
 
     assert_eq!(
         live_cell_text(&widths, &main),
-        "2⇄  ",
+        "2  ⇄",
         "two sessions, one of them steerable"
     );
     assert_eq!(
         live_cell_text(&widths, &spare),
         "1   ",
         "a pinned session still holds the account and burns its window, but no `⇄`"
+    );
+}
+
+/// `humanize_duration` goes 7 chars wide once the 7d reset lands in the 10h–23h
+/// band with double-digit minutes (`10h 20m`), and the 26-cell 7d tier was sized
+/// for the 6-char ceiling (`6d 23h`). The overflow leaks past the column's right
+/// edge and shoves every column after it — including `live` — one cell right, so
+/// the `live` header no longer lines up with its cell. Pinning the cell under the
+/// header catches both the overflow and any future change to the budget.
+#[test]
+fn live_cell_stays_under_header_when_7d_reset_is_two_digit_hours() {
+    let mut p = profile("main", 95.0, 10.0, 3600);
+    if let Some(ref mut usage) = p.usage {
+        // 37200s = 10h 20m → `humanize_duration` emits the 7-char form.
+        usage.seven_day = Some(UsageWindow {
+            utilization: 95.0,
+            resets_at: Some(reset_in(37_200)),
+        });
+    }
+    let mut app = App::new(config_with(vec![p], Some("main"), vec![]));
+    app.live_sessions = crate::live_sessions::LiveTally::of([live_row("4242-0", "main", true)]);
+
+    let widths = OverviewWidths::new(120, &app);
+    let row = render_overview_row(&app, 0, &widths, false, false);
+
+    assert_eq!(
+        live_cell_text(&widths, &row),
+        "1  ⇄",
+        "the 7d reset suffix must not push the live cell past its header"
     );
 }
 

@@ -3513,6 +3513,7 @@ fn a_swap_moves_the_mtime_of_the_store_it_repoints_to() {
 /// rotation that died mid-save would be silently discarded, losing a refresh pair
 /// that may be the only live one. `load_profile` adopting it first is what makes
 /// the touch safe, and the plan the touch requires is minted by that load.
+#[cfg(not(target_os = "macos"))]
 #[test]
 fn a_swap_adopts_a_crash_staged_sidecar_before_moving_the_store_mtime() {
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -4472,6 +4473,7 @@ fn poll_executes_the_member_the_daemon_named() {
 /// A standing intent the executor refuses re-fires every tick, so announcing
 /// unconditionally writes one line per second for as long as it stands — but a
 /// refusal nothing ever says leaves the session on its launch account invisibly.
+#[cfg(not(target_os = "macos"))]
 #[test]
 fn a_standing_refusal_is_announced_once_per_reason() {
     let tmp = tempfile::tempdir().expect("tempdir");

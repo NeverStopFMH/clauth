@@ -3445,6 +3445,7 @@ fn session_row_is_live_finds_the_marker_a_real_session_stamped() {
 
 /// Every member in one config, each carrying a refresh token, so only the
 /// live-session gate can keep it out of `rotation_candidates`.
+#[cfg(not(target_os = "macos"))]
 fn config_of(members: &[&Profile]) -> crate::profile::AppConfig {
     let mut config = crate::profile::AppConfig {
         state: crate::profile::AppState::default(),

@@ -1900,7 +1900,7 @@ impl ProfileRuntime {
     /// This session's swap executor. Production reaches it through the watchdog
     /// thread's own clone; this accessor exists so a test can drive one leg at a
     /// time instead of racing a 1 Hz tick.
-    #[cfg(test)]
+    #[cfg(all(test, not(target_os = "macos")))]
     fn swap(&self) -> &SessionSwap {
         &self.swap
     }

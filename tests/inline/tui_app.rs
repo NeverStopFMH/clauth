@@ -1718,6 +1718,125 @@ fn login_stage_events_advance_the_session() {
     assert_eq!(session.stage, LoginStage::ExchangingCode);
 }
 
+/// `?` opens the help modal at the top and ↑↓ scrolls it, clamped both ways —
+/// past the end a held ↓ would inflate the offset and make the next ↑ look
+/// dead, which is exactly what the Status and Plugin detail panes clamp for.
+#[test]
+fn help_modal_arrows_scroll_within_the_rendered_bounds() {
+    use super::{KeyCode, Modal, handle_key};
+    use crate::profile::{AppConfig, AppState};
+    let _home = crate::testutil::HomeSandbox::new();
+
+    let mut app = App::new(AppConfig {
+        state: AppState::default(),
+        profiles: vec![],
+    });
+    app.help_scroll = 7; // a stale offset from a previous open
+    handle_key(&mut app, crate::testutil::key(KeyCode::Char('?')));
+    assert!(matches!(app.modals.last(), Some(Modal::Help)));
+    assert_eq!(app.help_scroll, 0, "the modal opens at the top");
+
+    // Stands in for the render pass, which publishes the bound each frame.
+    // The values are ones a real 100-col `draw_help` actually produces: 29 at a
+    // 16-row terminal, 15 at 30 rows, 0 once the whole modal fits.
+    app.help_max_scroll.set(29);
+    for _ in 0..40 {
+        handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+    }
+    assert_eq!(app.help_scroll, 29, "↓ stops at the last renderable row");
+
+    // The bound MOVES: growing the terminal shrinks the scrollable range, and
+    // the offset left over from the short viewport is now past the end. ↑ must
+    // land one row above the NEW bottom — stepping down from the stale 29 would
+    // cost 14 presses that visibly move nothing, since the render clamps the
+    // display to 15 the whole way.
+    app.help_max_scroll.set(15);
+    handle_key(&mut app, crate::testutil::key(KeyCode::Up));
+    assert_eq!(
+        app.help_scroll, 14,
+        "↑ steps back from the bound, not the stale offset"
+    );
+
+    for _ in 0..30 {
+        handle_key(&mut app, crate::testutil::key(KeyCode::Up));
+    }
+    assert_eq!(app.help_scroll, 0, "↑ stops at the top");
+
+    // A viewport that swallowed the whole modal collapses the range to nothing.
+    app.help_max_scroll.set(0);
+    handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+    assert_eq!(app.help_scroll, 0, "nothing to scroll, nothing moves");
+    assert!(
+        matches!(app.modals.last(), Some(Modal::Help)),
+        "scrolling must not close the modal"
+    );
+
+    handle_key(&mut app, crate::testutil::key(KeyCode::Esc));
+    assert!(app.modals.is_empty(), "esc still closes it");
+}
+
+/// The same stale-offset defect the help modal had, on the two detail panes
+/// that share its scroll shape. Both clamp `↓` against the bound the render
+/// publishes but stepped `↑` down from whatever `detail_scroll` held, so a
+/// terminal that GREW — or, here, a shorter incident selected after a long one —
+/// left the offset above the new bound with the render clamping the display.
+/// Every `↑` press until the offset caught up moved nothing.
+#[test]
+fn status_detail_up_steps_back_from_the_published_bound() {
+    use super::{KeyCode, StatusFocus, Tab, handle_key};
+    use crate::profile::{AppConfig, AppState};
+    let _home = crate::testutil::HomeSandbox::new();
+
+    let mut app = App::new(AppConfig {
+        state: AppState::default(),
+        profiles: vec![],
+    });
+    app.tab = Tab::Status;
+    app.status.focus = StatusFocus::Detail;
+
+    // Stands in for the render pass, which publishes the bound each frame.
+    app.status.detail_max_scroll.set(40);
+    for _ in 0..60 {
+        handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+    }
+    assert_eq!(app.status.detail_scroll, 40, "↓ stops at the bound");
+
+    app.status.detail_max_scroll.set(12);
+    handle_key(&mut app, crate::testutil::key(KeyCode::Up));
+    assert_eq!(
+        app.status.detail_scroll, 11,
+        "↑ steps back from the bound, not the stale offset"
+    );
+}
+
+/// Plugin's detail pane, same defect and same fix as the Status one above.
+#[test]
+fn plugin_detail_up_steps_back_from_the_published_bound() {
+    use super::{KeyCode, PluginFocus, Tab, handle_key};
+    use crate::profile::{AppConfig, AppState};
+    let _home = crate::testutil::HomeSandbox::new();
+
+    let mut app = App::new(AppConfig {
+        state: AppState::default(),
+        profiles: vec![],
+    });
+    app.tab = Tab::Plugin;
+    app.plugin.focus = PluginFocus::Detail;
+
+    app.plugin.detail_max_scroll.set(40);
+    for _ in 0..60 {
+        handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+    }
+    assert_eq!(app.plugin.detail_scroll, 40, "↓ stops at the bound");
+
+    app.plugin.detail_max_scroll.set(12);
+    handle_key(&mut app, crate::testutil::key(KeyCode::Up));
+    assert_eq!(
+        app.plugin.detail_scroll, 11,
+        "↑ steps back from the bound, not the stale offset"
+    );
+}
+
 #[test]
 fn login_modal_esc_collapses_without_canceling() {
     use super::{KeyCode, Modal, handle_key, start_login};

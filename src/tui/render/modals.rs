@@ -18,7 +18,7 @@ use super::chain::reason_marker;
 use super::format::spinner_frame;
 use super::panes::{
     DIAG_AUTH_BROKEN, DIAG_BUDGET_SPENT, DIAG_CANCELED, DIAG_DISABLED, DIAG_KICK, bold_when,
-    head_cols, key_cell,
+    draw_scrolled_lines, head_cols, key_cell,
 };
 use crate::fallback::BlockedReason;
 
@@ -106,6 +106,27 @@ fn centered(area: Rect, width: u16, height: u16) -> Rect {
 /// tail. On any terminal wide enough for the content nothing splits and the
 /// modal renders exactly as before.
 fn draw_modal(frame: &mut Frame<'_>, area: Rect, title: &str, lines: Vec<Line<'_>>) {
+    draw_modal_scrolled(frame, area, title, lines, 0);
+}
+
+/// [`draw_modal`] with the content scrolled to start at row `scroll`, returning
+/// the largest offset the content allows so a caller holding the offset in state
+/// can clamp its key handler against it (the render pass owns the viewport).
+///
+/// A terminal too short for the whole modal used to drop the tail with nothing
+/// on screen saying so. The rows now go through the shared scrolled-lines
+/// helper, which draws the overflow scrollbar the cloudy-tui contract makes the
+/// only legal overflow signal. The focus block handed to it is the viewport
+/// window itself — "keep rows `scroll..scroll + viewport` on screen" — which
+/// resolves to exactly `scroll` once clamped. A modal that fits scrolls by 0 and
+/// draws no bar, so it renders as before.
+fn draw_modal_scrolled(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    title: &str,
+    lines: Vec<Line<'_>>,
+    scroll: u16,
+) -> u16 {
     let content_w = lines.iter().map(Line::width).max().unwrap_or(0) as u16;
     let w = (content_w + 6)
         .max(title.chars().count() as u16 + 4)
@@ -122,7 +143,18 @@ fn draw_modal(frame: &mut Frame<'_>, area: Rect, title: &str, lines: Vec<Line<'_
     let block = modal_block(title);
     let inner = block.inner(rect);
     frame.render_widget(block, rect);
-    frame.render_widget(Paragraph::new(lines).style(theme::base()), inner);
+
+    let viewport = inner.height as usize;
+    // A terminal short enough to leave no inner rows at all draws nothing, and
+    // `total - 0` would publish the whole content as a reachable offset.
+    let max_scroll = if viewport == 0 {
+        0
+    } else {
+        lines.len().saturating_sub(viewport).min(u16::MAX as usize) as u16
+    };
+    let scroll = scroll.min(max_scroll) as usize;
+    draw_scrolled_lines(frame, inner, lines, (scroll, scroll + viewport));
+    max_scroll
 }
 
 /// Split one styled line into `w`-column rows by character, preserving span
@@ -492,7 +524,7 @@ fn tab_specific_rows(tab: Tab) -> Vec<(&'static str, &'static [(&'static str, &'
                 ("env", "+ add env · \u{21b5} edits a value · a removes"),
                 (
                     "disable / enable",
-                    "\u{21b5} arms disable, again confirms \u{b7} enable is one press \u{b7} inert while active or a session is open",
+                    "\u{21b5} arms disable, again confirms \u{b7} enable is one press \u{b7} inert while active or a live session is open",
                 ),
                 ("delete", "\u{21b5} once to arm, again to confirm"),
                 ("esc", "stop editing / back to account list"),
@@ -556,6 +588,19 @@ fn draw_help(frame: &mut Frame<'_>, area: Rect, app: &App) {
         "previous / next tab (shift tab: previous)",
     )];
 
+    // The modal's own keys, in their own section. Not folded into `global`
+    // below: every tab binds ↑↓ for its own list, so the shadow filter there
+    // would drop this row on all eight — and hanging it off another section
+    // would put two ↑↓ rows with different senses a few lines apart, the exact
+    // contradiction that filter exists to prevent.
+    // The close keys were documented only at app level, where `q` reads
+    // "back / quit" and `esc` reads "back within a sub-view" — neither tells a
+    // reader how to dismiss what they are looking at.
+    let modal_keys: &[(&str, &str)] = &[
+        ("\u{2191}\u{2193}", "scroll"),
+        ("esc \u{00b7} q \u{00b7} ?", "close"),
+    ];
+
     let global_all: &[(&str, &str)] = &[
         ("n", "new account"),
         ("r", "refresh usage now"),
@@ -583,15 +628,22 @@ fn draw_help(frame: &mut Frame<'_>, area: Rect, app: &App) {
 
     let mut lines: Vec<Line<'_>> = Vec::new();
     lines.extend(key_section("tabs", nav));
+    lines.extend(key_section("this modal", modal_keys));
     for (section, entries) in &tab_specific {
         lines.extend(key_section(section, entries));
     }
     lines.extend(key_section("global", &global));
-    // Last, so the keys survive on a terminal too short for the whole modal —
-    // `draw_modal` clamps the height and drops the tail rather than scrolling.
+    // Last: the keys are what a reader came for, so they stay in view on a
+    // terminal too short for the whole modal. ↑↓ reaches the legend from there.
     lines.extend(glyph_section("glyphs", glyph_rows()));
     lines.pop(); // trim trailing blank from last section
-    draw_modal(frame, area, title, lines);
+    app.help_max_scroll.set(draw_modal_scrolled(
+        frame,
+        area,
+        title,
+        lines,
+        app.help_scroll,
+    ));
 }
 
 /// Legend for the 1-cell marks the account surfaces carry, with no key of their

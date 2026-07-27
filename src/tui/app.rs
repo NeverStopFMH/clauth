@@ -1322,6 +1322,12 @@ pub(crate) struct App {
     pub(crate) third_party_status: ThirdPartyStatusStore,
     pub(crate) tab: Tab,
     pub(crate) modals: Vec<Modal>,
+    /// First help-modal row on screen (↑↓ scrolls). Reset when the modal opens.
+    pub(crate) help_scroll: u16,
+    /// Max valid `help_scroll` from the last help render (`total - viewport`).
+    /// Interior mutability because the render pass takes `&App`; clamping there
+    /// stops a held ↓ from inflating `help_scroll` past the end.
+    pub(crate) help_max_scroll: std::cell::Cell<u16>,
 
     /// Selected account index, shared across Overview/Usage/Setup tabs.
     /// On Setup may also rest on the trailing `+ new` row (== profile_count).
@@ -1693,6 +1699,8 @@ impl App {
             third_party_status,
             tab: Tab::Overview,
             modals: Vec::new(),
+            help_scroll: 0,
+            help_max_scroll: std::cell::Cell::new(0),
             profile_cursor: 0,
             config_focus: ConfigFocus::Profiles,
             config_action_cursor: 0,
@@ -2412,6 +2420,7 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) {
         }
         KeyCode::Char('?') => {
             app.disarm_quit();
+            app.help_scroll = 0;
             app.modals.push(Modal::Help);
             return;
         }
@@ -2747,7 +2756,13 @@ fn handle_status_key(app: &mut App, key: KeyEvent) {
         }
         StatusFocus::Detail => match key.code {
             KeyCode::Up => {
-                app.status.detail_scroll = app.status.detail_scroll.saturating_sub(1);
+                // Clamp before stepping, for the mirror of the ↓ case: a shorter
+                // incident (or a taller terminal) shrinks the bound under an
+                // offset that outlived it, and stepping down from the stale
+                // value costs one press per row while the render clamps the
+                // display, so ↑ reads as dead.
+                let max = app.status.detail_max_scroll.get();
+                app.status.detail_scroll = app.status.detail_scroll.min(max).saturating_sub(1);
             }
             KeyCode::Down => {
                 // Clamp against the last render's content height so a held ↓ can't
@@ -2793,7 +2808,9 @@ fn handle_plugin_key(app: &mut App, key: KeyEvent) {
         }
         PluginFocus::Detail => match key.code {
             KeyCode::Up => {
-                app.plugin.detail_scroll = app.plugin.detail_scroll.saturating_sub(1);
+                // Clamp before stepping — see the Status detail pane's ↑ arm.
+                let max = app.plugin.detail_max_scroll.get();
+                app.plugin.detail_scroll = app.plugin.detail_scroll.min(max).saturating_sub(1);
             }
             KeyCode::Down => {
                 let max = app.plugin.detail_max_scroll.get();
@@ -4757,14 +4774,27 @@ fn handle_modal_key(app: &mut App, key: KeyEvent) {
         return;
     };
     match top {
-        Modal::Help => {
-            if matches!(
-                key.code,
-                KeyCode::Esc | KeyCode::Enter | KeyCode::Char('?' | 'q')
-            ) {
+        // The keymap outgrows a short terminal, so ↑↓ scrolls it — the same
+        // binding every other scrollable surface here uses. BOTH arms clamp
+        // against the bound the last render published: growing the terminal
+        // shrinks the range under a `help_scroll` that outlived it, and an
+        // unclamped step down would then need one press per stale row before
+        // the view moved at all (the render clamps the display meanwhile, so
+        // the key just looks dead).
+        Modal::Help => match key.code {
+            KeyCode::Up => {
+                let max = app.help_max_scroll.get();
+                app.help_scroll = app.help_scroll.min(max).saturating_sub(1);
+            }
+            KeyCode::Down => {
+                let max = app.help_max_scroll.get();
+                app.help_scroll = app.help_scroll.saturating_add(1).min(max);
+            }
+            KeyCode::Esc | KeyCode::Enter | KeyCode::Char('?' | 'q') => {
                 app.modals.pop();
             }
-        }
+            _ => {}
+        },
         Modal::Confirm(_) => handle_confirm_key(app, key),
         Modal::Divergence(_) => handle_divergence_key(app, key),
         Modal::CaptureName(_) => handle_capture_name_key(app, key),

@@ -82,6 +82,205 @@ fn fallback_tab_key_grammar_rows_pin_exact_order_and_copy() {
     );
 }
 
+/// A terminal too short for the whole keymap used to clamp the modal's height
+/// and drop the tail with nothing on screen saying so — the legend, and before
+/// it the Fallback tab's own last rows, simply were not there and the modal
+/// looked complete. The overflow now carries the contract's scrollbar and ↑↓
+/// reaches the tail.
+#[test]
+fn the_help_modal_scrolls_its_overflow_instead_of_dropping_it() {
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let mut app = empty_app(Tab::Overview);
+    let mut term = Terminal::new(TestBackend::new(100, 30)).unwrap();
+
+    term.draw(|f| draw_help(f, f.area(), &app)).unwrap();
+    let rows = crate::testutil::buffer_rows(term.backend().buffer());
+    let (left, right) = rows
+        .iter()
+        .find_map(|row| {
+            let chars: Vec<char> = row.chars().collect();
+            Some((
+                chars.iter().position(|c| *c == '\u{256d}')?,
+                chars.iter().position(|c| *c == '\u{256e}')?,
+            ))
+        })
+        .expect("the help modal's top border");
+
+    assert!(
+        !rows.iter().any(|r| r.contains("stale data")),
+        "this terminal must be too short for the legend, or the test proves nothing:\n{}",
+        rows.join("\n")
+    );
+    // The bar lives in the right padding column, one cell in from the border.
+    let bar: Vec<char> = rows
+        .iter()
+        .filter_map(|r| r.chars().nth(right - 2))
+        .filter(|c| *c == '\u{2503}' || *c == '\u{250a}')
+        .collect();
+    assert!(
+        bar.contains(&'\u{2503}') && bar.contains(&'\u{250a}'),
+        "clipped content must show a thumb on a track, got {bar:?}"
+    );
+
+    // The render pass publishes the bound the key handler clamps against.
+    let max = app.help_max_scroll.get();
+    assert!(max > 0, "a clipped modal must report a scrollable range");
+
+    app.help_scroll = max;
+    term.draw(|f| draw_help(f, f.area(), &app)).unwrap();
+    let rows = crate::testutil::buffer_rows(term.backend().buffer());
+    let slice =
+        |row: &String| -> String { row.chars().skip(left).take(right - left + 1).collect() };
+    let tail = rows
+        .iter()
+        .position(|r| r.contains("stale data"))
+        .unwrap_or_else(|| {
+            panic!(
+                "scrolled to the end, the last row shows:\n{}",
+                rows.join("\n")
+            )
+        });
+    // The thumb has reached the bottom of its track, and it sits in the right
+    // padding column — the content keeps every cell it had before.
+    assert_eq!(
+        slice(&rows[tail]),
+        "│    ⋯                   stale data                                     ┃ │",
+    );
+}
+
+/// A terminal short enough that the modal's chrome eats every row draws no
+/// content at all, so there is nothing to scroll. The published bound has to
+/// say so: `total - viewport` with a zero viewport yields the whole line count,
+/// which would hand the key handler an offset for a modal drawing nothing — and
+/// leave `help_scroll` stranded there once the terminal grew back.
+#[test]
+fn a_modal_with_no_room_to_draw_publishes_no_scroll_range() {
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let app = empty_app(Tab::Overview);
+    // 8 rows: `h` clamps to `area.height - 4`, which the border and the modal's
+    // vertical padding consume whole.
+    for height in [2, 5, 8] {
+        let mut term = Terminal::new(TestBackend::new(100, height)).unwrap();
+        term.draw(|f| draw_help(f, f.area(), &app)).unwrap();
+        assert_eq!(
+            app.help_max_scroll.get(),
+            0,
+            "a modal drawing zero rows at {height} rows must report no range"
+        );
+    }
+}
+
+/// A modal that fits keeps its exact geometry: the scroll plumbing must be a
+/// no-op below overflow, not a one-row shift or a bar stealing a column. The
+/// tail is pinned as an exact row slice, the same shape the legend pin below
+/// uses — a `contains` would pass on a row shifted a column or wearing a bar.
+///
+/// It also pins the THIS MODAL section that documents the scroll itself, whole:
+/// the row cannot go in `global`, since `draw_help` drops any global row whose
+/// key the current tab redefines and all eight tabs bind ↑↓ — and hanging it
+/// off another section would put two ↑↓ rows with different senses a few lines
+/// apart, which is what that filter exists to prevent.
+#[test]
+fn a_help_modal_that_fits_renders_without_a_scrollbar() {
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let app = empty_app(Tab::Overview);
+    let mut term = Terminal::new(TestBackend::new(100, 60)).unwrap();
+    term.draw(|f| draw_help(f, f.area(), &app)).unwrap();
+    let rows = crate::testutil::buffer_rows(term.backend().buffer());
+    let (left, right) = rows
+        .iter()
+        .find_map(|row| {
+            let chars: Vec<char> = row.chars().collect();
+            Some((
+                chars.iter().position(|c| *c == '\u{256d}')?,
+                chars.iter().position(|c| *c == '\u{256e}')?,
+            ))
+        })
+        .expect("the help modal's top border");
+    let slice =
+        |row: &String| -> String { row.chars().skip(left).take(right - left + 1).collect() };
+
+    assert_eq!(
+        app.help_max_scroll.get(),
+        0,
+        "the whole modal fits at 60 rows"
+    );
+    assert!(
+        rows.iter().all(|r| !r.contains('\u{250a}')),
+        "no overflow, no scrollbar track:\n{}",
+        rows.join("\n")
+    );
+
+    // The section whole — its header, both rows, and its placement. A copy-only
+    // pin would pass with the scroll row parked back under TABS, four lines from
+    // that section's own ↑↓ row.
+    let head = rows
+        .iter()
+        .position(|r| r.contains("THIS MODAL"))
+        .unwrap_or_else(|| panic!("the modal documents its own keys:\n{}", rows.join("\n")));
+    assert_eq!(
+        rows[head..head + 4].iter().map(slice).collect::<Vec<_>>(),
+        vec![
+            "│  THIS MODAL                                                             │"
+                .to_string(),
+            "│                                                                         │"
+                .to_string(),
+            "│    ↑↓                  scroll                                           │"
+                .to_string(),
+            "│    esc · q · ?         close                                            │"
+                .to_string(),
+        ],
+    );
+    let tabs = rows
+        .iter()
+        .position(|r| r.contains("TABS"))
+        .expect("the tabs section");
+    assert!(tabs < head, "it follows the tabs section");
+
+    let tail = rows
+        .iter()
+        .position(|r| r.contains("stale data"))
+        .unwrap_or_else(|| panic!("the tail renders in full:\n{}", rows.join("\n")));
+    assert_eq!(
+        slice(&rows[tail]),
+        "│    ⋯                   stale data                                       │",
+    );
+}
+
+/// The Setup section's rows, pinned for the same reason as the Fallback ones —
+/// and specifically so the disable row's gate copy can't drift back off the
+/// `live session` noun `config::row_hint` and `actions::disable_profile` state
+/// the same gate in. It shipped reading `a session is open` against their
+/// `has a live session`, one screen apart, with no test on either wording.
+#[test]
+fn setup_tab_key_grammar_rows_pin_exact_order_and_copy() {
+    assert_tab_rows(
+        Tab::Setup,
+        &[
+            ("↑↓", "pick account / + new, then a row"),
+            ("↵", "open settings · edit field · flip toggle"),
+            ("↵ on a field", "edit inline; ↵ again saves"),
+            ("space", "cycle the model preset (model row)"),
+            ("env", "+ add env · ↵ edits a value · a removes"),
+            (
+                "disable / enable",
+                "↵ arms disable, again confirms · enable is one press · inert while active or a live session is open",
+            ),
+            ("delete", "↵ once to arm, again to confirm"),
+            ("esc", "stop editing / back to account list"),
+        ],
+    );
+}
+
 /// The help modal's GLYPHS legend, rendered whole. It is the only place the
 /// account surfaces' 1-cell marks are explained, and two of them carry two
 /// meanings apiece split on HUE alone (`⊖` disabled/canceled, `⊘` aggregate/

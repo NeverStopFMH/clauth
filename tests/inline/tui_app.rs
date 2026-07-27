@@ -5441,3 +5441,239 @@ fn runtime_check_says_one_account_when_every_live_session_shares_it() {
         check.detail
     );
 }
+
+// ── chain_would_mix ──────────────────────────────────────────────────────────
+// Adding an api-key account to an all-oauth chain (or vice versa) lands a
+// confirm modal. Silent on already-mixed chains, empty chains, same-kind adds,
+// and unknown candidates (the add-picker never offers the last three, but the
+// helper must not panic on them either).
+
+use crate::profile::{AppConfig, AppState, Profile};
+use std::collections::BTreeMap;
+
+fn mini_profile(name: &str, api_key: Option<&str>) -> Profile {
+    Profile {
+        name: name.into(),
+        base_url: None,
+        api_key: api_key.map(str::to_string),
+        auto_start: false,
+        env: BTreeMap::new(),
+        models: Default::default(),
+        fallback_threshold: None,
+        weekly_threshold: None,
+        last_resort: false,
+        max_auto_spend: None,
+        check_weekly: true,
+        check_scoped: true,
+        bell_threshold: None,
+        disabled: false,
+        credentials: None,
+        usage: None,
+        fetch_status: None,
+        provider: None,
+        third_party_usage: None,
+    }
+}
+
+fn cfg_with(profiles: Vec<Profile>, chain: Vec<&str>) -> AppConfig {
+    let names: Vec<crate::profile::ProfileName> = profiles.iter().map(|p| p.name.clone()).collect();
+    AppConfig {
+        state: AppState {
+            profiles: names,
+            fallback_chain: chain.into_iter().map(Into::into).collect(),
+            ..AppState::default()
+        },
+        profiles,
+    }
+}
+
+#[test]
+fn chain_would_mix_true_when_api_key_candidate_joins_all_oauth_chain() {
+    let cfg = cfg_with(
+        vec![
+            mini_profile("oauth_a", None),
+            mini_profile("api_b", Some("sk-test")),
+        ],
+        vec!["oauth_a"],
+    );
+    assert!(super::chain_would_mix(&cfg, "api_b"));
+}
+
+#[test]
+fn chain_would_mix_true_when_oauth_candidate_joins_all_api_key_chain() {
+    let cfg = cfg_with(
+        vec![
+            mini_profile("api_a", Some("sk-test")),
+            mini_profile("oauth_b", None),
+        ],
+        vec!["api_a"],
+    );
+    assert!(super::chain_would_mix(&cfg, "oauth_b"));
+}
+
+#[test]
+fn chain_would_mix_silent_when_chain_already_mixed() {
+    // Direction-agnostic: once both kinds are in the chain, another add of
+    // either kind leaves the mix unchanged, so the modal is noise.
+    let cfg = cfg_with(
+        vec![
+            mini_profile("oauth_a", None),
+            mini_profile("api_b", Some("sk-test")),
+            mini_profile("api_c", Some("sk-test")),
+        ],
+        vec!["oauth_a", "api_b"],
+    );
+    assert!(!super::chain_would_mix(&cfg, "api_c"));
+}
+
+#[test]
+fn chain_would_mix_silent_when_oauth_added_to_already_mixed_chain() {
+    let cfg = cfg_with(
+        vec![
+            mini_profile("oauth_a", None),
+            mini_profile("oauth_c", None),
+            mini_profile("api_b", Some("sk-test")),
+        ],
+        vec!["oauth_a", "api_b"],
+    );
+    assert!(!super::chain_would_mix(&cfg, "oauth_c"));
+}
+
+#[test]
+fn chain_would_mix_silent_on_same_kind_add_to_homogeneous_chain() {
+    let cfg = cfg_with(
+        vec![mini_profile("oauth_a", None), mini_profile("oauth_b", None)],
+        vec!["oauth_a"],
+    );
+    assert!(!super::chain_would_mix(&cfg, "oauth_b"));
+}
+
+#[test]
+fn chain_would_mix_silent_on_empty_chain() {
+    let cfg = cfg_with(
+        vec![
+            mini_profile("oauth_a", None),
+            mini_profile("api_b", Some("sk-test")),
+        ],
+        vec![],
+    );
+    assert!(!super::chain_would_mix(&cfg, "api_b"));
+    assert!(!super::chain_would_mix(&cfg, "oauth_a"));
+}
+
+#[test]
+fn chain_would_mix_returns_false_for_unknown_candidate() {
+    let cfg = cfg_with(vec![mini_profile("oauth_a", None)], vec!["oauth_a"]);
+    assert!(!super::chain_would_mix(&cfg, "ghost"));
+}
+
+// ── Enter-arm wiring ────────────────────────────────────────────────────────
+// Drives the production `handle_fallback_add_key` Enter path end-to-end. Two
+// gaps closed at once: (1) removing the `if would_mix` gate (always calling
+// `commit_chain_add`) reds here — the modal vanishes; (2) editing the
+// message/detail literals in `handle_fallback_add_key` reds here — the pin
+// reads them back off the raised `Modal::Confirm`. The render-pin test in
+// `tui_render_modals.rs` covers `draw_confirm`'s shape; this one covers the
+// handler's contract.
+#[test]
+fn fallback_add_enter_raises_confirm_modal_when_add_would_mix_kinds() {
+    use crate::profile::{AppConfig, AppState};
+
+    let _home = crate::testutil::HomeSandbox::new();
+
+    let oauth_member = crate::testutil::blank_profile("alice");
+    let mut api_candidate = crate::testutil::blank_profile("bob");
+    api_candidate.api_key = Some("sk-test".to_string());
+
+    let profiles = vec![oauth_member, api_candidate];
+    let names: Vec<crate::profile::ProfileName> = profiles.iter().map(|p| p.name.clone()).collect();
+    let mut app = App::new(AppConfig {
+        state: AppState {
+            profiles: names.clone(),
+            // Homogeneous oauth chain — adding `bob` (api-key) would create the mix.
+            fallback_chain: vec!["alice".into()],
+            ..AppState::default()
+        },
+        profiles,
+    });
+    app.tab = super::Tab::Fallback;
+    app.fallback_focus = super::FallbackFocus::Detail;
+    // `chain_cursor` sits on the `+ add` row (members precede it); the add
+    // picker reads candidates from `chain_candidates`, so cursor 0 == `bob`.
+    app.chain_cursor = 1;
+    app.fallback_detail_cursor = 0;
+
+    super::handle_fallback_add_key(&mut app, crate::testutil::key(super::KeyCode::Enter));
+
+    let confirm = app
+        .modals
+        .last()
+        .and_then(|m| match m {
+            super::Modal::Confirm(s) => Some(s),
+            _ => None,
+        })
+        .expect("mix-creating add raises a confirm modal");
+    assert!(
+        matches!(&confirm.on_confirm, super::ConfirmAction::AddChainCandidate(n) if n == "bob"),
+        "confirm carries AddChainCandidate(\"bob\"), got {:?}",
+        confirm.on_confirm
+    );
+    assert_eq!(
+        confirm.message,
+        "mixing api-key and oauth accounts can leave sessions stuck on the api account.",
+        "production message copy in handle_fallback_add_key drifted"
+    );
+    assert_eq!(
+        confirm.detail.as_deref(),
+        Some("api → oauth switches may not work until cc restarts."),
+        "production detail copy in handle_fallback_add_key drifted"
+    );
+    // And the member has NOT been added — confirm must carry through, not preempt.
+    assert!(
+        !app.config().state.fallback_chain.iter().any(|n| n == "bob"),
+        "the candidate must not enter the chain until the confirm runs"
+    );
+}
+
+#[test]
+fn fallback_add_enter_commits_directly_when_add_would_not_mix() {
+    use crate::profile::{AppConfig, AppState};
+
+    let _home = crate::testutil::HomeSandbox::new();
+
+    // `blank_profile` defaults to `api_key: None`, so both are oauth — the add
+    // is same-kind to a homogeneous chain and must skip the modal.
+    let profiles = vec![
+        crate::testutil::blank_profile("alice"),
+        crate::testutil::blank_profile("carol"),
+    ];
+    let names: Vec<crate::profile::ProfileName> = profiles.iter().map(|p| p.name.clone()).collect();
+    let mut app = App::new(AppConfig {
+        state: AppState {
+            profiles: names.clone(),
+            fallback_chain: vec!["alice".into()],
+            ..AppState::default()
+        },
+        profiles,
+    });
+    app.tab = super::Tab::Fallback;
+    app.fallback_focus = super::FallbackFocus::Detail;
+    app.chain_cursor = 1;
+    app.fallback_detail_cursor = 0;
+
+    super::handle_fallback_add_key(&mut app, crate::testutil::key(super::KeyCode::Enter));
+
+    assert!(
+        app.modals.is_empty(),
+        "same-kind add must not raise a modal, got {:?}",
+        app.modals
+    );
+    assert!(
+        app.config()
+            .state
+            .fallback_chain
+            .iter()
+            .any(|n| n == "carol"),
+        "same-kind add commits directly without a confirm"
+    );
+}

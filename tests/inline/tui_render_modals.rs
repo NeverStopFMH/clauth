@@ -381,3 +381,50 @@ fn the_help_modal_legend_names_every_marker_and_its_hue() {
         .collect();
     assert_eq!(got, expected.to_vec());
 }
+
+// ── AddChainCandidate confirm modal ─────────────────────────────────────────
+// The `+ add` picker's mix-guard modal pins its body copy and the candidate
+// name in the confirm button label, so editing the message, dropping the
+// detail, or reverting the button to the generic `confirm` reds here.
+
+#[test]
+fn add_chain_candidate_modal_pins_body_and_named_confirm_button() {
+    use crate::tui::app::{ConfirmAction, ConfirmState};
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let state = ConfirmState {
+        message: "mixing api-key and oauth accounts can leave sessions stuck on the \
+                  api account."
+            .into(),
+        detail: Some("api → oauth switches may not work until cc restarts.".into()),
+        choice: false,
+        on_confirm: ConfirmAction::AddChainCandidate("test_name".into()),
+    };
+    let mut term = Terminal::new(TestBackend::new(100, 20)).unwrap();
+    term.draw(|f| draw_confirm(f, f.area(), &state)).unwrap();
+    let screen: String = crate::testutil::buffer_rows(term.backend().buffer())
+        .into_iter()
+        .map(|r| r + "\n")
+        .collect();
+
+    assert!(
+        screen.contains(
+            "mixing api-key and oauth accounts can leave sessions stuck on the api account"
+        ),
+        "message copy missing:\n{screen}"
+    );
+    assert!(
+        screen.contains("api → oauth switches may not work until cc restarts"),
+        "detail copy missing:\n{screen}"
+    );
+    assert!(
+        screen.contains("add 'test_name'"),
+        "confirm button label must name the candidate:\n{screen}"
+    );
+    assert!(
+        !screen.contains(" confirm "),
+        "the generic `confirm` label must not appear for AddChainCandidate:\n{screen}"
+    );
+}

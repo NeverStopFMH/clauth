@@ -246,6 +246,13 @@ fn draw_confirm(frame: &mut Frame<'_>, area: Rect, state: &ConfirmState) {
             | ConfirmAction::DeleteLiveSession(_)
     );
 
+    // `AddChainCandidate` names the candidate in its confirm button so the
+    // operator sees the exact add they are agreeing to, not a generic label.
+    let confirm_label = match &state.on_confirm {
+        ConfirmAction::AddChainCandidate(name) => format!("add '{name}'"),
+        _ => "confirm".to_string(),
+    };
+
     let mut lines: Vec<Line<'_>> = vec![Line::from(Span::styled(
         state.message.clone(),
         theme::body(),
@@ -258,21 +265,22 @@ fn draw_confirm(frame: &mut Frame<'_>, area: Rect, state: &ConfirmState) {
     let buttons = if matches!(state.on_confirm, ConfirmAction::Acknowledge) {
         Line::from(modal_button(" ok ", true))
     } else {
-        choice_buttons(state.choice, destructive)
+        choice_buttons(state.choice, destructive, &confirm_label)
     };
     lines.push(buttons.alignment(Alignment::Right));
 
     draw_modal(frame, area, title, lines);
 }
 
-fn choice_buttons(choice: bool, destructive_confirm: bool) -> Line<'static> {
+fn choice_buttons(choice: bool, destructive_confirm: bool, confirm_label: &str) -> Line<'static> {
+    let label = format!(" {confirm_label} ");
     Line::from(vec![
         modal_button(" cancel ", !choice),
         Span::raw("   "),
         if destructive_confirm {
-            danger_button(" confirm ", choice)
+            danger_button(&label, choice)
         } else {
-            modal_button(" confirm ", choice)
+            modal_button(&label, choice)
         },
     ])
 }

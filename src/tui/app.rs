@@ -480,6 +480,10 @@ pub(crate) enum ConfirmAction {
     /// guard in `delete_profile` refuses this, so confirm the deauth risk here
     /// and re-run the delete with `force`.
     DeleteLiveSession(String),
+    /// Fallback tab `+ add`: the candidate would mix api-key and oauth accounts
+    /// in the chain. Confirm carries the add through; cancel returns to the
+    /// picker. Non-destructive — the member can be removed after adding.
+    AddChainCandidate(String),
     /// Info-only modal: an action the user asked for is refused for a reason
     /// they should read (rotating a macOS profile whose running session holds
     /// its login in a Keychain entry clauth cannot write). Confirming just
@@ -4273,18 +4277,39 @@ fn handle_fallback_add_key(app: &mut App, key: KeyEvent) {
         }
         KeyCode::Enter | KeyCode::Char(' ') => {
             let name = candidates[app.fallback_detail_cursor].clone();
-            add_chain_candidate(app, &name);
-            app.toast(ToastKind::Success, format!("added '{name}' to chain"));
-            // When the picker empties, `+ add` disappears — land on the new member.
-            let remaining = chain_candidates(app);
-            if remaining.is_empty() {
-                leave_fallback_detail(app);
-                app.chain_cursor = chain_items(app).len().saturating_sub(1);
+            let would_mix = {
+                let cfg = app.config();
+                chain_would_mix(&cfg, &name)
+            };
+            if would_mix {
+                app.modals.push(Modal::Confirm(ConfirmState {
+                    message: "mixing api-key and oauth accounts can leave sessions stuck on the \
+                              api account."
+                        .into(),
+                    detail: Some("api → oauth switches may not work until cc restarts.".into()),
+                    choice: false,
+                    on_confirm: ConfirmAction::AddChainCandidate(name),
+                }));
             } else {
-                app.fallback_detail_cursor = app.fallback_detail_cursor.min(remaining.len() - 1);
+                commit_chain_add(app, &name);
             }
         }
         _ => {}
+    }
+}
+
+/// Add `name` to the chain, toast, and re-home focus. Shared by the direct
+/// add path and the `AddChainCandidate` confirm callback.
+fn commit_chain_add(app: &mut App, name: &str) {
+    add_chain_candidate(app, name);
+    app.toast(ToastKind::Success, format!("added '{name}' to chain"));
+    // When the picker empties, `+ add` disappears — land on the new member.
+    let remaining = chain_candidates(app);
+    if remaining.is_empty() {
+        leave_fallback_detail(app);
+        app.chain_cursor = chain_items(app).len().saturating_sub(1);
+    } else {
+        app.fallback_detail_cursor = app.fallback_detail_cursor.min(remaining.len() - 1);
     }
 }
 
@@ -4307,6 +4332,29 @@ pub(crate) fn chain_candidates(app: &App) -> Vec<String> {
         .filter(|p| !p.is_disabled() && !cfg.state.fallback_chain.iter().any(|c| c == &p.name))
         .map(|p| p.name.to_string())
         .collect()
+}
+
+/// Whether adding `name` to the fallback chain would mix api-key and oauth
+/// accounts. CC's env-var handling breaks the api-key → oauth switch direction
+/// (see docs/domain-knowledge.md), so a mixed chain can leave a running bare
+/// `claude` session stuck on the api-key account until restart. Fires only
+/// when a homogeneous chain would gain its other kind — silent on empty,
+/// already-mixed, and same-kind adds.
+pub(crate) fn chain_would_mix(cfg: &AppConfig, name: &str) -> bool {
+    let Some(candidate) = cfg.find(name) else {
+        return false;
+    };
+    let mut members = cfg.state.fallback_chain.iter().filter_map(|n| cfg.find(n));
+    let Some(first) = members.next() else {
+        return false;
+    };
+    let chain_kind = first.api_key.is_some();
+    // A chain that already holds both kinds can't have a mix "created" by a
+    // new add, so the modal would be noise.
+    if members.any(|p| p.api_key.is_some() != chain_kind) {
+        return false;
+    }
+    candidate.api_key.is_some() != chain_kind
 }
 
 /// Enter right pane for the selected chain item. No-op on `+ add` when empty.
@@ -6686,6 +6734,7 @@ fn run_confirm_action(app: &mut App, action: ConfirmAction) {
         }
         ConfirmAction::RestartLogin(name, is_new) => start_login(app, name, is_new),
         ConfirmAction::DeleteLiveSession(name) => finish_delete(app, &name, true),
+        ConfirmAction::AddChainCandidate(name) => commit_chain_add(app, &name),
         ConfirmAction::Acknowledge => {}
     }
 }

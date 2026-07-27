@@ -30,8 +30,6 @@ const GAUGE_BAR_MIN: usize = 3;
 const GAUGE_NAME_MAX: usize = 16;
 const GAUGE_NAME_MIN: usize = 3;
 const GAUGE_PCT_W: usize = 4;
-const GAUGE_DASH_W: usize = 1;
-
 // ── Account-name pulse ───────────────────────────────────────────────────
 
 const PULSE_SWEEP_MS: u64 = 900;
@@ -78,7 +76,7 @@ fn active_gauge(app: &App) -> Option<ActiveGauge> {
 }
 
 fn gauge_tail_w(has_pct: bool) -> usize {
-    if has_pct { GAUGE_PCT_W } else { GAUGE_DASH_W }
+    if has_pct { GAUGE_PCT_W } else { 0 }
 }
 
 fn gauge_total_w(name_w: usize, bar_cells: usize, has_pct: bool) -> usize {
@@ -116,6 +114,9 @@ fn gauge_fit(avail: usize, name_len: usize, has_pct: bool) -> GaugeFit {
     if gauge_total_w(name_w, bar_cells, has_pct) > avail {
         return GaugeFit::HIDDEN;
     }
+    if !has_pct && name_w == 0 {
+        return GaugeFit::HIDDEN;
+    }
     GaugeFit {
         name_w,
         bar_cells,
@@ -148,7 +149,7 @@ fn gauge_spans(fit: GaugeFit, name: &str, pct: Option<f64>, elapsed_ms: u64) -> 
                 Style::default().fg(theme::util_color(pct)),
             ));
         }
-        None => spans.push(Span::styled("—", theme::faint())),
+        None => {}
     }
     spans
 }

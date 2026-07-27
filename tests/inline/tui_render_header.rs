@@ -160,13 +160,13 @@ fn gauge_fit_provider_profile_never_shows_a_bar() {
 
     let tight = gauge_fit(9, 10, false);
     assert_eq!(tight.bar_cells, 0);
-    assert_eq!(tight.name_w, 6);
+    assert_eq!(tight.name_w, 7);
 
     let dash_only = gauge_fit(1, 10, false);
     assert_eq!(dash_only.name_w, 0);
     assert!(
-        dash_only.visible,
-        "the dash alone still renders at its 1-cell floor"
+        !dash_only.visible,
+        "no bar and no tail means nothing to render"
     );
 }
 
@@ -217,8 +217,12 @@ fn gauge_dash_for_provider_after_account_count() {
     assert!(row1.starts_with("1 account"), "row 1 starts with count");
     assert!(row1.contains("·"), "middot present for provider profile");
     assert!(row1.contains("z.ai"));
-    assert!(row1.contains('—'), "provider shows dash, not bar/percent");
+    assert!(
+        !row1.contains('—'),
+        "provider shows no dash when usage is absent"
+    );
     assert!(!row1.contains('█'), "provider must not render a bar");
+    assert!(!row1.contains('%'), "provider must not render a percent");
 }
 
 #[test]

@@ -3459,6 +3459,7 @@ fn config_of(members: &[&Profile]) -> crate::profile::AppConfig {
 
 /// A Claude Code re-login as it lands on disk: the runtime link replaced by a
 /// regular file, mtime `when` so the recency compare is unambiguous.
+#[cfg(not(target_os = "macos"))]
 fn cc_relogin(runtime: &Path, bytes: &[u8], when: SystemTime) -> PathBuf {
     let link = runtime.join(".credentials.json");
     let _ = fs::remove_file(&link);

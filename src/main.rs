@@ -40,6 +40,7 @@ mod tokens;
 mod tui;
 mod update;
 mod usage;
+mod watchdog;
 mod which;
 
 #[cfg(test)]

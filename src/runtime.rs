@@ -54,7 +54,6 @@ use std::collections::HashSet;
 use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc::{RecvTimeoutError, Sender, channel};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, SystemTime};
 
@@ -1616,7 +1615,7 @@ pub(crate) struct ProfileRuntime {
     legacy_lock: Option<File>,
     /// Wrapped in Option so Drop can take() it before joining the watchdog,
     /// signalling the thread to exit.
-    watchdog_signal: Option<Sender<()>>,
+    watchdog_signal: Option<crossbeam_channel::Sender<()>>,
     watchdog_handle: Option<JoinHandle<()>>,
 }
 
@@ -1751,37 +1750,119 @@ impl ProfileRuntime {
             ..
         } = paths;
 
-        let (tx, rx) = channel::<()>();
+        let (watchdog_tx, watchdog_rx) = crossbeam_channel::bounded::<()>(1);
         let watchdog_swap = std::sync::Arc::clone(&swap);
         let watchdog_claude_home = claude_home.clone();
         #[allow(clippy::expect_used, reason = "thread spawn failure is unrecoverable")]
         let watchdog_handle = thread::Builder::new()
             .name(format!("clauth-wdog-{name}"))
             .spawn(move || {
-                // One thread, two cadences: the config reconcilers
-                // (`.claude.json` + `settings.json`) run every CJSON_INTERVAL;
-                // credentials reconcile every ~WATCHDOG_INTERVAL, counted in
-                // cjson ticks. Loop exits on Disconnected (sender dropped in
-                // Drop) or Ok(()).
-                let cred_every =
-                    (WATCHDOG_INTERVAL.as_millis() / CJSON_INTERVAL.as_millis()).max(1);
-                let mut until_cred = cred_every;
-                while let Err(RecvTimeoutError::Timeout) = rx.recv_timeout(CJSON_INTERVAL) {
+                // Filesystem-event-driven reconcile with a 30 s fallback
+                // timer. Falls back to 1 Hz polling when notify is
+                // unavailable. Loop exits when the shutdown sender is
+                // dropped (see ProfileRuntime::Drop).
+                let reconcile = || {
                     if let Err(e) = crate::claude_json::sync_once() {
                         logline!("clauth: .claude.json sync failed: {e}");
                     }
                     if let Err(e) = crate::settings_sync::sync_once() {
                         logline!("clauth: settings.json sync failed: {e}");
                     }
-                    until_cred -= 1;
-                    if until_cred == 0 {
-                        until_cred = cred_every;
-                        if let Err(e) = tick(&watchdog_claude_home, &watchdog_swap) {
-                            logline!("clauth: watchdog tick failed: {e}");
+                    if let Err(e) = tick(&watchdog_claude_home, &watchdog_swap) {
+                        logline!("clauth: watchdog tick failed: {e}");
+                    }
+                    watchdog_swap.poll();
+                };
+
+                let wpaths = crate::watchdog::watch_paths(
+                    watchdog_swap.runtime.as_path(),
+                    watchdog_swap.canonical().as_path(),
+                    &watchdog_claude_home,
+                );
+                let watcher = crate::watchdog::try_start(&wpaths);
+
+                if let Some(ew) = watcher {
+                    // Event-driven: fs events trigger full reconcile,
+                    // a 1 s ticker runs poll() so daemon-requested swaps
+                    // are picked up promptly, and a 30 s fallback ticker
+                    // catches lost events. Cooldown on events prevents
+                    // self-trigger loops when tick() writes to a watched
+                    // file. On debouncer death (channel disconnect) the
+                    // loop falls through to the polling fallback.
+                    let fallback_ticker =
+                        crossbeam_channel::tick(crate::watchdog::FALLBACK_INTERVAL);
+                    let poll_ticker = crossbeam_channel::tick(std::time::Duration::from_secs(1));
+                    let mut last_reconcile = std::time::Instant::now();
+                    // Past by one cooldown so the first event always fires.
+                    last_reconcile -= crate::watchdog::WRITE_COOLDOWN;
+
+                    loop {
+                        crossbeam_channel::select! {
+                            recv(watchdog_rx) -> _ => return,
+                            recv(poll_ticker) -> _ => {
+                                watchdog_swap.poll();
+                            }
+                            recv(ew.wake) -> res => {
+                                // Err(RecvError): debouncer thread died
+                                // (panic or premature exit). Fall through
+                                // to polling — the tight select on a
+                                // disconnected channel would busy-spin.
+                                if res.is_err() {
+                                    logline!("clauth: fs watcher event channel \
+                                              disconnected, switching to poll");
+                                    break;
+                                }
+                                if last_reconcile.elapsed()
+                                    < crate::watchdog::WRITE_COOLDOWN
+                                {
+                                    continue;
+                                }
+                                last_reconcile = std::time::Instant::now();
+                                reconcile();
+                            }
+                            recv(fallback_ticker) -> _ => {
+                                last_reconcile = std::time::Instant::now();
+                                reconcile();
+                            }
                         }
-                        // After the credential leg, so a swap always starts from a
-                        // reconciled link.
-                        watchdog_swap.poll();
+                    }
+                    // Fall through to the polling loop below.
+                }
+
+                // Polling fallback — reached when:
+                // - notify is unavailable (watcher creation failed), or
+                // - the event channel disconnected (debouncer died).
+                // Config reconcilers (.claude.json + settings.json) run every
+                // CJSON_INTERVAL (100 ms); credentials reconcile every
+                // ~WATCHDOG_INTERVAL (1 s). Shutdown exits the thread.
+                let cred_every =
+                    (WATCHDOG_INTERVAL.as_millis() / CJSON_INTERVAL.as_millis()).max(1);
+                let mut until_cred = cred_every;
+                let ticker = crossbeam_channel::tick(CJSON_INTERVAL);
+                loop {
+                    crossbeam_channel::select! {
+                        recv(watchdog_rx) -> _ => return,
+                        recv(ticker) -> _ => {
+                            if let Err(e) = crate::claude_json::sync_once() {
+                                logline!("clauth: .claude.json sync failed: {e}");
+                            }
+                            if let Err(e) = crate::settings_sync::sync_once() {
+                                logline!("clauth: settings.json sync failed: {e}");
+                            }
+                            until_cred -= 1;
+                            if until_cred == 0 {
+                                until_cred = cred_every;
+                                if let Err(e) = tick(
+                                    &watchdog_claude_home,
+                                    &watchdog_swap,
+                                ) {
+                                    logline!(
+                                        "clauth: watchdog tick failed: {e}"
+                                    );
+                                }
+                                watchdog_swap.poll();
+                            }
+                        }
                     }
                 }
             })
@@ -1795,7 +1876,7 @@ impl ProfileRuntime {
             sessions,
             _pid_lock: pid_lock,
             legacy_lock,
-            watchdog_signal: Some(tx),
+            watchdog_signal: Some(watchdog_tx),
             watchdog_handle: Some(watchdog_handle),
         })
     }

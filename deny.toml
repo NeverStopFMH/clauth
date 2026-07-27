@@ -15,7 +15,13 @@ yanked = "deny"
 # `{ id = "RUSTSEC-YYYY-NNNN", reason = "why it's safe / no fix yet" }`; revisit
 # each on the next audit. cargo-deny v2 has no time-based grace period — this
 # explicit list IS the triage record.
-ignore = []
+ignore = [
+    # notify → notify-types → instant. The instant crate (unmaintained) is used
+    # only for cross-platform Instant::now() on WASM; not security-relevant and
+    # not used on our target. notify v7 maintains it as a leaf, not a platform we
+    # build for.
+    "RUSTSEC-2024-0384",
+]
 
 # ---------------------------------------------------------------------------
 # Licenses
@@ -37,6 +43,10 @@ allow = [
     "BSL-1.0",
     "Unicode-3.0",
     "CDLA-Permissive-2.0",
+    # notify v7 is shipped as MIT OR CC0-1.0. CC0 is FSF-approved and used by
+    # several well-known Rust ecosystem crates; its Cargo.toml lists CC0-1.0 as
+    # the primary license.
+    "CC0-1.0",
 ]
 # Confidence threshold for SPDX expression matching.
 confidence-threshold = 0.8

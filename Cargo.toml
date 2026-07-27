@@ -37,6 +37,13 @@ rpassword = "7"
 # `iana-time-zone` for the zone lookup. Its `unsafe` stays inside chrono.
 chrono = { version = "0.4.45", default-features = false, features = ["clock"] }
 rmcp = { version = "2.1.0", features = ["server", "macros", "transport-io"] }
+# Filesystem event watcher — drives credential/config reconcile off inotify /
+# FSEvents instead of wall-clock polling. Non-recursive watches only.
+notify = { version = "7", default-features = false, features = ["macos_fsevent"] }
+# Multi-producer multi-consumer channels with select!. Already pulled in as a
+# transitive dep of notify; pinned here so the watchdog loop can use
+# crossbeam_channel::select! to multiplex events, fallback timer, and shutdown.
+crossbeam-channel = "0.5"
 tokio = { version = "1.52.3", features = ["rt", "io-std"] }
 regex = "1.13.1"
 # CLI grammar + generated help. `wrap_help` is what keeps the command table and

@@ -21,7 +21,7 @@ use super::panes::{
     draw_profile_selector, empty_state, key_cell, master_detail, pill, rail_hint_lines,
     section_box, section_box_verbatim,
 };
-use crate::format::{endpoint_label, plan_label};
+use crate::format::{endpoint_label, format_pct, plan_label};
 use crate::profile::Profile;
 use crate::providers::StatRowKind;
 use crate::usage::{
@@ -360,7 +360,7 @@ impl Stat {
         // Natural width — `header_pad` right-aligns the whole block to `pct_col`,
         // so the `%` lands in the same column every row without padding the
         // number. (A fixed `{:>3.0}` width added stray spaces after the amount.)
-        let pct_str = format!("{:.0}%", self.pct);
+        let pct_str = format_pct(self.pct);
 
         // The amount sits in its own right-aligned column just left of the %,
         // with a 2-space gap when present.

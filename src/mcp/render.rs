@@ -2,6 +2,7 @@
 //! footer, single usage line, third-party headline. No I/O, no locks — callers
 //! pass in already-loaded cache data so these stay unit-testable.
 
+use crate::format::format_pct;
 use crate::providers::ThirdPartyStats;
 use crate::usage::UsageWindow;
 use crate::which::SessionAuth;
@@ -26,7 +27,7 @@ pub(crate) fn third_party_headline(s: &ThirdPartyStats) -> String {
     let body = if !s.bars.is_empty() {
         s.bars
             .iter()
-            .map(|b| format!("{} {}%", b.label, b.pct.round() as i64))
+            .map(|b| format!("{} {}", b.label, format_pct(b.pct)))
             .collect::<Vec<_>>()
             .join(", ")
     } else if let Some(row) = s.rows.iter().find(|r| !r.value.is_empty()) {
@@ -62,10 +63,10 @@ pub(crate) fn live_footer(
         parts.push(format!("active={a}"));
     }
     if let Some(w) = five_h {
-        parts.push(format!("5h {}% used", w.utilization.round() as i64));
+        parts.push(format!("5h {} used", format_pct(w.utilization)));
     }
     if let Some(w) = seven_d {
-        parts.push(format!("7d {}% used", w.utilization.round() as i64));
+        parts.push(format!("7d {} used", format_pct(w.utilization)));
     }
     parts.join(" | ")
 }

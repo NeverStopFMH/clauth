@@ -109,6 +109,15 @@ pub(crate) fn plan_label(plan: &PlanInfo) -> String {
     plan.tier.display()
 }
 
+/// Percent from API `f64`: drops trailing `.0` on whole numbers → `42%`, `42.3%`.
+pub(crate) fn format_pct(pct: f64) -> String {
+    if pct.fract() == 0.0 {
+        format!("{pct:.0}%")
+    } else {
+        format!("{pct}%")
+    }
+}
+
 #[cfg(test)]
 #[path = "../tests/inline/format.rs"]
 mod tests;

@@ -49,9 +49,9 @@ fn warm_usage(name: &str, five_h: f64, seven_d: f64) {
     );
 }
 
-const HEADER: &str = "  PROFILE  PLAN     5H   7D  ENDPOINT";
-// 42.4 → 42%, 17.6 → 18%: the row also pins the round-half behaviour.
-const WORK_ROW: &str = "* work     Max 5x  42%  18%  -";
+const HEADER: &str = "  PROFILE  PLAN       5H     7D  ENDPOINT";
+// 42.4 → 42.4%, 17.6 → 17.6%: format_pct drops only trailing `.0`.
+const WORK_ROW: &str = "* work     Max 5x  42.4%  17.6%  -";
 
 #[test]
 fn list_table_hides_disabled_by_default_and_marks_the_active_profile() {
@@ -101,7 +101,7 @@ fn list_table_reveals_disabled_with_a_trailing_marker_when_included() {
         [
             HEADER,
             WORK_ROW,
-            "  off      Max       -    -  - (disabled)",
+            "  off      Max         -      -  - (disabled)",
         ],
         "the disabled row keeps its columns aligned and carries the (disabled) marker"
     );

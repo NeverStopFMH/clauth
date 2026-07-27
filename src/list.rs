@@ -8,6 +8,7 @@
 use anyhow::Result;
 
 use crate::daemon::build_status;
+use crate::format::format_pct;
 use crate::profile::{AppConfig, load_config};
 
 /// `clauth list [--all|--disabled]` — print the account table. `include_disabled`
@@ -64,13 +65,14 @@ impl Row {
     }
 }
 
-/// The `utilization_pct` of the window labeled `label`, rounded to `NN%`; `-`
-/// when the profile has no cache or no such window.
+/// The `utilization_pct` of the window labeled `label`, formatted via
+/// [`format_pct`] (drops trailing `.0`); `-` when the profile has no cache
+/// or no such window.
 fn window_pct(windows: Option<&Vec<serde_json::Value>>, label: &str) -> String {
     windows
         .and_then(|ws| ws.iter().find(|w| w["label"].as_str() == Some(label)))
         .and_then(|w| w["utilization_pct"].as_f64())
-        .map_or_else(|| "-".to_string(), |u| format!("{}%", u.round() as i64))
+        .map_or_else(|| "-".to_string(), format_pct)
 }
 
 /// Minimum column width: the header vs every cell, counted in `char`s so a

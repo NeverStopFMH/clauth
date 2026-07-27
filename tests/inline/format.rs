@@ -60,6 +60,18 @@ fn resolve_in_tui_names_the_clauth_surface() {
 }
 
 #[test]
+fn format_pct_drops_trailing_zero_on_whole_numbers() {
+    assert_eq!(format_pct(42.0), "42%");
+    assert_eq!(format_pct(0.0), "0%");
+    assert_eq!(format_pct(100.0), "100%");
+}
+
+#[test]
+fn format_pct_shows_fractional_percent() {
+    assert_eq!(format_pct(42.3), "42.3%");
+}
+
+#[test]
 fn plan_label_renders_the_tier_only_the_canceled_marker_is_on_the_status_line() {
     let canceled = PlanInfo {
         tier: PlanTier::Free,

@@ -34,6 +34,7 @@ use crate::claude::{
     live_credentials_are_shell, read_claude_credentials, snapshot_active_credentials,
 };
 use crate::fallback::{DEFAULT_THRESHOLD, SwitchAction, auto_switch_if_needed, threshold_for};
+use crate::format::format_pct;
 use crate::lock::with_state_lock;
 use crate::lockorder::{RankedGuard, RankedMutex};
 use crate::oauth;
@@ -2060,7 +2061,10 @@ impl App {
             {
                 if u >= t {
                     if !self.bell_fired.contains_key(&name) {
-                        self.toast(ToastKind::Warning, format!("bell: {name} at {:.0}%", u));
+                        self.toast(
+                            ToastKind::Warning,
+                            format!("bell: {name} at {}", format_pct(u)),
+                        );
                         self.set_tab_activity(Tab::Overview, ToastKind::Warning);
                         self.bell_fired.insert(name, true);
                     }

@@ -60,10 +60,26 @@ pub(crate) fn run(json: bool) -> Result<()> {
 /// nothing matched. Shared by `clauth which` and the MCP `which` tool.
 pub(crate) fn resolve_active(config: &AppConfig) -> Option<(String, Source)> {
     let config_dir = std::env::var_os("CLAUDE_CONFIG_DIR").map(PathBuf::from);
-    let session_profile = config_dir
-        .as_deref()
-        .and_then(session_profile_from_config_dir);
-    let creds = credentials_path(config_dir.as_deref())
+    resolve_at(config, config_dir.as_deref())
+}
+
+/// Which profile owns the GLOBAL `~/.claude/.credentials.json` — the file a bare
+/// `claude` reads — regardless of the READER's own `CLAUDE_CONFIG_DIR`.
+///
+/// That env var describes the process asking, so [`resolve_active`] is the wrong
+/// question for attributing a DIFFERENT process's credentials: a TUI running
+/// inside a `clauth start` session would claim every bare `claude` on the box for
+/// its own runtime profile.
+pub(crate) fn resolve_global(config: &AppConfig) -> Option<(String, Source)> {
+    resolve_at(config, None)
+}
+
+/// The shared resolution: read the credentials a session with this config dir
+/// loads, and attribute them. One predicate for both entry points, so the two can
+/// never drift into different answers for the same file.
+fn resolve_at(config: &AppConfig, config_dir: Option<&Path>) -> Option<(String, Source)> {
+    let session_profile = config_dir.and_then(session_profile_from_config_dir);
+    let creds = credentials_path(config_dir)
         .ok()
         .and_then(|path| read_credentials(&path));
     resolve_profile(
@@ -138,8 +154,8 @@ fn read_credentials(path: &Path) -> Option<ClaudeCredentials> {
 /// attributed, no matter which tier matched it — including a stale token
 /// match against creds that predate the disable (a disabled profile's stored
 /// files are left untouched on disk, so its old refresh token can still sit
-/// there). Shared by `clauth which` and the MCP `which` tool via
-/// [`resolve_active`], the only caller of this function.
+/// there). Shared by `clauth which`, the MCP `which` tool, and the bare-session
+/// tally via [`resolve_at`], the only caller of this function.
 fn resolve_profile<'a>(
     config: &'a AppConfig,
     creds: Option<&ClaudeCredentials>,

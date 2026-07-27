@@ -510,3 +510,32 @@ fn parse_envelope_errors_on_unparseable_output() {
     let err = super::parse_delegate_envelope("not json at all").expect_err("garbage is an error");
     assert!(err.contains("failed to parse claude output"));
 }
+
+// ── bare-session marker gate ─────────────────────────────────────────────────
+
+/// A `clauth mcp` reading the GLOBAL credentials is the MCP half of a bare
+/// `claude`; every isolated tier reads its own `.credentials.json` — a supervised
+/// `clauth start` session (already registered) or a `delegate` child (which gets
+/// `CLAUDE_CONFIG_DIR` in the same builder as its depth marker).
+#[test]
+fn only_a_globally_authenticated_server_registers_a_bare_marker() {
+    use crate::which::SessionAuth;
+
+    assert!(bare_marker_wanted(&SessionAuth::Global, false));
+    assert!(!bare_marker_wanted(
+        &SessionAuth::IsolatedRuntime("work".to_string()),
+        false
+    ));
+    assert!(!bare_marker_wanted(&SessionAuth::IsolatedCustom, false));
+}
+
+/// The Plugin tab's `r` handshake boots a real `clauth mcp` child. Without the
+/// marker its 3s life would land on the tally as a session nobody is running —
+/// and the probe inherits no `CLAUDE_CONFIG_DIR` of its own to be caught by.
+#[test]
+fn the_plugin_probes_own_child_registers_no_bare_marker() {
+    assert!(!bare_marker_wanted(
+        &crate::which::SessionAuth::Global,
+        true
+    ));
+}

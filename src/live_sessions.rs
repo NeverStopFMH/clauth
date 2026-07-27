@@ -31,7 +31,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::lock::with_state_lock;
-use crate::profile::{atomic_write_600, clauth_dir, mkdir_700};
+use crate::profile::{AppConfig, atomic_write_600, clauth_dir, mkdir_700};
 use crate::runtime::{SessionId, is_session_id};
 
 /// One live session's row. Every field is written by exactly one of the two
@@ -146,10 +146,47 @@ impl LiveTally {
     /// SIGKILLed session's row outlives it for the whole daemon run. Gates on
     /// the same predicate the decision leg does, so a row cannot be live for one
     /// and dead for the other.
-    pub(crate) fn collect() -> Self {
-        Self::from_live_rows(list().into_iter().filter(|row| {
+    pub(crate) fn collect(config: &AppConfig) -> Self {
+        let mut tally = Self::from_live_rows(list().into_iter().filter(|row| {
             crate::runtime::session_row_is_live(&row.start_profile, row.isolated, &row.session_id)
-        }))
+        }));
+        tally.add_bare_sessions(config);
+        tally
+    }
+
+    /// Fold in the BARE `claude` sessions — started without `clauth start`, so
+    /// they read the `~/.claude/.credentials.json` link clauth owns and burn the
+    /// account it resolves to. They hold no registry row on purpose: a row reaches
+    /// the daemon's swap-decision leg, which reads [`list`] directly, and that leg
+    /// may only move sessions clauth supervises. Counting them HERE is what keeps
+    /// them a display fact. What the count is actually taken from, and how loosely
+    /// it stands in for a `claude` count, is
+    /// [`crate::runtime::live_bare_sessions`].
+    ///
+    /// Attribution is resolved at READ time and never stored: `clauth switch` and
+    /// the fallback chain both repoint that one shared link mid-session. It also
+    /// reads the link rather than `active_profile`, which under a divergence names
+    /// an account the bare session does not authenticate as.
+    ///
+    /// They count as `following` as well, because the chain genuinely moves them:
+    /// a global auto-switch repoints the link and Claude Code re-reads it.
+    ///
+    /// An unreadable marker dir counts as ZERO — the OPPOSITE direction to
+    /// [`crate::runtime::has_live_session`], which gates delete, disable and
+    /// rotation and so must read an unknown as live. This tally only renders, so
+    /// folding an unknown in as live would put a session on screen that nothing
+    /// produced.
+    fn add_bare_sessions(&mut self, config: &AppConfig) {
+        let bare = crate::runtime::live_bare_sessions().unwrap_or(0);
+        if bare == 0 {
+            return;
+        }
+        let Some((member, _)) = crate::which::resolve_global(config) else {
+            return;
+        };
+        let slot = self.0.entry(member).or_default();
+        slot.sessions += bare;
+        slot.following += bare;
     }
 
     /// Tally rows already known to be live. Attribution is `current_member`,

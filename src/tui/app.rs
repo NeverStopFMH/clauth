@@ -1666,7 +1666,9 @@ impl App {
         let (login_event_tx, login_event_rx) = std::sync::mpsc::channel();
         let (login_result_tx, login_result_rx) = std::sync::mpsc::channel();
 
-        // Seed the token cache before `config` moves into the handle below.
+        // Seed the token cache and the live tally before `config` moves into the
+        // handle below.
+        let live_sessions = crate::live_sessions::LiveTally::collect(&config);
         let session_tokens = collect_session_tokens(
             &config
                 .profiles
@@ -1765,7 +1767,7 @@ impl App {
             history_cache,
             history_mtimes,
             session_tokens,
-            live_sessions: crate::live_sessions::LiveTally::collect(),
+            live_sessions,
             last_live_sessions_refresh: Instant::now(),
         }
     }
@@ -3133,7 +3135,7 @@ fn recompute_plugin_checks(app: &mut App, refresh_version: bool) {
     // authenticates as it (`docs/plan/multi-session-fallback.md` §14). Its other
     // consumers ask "does a session own this account's chain", which stays true
     // under both markers.
-    let tally = crate::live_sessions::LiveTally::collect();
+    let tally = crate::live_sessions::LiveTally::collect(&app.config());
     for snap in snaps {
         let instances = tally.member(&snap.name).sessions;
         live_sessions += instances;
@@ -7333,7 +7335,8 @@ fn poll_live_sessions(app: &mut App) {
         return;
     }
     app.last_live_sessions_refresh = Instant::now();
-    app.live_sessions = crate::live_sessions::LiveTally::collect();
+    let tally = crate::live_sessions::LiveTally::collect(&app.config());
+    app.live_sessions = tally;
 }
 
 /// Plugin tab live refresh: re-run the cheap local checks (session counts + link

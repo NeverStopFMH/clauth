@@ -374,3 +374,34 @@ fn session_profile_none_for_non_runtime_path() {
         );
     }
 }
+
+/// `CLAUDE_CONFIG_DIR` describes the process ASKING, so it is the wrong input for
+/// attributing another process's credentials. A TUI running inside a `clauth
+/// start` session would otherwise claim every bare `claude` on the box for its
+/// own runtime profile.
+#[test]
+fn resolve_global_ignores_claude_config_dir_in_the_readers_env() {
+    let home = crate::testutil::HomeSandbox::new();
+    let config = config_with(
+        vec![blank_profile("global"), blank_profile("started")],
+        Some("global"),
+    );
+    let runtime_dir = home
+        .home()
+        .join(".clauth")
+        .join("profiles")
+        .join("started")
+        .join("runtime-4242-0");
+    let _config_dir = crate::testutil::ConfigDirSandbox::new(&home, &runtime_dir);
+
+    assert_eq!(
+        resolve_active(&config),
+        Some(("started".to_string(), Source::SessionDir)),
+        "fixture control: the reader's own env attributes it to its runtime profile"
+    );
+    assert_eq!(
+        resolve_global(&config),
+        Some(("global".to_string(), Source::CredentialLessActive)),
+        "the global credential link's owner does not depend on who is asking"
+    );
+}

@@ -192,3 +192,17 @@ fn global_entry_drifted_flags_stale_command_and_args() {
     );
     assert_eq!(global_entry_drifted(), Some(true));
 }
+
+/// The probe's child is a full `clauth mcp` server, so it must say who spawned
+/// it: without this the handshake registers a bare session for its own lifetime
+/// and the live tally counts a session nobody is running.
+#[test]
+fn the_mcp_probe_marks_its_child_as_a_probe() {
+    let env = crate::testutil::env_overrides(&probe_command());
+
+    assert_eq!(
+        env.get(crate::mcp::MCP_PROBE_ENV),
+        Some(&Some("1".to_string())),
+        "the probe's child must be marked, got: {env:?}"
+    );
+}

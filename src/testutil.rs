@@ -238,6 +238,53 @@ impl Drop for EndpointSandbox<'_> {
     }
 }
 
+/// RAII `CLAUDE_CONFIG_DIR` pin: forces the var for its lifetime and restores the
+/// previous value on drop (even on panic). Required by any test exercising a path
+/// that reads the session's config dir — `which::session_auth`,
+/// `which::resolve_active`, and everything attributing loaded credentials.
+///
+/// It BORROWS the [`HomeSandbox`] for the same reason [`EndpointSandbox`] does:
+/// the env is a process-global serialized by `HOME_TEST_LOCK`, which the home
+/// sandbox holds, so dropping the home first would release that lock with this
+/// pin still standing and let the next test run against it. As a borrow that
+/// inversion is E0505 at compile time instead of a race nothing checks.
+pub(crate) struct ConfigDirSandbox<'a> {
+    prev: Option<std::ffi::OsString>,
+    _home: std::marker::PhantomData<&'a HomeSandbox>,
+}
+
+impl<'a> ConfigDirSandbox<'a> {
+    #[expect(
+        unsafe_code,
+        reason = "env mutation is unsafe in Rust 2024; serialized by HOME_TEST_LOCK, held by the borrowed sandbox"
+    )]
+    pub(crate) fn new(_home: &'a HomeSandbox, dir: &Path) -> Self {
+        let prev = std::env::var_os("CLAUDE_CONFIG_DIR");
+        // SAFETY: test-only, serialized by `HOME_TEST_LOCK`, restored on drop.
+        unsafe { std::env::set_var("CLAUDE_CONFIG_DIR", dir) };
+        Self {
+            prev,
+            _home: std::marker::PhantomData,
+        }
+    }
+}
+
+impl Drop for ConfigDirSandbox<'_> {
+    #[expect(
+        unsafe_code,
+        reason = "env mutation is unsafe in Rust 2024; serialized by HOME_TEST_LOCK, held by the borrowed sandbox"
+    )]
+    fn drop(&mut self) {
+        // SAFETY: same as `new` — restore the prior value under the same lock.
+        unsafe {
+            match &self.prev {
+                Some(v) => std::env::set_var("CLAUDE_CONFIG_DIR", v),
+                None => std::env::remove_var("CLAUDE_CONFIG_DIR"),
+            }
+        }
+    }
+}
+
 /// RAII tier pin: acquires `TIER_TEST_LOCK` and forces the process-global color
 /// tier for its lifetime, putting the previous pin back on drop (even on panic).
 /// Required for any test asserting on a tier-dependent style, since the tier is

@@ -574,6 +574,61 @@ pub(crate) fn live_sessions_at(sessions: &Path) -> Option<usize> {
     live_marker_names(sessions).map(|names| names.len())
 }
 
+/// Liveness markers standing in for BARE `claude` sessions — the ones started
+/// without `clauth start`, reading the `~/.claude/.credentials.json` link clauth
+/// owns. One flock-held `<pid>` file per `clauth mcp` server that reads those
+/// global credentials ([`live_bare_sessions`] states how tight that stand-in is),
+/// deliberately OUTSIDE `profiles/`:
+/// [`session_marker_dirs`] scans a profile dir for names starting with
+/// `SESSIONS_STEM`, so nothing here can reach [`has_live_session`] and the
+/// delete, disable, and macOS rotation gates keep counting `clauth start`
+/// sessions only. A bare session holds no credential clauth handed it and none
+/// it could not already read, so it is a display fact, not a gate.
+fn live_bare_dir() -> Result<PathBuf> {
+    Ok(clauth_dir()?.join("live_bare"))
+}
+
+/// Stamp a marker for THIS process; the flock is held for exactly as long as the
+/// returned `File` is, so any death — SIGKILL included — releases it with no
+/// teardown path to run.
+///
+/// Keyed by pid, which the OS reuses: the file is opened without truncation and
+/// re-locked, never read as dead from its name alone. The state lock is what
+/// separates this create-then-lock from [`gc_bare_markers`]'s prune, which
+/// unlinks whatever it reads as unlocked — a marker pruned in that window leaves
+/// a running session holding an unlinked file that nothing can count.
+pub(crate) fn register_bare_session() -> Result<File> {
+    let dir = live_bare_dir()?;
+    let path = dir.join(std::process::id().to_string());
+    with_state_lock(|| {
+        crate::profile::mkdir_700(&dir)
+            .with_context(|| format!("failed to create {}", dir.display()))?;
+        let file =
+            open_pid_file(&path).with_context(|| format!("failed to open {}", path.display()))?;
+        file.try_lock()
+            .with_context(|| format!("marker {} already held", path.display()))?;
+        Ok(file)
+    })
+}
+
+/// How many marker holders are running. `None` when the probe could not tell,
+/// exactly as [`live_sessions_at`] defines it; the caller picks the direction,
+/// and the one caller that exists picks zero (see
+/// [`crate::live_sessions::LiveTally::collect`]).
+///
+/// This is a `clauth mcp` count STANDING IN for a bare `claude` count, and the
+/// approximation is loose in both directions. Under: a `claude` with no clauth
+/// MCP server wired boots none, so it is counted nowhere. Over: a plugin install
+/// and a manual `mcpServers.clauth` entry are namespaced separately by Claude
+/// Code and coexist after an upgrade (`plugin_global` and `manual_global` are
+/// independent in `tui::app`, and the tab stops offering the fix once either
+/// wires it), so one session can boot two servers and render as two; and any
+/// non-Claude-Code MCP client pointed at `clauth mcp` renders as a bare `claude`,
+/// since nothing here reads the client's `initialize`.
+pub(crate) fn live_bare_sessions() -> Option<usize> {
+    live_sessions_at(&live_bare_dir().ok()?)
+}
+
 /// Best-effort sweep removing runtime trees whose owning session died without
 /// running teardown (SIGKILL/crash strands the pair). With one tree per session
 /// this is load-bearing, not housekeeping: every crashed session would otherwise
@@ -584,7 +639,17 @@ pub(crate) fn live_sessions_at(sessions: &Path) -> Option<usize> {
 /// alike. Safe at any entry point: each removal re-checks liveness under the
 /// state lock (the same teardown gate `Drop` uses), so a live session — or one
 /// mid-acquire holding the lock — is never collected.
+///
+/// The marker sweeps are siblings of the tree sweep rather than its tail: an
+/// unreadable `profiles/` says nothing about a registry row or a bare session's
+/// marker, and folding them in would have skipped both on that return.
 pub(crate) fn gc_stale_runtimes() {
+    gc_runtime_trees();
+    gc_live_session_rows();
+    gc_bare_markers();
+}
+
+fn gc_runtime_trees() {
     let Ok(root) = profiles_root_dir() else {
         return;
     };
@@ -628,7 +693,33 @@ pub(crate) fn gc_stale_runtimes() {
             }
         }
     }
-    gc_live_session_rows();
+}
+
+/// Drop the markers of bare `claude` sessions that have exited — the ordinary
+/// case, since such a session never runs clauth code and leaves its file behind.
+/// The same per-entry prune the paired trees get, minus the tree removal: this
+/// dir holds nothing but markers, so no `remove_dir_all` is handed anything here.
+fn gc_bare_markers() {
+    let Ok(dir) = live_bare_dir() else {
+        return;
+    };
+    // Peek before locking. This runs at every `clauth mcp` boot — including the
+    // Plugin tab's probe child, which dies at 3s — while the state flock waits up
+    // to `STATE_LOCK_TIMEOUT` and is legitimately held ~20s by a macOS switch's
+    // keychain shell-out. Nothing to prune must not pay that wait. A marker that
+    // appears after the peek is collected by the next sweep, which is the whole
+    // contract of a best-effort GC; a marker that DISAPPEARS after it leaves
+    // `prune_stale_sessions` a `NotFound` it already treats as nothing to do.
+    let Ok(mut entries) = std::fs::read_dir(&dir) else {
+        return;
+    };
+    if entries.next().is_none() {
+        return;
+    }
+    let _ = with_state_lock(|| {
+        let _ = prune_stale_sessions(&dir);
+        Ok::<_, anyhow::Error>(())
+    });
 }
 
 /// Drop registry rows whose owning session is gone. A row is dead iff NEITHER

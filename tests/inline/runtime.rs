@@ -4509,3 +4509,139 @@ fn a_standing_refusal_is_announced_once_per_reason() {
         );
     });
 }
+
+// ── bare `claude` session markers ────────────────────────────────────────────
+
+/// The whole safety argument for counting bare sessions: their markers live
+/// OUTSIDE `profiles/`, so `has_live_session` — which gates delete, disable, and
+/// every macOS rotation leg — reads exactly the `clauth start` sessions it read
+/// before. Both directions, because a marker namespace that suppressed a real
+/// session's marker would be the same defect pointing the other way.
+#[test]
+fn a_bare_session_marker_is_invisible_to_has_live_session() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let _bare = register_bare_session().expect("register a bare session");
+        assert_eq!(
+            live_bare_sessions(),
+            Some(1),
+            "fixture control: the marker must actually be held"
+        );
+
+        assert!(
+            !has_live_session("work"),
+            "a bare `claude` must not gate this profile's delete/disable/rotation"
+        );
+
+        let _started = hold_session_row_marker("work", false, "4242-0").expect("hold a session");
+        assert!(
+            has_live_session("work"),
+            "a real `clauth start` session still reads live with a bare marker present"
+        );
+    });
+}
+
+/// A bare session dies without teardown as the normal case (it never ran clauth
+/// code), so its marker file outlives it and only GC removes it.
+#[test]
+fn gc_prunes_a_dead_bare_session_marker() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let dir = tmp.path().join(".clauth").join("live_bare");
+        drop(register_bare_session().expect("register a bare session"));
+        assert_eq!(
+            fs::read_dir(&dir).expect("read live_bare").count(),
+            1,
+            "fixture control: a released marker's file stays on disk"
+        );
+
+        gc_stale_runtimes();
+
+        assert_eq!(
+            fs::read_dir(&dir).expect("read live_bare").count(),
+            0,
+            "a marker nothing holds must be pruned"
+        );
+    });
+}
+
+#[test]
+fn gc_spares_a_held_bare_session_marker() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let _bare = register_bare_session().expect("register a bare session");
+
+        gc_stale_runtimes();
+
+        assert_eq!(
+            live_bare_sessions(),
+            Some(1),
+            "GC must not unlink a marker whose session is still running"
+        );
+    });
+}
+
+/// The bare-marker sweep runs at every `clauth mcp` boot, the Plugin tab's
+/// 3s-budget probe child included, and the state flock waits up to
+/// `STATE_LOCK_TIMEOUT` behind a macOS switch's keychain shell-out. Every other
+/// acquisition inside this sweep is conditional on there being work; this one
+/// must be too.
+#[test]
+fn gc_takes_no_state_flock_when_no_bare_marker_exists() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        crate::lock::OUTERMOST_ACQUISITIONS.with(|c| c.set(0));
+        gc_stale_runtimes();
+        assert_eq!(
+            crate::lock::OUTERMOST_ACQUISITIONS.with(|c| c.get()),
+            0,
+            "a sweep with nothing to collect must not wait on the cross-process lock"
+        );
+
+        // Fixture control: with a marker to look at, the sweep DOES lock — or the
+        // assertion above would hold against a leg that never runs at all.
+        let bare = register_bare_session().expect("register a bare session");
+        crate::lock::OUTERMOST_ACQUISITIONS.with(|c| c.set(0));
+        gc_stale_runtimes();
+        assert_eq!(
+            crate::lock::OUTERMOST_ACQUISITIONS.with(|c| c.get()),
+            1,
+            "the prune itself still runs under the lock, exactly once"
+        );
+
+        // The steady state on any box the feature has ever run on, and the arm
+        // the first leg does NOT reach: `register_bare_session` mints the dir and
+        // the sweep only ever unlinks FILES, so "no bare session running" means an
+        // EMPTY dir here, never an absent one. Pinning only the absent case would
+        // pin the sweep exactly where it was already free.
+        drop(bare);
+        let dir = live_bare_dir().expect("bare dir path");
+        // The liveness probe is fail-ALIVE, so one transient error can skip a
+        // prune; only a persistently-unpruned marker is a regression. Same
+        // hardening as `has_live_session_true_when_any_session_alive`, and it
+        // keeps a skipped prune from reading as a lock-count failure below.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let emptied = loop {
+            gc_stale_runtimes();
+            if fs::read_dir(&dir).expect("read live_bare").next().is_none() {
+                break true;
+            }
+            if std::time::Instant::now() >= deadline {
+                break false;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        assert!(
+            emptied && dir.is_dir(),
+            "fixture: the dir must survive the prune, emptied — or this leg degrades into the absent case above"
+        );
+
+        crate::lock::OUTERMOST_ACQUISITIONS.with(|c| c.set(0));
+        gc_stale_runtimes();
+        assert_eq!(
+            crate::lock::OUTERMOST_ACQUISITIONS.with(|c| c.get()),
+            0,
+            "an existing-but-empty marker dir must not wait on the lock either"
+        );
+    });
+}

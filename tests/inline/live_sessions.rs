@@ -269,8 +269,169 @@ fn collect_drops_a_row_whose_session_is_no_longer_running() {
         .expect("hold the live session's marker");
 
     assert_eq!(
-        LiveTally::collect().member("work").sessions,
+        LiveTally::collect(&config_with(vec![], "work"))
+            .member("work")
+            .sessions,
         1,
         "only the row whose marker is still held is a live session"
+    );
+}
+
+// ── bare `claude` sessions ───────────────────────────────────────────────────
+
+fn oauth_profile(name: &str, refresh: &str) -> crate::profile::Profile {
+    let mut profile = crate::testutil::blank_profile(name);
+    profile.credentials = Some(crate::profile::ClaudeCredentials {
+        claude_ai_oauth: Some(crate::profile::OAuthToken {
+            access_token: format!("at-{name}"),
+            refresh_token: Some(refresh.to_string()),
+            expires_at: None,
+            scopes: None,
+            subscription_type: None,
+        }),
+    });
+    profile
+}
+
+fn config_with(profiles: Vec<crate::profile::Profile>, active: &str) -> AppConfig {
+    AppConfig {
+        state: crate::profile::AppState {
+            active_profile: Some(active.into()),
+            profiles: profiles.iter().map(|p| p.name.clone()).collect(),
+            ..Default::default()
+        },
+        profiles,
+    }
+}
+
+/// What the credential link the bare `claude` reads actually holds.
+fn write_linked_credentials(refresh: &str) {
+    let dir = crate::profile::claude_dir().expect("claude dir");
+    std::fs::create_dir_all(&dir).expect("mkdir .claude");
+    std::fs::write(
+        dir.join(".credentials.json"),
+        format!(r#"{{"claudeAiOauth":{{"accessToken":"at","refreshToken":"{refresh}"}}}}"#),
+    )
+    .expect("write linked credentials");
+}
+
+/// A bare `claude` — started without `clauth start` — burns the same account
+/// window a supervised session does, and the daemon's global auto-switch really
+/// does move it (it repoints the very link the session re-reads), so it counts as
+/// following the chain too.
+#[test]
+fn a_held_bare_marker_counts_on_the_account_the_credential_link_resolves_to() {
+    let _home = HomeSandbox::new();
+    let config = config_with(vec![oauth_profile("work", "rt-work")], "work");
+    write_linked_credentials("rt-work");
+
+    let _bare = crate::runtime::register_bare_session().expect("hold a bare marker");
+
+    assert_eq!(
+        LiveTally::collect(&config).member("work"),
+        MemberSessions {
+            sessions: 1,
+            following: 1,
+            last_swap_at: None,
+        },
+    );
+}
+
+/// The link is the fact; `active_profile` is a wish. Under a divergence the bare
+/// `claude` authenticates as whatever the link resolves to, so that is where its
+/// window is spent and where it must be counted.
+#[test]
+fn bare_attribution_follows_the_credential_link_not_the_active_profile() {
+    let _home = HomeSandbox::new();
+    let config = config_with(
+        vec![
+            oauth_profile("work", "rt-work"),
+            oauth_profile("spare", "rt-spare"),
+        ],
+        "work",
+    );
+    write_linked_credentials("rt-spare");
+
+    let _bare = crate::runtime::register_bare_session().expect("hold a bare marker");
+
+    let tally = LiveTally::collect(&config);
+    assert_eq!(tally.member("spare").sessions, 1);
+    assert_eq!(
+        tally.member("work"),
+        MemberSessions::default(),
+        "the account the link does NOT resolve to hosts nothing"
+    );
+}
+
+/// The fd closing IS the release, which is what makes this survive SIGKILL: a
+/// bare session runs no clauth code and has no teardown path to unregister from.
+#[test]
+fn releasing_a_bare_marker_stops_it_counting() {
+    let _home = HomeSandbox::new();
+    let config = config_with(vec![oauth_profile("work", "rt-work")], "work");
+    write_linked_credentials("rt-work");
+
+    let bare = crate::runtime::register_bare_session().expect("hold a bare marker");
+    assert_eq!(
+        LiveTally::collect(&config).member("work").sessions,
+        1,
+        "positive control: the marker counts while it is held"
+    );
+
+    drop(bare);
+
+    // The liveness probe is fail-ALIVE (any `try_lock` I/O error reads as alive),
+    // so one transient error under a parallel suite can inflate a single reading;
+    // only a persistently-live reading is a regression. Same hardening as
+    // `runtime`'s `has_live_session_true_when_any_session_alive`.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let settled = loop {
+        if LiveTally::collect(&config).member("work").sessions == 0 {
+            break true;
+        }
+        if std::time::Instant::now() >= deadline {
+            break false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    };
+    assert!(settled, "a released bare marker must stop counting");
+}
+
+/// The tally is read by a TUI that may itself be running inside a `clauth start`
+/// session, where `CLAUDE_CONFIG_DIR` names its own runtime tree. That env
+/// describes the READER, so letting it reach the attribution claims every bare
+/// `claude` on the box for the reader's profile. Pinning the resolver in
+/// isolation is not enough — this pins which one the fold calls.
+#[test]
+fn bare_attribution_ignores_the_readers_own_config_dir() {
+    let home = HomeSandbox::new();
+    let config = config_with(
+        vec![
+            oauth_profile("work", "rt-work"),
+            oauth_profile("spare", "rt-spare"),
+        ],
+        "work",
+    );
+    write_linked_credentials("rt-work");
+    let reader_runtime = home
+        .home()
+        .join(".clauth")
+        .join("profiles")
+        .join("spare")
+        .join("runtime-4242-0");
+    let _config_dir = crate::testutil::ConfigDirSandbox::new(&home, &reader_runtime);
+
+    let _bare = crate::runtime::register_bare_session().expect("hold a bare marker");
+
+    let tally = LiveTally::collect(&config);
+    assert_eq!(
+        tally.member("work").sessions,
+        1,
+        "the bare session belongs to the account the global link resolves to"
+    );
+    assert_eq!(
+        tally.member("spare"),
+        MemberSessions::default(),
+        "the READER's own runtime profile hosts nothing"
     );
 }

@@ -22,6 +22,7 @@ use rmcp::{
 };
 use serde::Deserialize;
 
+use crate::logline::logline;
 use crate::profile::{AppConfig, load_config};
 use crate::profile_cache::{THIRD_PARTY_CACHE_FILE, USAGE_CACHE_FILE, load_profile_cache};
 use crate::profile_json::{provider_label, tier_label, windows_json};
@@ -29,6 +30,11 @@ use crate::providers::ThirdPartyStats;
 use crate::runtime::{Isolation, ProfileRuntime};
 use crate::usage::{UsageInfo, UsageWindow, now_epoch_secs, now_ms};
 use render::ProfileSnapshot;
+
+/// Marks the `clauth mcp` child that [`crate::plugin_probe::mcp_boots`] spawns
+/// for the Plugin tab's handshake check. clauth owns both sides of that spawn, so
+/// an env marker beats inferring it from the client's `initialize`.
+pub(crate) const MCP_PROBE_ENV: &str = "CLAUTH_MCP_PROBE";
 
 /// Default per-call delegate timeout (seconds) when the caller doesn't set one.
 const DEFAULT_RUN_TIMEOUT_SECS: u64 = 300;
@@ -1037,9 +1043,42 @@ fn build_instructions() -> String {
     render::instructions_block(&snapshots, &crate::which::session_auth())
 }
 
+/// Whether this `clauth mcp` process should hold a bare-session marker. Pure, so
+/// both refusals are exercised without an env or a spawn.
+///
+/// `Global` is the whole signal: a server reading the global `~/.claude`
+/// credentials is the MCP half of a bare `claude`, while every isolated tier
+/// reads its own file — a supervised `clauth start` session, already registered,
+/// or a `delegate` child, which gets `CLAUDE_CONFIG_DIR` in the same builder as
+/// its depth marker and so needs no depth check of its own here.
+fn bare_marker_wanted(auth: &crate::which::SessionAuth, is_probe: bool) -> bool {
+    matches!(auth, crate::which::SessionAuth::Global) && !is_probe
+}
+
+/// This server's bare-session marker, or `None` when the process is not a bare
+/// session or the registration failed. A failure is logged and never fatal: the
+/// tally is a display feature riding on the MCP server, and a broken count must
+/// not take the server down.
+fn hold_bare_session_marker() -> Option<std::fs::File> {
+    let is_probe = std::env::var_os(MCP_PROBE_ENV).is_some();
+    if !bare_marker_wanted(&crate::which::session_auth(), is_probe) {
+        return None;
+    }
+    match crate::runtime::register_bare_session() {
+        Ok(file) => Some(file),
+        Err(e) => {
+            logline!("clauth: bare-session marker not registered: {e:#}");
+            None
+        }
+    }
+}
+
 pub(crate) fn serve() -> Result<()> {
     crate::runtime::gc_stale_runtimes();
     jobs::gc(now_ms());
+    // Held across `block_on`, so the flock drops with the process however it dies
+    // — a bare `claude` runs no clauth teardown, SIGKILL least of all.
+    let _bare_marker = hold_bare_session_marker();
     // rmcp's service loop arms a Tokio timer (needs `enable_time`), so a bare
     // current-thread runtime panics right after the initialize reply. `enable_all`
     // also turns on the I/O driver, covering a future transport that polls a real

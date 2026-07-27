@@ -161,14 +161,18 @@ pub(crate) enum McpProbe {
 /// other probes — the server runs `gc_stale_runtimes()` at startup — so the tab
 /// gates it behind `r` only. Drains stdout on a thread so a chatty server can't
 /// deadlock the pipe; 3s budget, then kill.
-pub(crate) fn mcp_boots() -> McpProbe {
-    let mut child = match Command::new("clauth")
-        .arg("mcp")
+fn probe_command() -> Command {
+    let mut cmd = Command::new("clauth");
+    cmd.arg("mcp")
+        .env(crate::mcp::MCP_PROBE_ENV, "1")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-    {
+        .stderr(Stdio::null());
+    cmd
+}
+
+pub(crate) fn mcp_boots() -> McpProbe {
+    let mut child = match probe_command().spawn() {
         Ok(child) => child,
         Err(e) => return McpProbe::Failed(format!("spawn failed: {e}")),
     };

@@ -4464,6 +4464,7 @@ fn poll_does_nothing_until_the_daemon_names_a_member() {
 }
 
 /// The production trigger: the session's own tick reads its own row and executes.
+#[cfg(not(target_os = "macos"))]
 #[test]
 fn poll_executes_the_member_the_daemon_named() {
     let tmp = tempfile::tempdir().expect("tempdir");

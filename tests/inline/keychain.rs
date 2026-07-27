@@ -196,7 +196,7 @@ fn keychain_service_suffix_is_8_hex_chars() {
     assert!(
         suffix
             .chars()
-            .all(|c| c.is_ascii_lowercase() && c.is_ascii_hexdigit()),
+            .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
         "suffix must be lowercase hexadecimal: got {suffix}"
     );
 }

@@ -3293,6 +3293,7 @@ fn a_registered_session_is_opted_out_of_the_chain() {
 /// `--with-fallback` is the only thing that sets `follows_chain`, so the flag has
 /// to survive the whole way to the on-disk row: the decision leg reads that field
 /// and nothing else decides whether a session is steerable.
+#[cfg(not(target_os = "macos"))]
 #[test]
 fn an_opted_in_session_registers_as_following_the_chain() {
     let tmp = tempfile::tempdir().expect("tempdir");

@@ -1220,7 +1220,11 @@ fn touch_store(plan: &SwapPlan, memoized: Option<SystemTime>) -> Result<()> {
 static COARSE_MTIME_OVERRIDE: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
-#[cfg(test)]
+// Gated with its caller: the one test that poses a truncating filesystem drives
+// `swap_to`, refused at platform level on macOS, so an ungated setter there is a
+// dead-code error under clippy `-D warnings`. The static stays ungated —
+// `as_stored` reads it on every platform.
+#[cfg(all(test, not(target_os = "macos")))]
 fn set_coarse_mtime_override(on: bool) {
     COARSE_MTIME_OVERRIDE.store(on, std::sync::atomic::Ordering::SeqCst);
 }
@@ -1834,6 +1838,21 @@ impl ProfileRuntime {
             claude_home: claude_home.clone(),
             swap: std::sync::Arc::clone(&swap),
         };
+        // Armed HERE rather than on the spawned thread, so that `acquire`
+        // returning IS the barrier proving the watch is live. Arming costs
+        // 18-34 ms on macOS (FSEvents resolves and registers each directory),
+        // and a caller that spawned first had no way to learn when its watch
+        // went up: a credential write landing in that window produced no event
+        // and waited out the whole 30 s fallback. Costs ~15-26 ms inside this
+        // profile's rotation-guard hold, against a guard already held across
+        // OAuth round trips.
+        let specs = crate::watchdog::watch_specs(
+            swap.runtime.as_path(),
+            swap.canonical().as_path(),
+            &claude_home,
+        );
+        let requested = specs.len();
+        let watcher = crate::watchdog::try_start(&specs, crate::watchdog::PRODUCTION.debounce);
         #[allow(clippy::expect_used, reason = "thread spawn failure is unrecoverable")]
         let watchdog_handle = thread::Builder::new()
             .name(format!("clauth-wdog-{name}"))
@@ -1841,12 +1860,13 @@ impl ProfileRuntime {
                 // Event-driven reconcile, polling only where events are
                 // unavailable. Exits when the shutdown sender is dropped (see
                 // ProfileRuntime::Drop).
-                let specs = crate::watchdog::watch_specs(
-                    legs.swap.runtime.as_path(),
-                    legs.swap.canonical().as_path(),
-                    &legs.claude_home,
+                crate::watchdog::run_with_watcher(
+                    watcher,
+                    requested,
+                    &watchdog_rx,
+                    &crate::watchdog::PRODUCTION,
+                    &legs,
                 );
-                crate::watchdog::run(&specs, &watchdog_rx, &crate::watchdog::PRODUCTION, &legs);
             })
             .expect("failed to spawn watchdog thread");
 

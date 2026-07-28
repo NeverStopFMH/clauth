@@ -239,11 +239,16 @@ fn a_store_publish_reconciles_with_every_ticker_disabled() {
     let (done_tx, done_rx) = crossbeam_channel::unbounded();
     let rec = Recorder::new(Duration::ZERO, done_tx);
 
+    // Armed before the spawn, exactly as `runtime::acquire` does it, so the
+    // publish below cannot beat the watch up. This used to be a
+    // `sleep(debounce * 5)` after the spawn: a blind constant that happened to
+    // clear the ~34 ms macOS arm with little margin on a loaded runner.
+    let watcher = try_start(&specs, t.debounce);
+    let requested = specs.len();
+    let (shutdown, timings, recorder) = (&shutdown_rx, &t, &rec);
+
     std::thread::scope(|scope| {
-        scope.spawn(|| run(&specs, &shutdown_rx, &t, &rec));
-        // `run` arms the watcher on its own thread; a publish that beats it
-        // would leave nothing to observe.
-        std::thread::sleep(t.debounce * 5);
+        scope.spawn(move || run_with_watcher(watcher, requested, shutdown, timings, recorder));
 
         let started = Instant::now();
         publish(&store, br#"{"claudeAiOauth":{"accessToken":"fresh"}}"#);
@@ -299,6 +304,52 @@ fn the_filter_takes_named_children_and_drops_staging_siblings() {
         "the relink staging half is our own write in flight"
     );
     assert!(!wants(&specs, Path::new("/elsewhere/credentials.json")));
+}
+
+/// A watch armed through a symlinked ancestor must still take its events. macOS
+/// FSEvents reports realpaths, so such a watch delivers a parent that never
+/// equals the spelling it was armed on, `wants` drops every event, and the
+/// watchdog falls back to its 30 s poll while still reporting itself armed.
+///
+/// Every macOS test run hits it: `HOME_OVERRIDE` points at a `tempfile` dir
+/// under `TMPDIR`, which lives in `/var/folders`, a symlink onto
+/// `/private/var/folders`. Production reaches it only where a spec directory
+/// itself resolves through a symlink — a dotfiles-managed `~/.claude` is the
+/// plausible one — since `home_dir()` is otherwise `/Users/<name>`, which
+/// resolves to itself.
+///
+/// Posed with an explicit symlink rather than by leaning on `TMPDIR`, so the
+/// guard is pinned on every platform instead of only where the temp dir happens
+/// to be symlinked.
+#[cfg(unix)]
+#[test]
+fn a_watch_armed_through_a_symlink_takes_events_spelled_by_realpath() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let real = tmp.path().join("real");
+    std::fs::create_dir(&real).expect("real dir");
+    // The realpath as the backend would deliver it: `tmp` is itself under a
+    // symlinked ancestor on macOS, so joining is not enough.
+    let real = std::fs::canonicalize(&real).expect("realpath");
+    let link = tmp.path().join("link");
+    std::os::unix::fs::symlink(&real, &link).expect("symlink");
+
+    let specs = vec![WatchSpec::new(
+        &link,
+        Interest::Names(vec!["credentials.json".into()]),
+    )];
+
+    assert!(
+        wants(&specs, &link.join("credentials.json")),
+        "the spelling the watch was armed on must still match"
+    );
+    assert!(
+        wants(&specs, &real.join("credentials.json")),
+        "the realpath spelling FSEvents delivers must match too, or macOS never wakes"
+    );
+    assert!(
+        !wants(&specs, &real.join("kick_block.json")),
+        "resolving the directory must not widen which names the filter takes"
+    );
 }
 
 /// `wake` is `bounded(1)` and the debouncer discards what it coalesces, so an
@@ -395,8 +446,17 @@ fn the_poll_fallback_reconciles_when_no_directory_can_be_armed() {
     let (done_tx, done_rx) = unbounded();
     let rec = Recorder::new(Duration::ZERO, done_tx);
 
+    let (shutdown, timings, recorder) = (&shutdown_rx, &t, &rec);
     std::thread::scope(|scope| {
-        scope.spawn(|| run(&specs, &shutdown_rx, &t, &rec));
+        scope.spawn(move || {
+            run_with_watcher(
+                try_start(&specs, t.debounce),
+                specs.len(),
+                shutdown,
+                timings,
+                recorder,
+            )
+        });
 
         done_rx
             .recv_timeout(BOUND)
@@ -456,8 +516,17 @@ fn a_partially_armed_watcher_shortens_the_fallback() {
     let (done_tx, done_rx) = unbounded();
     let rec = Recorder::new(Duration::ZERO, done_tx);
 
+    let (shutdown, timings, recorder) = (&shutdown_rx, &t, &rec);
     std::thread::scope(|scope| {
-        scope.spawn(|| run(&specs, &shutdown_rx, &t, &rec));
+        scope.spawn(move || {
+            run_with_watcher(
+                try_start(&specs, t.debounce),
+                specs.len(),
+                shutdown,
+                timings,
+                recorder,
+            )
+        });
 
         // Nothing is published, so no event exists: a reconcile inside the bound
         // can only come from the fallback having been clamped to

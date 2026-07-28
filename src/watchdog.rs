@@ -90,13 +90,33 @@ pub(crate) enum Interest {
 #[derive(Debug, Clone)]
 pub(crate) struct WatchSpec {
     dir: PathBuf,
+    /// The same directory as the event backend spells it. macOS FSEvents
+    /// reports realpaths, so a watch armed through a symlinked ancestor (a
+    /// symlinked `$HOME`, or `TMPDIR` under `/var/folders` → `/private/var`)
+    /// delivers a parent that never equals `dir` and the filter drops every
+    /// event — silently, since the watch itself armed fine. Falls back to `dir`
+    /// when the directory does not exist, which is already the case where the
+    /// arm itself fails: every notify backend rejects a missing path before
+    /// arming, so a spec that cannot resolve also never delivers an event. Build
+    /// specs AFTER the directories exist, or that fallback quietly restores the
+    /// pre-fix behaviour on macOS with nothing said.
+    ///
+    /// Deliberately NOT `claude::paths_equivalent`'s shape (resolve both sides
+    /// at comparison time): that runs on the notify callback thread, once per
+    /// event per spec, over `$HOME` — a directory Claude Code rewrites
+    /// constantly. Resolving once at construction costs four stat-chains per
+    /// session instead, and keeps [`wants`] pure.
+    canonical_dir: PathBuf,
     interest: Interest,
 }
 
 impl WatchSpec {
     pub(crate) fn new(dir: impl Into<PathBuf>, interest: Interest) -> Self {
+        let dir = dir.into();
+        let canonical_dir = std::fs::canonicalize(&dir).unwrap_or_else(|_| dir.clone());
         Self {
-            dir: dir.into(),
+            dir,
+            canonical_dir,
             interest,
         }
     }
@@ -130,14 +150,15 @@ pub(crate) fn is_staging(name: &OsStr) -> bool {
         .is_some_and(|n| n.starts_with('.') && n.contains(".tmp."))
 }
 
-/// Whether a changed `path` can alter a reconcile's outcome. Pure, so the filter
-/// that bounds the event surface is pinned without a filesystem.
+/// Whether a changed `path` can alter a reconcile's outcome. Pure — both
+/// spellings a spec compares against were resolved when it was built — so the
+/// filter that bounds the event surface is pinned without a filesystem.
 fn wants(specs: &[WatchSpec], path: &Path) -> bool {
     let (Some(dir), Some(name)) = (path.parent(), path.file_name()) else {
         return false;
     };
     specs.iter().any(|spec| {
-        spec.dir == dir
+        (spec.dir == dir || spec.canonical_dir == dir)
             && match &spec.interest {
                 Interest::Names(names) => names.iter().any(|n| n.as_os_str() == name),
                 Interest::AnyChild => !is_staging(name),
@@ -343,17 +364,33 @@ pub(crate) enum Exit {
 /// `config_poll` instead would fix that and pull the credential leg's state
 /// flock to 10 Hz, which the split existed to avoid. Upgrade path if it ever
 /// matters: give the event loop its own config ticker rather than one fallback.
-pub(crate) fn run(specs: &[WatchSpec], shutdown: &Receiver<()>, t: &Timings, r: &dyn Reconcile) {
-    if let Some(watcher) = try_start(specs, t.debounce) {
+/// The reconcile loop over an ALREADY-ARMED watcher, `requested` being how many
+/// directories the caller asked for so a partial arm is still detectable.
+///
+/// Takes the watcher rather than arming one, so a caller can arm BEFORE handing
+/// the loop to a thread. Arming is not free — 18-34 ms on macOS, where FSEvents
+/// resolves and registers each directory — and a caller that spawns first has no
+/// signal for when its watch went live. A write landing in that window generates
+/// no event at all, so a fully-armed watcher then waits out its entire 30 s
+/// fallback. There is deliberately no arm-then-spawn convenience wrapper here:
+/// every caller holding the watcher first is what makes that race unwritable.
+pub(crate) fn run_with_watcher(
+    watcher: Option<EventWatcher>,
+    requested: usize,
+    shutdown: &Receiver<()>,
+    t: &Timings,
+    r: &dyn Reconcile,
+) {
+    if let Some(watcher) = watcher {
         let mut t = *t;
-        if watcher.armed < specs.len() {
+        if watcher.armed < requested {
             // Said once here rather than left to the per-directory arm errors:
             // those name a moment, this names a cost the whole session pays.
             logline!(
                 "clauth: fs watcher armed {} of {} directories; the rest reconcile \
                  every {:?} instead of on their events",
                 watcher.armed,
-                specs.len(),
+                requested,
                 t.credential_poll
             );
             t.fallback = t.credential_poll;

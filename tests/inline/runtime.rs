@@ -892,6 +892,10 @@ fn with_link_mode<T>(mode: LinkMode, f: impl FnOnce() -> T) -> T {
 /// Linux/macOS run can reach keeps the exact value, so the guard is otherwise
 /// unreachable. Call INSIDE [`with_fake_home`], whose `HOME_TEST_LOCK` hold
 /// serializes this process-global override.
+///
+/// Gated with its caller, which drives a `swap_to` macOS refuses at platform
+/// level.
+#[cfg(not(target_os = "macos"))]
 fn with_coarse_mtime<T>(f: impl FnOnce() -> T) -> T {
     struct ClearOnDrop;
     impl Drop for ClearOnDrop {
@@ -5195,8 +5199,16 @@ fn the_fake_mode_mirror_converges_under_concurrent_publishes() {
     };
     let (shutdown_tx, shutdown_rx) = crossbeam_channel::bounded::<()>(1);
 
+    // Armed before the spawn, as `acquire` does it. The soak used to outlast the
+    // arm by sheer length, which made the fixture's own "published 0 times"
+    // guard the only thing standing between a slow arm and a vacuous pass.
+    let watcher = crate::watchdog::try_start(&specs, timings.debounce);
+    let requested = specs.len();
+    let (shutdown, t, rec) = (&shutdown_rx, &timings, &mirror);
+
     std::thread::scope(|scope| {
-        scope.spawn(|| crate::watchdog::run(&specs, &shutdown_rx, &timings, &mirror));
+        scope
+            .spawn(move || crate::watchdog::run_with_watcher(watcher, requested, shutdown, t, rec));
 
         let writers: Vec<_> = (0..WRITERS)
             .map(|writer| {

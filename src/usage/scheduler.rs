@@ -792,10 +792,11 @@ fn fetch_with_rotation(
                 // TokenList (clearing any stale quarantine) and retry next
                 // tick (disk cache serves this one). Only an
                 // unchanged-credentials 400 is a real revocation. The adopt
-                // above is the identity-guarded fast path for the macOS
-                // Keychain active; this re-read catches every other racer
-                // (CC through the symlink, a sibling clauth process). See
-                // `carry_external_rotation`.
+                // above is the identity-guarded fast path for the ACTIVE
+                // profile's live mirror, on every platform since the
+                // `keychain_live()` term went; this re-read catches every
+                // other racer (CC writing THROUGH an intact symlink, a
+                // sibling clauth process). See `carry_external_rotation`.
                 if let Some(outcome) = carry_external_rotation(config, name, rt, refetch) {
                     return outcome;
                 }

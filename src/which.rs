@@ -256,10 +256,9 @@ fn emit_json(config: &AppConfig, resolved: Option<(String, Source)>) {
 /// carried by no refresh response — and report a canceled account's
 /// pre-cancellation plan forever.
 ///
-/// `base_url` carries the endpoint a third-party profile routes to, the same
-/// field `status.json` publishes for that profile: `tier` answers only for an
-/// Anthropic plan, so without it this surface could not name where a
-/// third-party session's requests actually go.
+/// `base_url` carries the endpoint the profile routes to, spelled as
+/// `status.json` publishes it, so a reader gets the destination without a second
+/// call.
 fn json_view(config: &AppConfig, resolved: Option<&(String, Source)>) -> serde_json::Value {
     let profile = resolved.and_then(|(name, _)| config.find(name));
     serde_json::json!({

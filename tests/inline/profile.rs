@@ -1481,28 +1481,62 @@ fn reload_fingerprint_drops_when_a_config_toml_is_removed() {
 
 // A `login --setup-token` re-mint writes only `session-token.json` (touches no
 // config.toml, no profiles.toml), so the fingerprint must fold that file in or
-// the hot reload never sees a new / re-minted long-lived token.
+// the hot reload never sees a new / re-minted long-lived token. What rides is the
+// sidecar's parsed status, so the trigger is the mint changing — not the file's
+// timestamp moving, which a swap onto a token-mode member does with no write.
 #[test]
 fn reload_fingerprint_bumps_when_a_session_token_is_added_or_changed() {
     let _home = crate::testutil::HomeSandbox::new();
     save_profile(&crate::testutil::blank_profile("p")).expect("save_profile");
-    let sidecar = profile_dir("p")
-        .expect("profile_dir")
-        .join("session-token.json");
+    let minted_at: i64 = 1_700_000_000_000;
     let before = reload_fingerprint();
-    std::fs::write(&sidecar, b"{}\n").expect("write sidecar");
+
+    crate::claude::write_session_token("p", &format!("sk-ant-{}", "m".repeat(40)), minted_at)
+        .expect("mint a session token");
     let after_add = reload_fingerprint();
     assert_ne!(
         before, after_add,
         "adding a session-token.json must trip the fingerprint"
     );
 
+    crate::claude::write_session_token(
+        "p",
+        &format!("sk-ant-{}", "r".repeat(40)),
+        minted_at + 60 * 60 * 1000,
+    )
+    .expect("re-mint");
+    let after_remint = reload_fingerprint();
+    assert_ne!(
+        after_add, after_remint,
+        "a re-mint carries a later expiry and must trip the fingerprint"
+    );
+}
+
+/// The swap executor stamps the store it repoints to, and for a token-mode member
+/// that store IS `session-token.json`. Riding the mtime made that bump read as a
+/// re-mint and forced a full reload of every profile on the next tick.
+#[test]
+fn reload_fingerprint_ignores_a_bare_session_token_stamp() {
+    let _home = crate::testutil::HomeSandbox::new();
+    save_profile(&crate::testutil::blank_profile("p")).expect("save_profile");
+    crate::claude::write_session_token(
+        "p",
+        &format!("sk-ant-{}", "m".repeat(40)),
+        1_700_000_000_000,
+    )
+    .expect("mint a session token");
+    let sidecar = profile_dir("p")
+        .expect("profile_dir")
+        .join("session-token.json");
+
+    let before = reload_fingerprint();
     let later = std::time::SystemTime::now() + std::time::Duration::from_secs(30);
     crate::testutil::set_mtime(&sidecar, later);
-    let after_edit = reload_fingerprint();
-    assert_ne!(
-        after_add, after_edit,
-        "a re-mint (session-token.json mtime change) must trip the fingerprint"
+
+    assert_eq!(
+        before,
+        reload_fingerprint(),
+        "a timestamp that moved with no byte behind it is not a config change",
     );
 }
 

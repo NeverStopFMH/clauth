@@ -35,7 +35,7 @@ pub(crate) fn has_session_token(name: &str) -> bool {
 
 /// What the `session-token.json` sidecar actually holds (#53 review: the
 /// split must engage only when the installed token IS long-lived).
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum SessionTokenStatus {
     /// A genuine long-lived login — defined by carrying NO refresh token:
     /// with nothing to rotate, sessions can never race clauth's refresher on

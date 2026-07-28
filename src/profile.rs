@@ -15,6 +15,7 @@ pub(crate) enum DivergenceChoice {
     Discard,
 }
 
+use crate::claude::SessionTokenStatus;
 use crate::lock::with_state_lock;
 use crate::logline::logline;
 use crate::providers::{Provider, ThirdPartyStats};
@@ -915,12 +916,16 @@ pub(crate) fn app_state_mtime() -> Option<SystemTime> {
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub(crate) struct ReloadFingerprint {
     profiles_toml_mtime: Option<SystemTime>,
-    /// `(profile dir name, config.toml mtime, session-token.json mtime)`, each
-    /// mtime `None` when the file is absent, sorted by name so readdir order
-    /// can't spuriously flip equality. The sidecar rides here because a
+    /// `(profile dir name, config.toml mtime, session-token.json status)`,
+    /// `None` when the file is absent, sorted by name so readdir order can't
+    /// spuriously flip equality. The sidecar rides here because a
     /// `login --setup-token` re-mint touches nothing else — without it the hot
-    /// reload never sees a new/changed long-lived token.
-    config_mtimes: Vec<(String, Option<SystemTime>, Option<SystemTime>)>,
+    /// reload never sees a new/changed long-lived token. It rides as its PARSED
+    /// status, not its mtime: a swap onto a token-mode member stamps that file's
+    /// mtime with no write behind it, and the status is what every consumer of
+    /// the sidecar actually reads, so a reload fires exactly when one of them
+    /// would see something new.
+    config_mtimes: Vec<(String, Option<SystemTime>, Option<SessionTokenStatus>)>,
 }
 
 /// Pure filesystem stat of the reload triggers. Holds NO locks — `config` sits
@@ -928,7 +933,8 @@ pub(crate) struct ReloadFingerprint {
 /// readdir/stat error contributes the empty value instead of erroring.
 pub(crate) fn reload_fingerprint() -> ReloadFingerprint {
     let profiles_toml_mtime = app_state_mtime();
-    let mut config_mtimes: Vec<(String, Option<SystemTime>, Option<SystemTime>)> = Vec::new();
+    let mut config_mtimes: Vec<(String, Option<SystemTime>, Option<SessionTokenStatus>)> =
+        Vec::new();
     if let Ok(root) = profiles_root()
         && let Ok(entries) = std::fs::read_dir(&root)
     {
@@ -937,19 +943,16 @@ pub(crate) fn reload_fingerprint() -> ReloadFingerprint {
                 continue;
             }
             let name = entry.file_name().to_string_lossy().into_owned();
-            let mtime_of = |file: &str| {
-                std::fs::metadata(entry.path().join(file))
-                    .and_then(|m| m.modified())
-                    .ok()
-            };
-            config_mtimes.push((
-                name,
-                mtime_of("config.toml"),
-                mtime_of("session-token.json"),
-            ));
+            let config_mtime = std::fs::metadata(entry.path().join("config.toml"))
+                .and_then(|m| m.modified())
+                .ok();
+            let token = crate::claude::session_token_status(&name);
+            config_mtimes.push((name, config_mtime, token));
         }
     }
-    config_mtimes.sort();
+    // By dir name, which readdir gives at most once, rather than by the whole
+    // tuple: ordering two sidecar STATUSES against each other means nothing.
+    config_mtimes.sort_by(|a, b| a.0.cmp(&b.0));
     ReloadFingerprint {
         profiles_toml_mtime,
         config_mtimes,

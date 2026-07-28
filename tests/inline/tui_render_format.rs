@@ -151,6 +151,63 @@ fn no_data_dash_stays_faint() {
     assert_eq!(spans[0].style.fg, theme::faint().fg);
 }
 
+// ── Overview tier chip ──────────────────────────────────────────────────────
+
+/// The Overview kind column takes the same `—` every other no-data cell uses
+/// once no tier is known. The bare "Claude" it used to print sat in a column
+/// read side by side against real tiers, so it scanned as a plan of its own.
+///
+/// Asserted against `NO_DATA`, not a second copy of the literal, because
+/// `overview.rs` decides whether to animate the cell by comparing this return
+/// value to that const. A glyph change that moved only one of the two would stop
+/// the no-animation branch firing with nothing else red.
+#[test]
+fn account_type_label_dashes_an_unfetched_plan() {
+    assert_eq!(NO_DATA, "—", "the house no-data glyph");
+
+    let unfetched = crate::testutil::blank_profile("a");
+    assert_eq!(account_type_label(&unfetched), NO_DATA);
+
+    let mut unclassified = crate::testutil::blank_profile("b");
+    unclassified.credentials = Some(crate::profile::ClaudeCredentials {
+        claude_ai_oauth: Some(crate::profile::OAuthToken {
+            access_token: "at".into(),
+            refresh_token: None,
+            expires_at: None,
+            scopes: None,
+            subscription_type: Some("something_new".into()),
+        }),
+    });
+    assert_eq!(account_type_label(&unclassified), NO_DATA);
+}
+
+/// The other direction: a fetched tier still loses only its `Claude ` prefix,
+/// `Free` is untouched, and an api-key profile still reads `API`.
+#[test]
+fn account_type_label_keeps_every_known_tier() {
+    let plan = |tier| {
+        Some(crate::usage::UsageInfo {
+            plan: Some(crate::usage::PlanInfo {
+                tier,
+                subscription_status: None,
+            }),
+            ..Default::default()
+        })
+    };
+
+    let mut max = crate::testutil::blank_profile("a");
+    max.usage = plan(crate::usage::PlanTier::Max(Some(20)));
+    assert_eq!(account_type_label(&max), "Max 20x");
+
+    let mut free = crate::testutil::blank_profile("b");
+    free.usage = plan(crate::usage::PlanTier::Free);
+    assert_eq!(account_type_label(&free), "Free");
+
+    let mut api = crate::testutil::blank_profile("c");
+    api.base_url = Some("https://api.deepseek.com/anthropic".into());
+    assert_eq!(account_type_label(&api), "API");
+}
+
 // ── Reset display (issue #39) ───────────────────────────────────────────────
 //
 // `clock_text` and the three compositions are pure, so these pin exact strings

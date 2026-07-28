@@ -1,9 +1,14 @@
 //! `clauth list` — a human-readable account table.
 //!
 //! Renders over the exact `serde_json::Value` body `daemon::build_status`
-//! produces, the same one `clauth status --json` serializes, so the two
-//! surfaces read one data path and cannot drift. Presentation only: it reads
-//! the on-disk usage caches `build_status` reads and never fetches.
+//! produces, the same one `clauth status --json` serializes, so every column
+//! sourced from that body cannot drift from `status`. Presentation only: it
+//! reads the on-disk usage caches `build_status` reads and never fetches.
+//!
+//! Two facts do NOT come from the body, because it carries neither: the
+//! `disabled` flag (read off `config`) and the `canceled` flag (read off the
+//! per-profile usage cache). Both surface in the trailing state marker, so this
+//! table shows two states `status --json` does not expose.
 
 use anyhow::Result;
 
@@ -26,15 +31,18 @@ pub(crate) fn run(include_disabled: bool) -> Result<()> {
     Ok(())
 }
 
-/// One rendered table row, sourced from a single `build_status` profile entry
-/// (plus `config` for the disabled flag, which the JSON body does not carry).
+/// One rendered table row. Three sources, because the JSON body carries only
+/// the first: a single `build_status` profile entry, `config` for the disabled
+/// flag, and the profile's own `usage_cache.json` for the canceled one (via
+/// `profile_json::is_canceled_cached`).
 struct Row {
     /// `*` for the active profile, a space otherwise.
     marker: char,
     name: String,
-    /// Tier for an anthropic account (`Max 5x`, `canceled`), else the provider
-    /// name for a third-party one; `entry["tier"]` already folds in the plan and
-    /// cancellation logic, so reading it keeps this in lockstep with `status`.
+    /// Tier for an anthropic account (`Max 5x`), else the provider name for a
+    /// third-party one. Reading `entry["tier"]` keeps this in lockstep with
+    /// `status`. A canceled subscription reads as its post-cancellation tier
+    /// (`Free`) here; [`Row::state_suffix`] is what names the cancellation.
     plan: String,
     /// 5h / 7d window utilization as `NN%` (share consumed), `-` when no cache.
     five_h: String,
@@ -42,6 +50,7 @@ struct Row {
     /// The third-party base url, or `-` for the default Anthropic endpoint.
     endpoint: String,
     disabled: bool,
+    canceled: bool,
 }
 
 impl Row {
@@ -61,7 +70,25 @@ impl Row {
             seven_d: window_pct(windows, crate::usage::LABEL_7D),
             endpoint: entry["base_url"].as_str().unwrap_or("-").to_string(),
             disabled: config.find(name).is_some_and(|p| p.is_disabled()),
+            canceled: crate::profile_json::is_canceled_cached(name),
         }
+    }
+
+    /// Trailing state marker: `(disabled)`, `(canceled)`, or `(disabled,
+    /// canceled)`. Both render rather than one winning — an operator usually
+    /// disables an account BECAUSE it died, so letting `disabled` mask
+    /// `canceled` is the erasure the Fallback tab's stacked pills already exist
+    /// to prevent. This table has no status column, so the suffix is the only
+    /// place either fact can appear.
+    fn state_suffix(&self) -> String {
+        let states: Vec<&str> = [(self.disabled, "disabled"), (self.canceled, "canceled")]
+            .into_iter()
+            .filter_map(|(on, label)| on.then_some(label))
+            .collect();
+        if states.is_empty() {
+            return String::new();
+        }
+        format!(" ({})", states.join(", "))
     }
 }
 
@@ -114,7 +141,7 @@ fn render_table(config: &AppConfig, body: &serde_json::Value) -> String {
             r.five_h,
             r.seven_d,
             r.endpoint,
-            if r.disabled { " (disabled)" } else { "" },
+            r.state_suffix(),
         ));
     }
     out

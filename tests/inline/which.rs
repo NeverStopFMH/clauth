@@ -321,6 +321,55 @@ fn disabled_profile_is_never_resolved_as_credential_less_active() {
     assert_eq!(resolve_profile(&config, Some(&live), false, None), None);
 }
 
+/// `which --json`'s `tier` is `null` when nothing on disk claims a tier, which
+/// is what `status.json` and the MCP tools already emit for the same account —
+/// the bare "Claude" this field used to print was a plan the account never had,
+/// and it made the three surfaces disagree.
+#[test]
+fn json_tier_is_null_when_no_tier_is_known() {
+    let config = config_with(vec![oauth_profile("work", "rt-work")], Some("work"));
+    let resolved = ("work".to_string(), Source::RefreshMatch);
+    let value = json_view(&config, Some(&resolved));
+
+    assert_eq!(
+        value["profile"], "work",
+        "fixture control: profile resolved"
+    );
+    assert!(
+        value["tier"].is_null(),
+        "tier must be null with no fetched plan and no token claim, got {}",
+        value["tier"]
+    );
+}
+
+/// The other direction: a token that DOES claim a tier still renders it.
+#[test]
+fn json_tier_renders_a_known_tier() {
+    let mut profile = oauth_profile("work", "rt-work");
+    if let Some(oauth) = profile
+        .credentials
+        .as_mut()
+        .and_then(|c| c.claude_ai_oauth.as_mut())
+    {
+        oauth.subscription_type = Some("max".to_string());
+    }
+    let config = config_with(vec![profile], Some("work"));
+    let resolved = ("work".to_string(), Source::RefreshMatch);
+
+    assert_eq!(json_view(&config, Some(&resolved))["tier"], "Claude Max");
+}
+
+/// An unresolved session emits every field as `null` rather than dropping them,
+/// so a consumer's key lookup never has to branch on presence.
+#[test]
+fn json_tier_is_null_when_nothing_resolved() {
+    let config = config_with(vec![oauth_profile("work", "rt-work")], Some("work"));
+    let value = json_view(&config, None);
+
+    assert!(value["profile"].is_null());
+    assert!(value["tier"].is_null());
+}
+
 #[test]
 fn source_maps_to_wire_strings() {
     assert_eq!(Source::RefreshMatch.as_str(), "refresh_match");

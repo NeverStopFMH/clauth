@@ -411,6 +411,10 @@ fn render_overview_row(
     // the list without drilling into Setup. The tag trails the tier, so
     // `fixed_split` drops it first under width pressure (tier stays legible).
     let mut label = account_type_label(profile);
+    // Read before the tag: a no-data dash is not a tier, and the row must not
+    // animate one. A lone glyph color-cycling beside the static faint dashes in
+    // the same row reads as live data, which is the opposite of what it means.
+    let no_tier = label == super::format::NO_DATA;
     if token_mode {
         label.push_str(" ·token");
     }
@@ -418,13 +422,21 @@ fn render_overview_row(
     // thing is live". A disabled account is not, so it renders the same flat dim
     // cell an uncredentialed row gets — dimming the pulse's crest would still
     // animate.
-    if profile.credentials.is_some() && !disabled {
+    if profile.credentials.is_some() && !disabled && !no_tier {
         let (clamped, pad) = fixed_split(&label, widths.kind);
         let mut pulse = pulse_name_spans(&clamped, theme::dim(), app.anim_ms());
         pulse.push(Span::raw(pad));
         spans.extend(pulse);
     } else {
-        spans.push(Span::styled(fixed(&label, widths.kind), theme::dim()));
+        // The dash joins the other no-data cells at `faint` only when it is the
+        // whole cell: a `·token` tag beside it is real data. A disabled row still
+        // flattens to dim, outranking no-data the way it outranks stale.
+        let style = if no_tier && !token_mode && !disabled {
+            theme::faint()
+        } else {
+            theme::dim()
+        };
+        spans.push(Span::styled(fixed(&label, widths.kind), style));
     }
     spans.push(narrow_gap(widths));
     spans.push(timer_span);

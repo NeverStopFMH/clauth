@@ -9,6 +9,21 @@ use crate::profile::Profile;
 use crate::profile_cache::{USAGE_CACHE_FILE, load_profile_cache};
 use crate::usage::{PlanInfo, PlanTier, UsageInfo};
 
+/// The last-persisted `/profile` plan for a name, off the same on-disk cache
+/// every reader here sources from.
+fn cached_plan(name: &str) -> Option<PlanInfo> {
+    load_profile_cache::<UsageInfo>(name, USAGE_CACHE_FILE).and_then(|u| u.plan)
+}
+
+/// Cancellation for a surface holding a `load_config` profile. Deliberately NOT
+/// [`crate::fallback::is_canceled`], which reads the in-memory `Profile::usage`
+/// that only the TUI ever fills — outside it that predicate answers `false` for
+/// every account, canceled or not. This reads the disk instead, so a CLI
+/// surface gets the same answer the TUI does.
+pub(crate) fn is_canceled_cached(name: &str) -> bool {
+    cached_plan(name).is_some_and(|p| p.is_canceled())
+}
+
 /// Display provider for a profile: a recognised third-party name, else
 /// `anthropic` for an OAuth profile.
 pub(crate) fn provider_label(profile: &Profile) -> String {
@@ -20,22 +35,19 @@ pub(crate) fn provider_label(profile: &Profile) -> String {
 
 /// Human account-tier label for an OAuth profile, preferring the fetched plan
 /// tier (carries the Max multiplier, e.g. `Max 5x`) over the bare OAuth
-/// `subscription_type` token (`max`). A `canceled` plan (read straight off the
-/// on-disk `/profile` cache, so this holds even before this session's first
-/// live fetch) overrides the tier outright — the org's tier already reads
-/// `claude_free` post-cancellation, so showing it plain would misreport a dead
-/// account as a genuine free one. `None` for third-party/api-key profiles and
-/// when neither a fetched plan nor a token hint is on disk.
+/// `subscription_type` token (`max`). Read straight off the on-disk `/profile`
+/// cache, so it holds even before this session's first live fetch. `None` for
+/// third-party/api-key profiles and when neither a fetched plan nor a token hint
+/// is on disk.
+///
+/// Cancellation is a STATUS, not a tier: the org drops to `claude_free` when a
+/// subscription is canceled, so a `Free` reading already carries it, and the
+/// marker belongs on the status line the way every other surface renders it.
 pub(crate) fn tier_label(profile: &Profile) -> Option<String> {
     if profile.is_third_party() {
         return None;
     }
-    let cached = load_profile_cache::<UsageInfo>(profile.name.as_str(), USAGE_CACHE_FILE)
-        .and_then(|u| u.plan);
-    if cached.as_ref().is_some_and(PlanInfo::is_canceled) {
-        return Some("canceled".to_string());
-    }
-    let fetched = cached.filter(|p| p.tier != PlanTier::Unknown);
+    let fetched = cached_plan(profile.name.as_str()).filter(|p| p.tier != PlanTier::Unknown);
     match fetched {
         Some(plan) => plan.tier.short_label(),
         None => {

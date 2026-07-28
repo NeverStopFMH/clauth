@@ -438,6 +438,33 @@ fn from_subscription_type_defaults_to_unknown_not_pro() {
     );
 }
 
+/// Round-trip: `login_profile_from_raw` writes `"free"` into the stored token for
+/// a `Free` account, so `from_subscription_type` has to read it back. Without the
+/// arm every Free login classified `Unknown` and rendered as no-tier — clauth
+/// failing to read its own write, on the one tier that has no `has_claude_*` flag
+/// to recover it.
+#[test]
+fn from_subscription_type_round_trips_every_token_a_login_mints() {
+    for (raw, want) in [
+        ("max", PlanTier::Max(None)),
+        ("pro", PlanTier::Pro),
+        ("team", PlanTier::Team),
+        ("enterprise", PlanTier::Enterprise),
+        ("free", PlanTier::Free),
+    ] {
+        assert_eq!(
+            PlanTier::from_subscription_type(Some(raw)),
+            want,
+            "{raw} is a token `login_profile_from_raw` mints"
+        );
+    }
+    assert_eq!(
+        PlanTier::Free.display().as_deref(),
+        Some("Claude Free"),
+        "a free login still names its plan, never the no-data form"
+    );
+}
+
 #[test]
 fn parses_z_suffix() {
     assert_eq!(iso_to_epoch_secs("2026-05-17T14:20:00Z"), Some(BASE_UTC));

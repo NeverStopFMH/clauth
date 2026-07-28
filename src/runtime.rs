@@ -853,7 +853,7 @@ fn rotation_lock_path(name: &str) -> Result<PathBuf> {
 /// Cross-process advisory lock serializing a token rotation against a
 /// `clauth start` session acquire for the SAME profile.
 ///
-/// A refresh token is single-use: once `oauth::refresh` spends it the server
+/// A refresh token is single-use: once `oauth::refresh_result` spends it the server
 /// kills it, and a second refresh of the same token returns `invalid_grant`,
 /// costing the losing caller its token (not the account — the pair minted by
 /// the first spend survives, measured; see `docs/domain-knowledge.md`).

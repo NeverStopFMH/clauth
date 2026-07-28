@@ -5732,7 +5732,9 @@ fn start_login(app: &mut App, name: String, is_new: bool) {
             };
             let _ = event_tx.send((generation, event));
         });
-        let _ = result_tx.send((generation, res.map_err(|e| e.to_string())));
+        // A toast, not stderr: the canned line without the HTTP status. The
+        // status is in `~/.clauth/clauth.log` via the exchange's `logline!`.
+        let _ = result_tx.send((generation, res.map_err(|e| e.user_message())));
     });
     open_login_modal(app);
 }
@@ -6709,7 +6711,8 @@ fn run_confirm_action(app: &mut App, action: ConfirmAction) {
             }
             // The per-profile RotationGuard inside rotate_one serialises against a
             // live session's own refresh, so unlike RotateAll this doesn't need the
-            // global any_busy gate — a busy guard surfaces as a Danger toast.
+            // global any_busy gate — an unacquirable guard surfaces as a Danger
+            // toast (contention blocks inside `acquire`, it never lands there).
             let config = Arc::clone(&app.config);
             let refetch = Arc::clone(&app.refetch_queue);
             let activity = Arc::clone(&app.activity);
@@ -7544,7 +7547,7 @@ fn drain_switch_gates(app: &mut App) {
             ),
             oauth::AuthGate::Transient(e) => app.toast(
                 ToastKind::Danger,
-                crate::format::refresh_transient(&name, &e.to_string()).toast(),
+                crate::format::refresh_transient(&name, &e).toast(),
             ),
         }
     }

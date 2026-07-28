@@ -53,9 +53,9 @@ fn no_network(
     _rt: &str,
     _scopes: Option<&str>,
 ) -> std::result::Result<crate::oauth::TokenResponse, crate::oauth::RefreshError> {
-    Err(crate::oauth::RefreshError::Transient(anyhow::anyhow!(
-        "no network in tests"
-    )))
+    Err(crate::oauth::RefreshError::Transient(
+        crate::oauth::TokenFailure::Transport,
+    ))
 }
 
 fn handle(config: AppConfig) -> crate::profile::ConfigHandle {
@@ -562,7 +562,7 @@ fn noninteractive_switch_refuses_a_dead_target_with_login_hint() {
 
     let revoked = |_: &str, _: Option<&str>| {
         Err(crate::oauth::RefreshError::Invalid(
-            "HTTP 400: refresh token not found or invalid".into(),
+            crate::oauth::TokenFailure::Status(400),
         ))
     };
     let err = switch_profile_noninteractive(&config, "target", None, revoked)
@@ -642,7 +642,7 @@ fn switch_to_the_active_profile_never_gates() {
 
     let revoked = |_: &str, _: Option<&str>| {
         Err(crate::oauth::RefreshError::Invalid(
-            "HTTP 400: refresh token not found or invalid".into(),
+            crate::oauth::TokenFailure::Status(400),
         ))
     };
     let (previous, active) = switch_profile_noninteractive(&config, "active", None, revoked)

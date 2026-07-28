@@ -543,9 +543,8 @@ fn gate_invalid_refresh_marks_broken_and_refuses() {
         Some("rt-revoked"),
         Some(past_expiry()),
     )));
-    let refresher = |_rt: &str, _scopes: Option<&str>| {
-        Err(RefreshError::Invalid("HTTP 400: invalid_grant".to_string()))
-    };
+    let refresher =
+        |_rt: &str, _scopes: Option<&str>| Err(RefreshError::Invalid(TokenFailure::Status(400)));
     assert!(matches!(
         ensure_installable(&handle, name, refresher),
         AuthGate::Broken
@@ -568,9 +567,8 @@ fn gate_transient_refresh_does_not_quarantine() {
         Some("rt-ok"),
         Some(past_expiry()),
     )));
-    let refresher = |_rt: &str, _scopes: Option<&str>| {
-        Err(RefreshError::Transient(anyhow::anyhow!("connection reset")))
-    };
+    let refresher =
+        |_rt: &str, _scopes: Option<&str>| Err(RefreshError::Transient(TokenFailure::Transport));
     assert!(matches!(
         ensure_installable(&handle, name, refresher),
         AuthGate::Transient(_)
@@ -647,9 +645,8 @@ fn gate_flagged_profile_with_a_dead_chain_stays_broken() {
     let mut config = oauth_config(name, Some("rt-revoked"), Some(future_expiry()));
     config.set_auth_broken(name, true);
     let handle = Arc::new(RankedMutex::new(config));
-    let refresher = |_rt: &str, _scopes: Option<&str>| {
-        Err(RefreshError::Invalid("HTTP 400: invalid_grant".to_string()))
-    };
+    let refresher =
+        |_rt: &str, _scopes: Option<&str>| Err(RefreshError::Invalid(TokenFailure::Status(400)));
     assert!(matches!(
         ensure_installable(&handle, name, refresher),
         AuthGate::Broken
@@ -664,7 +661,9 @@ fn gate_flagged_profile_with_a_dead_chain_stays_broken() {
 
 /// A 2xx token-endpoint body that fails to deserialize still holds the live
 /// access+refresh tokens, so `token_parse_error` must surface only the serde
-/// error + HTTP status + body length — never the token values.
+/// error + HTTP status + body length — never the token values. Asserted against
+/// `log_detail`, the WIDEST rendering: the user-facing one withholds strictly
+/// more, so a leak that clears this clears the toast too.
 #[test]
 fn token_parse_error_redacts_the_2xx_body() {
     // Missing `expires_in` → fails to parse into TokenResponse, but the body
@@ -677,7 +676,7 @@ fn token_parse_error_redacts_the_2xx_body() {
         Ok(_) => panic!("2xx body without expires_in must fail to parse into TokenResponse"),
         Err(e) => e,
     };
-    let msg = super::token_parse_error(err, 200, body.len()).to_string();
+    let msg = super::token_parse_error(&err, 200, body.len()).log_detail();
 
     assert!(
         !msg.contains("SECRETLEAK"),
@@ -1469,8 +1468,8 @@ fn kick_429_surfaces_limiter_metadata() {
 
     let KickError::Status(429, Some(rl)) = err else {
         panic!(
-            "expected a 429 with limiter metadata, got {:?}",
-            anyhow::Error::from(err)
+            "expected a 429 with limiter metadata, got {}",
+            describe_kick_failure(&err)
         );
     };
     assert!(
@@ -1778,5 +1777,379 @@ fn a_kick_rotation_carries_its_pair_back_when_the_persist_fails() {
             .count(),
         1,
         "the persist bail returns before the retry kick: {seen:?}"
+    );
+}
+
+// ── containment: the endpoint's own bytes never reach a refusal ──────────────
+//
+// `TokenFailure` is the guard, and it is a TYPE rather than a convention on
+// purpose: this codebase already broke the convention version. The manual
+// rotate path printed `HTTP 400: {"error": "invalid_grant", …}` into a Danger
+// toast from four hundred lines away from a sibling switch path that spelled
+// the same condition through `format::refresh_transient`. With no `Display`,
+// that bypass is a compile error instead of something review has to catch.
+
+use crate::testutil::{NotDisplay as _, NotIntoAnyhow as _, Probe};
+
+/// The structural half of the containment, covering BOTH escape hatches: a
+/// `Display` impl makes `{e}` compile again, and an `Into<anyhow::Error>` makes
+/// `?` do the same thing one layer up (which is exactly what the deleted
+/// `From<RefreshError>`/`From<KickError>` impls were). Either one added back
+/// reds this on its own, before any surface has to be re-audited — which is
+/// what a string payload plus a naming convention could never do. Each leg has
+/// its positive control; without them a probe that answered `false` for
+/// everything would read as a pass.
+#[test]
+fn oauth_error_types_have_no_printable_escape_hatch() {
+    assert!(
+        Probe::<String>::is_display(),
+        "positive control: the probe must detect a type that DOES implement Display"
+    );
+    assert!(
+        Probe::<std::io::Error>::into_anyhow(),
+        "positive control: the probe must detect a type that DOES convert into anyhow"
+    );
+    for (name, displays, converts) in [
+        (
+            "TokenFailure",
+            Probe::<TokenFailure>::is_display(),
+            Probe::<TokenFailure>::into_anyhow(),
+        ),
+        (
+            "RefreshError",
+            Probe::<RefreshError>::is_display(),
+            Probe::<RefreshError>::into_anyhow(),
+        ),
+        (
+            "KickError",
+            Probe::<KickError>::is_display(),
+            Probe::<KickError>::into_anyhow(),
+        ),
+    ] {
+        assert!(
+            !displays,
+            "{name} must stay Display-free — with one, a bare {{e}} on a toast, a \
+             bail!, or an MCP `reason` compiles again and the endpoint's own words \
+             are one keystroke from a user"
+        );
+        assert!(
+            !converts,
+            "{name} must not convert into anyhow::Error — that conversion is what \
+             smuggled the raw body past the terminal/transient classification into \
+             whatever surface caught it"
+        );
+    }
+}
+
+// ── every Retry selection, pinned at the CALL SITE that chooses it ───────────
+//
+// `format.rs` pins the Retry→copy MAPPING. That is not the same thing and does
+// not defend it: flipping `Retry::Stated` to `Retry::Connection` at a call site
+// leaves the mapping correct and restores the exact defect the enum exists to
+// remove — two contradictory reasons to retry in one sentence. Four of the six
+// selections survived the whole suite until these landed, so each one below
+// reaches its real call site and asserts the sentence an operator reads.
+
+/// The guard-refusal copy must describe the condition that actually produces
+/// it, and name one next step rather than two.
+///
+/// Reached by failing `RotationGuard::acquire`'s `mkdir_700`, NOT by holding the
+/// lock: `acquire` ends in `File::lock()`, which BLOCKS. A second acquire in
+/// this process waits instead of erroring, so a contention-based fixture
+/// deadlocks the suite rather than exercising the arm (it did, once, here).
+///
+/// That mechanism is why the copy changed. Creating or opening the lock file is
+/// the ONLY thing that lands here, so the previous wording — `rotation lock
+/// busy; retry after the in-flight refresh` — described a condition that cannot
+/// produce it and advised waiting for a refresh that is not running. An earlier
+/// version of this very test pinned that sentence, which is worse than leaving
+/// it unpinned: it would have handed a red suite to whoever noticed.
+#[test]
+fn guard_acquire_failure_names_the_filesystem_cause() {
+    let _home = HomeSandbox::new();
+    let name = "gate-retry-lock-busy";
+    let handle = Arc::new(RankedMutex::new(oauth_config(
+        name,
+        Some("rt-ok"),
+        Some(past_expiry()),
+    )));
+    // A regular file where the profile DIRECTORY belongs: `acquire` creates
+    // `<profile>/rotation.lock`, so its `mkdir_700` of the parent fails.
+    #[allow(clippy::expect_used, reason = "test")]
+    let dir = crate::profile::profile_dir(name).expect("profile dir");
+    if let Some(parent) = dir.parent() {
+        #[allow(clippy::expect_used, reason = "test")]
+        std::fs::create_dir_all(parent).expect("profile parent");
+    }
+    #[allow(clippy::expect_used, reason = "test")]
+    std::fs::write(&dir, b"not a directory").expect("occupy the profile dir path");
+
+    let AuthGate::Transient(t) = ensure_installable(&handle, name, never_refresh) else {
+        panic!("an unacquirable rotation guard must refuse transiently");
+    };
+    assert_eq!(
+        t.text(),
+        format!("could not lock '{name}' for a token refresh; check permissions on ~/.clauth"),
+        "the cause names its own next step; a second one contradicts it"
+    );
+    assert!(
+        !t.text().contains("in-flight"),
+        "contention cannot produce this arm, so the copy must not blame it: {}",
+        t.text()
+    );
+}
+
+/// A poisoned config mutex does not clear itself, so a retry hint would be a
+/// lie. Reached by panicking a thread while it holds the lock — the only way
+/// this arm happens in production too.
+#[test]
+fn poisoned_config_refusal_offers_no_retry() {
+    let _home = HomeSandbox::new();
+    let name = "gate-retry-poisoned";
+    let handle = Arc::new(RankedMutex::new(oauth_config(
+        name,
+        Some("rt-ok"),
+        Some(past_expiry()),
+    )));
+    let poisoner = Arc::clone(&handle);
+    let _ = std::thread::spawn(move || {
+        let _held = poisoner.lock();
+        panic!("deliberate: poison the config mutex");
+    })
+    .join();
+
+    let AuthGate::Transient(t) = ensure_installable(&handle, name, never_refresh) else {
+        panic!("a poisoned config mutex must refuse transiently");
+    };
+    assert_eq!(
+        t.text(),
+        "clauth hit an internal lock error, restart clauth"
+    );
+}
+
+/// A 2xx whose body does not parse: the transport worked, so waiting is the
+/// honest advice — and the body itself still never reaches the toast.
+#[test]
+fn an_unparseable_2xx_tells_the_operator_to_wait() {
+    use std::sync::mpsc;
+    let home = HomeSandbox::new();
+    let name = "rotate-unparseable-2xx";
+    let (base, server) = crate::testutil::serve_endpoints(2, |_, _| {
+        (200, format!(r#"{{"unexpected":"{WIRE_CANARY}"}}"#))
+    });
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    let (tx, rx) = mpsc::channel();
+    let cfg = crate::testutil::rotation_fixture_config(name);
+
+    rotate_one_inner(&cfg, name, None, &tx);
+    #[allow(clippy::expect_used, reason = "test")]
+    let OpResult { outcome, .. } = rx.try_recv().expect("the HTTP leg emits an OpResult");
+    let msg = match outcome {
+        Ok(()) => panic!("an unparseable token body is not a completed rotation"),
+        Err(e) => e.to_string(),
+    };
+    assert_eq!(msg, "anthropic's reply was unreadable: retry in a moment");
+    assert!(
+        !msg.contains(WIRE_CANARY),
+        "the 2xx body holds live credentials and must never surface: {msg}"
+    );
+
+    #[allow(clippy::expect_used, reason = "test")]
+    let seen = server.join().expect("listener");
+    assert_eq!(seen, vec!["/v1/oauth/token".to_string()]);
+}
+
+/// The refresh landed but its pair could not be written. The chain is fine and
+/// the next attempt can succeed, so this one DOES get a retry hint — the arm
+/// that must not collapse into `Stated`.
+#[test]
+fn a_failed_persist_after_a_good_refresh_offers_a_retry() {
+    let _home = HomeSandbox::new();
+    let name = "gate-retry-persist-fails";
+    let handle = Arc::new(RankedMutex::new(oauth_config(
+        name,
+        Some("rt-old"),
+        Some(past_expiry()),
+    )));
+    // A DIRECTORY where `credentials.json` belongs: the rotation guard still
+    // acquires (its parent is a real dir), the refresh still lands, and only
+    // `save_profile`'s credential write fails — the one reachable way to make
+    // `apply_rotated_tokens_locked` err without breaking an earlier step.
+    #[allow(clippy::expect_used, reason = "test")]
+    let dir = crate::profile::profile_dir(name).expect("profile dir");
+    #[allow(clippy::expect_used, reason = "test")]
+    std::fs::create_dir_all(dir.join("credentials.json")).expect("occupy the credentials path");
+
+    let refresher = |_rt: &str, _scopes: Option<&str>| {
+        Ok(TokenResponse {
+            access_token: "at-new".to_string(),
+            refresh_token: "rt-new".to_string(),
+            expires_in: 3600,
+            scope: None,
+        })
+    };
+    let AuthGate::Transient(t) = ensure_installable(&handle, name, refresher) else {
+        panic!("a failed persist must refuse transiently, never install");
+    };
+    assert_eq!(
+        t.text(),
+        format!("refreshed '{name}' but failed to persist the rotated tokens: retry in a moment")
+    );
+}
+
+/// Bytes only the wire could have written. Any of it in a refusal is the leak.
+const WIRE_CANARY: &str = "WIRE-BYTES-CANARY";
+
+/// The dead-token envelope and an upstream error page, both carrying the
+/// canary. Indexed so one listener can answer both legs of a test.
+fn canary_bodies(i: usize) -> (u16, String) {
+    if i == 0 {
+        (
+            400,
+            format!(r#"{{"error": "invalid_grant", "error_description": "{WIRE_CANARY}"}}"#),
+        )
+    } else {
+        (503, format!("<html>{WIRE_CANARY}</html>"))
+    }
+}
+
+/// The reported defect, driven through the real HTTP leg: the manual rotate
+/// emits its failure as an `OpResult` the TUI renders as a Danger toast, and
+/// that used to be `HTTP {status}: {body}` because the plain `refresh` wrapper
+/// collapsed the Invalid/Transient split into one opaque error. Both arms are
+/// asserted — a dead chain keeps the shared `clauth login` recovery step, a
+/// blip gets the canned transient line — and neither carries a wire byte.
+#[test]
+fn rotate_refusal_carries_no_wire_bytes_in_either_direction() {
+    use std::sync::mpsc;
+    let home = HomeSandbox::new();
+    // `max` above the two requests a correct run makes, per `serve_endpoints`.
+    let (base, server) = crate::testutil::serve_endpoints(3, |_, i| canary_bodies(i));
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    let (tx, rx) = mpsc::channel();
+
+    let dead = "rotate-refusal-dead";
+    let dead_cfg = crate::testutil::rotation_fixture_config(dead);
+    rotate_one_inner(&dead_cfg, dead, None, &tx);
+    #[allow(clippy::expect_used, reason = "test")]
+    let OpResult { outcome, .. } = rx.try_recv().expect("the HTTP leg emits an OpResult");
+    let msg = match outcome {
+        Ok(()) => panic!("a 400 must never read as a completed rotation"),
+        Err(e) => e.to_string(),
+    };
+    assert!(
+        !msg.contains(WIRE_CANARY),
+        "the endpoint's body reached the rotate toast: {msg}"
+    );
+    assert!(
+        !msg.contains("HTTP"),
+        "the endpoint's status reached the rotate toast: {msg}"
+    );
+    assert!(
+        msg.contains(&format!("clauth login {dead}")),
+        "the dead-chain arm must keep the one recovery step it shares with the \
+         switch gate and the daemon, got: {msg}"
+    );
+
+    let flaky = "rotate-refusal-flaky";
+    let flaky_cfg = crate::testutil::rotation_fixture_config(flaky);
+    rotate_one_inner(&flaky_cfg, flaky, None, &tx);
+    #[allow(clippy::expect_used, reason = "test")]
+    let OpResult { outcome, .. } = rx.try_recv().expect("the HTTP leg emits an OpResult");
+    let msg = match outcome {
+        Ok(()) => panic!("a 503 must never read as a completed rotation"),
+        Err(e) => e.to_string(),
+    };
+    assert!(
+        !msg.contains(WIRE_CANARY) && !msg.contains("HTTP"),
+        "the endpoint's page reached the rotate toast: {msg}"
+    );
+    // Copy pin, not the structural guard: this wording is what the toast's
+    // "refresh for '<name>' failed" line completes. Both arms now end on a next
+    // step — the dead one says re-login, this one says wait — because a toast
+    // that only names a condition leaves the operator nothing to do.
+    assert_eq!(msg, "anthropic is having trouble: retry in a moment");
+
+    #[allow(clippy::expect_used, reason = "test")]
+    let seen = server.join().expect("listener");
+    assert_eq!(
+        seen,
+        vec!["/v1/oauth/token".to_string(); 2],
+        "proof of execution: both legs actually answered the endpoint"
+    );
+}
+
+/// The terminal-vs-transient split is what the `auth_broken` quarantine rests
+/// on, and it now lives entirely inside `refresh_result` — the body that decides
+/// it is dropped the instant it has decided. Driven over the real wire in BOTH
+/// directions, because the injected-refresher gate tests construct the verdict
+/// rather than derive it, and would stay green if the mapping inverted.
+#[test]
+fn refresh_classification_survives_the_real_wire_in_both_directions() {
+    let home = HomeSandbox::new();
+    let (base, server) = crate::testutil::serve_endpoints(3, |_, i| canary_bodies(i));
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+
+    let dead = "gate-wire-dead";
+    let dead_cfg = Arc::new(RankedMutex::new(oauth_config(
+        dead,
+        Some("rt-revoked"),
+        Some(past_expiry()),
+    )));
+    assert!(
+        matches!(
+            ensure_installable(&dead_cfg, dead, refresh_result),
+            AuthGate::Broken
+        ),
+        "a confirmed invalid_grant is still terminal"
+    );
+    #[allow(clippy::expect_used, reason = "test")]
+    let dead_flagged = dead_cfg.lock().expect("lock").is_auth_broken(dead);
+    assert!(dead_flagged, "a dead refresh token still quarantines");
+
+    let flaky = "gate-wire-flaky";
+    let flaky_cfg = Arc::new(RankedMutex::new(oauth_config(
+        flaky,
+        Some("rt-ok"),
+        Some(past_expiry()),
+    )));
+    let AuthGate::Transient(e) = ensure_installable(&flaky_cfg, flaky, refresh_result) else {
+        panic!("a 5xx the endpoint never confirmed must stay transient");
+    };
+    #[allow(clippy::expect_used, reason = "test")]
+    let flaky_flagged = flaky_cfg.lock().expect("lock").is_auth_broken(flaky);
+    assert!(
+        !flaky_flagged,
+        "a 5xx must never quarantine — the retry is what recovers it"
+    );
+    // This value is what the CLI bail, the TUI toast, the MCP `reason` and the
+    // daemon's deferral line are all built from. Both renderings are asserted
+    // together so neither half drifts alone: the CLI form MUST name the status
+    // (an operator at a terminal has no log open beside it) and MUST NOT carry a
+    // byte of the body; the canned form carries neither.
+    let cli = e.text_with_status();
+    let canned = e.text();
+    assert!(
+        cli.contains("HTTP 503"),
+        "CLI stderr must still name the status: {cli}"
+    );
+    assert!(
+        !cli.contains(WIRE_CANARY) && !cli.contains("html"),
+        "the endpoint's page reached CLI stderr: {cli}"
+    );
+    assert!(
+        !canned.contains("503") && !canned.contains(WIRE_CANARY) && !canned.contains("html"),
+        "the toast/MCP form must carry neither the status nor the body: {canned}"
+    );
+    // A 5xx is not Anthropic "rejecting" anything, and telling the operator to
+    // check their connection over one is wrong advice.
+    assert_eq!(canned, "anthropic is having trouble: retry in a moment");
+
+    #[allow(clippy::expect_used, reason = "test")]
+    let seen = server.join().expect("listener");
+    assert_eq!(
+        seen,
+        vec!["/v1/oauth/token".to_string(); 2],
+        "proof of execution: both legs actually answered the endpoint"
     );
 }

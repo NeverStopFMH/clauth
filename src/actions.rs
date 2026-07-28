@@ -175,10 +175,13 @@ pub(crate) fn switch_profile_cli(config: AppConfig, canonical: &str) -> Result<(
         match oauth::ensure_installable(&config, canonical, oauth::refresh_result) {
             oauth::AuthGate::Ready | oauth::AuthGate::Refreshed => {}
             oauth::AuthGate::Broken => bail!("{}", crate::format::login_expired(canonical).line()),
+            // CLI stderr: name the HTTP status too. This lands on `main.rs`'s
+            // `eprintln!` backstop, a terminal with no companion log open, so the
+            // status is the one wire fact the operator has nowhere else to read.
             oauth::AuthGate::Transient(e) => {
                 bail!(
                     "{}",
-                    crate::format::refresh_transient(canonical, &e.to_string()).line()
+                    crate::format::refresh_transient_cli(canonical, &e).line()
                 )
             }
         }
@@ -290,11 +293,10 @@ pub(crate) fn switch_profile_noninteractive(
         match oauth::ensure_installable(config, target, refresher) {
             oauth::AuthGate::Ready | oauth::AuthGate::Refreshed => {}
             oauth::AuthGate::Broken => bail!("{}", crate::format::login_expired(target).line()),
+            // NOT a CLI stderr path — this is the MCP tool's JSON `reason`, so it
+            // keeps the canned line without the status.
             oauth::AuthGate::Transient(e) => {
-                bail!(
-                    "{}",
-                    crate::format::refresh_transient(target, &e.to_string()).line()
-                )
+                bail!("{}", crate::format::refresh_transient(target, &e).line())
             }
         }
     }

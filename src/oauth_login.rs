@@ -19,6 +19,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use sha2::{Digest, Sha256};
 
+use crate::logline::logline;
 use crate::profile::{AccountId, ClaudeCredentials, OAuthToken};
 use crate::usage::now_ms;
 
@@ -240,6 +241,69 @@ fn write_response(mut stream: &TcpStream, status: &str, page: Page) {
     let _ = stream.flush();
 }
 
+/// Why the authorize callback came back without a code — the browser-redirect
+/// twin of [`crate::oauth::TokenFailure`], typed for the same reason.
+///
+/// The callback's `error` / `error_description` query params are upstream text
+/// with NO cap (worse than the token-endpoint bodies, which at least passed a
+/// first-line + 200-char trim), and they used to be interpolated straight into
+/// `clauth login`'s stderr and the TUI Setup toast. So `error` is PARSED into
+/// RFC 6749 §4.1.2.1's closed code set at the boundary and its bytes dropped;
+/// `error_description` is free-form and never leaves the wire at all. No
+/// `Display`, no conversion into `anyhow::Error`.
+///
+/// An unrecognized code is anonymous rather than echoed-with-a-cap: `logline!`
+/// is line-oriented and nothing strips newlines, so echoing free upstream text
+/// even into a log forges entries.
+pub(crate) enum AuthorizeRejection {
+    /// `access_denied` — the operator declined the consent screen. The one arm
+    /// that is a choice rather than a failure.
+    Declined,
+    /// Anthropic's own side; a retry can clear it.
+    Upstream(&'static str),
+    /// The authorize REQUEST was refused, so a retry sends the same thing again.
+    Refused(&'static str),
+    /// An `error` value outside the spec's set — the case where the bytes are
+    /// least trustworthy, so none are kept.
+    Unrecognized,
+}
+
+impl AuthorizeRejection {
+    /// Parse the callback's `error` param. The input is discarded here: every
+    /// value any arm carries onward is one of this function's own literals, so
+    /// nothing downstream can be holding browser-supplied bytes.
+    fn parse(code: &str) -> Self {
+        match code {
+            "access_denied" => Self::Declined,
+            "server_error" => Self::Upstream("server_error"),
+            "temporarily_unavailable" => Self::Upstream("temporarily_unavailable"),
+            "invalid_request" => Self::Refused("invalid_request"),
+            "unauthorized_client" => Self::Refused("unauthorized_client"),
+            "unsupported_response_type" => Self::Refused("unsupported_response_type"),
+            "invalid_scope" => Self::Refused("invalid_scope"),
+            _ => Self::Unrecognized,
+        }
+    }
+
+    fn user_message(&self) -> &'static str {
+        match self {
+            Self::Declined => "you declined the authorization request",
+            Self::Upstream(_) => "anthropic is having trouble",
+            Self::Refused(_) | Self::Unrecognized => "anthropic refused the login",
+        }
+    }
+
+    /// Operator-log rendering: the spec code the user copy withholds, as our own
+    /// literal rather than the browser's bytes.
+    fn log_detail(&self) -> &'static str {
+        match self {
+            Self::Declined => "access_denied",
+            Self::Upstream(code) | Self::Refused(code) => code,
+            Self::Unrecognized => "an error code outside RFC 6749's set (withheld)",
+        }
+    }
+}
+
 /// Handle one connection. `Ok(Some(code))` on the real `/callback` with matching
 /// `state`; `Ok(None)` for any unrelated request (keep waiting); `Err` on an
 /// OAuth error param or a state mismatch (a security stop).
@@ -287,9 +351,13 @@ fn handle_callback(stream: TcpStream, expected_state: &str) -> Result<Option<Str
         return Ok(None);
     }
     if let Some(err) = query_param(query, "error") {
-        let desc = query_param(query, "error_description").unwrap_or_default();
+        // Parse before anything else touches it: `err` and the `error_description`
+        // beside it are uncapped browser-supplied text, and interpolating them
+        // into the `bail!` below put them on `clauth login`'s stderr and the TUI
+        // Setup toast verbatim. `error_description` is not read at all.
+        let rejection = AuthorizeRejection::parse(&err);
         // A user-declined consent screen reads differently from a broken flow.
-        let page = if err == "access_denied" {
+        let page = if matches!(rejection, AuthorizeRejection::Declined) {
             Page {
                 tone: Tone::Warning,
                 title: "Login canceled",
@@ -307,7 +375,11 @@ fn handle_callback(stream: TcpStream, expected_state: &str) -> Result<Option<Str
             }
         };
         write_response(&stream, "400 Bad Request", page);
-        anyhow::bail!("authorization failed: {err} {desc}");
+        logline!(
+            "clauth: the authorize callback refused the login: {}",
+            rejection.log_detail()
+        );
+        anyhow::bail!("{}", rejection.user_message());
     }
     let Some(code) = query_param(query, "code") else {
         write_response(
@@ -417,13 +489,81 @@ pub(crate) struct LoginOutcome {
 /// also renders the later stages). Opening the browser is best-effort: on
 /// failure the announced URL is the fallback and the listener still waits.
 /// Blocks the caller for the browser round-trip (up to [`LOGIN_TIMEOUT_SECS`]).
-pub(crate) fn login_with(progress: impl Fn(LoginProgress<'_>)) -> Result<LoginOutcome> {
-    let (verifier, challenge) = new_pkce()?;
-    let state = random_b64url(32)?;
+/// Why a `clauth login` produced no credential.
+///
+/// Typed so its two callers can diverge exactly as the switch path's already do:
+/// `clauth login`'s stderr names the HTTP status (a terminal has no companion
+/// log open beside it) and the TUI's login toast does not. No `Display` and no
+/// `Into<anyhow::Error>`, so neither caller can bypass that split with a bare
+/// `{e}` or a `?`.
+pub(crate) enum LoginError {
+    /// The token endpoint refused the authorization-code exchange — the one
+    /// login failure that carries an HTTP status, so the only arm where the two
+    /// renderings differ at all.
+    Exchange(crate::oauth::TokenFailure),
+    /// Everything else: the authorize callback's rejection (already canned by
+    /// [`AuthorizeRejection`], and a browser redirect carries no HTTP status of
+    /// ours to name), CSPRNG, the loopback bind/accept, the state mismatch, the
+    /// browser timeout. All clauth-authored, so both renderings coincide.
+    Local(anyhow::Error),
+}
+
+impl LoginError {
+    /// The LOGIN path's retry mapping, deliberately not
+    /// [`crate::oauth::TokenFailure::as_refresh_transient`].
+    ///
+    /// A code exchange happens at the very end of the flow: by the time it is
+    /// rejected the loopback listener is torn down and the authorization code is
+    /// spent, expired, or was never matched by the PKCE verifier. None of those
+    /// is fixed by waiting, so the refresh path's `Wait` — which is right for a
+    /// 429 it will re-attempt next tick — names an action that no longer exists
+    /// here. Only the transport arm keeps its own advice, because an unreachable
+    /// endpoint is the one blocker worth clearing before running the command
+    /// again.
+    fn transient(f: &crate::oauth::TokenFailure) -> crate::format::Transient {
+        use crate::format::{Cause, Retry, Transient};
+        use crate::oauth::TokenFailure;
+        let cause = Cause::Endpoint(f.user_message());
+        match f {
+            TokenFailure::Transport => Transient::new(cause, Retry::Connection),
+            TokenFailure::Status(s) => Transient::with_status(cause, *s, Retry::Restart),
+            TokenFailure::Body { status, .. } => {
+                Transient::with_status(cause, *status, Retry::Restart)
+            }
+        }
+    }
+
+    /// Canned: the TUI login toast.
+    pub(crate) fn user_message(&self) -> String {
+        match self {
+            Self::Exchange(f) => Self::transient(f).text(),
+            Self::Local(e) => e.to_string(),
+        }
+    }
+
+    /// Canned plus the HTTP status where one exists: `clauth login`'s stderr.
+    pub(crate) fn cli_message(&self) -> String {
+        match self {
+            Self::Exchange(f) => Self::transient(f).text_with_status(),
+            Self::Local(e) => e.to_string(),
+        }
+    }
+}
+
+pub(crate) fn login_with(
+    progress: impl Fn(LoginProgress<'_>),
+) -> std::result::Result<LoginOutcome, LoginError> {
+    let (verifier, challenge) = new_pkce().map_err(LoginError::Local)?;
+    let state = random_b64url(32).map_err(LoginError::Local)?;
 
     let listener = TcpListener::bind(("127.0.0.1", 0))
-        .context("failed to bind the loopback listener for the OAuth callback")?;
-    let port = listener.local_addr()?.port();
+        .context("failed to bind the loopback listener for the OAuth callback")
+        .map_err(LoginError::Local)?;
+    let port = listener
+        .local_addr()
+        .map_err(anyhow::Error::from)
+        .map_err(LoginError::Local)?
+        .port();
     let redirect_uri = format!("http://localhost:{port}/callback");
     let url = authorize_url(&redirect_uri, &challenge, &state);
 
@@ -431,9 +571,15 @@ pub(crate) fn login_with(progress: impl Fn(LoginProgress<'_>)) -> Result<LoginOu
     let _ = crate::platform::open_url(&url);
 
     let deadline = Instant::now() + Duration::from_secs(LOGIN_TIMEOUT_SECS);
-    let code = wait_for_code(&listener, &state, deadline)?;
+    let code = wait_for_code(&listener, &state, deadline).map_err(LoginError::Local)?;
     progress(LoginProgress::ExchangingCode);
-    let token = crate::oauth::exchange_code(&code, &verifier, &redirect_uri, &state)?;
+    let token =
+        crate::oauth::exchange_code(&code, &verifier, &redirect_uri, &state).map_err(|e| {
+            // The BODY stops here; the status rides the typed value so stderr can
+            // name it and the toast cannot.
+            logline!("clauth: login code exchange failed: {}", e.log_detail());
+            LoginError::Exchange(e)
+        })?;
     let mut creds = credentials_from_token(token);
 
     progress(LoginProgress::Verifying);

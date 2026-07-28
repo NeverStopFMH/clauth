@@ -57,6 +57,46 @@ impl Drop for HomeSandbox {
     }
 }
 
+// ── printable-escape-hatch probes ────────────────────────────────────────────
+//
+// The error types that hold upstream-derived facts (`oauth::TokenFailure`,
+// `RefreshError`, `KickError`, `oauth_login::AuthorizeRejection`) are contained
+// by NOT being printable: no `Display` means `{e}` does not compile, and no
+// `Into<anyhow::Error>` means `?` cannot launder one into something that does.
+// Both properties are invisible to a normal assertion, so probe them: the
+// inherent method wins method lookup whenever its bound holds, and lookup falls
+// through to the blanket trait method when it does not.
+
+pub(crate) struct Probe<T>(std::marker::PhantomData<T>);
+
+impl<T: std::fmt::Display> Probe<T> {
+    pub(crate) fn is_display() -> bool {
+        true
+    }
+}
+
+impl<T: Into<anyhow::Error>> Probe<T> {
+    pub(crate) fn into_anyhow() -> bool {
+        true
+    }
+}
+
+pub(crate) trait NotDisplay {
+    fn is_display() -> bool {
+        false
+    }
+}
+
+impl<T> NotDisplay for Probe<T> {}
+
+pub(crate) trait NotIntoAnyhow {
+    fn into_anyhow() -> bool {
+        false
+    }
+}
+
+impl<T> NotIntoAnyhow for Probe<T> {}
+
 // ── offline rotation-leg harness ─────────────────────────────────────────────
 //
 // Every rotation decision sits BEHIND an HTTP call, so a refusal deleted from

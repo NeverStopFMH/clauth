@@ -3816,13 +3816,14 @@ fn tick_stands_down_when_another_instance_holds_the_fetch_lease() {
 /// No seam is needed: a `Generic` target's `base_url` IS one. `api_origin` takes
 /// the listener's `http://127.0.0.1:PORT` verbatim and the generic engine probes
 /// its curated paths against exactly that origin. An empty `tokens` list keeps
-/// the OAuth leg out of the tick entirely, so no request can escape to the real
-/// Anthropic host.
+/// the OAuth leg out of the tick, and `EndpointSandbox` also points the OAuth
+/// endpoints at the SAME listener, so a future leak would be RECORDED here
+/// rather than silently escaping to the real Anthropic host.
 #[test]
 fn tick_fetches_the_third_party_leg_under_its_own_lease() {
     use crate::profile::{AppConfig, AppState};
     use std::sync::atomic::{AtomicBool, AtomicU64};
-    let _home = crate::testutil::HomeSandbox::new();
+    let home = crate::testutil::HomeSandbox::new();
 
     let name = "gen";
     // One request is a correct run (the first candidate path answers); `max` sits
@@ -3831,6 +3832,7 @@ fn tick_fetches_the_third_party_leg_under_its_own_lease() {
     let (base, server) = crate::testutil::serve_endpoints(4, |_, _| {
         (200, r#"{"session":{"percent":42.5}}"#.to_string())
     });
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
     let mut profile = crate::testutil::blank_profile(name);
     profile.base_url = Some(base.clone());
     profile.api_key = Some("key".to_string());
@@ -3878,6 +3880,15 @@ fn tick_fetches_the_third_party_leg_under_its_own_lease() {
         seen.len(),
         1,
         "the answering candidate ends the probe: {seen:?}"
+    );
+    assert!(
+        !seen.iter().any(|p| {
+            p.starts_with("/v1/oauth/token")
+                || p.starts_with("/api/oauth/usage")
+                || p.starts_with("/api/oauth/profile")
+                || p.starts_with("/v1/messages")
+        }),
+        "an empty `tokens` work-list must never reach the OAuth endpoints: {seen:?}"
     );
     let bars = state
         .third_party_usage_store

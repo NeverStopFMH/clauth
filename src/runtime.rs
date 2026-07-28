@@ -2741,14 +2741,25 @@ fn mirror_tree(claude_home: &Path, runtime: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Unioned child-name set of two directories. Absent/unreadable side
-/// contributes nothing. Names sorted for deterministic, stable iteration.
+/// Unioned child-name set of two directories, minus the publishes in flight.
+/// Absent/unreadable side contributes nothing. Names sorted for deterministic,
+/// stable iteration.
 fn union_children(a: &Path, b: &Path) -> Vec<std::ffi::OsString> {
     let mut names: HashSet<std::ffi::OsString> = HashSet::new();
     for dir in [a, b] {
         if let Ok(entries) = std::fs::read_dir(dir) {
             for entry in entries.flatten() {
-                names.insert(entry.file_name());
+                let name = entry.file_name();
+                // A staging sibling belongs to a `copy_file` mid-publish — one
+                // of the several a shared fake-mode tree has running at once.
+                // Walking it either fails the whole tick when the source is
+                // renamed away between the stat and the copy, or lands an
+                // orphan on the other side that nothing ever removes, since the
+                // mirror never deletes.
+                if crate::watchdog::is_staging(&name) {
+                    continue;
+                }
+                names.insert(name);
             }
         }
     }

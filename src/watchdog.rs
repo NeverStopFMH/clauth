@@ -113,7 +113,11 @@ pub(crate) struct EventWatcher {
 /// renamed into place (`profile::tmp_sibling`, `relink_to_canonical`). Waking on
 /// the staging half costs a reconcile per publish and can only ever observe a
 /// path that is about to move anyway.
-fn is_staging(name: &OsStr) -> bool {
+///
+/// Also the fake-mode tree mirror's skip rule (`runtime::union_children`): a
+/// walk that treats one as tree content either fails when the source is renamed
+/// away mid-copy, or lands an orphan the mirror can never delete.
+pub(crate) fn is_staging(name: &OsStr) -> bool {
     name.to_str()
         .is_some_and(|n| n.starts_with('.') && n.contains(".tmp."))
 }

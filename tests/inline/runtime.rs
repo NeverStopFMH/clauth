@@ -4969,25 +4969,33 @@ fn the_fake_mode_mirror_converges_under_concurrent_publishes() {
     std::thread::scope(|scope| {
         scope.spawn(|| crate::watchdog::run(&specs, &shutdown_rx, &timings, &mirror));
 
-        for writer in 0..WRITERS {
-            let (home, runtime, src) = (&home, &runtime, &src);
-            scope.spawn(move || {
-                for round in 0..ROUNDS {
-                    let staged = src.join(format!("w{writer}"));
-                    fs::write(&staged, payload(writer, round)).expect("stage");
-                    // The one publish primitive fake mode uses, into whichever
-                    // side of the mirror this round targets.
-                    let side = if round % 2 == 0 { home } else { runtime };
-                    copy_file(&staged, &side.join(format!("shared-{writer}.json")))
-                        .expect("publish");
-                    std::thread::sleep(Duration::from_millis(5));
-                }
-            });
+        let writers: Vec<_> = (0..WRITERS)
+            .map(|writer| {
+                let (home, runtime, src) = (&home, &runtime, &src);
+                scope.spawn(move || {
+                    for round in 0..ROUNDS {
+                        let staged = src.join(format!("w{writer}"));
+                        fs::write(&staged, payload(writer, round)).expect("stage");
+                        // The one publish primitive fake mode uses, into
+                        // whichever side of the mirror this round targets.
+                        let side = if round % 2 == 0 { home } else { runtime };
+                        copy_file(&staged, &side.join(format!("shared-{writer}.json")))
+                            .expect("publish");
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                })
+            })
+            .collect();
+        // JOINED, not slept past: the quiescence measurement below asserts "with
+        // no writer running", and a writer the box was too loaded to finish on
+        // time turns its own legitimate wakes into a write-loop verdict.
+        for writer in writers {
+            writer.join().expect("writer");
         }
 
-        // The writers are done. A convergent mirror goes quiet: at most one more
-        // pass (the one that observes the last publish), then every file is
-        // byte-equal and it writes nothing. A self-feeding one keeps climbing.
+        // A convergent mirror goes quiet: at most one more pass (the one that
+        // observes the last publish), then every file is byte-equal and it
+        // writes nothing. A self-feeding one keeps climbing.
         std::thread::sleep(cooldown * 4);
         let settled = mirror.passes();
         std::thread::sleep(cooldown * 8);
@@ -5021,4 +5029,45 @@ fn the_fake_mode_mirror_converges_under_concurrent_publishes() {
         assert!(intact(&left), "{name} is torn on the ~/.claude side");
         assert_eq!(left, right, "{name} did not converge across the mirror");
     }
+    for side in [&home, &runtime] {
+        let orphans: Vec<_> = dir_entry_names(side)
+            .into_iter()
+            .filter(|n| crate::watchdog::is_staging(n.as_ref()))
+            .collect();
+        assert!(
+            orphans.is_empty(),
+            "{} holds staging files the mirror can never delete: {orphans:?}",
+            side.display()
+        );
+    }
+}
+
+/// A staging sibling is a publish in flight, on its way to being renamed away.
+/// The mirror must walk past one: treating it as tree content fails the tick
+/// when the source vanishes between the stat and the copy, and succeeding is
+/// worse — the mirror never deletes, so the copy is a permanent orphan.
+#[test]
+fn the_mirror_walks_past_a_publish_in_flight() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let home = tmp.path().join(".claude");
+    let runtime = tmp.path().join("runtime");
+    fs::create_dir_all(home.join("plugins")).expect("mkdir home");
+    fs::create_dir_all(&runtime).expect("mkdir runtime");
+    fs::write(home.join("statusline.sh"), b"#!/bin/sh\n").expect("write real");
+    // Nested, because `mirror_tree`'s top-level skip list would mask a walk that
+    // recurses into staging siblings one level down.
+    let staging = crate::profile::tmp_sibling(&home.join("plugins").join("config.json"));
+    fs::write(&staging, b"half-written").expect("write staging");
+
+    mirror_tree(&home, &runtime).expect("mirror");
+
+    assert!(
+        runtime.join("statusline.sh").exists(),
+        "a real entry must still mirror"
+    );
+    let name = staging.file_name().expect("staging name");
+    assert!(
+        !runtime.join("plugins").join(name).exists(),
+        "a publish in flight was mirrored as tree content"
+    );
 }

@@ -3876,11 +3876,9 @@ fn tick_fetches_the_third_party_leg_under_its_own_lease() {
     super::tick(&state);
     let seen = server.join().expect("listener");
 
-    assert_eq!(
-        seen.len(),
-        1,
-        "the answering candidate ends the probe: {seen:?}"
-    );
+    // Leak assert BEFORE the count: a leak trips the count too, and the count's
+    // message names the wrong defect. Ordered this way the failure text matches
+    // the failure.
     assert!(
         !seen.iter().any(|p| {
             p.starts_with("/v1/oauth/token")
@@ -3889,6 +3887,11 @@ fn tick_fetches_the_third_party_leg_under_its_own_lease() {
                 || p.starts_with("/v1/messages")
         }),
         "an empty `tokens` work-list must never reach the OAuth endpoints: {seen:?}"
+    );
+    assert_eq!(
+        seen.len(),
+        1,
+        "the answering candidate ends the probe: {seen:?}"
     );
     let bars = state
         .third_party_usage_store
@@ -5725,7 +5728,7 @@ fn a_failed_retry_keeps_the_pair_and_queues_a_refetch() {
 #[test]
 fn an_unacquirable_rotation_guard_bails_without_spending_the_chain() {
     let home = crate::testutil::HomeSandbox::new();
-    let name = "guard-busy";
+    let name = "guard-unacquirable";
     // Zero token requests expected; `max` is above the one `/usage` call so a
     // leaked rotation would be recorded rather than silently refused a socket.
     let (base, server) = crate::testutil::serve_endpoints(4, |path, _| {

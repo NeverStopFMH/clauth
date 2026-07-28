@@ -1684,3 +1684,99 @@ fn rotate_one_inner_does_not_rotate_under_a_live_session_on_macos() {
     assert_eq!(stored.as_deref(), Some("at-old"), "the pair is untouched");
     drop(pid);
 }
+
+// ── the kick's two stuck-429 arms ────────────────────────────────────────────
+
+/// The kick shares ONE `api.anthropic.com` spacing slot with `/usage` and
+/// `/profile`, so a multi-profile window-reset fan-out can't burst
+/// `/v1/messages`. The pacing key is the hardcoded origin, not the overridden
+/// loopback URL, which is what makes the reservation observable through
+/// `EndpointSandbox` at all.
+///
+/// Asserting the reservation the kick LEAVES, rather than timing a second
+/// same-host request through it, is what keeps this free: observing the wait
+/// costs a real `REQUEST_SPACING_MS` sleep per run.
+#[test]
+fn the_kick_reserves_the_shared_anthropic_request_slot() {
+    let home = HomeSandbox::new();
+    let name = "kick-paced";
+    let (base, server) = crate::testutil::serve_endpoints(3, |_, _| (200, "{}".to_string()));
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    // `EndpointSandbox` clears the slots, so the kick starts from an unreserved
+    // host: it waits 0 ms and the reservation it leaves behind is the whole signal.
+    assert_eq!(
+        crate::usage::reserved_request_slot(crate::usage::ANTHROPIC_ORIGIN),
+        None,
+        "the probe must start unreserved, or a leftover slot would pass for the kick's"
+    );
+    let before = crate::usage::now_ms();
+    let config = crate::testutil::rotation_fixture_config(name);
+
+    let result = auto_start_kick(&config, name, "at-old", Some("rt-old"), None, None);
+    let seen = server.join().expect("listener");
+
+    assert!(result.opened, "the 200 opens the window: {seen:?}");
+    assert_eq!(seen.len(), 1, "one kick, nothing else: {seen:?}");
+    let slot = crate::usage::reserved_request_slot(crate::usage::ANTHROPIC_ORIGIN);
+    assert!(
+        slot.is_some_and(|t| t > before),
+        "the kick must reserve the shared slot so the next same-host request waits; got {slot:?}"
+    );
+}
+
+/// A rotation whose persist fails still hands the minted pair back: the refresh
+/// already spent the old single-use token, so dropping the new one leaves the
+/// caller's snapshot on a dead token that 400s every tick until a restart adopts
+/// the staged sidecar. `opened` stays false — the retry kick never runs — and
+/// that is exactly why `KickResult` sets `rotated` independently of it.
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn a_kick_rotation_carries_its_pair_back_when_the_persist_fails() {
+    let home = HomeSandbox::new();
+    let name = "kick-persist-fail";
+    // messages 401 → token 200. `max` sits above that so a retry kick would be
+    // recorded rather than silently refused a socket.
+    let (base, server) = crate::testutil::serve_endpoints(5, |path, _| {
+        if path.starts_with("/v1/oauth/token") {
+            (
+                200,
+                r#"{"access_token":"at-new","refresh_token":"rt-new","expires_in":28800}"#
+                    .to_string(),
+            )
+        } else {
+            (401, r#"{"error":"unauthorized"}"#.to_string())
+        }
+    });
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    let config = crate::testutil::rotation_fixture_config(name);
+    crate::testutil::block_credentials_write(name);
+
+    let result = auto_start_kick(&config, name, "at-old", Some("rt-old"), None, None);
+    let seen = server.join().expect("listener");
+
+    assert!(
+        seen.iter().any(|p| p.starts_with("/v1/oauth/token")),
+        "the leg must actually rotate before the persist can fail: {seen:?}"
+    );
+    // Proof the fixture failed the persist where it claims to: the crash-durable
+    // sidecar is only cleared after a committed save.
+    let pending =
+        crate::profile::profile_subpath(name, "credentials.json.pending").expect("pending path");
+    assert!(
+        pending.is_file(),
+        "the staged sidecar must survive, or the save never failed"
+    );
+    assert_eq!(
+        result.rotated,
+        Some(("at-new".to_string(), Some("rt-new".to_string()))),
+        "a minted pair must propagate even when it could not be persisted"
+    );
+    assert!(!result.opened, "the retry kick never ran");
+    assert_eq!(
+        seen.iter()
+            .filter(|p| p.starts_with("/v1/messages"))
+            .count(),
+        1,
+        "the persist bail returns before the retry kick: {seen:?}"
+    );
+}

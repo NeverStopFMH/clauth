@@ -197,6 +197,27 @@ pub(crate) fn rotation_fixture_config(name: &str) -> crate::profile::ConfigHandl
     std::sync::Arc::new(crate::lockorder::RankedMutex::new(config))
 }
 
+/// Make the next `save_profile` for `name` fail on its credentials write, so a
+/// rotation's persist leg can be driven without root or a mode flip: the write
+/// goes through `atomic_write_600`, whose `rename(tmp, credentials.json)` is
+/// `EISDIR` once a DIRECTORY sits at that path.
+///
+/// Aimed at `credentials.json` rather than the profile dir on purpose — a broken
+/// profile dir fails `RotationGuard::acquire` first (`rotation.lock` lives there),
+/// so the leg would bail long before reaching the persist under test.
+///
+/// Gated with its callers: both are non-macOS tests, and an ungated helper with
+/// no macOS caller is a dead-code error that reds that leg on clippy
+/// `-D warnings` before a test runs.
+#[cfg(not(target_os = "macos"))]
+pub(crate) fn block_credentials_write(name: &str) {
+    let path = crate::profile::profile_subpath(name, "credentials.json").expect("credentials path");
+    if path.is_file() {
+        std::fs::remove_file(&path).expect("drop the fixture's credentials file");
+    }
+    std::fs::create_dir(&path).expect("block the credentials path with a directory");
+}
+
 /// RAII pin redirecting every Anthropic endpoint the rotation legs touch —
 /// `/usage`, the token endpoint, and the `/v1/messages` kick — at one loopback
 /// listener, and clearing them on drop even if the test panics. Also resets the

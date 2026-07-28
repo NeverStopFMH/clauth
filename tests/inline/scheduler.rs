@@ -3808,6 +3808,101 @@ fn tick_stands_down_when_another_instance_holds_the_fetch_lease() {
     drop(other);
 }
 
+/// `tick`'s third-party leg, end to end against a real loopback provider. The
+/// only other `tick` test plants a competing lease and takes the stand-down
+/// return, so everything past that check — the snapshot, the partition, the
+/// spawned leg, and the store/status/stamp writes it lands — was dark.
+///
+/// No seam is needed: a `Generic` target's `base_url` IS one. `api_origin` takes
+/// the listener's `http://127.0.0.1:PORT` verbatim and the generic engine probes
+/// its curated paths against exactly that origin. An empty `tokens` list keeps
+/// the OAuth leg out of the tick entirely, so no request can escape to the real
+/// Anthropic host.
+#[test]
+fn tick_fetches_the_third_party_leg_under_its_own_lease() {
+    use crate::profile::{AppConfig, AppState};
+    use std::sync::atomic::{AtomicBool, AtomicU64};
+    let _home = crate::testutil::HomeSandbox::new();
+
+    let name = "gen";
+    // One request is a correct run (the first candidate path answers); `max` sits
+    // above it so a regression that walks the whole candidate list is recorded
+    // rather than silently refused a socket.
+    let (base, server) = crate::testutil::serve_endpoints(4, |_, _| {
+        (200, r#"{"session":{"percent":42.5}}"#.to_string())
+    });
+    let mut profile = crate::testutil::blank_profile(name);
+    profile.base_url = Some(base.clone());
+    profile.api_key = Some("key".to_string());
+    let config: crate::profile::ConfigHandle = Arc::new(RankedMutex::new(AppConfig {
+        state: AppState::default(),
+        profiles: vec![profile],
+    }));
+    let entry = ThirdPartyEntry {
+        name: name.to_string(),
+        target: crate::providers::ThirdPartyTarget::Generic {
+            base_url: base.clone(),
+        },
+        api_key: "key".to_string(),
+    };
+    let state = super::SchedulerState {
+        config,
+        // Empty on purpose: an OAuth work-list would fire at the real endpoint.
+        tokens: Arc::new(RankedMutex::new(vec![])),
+        store: Arc::new(RankedMutex::new(HashMap::new())),
+        status: Arc::new(RankedMutex::new(HashMap::new())),
+        refresh_interval: Arc::new(AtomicU64::new(REFRESH_INTERVAL_MS)),
+        next_refresh_per_profile: Arc::new(RankedMutex::new(HashMap::new())),
+        activity: Arc::new(RankedMutex::new(HashMap::new())),
+        last_fetched: Arc::new(RankedMutex::new(HashMap::new())),
+        poll_streaks: Arc::new(RankedMutex::new(HashMap::new())),
+        kick_blocks: Arc::new(RankedMutex::new(HashMap::new())),
+        pending_switch: Arc::new(RankedMutex::new(HashSet::new())),
+        pending_switch_off: Arc::new(RankedMutex::new(false)),
+        refetch_queue: Arc::new(RankedMutex::new(HashSet::new())),
+        third_party_tokens: Arc::new(RankedMutex::new(vec![entry])),
+        third_party_usage_store: Arc::new(RankedMutex::new(HashMap::new())),
+        third_party_status: Arc::new(RankedMutex::new(HashMap::new())),
+        suppressed_generic: Arc::new(RankedMutex::new(HashSet::new())),
+        shutting_down: Arc::new(AtomicBool::new(false)),
+        // Nothing else holds the flock, so this tick is the fetcher.
+        fetch_lease: Arc::new(crate::daemon::FetchLease::new()),
+        standdown_active: AtomicBool::new(false),
+        last_history_prune: AtomicU64::new(crate::usage::now_ms()),
+    };
+
+    super::tick(&state);
+    let seen = server.join().expect("listener");
+
+    assert_eq!(
+        seen.len(),
+        1,
+        "the answering candidate ends the probe: {seen:?}"
+    );
+    let bars = state
+        .third_party_usage_store
+        .lock()
+        .unwrap()
+        .get(name)
+        .map(|s| s.bars.clone())
+        .expect("the leg must land its stats in the store");
+    assert_eq!(bars.len(), 1);
+    assert!((bars[0].pct - 42.5).abs() < f64::EPSILON, "got {bars:?}");
+    assert_eq!(
+        state.third_party_status.lock().unwrap().get(name).copied(),
+        Some(super::FetchStatus::Fresh),
+        "a landed body is Fresh, not a cache fallback"
+    );
+    assert!(
+        state.last_fetched.lock().unwrap().contains_key(name),
+        "the fetch stamps its slot, or the profile re-fetches every tick"
+    );
+    assert!(
+        state.activity.lock().unwrap().get(name).is_none(),
+        "the worker clears its own spinner on landing"
+    );
+}
+
 // ── active-profile 429 ladder cap ────────────────────────────────────────────
 //
 // A deep back-off slot on the active row mostly buys staleness on the exact
@@ -5316,5 +5411,419 @@ fn auto_start_kick_does_not_rotate_under_a_live_session_on_macos() {
     assert!(
         !result.opened,
         "the window stays shut; the kick could not recover"
+    );
+}
+
+// ── the rest of `fetch_with_rotation`, driven offline ────────────────────────
+//
+// Everything below the 401 arm above: the clock-expired-429 unmask, both retry
+// failure arms, the guard-acquire bail, and the persist-failure carry-back. Each
+// sits behind at least one HTTP round trip, so the loopback listener is what
+// makes any of them reachable.
+
+/// The rotation fixture with the stored access token ALREADY clock-expired and
+/// preemptive rotation OFF (the Config-tab escape hatch). Both halves are what
+/// put a `/usage` 429 on the AUTH-1 unmask path: with the toggle on, that same
+/// expiry takes the proactive branch and the plain fetch the 429 comes from
+/// never runs at all.
+///
+/// Gated with its callers: every consumer below is a non-macOS test, and an
+/// ungated helper with no macOS caller is a dead-code error that reds that leg
+/// on clippy `-D warnings` before a test runs.
+#[cfg(not(target_os = "macos"))]
+fn expired_lazy_config(name: &str) -> crate::profile::ConfigHandle {
+    let config = crate::testutil::rotation_fixture_config(name);
+    {
+        let mut cfg = config.lock().unwrap();
+        cfg.state.preemptive_rotation = false;
+        let oauth = cfg
+            .find_mut(name)
+            .and_then(|p| p.credentials.as_mut())
+            .and_then(|c| c.claude_ai_oauth.as_mut())
+            .expect("the fixture profile carries an OAuth block");
+        oauth.expires_at = Some(crate::usage::now_ms() as i64 - 1_000);
+    }
+    config
+}
+
+#[cfg(not(target_os = "macos"))]
+fn rotation_entry(name: &str, access_expires_at: Option<i64>) -> super::TokenEntry {
+    super::TokenEntry {
+        name: name.to_string(),
+        access_token: "at-old".into(),
+        refresh_token: Some("rt-old".into()),
+        auto_start: false,
+        access_expires_at,
+        auth_broken: false,
+    }
+}
+
+/// Anchor the profile and stamp its `/profile` clock fresh, so `take_profile_fetch`
+/// refuses on its own and the ONLY thing that can still pull `/profile` is
+/// `force_profile`. Without this the first attempt spends the hourly slot itself
+/// and the force is invisible.
+#[cfg(not(target_os = "macos"))]
+fn silence_profile_ttl(name: &str) {
+    use crate::profile_cache::{
+        ACCOUNT_ID_CACHE_FILE, PROFILE_FETCHED_CACHE_FILE, write_profile_cache,
+    };
+    write_profile_cache(
+        name,
+        ACCOUNT_ID_CACHE_FILE,
+        &crate::profile::AccountId::from("uuid-anchor"),
+    );
+    write_profile_cache(name, PROFILE_FETCHED_CACHE_FILE, &crate::usage::now_ms());
+}
+
+/// A disk cache to fall back onto, so a bail's status is the one the leg chose
+/// rather than the `Failed` downgrade `load_cached_with_status` applies when
+/// there is nothing cached at all.
+#[cfg(not(target_os = "macos"))]
+fn seed_usage_cache(name: &str) {
+    crate::profile_cache::write_profile_cache(
+        name,
+        crate::profile_cache::USAGE_CACHE_FILE,
+        &crate::usage::UsageInfo::default(),
+    );
+}
+
+/// A `/profile` body for an account whose subscription was canceled — the tier
+/// flip that only the live-token re-pull can observe.
+#[cfg(not(target_os = "macos"))]
+const CANCELED_PROFILE_BODY: &str = r#"{"account":{"uuid":"uuid-1"},
+   "organization":{"organization_type":"claude_free","subscription_status":"canceled"}}"#;
+
+#[cfg(not(target_os = "macos"))]
+fn active_pro_plan() -> crate::usage::PlanInfo {
+    crate::usage::PlanInfo {
+        tier: crate::usage::PlanTier::Pro,
+        subscription_status: Some("active".to_string()),
+    }
+}
+
+/// The AUTH-1 unmask end to end: a `/usage` 429 on an already clock-expired token
+/// is not an endpoint throttle to sit out — it masks a token that must be
+/// refreshed, and refusing to rotate leaves a dead login hiding behind
+/// `RateLimited` forever. It also pins the `unmask_429` half of `force_profile`:
+/// the 429'd attempt already spent this tick's hourly `/profile` slot on the
+/// now-dead token, so without the force the canceled account below would keep
+/// reporting the previous tier for a full hour.
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn a_429_on_a_clock_expired_token_rotates_and_repulls_the_plan() {
+    let home = crate::testutil::HomeSandbox::new();
+    let name = "unmask-429";
+    // usage 429 → token 200 → usage 200 → profile 200. `max` sits above that, so
+    // a second `/profile` (or any extra request) would still be recorded.
+    let (base, server) = crate::testutil::serve_endpoints(7, |path, i| {
+        if path.starts_with("/v1/oauth/token") {
+            (
+                200,
+                r#"{"access_token":"at-new","refresh_token":"rt-new","expires_in":28800}"#
+                    .to_string(),
+            )
+        } else if path.starts_with("/api/oauth/usage") {
+            if i == 0 {
+                (429, r#"{"error":"rate_limited"}"#.to_string())
+            } else {
+                (
+                    200,
+                    r#"{"limits":[{"kind":"session","percent":12,
+                   "resets_at":"2099-01-01T00:00:00+00:00"}]}"#
+                        .to_string(),
+                )
+            }
+        } else if path.starts_with("/api/oauth/profile") {
+            (200, CANCELED_PROFILE_BODY.to_string())
+        } else {
+            (404, "{}".to_string())
+        }
+    });
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    let config = expired_lazy_config(name);
+    silence_profile_ttl(name);
+    let entry = rotation_entry(name, Some(crate::usage::now_ms() as i64 - 1_000));
+    let refetch: super::RefetchQueue = Arc::new(RankedMutex::new(HashSet::new()));
+    let activity: super::ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
+
+    // A plan already in hand, so `prev_plan.is_none()` is FALSE and the unmask is
+    // the only thing left that can force the retry's `/profile` pull.
+    let outcome = super::fetch_with_rotation(
+        &config,
+        &entry,
+        Some(active_pro_plan()),
+        &refetch,
+        &activity,
+    );
+    let seen = server.join().expect("listener");
+
+    assert!(
+        seen.iter().any(|p| p.starts_with("/v1/oauth/token")),
+        "a 429 on a clock-expired token must reach the token endpoint: {seen:?}"
+    );
+    assert_eq!(
+        outcome.rotated,
+        Some(("at-new".to_string(), Some("rt-new".to_string()))),
+        "the rotated pair must come back for the TokenList sync"
+    );
+    assert_eq!(outcome.status, super::FetchStatus::Fresh);
+    assert!(outcome.from_fetch, "a live body, not a cache fallback");
+    let profile_calls = seen
+        .iter()
+        .filter(|p| p.starts_with("/api/oauth/profile"))
+        .count();
+    assert_eq!(
+        profile_calls, 1,
+        "the fresh token must re-pull /profile past the hourly stamp: {seen:?}"
+    );
+    let plan = outcome
+        .info
+        .as_ref()
+        .and_then(|i| i.plan.as_ref())
+        .expect("the live body carries a plan");
+    assert!(
+        plan.is_canceled(),
+        "the re-pull is what observes the cancellation; got {plan:?}"
+    );
+    assert_eq!(plan.tier, crate::usage::PlanTier::Free);
+}
+
+/// The post-rotation retry itself 429s. The minted pair still comes back (the old
+/// single-use token is already spent), the `/profile` reading taken despite that
+/// 429 rides along so a canceled account is still observed — and the profile must
+/// NOT be pushed onto the refetch queue: enqueueing here is the
+/// rotate → 429 → enqueue → rotate cycle the `retry-after` deferral exists to
+/// replace.
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn a_rate_limited_retry_keeps_the_pair_and_never_enqueues_a_refetch() {
+    let home = crate::testutil::HomeSandbox::new();
+    let name = "retry-429";
+    // usage 401 → token 200 → usage 429 → profile 200.
+    let (base, server) = crate::testutil::serve_endpoints(7, |path, i| {
+        if path.starts_with("/v1/oauth/token") {
+            (
+                200,
+                r#"{"access_token":"at-new","refresh_token":"rt-new","expires_in":28800}"#
+                    .to_string(),
+            )
+        } else if path.starts_with("/api/oauth/usage") {
+            if i == 0 {
+                (401, r#"{"error":"unauthorized"}"#.to_string())
+            } else {
+                (429, r#"{"error":"rate_limited"}"#.to_string())
+            }
+        } else if path.starts_with("/api/oauth/profile") {
+            (200, CANCELED_PROFILE_BODY.to_string())
+        } else {
+            (404, "{}".to_string())
+        }
+    });
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    let config = crate::testutil::rotation_fixture_config(name);
+    seed_usage_cache(name);
+    let entry = rotation_entry(name, Some(crate::usage::now_ms() as i64 + 86_400_000));
+    let refetch: super::RefetchQueue = Arc::new(RankedMutex::new(HashSet::new()));
+    let activity: super::ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
+
+    let outcome = super::fetch_with_rotation(&config, &entry, None, &refetch, &activity);
+    let seen = server.join().expect("listener");
+
+    assert!(
+        seen.iter().any(|p| p.starts_with("/v1/oauth/token")),
+        "the 401 must rotate before the retry can be rate-limited: {seen:?}"
+    );
+    assert_eq!(
+        outcome.rotated,
+        Some(("at-new".to_string(), Some("rt-new".to_string()))),
+        "a rate-limited retry still holds the only usable pair"
+    );
+    assert_eq!(outcome.status, super::FetchStatus::RateLimited);
+    assert!(!outcome.from_fetch, "the 429 serves the disk cache");
+    assert!(
+        refetch.lock().unwrap().is_empty(),
+        "a 429 defers by retry-after; forcing it back onto the next tick re-rotates"
+    );
+    let plan = outcome
+        .plan_override
+        .as_ref()
+        .expect("the /profile reading taken despite the 429 rides along");
+    assert!(plan.is_canceled(), "got {plan:?}");
+}
+
+/// Rotation succeeded but the retry died on a transient error. The pair comes
+/// back AND the profile is queued so the next tick re-polls with the new token
+/// instead of sitting out a full refresh interval on stale cache.
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn a_failed_retry_keeps_the_pair_and_queues_a_refetch() {
+    let home = crate::testutil::HomeSandbox::new();
+    let name = "retry-transient";
+    // usage 401 → token 200 → usage 500. `/profile` is never reached: the
+    // non-429 error arm short-circuits before the plan leg.
+    let (base, server) = crate::testutil::serve_endpoints(6, |path, i| {
+        if path.starts_with("/v1/oauth/token") {
+            (
+                200,
+                r#"{"access_token":"at-new","refresh_token":"rt-new","expires_in":28800}"#
+                    .to_string(),
+            )
+        } else if path.starts_with("/api/oauth/usage") {
+            if i == 0 {
+                (401, r#"{"error":"unauthorized"}"#.to_string())
+            } else {
+                (500, r#"{"error":"server_error"}"#.to_string())
+            }
+        } else {
+            (404, "{}".to_string())
+        }
+    });
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    let config = crate::testutil::rotation_fixture_config(name);
+    seed_usage_cache(name);
+    let entry = rotation_entry(name, Some(crate::usage::now_ms() as i64 + 86_400_000));
+    let refetch: super::RefetchQueue = Arc::new(RankedMutex::new(HashSet::new()));
+    let activity: super::ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
+
+    let outcome = super::fetch_with_rotation(&config, &entry, None, &refetch, &activity);
+    let seen = server.join().expect("listener");
+
+    assert!(
+        seen.iter().any(|p| p.starts_with("/v1/oauth/token")),
+        "the 401 must rotate before the retry can fail: {seen:?}"
+    );
+    assert_eq!(
+        outcome.rotated,
+        Some(("at-new".to_string(), Some("rt-new".to_string()))),
+        "the minted pair survives a failed retry"
+    );
+    assert_eq!(outcome.status, super::FetchStatus::Cached);
+    assert!(!outcome.from_fetch);
+    assert_eq!(
+        refetch.lock().unwrap().iter().collect::<Vec<_>>(),
+        vec![&name.to_string()],
+        "the new token must be retried next tick, not one interval from now"
+    );
+}
+
+/// The rotation lock is unavailable, so the leg may not touch the credentials at
+/// all: it bails to cache without reaching the token endpoint. Forced by putting
+/// a DIRECTORY at `rotation.lock`, which is `EISDIR` when `open_pid_file` opens it
+/// read-write — one of the IO failures `acquire` returns `Err` for in production.
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn a_busy_rotation_guard_bails_without_spending_the_chain() {
+    let home = crate::testutil::HomeSandbox::new();
+    let name = "guard-busy";
+    // Zero token requests expected; `max` is above the one `/usage` call so a
+    // leaked rotation would be recorded rather than silently refused a socket.
+    let (base, server) = crate::testutil::serve_endpoints(4, |path, _| {
+        if path.starts_with("/api/oauth/usage") {
+            (401, r#"{"error":"unauthorized"}"#.to_string())
+        } else {
+            (
+                200,
+                r#"{"access_token":"at-LEAK","refresh_token":"rt-LEAK","expires_in":28800}"#
+                    .to_string(),
+            )
+        }
+    });
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    let config = crate::testutil::rotation_fixture_config(name);
+    seed_usage_cache(name);
+    let lock_path = crate::profile::profile_subpath(name, "rotation.lock").expect("lock path");
+    std::fs::create_dir_all(&lock_path).expect("block the rotation lock");
+    assert!(
+        crate::runtime::RotationGuard::acquire(name).is_err(),
+        "the fixture must actually deny the guard, or this proves nothing"
+    );
+    let entry = rotation_entry(name, Some(crate::usage::now_ms() as i64 + 86_400_000));
+    let refetch: super::RefetchQueue = Arc::new(RankedMutex::new(HashSet::new()));
+    let activity: super::ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
+
+    let outcome = super::fetch_with_rotation(&config, &entry, None, &refetch, &activity);
+    let seen = server.join().expect("listener");
+
+    assert!(
+        !seen.iter().any(|p| p.starts_with("/v1/oauth/token")),
+        "an unheld guard must never let the single-use chain be spent: {seen:?}"
+    );
+    assert_eq!(outcome.rotated, None, "nothing may be rotated");
+    assert_eq!(outcome.status, super::FetchStatus::Cached);
+    let stored = config
+        .lock()
+        .unwrap()
+        .find(name)
+        .and_then(|p| p.access_token().map(str::to_string));
+    assert_eq!(
+        stored.as_deref(),
+        Some("at-old"),
+        "the stored pair is untouched"
+    );
+}
+
+/// A rotation whose persist fails still hands the minted pair back. The refresh
+/// already spent the old single-use token, so the new pair is the only usable
+/// one: dropping it leaves the caller's `TokenList` on a dead token that 400s
+/// every tick until a restart adopts the staged sidecar, while the in-memory
+/// `AppConfig` has already moved on — the divergence asserted below.
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn a_rotation_carries_its_pair_back_when_the_persist_fails() {
+    let home = crate::testutil::HomeSandbox::new();
+    let name = "persist-fail";
+    // usage 401 → token 200; the retry never runs (the persist bails first).
+    let (base, server) = crate::testutil::serve_endpoints(5, |path, i| {
+        if path.starts_with("/v1/oauth/token") {
+            (
+                200,
+                r#"{"access_token":"at-new","refresh_token":"rt-new","expires_in":28800}"#
+                    .to_string(),
+            )
+        } else if path.starts_with("/api/oauth/usage") && i == 0 {
+            (401, r#"{"error":"unauthorized"}"#.to_string())
+        } else {
+            (404, "{}".to_string())
+        }
+    });
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    let config = crate::testutil::rotation_fixture_config(name);
+    seed_usage_cache(name);
+    crate::testutil::block_credentials_write(name);
+    let entry = rotation_entry(name, Some(crate::usage::now_ms() as i64 + 86_400_000));
+    let refetch: super::RefetchQueue = Arc::new(RankedMutex::new(HashSet::new()));
+    let activity: super::ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
+
+    let outcome = super::fetch_with_rotation(&config, &entry, None, &refetch, &activity);
+    let seen = server.join().expect("listener");
+
+    assert!(
+        seen.iter().any(|p| p.starts_with("/v1/oauth/token")),
+        "the leg must actually rotate before the persist can fail: {seen:?}"
+    );
+    // Proof the fixture failed the persist where it claims to: the crash-durable
+    // sidecar is only cleared after a committed save.
+    let pending =
+        crate::profile::profile_subpath(name, "credentials.json.pending").expect("pending path");
+    assert!(
+        pending.is_file(),
+        "the staged sidecar must survive, or the save never failed"
+    );
+    assert_eq!(
+        outcome.rotated,
+        Some(("at-new".to_string(), Some("rt-new".to_string()))),
+        "the pair the refresh minted is the only usable one — it must reach the TokenList"
+    );
+    assert_eq!(outcome.status, super::FetchStatus::Cached);
+    assert!(!outcome.from_fetch);
+    let stored = config
+        .lock()
+        .unwrap()
+        .find(name)
+        .and_then(|p| p.access_token().map(str::to_string));
+    assert_eq!(
+        stored.as_deref(),
+        Some("at-new"),
+        "in-memory config already advanced — dropping the pair is what strands the TokenList"
     );
 }

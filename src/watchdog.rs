@@ -14,6 +14,8 @@
 
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use crossbeam_channel::{Receiver, bounded, unbounded};
@@ -135,6 +137,189 @@ pub(crate) struct EventWatcher {
     /// `specs.len()` the unarmed surface has no event coverage at all, so
     /// [`run`] shortens the fallback rather than leaving it on 30 s.
     armed: usize,
+    /// Shared with the notify callback, read by [`run_events`].
+    health: Arc<FilterHealth>,
+}
+
+impl EventWatcher {
+    /// Whether every directory the caller asked for armed. Its own method so
+    /// the dead-filter gate is a named predicate a test can assert, rather than
+    /// a comparison buried in a `then`.
+    pub(crate) fn fully_armed(&self, requested: usize) -> bool {
+        self.armed == requested
+    }
+}
+
+/// What one delivered event means, both for the loop and for the filter's
+/// health. Pure, so the rescan rule below is pinned without a backend that can
+/// be made to drop events on demand.
+struct EventVerdict<'a> {
+    /// The loop must reconcile.
+    wake: bool,
+    /// [`wants`] took at least one of the event's paths.
+    matched: bool,
+    /// A path whose parent is no spec's directory under EITHER spelling. notify
+    /// forwards only children of the key it armed, so an event nobody can
+    /// account for means a spelling this watcher will never match.
+    orphan: Option<&'a Path>,
+}
+
+fn classify<'a>(specs: &[WatchSpec], event: &'a notify::Event) -> EventVerdict<'a> {
+    let matched = event.paths.iter().any(|p| wants(specs, p));
+    EventVerdict {
+        // A dropped-event overflow says the queue lost changes nobody can
+        // name, so it must reconcile even though it carries no path.
+        wake: matched || event.need_rescan(),
+        matched,
+        // Only for an event nothing took: one that matched is accounted for,
+        // and this walks every spec a second time on the callback thread.
+        orphan: (!matched)
+            .then(|| event.paths.iter().find(|p| !attributable(specs, p)))
+            .flatten()
+            .map(PathBuf::as_path),
+    }
+}
+
+/// Whether `path` is a child of some spec's directory under EITHER spelling.
+/// Independent of [`Interest`]: this asks whether the event can be accounted
+/// for at all, not whether it is worth a reconcile.
+fn attributable(specs: &[WatchSpec], path: &Path) -> bool {
+    path.parent().is_some_and(|dir| {
+        specs
+            .iter()
+            .any(|spec| spec.dir == dir || spec.canonical_dir == dir)
+    })
+}
+
+/// Whether the event filter is matching anything at all.
+///
+/// [`EventWatcher::armed`] is the only other health signal, and a watcher that
+/// matches NO event satisfies it fully: the macOS realpath bug armed every
+/// directory and then dropped every event it was handed, so the program
+/// reported itself covered while the whole surface sat on the 30 s fallback.
+/// Four tests failing on a Mac are what surfaced that; nothing in the running
+/// program said a word for the bug's entire life.
+///
+/// Three counters rather than a match count, because a match count alone cannot
+/// tell a dead filter from an idle machine, and an aggregate one cannot tell a
+/// dead SPEC from three healthy siblings:
+///   * `seen` vs `matched` catches a filter that takes nothing at all (a wrong
+///     [`Interest`] name list, where the directory spelling is right);
+///   * `orphans` catches one spec whose spelling is wrong while the others
+///     match happily, which is the shape a dotfiles-managed `~/.claude` would
+///     take in production.
+pub(crate) struct FilterHealth {
+    /// The watched directories, rendered once at arm time so the diagnostic can
+    /// name the surface without the callback thread ever walking specs. Both
+    /// spellings where they differ: that difference IS the bug being hunted.
+    dirs: String,
+    seen: AtomicU64,
+    matched: AtomicU64,
+    orphans: AtomicU64,
+    /// The first unaccountable path, kept so the line names the delivered
+    /// spelling rather than only the armed one.
+    orphan_sample: OnceLock<PathBuf>,
+}
+
+impl FilterHealth {
+    fn new(specs: &[WatchSpec]) -> Self {
+        let dirs = specs
+            .iter()
+            .map(|s| {
+                if s.canonical_dir == s.dir {
+                    s.dir.display().to_string()
+                } else {
+                    format!("{} (as {})", s.dir.display(), s.canonical_dir.display())
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        Self {
+            dirs,
+            seen: AtomicU64::new(0),
+            matched: AtomicU64::new(0),
+            orphans: AtomicU64::new(0),
+            orphan_sample: OnceLock::new(),
+        }
+    }
+
+    /// Record one event the callback was handed.
+    fn saw(&self, verdict: &EventVerdict<'_>) {
+        // Both exonerating counters move BEFORE `seen`: a reader landing
+        // between two increments then observes a state that under-accuses,
+        // never one that never existed.
+        if verdict.matched {
+            self.matched.fetch_add(1, Ordering::Relaxed);
+        }
+        if let Some(path) = verdict.orphan {
+            let _ = self.orphan_sample.set(path.to_path_buf());
+            self.orphans.fetch_add(1, Ordering::Relaxed);
+        }
+        self.seen.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn counts(&self) -> Counts {
+        Counts {
+            seen: self.seen.load(Ordering::Relaxed),
+            matched: self.matched.load(Ordering::Relaxed),
+            orphans: self.orphans.load(Ordering::Relaxed),
+        }
+    }
+
+    /// `, e.g. <path>` for the diagnostic, empty when nothing was orphaned.
+    fn orphan_hint(&self) -> String {
+        self.orphan_sample
+            .get()
+            .map(|p| format!(", e.g. {}", p.display()))
+            .unwrap_or_default()
+    }
+}
+
+/// One fallback tick's reading of [`FilterHealth`].
+#[derive(Debug, Clone, Copy)]
+struct Counts {
+    seen: u64,
+    matched: u64,
+    orphans: u64,
+}
+
+/// Fallback intervals a fully-armed watcher gets before its counters are read
+/// as a verdict. What this buys is time for a legitimate match to show up, not
+/// grace for a burst: `seen` is monotonic, so events counted at arm time still
+/// count at the horizon.
+const DEAD_FILTER_INTERVALS: u32 = 3;
+
+/// Volume floor under either arm of the check. Unmatched events are the normal
+/// steady state — `$HOME` is watched for one name and rewritten by everything —
+/// so the signal is a STREAM of them, never a stray one.
+const DEAD_FILTER_MIN_EVENTS: u64 = 16;
+
+/// One-shot detector for a fully-armed watcher whose filter is not doing its
+/// job. Driven on [`run_events`]'s fallback ticks, the one cadence such a
+/// watcher still has: with no matches there are no wakes either.
+#[derive(Default)]
+struct DeadFilter {
+    intervals: u32,
+    reported: bool,
+}
+
+impl DeadFilter {
+    /// The counters to report, at most ONCE per watcher: the condition holds
+    /// for the rest of the session by construction, so repeating it per
+    /// interval would turn a defect report into a heartbeat in the log.
+    fn fires(&mut self, health: &FilterHealth) -> Option<Counts> {
+        if self.reported {
+            return None;
+        }
+        self.intervals += 1;
+        if self.intervals < DEAD_FILTER_INTERVALS {
+            return None;
+        }
+        let counts = health.counts();
+        self.reported = counts.orphans >= DEAD_FILTER_MIN_EVENTS
+            || (counts.matched == 0 && counts.seen >= DEAD_FILTER_MIN_EVENTS);
+        self.reported.then_some(counts)
+    }
 }
 
 /// clauth publishes every file as a hidden `.<name>.tmp.<pid>[.<seq>]` sibling
@@ -230,12 +415,14 @@ pub(crate) fn try_start(specs: &[WatchSpec], debounce: Duration) -> Option<Event
     let (raw_tx, raw_rx) = unbounded();
 
     let filter: Vec<WatchSpec> = specs.to_vec();
+    let health = Arc::new(FilterHealth::new(specs));
+    let callback_health = Arc::clone(&health);
     let mut handle = match notify::recommended_watcher(
         move |res: std::result::Result<notify::Event, notify::Error>| {
             let Ok(event) = res else { return };
-            // A dropped-event overflow says the queue lost changes nobody can
-            // name, so it must reconcile even though it carries no path.
-            if event.need_rescan() || event.paths.iter().any(|p| wants(&filter, p)) {
+            let verdict = classify(&filter, &event);
+            callback_health.saw(&verdict);
+            if verdict.wake {
                 let _ = raw_tx.send(());
             }
         },
@@ -275,6 +462,7 @@ pub(crate) fn try_start(specs: &[WatchSpec], debounce: Duration) -> Option<Event
         handle,
         wake: wake_rx,
         armed,
+        health,
     })
 }
 
@@ -383,6 +571,12 @@ pub(crate) fn run_with_watcher(
 ) {
     if let Some(watcher) = watcher {
         let mut t = *t;
+        // Only a FULLY armed watcher is a candidate for the dead-filter check:
+        // an unarmed directory already explains a missing match, and it reports
+        // itself below, so the two diagnostics never accuse the same session.
+        let health = watcher
+            .fully_armed(requested)
+            .then(|| watcher.health.as_ref());
         if watcher.armed < requested {
             // Said once here rather than left to the per-directory arm errors:
             // those name a moment, this names a cost the whole session pays.
@@ -395,7 +589,7 @@ pub(crate) fn run_with_watcher(
             );
             t.fallback = t.credential_poll;
         }
-        match run_events(&watcher.wake, shutdown, &t, r) {
+        match run_events(&watcher.wake, shutdown, &t, r, health) {
             Exit::Shutdown => return,
             Exit::WatcherLost => {
                 logline!("clauth: fs watcher event channel disconnected, switching to poll")
@@ -408,11 +602,15 @@ pub(crate) fn run_with_watcher(
 /// Event-driven loop. Reconciles on a wake, no faster than one `cooldown` after
 /// the previous reconcile RETURNED, with the fallback ticker covering an event
 /// that never arrived.
+///
+/// `health` is `Some` only for a fully-armed watcher, whose filter is then held
+/// to matching something (see [`FilterHealth`]).
 pub(crate) fn run_events(
     wake: &Receiver<()>,
     shutdown: &Receiver<()>,
     t: &Timings,
     r: &dyn Reconcile,
+    health: Option<&FilterHealth>,
 ) -> Exit {
     let fallback = crossbeam_channel::tick(t.fallback);
     let swap_poll = crossbeam_channel::tick(t.swap_poll);
@@ -423,6 +621,7 @@ pub(crate) fn run_events(
     // `bounded(1)` and the debouncer discards what it coalesces, so a dropped
     // one has no replay and its change waits out the whole fallback interval.
     let mut pending = false;
+    let mut dead = DeadFilter::default();
 
     loop {
         let idle = if pending {
@@ -439,7 +638,28 @@ pub(crate) fn run_events(
                 }
                 pending = true;
             }
-            recv(fallback) -> _ => pending = true,
+            recv(fallback) -> _ => {
+                pending = true;
+                if let Some(health) = health
+                    && let Some(counts) = dead.fires(health)
+                {
+                    // Log only. Unlike a partial arm this state is never
+                    // legitimate, so shortening the fallback would buy the
+                    // latency back while hiding the defect that has to be fixed.
+                    logline!(
+                        "clauth: fs watcher armed every directory but is not matching its \
+                         events ({} seen, {} matched, {} under a directory it cannot \
+                         account for{}); changes reconcile on the {:?} fallback instead of \
+                         on their own events. Watched: {}",
+                        counts.seen,
+                        counts.matched,
+                        counts.orphans,
+                        health.orphan_hint(),
+                        t.fallback,
+                        health.dirs
+                    );
+                }
+            }
             // Only reachable with a deferred wake outstanding; `idle` is then
             // exactly what is left of its cooldown.
             default(idle) => {}

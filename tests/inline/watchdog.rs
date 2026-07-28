@@ -1,7 +1,8 @@
 //! Inline tests for `crate::watchdog` — the event filter, the watch's survival
-//! of the rename every clauth write publishes through, and the two loop
-//! properties (cooldown measured from the reconcile's END, a cooled-down wake
-//! deferred rather than dropped).
+//! of the rename every clauth write publishes through, the two loop properties
+//! (cooldown measured from the reconcile's END, a cooled-down wake deferred
+//! rather than dropped), and the filter-health signal that keeps a watcher
+//! matching nothing from reading as a healthy one.
 //!
 //! The loop tests drive `run_events` through a plain channel instead of a real
 //! watcher: the loop's timing behavior is what they pin, and a filesystem in the
@@ -94,6 +95,34 @@ impl Reconcile for Recorder {
     }
     fn swap_poll(&self) {
         self.swap_polls.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// An event the filter refused whose directory it still recognises — the steady
+/// state of watching `$HOME` for one name.
+fn refused() -> EventVerdict<'static> {
+    EventVerdict {
+        wake: false,
+        matched: false,
+        orphan: None,
+    }
+}
+
+/// An event `wants` took.
+fn took() -> EventVerdict<'static> {
+    EventVerdict {
+        wake: true,
+        matched: true,
+        orphan: None,
+    }
+}
+
+/// An event delivered under a directory no spec can account for.
+fn orphaned(path: &Path) -> EventVerdict<'_> {
+    EventVerdict {
+        wake: false,
+        matched: false,
+        orphan: Some(path),
     }
 }
 
@@ -380,6 +409,18 @@ fn a_watch_armed_through_a_symlink_takes_events_spelled_by_realpath() {
         !wants(&specs, &real.join("kick_block.json")),
         "resolving the directory must not widen which names the filter takes"
     );
+    // The health side of the same both-spellings rule: a realpath delivery is
+    // accounted for, so a working macOS watcher never accuses itself.
+    let refused_but_known = notify::Event::new(notify::EventKind::Other)
+        .add_path(real.join("kick_block.json"))
+        .add_path(link.join("kick_block.json"));
+    let verdict = classify(&specs, &refused_but_known);
+    assert!(!verdict.matched, "neither name is in the interest list");
+    assert!(
+        verdict.orphan.is_none(),
+        "a child of the watched directory under EITHER spelling is accounted \
+         for; reading one as unaccountable makes a healthy mac accuse itself"
+    );
 }
 
 /// `wake` is `bounded(1)` and the debouncer discards what it coalesces, so an
@@ -396,7 +437,7 @@ fn a_wake_inside_the_cooldown_is_deferred_not_dropped() {
     let rec = Recorder::new(Duration::ZERO, done_tx);
 
     std::thread::scope(|scope| {
-        scope.spawn(|| run_events(&wake_rx, &shutdown_rx, &t, &rec));
+        scope.spawn(|| run_events(&wake_rx, &shutdown_rx, &t, &rec, None));
 
         wake_tx.send(()).expect("first wake");
         done_rx.recv_timeout(BOUND).expect("first reconcile");
@@ -427,7 +468,7 @@ fn the_cooldown_is_measured_from_the_end_of_the_reconcile() {
     let rec = Recorder::new(work, done_tx);
 
     std::thread::scope(|scope| {
-        scope.spawn(|| run_events(&wake_rx, &shutdown_rx, &t, &rec));
+        scope.spawn(|| run_events(&wake_rx, &shutdown_rx, &t, &rec, None));
 
         wake_tx.send(()).expect("first wake");
         // Mid-reconcile, standing in for the events that reconcile's own writes
@@ -540,6 +581,15 @@ fn a_partially_armed_watcher_shortens_the_fallback() {
     };
     let watcher = try_start(&specs, t.debounce).expect("one directory still arms");
     assert_eq!(watcher.armed, 1, "exactly one of the two must have armed");
+    assert!(
+        !watcher.fully_armed(specs.len()),
+        "a partial arm must not be handed to the dead-filter check: its unarmed \
+         directory already explains every missing match"
+    );
+    assert!(
+        watcher.fully_armed(1),
+        "and the predicate must read the REQUESTED count, not a constant"
+    );
     drop(watcher);
 
     let (shutdown_tx, shutdown_rx) = crossbeam_channel::bounded::<()>(1);
@@ -567,6 +617,226 @@ fn a_partially_armed_watcher_shortens_the_fallback() {
 
         drop(shutdown_tx);
     });
+}
+
+/// The callback has to count events it was HANDED apart from the ones it took.
+/// From the match count alone a filter that matches nothing reads exactly like
+/// a quiet disk, which is the ambiguity that let the macOS realpath bug sit
+/// undetected for its whole life.
+#[test]
+fn the_callback_counts_events_it_was_handed_apart_from_the_ones_it_took() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let debounce = Duration::from_millis(20);
+    let specs = vec![WatchSpec::new(
+        tmp.path(),
+        Interest::Names(vec!["settings.json".into()]),
+    )];
+    let watcher = try_start(&specs, debounce).expect("watcher");
+
+    // A name the filter refuses, inside a directory it watches: the backend
+    // hands the callback an event and `wants` drops it.
+    std::fs::write(tmp.path().join("unrelated.json"), b"{}").expect("write unrelated");
+    let deadline = Instant::now() + BOUND;
+    while watcher.health.counts().seen == 0 && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let counts = watcher.health.counts();
+    assert!(
+        counts.seen > 0,
+        "an event the filter refused was never counted as seen, so a dead filter \
+         is indistinguishable from an idle machine"
+    );
+    assert_eq!(
+        counts.matched, 0,
+        "a refused event must not count as a match"
+    );
+    assert_eq!(
+        counts.orphans, 0,
+        "a refused CHILD of a watched directory is accounted for: the spelling \
+         is right and only the name was uninteresting"
+    );
+
+    publish(&tmp.path().join("settings.json"), b"{}");
+    watcher
+        .wake
+        .recv_timeout(BOUND)
+        .expect("the watched name produced no wake");
+    assert!(
+        watcher.health.counts().matched > 0,
+        "the event that woke the loop was never counted as a match"
+    );
+}
+
+/// A rescan carries NO paths (`Event::new(EventKind::Other).set_flag(Rescan)`),
+/// so `wants` never runs on it. Counting it as a match retires the detector for
+/// the whole session on the first queue overflow — and heavy churn, which is
+/// what overflows the queue, is exactly when a degraded watcher matters.
+#[test]
+fn a_rescan_wakes_the_loop_but_never_counts_as_a_match() {
+    let specs = vec![WatchSpec::new(
+        "/home/u/.claude",
+        Interest::Names(vec!["settings.json".into()]),
+    )];
+    let rescan = notify::Event::new(notify::EventKind::Other).set_flag(notify::event::Flag::Rescan);
+
+    let verdict = classify(&specs, &rescan);
+
+    assert!(
+        verdict.wake,
+        "a dropped-event overflow must still reconcile"
+    );
+    assert!(
+        !verdict.matched,
+        "a pathless event proves nothing about the filter, so it must not \
+         exonerate one that matches nothing"
+    );
+    assert!(
+        verdict.orphan.is_none(),
+        "an event with no paths cannot accuse a spelling either"
+    );
+}
+
+/// One spec whose spelling is wrong while its siblings match is the shape a
+/// dotfiles-managed `~/.claude` takes in production, and an aggregate match
+/// count cannot see it: the healthy siblings keep `matched` above zero forever.
+/// An event nobody can account for is the discriminator — notify forwards only
+/// children of the key it armed.
+#[test]
+fn a_stream_of_unaccountable_events_is_reported_even_while_another_spec_matches() {
+    let health = FilterHealth::new(&[WatchSpec::new("/home/u/.claude", Interest::AnyChild)]);
+    health.saw(&took());
+    let delivered = Path::new("/private/var/u/.claude/settings.json");
+    for _ in 0..DEAD_FILTER_MIN_EVENTS {
+        health.saw(&orphaned(delivered));
+    }
+    let mut dead = DeadFilter::default();
+
+    for interval in 1..DEAD_FILTER_INTERVALS {
+        assert!(
+            dead.fires(&health).is_none(),
+            "interval {interval} reported before the horizon"
+        );
+    }
+    let counts = dead
+        .fires(&health)
+        .expect("a spec delivering events nobody can account for went unreported");
+    assert_eq!(counts.orphans, DEAD_FILTER_MIN_EVENTS);
+    assert!(
+        counts.matched > 0,
+        "the fixture must keep a healthy sibling, or this passes for the \
+         zero-match reason instead of the one it names"
+    );
+    assert!(
+        health
+            .orphan_hint()
+            .contains("/private/var/u/.claude/settings.json"),
+        "the diagnostic must name the spelling the backend DELIVERED, which is \
+         the whole discriminator: {}",
+        health.orphan_hint()
+    );
+}
+
+/// Both spellings, because the difference between them IS the bug this detects.
+/// A line naming only the directory clauth armed tells the operator nothing
+/// they did not already configure.
+#[test]
+fn the_watched_list_names_both_spellings_when_they_differ() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let real = tmp.path().join("real");
+    std::fs::create_dir_all(&real).expect("mkdir real");
+    // Resolved, or the "resolves to itself" half is untrue wherever TMPDIR is
+    // itself symlinked: the `cargo.sh` test leg and every macOS run.
+    let real = std::fs::canonicalize(&real).expect("realpath");
+    let link = tmp.path().join("link");
+    std::os::unix::fs::symlink(&real, &link).expect("symlink");
+
+    let linked = FilterHealth::new(&[WatchSpec::new(&link, Interest::AnyChild)]);
+    assert!(
+        linked.dirs.contains(&real.display().to_string())
+            && linked.dirs.contains(&link.display().to_string()),
+        "a spec armed through a symlink must name what it watches AND what the \
+         backend will deliver: {}",
+        linked.dirs
+    );
+
+    let plain = FilterHealth::new(&[WatchSpec::new(&real, Interest::AnyChild)]);
+    assert_eq!(
+        plain.dirs,
+        real.display().to_string(),
+        "a directory that resolves to itself must not be printed twice"
+    );
+}
+
+/// A fully-armed watcher that matches nothing degrades exactly as silently as
+/// an unarmed one used to, so it must say so — ONCE. The condition holds for
+/// the rest of the session by construction, so a line per interval would be a
+/// heartbeat in the log rather than a defect report.
+#[test]
+fn a_watcher_that_matches_nothing_reports_once_and_not_per_interval() {
+    let health = FilterHealth::new(&[WatchSpec::new("/home/u/.claude", Interest::AnyChild)]);
+    for _ in 0..DEAD_FILTER_MIN_EVENTS {
+        health.saw(&refused());
+    }
+    let mut dead = DeadFilter::default();
+
+    for interval in 1..DEAD_FILTER_INTERVALS {
+        assert!(
+            dead.fires(&health).is_none(),
+            "fallback interval {interval} accused a filter before the horizon"
+        );
+    }
+    let counts = dead
+        .fires(&health)
+        .expect("a stream of events with nothing matching went unreported");
+    assert_eq!(
+        (counts.seen, counts.matched),
+        (DEAD_FILTER_MIN_EVENTS, 0),
+        "the report must carry the counters the decision was made on"
+    );
+    for repeat in 1..=3 {
+        assert!(
+            dead.fires(&health).is_none(),
+            "the diagnostic repeated on interval {repeat} after the horizon"
+        );
+    }
+}
+
+/// One match proves the filter works, whatever volume of events it refuses
+/// after that: `$HOME` is watched for a single name and rewritten by
+/// everything, so refusals are the steady state rather than a symptom.
+#[test]
+fn one_matched_event_clears_the_suspicion_for_good() {
+    let health = FilterHealth::new(&[WatchSpec::new("/home/u/.claude", Interest::AnyChild)]);
+    health.saw(&took());
+    for _ in 0..DEAD_FILTER_MIN_EVENTS * 4 {
+        health.saw(&refused());
+    }
+    let mut dead = DeadFilter::default();
+
+    for interval in 1..=DEAD_FILTER_INTERVALS * 4 {
+        assert!(
+            dead.fires(&health).is_none(),
+            "interval {interval} accused a filter that had already matched"
+        );
+    }
+}
+
+/// A quiet disk is not a dead filter. Without the volume floor, a session that
+/// saw a couple of stray events and nothing else would be reported as broken.
+#[test]
+fn a_quiet_watcher_is_never_accused() {
+    let health = FilterHealth::new(&[WatchSpec::new("/home/u/.claude", Interest::AnyChild)]);
+    for _ in 0..DEAD_FILTER_MIN_EVENTS - 1 {
+        health.saw(&refused());
+    }
+    let mut dead = DeadFilter::default();
+
+    for interval in 1..=DEAD_FILTER_INTERVALS * 4 {
+        assert!(
+            dead.fires(&health).is_none(),
+            "interval {interval} accused a session that saw almost no events"
+        );
+    }
 }
 
 /// `watch_specs` covers every file the reconcile reads, and covers them by

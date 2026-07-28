@@ -7,7 +7,22 @@
 
 use crate::profile::Profile;
 use crate::profile_cache::{USAGE_CACHE_FILE, load_profile_cache};
-use crate::usage::{PlanTier, UsageInfo};
+use crate::usage::{PlanInfo, PlanTier, UsageInfo};
+
+/// The last-persisted `/profile` plan for a name, off the same on-disk cache
+/// every reader here sources from.
+fn cached_plan(name: &str) -> Option<PlanInfo> {
+    load_profile_cache::<UsageInfo>(name, USAGE_CACHE_FILE).and_then(|u| u.plan)
+}
+
+/// Cancellation for a surface holding a `load_config` profile. Deliberately NOT
+/// [`crate::fallback::is_canceled`], which reads the in-memory `Profile::usage`
+/// that only the TUI ever fills — outside it that predicate answers `false` for
+/// every account, cancelled or not. This reads the disk instead, so a CLI
+/// surface gets the same answer the TUI does.
+pub(crate) fn is_canceled_cached(name: &str) -> bool {
+    cached_plan(name).is_some_and(|p| p.is_canceled())
+}
 
 /// Display provider for a profile: a recognised third-party name, else
 /// `anthropic` for an OAuth profile.
@@ -32,9 +47,7 @@ pub(crate) fn tier_label(profile: &Profile) -> Option<String> {
     if profile.is_third_party() {
         return None;
     }
-    let fetched = load_profile_cache::<UsageInfo>(profile.name.as_str(), USAGE_CACHE_FILE)
-        .and_then(|u| u.plan)
-        .filter(|p| p.tier != PlanTier::Unknown);
+    let fetched = cached_plan(profile.name.as_str()).filter(|p| p.tier != PlanTier::Unknown);
     match fetched {
         Some(plan) => plan.tier.short_label(),
         None => {

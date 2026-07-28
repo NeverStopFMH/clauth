@@ -35,8 +35,7 @@ struct Row {
     /// Tier for an anthropic account (`Max 5x`), else the provider name for a
     /// third-party one. Reading `entry["tier"]` keeps this in lockstep with
     /// `status`. A canceled subscription reads as its post-cancellation tier
-    /// (`Free`) — this table has no status column, so it carries no cancellation
-    /// signal at all.
+    /// (`Free`) here; [`Row::state_suffix`] is what names the cancellation.
     plan: String,
     /// 5h / 7d window utilization as `NN%` (share consumed), `-` when no cache.
     five_h: String,
@@ -44,6 +43,7 @@ struct Row {
     /// The third-party base url, or `-` for the default Anthropic endpoint.
     endpoint: String,
     disabled: bool,
+    canceled: bool,
 }
 
 impl Row {
@@ -63,7 +63,25 @@ impl Row {
             seven_d: window_pct(windows, crate::usage::LABEL_7D),
             endpoint: entry["base_url"].as_str().unwrap_or("-").to_string(),
             disabled: config.find(name).is_some_and(|p| p.is_disabled()),
+            canceled: crate::profile_json::is_canceled_cached(name),
         }
+    }
+
+    /// Trailing state marker: `(disabled)`, `(canceled)`, or `(disabled,
+    /// canceled)`. Both render rather than one winning — an operator usually
+    /// disables an account BECAUSE it died, so letting `disabled` mask
+    /// `canceled` is the erasure the Fallback tab's stacked pills already exist
+    /// to prevent. This table has no status column, so the suffix is the only
+    /// place either fact can appear.
+    fn state_suffix(&self) -> String {
+        let states: Vec<&str> = [(self.disabled, "disabled"), (self.canceled, "canceled")]
+            .into_iter()
+            .filter_map(|(on, label)| on.then_some(label))
+            .collect();
+        if states.is_empty() {
+            return String::new();
+        }
+        format!(" ({})", states.join(", "))
     }
 }
 
@@ -116,7 +134,7 @@ fn render_table(config: &AppConfig, body: &serde_json::Value) -> String {
             r.five_h,
             r.seven_d,
             r.endpoint,
-            if r.disabled { " (disabled)" } else { "" },
+            r.state_suffix(),
         ));
     }
     out

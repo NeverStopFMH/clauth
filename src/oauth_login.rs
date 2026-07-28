@@ -512,12 +512,20 @@ impl LoginError {
     /// The LOGIN path's retry mapping, deliberately not
     /// [`crate::oauth::TokenFailure::as_refresh_transient`].
     ///
-    /// A code exchange happens at the very end of the flow: by the time it is
-    /// rejected the loopback listener is torn down and the authorization code is
-    /// spent, expired, or was never matched by the PKCE verifier. None of those
-    /// is fixed by waiting, so the refresh path's `Wait` — which is right for a
-    /// 429 it will re-attempt next tick — names an action that no longer exists
-    /// here. Only the transport arm keeps its own advice, because an unreachable
+    /// The operative fact is that this function has NO retry path around
+    /// `exchange_code`: whatever the status, the failure unwinds out of
+    /// `login_with` and the only action left to anyone is running `clauth login`
+    /// again. So the refresh path's `Wait` — right for a 429 it will re-attempt
+    /// on its next tick — names an action that does not exist here.
+    ///
+    /// Deliberately NOT justified by "the code is spent" or "the listener is
+    /// torn down": the first is true of a 400 and not of a 429 (which likely
+    /// never consumed the code), and the second is simply false — `listener` is
+    /// still in scope through the exchange and drops only on unwind. Both were
+    /// written here and both were wrong; the absence of a retry loop is the
+    /// claim that is checkable and that stops being true if one is added.
+    ///
+    /// Only the transport arm keeps its own advice, because an unreachable
     /// endpoint is the one blocker worth clearing before running the command
     /// again.
     fn transient(f: &crate::oauth::TokenFailure) -> crate::format::Transient {

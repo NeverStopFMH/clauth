@@ -72,10 +72,11 @@ pub(crate) enum Retry {
     /// connection and retry` gives two different and incompatible reasons to
     /// retry, one of which is wrong).
     Stated,
-    /// There is nothing left to retry: the login flow is OVER. Its loopback
-    /// listener is torn down and its authorization code is single-use, so a
-    /// code-exchange rejection is not fixed by waiting — only by running
-    /// `clauth login` again for a fresh code.
+    /// There is nothing left to retry in-process: `login_with` has no retry
+    /// path around its code exchange, so whatever the status, the only action
+    /// available is running `clauth login` again. Stated as the ABSENCE of a
+    /// retry loop rather than as a fact about the code or the listener, because
+    /// this correctly stops being true the moment someone adds one.
     Restart,
 }
 
@@ -83,8 +84,8 @@ pub(crate) enum Retry {
 ///
 /// Deliberately not one open `String` field. The historically-real accident is
 /// `format!("{status}: {body}")` handed to a free-text cause, and that no longer
-/// compiles: there is no free-text cause to hand it to, so the caller has to
-/// pick an arm that describes what actually happened.
+/// has an arm to land in: the caller must pick one that describes what actually
+/// happened, which is a question a response body does not answer.
 ///
 /// What the types ENFORCE is narrower than that, and worth stating exactly.
 /// Only [`Self::Endpoint`] is sealed — `&'static str` cannot hold a

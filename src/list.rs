@@ -1,9 +1,14 @@
 //! `clauth list` — a human-readable account table.
 //!
 //! Renders over the exact `serde_json::Value` body `daemon::build_status`
-//! produces, the same one `clauth status --json` serializes, so the two
-//! surfaces read one data path and cannot drift. Presentation only: it reads
-//! the on-disk usage caches `build_status` reads and never fetches.
+//! produces, the same one `clauth status --json` serializes, so every column
+//! sourced from that body cannot drift from `status`. Presentation only: it
+//! reads the on-disk usage caches `build_status` reads and never fetches.
+//!
+//! Two facts do NOT come from the body, because it carries neither: the
+//! `disabled` flag (read off `config`) and the `canceled` flag (read off the
+//! per-profile usage cache). Both surface in the trailing state marker, so this
+//! table shows two states `status --json` does not expose.
 
 use anyhow::Result;
 
@@ -26,8 +31,10 @@ pub(crate) fn run(include_disabled: bool) -> Result<()> {
     Ok(())
 }
 
-/// One rendered table row, sourced from a single `build_status` profile entry
-/// (plus `config` for the disabled flag, which the JSON body does not carry).
+/// One rendered table row. Three sources, because the JSON body carries only
+/// the first: a single `build_status` profile entry, `config` for the disabled
+/// flag, and the profile's own `usage_cache.json` for the canceled one (via
+/// `profile_json::is_canceled_cached`).
 struct Row {
     /// `*` for the active profile, a space otherwise.
     marker: char,

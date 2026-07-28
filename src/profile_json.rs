@@ -18,7 +18,7 @@ fn cached_plan(name: &str) -> Option<PlanInfo> {
 /// Cancellation for a surface holding a `load_config` profile. Deliberately NOT
 /// [`crate::fallback::is_canceled`], which reads the in-memory `Profile::usage`
 /// that only the TUI ever fills — outside it that predicate answers `false` for
-/// every account, cancelled or not. This reads the disk instead, so a CLI
+/// every account, canceled or not. This reads the disk instead, so a CLI
 /// surface gets the same answer the TUI does.
 pub(crate) fn is_canceled_cached(name: &str) -> bool {
     cached_plan(name).is_some_and(|p| p.is_canceled())

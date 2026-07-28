@@ -180,15 +180,25 @@ fn classify<'a>(specs: &[WatchSpec], event: &'a notify::Event) -> EventVerdict<'
     }
 }
 
-/// Whether `path` is a child of some spec's directory under EITHER spelling.
+/// Whether `path` belongs to some spec's directory under EITHER spelling.
 /// Independent of [`Interest`]: this asks whether the event can be accounted
 /// for at all, not whether it is worth a reconcile.
+///
+/// The path IS a spec directory for every event about a watched directory
+/// itself: inotify leaves `name` empty there and notify then reports the watch
+/// root (`inotify.rs`, `None => self.paths.get(&event.wd).cloned()`), with
+/// `WatchMask::OPEN` armed, so every `opendir` of a watched directory lands
+/// here. clauth's own config leg does two of them per reconcile
+/// (`runtime::shared_runtime_dirs` reads the profile store directory), which
+/// is enough on its own to cross the orphan floor on a healthy install. Such
+/// an event came from a watch we armed, so it is accounted for by definition.
 fn attributable(specs: &[WatchSpec], path: &Path) -> bool {
-    path.parent().is_some_and(|dir| {
+    let belongs = |dir: &Path| {
         specs
             .iter()
             .any(|spec| spec.dir == dir || spec.canonical_dir == dir)
-    })
+    };
+    belongs(path) || path.parent().is_some_and(belongs)
 }
 
 /// Whether the event filter is matching anything at all.
@@ -252,8 +262,12 @@ impl FilterHealth {
             self.matched.fetch_add(1, Ordering::Relaxed);
         }
         if let Some(path) = verdict.orphan {
-            let _ = self.orphan_sample.set(path.to_path_buf());
-            self.orphans.fetch_add(1, Ordering::Relaxed);
+            // Sampled at the floor, not on the first one: an early stray would
+            // otherwise shadow the stream that actually triggers the report,
+            // and the sample is the whole diagnosis.
+            if self.orphans.fetch_add(1, Ordering::Relaxed) + 1 >= DEAD_FILTER_MIN_EVENTS {
+                let _ = self.orphan_sample.set(path.to_path_buf());
+            }
         }
         self.seen.fetch_add(1, Ordering::Relaxed);
     }
@@ -303,11 +317,25 @@ struct DeadFilter {
     reported: bool,
 }
 
+/// Which reading of the counters fired. The two are different defects with
+/// different operator-facing wording: `Unaccountable` fires WITH matches on the
+/// healthy specs by construction, so one shared "matched nothing" headline
+/// would be flatly wrong for it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DeadFilterKind {
+    /// Events arriving under a directory no spec accounts for: one spec's
+    /// spelling is wrong while its siblings may be matching fine.
+    Unaccountable,
+    /// Nothing matched at all, with the spellings all accounted for: the
+    /// [`Interest`] lists, not the directories.
+    NothingMatched,
+}
+
 impl DeadFilter {
-    /// The counters to report, at most ONCE per watcher: the condition holds
-    /// for the rest of the session by construction, so repeating it per
-    /// interval would turn a defect report into a heartbeat in the log.
-    fn fires(&mut self, health: &FilterHealth) -> Option<Counts> {
+    /// What to report, at most ONCE per watcher: the condition holds for the
+    /// rest of the session by construction, so repeating it per interval would
+    /// turn a defect report into a heartbeat in the log.
+    fn fires(&mut self, health: &FilterHealth) -> Option<(DeadFilterKind, Counts)> {
         if self.reported {
             return None;
         }
@@ -316,9 +344,15 @@ impl DeadFilter {
             return None;
         }
         let counts = health.counts();
-        self.reported = counts.orphans >= DEAD_FILTER_MIN_EVENTS
-            || (counts.matched == 0 && counts.seen >= DEAD_FILTER_MIN_EVENTS);
-        self.reported.then_some(counts)
+        let kind = if counts.orphans >= DEAD_FILTER_MIN_EVENTS {
+            Some(DeadFilterKind::Unaccountable)
+        } else if counts.matched == 0 && counts.seen >= DEAD_FILTER_MIN_EVENTS {
+            Some(DeadFilterKind::NothingMatched)
+        } else {
+            None
+        };
+        self.reported = kind.is_some();
+        kind.map(|kind| (kind, counts))
     }
 }
 
@@ -641,23 +675,31 @@ pub(crate) fn run_events(
             recv(fallback) -> _ => {
                 pending = true;
                 if let Some(health) = health
-                    && let Some(counts) = dead.fires(health)
+                    && let Some((kind, counts)) = dead.fires(health)
                 {
                     // Log only. Unlike a partial arm this state is never
                     // legitimate, so shortening the fallback would buy the
                     // latency back while hiding the defect that has to be fixed.
-                    logline!(
-                        "clauth: fs watcher armed every directory but is not matching its \
-                         events ({} seen, {} matched, {} under a directory it cannot \
-                         account for{}); changes reconcile on the {:?} fallback instead of \
-                         on their own events. Watched: {}",
-                        counts.seen,
-                        counts.matched,
-                        counts.orphans,
-                        health.orphan_hint(),
-                        t.fallback,
-                        health.dirs
-                    );
+                    match kind {
+                        DeadFilterKind::Unaccountable => logline!(
+                            "clauth: fs watcher is being handed events under a directory it \
+                             cannot account for ({} of {} seen{}), so that surface reconciles \
+                             on the {:?} fallback rather than on its own events. Watched: {}",
+                            counts.orphans,
+                            counts.seen,
+                            health.orphan_hint(),
+                            t.fallback,
+                            health.dirs
+                        ),
+                        DeadFilterKind::NothingMatched => logline!(
+                            "clauth: fs watcher armed every directory but matched none of its \
+                             {} events, so every change reconciles on the {:?} fallback rather \
+                             than on its own event. Watched: {}",
+                            counts.seen,
+                            t.fallback,
+                            health.dirs
+                        ),
+                    }
                 }
             }
             // Only reachable with a deferred wake outstanding; `idle` is then

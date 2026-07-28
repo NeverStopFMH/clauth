@@ -667,6 +667,61 @@ fn the_callback_counts_events_it_was_handed_apart_from_the_ones_it_took() {
     );
 }
 
+/// An event about a watched directory ITSELF is accounted for by definition:
+/// it came from a watch we armed. inotify leaves `name` empty for those and
+/// notify then reports the watch root, with `WatchMask::OPEN` armed — so every
+/// `opendir` of a watched directory produces one, and clauth's own config leg
+/// does two per reconcile (`runtime::shared_runtime_dirs` reads the profile
+/// store directory). Reading them as unaccountable crosses the orphan floor in
+/// under two minutes on a healthy install, which trains the operator to ignore
+/// the one line this whole signal exists to emit.
+#[test]
+fn an_event_about_the_watched_directory_itself_is_never_an_orphan() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let specs = vec![WatchSpec::new(
+        tmp.path(),
+        Interest::Names(vec!["settings.json".into()]),
+    )];
+
+    let on_the_dir = notify::Event::new(notify::EventKind::Access(
+        notify::event::AccessKind::Open(notify::event::AccessMode::Any),
+    ))
+    .add_path(tmp.path().to_path_buf());
+    let verdict = classify(&specs, &on_the_dir);
+    assert!(
+        !verdict.matched,
+        "the directory is not one of the names the filter takes"
+    );
+    assert!(
+        verdict.orphan.is_none(),
+        "an event whose path IS the watched directory came from our own watch"
+    );
+
+    // The backend leg, which is what would have caught this: inotify's OPEN is
+    // the mask that makes a plain `read_dir` observable. Linux-only because the
+    // event is inotify's, not because the rule is.
+    #[cfg(target_os = "linux")]
+    {
+        let watcher = try_start(&specs, Duration::from_millis(20)).expect("watcher");
+        let _ = std::fs::read_dir(tmp.path()).expect("read the watched directory");
+        let deadline = Instant::now() + BOUND;
+        while watcher.health.counts().seen == 0 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let counts = watcher.health.counts();
+        assert!(
+            counts.seen > 0,
+            "reading a watched directory produced no event at all, so this leg \
+             proves nothing"
+        );
+        assert_eq!(
+            counts.orphans, 0,
+            "clauth's own reconcile reads this directory twice per pass: \
+             counting that as unaccountable accuses every healthy session"
+        );
+    }
+}
+
 /// A rescan carries NO paths (`Event::new(EventKind::Other).set_flag(Rescan)`),
 /// so `wants` never runs on it. Counting it as a match retires the detector for
 /// the whole session on the first queue overflow — and heavy churn, which is
@@ -717,9 +772,15 @@ fn a_stream_of_unaccountable_events_is_reported_even_while_another_spec_matches(
             "interval {interval} reported before the horizon"
         );
     }
-    let counts = dead
+    let (kind, counts) = dead
         .fires(&health)
         .expect("a spec delivering events nobody can account for went unreported");
+    assert_eq!(
+        kind,
+        DeadFilterKind::Unaccountable,
+        "the arm decides the wording, and a 'matched nothing' headline is false \
+         here: this fires WITH matches from the healthy siblings"
+    );
     assert_eq!(counts.orphans, DEAD_FILTER_MIN_EVENTS);
     assert!(
         counts.matched > 0,
@@ -785,9 +846,14 @@ fn a_watcher_that_matches_nothing_reports_once_and_not_per_interval() {
             "fallback interval {interval} accused a filter before the horizon"
         );
     }
-    let counts = dead
+    let (kind, counts) = dead
         .fires(&health)
         .expect("a stream of events with nothing matching went unreported");
+    assert_eq!(
+        kind,
+        DeadFilterKind::NothingMatched,
+        "every spelling here is accounted for, so this is the interest lists"
+    );
     assert_eq!(
         (counts.seen, counts.matched),
         (DEAD_FILTER_MIN_EVENTS, 0),

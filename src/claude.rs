@@ -74,11 +74,18 @@ impl SessionTokenStatus {
 /// Content-aware read of a profile's sidecar: `None` = no sidecar (or one too
 /// corrupt to parse a login out of — same disengaged outcome either way).
 pub(crate) fn session_token_status(name: &str) -> Option<SessionTokenStatus> {
-    let path = profile_dir(name).ok()?.join("session-token.json");
+    session_token_status_at(&profile_dir(name).ok()?.join("session-token.json"))
+}
+
+/// [`session_token_status`] against a sidecar path the caller already holds. The
+/// reload fingerprint walks dirents, and round-tripping a lossily-decoded dir
+/// name back through `profile_dir` would resolve a different file than the one
+/// it stat'd beside it.
+pub(crate) fn session_token_status_at(path: &Path) -> Option<SessionTokenStatus> {
     if !path.exists() {
         return None;
     }
-    let creds = read_json_file::<ClaudeCredentials>(&path).ok()?;
+    let creds = read_json_file::<ClaudeCredentials>(path).ok()?;
     let oauth = creds.claude_ai_oauth.as_ref()?;
     if oauth.refresh_token.is_some() {
         return Some(SessionTokenStatus::NotLongLived);

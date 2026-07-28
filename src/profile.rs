@@ -928,9 +928,11 @@ pub(crate) struct ReloadFingerprint {
     config_mtimes: Vec<(String, Option<SystemTime>, Option<SessionTokenStatus>)>,
 }
 
-/// Pure filesystem stat of the reload triggers. Holds NO locks — `config` sits
-/// high in the rank hierarchy, so this must stay lock-free — and fails soft: a
-/// readdir/stat error contributes the empty value instead of erroring.
+/// Reads the reload triggers off disk: a stat per `config.toml`, and a read plus
+/// JSON parse of each `session-token.json` that exists. Holds NO locks —
+/// `config` sits high in the rank hierarchy, so this must stay lock-free — and
+/// fails soft: a readdir/stat/parse error contributes the empty value instead of
+/// erroring.
 pub(crate) fn reload_fingerprint() -> ReloadFingerprint {
     let profiles_toml_mtime = app_state_mtime();
     let mut config_mtimes: Vec<(String, Option<SystemTime>, Option<SessionTokenStatus>)> =
@@ -946,7 +948,8 @@ pub(crate) fn reload_fingerprint() -> ReloadFingerprint {
             let config_mtime = std::fs::metadata(entry.path().join("config.toml"))
                 .and_then(|m| m.modified())
                 .ok();
-            let token = crate::claude::session_token_status(&name);
+            let token =
+                crate::claude::session_token_status_at(&entry.path().join("session-token.json"));
             config_mtimes.push((name, config_mtime, token));
         }
     }

@@ -4084,7 +4084,7 @@ fn gc_keeps_a_swapped_row_after_its_launch_profile_is_force_deleted() {
         gc_stale_runtimes();
         assert!(
             crate::live_sessions::get(&sid).is_none(),
-            "a row must go once its session has released every marker it held"
+            "a row must go once nothing it stamped is still flock-held at a path that exists"
         );
     });
 }

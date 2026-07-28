@@ -884,12 +884,14 @@ fn with_link_mode<T>(mode: LinkMode, f: impl FnOnce() -> T) -> T {
     f()
 }
 
-/// Stand in for a one-second-granularity filesystem for the duration of `f`:
-/// `touch_store` reads its stamp back truncated, exactly as it would there. Every
-/// filesystem a Linux/macOS run can reach keeps the exact value, so the branch
-/// that withholds a receipt on a truncating one is otherwise unreachable. Call
-/// INSIDE [`with_fake_home`], whose `HOME_TEST_LOCK` hold serializes this
-/// process-global override.
+/// Truncate `touch_store`'s READ-BACK to whole seconds for the duration of `f` —
+/// the one thing the receipt guard consults, not a model of a coarse filesystem
+/// end to end. `file_mtime` is untouched, so `memoized` stays full-precision and
+/// the stamp-ahead fallback cannot fire here the way it could on a genuine 1s
+/// mount; that branch is out of scope for what this poses. Every filesystem a
+/// Linux/macOS run can reach keeps the exact value, so the guard is otherwise
+/// unreachable. Call INSIDE [`with_fake_home`], whose `HOME_TEST_LOCK` hold
+/// serializes this process-global override.
 fn with_coarse_mtime<T>(f: impl FnOnce() -> T) -> T {
     struct ClearOnDrop;
     impl Drop for ClearOnDrop {
@@ -4534,15 +4536,13 @@ fn a_truncating_filesystem_gets_no_receipt_at_all() {
             !receipt.exists(),
             "a receipt whose stamp a later write can alias onto must never be written"
         );
-        let stamped = fs::metadata(&intended_store)
-            .expect("meta")
-            .modified()
-            .expect("mtime");
-        assert_ne!(stamped, last_write, "precondition: the swap still stamped");
-        assert_eq!(
-            crate::profile_cache::effective_write_time(&intended_store),
-            Some(stamped),
-            "with no receipt the store reports its raw mtime, which is the pre-receipt answer"
+        assert_ne!(
+            fs::metadata(&intended_store)
+                .expect("meta")
+                .modified()
+                .expect("mtime"),
+            last_write,
+            "precondition: the swap still stamped, so the refusal is the receipt's alone"
         );
     });
 }

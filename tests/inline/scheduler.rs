@@ -4250,11 +4250,19 @@ fn oauth_completions_apply_in_completion_order_not_list_order() {
 // A rotation tick can run two adopts, each resolving the stored and the live
 // token's account uuid — up to four `/profile` GETs, 5s apart, for the same two
 // immutable answers.
+//
+// The memo is process-lifetime, so both tests below take a `HomeSandbox` purely
+// to serialize on `HOME_TEST_LOCK`: `EndpointSandbox` clears the memo on
+// construction and drop, and under the `cargo test` fallback (threads, one
+// process) an unserialized run would let that clear land between an insert here
+// and the assertion on it.
 
 /// A resolved uuid is fetched once per token: immutable, so a hit is exact.
 /// Distinct tokens still each get their own probe.
 #[test]
 fn the_identity_memo_resolves_each_token_once() {
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::usage::reset_identity_memo();
     let calls = std::cell::RefCell::new(Vec::<String>::new());
     let probe = |tok: &str| {
         calls.borrow_mut().push(tok.to_string());
@@ -4282,6 +4290,8 @@ fn the_identity_memo_resolves_each_token_once() {
 /// attempt — caching the `None` would silently make that second adopt a no-op.
 #[test]
 fn the_identity_memo_never_caches_a_failed_probe() {
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::usage::reset_identity_memo();
     let calls = std::cell::RefCell::new(0usize);
     // Fails the first time, succeeds after — the mirror catching up mid-tick.
     let probe = |_tok: &str| {
@@ -4303,6 +4313,36 @@ fn the_identity_memo_never_caches_a_failed_probe() {
         *calls.borrow(),
         2,
         "once it resolves, the answer is cached like any other"
+    );
+}
+
+/// The memo outlives the call that filled it. Every `fetch_with_rotation` leg
+/// builds its own closure, so a per-call store re-probes `/profile` on each one
+/// — which is what a permanently-foreign live mirror turns into an unbounded
+/// request stream. A per-call store passes both tests above and only this one.
+#[test]
+fn the_identity_memo_outlives_the_call_that_filled_it() {
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::usage::reset_identity_memo();
+    let calls = std::cell::RefCell::new(0usize);
+    let probe = |_tok: &str| {
+        *calls.borrow_mut() += 1;
+        Some(crate::profile::AccountId::from("uuid-durable"))
+    };
+
+    assert_eq!(
+        memoized_identity(&probe)("tok-durable").as_deref(),
+        Some("uuid-durable")
+    );
+    assert_eq!(
+        memoized_identity(&probe)("tok-durable").as_deref(),
+        Some("uuid-durable"),
+        "a second leg's fresh closure must still answer from the memo"
+    );
+    assert_eq!(
+        *calls.borrow(),
+        1,
+        "one probe per token per PROCESS, not per call"
     );
 }
 
@@ -5501,6 +5541,37 @@ fn seed_usage_cache(name: &str) {
     );
 }
 
+/// Write the live slot (`~/.claude/.credentials.json`) as a REGULAR file holding
+/// `access` — what CC leaves behind every time it refreshes, since it renames a
+/// temp sibling over the destination and `rename(2)` acts on the link rather
+/// than its target. Against the fixture's stored `at-old` this classifies
+/// `LinkState::Diverged`, the adopt's second gate.
+///
+/// Gated with its callers, like `expired_lazy_config` above.
+#[cfg(not(target_os = "macos"))]
+fn write_live_mirror(access: &str, expires_at: i64) {
+    let live = crate::profile::claude_dir()
+        .expect("claude dir")
+        .join(".credentials.json");
+    std::fs::create_dir_all(live.parent().expect("claude dir parent")).expect("mkdir claude dir");
+    let creds = crate::profile::ClaudeCredentials {
+        claude_ai_oauth: Some(crate::profile::OAuthToken {
+            access_token: access.to_string(),
+            refresh_token: Some(format!("{access}-refresh")),
+            expires_at: Some(expires_at),
+            scopes: None,
+            subscription_type: None,
+        }),
+    };
+    std::fs::write(&live, serde_json::to_vec(&creds).expect("serialize mirror"))
+        .expect("write the live mirror");
+}
+
+/// A `/profile` body answering the uuid `silence_profile_ttl` anchors the
+/// profile to, so the live mirror's token proves the SAME account.
+#[cfg(not(target_os = "macos"))]
+const ANCHOR_PROFILE_BODY: &str = r#"{"account":{"uuid":"uuid-anchor"}}"#;
+
 /// A `/profile` body for an account whose subscription was canceled — the tier
 /// flip that only the live-token re-pull can observe.
 #[cfg(not(target_os = "macos"))]
@@ -5840,4 +5911,142 @@ fn a_rotation_carries_its_pair_back_when_the_persist_fails() {
         Some("at-new"),
         "in-memory config already advanced — dropping the pair is what strands the TokenList"
     );
+}
+
+// ── the two adopt CALL SITES ─────────────────────────────────────────────────
+//
+// `try_adopt_live_rotation` itself is covered in `tests/inline/oauth.rs`; what
+// was covered by nothing is `fetch_with_rotation` REACHING it. Both sites sat
+// behind a `keychain_live()` term that is `false` under `cfg(test)` on macOS and
+// hardcoded `false` everywhere else, so no test on any platform could enter
+// them. Deleting that term is what these two pin.
+
+/// The pre-spend adopt. CC's routine refresh renames a fresh regular file over
+/// clauth's symlink, so the live slot holds a fresher same-account pair while
+/// the store lags — and the store's refresh token is already spent. Adopting
+/// costs zero requests to the token endpoint; spending is what lands the
+/// profile in `auth_broken` on the next tick.
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn a_fresher_live_mirror_is_adopted_before_any_refresh_is_spent() {
+    let home = crate::testutil::HomeSandbox::new();
+    let name = "adopt-presspend";
+    // usage 401 → profile 200 (the live token's identity probe). `max` sits well
+    // above that, so a token request the leg must NOT make is still recorded.
+    let (base, server) = crate::testutil::serve_endpoints(5, |path, _| {
+        if path.starts_with("/api/oauth/usage") {
+            (401, r#"{"error":"unauthorized"}"#.to_string())
+        } else if path.starts_with("/api/oauth/profile") {
+            (200, ANCHOR_PROFILE_BODY.to_string())
+        } else {
+            (
+                200,
+                r#"{"access_token":"at-LEAK","refresh_token":"rt-LEAK","expires_in":28800}"#
+                    .to_string(),
+            )
+        }
+    });
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    let config = crate::testutil::rotation_fixture_config(name);
+    seed_usage_cache(name);
+    silence_profile_ttl(name);
+    // Strictly later than the fixture's stored expiry — the adopt's third gate.
+    write_live_mirror("at-mirror-pre", crate::usage::now_ms() as i64 + 90_000_000);
+    let entry = rotation_entry(name, Some(crate::usage::now_ms() as i64 + 86_400_000));
+    let refetch: super::RefetchQueue = Arc::new(RankedMutex::new(HashSet::new()));
+    let activity: super::ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
+
+    let outcome = super::fetch_with_rotation(&config, &entry, None, &refetch, &activity);
+    let seen = server.join().expect("listener");
+
+    assert!(
+        !seen.iter().any(|p| p.starts_with("/v1/oauth/token")),
+        "adopting a pair CC already minted must spend nothing: {seen:?}"
+    );
+    assert_eq!(
+        outcome.rotated,
+        Some((
+            "at-mirror-pre".to_string(),
+            Some("at-mirror-pre-refresh".to_string())
+        )),
+        "the adopted pair must reach the TokenList, or the next poll spends the revoked one"
+    );
+    let stored = config
+        .lock()
+        .unwrap()
+        .find(name)
+        .and_then(|p| p.access_token().map(str::to_string));
+    assert_eq!(
+        stored.as_deref(),
+        Some("at-mirror-pre"),
+        "the store caught up"
+    );
+    assert_eq!(outcome.status, super::FetchStatus::Cached);
+    assert_eq!(
+        refetch.lock().unwrap().iter().collect::<Vec<_>>(),
+        vec![&name.to_string()],
+        "this tick serves cache; the next one polls with the adopted token"
+    );
+}
+
+/// The retry adopt, after the refresh comes back terminally rejected. The
+/// mirror surfaces its fresher pair DURING that round trip — the race the
+/// second call site exists for — so the leg adopts instead of quarantining.
+/// Without the adopt, `carry_external_rotation` reads a store nothing advanced
+/// and `mark_auth_broken` fires, which only a login, a carry, or an adopt lifts.
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn an_adopt_after_a_rejected_refresh_keeps_the_profile_out_of_quarantine() {
+    let home = crate::testutil::HomeSandbox::new();
+    let name = "adopt-retry";
+    let mirror_expiry = crate::usage::now_ms() as i64 + 90_000_000;
+    // usage 401 → token 400 `invalid_grant` → profile 200. The mirror is written
+    // as the token request is served, so the FIRST adopt sees a missing live
+    // slot and only the retry can succeed.
+    let (base, server) = crate::testutil::serve_endpoints(6, move |path, _| {
+        if path.starts_with("/v1/oauth/token") {
+            write_live_mirror("at-mirror-retry", mirror_expiry);
+            (400, r#"{"error":"invalid_grant"}"#.to_string())
+        } else if path.starts_with("/api/oauth/usage") {
+            (401, r#"{"error":"unauthorized"}"#.to_string())
+        } else if path.starts_with("/api/oauth/profile") {
+            (200, ANCHOR_PROFILE_BODY.to_string())
+        } else {
+            (404, "{}".to_string())
+        }
+    });
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    let config = crate::testutil::rotation_fixture_config(name);
+    seed_usage_cache(name);
+    silence_profile_ttl(name);
+    let entry = rotation_entry(name, Some(crate::usage::now_ms() as i64 + 86_400_000));
+    let refetch: super::RefetchQueue = Arc::new(RankedMutex::new(HashSet::new()));
+    let activity: super::ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
+
+    let outcome = super::fetch_with_rotation(&config, &entry, None, &refetch, &activity);
+    let seen = server.join().expect("listener");
+
+    assert!(
+        seen.iter().any(|p| p.starts_with("/v1/oauth/token")),
+        "the refresh must actually be attempted and rejected, or the retry never runs: {seen:?}"
+    );
+    assert!(
+        !config.lock().unwrap().is_auth_broken(name),
+        "the adopted pair proves the chain is alive — quarantining here needs a manual login"
+    );
+    assert_eq!(
+        outcome.rotated,
+        Some((
+            "at-mirror-retry".to_string(),
+            Some("at-mirror-retry-refresh".to_string())
+        )),
+        "the adopted pair must reach the TokenList"
+    );
+    let stored = config
+        .lock()
+        .unwrap()
+        .find(name)
+        .and_then(|p| p.access_token().map(str::to_string));
+    assert_eq!(stored.as_deref(), Some("at-mirror-retry"));
+    assert_eq!(outcome.status, super::FetchStatus::Cached);
 }

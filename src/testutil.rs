@@ -262,7 +262,9 @@ pub(crate) fn block_credentials_write(name: &str) {
 /// `/usage`, the token endpoint, and the `/v1/messages` kick — at one loopback
 /// listener, and clearing them on drop even if the test panics. Also resets the
 /// per-host request spacing, or the second request in a leg sleeps out
-/// `REQUEST_SPACING_MS`.
+/// `REQUEST_SPACING_MS`, and the adopt's token → uuid memo, which is
+/// process-lifetime: a fake token two tests share would otherwise let the first
+/// answer the second's probe and delete the very request it asserts on.
 ///
 /// Rotation decisions all sit BEHIND an HTTP call, so without this the refusals
 /// in `fetch_with_rotation` / `auto_start_kick` / `rotate_one_inner` are covered
@@ -287,6 +289,7 @@ impl<'a> EndpointSandbox<'a> {
             &format!("{base}/api/oauth/profile"),
         );
         crate::usage::reset_request_slots();
+        crate::usage::reset_identity_memo();
         Self(std::marker::PhantomData)
     }
 }
@@ -296,6 +299,7 @@ impl Drop for EndpointSandbox<'_> {
         crate::oauth::clear_endpoint_overrides();
         crate::usage::clear_usage_endpoint_override();
         crate::usage::reset_request_slots();
+        crate::usage::reset_identity_memo();
     }
 }
 

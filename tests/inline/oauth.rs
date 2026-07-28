@@ -862,9 +862,9 @@ mod keychain_mirror_gate {
 // rotates first, its file mirror (~/.claude/.credentials.json) carries the
 // fresher pair. Adopting it — identity-guarded — replaces racing for the
 // chain. All offline: identity is injected, the "mirror" is a sandboxed file.
-// NOT macOS-gated: only the production call site's `keychain_live()` gate is
-// platform-specific — the identity gate and the expiry-monotonicity re-check
-// must hold (and run in CI) on every OS.
+// NOT macOS-gated, and since the call sites lost their Keychain term there is no
+// longer a platform-specific gate anywhere on this path: the identity gate and
+// the expiry-monotonicity re-check must hold (and run in CI) on every OS.
 mod adopt_live_rotation {
     use super::*;
     use crate::lockorder::RankedMutex;

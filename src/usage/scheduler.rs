@@ -472,8 +472,13 @@ const ROTATE_LEAD_FLOOR_MS: i64 = 900_000;
 ///
 /// Correctness still does not depend on winning that race: when CC refreshes
 /// first — clauth downtime, a lost race — the poller ADOPTS CC's fresher pair
-/// rather than fighting for the chain (`oauth::try_adopt_live_rotation`), and
-/// a double-spend costs one failed request, not the account.
+/// rather than fighting for the chain (`oauth::try_adopt_live_rotation`).
+/// Losing is not free, though. Anthropic does not punish the double-spend — the
+/// pair the winner minted keeps working (`docs/domain-knowledge.md`) — but
+/// clauth answers the `invalid_grant` its own loser gets with a LOCAL
+/// quarantine (`mark_auth_broken`), and only an adopt, a carry, or a
+/// `clauth login` lifts that. Rotating early is what keeps the chain off that
+/// path, not what makes the path harmless.
 fn rotate_lead_ms(interval_ms: u64) -> i64 {
     ((interval_ms as i64).saturating_mul(3)).max(ROTATE_LEAD_FLOOR_MS)
 }
@@ -494,22 +499,44 @@ fn proactive_rotation_due(
     enabled && access_expires_at.is_some_and(|exp| now_ms + rotate_lead_ms(interval_ms) >= exp)
 }
 
-/// Whether the macOS Keychain mirror is live — `false` under `cfg(test)` and
-/// on every other OS, where the symlinked profile file is the live credential.
-#[cfg(target_os = "macos")]
-fn keychain_live() -> bool {
-    crate::keychain::enabled()
+/// Backing store for [`memoized_identity`], keyed by the SHA-256 of the access
+/// token rather than the token: the map outlives every call now, and the tokens
+/// reaching it include ones nothing else in the process retains (a superseded
+/// pair, a foreign account's live mirror), so keeping the bytes would be a new
+/// retention of key material for no gain. A digest collision is the only way a
+/// hit can be wrong, which is the property SHA-256 sells.
+static IDENTITY_MEMO: std::sync::LazyLock<
+    RankedMutex<HashMap<[u8; 32], crate::profile::AccountId>, rank::IdentityMemo>,
+> = std::sync::LazyLock::new(|| RankedMutex::new(HashMap::new()));
+
+fn identity_key(access_token: &str) -> [u8; 32] {
+    use sha2::{Digest as _, Sha256};
+    Sha256::digest(access_token.as_bytes()).into()
 }
 
-#[cfg(not(target_os = "macos"))]
-fn keychain_live() -> bool {
-    false
+/// Test-only: forget every resolved identity, so one test's fake token cannot
+/// answer another's probe out of a map that now outlives both. Wired into
+/// `testutil::EndpointSandbox` alongside `reset_request_slots`.
+#[cfg(test)]
+pub(crate) fn reset_identity_memo() {
+    if let Ok(mut m) = IDENTITY_MEMO.lock() {
+        m.clear();
+    }
 }
 
 /// Wrap an identity probe so each access token is resolved at most once per
-/// caller. An access token's account uuid is immutable, so a memo hit is exact
+/// PROCESS. An access token's account uuid is immutable, so a memo hit is exact
 /// rather than merely fresh — which is what makes caching safe for a check whose
-/// whole job is proving two tokens belong to the same account.
+/// whole job is proving two tokens belong to the same account, and why this is a
+/// memo rather than a TTL on the probe.
+///
+/// Per-call scope was enough while the adopt below was gated to macOS. It is not
+/// now: a live mirror that is permanently fresher yet permanently FOREIGN (a
+/// manual CC `/login` into another account) fails the identity gate on every
+/// rotation leg forever, and a per-call memo re-spends a `/profile` request
+/// against the rate-limited Anthropic host each time. Process lifetime prices
+/// those probes by rotation events — one per token ever seen — instead of by leg
+/// count.
 ///
 /// ONLY a `Some` is cached. A `None` means the probe failed (network, 401, shape
 /// drift), and the adopt retry after a failed refresh exists precisely because the
@@ -518,14 +545,17 @@ fn keychain_live() -> bool {
 fn memoized_identity<'a>(
     probe: &'a dyn Fn(&str) -> Option<crate::profile::AccountId>,
 ) -> impl Fn(&str) -> Option<crate::profile::AccountId> + 'a {
-    let seen: std::cell::RefCell<HashMap<String, crate::profile::AccountId>> =
-        std::cell::RefCell::new(HashMap::new());
     move |tok: &str| {
-        if let Some(hit) = seen.borrow().get(tok).cloned() {
+        let key = identity_key(tok);
+        // Released before the probe: it reserves the per-host request slot
+        // (`UsageThrottle`), which ranks OUTSIDE this leaf.
+        if let Some(hit) = IDENTITY_MEMO.lock().ok().and_then(|m| m.get(&key).cloned()) {
             return Some(hit);
         }
         let uuid = probe(tok)?;
-        seen.borrow_mut().insert(tok.to_string(), uuid.clone());
+        if let Ok(mut m) = IDENTITY_MEMO.lock() {
+            m.insert(key, uuid.clone());
+        }
         Some(uuid)
     }
 }
@@ -691,23 +721,24 @@ fn fetch_with_rotation(
         return bail_unrotated();
     };
 
-    // Both adopts below resolve the same two tokens (ours + the live mirror's), so
-    // they share one memo for this call rather than re-spending `/profile` on a
-    // uuid already resolved seconds ago.
+    // Both adopts below resolve the same two tokens (ours + the live mirror's),
+    // and every earlier leg's answers are still in the memo — an account uuid is
+    // a property of the token, so `/profile` is asked once per token ever seen.
     let identity = memoized_identity(&|tok| crate::usage::fetch_account_uuid(tok));
 
-    // Adopt before spending: when the ACTIVE Keychain profile's live file
-    // mirror already holds a FRESHER same-account pair, the running claude
-    // rotated first — adopt its pair (identity-guarded) instead of burning
-    // OUR single-use refresh token against a family it just superseded.
+    // Adopt before spending: when the ACTIVE profile's live file mirror already
+    // holds a FRESHER same-account pair, the running claude rotated first —
+    // adopt its pair (identity-guarded) instead of burning OUR single-use
+    // refresh token against a family it just superseded.
     // Queue a refetch so the next tick polls with the adopted token; disk
     // cache serves this tick.
-    // Ceiling: keyed on the macOS Keychain, so a `LinkMode::Fake` host (Windows
-    // without symlink privilege) keeps a second on-disk chain this never
-    // recovers from. Widening it needs a credential watcher on that copy, not a
-    // looser gate here.
+    // Ceiling: the adopt reaches exactly as far as `claude::read_claude_credentials`
+    // does — the GLOBAL `~/.claude/.credentials.json`. A `LinkMode::Fake` host
+    // (Windows without symlink privilege) keeps its second chain in the SESSION's
+    // runtime copy, a different file, so that one is still unrecovered here.
+    // Reaching it needs a profile → live-session lookup the scheduler does not
+    // have; tracked on its own.
     if is_active
-        && keychain_live()
         && let Some(adopted) =
             crate::oauth::try_adopt_live_rotation(config, name, &rotation_guard, &identity)
     {
@@ -737,14 +768,13 @@ fn fetch_with_rotation(
     let tok = match rotation {
         Ok(t) => t,
         Err(e) => {
-            // A failed refresh on the ACTIVE Keychain profile usually means
-            // the live claude rotated first and revoked our copy — one more
-            // adopt attempt (its mirror may have JUST surfaced the fresh
-            // pair) before falling back. This same path re-runs every poll,
-            // so a lagging store self-heals as soon as the mirror catches up
-            // (at latest CC's next launch).
+            // A failed refresh on the ACTIVE profile usually means the live
+            // claude rotated first and revoked our copy — one more adopt
+            // attempt (its mirror may have JUST surfaced the fresh pair)
+            // before falling back. This same path re-runs every poll, so a
+            // lagging store self-heals as soon as the mirror catches up (at
+            // latest CC's next launch).
             if is_active
-                && keychain_live()
                 && let Some(adopted) =
                     crate::oauth::try_adopt_live_rotation(config, name, &rotation_guard, &identity)
             {

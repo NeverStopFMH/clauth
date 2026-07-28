@@ -152,6 +152,14 @@ pub(crate) mod rank {
         // Standalone leaves — never nested with another tracked lock.
         NextRefresh = 1100;
         RefetchQueue = 1200;
+        /// Process-lifetime `access token digest → account uuid` memo behind the
+        /// adopt's identity gate (`usage::scheduler::memoized_identity`). A true
+        /// leaf: every acquisition is get-or-insert and releases before the
+        /// `/profile` probe runs, so nothing is acquired while it is held. Its
+        /// one holder is `Rotation`, and the probe it guards itself takes
+        /// `UsageThrottle` (150) — holding this across that probe inverts the
+        /// order and asserts here rather than deadlocking in production.
+        IdentityMemo = 1250;
         /// Session-scoped set of generic profiles suppressed from the timer until
         /// a manual refresh (`usage::scheduler`). Leaf — acquired standalone in
         /// `tick`/`fetch_third_party_due`, never under another lock.

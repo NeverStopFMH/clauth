@@ -36,6 +36,10 @@ pub(crate) use scheduler::ACTIVE_CAP_MAX_STREAK;
 // and read one back so a leg's reservation is assertable without that sleep.
 #[cfg(test)]
 pub(crate) use fetch::{reserved_request_slot, reset_request_slots};
+// Test-only: the adopt's token → uuid memo outlives a call now, so it also
+// outlives a test. Cleared with the endpoint overrides that make it reachable.
+#[cfg(test)]
+pub(crate) use scheduler::reset_identity_memo;
 // Test-only: point `/usage` at a loopback listener so `fetch_with_rotation`'s
 // 401-then-rotate leg — and the refusal inside it — can run offline.
 #[cfg(test)]

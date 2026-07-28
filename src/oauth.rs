@@ -760,9 +760,11 @@ pub(crate) fn auto_start_kick(
 /// other path (which emits its own `OpResult` and clears activity). Lets
 /// `refresh_all` workers surface the guard-fail as a Danger toast.
 enum RotateOutcome {
-    /// `RotationGuard::acquire` failed — a live session or sibling worker holds
-    /// the per-profile rotation lock. No `OpResult` was emitted.
-    GuardBusy,
+    /// `RotationGuard::acquire` failed — the lock file could not be created or
+    /// opened. NOT contention: `acquire` blocks on the flock, so a sibling
+    /// worker or a live session holding it makes this leg wait rather than
+    /// arrive here. No `OpResult` was emitted.
+    GuardUnavailable,
     /// The HTTP/persist leg ran and emitted its `OpResult`. The bool is whether
     /// the rotated pair was persisted.
     Persisted(bool),
@@ -780,7 +782,7 @@ enum RotateOutcome {
 /// next request rather than racing for the chain.
 ///
 /// HTTP/persist leg emits one `OpResult { kind: Refreshing }` and clears the
-/// activity slot. Returns [`RotateOutcome::GuardBusy`] without emitting an
+/// activity slot. Returns [`RotateOutcome::GuardUnavailable`] without emitting an
 /// `OpResult` when the lock can't be acquired (slot never pre-stamped here;
 /// `refresh_all` pre-stamps and clears it). The no-refresh-token leg returns
 /// [`RotateOutcome::Persisted(false)`] silently.
@@ -791,7 +793,7 @@ fn rotate_one_inner(
     sender: &OpResultSender,
 ) -> RotateOutcome {
     let Ok(_rotation_guard) = RotationGuard::acquire(name) else {
-        return RotateOutcome::GuardBusy;
+        return RotateOutcome::GuardUnavailable;
     };
     let token = {
         #[allow(clippy::expect_used, reason = "mutex poisoning is unrecoverable")]
@@ -951,7 +953,7 @@ pub(crate) fn refresh_all(
             // Guard-fail leg never emits an OpResult, so this pre-stamped slot
             // would freeze the spinner AND swallow the failure. Emit the Danger
             // toast (matches the pre-collapse worker) and clear.
-            Ok((n, RotateOutcome::GuardBusy)) => {
+            Ok((n, RotateOutcome::GuardUnavailable)) => {
                 let _ = sender.send(OpResult {
                     name: n.clone(),
                     outcome: Err(anyhow::anyhow!("failed to acquire rotation lock")),
@@ -996,8 +998,8 @@ pub(crate) fn rotate_one(
     let persisted = match rotate_one_inner(config, name, Some(activity), sender) {
         RotateOutcome::Persisted(true) => true,
         // Guard-fail never emits an OpResult; surface the failure + clear, exactly
-        // as refresh_all's join loop does for a busy guard.
-        RotateOutcome::GuardBusy => {
+        // as refresh_all's join loop does for an unavailable guard.
+        RotateOutcome::GuardUnavailable => {
             let _ = sender.send(OpResult {
                 name: name.to_string(),
                 outcome: Err(anyhow::anyhow!("failed to acquire rotation lock")),
@@ -1462,13 +1464,14 @@ pub(crate) fn ensure_installable(
     }
 
     // RotationGuard across the HTTP window (single-use double-spend guard),
-    // acquired with no config lock held. A busy guard means a live session or
-    // sibling worker is already on this chain — refuse this switch and retry.
+    // acquired with no config lock held. Contention does NOT land in the `else`
+    // below: `acquire` blocks on the flock, so a sibling worker or live session
+    // on this chain makes us wait. Only creating/opening the lock file can fail.
     let Ok(guard) = RotationGuard::acquire(name) else {
         // `Stated`: this copy already names its own next step, and appending a
         // second one gave the operator two incompatible reasons to retry.
         return AuthGate::Transient(crate::format::Transient::new(
-            crate::format::Cause::RotationLockBusy(name.to_string()),
+            crate::format::Cause::RotationLockUnavailable(name.to_string()),
             crate::format::Retry::Stated,
         ));
     };

@@ -6711,7 +6711,8 @@ fn run_confirm_action(app: &mut App, action: ConfirmAction) {
             }
             // The per-profile RotationGuard inside rotate_one serialises against a
             // live session's own refresh, so unlike RotateAll this doesn't need the
-            // global any_busy gate — a busy guard surfaces as a Danger toast.
+            // global any_busy gate — an unacquirable guard surfaces as a Danger
+            // toast (contention blocks inside `acquire`, it never lands there).
             let config = Arc::clone(&app.config);
             let refetch = Arc::clone(&app.refetch_queue);
             let activity = Arc::clone(&app.activity);

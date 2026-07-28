@@ -68,9 +68,9 @@ pub(crate) enum Retry {
     /// telling someone to check their connection over a 429 is wrong advice.
     Wait,
     /// The cause already names its own next step, so a second one would
-    /// contradict it (`rotation lock busy; retry after the in-flight refresh`
-    /// followed by `check your connection and retry` gives two different and
-    /// incompatible reasons to retry).
+    /// contradict it (`check permissions on ~/.clauth` followed by `check your
+    /// connection and retry` gives two different and incompatible reasons to
+    /// retry, one of which is wrong).
     Stated,
     /// There is nothing left to retry: the login flow is OVER. Its loopback
     /// listener is torn down and its authorization code is single-use, so a
@@ -89,7 +89,7 @@ pub(crate) enum Retry {
 /// What the types ENFORCE is narrower than that, and worth stating exactly.
 /// Only [`Self::Endpoint`] is sealed — `&'static str` cannot hold a
 /// runtime-allocated response body, and it takes precisely what
-/// `TokenFailure::user_message` returns. [`Self::RotationLockBusy`] and
+/// `TokenFailure::user_message` returns. [`Self::RotationLockUnavailable`] and
 /// [`Self::PersistFailed`] still hold a `String`; what keeps THOSE honest is
 /// that each renders its own fixed sentence below and interpolates the value as
 /// a profile name, so a body passed there would read as an account name and
@@ -98,8 +98,15 @@ pub(crate) enum Retry {
 pub(crate) enum Cause {
     /// Already-canned copy from `oauth::TokenFailure`.
     Endpoint(&'static str),
-    /// A sibling worker or a live session holds the per-profile rotation lock.
-    RotationLockBusy(String),
+    /// The per-profile rotation lock could not be CREATED or OPENED — a
+    /// filesystem or permissions problem under `~/.clauth`.
+    ///
+    /// Not contention, despite what this arm used to say. `RotationGuard::
+    /// acquire` ends in a blocking `File::lock()`, so a sibling worker or a live
+    /// session holding the lock makes the caller WAIT; it can never surface
+    /// here. The old copy told the operator to wait for an in-flight refresh
+    /// that does not exist, and a test pinned that wording.
+    RotationLockUnavailable(String),
     /// A poisoned mutex: another thread panicked, so it will not clear itself
     /// and a retry hint would be a lie.
     InternalLock,
@@ -111,8 +118,10 @@ impl Cause {
     fn text(&self) -> String {
         match self {
             Self::Endpoint(canned) => (*canned).to_string(),
-            Self::RotationLockBusy(profile) => {
-                format!("'{profile}' rotation lock busy; retry after the in-flight refresh")
+            Self::RotationLockUnavailable(profile) => {
+                format!(
+                    "could not lock '{profile}' for a token refresh; check permissions on ~/.clauth"
+                )
             }
             Self::InternalLock => "clauth hit an internal lock error, restart clauth".to_string(),
             Self::PersistFailed(profile) => {

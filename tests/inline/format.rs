@@ -83,10 +83,13 @@ fn the_retry_hint_follows_the_kind_not_the_call_site() {
 
     // `Stated` adds nothing: the cause already names its own next step, and a
     // second one contradicts it.
-    let stated = Transient::new(Cause::RotationLockBusy("work".to_string()), Retry::Stated);
+    let stated = Transient::new(
+        Cause::RotationLockUnavailable("work".to_string()),
+        Retry::Stated,
+    );
     assert_eq!(
         stated.text(),
-        "'work' rotation lock busy; retry after the in-flight refresh"
+        "could not lock 'work' for a token refresh; check permissions on ~/.clauth"
     );
 }
 
@@ -142,8 +145,8 @@ fn every_transient_cause_renders_its_own_copy() {
             "anthropic is throttling requests",
         ),
         (
-            Cause::RotationLockBusy("work".to_string()),
-            "'work' rotation lock busy; retry after the in-flight refresh",
+            Cause::RotationLockUnavailable("work".to_string()),
+            "could not lock 'work' for a token refresh; check permissions on ~/.clauth",
         ),
         (
             Cause::InternalLock,

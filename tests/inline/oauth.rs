@@ -1754,15 +1754,22 @@ fn oauth_error_types_have_no_printable_escape_hatch() {
 // selections survived the whole suite until these landed, so each one below
 // reaches its real call site and asserts the sentence an operator reads.
 
-/// The guard-refusal copy already tells the operator what to wait for, so it
-/// must NOT also be told to check its connection.
+/// The guard-refusal copy must describe the condition that actually produces
+/// it, and name one next step rather than two.
 ///
 /// Reached by failing `RotationGuard::acquire`'s `mkdir_700`, NOT by holding the
 /// lock: `acquire` ends in `File::lock()`, which BLOCKS. A second acquire in
 /// this process waits instead of erroring, so a contention-based fixture
 /// deadlocks the suite rather than exercising the arm (it did, once, here).
+///
+/// That mechanism is why the copy changed. Creating or opening the lock file is
+/// the ONLY thing that lands here, so the previous wording — `rotation lock
+/// busy; retry after the in-flight refresh` — described a condition that cannot
+/// produce it and advised waiting for a refresh that is not running. An earlier
+/// version of this very test pinned that sentence, which is worse than leaving
+/// it unpinned: it would have handed a red suite to whoever noticed.
 #[test]
-fn guard_acquire_failure_states_one_reason_to_retry() {
+fn guard_acquire_failure_names_the_filesystem_cause() {
     let _home = HomeSandbox::new();
     let name = "gate-retry-lock-busy";
     let handle = Arc::new(RankedMutex::new(oauth_config(
@@ -1786,8 +1793,13 @@ fn guard_acquire_failure_states_one_reason_to_retry() {
     };
     assert_eq!(
         t.text(),
-        format!("'{name}' rotation lock busy; retry after the in-flight refresh"),
+        format!("could not lock '{name}' for a token refresh; check permissions on ~/.clauth"),
         "the cause names its own next step; a second one contradicts it"
+    );
+    assert!(
+        !t.text().contains("in-flight"),
+        "contention cannot produce this arm, so the copy must not blame it: {}",
+        t.text()
     );
 }
 

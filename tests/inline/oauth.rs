@@ -1745,6 +1745,150 @@ fn oauth_error_types_have_no_printable_escape_hatch() {
     }
 }
 
+// ── every Retry selection, pinned at the CALL SITE that chooses it ───────────
+//
+// `format.rs` pins the Retry→copy MAPPING. That is not the same thing and does
+// not defend it: flipping `Retry::Stated` to `Retry::Connection` at a call site
+// leaves the mapping correct and restores the exact defect the enum exists to
+// remove — two contradictory reasons to retry in one sentence. Four of the six
+// selections survived the whole suite until these landed, so each one below
+// reaches its real call site and asserts the sentence an operator reads.
+
+/// The guard-refusal copy already tells the operator what to wait for, so it
+/// must NOT also be told to check its connection.
+///
+/// Reached by failing `RotationGuard::acquire`'s `mkdir_700`, NOT by holding the
+/// lock: `acquire` ends in `File::lock()`, which BLOCKS. A second acquire in
+/// this process waits instead of erroring, so a contention-based fixture
+/// deadlocks the suite rather than exercising the arm (it did, once, here).
+#[test]
+fn guard_acquire_failure_states_one_reason_to_retry() {
+    let _home = HomeSandbox::new();
+    let name = "gate-retry-lock-busy";
+    let handle = Arc::new(RankedMutex::new(oauth_config(
+        name,
+        Some("rt-ok"),
+        Some(past_expiry()),
+    )));
+    // A regular file where the profile DIRECTORY belongs: `acquire` creates
+    // `<profile>/rotation.lock`, so its `mkdir_700` of the parent fails.
+    #[allow(clippy::expect_used, reason = "test")]
+    let dir = crate::profile::profile_dir(name).expect("profile dir");
+    if let Some(parent) = dir.parent() {
+        #[allow(clippy::expect_used, reason = "test")]
+        std::fs::create_dir_all(parent).expect("profile parent");
+    }
+    #[allow(clippy::expect_used, reason = "test")]
+    std::fs::write(&dir, b"not a directory").expect("occupy the profile dir path");
+
+    let AuthGate::Transient(t) = ensure_installable(&handle, name, never_refresh) else {
+        panic!("an unacquirable rotation guard must refuse transiently");
+    };
+    assert_eq!(
+        t.text(),
+        format!("'{name}' rotation lock busy; retry after the in-flight refresh"),
+        "the cause names its own next step; a second one contradicts it"
+    );
+}
+
+/// A poisoned config mutex does not clear itself, so a retry hint would be a
+/// lie. Reached by panicking a thread while it holds the lock — the only way
+/// this arm happens in production too.
+#[test]
+fn poisoned_config_refusal_offers_no_retry() {
+    let _home = HomeSandbox::new();
+    let name = "gate-retry-poisoned";
+    let handle = Arc::new(RankedMutex::new(oauth_config(
+        name,
+        Some("rt-ok"),
+        Some(past_expiry()),
+    )));
+    let poisoner = Arc::clone(&handle);
+    let _ = std::thread::spawn(move || {
+        let _held = poisoner.lock();
+        panic!("deliberate: poison the config mutex");
+    })
+    .join();
+
+    let AuthGate::Transient(t) = ensure_installable(&handle, name, never_refresh) else {
+        panic!("a poisoned config mutex must refuse transiently");
+    };
+    assert_eq!(
+        t.text(),
+        "clauth hit an internal lock error, restart clauth"
+    );
+}
+
+/// A 2xx whose body does not parse: the transport worked, so waiting is the
+/// honest advice — and the body itself still never reaches the toast.
+#[test]
+fn an_unparseable_2xx_tells_the_operator_to_wait() {
+    use std::sync::mpsc;
+    let home = HomeSandbox::new();
+    let name = "rotate-unparseable-2xx";
+    let (base, server) = crate::testutil::serve_endpoints(2, |_, _| {
+        (200, format!(r#"{{"unexpected":"{WIRE_CANARY}"}}"#))
+    });
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    let (tx, rx) = mpsc::channel();
+    let cfg = crate::testutil::rotation_fixture_config(name);
+
+    rotate_one_inner(&cfg, name, None, &tx);
+    #[allow(clippy::expect_used, reason = "test")]
+    let OpResult { outcome, .. } = rx.try_recv().expect("the HTTP leg emits an OpResult");
+    let msg = match outcome {
+        Ok(()) => panic!("an unparseable token body is not a completed rotation"),
+        Err(e) => e.to_string(),
+    };
+    assert_eq!(msg, "anthropic's reply was unreadable: retry in a moment");
+    assert!(
+        !msg.contains(WIRE_CANARY),
+        "the 2xx body holds live credentials and must never surface: {msg}"
+    );
+
+    #[allow(clippy::expect_used, reason = "test")]
+    let seen = server.join().expect("listener");
+    assert_eq!(seen, vec!["/v1/oauth/token".to_string()]);
+}
+
+/// The refresh landed but its pair could not be written. The chain is fine and
+/// the next attempt can succeed, so this one DOES get a retry hint — the arm
+/// that must not collapse into `Stated`.
+#[test]
+fn a_failed_persist_after_a_good_refresh_offers_a_retry() {
+    let _home = HomeSandbox::new();
+    let name = "gate-retry-persist-fails";
+    let handle = Arc::new(RankedMutex::new(oauth_config(
+        name,
+        Some("rt-old"),
+        Some(past_expiry()),
+    )));
+    // A DIRECTORY where `credentials.json` belongs: the rotation guard still
+    // acquires (its parent is a real dir), the refresh still lands, and only
+    // `save_profile`'s credential write fails — the one reachable way to make
+    // `apply_rotated_tokens_locked` err without breaking an earlier step.
+    #[allow(clippy::expect_used, reason = "test")]
+    let dir = crate::profile::profile_dir(name).expect("profile dir");
+    #[allow(clippy::expect_used, reason = "test")]
+    std::fs::create_dir_all(dir.join("credentials.json")).expect("occupy the credentials path");
+
+    let refresher = |_rt: &str, _scopes: Option<&str>| {
+        Ok(TokenResponse {
+            access_token: "at-new".to_string(),
+            refresh_token: "rt-new".to_string(),
+            expires_in: 3600,
+            scope: None,
+        })
+    };
+    let AuthGate::Transient(t) = ensure_installable(&handle, name, refresher) else {
+        panic!("a failed persist must refuse transiently, never install");
+    };
+    assert_eq!(
+        t.text(),
+        format!("refreshed '{name}' but failed to persist the rotated tokens: retry in a moment")
+    );
+}
+
 /// Bytes only the wire could have written. Any of it in a refusal is the leak.
 const WIRE_CANARY: &str = "WIRE-BYTES-CANARY";
 

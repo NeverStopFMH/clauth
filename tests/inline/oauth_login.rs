@@ -258,11 +258,11 @@ fn login_names_the_status_on_stderr_but_not_in_the_toast() {
     let rejected = LoginError::Exchange(TokenFailure::Status(400));
     assert_eq!(
         rejected.cli_message(),
-        "anthropic rejected the request (HTTP 400): retry in a moment"
+        "anthropic rejected the request (HTTP 400): run clauth login again for a fresh code"
     );
     assert_eq!(
         rejected.user_message(),
-        "anthropic rejected the request: retry in a moment"
+        "anthropic rejected the request: run clauth login again for a fresh code"
     );
     assert!(
         !rejected.user_message().contains("400"),
@@ -270,8 +270,27 @@ fn login_names_the_status_on_stderr_but_not_in_the_toast() {
         rejected.user_message()
     );
 
+    // The advice is NOT "retry in a moment", which is what reusing the refresh
+    // path's mapping produced. A code exchange is rejected at the END of the
+    // flow: the loopback listener is gone and the code is spent, expired, or
+    // never matched the PKCE verifier, so waiting fixes none of them. A 429 is
+    // the case that makes it obvious — a refresh would genuinely wait and
+    // re-attempt next tick, a login has no next tick.
+    for status in [400, 429, 503] {
+        let m = LoginError::Exchange(TokenFailure::Status(status)).user_message();
+        assert!(
+            m.ends_with(": run clauth login again for a fresh code"),
+            "a spent authorization code is only fixed by a new login, got: {m}"
+        );
+        assert!(
+            !m.contains("retry in a moment"),
+            "there is nothing left to retry once the flow has ended: {m}"
+        );
+    }
+
     // A transport failure never saw a status, so the two forms coincide rather
-    // than inventing one, and the advice is the connection.
+    // than inventing one, and the advice is the connection — the one blocker
+    // worth clearing BEFORE running the command again.
     let offline = LoginError::Exchange(TokenFailure::Transport);
     assert_eq!(
         offline.cli_message(),

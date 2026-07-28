@@ -72,18 +72,29 @@ pub(crate) enum Retry {
     /// followed by `check your connection and retry` gives two different and
     /// incompatible reasons to retry).
     Stated,
+    /// There is nothing left to retry: the login flow is OVER. Its loopback
+    /// listener is torn down and its authorization code is single-use, so a
+    /// code-exchange rejection is not fixed by waiting — only by running
+    /// `clauth login` again for a fresh code.
+    Restart,
 }
 
 /// Every transient cause clauth can state, as a CLOSED set.
 ///
-/// Deliberately not a `String`. A `String` cause ACCEPTS an upstream response
-/// body, and the reason this module and `oauth::TokenFailure` exist at all is
-/// that "nobody will print the raw error" is a convention which already failed
-/// once here. A response body is always a runtime-allocated `String`, so none of
-/// these arms can hold one: the endpoint arm takes `&'static str` (exactly what
-/// `TokenFailure::user_message` returns) and the rest carry a profile name read
-/// from local config. That is a structural guard rather than a promise — the
-/// previous `cause: String` was only ever the latter.
+/// Deliberately not one open `String` field. The historically-real accident is
+/// `format!("{status}: {body}")` handed to a free-text cause, and that no longer
+/// compiles: there is no free-text cause to hand it to, so the caller has to
+/// pick an arm that describes what actually happened.
+///
+/// What the types ENFORCE is narrower than that, and worth stating exactly.
+/// Only [`Self::Endpoint`] is sealed — `&'static str` cannot hold a
+/// runtime-allocated response body, and it takes precisely what
+/// `TokenFailure::user_message` returns. [`Self::RotationLockBusy`] and
+/// [`Self::PersistFailed`] still hold a `String`; what keeps THOSE honest is
+/// that each renders its own fixed sentence below and interpolates the value as
+/// a profile name, so a body passed there would read as an account name and
+/// nothing else. Sealing all four means a newtype only the callers can mint;
+/// worth doing if a fifth arm ever needs a runtime value that is not a name.
 pub(crate) enum Cause {
     /// Already-canned copy from `oauth::TokenFailure`.
     Endpoint(&'static str),
@@ -145,6 +156,7 @@ impl Transient {
             Retry::Connection => ": check your connection and retry",
             Retry::Wait => ": retry in a moment",
             Retry::Stated => "",
+            Retry::Restart => ": run clauth login again for a fresh code",
         }
     }
 

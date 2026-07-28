@@ -225,9 +225,15 @@ impl TokenFailure {
         }
     }
 
-    /// The shared transient value: canned cause, the status for the surfaces
-    /// allowed to name it, and the next step this kind actually warrants.
-    pub(crate) fn as_transient(&self) -> crate::format::Transient {
+    /// The REFRESH path's transient value: canned cause, the status for the
+    /// surfaces allowed to name it, and the next step a refresh warrants.
+    ///
+    /// Named for its path because the retry hint is NOT a property of the
+    /// failure alone — it depends on what the caller can still do. A refresh is
+    /// re-attempted on the next tick, so `Wait` is right here; a login has no
+    /// next tick and its code is spent, so `oauth_login` maps the same statuses
+    /// to `Restart` instead. A third caller must pick, not inherit.
+    pub(crate) fn as_refresh_transient(&self) -> crate::format::Transient {
         use crate::format::{Cause, Retry, Transient};
         // `Cause::Endpoint` takes `&'static str`, which is exactly what
         // `user_message` returns — a response body is a runtime `String` and
@@ -839,7 +845,9 @@ fn rotate_one_inner(
                 RefreshError::Invalid(_) => {
                     anyhow::anyhow!("{}", crate::format::login_expired(name).detail())
                 }
-                RefreshError::Transient(f) => anyhow::anyhow!("{}", f.as_transient().text()),
+                RefreshError::Transient(f) => {
+                    anyhow::anyhow!("{}", f.as_refresh_transient().text())
+                }
             })
         }
     };
@@ -1618,7 +1626,7 @@ fn gate_under_guard(
                     mark_auth_broken(config, name, true);
                     AuthGate::Broken
                 }
-                RefreshError::Transient(f) => AuthGate::Transient(f.as_transient()),
+                RefreshError::Transient(f) => AuthGate::Transient(f.as_refresh_transient()),
             }
         }
     }

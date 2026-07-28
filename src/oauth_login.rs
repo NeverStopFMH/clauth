@@ -241,9 +241,6 @@ fn write_response(mut stream: &TcpStream, status: &str, page: Page) {
     let _ = stream.flush();
 }
 
-/// Handle one connection. `Ok(Some(code))` on the real `/callback` with matching
-/// `state`; `Ok(None)` for any unrelated request (keep waiting); `Err` on an
-/// OAuth error param or a state mismatch (a security stop).
 /// Why the authorize callback came back without a code — the browser-redirect
 /// twin of [`crate::oauth::TokenFailure`], typed for the same reason.
 ///
@@ -307,6 +304,9 @@ impl AuthorizeRejection {
     }
 }
 
+/// Handle one connection. `Ok(Some(code))` on the real `/callback` with matching
+/// `state`; `Ok(None)` for any unrelated request (keep waiting); `Err` on an
+/// OAuth error param or a state mismatch (a security stop).
 fn handle_callback(stream: TcpStream, expected_state: &str) -> Result<Option<String>> {
     stream.set_read_timeout(Some(Duration::from_secs(10))).ok();
     let mut request_line = String::new();
@@ -509,10 +509,34 @@ pub(crate) enum LoginError {
 }
 
 impl LoginError {
+    /// The LOGIN path's retry mapping, deliberately not
+    /// [`crate::oauth::TokenFailure::as_refresh_transient`].
+    ///
+    /// A code exchange happens at the very end of the flow: by the time it is
+    /// rejected the loopback listener is torn down and the authorization code is
+    /// spent, expired, or was never matched by the PKCE verifier. None of those
+    /// is fixed by waiting, so the refresh path's `Wait` — which is right for a
+    /// 429 it will re-attempt next tick — names an action that no longer exists
+    /// here. Only the transport arm keeps its own advice, because an unreachable
+    /// endpoint is the one blocker worth clearing before running the command
+    /// again.
+    fn transient(f: &crate::oauth::TokenFailure) -> crate::format::Transient {
+        use crate::format::{Cause, Retry, Transient};
+        use crate::oauth::TokenFailure;
+        let cause = Cause::Endpoint(f.user_message());
+        match f {
+            TokenFailure::Transport => Transient::new(cause, Retry::Connection),
+            TokenFailure::Status(s) => Transient::with_status(cause, *s, Retry::Restart),
+            TokenFailure::Body { status, .. } => {
+                Transient::with_status(cause, *status, Retry::Restart)
+            }
+        }
+    }
+
     /// Canned: the TUI login toast.
     pub(crate) fn user_message(&self) -> String {
         match self {
-            Self::Exchange(f) => f.as_transient().text(),
+            Self::Exchange(f) => Self::transient(f).text(),
             Self::Local(e) => e.to_string(),
         }
     }
@@ -520,7 +544,7 @@ impl LoginError {
     /// Canned plus the HTTP status where one exists: `clauth login`'s stderr.
     pub(crate) fn cli_message(&self) -> String {
         match self {
-            Self::Exchange(f) => f.as_transient().text_with_status(),
+            Self::Exchange(f) => Self::transient(f).text_with_status(),
             Self::Local(e) => e.to_string(),
         }
     }

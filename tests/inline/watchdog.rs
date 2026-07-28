@@ -214,6 +214,31 @@ fn a_sustained_event_stream_wakes_once_per_window_not_once_per_burst() {
     );
 }
 
+/// Signals only once the store actually holds `want`, so a reconcile that ran
+/// for some other reason cannot satisfy the wait.
+///
+/// A wake alone is NOT evidence here. macOS hands a freshly-armed FSEvents
+/// stream operations that PRECEDED the arm — this fixture's own `create_dir_all`
+/// calls and seed write among them — so a reconcile fires before the publish
+/// under test happens at all. Counting wakes, the test passed in 0.166 s with
+/// its `publish` line deleted. Reading the bytes is what ties the reconcile to
+/// the publish instead of to the seeding, on both platforms.
+struct AwaitContent {
+    store: PathBuf,
+    want: &'static [u8],
+    done: Sender<()>,
+}
+
+impl Reconcile for AwaitContent {
+    fn config(&self) {}
+    fn credentials(&self) {
+        if std::fs::read(&self.store).is_ok_and(|got| got == self.want) {
+            let _ = self.done.send(());
+        }
+    }
+    fn swap_poll(&self) {}
+}
+
 /// The measured "reflected without waiting a tick" claim. Every ticker is set
 /// past the bound, so a publish into a watched directory is the only thing that
 /// can drive a reconcile at all — which is what makes a green here mean the
@@ -237,7 +262,12 @@ fn a_store_publish_reconciles_with_every_ticker_disabled() {
     let t = timings(Duration::ZERO);
     let (shutdown_tx, shutdown_rx) = crossbeam_channel::bounded::<()>(1);
     let (done_tx, done_rx) = crossbeam_channel::unbounded();
-    let rec = Recorder::new(Duration::ZERO, done_tx);
+    const FRESH: &[u8] = br#"{"claudeAiOauth":{"accessToken":"fresh"}}"#;
+    let rec = AwaitContent {
+        store: store.clone(),
+        want: FRESH,
+        done: done_tx,
+    };
 
     // Armed before the spawn, exactly as `runtime::acquire` does it, so the
     // publish below cannot beat the watch up. This used to be a
@@ -251,7 +281,7 @@ fn a_store_publish_reconciles_with_every_ticker_disabled() {
         scope.spawn(move || run_with_watcher(watcher, requested, shutdown, timings, recorder));
 
         let started = Instant::now();
-        publish(&store, br#"{"claudeAiOauth":{"accessToken":"fresh"}}"#);
+        publish(&store, FRESH);
         done_rx
             .recv_timeout(BOUND)
             .expect("a publish into the credential store drove no reconcile");

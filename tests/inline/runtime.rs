@@ -4023,6 +4023,72 @@ fn gc_spares_a_swapped_members_marker_dir_while_the_session_lives() {
     });
 }
 
+/// GC's half of the force-delete divergence, mirroring the tally's
+/// `a_swapped_session_counts_on_current_member_after_its_launch_marker_is_removed`:
+/// `clauth delete <launch> --force` removes the launch profile's whole dir, marker
+/// dirs included, while the session keeps running on the member it swapped onto.
+/// Probing `start_profile` there finds nothing, reads the row as dead, and reaps a
+/// session the tally is still counting — the exact split the shared
+/// `current_member`-first probe exists to prevent.
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn gc_keeps_a_swapped_row_after_its_launch_profile_is_force_deleted() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let launch = member("rowgc-a");
+        let intended = member("rowgc-b");
+        member_store(&launch);
+        member_store(&intended);
+        let (swap, _launch_markers) = lone_session(&launch, Isolation::Shared);
+        let sid = swap.session.as_str().to_string();
+
+        assert_eq!(
+            swap.swap_to("rowgc-b").expect("swap"),
+            SwapOutcome::Swapped,
+            "fixture: only a landed swap writes the `current_member` under test"
+        );
+
+        // The real force-delete, not a hand `remove_dir_all`: this state is
+        // reachable only because `--force` is the one thing that skips the
+        // live-session gate, and nothing else removes a profile dir out from under
+        // a running session.
+        let mut config = crate::profile::AppConfig {
+            state: crate::profile::AppState {
+                profiles: vec![launch.name.clone(), intended.name.clone()],
+                ..Default::default()
+            },
+            profiles: vec![launch, intended],
+        };
+        crate::actions::delete_profile(&mut config, "rowgc-a", true).expect("force-delete");
+        assert!(
+            !crate::profile::profile_dir("rowgc-a")
+                .expect("profile dir")
+                .exists(),
+            "fixture: the force-delete must take the launch marker dirs with it"
+        );
+
+        gc_stale_runtimes();
+
+        assert_eq!(
+            crate::live_sessions::get(&sid)
+                .and_then(|row| row.current_member)
+                .as_deref(),
+            Some("rowgc-b"),
+            "GC reaped the row of a session still running on its swapped-onto member"
+        );
+
+        // Control: the sweep does reach this row and does reap it once nothing
+        // holds the swapped-onto member's markers either — so the assertion above
+        // cannot be passing on a leg that never ran.
+        drop(swap);
+        gc_stale_runtimes();
+        assert!(
+            crate::live_sessions::get(&sid).is_none(),
+            "a row must go once its session has released every marker it held"
+        );
+    });
+}
+
 /// Teardown owns every marker the session stamped — both layouts, on the launch
 /// member and on each member it swapped onto — or a dead session keeps blocking
 /// rotation on accounts nothing is using.

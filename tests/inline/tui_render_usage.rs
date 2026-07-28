@@ -323,6 +323,65 @@ fn header_lines_plan_falls_back_to_account_tier() {
     );
 }
 
+/// A HYBRID profile — an OAuth pair AND a custom `base_url`, no api key, no
+/// recognised provider — renders its FETCHED tier, not the bare "api" literal.
+/// `is_oauth()` keys on `base_url`, so a hybrid reads false there while the body
+/// this header heads still draws its live OAuth window bars (the `api_key ||
+/// is_third_party` fork this file uses for the body). Reading `api` directly
+/// above Anthropic 5h/7d bars sourced from the very `UsageInfo` whose tier was
+/// discarded is the disagreement; the header and the body must share one fork.
+///
+/// Reachable in production two ways, both leaving `credentials` intact:
+/// `edit_profile_endpoint` sets `base_url` and clears only `third_party_usage`,
+/// and `capture_snapshot` reads the credentials file and the endpoint config
+/// independently into one profile. The scheduler then refetches it every tick,
+/// because `collect_tokens` keys on `claude_ai_oauth.is_some()`, not `is_oauth()`.
+#[test]
+fn header_lines_plan_shows_a_hybrid_oauth_profiles_fetched_tier() {
+    let mut profile = crate::testutil::blank_profile("hybrid");
+    profile.base_url = Some("https://proxy.example/anthropic".to_string());
+    profile.credentials = Some(crate::profile::ClaudeCredentials {
+        claude_ai_oauth: Some(crate::profile::OAuthToken {
+            access_token: "at".into(),
+            refresh_token: None,
+            expires_at: None,
+            scopes: None,
+            subscription_type: Some("max".into()),
+        }),
+    });
+    profile.usage = Some(crate::usage::UsageInfo {
+        plan: Some(crate::usage::PlanInfo {
+            tier: crate::usage::PlanTier::Max(Some(20)),
+            subscription_status: None,
+        }),
+        ..Default::default()
+    });
+    assert!(
+        !profile.is_oauth() && !profile.is_third_party() && profile.api_key.is_none(),
+        "fixture must be the hybrid shape, or this pins nothing"
+    );
+    let header = HeaderState {
+        activity: ProfileActivity::Idle,
+        next_refresh_ms: None,
+        tick: 0,
+        streaks: StreakCounts::default(),
+        kick_block: None,
+        diag: DiagFlags::default(),
+    };
+    let plan_row: String = header_lines(&profile, &header, 52)
+        .first()
+        .map(|l| l.spans.iter().map(|s| s.content.clone()).collect())
+        .unwrap_or_default();
+    assert!(
+        plan_row.contains("Claude Max 20x"),
+        "hybrid plan row shows its fetched tier, got {plan_row:?}"
+    );
+    assert!(
+        !plan_row.contains("api"),
+        "hybrid plan row must not fall through to the bare 'api' literal, got {plan_row:?}"
+    );
+}
+
 /// With no fetched plan AND no tier the token can claim, the `plan` row takes
 /// the house no-data dash in the faint no-data treatment. The bare "Claude" it
 /// printed before named a plan the account never had.

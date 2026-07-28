@@ -722,13 +722,16 @@ fn header_lines(profile: &Profile, header: &HeaderState, inner_w: u16) -> Vec<Li
         .third_party_usage
         .as_ref()
         .and_then(|s| s.plan.clone())
-        // With no fetched plan, show the OAuth token's tier (what the Overview
-        // shows) instead of a bare "oauth"; api-key profiles keep "api".
+        // Forked exactly as the BODY below is, so the header cannot name a
+        // different account kind than the bars under it. `is_oauth()` is the
+        // wrong test here: it keys on `base_url` alone, so a hybrid (OAuth pair
+        // plus a custom endpoint) reads "api" directly above the live Anthropic
+        // windows its own `usage` fed.
         .or_else(|| {
-            if profile.is_oauth() {
-                account_tier(profile).and_then(|t| t.display())
-            } else {
+            if profile.api_key.is_some() || profile.is_third_party() {
                 Some("api".to_string())
+            } else {
+                account_tier(profile).and_then(|t| t.display())
             }
         });
     // No tier known yet takes the house no-data dash: a bare "Claude" here read

@@ -6,7 +6,8 @@
 //! `atomic_write_600`), which unlinks the watched inode: inotify then drops the
 //! watch (`IN_DELETE_SELF` / `IN_IGNORED`) with nothing re-arming it, so a file
 //! watch survives exactly one write. A directory inode outlives its children's
-//! renames.
+//! renames — not its OWN: renaming a watched directory aside kills that watch
+//! for the session the same way, just far more rarely, and nothing re-arms it.
 //!
 //! Dir watches widen the event surface, so [`Interest`] narrows each watch back
 //! down to the children that can actually change a reconcile's outcome.
@@ -54,10 +55,15 @@ pub(crate) struct Timings {
     /// fake-symlink mode needs a tight upper bound on how long a session can
     /// read stale credentials after a sibling refreshes — every additional
     /// second is another window in which a 401 could revoke an already-rotated
-    /// refresh token chain. The event loop reuses it for the swap-poll ticker:
-    /// the daemon's intent lands in `~/.clauth/live_sessions/`, which no watch
-    /// covers, so that leg has no filesystem signal to key on.
+    /// refresh token chain.
     pub(crate) credential_poll: Duration,
+    /// Swap-poll cadence, on BOTH paths. The daemon's intent lands in
+    /// `~/.clauth/live_sessions/`, which no watch covers, so this leg has no
+    /// filesystem signal to key on. Its own field rather than a second use of
+    /// `credential_poll`: the two happen to share a value but are bounded by
+    /// different things — that one by the single-use refresh chain, this one by
+    /// how fast a daemon-requested member swap should land.
+    pub(crate) swap_poll: Duration,
 }
 
 /// What `clauth start` runs on.
@@ -67,6 +73,7 @@ pub(crate) const PRODUCTION: Timings = Timings {
     fallback: Duration::from_secs(30),
     config_poll: Duration::from_millis(100),
     credential_poll: Duration::from_secs(1),
+    swap_poll: Duration::from_secs(1),
 };
 
 /// Which children of a watched directory are worth a reconcile.
@@ -104,9 +111,10 @@ pub(crate) struct EventWatcher {
     /// debouncer thread exits (panic or early return) — the watchdog detects
     /// this and falls back to polling.
     pub(crate) wake: Receiver<()>,
-    /// Kept so the debouncer outlives the watcher rather than being detached.
-    #[allow(dead_code)]
-    _debouncer: std::thread::JoinHandle<()>,
+    /// How many of the requested directories actually armed. Below
+    /// `specs.len()` the unarmed surface has no event coverage at all, so
+    /// [`run`] shortens the fallback rather than leaving it on 30 s.
+    armed: usize,
 }
 
 /// clauth publishes every file as a hidden `.<name>.tmp.<pid>[.<seq>]` sibling
@@ -188,10 +196,15 @@ pub(crate) fn watch_specs(
 /// Try to create a filesystem watcher for `specs`.
 ///
 /// A directory that cannot be armed is logged and skipped rather than failing
-/// the whole watcher — one absent `~/.claude/` would otherwise put every session
-/// on the fallback interval. Returns `None` only when nothing could be armed, or
-/// when `notify` itself is unavailable (inotify instance limit, unsupported
-/// platform); the caller then falls back to polling.
+/// the whole watcher. `inotify_add_watch` fails per-directory, so a box at
+/// `fs.inotify.max_user_watches` hands back some arms and not others, and the
+/// ones that did arm are worth keeping. What partial arming must NOT do is leave
+/// the rest on the 30 s fallback, which is 30x worse than the poll it replaced —
+/// [`run`] reads [`EventWatcher::armed`] and shortens the fallback for that.
+///
+/// Returns `None` only when nothing could be armed, or when `notify` itself is
+/// unavailable (inotify instance limit, unsupported platform); the caller then
+/// falls back to polling.
 pub(crate) fn try_start(specs: &[WatchSpec], debounce: Duration) -> Option<EventWatcher> {
     let (raw_tx, raw_rx) = unbounded();
 
@@ -229,46 +242,81 @@ pub(crate) fn try_start(specs: &[WatchSpec], debounce: Duration) -> Option<Event
 
     let (wake_tx, wake_rx) = bounded::<()>(1);
 
-    // Debouncer thread: coalesces a burst of events into one wake.
-    let debouncer = std::thread::Builder::new()
+    // Debouncer thread: coalesces a burst of events into one wake. Detached —
+    // it ends when `RecommendedWatcher`'s drop disconnects `raw_rx`, and its
+    // exit drops `wake_tx`, which is how the loop learns the debouncer died.
+    std::thread::Builder::new()
         .name("clauth-wdog-evt".into())
-        .spawn(move || {
-            loop {
-                // Block until the first event or the watcher is dropped
-                // (disconnects raw_rx).
-                if raw_rx.recv().is_err() {
-                    return;
-                }
-                // `try_send` on a `bounded(1)`: a wake already queued covers
-                // this event too, and blocking here would stall the drain
-                // below behind a reconcile.
-                match wake_tx.try_send(()) {
-                    Ok(()) | Err(crossbeam_channel::TrySendError::Full(())) => {}
-                    Err(crossbeam_channel::TrySendError::Disconnected(())) => return,
-                }
-                // Coalesce for a FIXED window rather than until events go idle.
-                // A sustained write stream never goes idle, so an idle-gap
-                // window emits one wake at the head of the burst and then
-                // nothing at all until the stream stops — every change in
-                // between reaching reconcile only on the fallback interval.
-                let window_ends = Instant::now() + debounce;
-                loop {
-                    let left = window_ends.saturating_duration_since(Instant::now());
-                    match raw_rx.recv_timeout(left) {
-                        Ok(()) => {} // coalesce
-                        Err(crossbeam_channel::RecvTimeoutError::Timeout) => break,
-                        Err(crossbeam_channel::RecvTimeoutError::Disconnected) => return,
-                    }
-                }
-            }
-        })
+        .spawn(move || debounce_loop(&raw_rx, &wake_tx, debounce))
         .ok()?;
 
     Some(EventWatcher {
         handle,
         wake: wake_rx,
-        _debouncer: debouncer,
+        armed,
     })
+}
+
+/// Coalesce raw events into wakes, one per `debounce`-long window, until either
+/// channel disconnects.
+///
+/// Split out of the spawn so the window logic is testable without a filesystem
+/// and without the `bounded(1)` wake channel: under starvation that channel
+/// drops signals by design, which makes a wake COUNT taken through it a measure
+/// of the consumer's scheduling rather than of this loop.
+fn debounce_loop(
+    raw_rx: &Receiver<()>,
+    wake_tx: &crossbeam_channel::Sender<()>,
+    debounce: Duration,
+) {
+    // Signal, coalescing against a wake already queued. `Full` needs no second
+    // signal: an unconsumed wake already guarantees a reconcile that STARTS
+    // after this event, which is the property that matters. Blocking instead
+    // would stall the drain below behind a reconcile.
+    let signal = || {
+        !matches!(
+            wake_tx.try_send(()),
+            Err(crossbeam_channel::TrySendError::Disconnected(()))
+        )
+    };
+    loop {
+        // Block until the first event of a burst, or until the watcher is
+        // dropped (which disconnects raw_rx).
+        if raw_rx.recv().is_err() || !signal() {
+            return;
+        }
+        // Coalesce for a FIXED window rather than until events go idle. A
+        // sustained write stream never goes idle, so an idle-gap window emits
+        // one wake at the head of the burst and then nothing at all until the
+        // stream stops.
+        let window_ends = Instant::now() + debounce;
+        let mut coalesced = false;
+        loop {
+            let left = window_ends.saturating_duration_since(Instant::now());
+            // Leave on the CLOCK, not on the queue going quiet. `recv_timeout`
+            // with nothing left to wait returns the next queued event rather
+            // than timing out, so draining until it times out means draining
+            // until the producer pauses — which is the idle-gap behavior this
+            // window replaced, reappearing exactly when events outrun the
+            // drain. What is still queued belongs to the next window.
+            if left.is_zero() {
+                break;
+            }
+            match raw_rx.recv_timeout(left) {
+                Ok(()) => coalesced = true,
+                Err(crossbeam_channel::RecvTimeoutError::Timeout) => break,
+                Err(crossbeam_channel::RecvTimeoutError::Disconnected) => return,
+            }
+        }
+        // The head wake was emitted BEFORE everything this window swallowed, and
+        // the consumer drains it in microseconds against a window of hundreds of
+        // milliseconds. Without a wake strictly after the last coalesced event,
+        // that event has no replay at all — the same drop-with-no-replay the
+        // loop refuses to do one layer down.
+        if coalesced && !signal() {
+            return;
+        }
+    }
 }
 
 /// Why the event loop returned.
@@ -282,9 +330,35 @@ pub(crate) enum Exit {
 
 /// Run the watchdog until `shutdown` fires: event-driven while a watcher can be
 /// armed, polling otherwise.
+///
+/// A partially-armed watcher runs the event loop on a SHORTENED fallback. The
+/// unarmed directories have no event coverage, and leaving them on the 30 s
+/// safety net would be 30x worse than the 1 s credential poll this path replaced
+/// — the one outcome a "some coverage is better than none" degradation must not
+/// buy.
+///
+/// Ceiling: one clamped ticker cannot reproduce the poll's split cadence (config
+/// at 100 ms, credentials at 1 s), so an unarmed directory's CONFIG surface
+/// lands at 1 s — still 10x slower than polling would have been. Clamping to
+/// `config_poll` instead would fix that and pull the credential leg's state
+/// flock to 10 Hz, which the split existed to avoid. Upgrade path if it ever
+/// matters: give the event loop its own config ticker rather than one fallback.
 pub(crate) fn run(specs: &[WatchSpec], shutdown: &Receiver<()>, t: &Timings, r: &dyn Reconcile) {
     if let Some(watcher) = try_start(specs, t.debounce) {
-        match run_events(&watcher.wake, shutdown, t, r) {
+        let mut t = *t;
+        if watcher.armed < specs.len() {
+            // Said once here rather than left to the per-directory arm errors:
+            // those name a moment, this names a cost the whole session pays.
+            logline!(
+                "clauth: fs watcher armed {} of {} directories; the rest reconcile \
+                 every {:?} instead of on their events",
+                watcher.armed,
+                specs.len(),
+                t.credential_poll
+            );
+            t.fallback = t.credential_poll;
+        }
+        match run_events(&watcher.wake, shutdown, &t, r) {
             Exit::Shutdown => return,
             Exit::WatcherLost => {
                 logline!("clauth: fs watcher event channel disconnected, switching to poll")
@@ -304,7 +378,7 @@ pub(crate) fn run_events(
     r: &dyn Reconcile,
 ) -> Exit {
     let fallback = crossbeam_channel::tick(t.fallback);
-    let swap_poll = crossbeam_channel::tick(t.credential_poll);
+    let swap_poll = crossbeam_channel::tick(t.swap_poll);
     // `None` rather than a back-dated `Instant`: the first wake must reconcile
     // at once, and `Instant` arithmetic can underflow near boot.
     let mut last_reconcile: Option<Instant> = None;

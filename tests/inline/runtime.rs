@@ -4832,9 +4832,10 @@ fn a_relogin_reaches_a_sibling_session_without_waiting_for_the_fallback() {
         let b =
             ProfileRuntime::acquire(&profile, Isolation::Shared, &[], false).expect("acquire b");
 
-        // What makes the measurement discriminating: inside this window nothing
-        // but an event can have driven the reconcile.
-        let window = Duration::from_secs(5);
+        // Sized at the credential cadence the poll fallback would run: measured
+        // convergence here is ~30 ms, so this is a ~30x margin that still fails
+        // the moment the event path stops being the thing driving it.
+        let window = crate::watchdog::PRODUCTION.credential_poll;
         assert!(
             crate::watchdog::PRODUCTION.fallback > window,
             "fixture: the fallback ticker must not be able to meet the window, \
@@ -4856,7 +4857,6 @@ fn a_relogin_reaches_a_sibling_session_without_waiting_for_the_fallback() {
             }
             std::thread::sleep(Duration::from_millis(20));
         }
-        let took = started.elapsed();
 
         assert_eq!(
             fs::read(&canonical).expect("read canonical"),
@@ -4867,10 +4867,6 @@ fn a_relogin_reaches_a_sibling_session_without_waiting_for_the_fallback() {
             fs::read(&sibling).expect("read sibling"),
             CREDS_V2,
             "the sibling session still resolves the pre-re-login chain after {window:?}"
-        );
-        assert!(
-            took < window,
-            "reconcile took {took:?}, which only the fallback ticker explains"
         );
 
         drop(b);
@@ -4901,15 +4897,38 @@ fn the_fake_mode_mirror_converges_under_concurrent_publishes() {
         bytes.len() == TOKEN * REPEATS && bytes.chunks(TOKEN).all(|c| c == &bytes[..TOKEN])
     }
 
+    /// Every published entry on one side, as `(name, len, mtime)`. What a write
+    /// loop moves and a converged mirror does not — including a rewrite of
+    /// identical bytes, which `copy_file`'s rename stamps with a fresh mtime.
+    /// Staging siblings are excluded for the same reason production excludes
+    /// them: they are not published yet.
+    fn shape(side: &Path) -> Vec<(std::ffi::OsString, u64, SystemTime)> {
+        let mut out: Vec<_> = fs::read_dir(side)
+            .expect("read side")
+            .flatten()
+            .filter(|e| !crate::watchdog::is_staging(&e.file_name()))
+            .filter_map(|e| {
+                let meta = e.metadata().ok()?;
+                Some((e.file_name(), meta.len(), meta.modified().ok()?))
+            })
+            .collect();
+        out.sort();
+        out
+    }
+
     struct Mirror {
         home: PathBuf,
         runtime: PathBuf,
-        passes: std::sync::atomic::AtomicUsize,
+        /// Passes that actually PUBLISHED something. Counting passes instead
+        /// cannot tell a self-feeding loop from a notify reader draining a
+        /// backlog in dribs — the latter reconciles at the cooldown cap for as
+        /// long as the backlog lasts, which is correct behavior.
+        writes: std::sync::atomic::AtomicUsize,
         torn: std::sync::Mutex<Vec<String>>,
     }
     impl Mirror {
-        fn passes(&self) -> usize {
-            self.passes.load(std::sync::atomic::Ordering::Relaxed)
+        fn writes(&self) -> usize {
+            self.writes.load(std::sync::atomic::Ordering::Relaxed)
         }
         fn torn(&self) -> Vec<String> {
             self.torn.lock().unwrap_or_else(|p| p.into_inner()).clone()
@@ -4918,11 +4937,21 @@ fn the_fake_mode_mirror_converges_under_concurrent_publishes() {
     impl crate::watchdog::Reconcile for Mirror {
         fn config(&self) {}
         fn credentials(&self) {
+            let before = (shape(&self.home), shape(&self.runtime));
             mirror_tree(&self.home, &self.runtime).expect("mirror");
-            self.passes
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let after = (shape(&self.home), shape(&self.runtime));
+            if before != after {
+                self.writes
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
             for side in [&self.home, &self.runtime] {
                 for entry in fs::read_dir(side).expect("read side").flatten() {
+                    // A staging sibling a concurrent `copy_file` is mid-copy into
+                    // is half-written by definition and not yet published, so it
+                    // is not torn — the same filter production applies.
+                    if crate::watchdog::is_staging(&entry.file_name()) {
+                        continue;
+                    }
                     let path = entry.path();
                     let Ok(bytes) = fs::read(&path) else { continue };
                     if !intact(&bytes) {
@@ -4956,12 +4985,13 @@ fn the_fake_mode_mirror_converges_under_concurrent_publishes() {
         fallback: Duration::from_secs(600),
         config_poll: Duration::from_secs(600),
         credential_poll: Duration::from_secs(600),
+        swap_poll: Duration::from_secs(600),
     };
     let specs = crate::watchdog::watch_specs(&runtime, &store, &home);
     let mirror = Mirror {
         home: home.clone(),
         runtime: runtime.clone(),
-        passes: std::sync::atomic::AtomicUsize::new(0),
+        writes: std::sync::atomic::AtomicUsize::new(0),
         torn: std::sync::Mutex::new(Vec::new()),
     };
     let (shutdown_tx, shutdown_rx) = crossbeam_channel::bounded::<()>(1);
@@ -4993,22 +5023,26 @@ fn the_fake_mode_mirror_converges_under_concurrent_publishes() {
             writer.join().expect("writer");
         }
 
-        // A convergent mirror goes quiet: at most one more pass (the one that
-        // observes the last publish), then every file is byte-equal and it
-        // writes nothing. A self-feeding one keeps climbing.
+        // A convergent mirror stops PUBLISHING once the writers stop. It may
+        // still run any number of passes — a notify reader draining the writer
+        // phase's backlog keeps waking it, which is correct — so the oracle is
+        // bytes moved, not passes taken.
         std::thread::sleep(cooldown * 4);
-        let settled = mirror.passes();
+        let settled = mirror.writes();
         std::thread::sleep(cooldown * 8);
-        let after = mirror.passes();
+        let after = mirror.writes();
         drop(shutdown_tx);
 
         assert!(
             settled >= 2,
-            "fixture: the mirror ran {settled} times, so the soak never reached the code under test"
+            "fixture: the mirror published {settled} times during the soak, \
+             so quiescence below would hold no matter what the code does"
         );
-        assert!(
-            after - settled <= 1,
-            "the mirror kept re-triggering with no writer running: {} further passes",
+        assert_eq!(
+            after,
+            settled,
+            "the mirror published {} more times with no writer running: it is \
+             feeding on its own writes",
             after - settled
         );
         assert!(

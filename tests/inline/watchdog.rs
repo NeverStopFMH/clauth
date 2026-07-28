@@ -30,14 +30,28 @@ fn timings(cooldown: Duration) -> Timings {
         fallback: NEVER,
         config_poll: NEVER,
         credential_poll: NEVER,
+        swap_poll: NEVER,
     }
 }
 
-/// Records one span per credential leg and signals it, so a test can await each
-/// reconcile on a deadline. `work` simulates a reconcile slower than its own
+/// One credential leg, as the loop itself saw it.
+#[derive(Debug, Clone, Copy)]
+struct Pass {
+    entered: Instant,
+    returned: Instant,
+    /// Counters read INSIDE the leg, not by the test thread afterwards. The loop
+    /// signals `done` at the END of `credentials()` and only then calls
+    /// `swap_poll()`, so a cross-thread read after that signal races the loop's
+    /// own next step and reads whatever it happens to catch.
+    configs: usize,
+    swap_polls: usize,
+}
+
+/// Records one [`Pass`] per credential leg and signals it, so a test can await
+/// each reconcile on a deadline. `work` simulates a reconcile slower than its own
 /// cooldown — the fake-mode tree walk plus a state flock that can block for 25 s.
 struct Recorder {
-    spans: Mutex<Vec<(Instant, Instant)>>,
+    passes: Mutex<Vec<Pass>>,
     configs: AtomicUsize,
     swap_polls: AtomicUsize,
     work: Duration,
@@ -47,7 +61,7 @@ struct Recorder {
 impl Recorder {
     fn new(work: Duration, done: Sender<()>) -> Self {
         Self {
-            spans: Mutex::new(Vec::new()),
+            passes: Mutex::new(Vec::new()),
             configs: AtomicUsize::new(0),
             swap_polls: AtomicUsize::new(0),
             work,
@@ -55,8 +69,8 @@ impl Recorder {
         }
     }
 
-    fn span(&self, i: usize) -> (Instant, Instant) {
-        self.spans.lock().unwrap_or_else(|p| p.into_inner())[i]
+    fn pass(&self, i: usize) -> Pass {
+        self.passes.lock().unwrap_or_else(|p| p.into_inner())[i]
     }
 }
 
@@ -67,10 +81,15 @@ impl Reconcile for Recorder {
     fn credentials(&self) {
         let entered = Instant::now();
         std::thread::sleep(self.work);
-        self.spans
+        self.passes
             .lock()
             .unwrap_or_else(|p| p.into_inner())
-            .push((entered, Instant::now()));
+            .push(Pass {
+                entered,
+                returned: Instant::now(),
+                configs: self.configs.load(Ordering::Relaxed),
+                swap_polls: self.swap_polls.load(Ordering::Relaxed),
+            });
         let _ = self.done.send(());
     }
     fn swap_poll(&self) {
@@ -106,8 +125,8 @@ fn a_dir_watch_survives_the_rename_that_publishes_a_file() {
     let watcher = try_start(&specs, debounce).expect("watcher");
 
     for round in 0..3u32 {
-        // Clear of the previous burst's coalescing window, so a missing wake is
-        // a dead watch rather than a swallowed duplicate.
+        // Clear of the previous burst's coalescing window, so this round tests
+        // only the watch's survival and nothing about coalescing.
         std::thread::sleep(debounce * 3);
         publish(&target, format!(r#"{{"round":{round}}}"#).as_bytes());
         assert!(
@@ -117,35 +136,81 @@ fn a_dir_watch_survives_the_rename_that_publishes_a_file() {
     }
 }
 
-/// A burst coalesces into one wake per WINDOW, never into one wake for the whole
-/// burst. A write stream that keeps the queue non-empty never goes idle, so an
-/// idle-gap window delivers the head event and then nothing until the stream
-/// stops — every change in between reaching reconcile only on the fallback.
+/// A publish landing INSIDE a coalescing window still has to reach reconcile.
+/// The head wake is emitted before that publish exists and the consumer takes it
+/// in microseconds against a window of hundreds of milliseconds, so without a
+/// wake emitted at the END of the window the change has no replay at all and
+/// waits out the entire fallback — the drop-with-no-replay `run_events` refuses
+/// to do one layer down.
 #[test]
-fn a_sustained_write_stream_keeps_waking_the_watchdog() {
+fn a_publish_inside_the_coalescing_window_still_wakes_the_watchdog() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let target = tmp.path().join("settings.json");
     std::fs::write(&target, b"{}").expect("seed target");
 
-    let debounce = Duration::from_millis(30);
-    let specs = vec![WatchSpec::new(tmp.path(), Interest::AnyChild)];
+    let debounce = Duration::from_millis(100);
+    let specs = vec![WatchSpec::new(
+        tmp.path(),
+        Interest::Names(vec!["settings.json".into()]),
+    )];
     let watcher = try_start(&specs, debounce).expect("watcher");
 
-    let deadline = Instant::now() + debounce * 20;
-    let mut publishes = 0u32;
-    let mut wakes = 0u32;
-    while Instant::now() < deadline {
-        publishes += 1;
-        publish(&target, format!(r#"{{"n":{publishes}}}"#).as_bytes());
-        std::thread::sleep(debounce / 6);
-        if watcher.wake.try_recv().is_ok() {
-            wakes += 1;
-        }
-    }
+    publish(&target, br#"{"round":0}"#);
+    watcher
+        .wake
+        .recv_timeout(BOUND)
+        .expect("the head publish produced no wake");
+
+    // No sleep: this lands while the first burst's window is still open, which
+    // is where a credential write racing an unrelated one in the same directory
+    // actually lands.
+    publish(&target, br#"{"round":1}"#);
     assert!(
-        wakes >= 3,
-        "{publishes} publishes with no idle gap produced {wakes} wakes: \
-         the burst was swallowed rather than coalesced"
+        watcher.wake.recv_timeout(BOUND).is_ok(),
+        "a publish inside the coalescing window was swallowed with no replay"
+    );
+}
+
+/// A burst coalesces into one wake per WINDOW, never into one wake for the whole
+/// burst. A stream that keeps the queue non-empty never goes idle, so an idle-gap
+/// window emits at the head and then nothing until the stream stops — every
+/// change in between reaching reconcile only on the fallback interval.
+///
+/// Driven through `debounce_loop` directly, with an UNBOUNDED wake channel and
+/// the count taken after the feed stops. Measuring through the production
+/// `bounded(1)` channel instead counts what a consumer managed to dequeue, which
+/// under starvation is 1 no matter how the window behaves — pinned to one CPU
+/// that read the healthy debouncer as the bug it was written to catch.
+#[test]
+fn a_sustained_event_stream_wakes_once_per_window_not_once_per_burst() {
+    let debounce = Duration::from_millis(30);
+    let windows = 20;
+    let (raw_tx, raw_rx) = unbounded();
+    let (wake_tx, wake_rx) = unbounded();
+
+    let mut events = 0u32;
+    std::thread::scope(|scope| {
+        scope.spawn(|| debounce_loop(&raw_rx, &wake_tx, debounce));
+
+        let deadline = Instant::now() + debounce * windows;
+        while Instant::now() < deadline {
+            events += 1;
+            raw_tx.send(()).expect("feed");
+            std::thread::sleep(debounce / 6);
+        }
+        // Ends the loop, so the count below is total signals emitted rather than
+        // a sample taken while it was still running.
+        drop(raw_tx);
+    });
+
+    // The scope borrowed `wake_tx` for the loop; releasing it here is what lets
+    // `iter()` terminate instead of blocking on a sender that still exists.
+    drop(wake_tx);
+    let wakes = wake_rx.iter().count();
+    assert!(
+        wakes >= 5,
+        "{events} events with no idle gap over {windows} windows produced \
+         {wakes} wakes: the whole burst was coalesced into one"
     );
 }
 
@@ -263,11 +328,7 @@ fn a_wake_inside_the_cooldown_is_deferred_not_dropped() {
         drop(shutdown_tx);
     });
 
-    assert_eq!(
-        rec.configs.load(Ordering::Relaxed),
-        2,
-        "both reconciles must run every leg"
-    );
+    assert_eq!(rec.pass(1).configs, 2, "both reconciles must run every leg");
 }
 
 /// Stamping the cooldown before the reconcile spends it on the reconcile
@@ -299,9 +360,7 @@ fn the_cooldown_is_measured_from_the_end_of_the_reconcile() {
         drop(shutdown_tx);
     });
 
-    let (_, first_returned) = rec.span(0);
-    let (second_entered, _) = rec.span(1);
-    let gap = second_entered.duration_since(first_returned);
+    let gap = rec.pass(1).entered.duration_since(rec.pass(0).returned);
     assert!(
         gap >= cooldown,
         "the second reconcile started {gap:?} after the first returned, \
@@ -325,6 +384,7 @@ fn the_poll_fallback_reconciles_when_no_directory_can_be_armed() {
         fallback: NEVER,
         config_poll: Duration::from_millis(20),
         credential_poll: Duration::from_millis(200),
+        swap_poll: Duration::from_millis(200),
     };
     assert!(
         try_start(&specs, t.debounce).is_none(),
@@ -341,16 +401,70 @@ fn the_poll_fallback_reconciles_when_no_directory_can_be_armed() {
         done_rx
             .recv_timeout(BOUND)
             .expect("the polling fallback never reconciled credentials");
-        assert_eq!(
-            rec.configs.load(Ordering::Relaxed),
-            10,
-            "the config leg runs `credential_poll / config_poll` times per credential leg"
-        );
-
         done_rx
             .recv_timeout(BOUND)
             .expect("the polling fallback stopped after one credential reconcile");
-        assert!(rec.swap_polls.load(Ordering::Relaxed) >= 2);
+
+        drop(shutdown_tx);
+    });
+
+    // Read off the legs themselves: the loop bumps `swap_polls` AFTER the signal
+    // `done` rides, so a cross-thread read here trails the loop by a step.
+    assert_eq!(
+        rec.pass(0).configs,
+        10,
+        "the config leg runs `credential_poll / config_poll` times per credential leg"
+    );
+    assert_eq!(
+        rec.pass(1).configs,
+        20,
+        "and keeps that ratio on the second credential leg"
+    );
+    assert_eq!(
+        rec.pass(1).swap_polls,
+        1,
+        "each credential leg is followed by exactly one swap poll"
+    );
+}
+
+/// Partial arming must not silently cost 30x. The unarmed directories have no
+/// event coverage at all, so leaving them on the 30 s safety net is worse than
+/// the 1 s poll this path replaced — the loop shortens the fallback instead.
+#[test]
+fn a_partially_armed_watcher_shortens_the_fallback() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let live = tmp.path().join("live");
+    std::fs::create_dir_all(&live).expect("mkdir live");
+    let specs = vec![
+        WatchSpec::new(&live, Interest::AnyChild),
+        WatchSpec::new(tmp.path().join("does-not-exist"), Interest::AnyChild),
+    ];
+    let t = Timings {
+        debounce: Duration::from_millis(20),
+        cooldown: Duration::ZERO,
+        // Both far past the bound, so only the CLAMP can explain a reconcile.
+        fallback: NEVER,
+        config_poll: NEVER,
+        credential_poll: Duration::from_millis(200),
+        swap_poll: NEVER,
+    };
+    let watcher = try_start(&specs, t.debounce).expect("one directory still arms");
+    assert_eq!(watcher.armed, 1, "exactly one of the two must have armed");
+    drop(watcher);
+
+    let (shutdown_tx, shutdown_rx) = crossbeam_channel::bounded::<()>(1);
+    let (done_tx, done_rx) = unbounded();
+    let rec = Recorder::new(Duration::ZERO, done_tx);
+
+    std::thread::scope(|scope| {
+        scope.spawn(|| run(&specs, &shutdown_rx, &t, &rec));
+
+        // Nothing is published, so no event exists: a reconcile inside the bound
+        // can only come from the fallback having been clamped to
+        // `credential_poll`. Unclamped it would be `NEVER`.
+        done_rx
+            .recv_timeout(BOUND)
+            .expect("a partially armed watcher left the unarmed surface on the long fallback");
 
         drop(shutdown_tx);
     });

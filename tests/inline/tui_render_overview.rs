@@ -850,15 +850,14 @@ fn disabled_row_type_cell_does_not_pulse() {
     b.credentials = Some(oauth_creds());
     let config = config_with(vec![a, b], None, vec![]);
 
-    // `pulse_name_spans` keys off `app.started_at.elapsed()`, so two Apps
-    // constructed a real interval apart sample different phases of the wave.
-    // 450ms is the crest of the 900ms sweep, where the envelope peaks: the
-    // phase furthest from the flat 0ms frame, so a surviving pulse shows up at
-    // its widest rather than at some near-zero lean that rounds back to base.
+    // `pulse_name_spans` keys off `App::anim_ms`, so two Apps with different
+    // pinned phases sample different points of the wave. 450ms is the crest of
+    // the 900ms sweep, where the envelope peaks: the phase furthest from the
+    // flat 0ms frame, so a surviving pulse shows up at its widest rather than at
+    // some near-zero lean that rounds back to base.
     let snapshot = |idx: usize| -> Vec<(String, Option<ratatui::style::Color>)> {
         let mut app = App::new(config.clone());
-        app.started_at =
-            std::time::Instant::now() - std::time::Duration::from_millis(450 * idx as u64);
+        app.anim_phase_ms = Some(450 * idx as u64);
         let widths = OverviewWidths::new(110, &app);
         render_overview_row(&app, 0, &widths, false, true)
             .spans
@@ -875,7 +874,7 @@ fn disabled_row_type_cell_does_not_pulse() {
     // Control: the ENABLED sibling does pulse, so the comparison above is real.
     let enabled_snapshot = |elapsed_ms: u64| -> Vec<Option<ratatui::style::Color>> {
         let mut app = App::new(config.clone());
-        app.started_at = std::time::Instant::now() - std::time::Duration::from_millis(elapsed_ms);
+        app.anim_phase_ms = Some(elapsed_ms);
         let widths = OverviewWidths::new(110, &app);
         render_overview_row(&app, 1, &widths, false, true)
             .spans

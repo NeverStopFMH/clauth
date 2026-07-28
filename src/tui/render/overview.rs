@@ -420,8 +420,7 @@ fn render_overview_row(
     // animate.
     if profile.credentials.is_some() && !disabled {
         let (clamped, pad) = fixed_split(&label, widths.kind);
-        let elapsed = app.started_at.elapsed().as_millis() as u64;
-        let mut pulse = pulse_name_spans(&clamped, theme::dim(), elapsed);
+        let mut pulse = pulse_name_spans(&clamped, theme::dim(), app.anim_ms());
         pulse.push(Span::raw(pad));
         spans.extend(pulse);
     } else {

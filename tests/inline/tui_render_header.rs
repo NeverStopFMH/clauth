@@ -174,6 +174,7 @@ fn gauge_fit_provider_profile_never_shows_a_bar() {
 
 #[test]
 fn header_height_is_always_three() {
+    let _home = crate::testutil::HomeSandbox::new();
     let with_active = app_with(vec![oauth_profile("uwuclxdy", 42.0)], Some("uwuclxdy"));
     assert_eq!(header_height(&with_active), 3);
 
@@ -189,6 +190,7 @@ fn header_height_is_always_three() {
 
 #[test]
 fn gauge_after_account_count_on_wide_terminal() {
+    let _home = crate::testutil::HomeSandbox::new();
     let mut app = app_with(vec![oauth_profile("uwuclxdy", 42.0)], Some("uwuclxdy"));
     app.tab = Tab::Tokens;
     let row1 = row_content(&app, 120, 1);
@@ -203,6 +205,7 @@ fn gauge_after_account_count_on_wide_terminal() {
 
 #[test]
 fn gauge_after_account_count_shows_bar_when_roomy() {
+    let _home = crate::testutil::HomeSandbox::new();
     let mut app = app_with(vec![oauth_profile("uwuclxdy", 42.0)], Some("uwuclxdy"));
     app.tab = Tab::Tokens;
     let row1 = row_content(&app, 120, 1);
@@ -211,6 +214,7 @@ fn gauge_after_account_count_shows_bar_when_roomy() {
 
 #[test]
 fn gauge_dash_for_provider_after_account_count() {
+    let _home = crate::testutil::HomeSandbox::new();
     let mut app = app_with(vec![provider_profile("z.ai")], Some("z.ai"));
     app.tab = Tab::Tokens;
     let row1 = row_content(&app, 90, 1);
@@ -227,6 +231,7 @@ fn gauge_dash_for_provider_after_account_count() {
 
 #[test]
 fn gauge_hidden_in_compact_mode() {
+    let _home = crate::testutil::HomeSandbox::new();
     let mut app = app_with(vec![oauth_profile("uwuclxdy", 42.0)], Some("uwuclxdy"));
     app.compact = true;
     let rows = render_header_rows(&app, 90);
@@ -240,6 +245,7 @@ fn gauge_hidden_in_compact_mode() {
 
 #[test]
 fn gauge_hidden_when_no_active_profile() {
+    let _home = crate::testutil::HomeSandbox::new();
     let app = app_with(vec![oauth_profile("uwuclxdy", 42.0)], None);
     let rows = render_header_rows(&app, 90);
     assert_eq!(rows.len(), 3);
@@ -249,6 +255,7 @@ fn gauge_hidden_when_no_active_profile() {
 
 #[test]
 fn gauge_collapses_to_name_only_on_narrow_terminal() {
+    let _home = crate::testutil::HomeSandbox::new();
     let mut app = app_with(vec![oauth_profile("uwuclxdy", 42.0)], Some("uwuclxdy"));
     app.tab = Tab::Tokens;
     let row1 = row_content(&app, 60, 1);
@@ -262,6 +269,7 @@ fn gauge_collapses_to_name_only_on_narrow_terminal() {
 
 #[test]
 fn gauge_on_row1_with_status_dot() {
+    let _home = crate::testutil::HomeSandbox::new();
     let mut app = app_with(vec![oauth_profile("uwuclxdy", 42.0)], Some("uwuclxdy"));
     app.tab = Tab::Tokens;
     let row1 = row_content(&app, 100, 1);
@@ -272,6 +280,7 @@ fn gauge_on_row1_with_status_dot() {
 
 #[test]
 fn row2_is_tabs_only() {
+    let _home = crate::testutil::HomeSandbox::new();
     let mut app = app_with(vec![oauth_profile("uwuclxdy", 42.0)], Some("uwuclxdy"));
     app.tab = Tab::Tokens;
     let row2 = row_content(&app, 90, 2);
@@ -286,6 +295,9 @@ fn row2_is_tabs_only() {
 
 #[test]
 fn daemon_dot_maps_health_to_color_and_hides_when_absent() {
+    // `HomeSandbox` outermost: its `HOME_TEST_LOCK` must not be taken while a
+    // RankedMutex (here `TierSandbox`'s) is held.
+    let _home = crate::testutil::HomeSandbox::new();
     let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
     use crate::daemon::DaemonHealth;
     let mut app = app_with(vec![oauth_profile("uwuclxdy", 42.0)], Some("uwuclxdy"));

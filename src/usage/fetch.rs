@@ -310,7 +310,7 @@ impl SpendInfo {
 }
 
 /// Canonical account tier, computed once at fetch time. The single source of
-/// truth that `plan_label` / `endpoint_label` render from — collapses the old
+/// truth that `format::account_tier` renders from — collapses the old
 /// four-field `PlanInfo` fan-out into one enum. `Serialize`/`Deserialize` keep it
 /// in the `usage_cache.json` shape; a field rename simply misses → refetches.
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]

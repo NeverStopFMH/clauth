@@ -1,6 +1,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use super::*;
+use crate::usage::PlanInfo;
 
 // The centralized diagnostics are load-bearing precisely because they render on
 // three surfaces from one definition; these pin that one head reaches all three
@@ -205,31 +206,39 @@ fn format_pct_shows_fractional_percent() {
 }
 
 #[test]
-fn plan_label_renders_the_tier_only_the_canceled_marker_is_on_the_status_line() {
-    let canceled = PlanInfo {
-        tier: PlanTier::Free,
-        subscription_status: Some("canceled".to_string()),
-    };
-    assert_eq!(plan_label(&canceled).as_deref(), Some("Claude Free"));
+fn account_tier_reads_the_fetched_tier_only_the_canceled_marker_is_on_the_status_line() {
+    let mut canceled = crate::testutil::blank_profile("a");
+    canceled.usage = Some(crate::usage::UsageInfo {
+        plan: Some(PlanInfo {
+            tier: PlanTier::Free,
+            subscription_status: Some("canceled".to_string()),
+        }),
+        ..Default::default()
+    });
+    assert_eq!(account_tier(&canceled), Some(PlanTier::Free));
 
     // A genuine, never-subscribed free account looks the same here — the
-    // canceled distinction lives on the status line, not the plan label.
-    let free = PlanInfo {
-        tier: PlanTier::Free,
-        subscription_status: None,
-    };
-    assert_eq!(plan_label(&free).as_deref(), Some("Claude Free"));
+    // canceled distinction lives on the status line, not the plan tier.
+    let mut free = crate::testutil::blank_profile("b");
+    free.usage = Some(crate::usage::UsageInfo {
+        plan: Some(PlanInfo {
+            tier: PlanTier::Free,
+            subscription_status: None,
+        }),
+        ..Default::default()
+    });
+    assert_eq!(account_tier(&free), Some(PlanTier::Free));
 }
 
-/// An unfetched plan has no tier at all. `endpoint_label` says so with `None`
+/// An unfetched plan has no tier at all. `account_tier` says so with `None`
 /// so each surface picks its own no-data form — a bare "Claude" here read as a
 /// real plan, and shipped to the Overview chip, the Usage `plan` row and
 /// `which --json`'s `tier` alike.
 #[test]
-fn endpoint_label_reports_no_tier_for_an_unfetched_plan() {
+fn account_tier_reports_no_tier_for_an_unfetched_plan() {
     // No credentials at all: nothing on disk claims a tier.
     let bare = crate::testutil::blank_profile("a");
-    assert_eq!(endpoint_label(&bare), None);
+    assert_eq!(account_tier(&bare), None);
 
     // A token whose `subscription_type` is not one clauth classifies is the
     // same "we do not know" — never a fabricated tier.
@@ -243,7 +252,7 @@ fn endpoint_label_reports_no_tier_for_an_unfetched_plan() {
             subscription_type: Some("something_new".into()),
         }),
     });
-    assert_eq!(endpoint_label(&unclassified), None);
+    assert_eq!(account_tier(&unclassified), None);
 
     // A fetched plan whose tier never classified, with no token claim to fall
     // through to, reads the same way.
@@ -255,7 +264,7 @@ fn endpoint_label_reports_no_tier_for_an_unfetched_plan() {
         }),
         ..Default::default()
     });
-    assert_eq!(endpoint_label(&unknown_plan), None);
+    assert_eq!(account_tier(&unknown_plan), None);
 }
 
 /// An UNCLASSIFIED fetched plan is not an answer, so it falls through to the
@@ -263,7 +272,7 @@ fn endpoint_label_reports_no_tier_for_an_unfetched_plan() {
 /// on it instead left this surface reporting "no data" while `status.json` showed
 /// a tier for the same account at the same instant.
 #[test]
-fn endpoint_label_falls_through_an_unclassified_fetched_plan_to_the_token() {
+fn account_tier_falls_through_an_unclassified_fetched_plan_to_the_token() {
     let token = |sub: &str| {
         Some(crate::profile::ClaudeCredentials {
             claude_ai_oauth: Some(crate::profile::OAuthToken {
@@ -289,8 +298,8 @@ fn endpoint_label_falls_through_an_unclassified_fetched_plan_to_the_token() {
     unclassified.usage = plan(PlanTier::Unknown);
     unclassified.credentials = token("max");
     assert_eq!(
-        endpoint_label(&unclassified).as_deref(),
-        Some("Claude Max"),
+        account_tier(&unclassified),
+        Some(PlanTier::Max(None)),
         "an unclassified fetched tier must not mask the token's claim"
     );
 
@@ -300,8 +309,8 @@ fn endpoint_label_falls_through_an_unclassified_fetched_plan_to_the_token() {
     disagreeing.usage = plan(PlanTier::Max(Some(20)));
     disagreeing.credentials = token("pro");
     assert_eq!(
-        endpoint_label(&disagreeing).as_deref(),
-        Some("Claude Max 20x"),
+        account_tier(&disagreeing),
+        Some(PlanTier::Max(Some(20))),
         "the fetched tier is the better source and still wins"
     );
 }
@@ -311,7 +320,7 @@ fn endpoint_label_falls_through_an_unclassified_fetched_plan_to_the_token() {
 /// form. Free has no `has_claude_*` flag to recover it, so the token is the only
 /// pre-fetch source it has.
 #[test]
-fn endpoint_label_reads_back_a_free_logins_stored_token() {
+fn account_tier_reads_back_a_free_logins_stored_token() {
     let mut free = crate::testutil::blank_profile("a");
     free.credentials = Some(crate::profile::ClaudeCredentials {
         claude_ai_oauth: Some(crate::profile::OAuthToken {
@@ -322,14 +331,13 @@ fn endpoint_label_reads_back_a_free_logins_stored_token() {
             subscription_type: Some("free".into()),
         }),
     });
-    assert_eq!(endpoint_label(&free).as_deref(), Some("Claude Free"));
+    assert_eq!(account_tier(&free), Some(PlanTier::Free));
 }
 
-/// The other direction, all three branches: a real tier still renders, `Free`
-/// is untouched by the unfetched-plan change, and a third-party profile still
-/// gets its raw endpoint url back.
+/// The other direction: a real tier still renders, and `Free` is untouched by
+/// the unfetched-plan change.
 #[test]
-fn endpoint_label_still_renders_every_known_tier_and_the_endpoint_url() {
+fn account_tier_still_renders_every_known_tier() {
     let mut fetched = crate::testutil::blank_profile("a");
     fetched.usage = Some(crate::usage::UsageInfo {
         plan: Some(PlanInfo {
@@ -338,7 +346,7 @@ fn endpoint_label_still_renders_every_known_tier_and_the_endpoint_url() {
         }),
         ..Default::default()
     });
-    assert_eq!(endpoint_label(&fetched).as_deref(), Some("Claude Max 20x"));
+    assert_eq!(account_tier(&fetched), Some(PlanTier::Max(Some(20))));
 
     let mut free = crate::testutil::blank_profile("b");
     free.usage = Some(crate::usage::UsageInfo {
@@ -348,7 +356,7 @@ fn endpoint_label_still_renders_every_known_tier_and_the_endpoint_url() {
         }),
         ..Default::default()
     });
-    assert_eq!(endpoint_label(&free).as_deref(), Some("Claude Free"));
+    assert_eq!(account_tier(&free), Some(PlanTier::Free));
 
     let mut token_only = crate::testutil::blank_profile("c");
     token_only.credentials = Some(crate::profile::ClaudeCredentials {
@@ -360,13 +368,5 @@ fn endpoint_label_still_renders_every_known_tier_and_the_endpoint_url() {
             subscription_type: Some("pro".into()),
         }),
     });
-    assert_eq!(endpoint_label(&token_only).as_deref(), Some("Claude Pro"));
-
-    let mut third_party = crate::testutil::blank_profile("d");
-    third_party.base_url = Some("https://api.deepseek.com/anthropic".to_string());
-    assert_eq!(
-        endpoint_label(&third_party).as_deref(),
-        Some("https://api.deepseek.com/anthropic"),
-        "the base-url branch must keep returning the raw endpoint"
-    );
+    assert_eq!(account_tier(&token_only), Some(PlanTier::Pro));
 }

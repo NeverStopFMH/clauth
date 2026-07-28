@@ -282,10 +282,10 @@ fn tp_rows_disabled_profile_is_terminal() {
 }
 
 /// With no fetched plan, the Usage `plan` row must match the Overview's tier
-/// label (`endpoint_label`) instead of a bare "oauth"/"api", so the two surfaces
+/// label (`account_tier`) instead of a bare "oauth"/"api", so the two surfaces
 /// never disagree. A `subscription_type` claim renders as its tier.
 #[test]
-fn header_lines_plan_falls_back_to_endpoint_label() {
+fn header_lines_plan_falls_back_to_account_tier() {
     let mut profile = crate::testutil::blank_profile("a");
     profile.credentials = Some(crate::profile::ClaudeCredentials {
         claude_ai_oauth: Some(crate::profile::OAuthToken {
@@ -309,7 +309,9 @@ fn header_lines_plan_falls_back_to_endpoint_label() {
         .first()
         .map(|l| l.spans.iter().map(|s| s.content.clone()).collect())
         .unwrap_or_default();
-    let expected = crate::format::endpoint_label(&profile).expect("a 'max' token claims a tier");
+    let expected = crate::format::account_tier(&profile)
+        .and_then(|t| t.display())
+        .expect("a 'max' token claims a tier");
     assert_eq!(expected, "Claude Max", "sanity: the tier label under test");
     assert!(
         plan_row.contains(&expected),
@@ -363,10 +365,10 @@ fn header_lines_plan_dashes_when_no_tier_is_known() {
     );
 }
 
-/// The `endpoint_label` fallback is gated to OAuth profiles: an api-key profile
-/// with no plan keeps "api", never its raw endpoint url (which `endpoint_label`
-/// returns base-url-first). Pins the regression a blanket `endpoint_label` swap
-/// would cause on DeepSeek/z.ai/generic rows.
+/// The `account_tier` fallback is gated to OAuth profiles: an api-key profile
+/// with no plan keeps "api", never a leaked tier guess or its raw endpoint url.
+/// Pins the regression an ungated `account_tier` call would cause on
+/// DeepSeek/z.ai/generic rows.
 #[test]
 fn header_lines_plan_keeps_api_for_api_key_profiles() {
     let profile = crate::profile::Profile::new(

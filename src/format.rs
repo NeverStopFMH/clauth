@@ -9,7 +9,7 @@
 //! grab-bag `format.rs` (surveyed 2026-07-16).
 
 use crate::profile::Profile;
-use crate::usage::{PlanInfo, PlanTier};
+use crate::usage::PlanTier;
 
 // ── Cross-surface diagnostics ───────────────────────────────────────────────
 //
@@ -239,35 +239,32 @@ pub(crate) fn truncate(s: &str, max: usize) -> String {
     out
 }
 
-/// A third-party profile's raw endpoint, else the account's tier. `None` when
-/// no tier is known, so a surface renders its own no-data form rather than a
-/// bare "Claude" that reads as a real plan.
-pub(crate) fn endpoint_label(profile: &Profile) -> Option<String> {
-    if let Some(url) = &profile.base_url {
-        return Some(url.clone());
-    }
+/// The account's tier: a fetched plan wins when classified, else the OAuth
+/// token's `subscription_type` claim, else `None` when neither names one. A
+/// surface renders its own no-data form on `None` rather than a bare "Claude"
+/// that reads as a real plan.
+pub(crate) fn account_tier(profile: &Profile) -> Option<PlanTier> {
     // A fetched tier wins, but an UNCLASSIFIED one is not an answer: fall through
     // the way `profile_json::tier_label` does, or this surface reads "no data"
     // while that one shows the token's tier for the very same account.
-    if let Some(label) = profile
+    let fetched = profile
         .usage
         .as_ref()
         .and_then(|u| u.plan.as_ref())
-        .and_then(plan_label)
-    {
-        return Some(label);
-    }
-    // No fetched plan yet — fall back to the OAuth token's subscription_type.
-    let sub = profile
-        .credentials
-        .as_ref()
-        .and_then(|c| c.claude_ai_oauth.as_ref())
-        .and_then(|o| o.subscription_type.as_deref());
-    PlanTier::from_subscription_type(sub).display()
-}
-
-pub(crate) fn plan_label(plan: &PlanInfo) -> Option<String> {
-    plan.tier.display()
+        .map(|p| p.tier.clone())
+        .filter(|t| *t != PlanTier::Unknown);
+    fetched.or_else(|| {
+        // No fetched plan yet — fall back to the OAuth token's subscription_type.
+        let sub = profile
+            .credentials
+            .as_ref()
+            .and_then(|c| c.claude_ai_oauth.as_ref())
+            .and_then(|o| o.subscription_type.as_deref());
+        match PlanTier::from_subscription_type(sub) {
+            PlanTier::Unknown => None,
+            tier => Some(tier),
+        }
+    })
 }
 
 /// Percent from API `f64`: drops trailing `.0` on whole numbers → `42%`, `42.3%`.

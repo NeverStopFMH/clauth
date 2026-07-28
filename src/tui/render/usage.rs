@@ -21,7 +21,7 @@ use super::panes::{
     draw_profile_selector, empty_state, key_cell, master_detail, pill, rail_hint_lines,
     section_box, section_box_verbatim,
 };
-use crate::format::{endpoint_label, format_pct, plan_label};
+use crate::format::{account_tier, format_pct};
 use crate::profile::Profile;
 use crate::providers::StatRowKind;
 use crate::usage::{
@@ -722,20 +722,11 @@ fn header_lines(profile: &Profile, header: &HeaderState, inner_w: u16) -> Vec<Li
         .third_party_usage
         .as_ref()
         .and_then(|s| s.plan.clone())
-        .or_else(|| {
-            profile
-                .usage
-                .as_ref()
-                .and_then(|u| u.plan.as_ref())
-                .and_then(plan_label)
-        })
         // With no fetched plan, show the OAuth token's tier (what the Overview
         // shows) instead of a bare "oauth"; api-key profiles keep "api".
-        // `is_oauth` gates out the base-url branch of `endpoint_label`, so it
-        // only ever resolves to a tier here, never a raw endpoint url.
         .or_else(|| {
             if profile.is_oauth() {
-                endpoint_label(profile)
+                account_tier(profile).and_then(|t| t.display())
             } else {
                 Some("api".to_string())
             }

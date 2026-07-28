@@ -6,7 +6,7 @@ use ratatui::style::{Color, Style};
 use ratatui::text::Span;
 
 use super::super::theme;
-use crate::format::endpoint_label;
+use crate::format::account_tier;
 use crate::profile::{AppState, ClockFormat, Profile, ResetDisplay};
 use crate::usage::{
     FetchStatus, ProfileActivity, UsageWindow, humanize_duration, iso_to_epoch_secs, now_epoch_secs,
@@ -79,13 +79,9 @@ pub(super) fn account_type_label(profile: &Profile) -> String {
     if !profile.is_oauth() {
         return "API".to_string();
     }
-    let Some(label) = endpoint_label(profile) else {
-        return NO_DATA.to_string();
-    };
-    label
-        .strip_prefix("Claude ")
-        .unwrap_or(label.as_str())
-        .to_string()
+    account_tier(profile)
+        .and_then(|t| t.short_label())
+        .unwrap_or_else(|| NO_DATA.to_string())
 }
 
 pub(super) fn bar_string_with_cells(pct: f64, cells: usize) -> String {

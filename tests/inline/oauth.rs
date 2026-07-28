@@ -543,9 +543,8 @@ fn gate_invalid_refresh_marks_broken_and_refuses() {
         Some("rt-revoked"),
         Some(past_expiry()),
     )));
-    let refresher = |_rt: &str, _scopes: Option<&str>| {
-        Err(RefreshError::Invalid("HTTP 400: invalid_grant".to_string()))
-    };
+    let refresher =
+        |_rt: &str, _scopes: Option<&str>| Err(RefreshError::Invalid(TokenFailure::Status(400)));
     assert!(matches!(
         ensure_installable(&handle, name, refresher),
         AuthGate::Broken
@@ -568,9 +567,8 @@ fn gate_transient_refresh_does_not_quarantine() {
         Some("rt-ok"),
         Some(past_expiry()),
     )));
-    let refresher = |_rt: &str, _scopes: Option<&str>| {
-        Err(RefreshError::Transient(anyhow::anyhow!("connection reset")))
-    };
+    let refresher =
+        |_rt: &str, _scopes: Option<&str>| Err(RefreshError::Transient(TokenFailure::Transport));
     assert!(matches!(
         ensure_installable(&handle, name, refresher),
         AuthGate::Transient(_)
@@ -647,9 +645,8 @@ fn gate_flagged_profile_with_a_dead_chain_stays_broken() {
     let mut config = oauth_config(name, Some("rt-revoked"), Some(future_expiry()));
     config.set_auth_broken(name, true);
     let handle = Arc::new(RankedMutex::new(config));
-    let refresher = |_rt: &str, _scopes: Option<&str>| {
-        Err(RefreshError::Invalid("HTTP 400: invalid_grant".to_string()))
-    };
+    let refresher =
+        |_rt: &str, _scopes: Option<&str>| Err(RefreshError::Invalid(TokenFailure::Status(400)));
     assert!(matches!(
         ensure_installable(&handle, name, refresher),
         AuthGate::Broken
@@ -664,7 +661,9 @@ fn gate_flagged_profile_with_a_dead_chain_stays_broken() {
 
 /// A 2xx token-endpoint body that fails to deserialize still holds the live
 /// access+refresh tokens, so `token_parse_error` must surface only the serde
-/// error + HTTP status + body length — never the token values.
+/// error + HTTP status + body length — never the token values. Asserted against
+/// `log_detail`, the WIDEST rendering: the user-facing one withholds strictly
+/// more, so a leak that clears this clears the toast too.
 #[test]
 fn token_parse_error_redacts_the_2xx_body() {
     // Missing `expires_in` → fails to parse into TokenResponse, but the body
@@ -677,7 +676,7 @@ fn token_parse_error_redacts_the_2xx_body() {
         Ok(_) => panic!("2xx body without expires_in must fail to parse into TokenResponse"),
         Err(e) => e,
     };
-    let msg = super::token_parse_error(err, 200, body.len()).to_string();
+    let msg = super::token_parse_error(&err, 200, body.len()).log_detail();
 
     assert!(
         !msg.contains("SECRETLEAK"),
@@ -1469,8 +1468,8 @@ fn kick_429_surfaces_limiter_metadata() {
 
     let KickError::Status(429, Some(rl)) = err else {
         panic!(
-            "expected a 429 with limiter metadata, got {:?}",
-            anyhow::Error::from(err)
+            "expected a 429 with limiter metadata, got {}",
+            describe_kick_failure(&err)
         );
     };
     assert!(
@@ -1683,4 +1682,236 @@ fn rotate_one_inner_does_not_rotate_under_a_live_session_on_macos() {
         .and_then(|p| p.access_token().map(str::to_string));
     assert_eq!(stored.as_deref(), Some("at-old"), "the pair is untouched");
     drop(pid);
+}
+
+// ── containment: the endpoint's own bytes never reach a refusal ──────────────
+//
+// `TokenFailure` is the guard, and it is a TYPE rather than a convention on
+// purpose: this codebase already broke the convention version. The manual
+// rotate path printed `HTTP 400: {"error": "invalid_grant", …}` into a Danger
+// toast from four hundred lines away from a sibling switch path that spelled
+// the same condition through `format::refresh_transient`. With no `Display`,
+// that bypass is a compile error instead of something review has to catch.
+
+/// Compile-time probes for the two ways a value grows a printable form: an
+/// inherent method wins method lookup whenever its bound holds, and lookup falls
+/// through to the blanket trait method when it does not.
+struct Probe<T>(std::marker::PhantomData<T>);
+
+impl<T: std::fmt::Display> Probe<T> {
+    fn is_display() -> bool {
+        true
+    }
+}
+
+impl<T: Into<anyhow::Error>> Probe<T> {
+    fn into_anyhow() -> bool {
+        true
+    }
+}
+
+trait NotDisplay {
+    fn is_display() -> bool {
+        false
+    }
+}
+
+impl<T> NotDisplay for Probe<T> {}
+
+trait NotIntoAnyhow {
+    fn into_anyhow() -> bool {
+        false
+    }
+}
+
+impl<T> NotIntoAnyhow for Probe<T> {}
+
+/// The structural half of the containment, covering BOTH escape hatches: a
+/// `Display` impl makes `{e}` compile again, and an `Into<anyhow::Error>` makes
+/// `?` do the same thing one layer up (which is exactly what the deleted
+/// `From<RefreshError>`/`From<KickError>` impls were). Either one added back
+/// reds this on its own, before any surface has to be re-audited — which is
+/// what a string payload plus a naming convention could never do. Each leg has
+/// its positive control; without them a probe that answered `false` for
+/// everything would read as a pass.
+#[test]
+fn oauth_error_types_have_no_printable_escape_hatch() {
+    assert!(
+        Probe::<String>::is_display(),
+        "positive control: the probe must detect a type that DOES implement Display"
+    );
+    assert!(
+        Probe::<std::io::Error>::into_anyhow(),
+        "positive control: the probe must detect a type that DOES convert into anyhow"
+    );
+    for (name, displays, converts) in [
+        (
+            "TokenFailure",
+            Probe::<TokenFailure>::is_display(),
+            Probe::<TokenFailure>::into_anyhow(),
+        ),
+        (
+            "RefreshError",
+            Probe::<RefreshError>::is_display(),
+            Probe::<RefreshError>::into_anyhow(),
+        ),
+        (
+            "KickError",
+            Probe::<KickError>::is_display(),
+            Probe::<KickError>::into_anyhow(),
+        ),
+    ] {
+        assert!(
+            !displays,
+            "{name} must stay Display-free — with one, a bare {{e}} on a toast, a \
+             bail!, or an MCP `reason` compiles again and the endpoint's own words \
+             are one keystroke from a user"
+        );
+        assert!(
+            !converts,
+            "{name} must not convert into anyhow::Error — that conversion is what \
+             smuggled the raw body past the terminal/transient classification into \
+             whatever surface caught it"
+        );
+    }
+}
+
+/// Bytes only the wire could have written. Any of it in a refusal is the leak.
+const WIRE_CANARY: &str = "WIRE-BYTES-CANARY";
+
+/// The dead-token envelope and an upstream error page, both carrying the
+/// canary. Indexed so one listener can answer both legs of a test.
+fn canary_bodies(i: usize) -> (u16, String) {
+    if i == 0 {
+        (
+            400,
+            format!(r#"{{"error": "invalid_grant", "error_description": "{WIRE_CANARY}"}}"#),
+        )
+    } else {
+        (503, format!("<html>{WIRE_CANARY}</html>"))
+    }
+}
+
+/// The reported defect, driven through the real HTTP leg: the manual rotate
+/// emits its failure as an `OpResult` the TUI renders as a Danger toast, and
+/// that used to be `HTTP {status}: {body}` because the plain `refresh` wrapper
+/// collapsed the Invalid/Transient split into one opaque error. Both arms are
+/// asserted — a dead chain keeps the shared `clauth login` recovery step, a
+/// blip gets the canned transient line — and neither carries a wire byte.
+#[test]
+fn rotate_refusal_carries_no_wire_bytes_in_either_direction() {
+    use std::sync::mpsc;
+    let home = HomeSandbox::new();
+    // `max` above the two requests a correct run makes, per `serve_endpoints`.
+    let (base, server) = crate::testutil::serve_endpoints(3, |_, i| canary_bodies(i));
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    let (tx, rx) = mpsc::channel();
+
+    let dead = "rotate-refusal-dead";
+    let dead_cfg = crate::testutil::rotation_fixture_config(dead);
+    rotate_one_inner(&dead_cfg, dead, None, &tx);
+    #[allow(clippy::expect_used, reason = "test")]
+    let OpResult { outcome, .. } = rx.try_recv().expect("the HTTP leg emits an OpResult");
+    let msg = match outcome {
+        Ok(()) => panic!("a 400 must never read as a completed rotation"),
+        Err(e) => e.to_string(),
+    };
+    assert!(
+        !msg.contains(WIRE_CANARY),
+        "the endpoint's body reached the rotate toast: {msg}"
+    );
+    assert!(
+        !msg.contains("HTTP"),
+        "the endpoint's status reached the rotate toast: {msg}"
+    );
+    assert!(
+        msg.contains(&format!("clauth login {dead}")),
+        "the dead-chain arm must keep the one recovery step it shares with the \
+         switch gate and the daemon, got: {msg}"
+    );
+
+    let flaky = "rotate-refusal-flaky";
+    let flaky_cfg = crate::testutil::rotation_fixture_config(flaky);
+    rotate_one_inner(&flaky_cfg, flaky, None, &tx);
+    #[allow(clippy::expect_used, reason = "test")]
+    let OpResult { outcome, .. } = rx.try_recv().expect("the HTTP leg emits an OpResult");
+    let msg = match outcome {
+        Ok(()) => panic!("a 503 must never read as a completed rotation"),
+        Err(e) => e.to_string(),
+    };
+    assert!(
+        !msg.contains(WIRE_CANARY) && !msg.contains("HTTP"),
+        "the endpoint's page reached the rotate toast: {msg}"
+    );
+    // Copy pin, not the structural guard: this wording is what the toast's
+    // "refresh for '<name>' failed" line completes.
+    assert_eq!(msg, "anthropic rejected the request");
+
+    #[allow(clippy::expect_used, reason = "test")]
+    let seen = server.join().expect("listener");
+    assert_eq!(
+        seen,
+        vec!["/v1/oauth/token".to_string(); 2],
+        "proof of execution: both legs actually answered the endpoint"
+    );
+}
+
+/// The terminal-vs-transient split is what the `auth_broken` quarantine rests
+/// on, and it now lives entirely inside `refresh_result` — the body that decides
+/// it is dropped the instant it has decided. Driven over the real wire in BOTH
+/// directions, because the injected-refresher gate tests construct the verdict
+/// rather than derive it, and would stay green if the mapping inverted.
+#[test]
+fn refresh_classification_survives_the_real_wire_in_both_directions() {
+    let home = HomeSandbox::new();
+    let (base, server) = crate::testutil::serve_endpoints(3, |_, i| canary_bodies(i));
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+
+    let dead = "gate-wire-dead";
+    let dead_cfg = Arc::new(RankedMutex::new(oauth_config(
+        dead,
+        Some("rt-revoked"),
+        Some(past_expiry()),
+    )));
+    assert!(
+        matches!(
+            ensure_installable(&dead_cfg, dead, refresh_result),
+            AuthGate::Broken
+        ),
+        "a confirmed invalid_grant is still terminal"
+    );
+    #[allow(clippy::expect_used, reason = "test")]
+    let dead_flagged = dead_cfg.lock().expect("lock").is_auth_broken(dead);
+    assert!(dead_flagged, "a dead refresh token still quarantines");
+
+    let flaky = "gate-wire-flaky";
+    let flaky_cfg = Arc::new(RankedMutex::new(oauth_config(
+        flaky,
+        Some("rt-ok"),
+        Some(past_expiry()),
+    )));
+    let AuthGate::Transient(e) = ensure_installable(&flaky_cfg, flaky, refresh_result) else {
+        panic!("a 5xx the endpoint never confirmed must stay transient");
+    };
+    #[allow(clippy::expect_used, reason = "test")]
+    let flaky_flagged = flaky_cfg.lock().expect("lock").is_auth_broken(flaky);
+    assert!(
+        !flaky_flagged,
+        "a 5xx must never quarantine — the retry is what recovers it"
+    );
+    // This value is what the CLI bail, the TUI toast, the MCP `reason` and the
+    // daemon's deferral line are all built from.
+    let msg = e.to_string();
+    assert!(
+        !msg.contains(WIRE_CANARY) && !msg.contains("HTTP") && !msg.contains("html"),
+        "the endpoint's page reached the switch refusal: {msg}"
+    );
+
+    #[allow(clippy::expect_used, reason = "test")]
+    let seen = server.join().expect("listener");
+    assert_eq!(
+        seen,
+        vec!["/v1/oauth/token".to_string(); 2],
+        "proof of execution: both legs actually answered the endpoint"
+    );
 }

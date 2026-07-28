@@ -3105,7 +3105,7 @@ fn bootstrap_third_party_seeds_any_cache() {
 fn dead_refresh_token_is_terminal() {
     // A 4xx from the token endpoint (revoked / expired refresh token) → the login
     // is gone; quarantine so the UI surfaces reauth immediately.
-    let err = RefreshError::Invalid("HTTP 400: invalid_grant".to_string());
+    let err = RefreshError::Invalid(crate::oauth::TokenFailure::Status(400));
     assert!(super::refresh_failure_is_terminal(&err));
 }
 
@@ -3113,7 +3113,7 @@ fn dead_refresh_token_is_terminal() {
 fn transient_refresh_failure_is_not_terminal() {
     // A network / 5xx / parse blip must NOT quarantine — the token may be fine; the
     // fixed cadence retries next tick.
-    let err = RefreshError::Transient(anyhow::anyhow!("connection reset by peer"));
+    let err = RefreshError::Transient(crate::oauth::TokenFailure::Transport);
     assert!(!super::refresh_failure_is_terminal(&err));
 }
 

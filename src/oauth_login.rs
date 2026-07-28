@@ -19,6 +19,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use sha2::{Digest, Sha256};
 
+use crate::logline::logline;
 use crate::profile::{AccountId, ClaudeCredentials, OAuthToken};
 use crate::usage::now_ms;
 
@@ -433,7 +434,13 @@ pub(crate) fn login_with(progress: impl Fn(LoginProgress<'_>)) -> Result<LoginOu
     let deadline = Instant::now() + Duration::from_secs(LOGIN_TIMEOUT_SECS);
     let code = wait_for_code(&listener, &state, deadline)?;
     progress(LoginProgress::ExchangingCode);
-    let token = crate::oauth::exchange_code(&code, &verifier, &redirect_uri, &state)?;
+    let token =
+        crate::oauth::exchange_code(&code, &verifier, &redirect_uri, &state).map_err(|e| {
+            // The rejection's status stops here — the login toast and `clauth
+            // login`'s stderr get the canned line, the log keeps the detail.
+            logline!("clauth: login code exchange failed: {}", e.log_detail());
+            anyhow::anyhow!("{}", e.user_message())
+        })?;
     let mut creds = credentials_from_token(token);
 
     progress(LoginProgress::Verifying);

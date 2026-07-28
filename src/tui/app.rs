@@ -5732,7 +5732,9 @@ fn start_login(app: &mut App, name: String, is_new: bool) {
             };
             let _ = event_tx.send((generation, event));
         });
-        let _ = result_tx.send((generation, res.map_err(|e| e.to_string())));
+        // A toast, not stderr: the canned line without the HTTP status. The
+        // status is in `~/.clauth/clauth.log` via the exchange's `logline!`.
+        let _ = result_tx.send((generation, res.map_err(|e| e.user_message())));
     });
     open_login_modal(app);
 }

@@ -376,7 +376,11 @@ fn run_oauth_browser(reauth: bool, target: &str) -> Result<actions::CaptureSnaps
         if let oauth_login::LoginProgress::AuthorizeUrl(url) = progress {
             println!("\nIf the browser didn't open, visit this URL to authorize:\n{url}\n");
         }
-    })?;
+    })
+    // CLI stderr: name the HTTP status too. This lands on the `eprintln!`
+    // backstop below, a terminal with no companion log open, and a fresh login
+    // failing on a 400 is the case that ruling exists for.
+    .map_err(|e| anyhow::anyhow!("{}", e.cli_message()))?;
     println!(
         "clauth: login complete.\n{}",
         oauth_login::login_summary(&outcome.credentials)

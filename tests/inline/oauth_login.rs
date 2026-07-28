@@ -245,23 +245,75 @@ fn authorize_rejection_parses_rfc6749_codes_and_anonymizes_the_rest() {
     );
 }
 
+/// `clauth login` is the path where the status ruling bites hardest: an
+/// interactive user hitting a 400 on a fresh login has no log open beside the
+/// terminal. So stderr names the status and the TUI toast does not — asserted
+/// together, because a status that silently stops reaching stderr looks exactly
+/// like one that was never added.
+#[test]
+fn login_names_the_status_on_stderr_but_not_in_the_toast() {
+    use crate::oauth::TokenFailure;
+    use crate::oauth_login::LoginError;
+
+    let rejected = LoginError::Exchange(TokenFailure::Status(400));
+    assert_eq!(
+        rejected.cli_message(),
+        "anthropic rejected the request (HTTP 400): retry in a moment"
+    );
+    assert_eq!(
+        rejected.user_message(),
+        "anthropic rejected the request: retry in a moment"
+    );
+    assert!(
+        !rejected.user_message().contains("400"),
+        "the toast must not carry the status: {}",
+        rejected.user_message()
+    );
+
+    // A transport failure never saw a status, so the two forms coincide rather
+    // than inventing one, and the advice is the connection.
+    let offline = LoginError::Exchange(TokenFailure::Transport);
+    assert_eq!(
+        offline.cli_message(),
+        "could not reach anthropic: check your connection and retry"
+    );
+    assert_eq!(offline.cli_message(), offline.user_message());
+
+    // Every clauth-authored failure renders identically on both surfaces —
+    // there is no upstream status to withhold from one of them.
+    let local = LoginError::Local(anyhow::anyhow!("OAuth state mismatch (possible CSRF)"));
+    assert_eq!(local.cli_message(), local.user_message());
+    assert_eq!(local.user_message(), "OAuth state mismatch (possible CSRF)");
+}
+
 /// Same structural guard as `oauth::TokenFailure`: no `Display` and no
 /// `Into<anyhow::Error>`, so a surface cannot print the browser's words even by
 /// accident. Positive controls prove the probe discriminates.
 #[test]
 fn authorize_rejection_has_no_printable_escape_hatch() {
-    use crate::oauth_login::AuthorizeRejection;
+    use crate::oauth_login::{AuthorizeRejection, LoginError};
     use crate::testutil::{NotDisplay as _, NotIntoAnyhow as _, Probe};
     assert!(Probe::<String>::is_display(), "positive control");
     assert!(Probe::<std::io::Error>::into_anyhow(), "positive control");
-    assert!(
-        !Probe::<AuthorizeRejection>::is_display(),
-        "AuthorizeRejection must stay Display-free"
-    );
-    assert!(
-        !Probe::<AuthorizeRejection>::into_anyhow(),
-        "AuthorizeRejection must not convert into anyhow::Error"
-    );
+    for (name, displays, converts) in [
+        (
+            "AuthorizeRejection",
+            Probe::<AuthorizeRejection>::is_display(),
+            Probe::<AuthorizeRejection>::into_anyhow(),
+        ),
+        (
+            "LoginError",
+            Probe::<LoginError>::is_display(),
+            Probe::<LoginError>::into_anyhow(),
+        ),
+    ] {
+        assert!(!displays, "{name} must stay Display-free");
+        assert!(
+            !converts,
+            "{name} must not convert into anyhow::Error — that is the `?` that \
+             would collapse the CLI/toast split back into one rendering"
+        );
+    }
 }
 
 #[test]

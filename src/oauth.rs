@@ -228,15 +228,17 @@ impl TokenFailure {
     /// The shared transient value: canned cause, the status for the surfaces
     /// allowed to name it, and the next step this kind actually warrants.
     pub(crate) fn as_transient(&self) -> crate::format::Transient {
-        use crate::format::{Retry, Transient};
+        use crate::format::{Cause, Retry, Transient};
+        // `Cause::Endpoint` takes `&'static str`, which is exactly what
+        // `user_message` returns — a response body is a runtime `String` and
+        // structurally cannot be substituted here.
+        let cause = Cause::Endpoint(self.user_message());
         match self {
-            Self::Status(s) => Transient::with_status(self.user_message(), *s, Retry::Wait),
+            Self::Status(s) => Transient::with_status(cause, *s, Retry::Wait),
             // No status was ever seen, and the connection is the one thing the
             // operator can act on.
-            Self::Transport => Transient::new(self.user_message(), Retry::Connection),
-            Self::Body { status, .. } => {
-                Transient::with_status(self.user_message(), *status, Retry::Wait)
-            }
+            Self::Transport => Transient::new(cause, Retry::Connection),
+            Self::Body { status, .. } => Transient::with_status(cause, *status, Retry::Wait),
         }
     }
 
@@ -1458,7 +1460,7 @@ pub(crate) fn ensure_installable(
         // `Stated`: this copy already names its own next step, and appending a
         // second one gave the operator two incompatible reasons to retry.
         return AuthGate::Transient(crate::format::Transient::new(
-            format!("'{name}' rotation lock busy; retry after the in-flight refresh"),
+            crate::format::Cause::RotationLockBusy(name.to_string()),
             crate::format::Retry::Stated,
         ));
     };
@@ -1497,7 +1499,7 @@ fn oauth_shape(
         // A poisoned mutex means another thread panicked; it does not clear on
         // its own, so a retry hint would be a lie.
         return Err(AuthGate::Transient(crate::format::Transient::new(
-            "clauth hit an internal lock error, restart clauth",
+            crate::format::Cause::InternalLock,
             crate::format::Retry::Stated,
         )));
     };
@@ -1598,7 +1600,7 @@ fn gate_under_guard(
         Ok(tok) => {
             if apply_rotated_tokens_locked(config, name, tok).is_err() {
                 return AuthGate::Transient(crate::format::Transient::new(
-                    format!("refreshed '{name}' but failed to persist the rotated tokens"),
+                    crate::format::Cause::PersistFailed(name.to_string()),
                     crate::format::Retry::Wait,
                 ));
             }

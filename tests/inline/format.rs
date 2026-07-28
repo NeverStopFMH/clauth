@@ -29,7 +29,10 @@ fn login_expired_shares_one_head_across_line_and_toast() {
 fn refresh_transient_carries_the_error_in_the_detail() {
     let m = refresh_transient(
         "flaky",
-        &Transient::new("could not reach anthropic", Retry::Connection),
+        &Transient::new(
+            Cause::Endpoint("could not reach anthropic"),
+            Retry::Connection,
+        ),
     );
     assert_eq!(
         m.line(),
@@ -54,13 +57,20 @@ fn refresh_transient_carries_the_error_in_the_detail() {
 /// rotation-lock one, which already tells you to retry for a different reason.
 #[test]
 fn the_retry_hint_follows_the_kind_not_the_call_site() {
-    let connection = Transient::new("could not reach anthropic", Retry::Connection);
+    let connection = Transient::new(
+        Cause::Endpoint("could not reach anthropic"),
+        Retry::Connection,
+    );
     assert_eq!(
         connection.text(),
         "could not reach anthropic: check your connection and retry"
     );
 
-    let wait = Transient::with_status("anthropic is throttling requests", 429, Retry::Wait);
+    let wait = Transient::with_status(
+        Cause::Endpoint("anthropic is throttling requests"),
+        429,
+        Retry::Wait,
+    );
     assert_eq!(
         wait.text(),
         "anthropic is throttling requests: retry in a moment"
@@ -73,10 +83,7 @@ fn the_retry_hint_follows_the_kind_not_the_call_site() {
 
     // `Stated` adds nothing: the cause already names its own next step, and a
     // second one contradicts it.
-    let stated = Transient::new(
-        "'work' rotation lock busy; retry after the in-flight refresh",
-        Retry::Stated,
-    );
+    let stated = Transient::new(Cause::RotationLockBusy("work".to_string()), Retry::Stated);
     assert_eq!(
         stated.text(),
         "'work' rotation lock busy; retry after the in-flight refresh"
@@ -88,7 +95,11 @@ fn the_retry_hint_follows_the_kind_not_the_call_site() {
 /// stops reaching stderr looks exactly like one that was never added.
 #[test]
 fn only_the_status_bearing_form_names_the_status() {
-    let t = Transient::with_status("anthropic is having trouble", 503, Retry::Wait);
+    let t = Transient::with_status(
+        Cause::Endpoint("anthropic is having trouble"),
+        503,
+        Retry::Wait,
+    );
     assert_eq!(
         t.text_with_status(),
         "anthropic is having trouble (HTTP 503): retry in a moment"
@@ -112,8 +123,39 @@ fn only_the_status_bearing_form_names_the_status() {
 
     // A failure that never saw a status has nothing honest to add, so the two
     // forms coincide rather than inventing one.
-    let no_status = Transient::new("could not reach anthropic", Retry::Connection);
+    let no_status = Transient::new(
+        Cause::Endpoint("could not reach anthropic"),
+        Retry::Connection,
+    );
     assert_eq!(no_status.text_with_status(), no_status.text());
+}
+
+/// Every arm of the closed cause set renders, and the two name-bearing ones
+/// interpolate the profile. Pinned because `Cause` is what replaced a
+/// `cause: String` that would have accepted a response body: if an arm is ever
+/// added, this is where its copy has to be stated rather than passed in.
+#[test]
+fn every_transient_cause_renders_its_own_copy() {
+    for (cause, want) in [
+        (
+            Cause::Endpoint("anthropic is throttling requests"),
+            "anthropic is throttling requests",
+        ),
+        (
+            Cause::RotationLockBusy("work".to_string()),
+            "'work' rotation lock busy; retry after the in-flight refresh",
+        ),
+        (
+            Cause::InternalLock,
+            "clauth hit an internal lock error, restart clauth",
+        ),
+        (
+            Cause::PersistFailed("work".to_string()),
+            "refreshed 'work' but failed to persist the rotated tokens",
+        ),
+    ] {
+        assert_eq!(Transient::new(cause, Retry::Stated).text(), want);
+    }
 }
 
 /// `detail()` is what lets a surface whose own first line states the condition

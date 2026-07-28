@@ -74,32 +74,67 @@ pub(crate) enum Retry {
     Stated,
 }
 
+/// Every transient cause clauth can state, as a CLOSED set.
+///
+/// Deliberately not a `String`. A `String` cause ACCEPTS an upstream response
+/// body, and the reason this module and `oauth::TokenFailure` exist at all is
+/// that "nobody will print the raw error" is a convention which already failed
+/// once here. A response body is always a runtime-allocated `String`, so none of
+/// these arms can hold one: the endpoint arm takes `&'static str` (exactly what
+/// `TokenFailure::user_message` returns) and the rest carry a profile name read
+/// from local config. That is a structural guard rather than a promise — the
+/// previous `cause: String` was only ever the latter.
+pub(crate) enum Cause {
+    /// Already-canned copy from `oauth::TokenFailure`.
+    Endpoint(&'static str),
+    /// A sibling worker or a live session holds the per-profile rotation lock.
+    RotationLockBusy(String),
+    /// A poisoned mutex: another thread panicked, so it will not clear itself
+    /// and a retry hint would be a lie.
+    InternalLock,
+    /// The refresh landed but the rotated pair could not be written.
+    PersistFailed(String),
+}
+
+impl Cause {
+    fn text(&self) -> String {
+        match self {
+            Self::Endpoint(canned) => (*canned).to_string(),
+            Self::RotationLockBusy(profile) => {
+                format!("'{profile}' rotation lock busy; retry after the in-flight refresh")
+            }
+            Self::InternalLock => "clauth hit an internal lock error, restart clauth".to_string(),
+            Self::PersistFailed(profile) => {
+                format!("refreshed '{profile}' but failed to persist the rotated tokens")
+            }
+        }
+    }
+}
+
 /// A transient failure carrying its own next step, and the HTTP status when the
 /// failure had one.
 ///
-/// `cause` is always clauth-authored or already-canned copy — an upstream
-/// response body can never reach it, which is `oauth::TokenFailure`'s job one
-/// layer down. The status is deliberately separable: CLI stderr shows it (the
-/// `main.rs` backstop is a terminal with no log beside it) while a toast and the
-/// MCP payload do not.
+/// The status is deliberately separable: CLI stderr and the daemon log show it
+/// (neither has a companion log to read it out of) while a toast and the MCP
+/// payload do not.
 pub(crate) struct Transient {
-    cause: String,
+    cause: Cause,
     status: Option<u16>,
     retry: Retry,
 }
 
 impl Transient {
-    pub(crate) fn new(cause: impl Into<String>, retry: Retry) -> Self {
+    pub(crate) fn new(cause: Cause, retry: Retry) -> Self {
         Self {
-            cause: cause.into(),
+            cause,
             status: None,
             retry,
         }
     }
 
-    pub(crate) fn with_status(cause: impl Into<String>, status: u16, retry: Retry) -> Self {
+    pub(crate) fn with_status(cause: Cause, status: u16, retry: Retry) -> Self {
         Self {
-            cause: cause.into(),
+            cause,
             status: Some(status),
             retry,
         }
@@ -115,14 +150,14 @@ impl Transient {
 
     /// Cause + next step, no status. TUI toasts and the MCP `reason`.
     pub(crate) fn text(&self) -> String {
-        format!("{}{}", self.cause, self.suffix())
+        format!("{}{}", self.cause.text(), self.suffix())
     }
 
     /// Cause + status + next step. CLI stderr and the daemon log, the two
     /// surfaces with no companion log to read the status out of.
     pub(crate) fn text_with_status(&self) -> String {
         match self.status {
-            Some(s) => format!("{} (HTTP {s}){}", self.cause, self.suffix()),
+            Some(s) => format!("{} (HTTP {s}){}", self.cause.text(), self.suffix()),
             None => self.text(),
         }
     }

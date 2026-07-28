@@ -489,13 +489,57 @@ pub(crate) struct LoginOutcome {
 /// also renders the later stages). Opening the browser is best-effort: on
 /// failure the announced URL is the fallback and the listener still waits.
 /// Blocks the caller for the browser round-trip (up to [`LOGIN_TIMEOUT_SECS`]).
-pub(crate) fn login_with(progress: impl Fn(LoginProgress<'_>)) -> Result<LoginOutcome> {
-    let (verifier, challenge) = new_pkce()?;
-    let state = random_b64url(32)?;
+/// Why a `clauth login` produced no credential.
+///
+/// Typed so its two callers can diverge exactly as the switch path's already do:
+/// `clauth login`'s stderr names the HTTP status (a terminal has no companion
+/// log open beside it) and the TUI's login toast does not. No `Display` and no
+/// `Into<anyhow::Error>`, so neither caller can bypass that split with a bare
+/// `{e}` or a `?`.
+pub(crate) enum LoginError {
+    /// The token endpoint refused the authorization-code exchange — the one
+    /// login failure that carries an HTTP status, so the only arm where the two
+    /// renderings differ at all.
+    Exchange(crate::oauth::TokenFailure),
+    /// Everything else: the authorize callback's rejection (already canned by
+    /// [`AuthorizeRejection`], and a browser redirect carries no HTTP status of
+    /// ours to name), CSPRNG, the loopback bind/accept, the state mismatch, the
+    /// browser timeout. All clauth-authored, so both renderings coincide.
+    Local(anyhow::Error),
+}
+
+impl LoginError {
+    /// Canned: the TUI login toast.
+    pub(crate) fn user_message(&self) -> String {
+        match self {
+            Self::Exchange(f) => f.as_transient().text(),
+            Self::Local(e) => e.to_string(),
+        }
+    }
+
+    /// Canned plus the HTTP status where one exists: `clauth login`'s stderr.
+    pub(crate) fn cli_message(&self) -> String {
+        match self {
+            Self::Exchange(f) => f.as_transient().text_with_status(),
+            Self::Local(e) => e.to_string(),
+        }
+    }
+}
+
+pub(crate) fn login_with(
+    progress: impl Fn(LoginProgress<'_>),
+) -> std::result::Result<LoginOutcome, LoginError> {
+    let (verifier, challenge) = new_pkce().map_err(LoginError::Local)?;
+    let state = random_b64url(32).map_err(LoginError::Local)?;
 
     let listener = TcpListener::bind(("127.0.0.1", 0))
-        .context("failed to bind the loopback listener for the OAuth callback")?;
-    let port = listener.local_addr()?.port();
+        .context("failed to bind the loopback listener for the OAuth callback")
+        .map_err(LoginError::Local)?;
+    let port = listener
+        .local_addr()
+        .map_err(anyhow::Error::from)
+        .map_err(LoginError::Local)?
+        .port();
     let redirect_uri = format!("http://localhost:{port}/callback");
     let url = authorize_url(&redirect_uri, &challenge, &state);
 
@@ -503,14 +547,14 @@ pub(crate) fn login_with(progress: impl Fn(LoginProgress<'_>)) -> Result<LoginOu
     let _ = crate::platform::open_url(&url);
 
     let deadline = Instant::now() + Duration::from_secs(LOGIN_TIMEOUT_SECS);
-    let code = wait_for_code(&listener, &state, deadline)?;
+    let code = wait_for_code(&listener, &state, deadline).map_err(LoginError::Local)?;
     progress(LoginProgress::ExchangingCode);
     let token =
         crate::oauth::exchange_code(&code, &verifier, &redirect_uri, &state).map_err(|e| {
-            // The rejection's status stops here — the login toast and `clauth
-            // login`'s stderr get the canned line, the log keeps the detail.
+            // The BODY stops here; the status rides the typed value so stderr can
+            // name it and the toast cannot.
             logline!("clauth: login code exchange failed: {}", e.log_detail());
-            anyhow::anyhow!("{}", e.user_message())
+            LoginError::Exchange(e)
         })?;
     let mut creds = credentials_from_token(token);
 

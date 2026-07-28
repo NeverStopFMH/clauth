@@ -1188,7 +1188,12 @@ fn touch_store(plan: &SwapPlan, memoized: Option<SystemTime>) -> Result<()> {
         file.set_times(std::fs::FileTimes::new().set_modified(at))
             .with_context(|| format!("failed to touch {}", plan.store.display()))
     };
-    let landed = || file.metadata().ok().and_then(|m| m.modified().ok());
+    let landed = || {
+        file.metadata()
+            .ok()
+            .and_then(|m| m.modified().ok())
+            .map(as_stored)
+    };
     let asked = SystemTime::now();
     stamp(asked)?;
     // A receipt is only sound where the filesystem kept the EXACT value asked
@@ -1213,6 +1218,35 @@ fn touch_store(plan: &SwapPlan, memoized: Option<SystemTime>) -> Result<()> {
         crate::profile_cache::write_touch_receipt(&plan.member, &plan.store, stamped, displaced);
     }
     Ok(())
+}
+
+/// Test-only mtime-granularity override for [`touch_store`]'s read-back. Every
+/// filesystem a Linux/macOS test run can reach (ext4, tmpfs, apfs) stores the
+/// exact value `set_times` asked for, so the branch that withholds a receipt
+/// where the mtime TRUNCATES has no other way to be exercised — and it is the
+/// branch that fails silently, since a receipt issued on a truncating filesystem
+/// aliases onto any write landing in the same tick. Serialized by
+/// `profile::HOME_TEST_LOCK`, which every test that sets it already holds via
+/// `with_fake_home`. Never compiled into the binary.
+#[cfg(test)]
+static COARSE_MTIME_OVERRIDE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(test)]
+fn set_coarse_mtime_override(on: bool) {
+    COARSE_MTIME_OVERRIDE.store(on, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// What the filesystem would have stored for `at`. Identity everywhere except a
+/// test that has asked to stand in for a one-second-granularity filesystem.
+fn as_stored(at: SystemTime) -> SystemTime {
+    #[cfg(test)]
+    if COARSE_MTIME_OVERRIDE.load(std::sync::atomic::Ordering::SeqCst)
+        && let Ok(since_epoch) = at.duration_since(std::time::UNIX_EPOCH)
+    {
+        return std::time::UNIX_EPOCH + Duration::from_secs(since_epoch.as_secs());
+    }
+    at
 }
 
 /// A file's mtime, or `None` when it has none to read.

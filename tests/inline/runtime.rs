@@ -884,6 +884,24 @@ fn with_link_mode<T>(mode: LinkMode, f: impl FnOnce() -> T) -> T {
     f()
 }
 
+/// Stand in for a one-second-granularity filesystem for the duration of `f`:
+/// `touch_store` reads its stamp back truncated, exactly as it would there. Every
+/// filesystem a Linux/macOS run can reach keeps the exact value, so the branch
+/// that withholds a receipt on a truncating one is otherwise unreachable. Call
+/// INSIDE [`with_fake_home`], whose `HOME_TEST_LOCK` hold serializes this
+/// process-global override.
+fn with_coarse_mtime<T>(f: impl FnOnce() -> T) -> T {
+    struct ClearOnDrop;
+    impl Drop for ClearOnDrop {
+        fn drop(&mut self) {
+            set_coarse_mtime_override(false);
+        }
+    }
+    set_coarse_mtime_override(true);
+    let _clear = ClearOnDrop;
+    f()
+}
+
 /// Build `~/.claude/` (required by `acquire`).
 fn fake_claude_home(root: &Path) -> PathBuf {
     let claude = root.join(".claude");
@@ -4482,6 +4500,49 @@ fn a_second_swap_onto_a_member_keeps_reporting_its_real_last_write() {
             crate::profile_cache::effective_write_time(&intended_store),
             Some(last_write),
             "a stamp displacing an earlier stamp must carry the real write forward"
+        );
+    });
+}
+
+/// On a filesystem whose mtimes truncate, a receipt is WORSE than none: a real
+/// write landing in the same tick as the stamp carries the stamp's own mtime, so
+/// the receipt would resolve that write back to the value it displaced and invert
+/// both credential decisions — on a member whose store was just committed. The
+/// swap must therefore leave no receipt there and fall back to the raw mtime,
+/// which is the pre-receipt answer rather than a wrong one. This fails silently:
+/// drop the guard and every other test still passes.
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn a_truncating_filesystem_gets_no_receipt_at_all() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let launch = member("coarse-a");
+        let intended = member("coarse-b");
+        member_store(&launch);
+        let intended_store = member_store(&intended);
+        let (swap, _launch_markers) = lone_session(&launch, Isolation::Shared);
+
+        let last_write = SystemTime::now() - Duration::from_secs(300);
+        set_mtime(&intended_store, last_write);
+
+        with_coarse_mtime(|| {
+            assert_eq!(swap.swap_to("coarse-b").expect("out"), SwapOutcome::Swapped);
+        });
+
+        let receipt = intended_store.with_file_name(crate::profile_cache::TOUCH_RECEIPT_FILE);
+        assert!(
+            !receipt.exists(),
+            "a receipt whose stamp a later write can alias onto must never be written"
+        );
+        let stamped = fs::metadata(&intended_store)
+            .expect("meta")
+            .modified()
+            .expect("mtime");
+        assert_ne!(stamped, last_write, "precondition: the swap still stamped");
+        assert_eq!(
+            crate::profile_cache::effective_write_time(&intended_store),
+            Some(stamped),
+            "with no receipt the store reports its raw mtime, which is the pre-receipt answer"
         );
     });
 }

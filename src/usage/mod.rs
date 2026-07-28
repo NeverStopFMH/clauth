@@ -32,9 +32,10 @@ pub(crate) use scheduler::{
 #[cfg(test)]
 pub(crate) use scheduler::ACTIVE_CAP_MAX_STREAK;
 // Test-only: reset the per-host request-spacing slots so a real-bytes wire test
-// driving a builder through `await_request_slot` doesn't sleep out the window.
+// driving a builder through `await_request_slot` doesn't sleep out the window,
+// and read one back so a leg's reservation is assertable without that sleep.
 #[cfg(test)]
-pub(crate) use fetch::reset_request_slots;
+pub(crate) use fetch::{reserved_request_slot, reset_request_slots};
 // Test-only: point `/usage` at a loopback listener so `fetch_with_rotation`'s
 // 401-then-rotate leg — and the refusal inside it — can run offline.
 #[cfg(test)]

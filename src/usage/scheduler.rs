@@ -784,14 +784,18 @@ fn fetch_with_rotation(
     // Persist under the AppConfig mutex + state lock — matches every other rotation site
     // so a concurrent `rotate_one_inner` can't interleave, and keeps in-memory AppConfig in sync.
     let access = tok.access_token.clone();
-    let refresh = tok.refresh_token.clone();
+    // The refresh already spent the old single-use token, so this pair is now the
+    // only usable one — carry it back even when the persist below fails, or the
+    // caller's live snapshot keeps the dead token and 400s every tick until a
+    // restart adopts the staged sidecar (`auto_start_kick` carries its pair back
+    // for the same reason).
+    let rotated: Option<RotatedTokens> = Some((access.clone(), Some(tok.refresh_token.clone())));
     if crate::oauth::apply_rotated_tokens_locked(config, name, tok).is_err() {
-        return bail_to_cache(None);
+        return bail_to_cache(rotated);
     }
     // A successful refresh + persist clears any prior auth-broken quarantine
     // (mirrors `ensure_installable`); a no-op when the flag was already clear.
     crate::oauth::mark_auth_broken(config, name, false);
-    let rotated: Option<RotatedTokens> = Some((access.clone(), Some(refresh)));
     // A refresh mints a new token for the SAME account, so no `/profile` field can
     // change because of it — the hourly TTL governs the plan here exactly as it
     // does on the plain leg above. Force a pull when holding NO plan (never

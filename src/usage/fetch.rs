@@ -149,6 +149,18 @@ pub(crate) fn reset_request_slots() {
     }
 }
 
+/// The slot currently reserved for `host`, `None` when it holds none. Test-only
+/// companion to [`reset_request_slots`]: a leg that skips [`await_request_slot`]
+/// is otherwise only observable by timing a second same-host request through the
+/// full [`REQUEST_SPACING_MS`] sleep, which costs the suite 5 s per assertion.
+#[cfg(test)]
+pub(crate) fn reserved_request_slot(host: &str) -> Option<u64> {
+    NEXT_REQUEST_SLOT
+        .lock()
+        .ok()
+        .and_then(|slots| slots.get(host).copied())
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct UsageWindow {
     pub(crate) utilization: f64,

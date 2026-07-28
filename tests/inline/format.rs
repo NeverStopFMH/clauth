@@ -77,7 +77,7 @@ fn plan_label_renders_the_tier_only_the_canceled_marker_is_on_the_status_line() 
         tier: PlanTier::Free,
         subscription_status: Some("canceled".to_string()),
     };
-    assert_eq!(plan_label(&canceled), "Claude Free");
+    assert_eq!(plan_label(&canceled).as_deref(), Some("Claude Free"));
 
     // A genuine, never-subscribed free account looks the same here — the
     // canceled distinction lives on the status line, not the plan label.
@@ -85,5 +85,87 @@ fn plan_label_renders_the_tier_only_the_canceled_marker_is_on_the_status_line() 
         tier: PlanTier::Free,
         subscription_status: None,
     };
-    assert_eq!(plan_label(&free), "Claude Free");
+    assert_eq!(plan_label(&free).as_deref(), Some("Claude Free"));
+}
+
+/// An unfetched plan has no tier at all. `endpoint_label` says so with `None`
+/// so each surface picks its own no-data form — a bare "Claude" here read as a
+/// real plan, and shipped to the Overview chip, the Usage `plan` row and
+/// `which --json`'s `tier` alike.
+#[test]
+fn endpoint_label_reports_no_tier_for_an_unfetched_plan() {
+    // No credentials at all: nothing on disk claims a tier.
+    let bare = crate::testutil::blank_profile("a");
+    assert_eq!(endpoint_label(&bare), None);
+
+    // A token whose `subscription_type` is not one clauth classifies is the
+    // same "we do not know" — never a fabricated tier.
+    let mut unclassified = crate::testutil::blank_profile("b");
+    unclassified.credentials = Some(crate::profile::ClaudeCredentials {
+        claude_ai_oauth: Some(crate::profile::OAuthToken {
+            access_token: "at".into(),
+            refresh_token: None,
+            expires_at: None,
+            scopes: None,
+            subscription_type: Some("something_new".into()),
+        }),
+    });
+    assert_eq!(endpoint_label(&unclassified), None);
+
+    // A fetched plan whose tier never classified reads the same way.
+    let mut unknown_plan = crate::testutil::blank_profile("c");
+    unknown_plan.usage = Some(crate::usage::UsageInfo {
+        plan: Some(PlanInfo {
+            tier: PlanTier::Unknown,
+            subscription_status: None,
+        }),
+        ..Default::default()
+    });
+    assert_eq!(endpoint_label(&unknown_plan), None);
+}
+
+/// The other direction, all three branches: a real tier still renders, `Free`
+/// is untouched by the unfetched-plan change, and a third-party profile still
+/// gets its raw endpoint url back.
+#[test]
+fn endpoint_label_still_renders_every_known_tier_and_the_endpoint_url() {
+    let mut fetched = crate::testutil::blank_profile("a");
+    fetched.usage = Some(crate::usage::UsageInfo {
+        plan: Some(PlanInfo {
+            tier: PlanTier::Max(Some(20)),
+            subscription_status: None,
+        }),
+        ..Default::default()
+    });
+    assert_eq!(endpoint_label(&fetched).as_deref(), Some("Claude Max 20x"));
+
+    let mut free = crate::testutil::blank_profile("b");
+    free.usage = Some(crate::usage::UsageInfo {
+        plan: Some(PlanInfo {
+            tier: PlanTier::Free,
+            subscription_status: None,
+        }),
+        ..Default::default()
+    });
+    assert_eq!(endpoint_label(&free).as_deref(), Some("Claude Free"));
+
+    let mut token_only = crate::testutil::blank_profile("c");
+    token_only.credentials = Some(crate::profile::ClaudeCredentials {
+        claude_ai_oauth: Some(crate::profile::OAuthToken {
+            access_token: "at".into(),
+            refresh_token: None,
+            expires_at: None,
+            scopes: None,
+            subscription_type: Some("pro".into()),
+        }),
+    });
+    assert_eq!(endpoint_label(&token_only).as_deref(), Some("Claude Pro"));
+
+    let mut third_party = crate::testutil::blank_profile("d");
+    third_party.base_url = Some("https://api.deepseek.com/anthropic".to_string());
+    assert_eq!(
+        endpoint_label(&third_party).as_deref(),
+        Some("https://api.deepseek.com/anthropic"),
+        "the base-url branch must keep returning the raw endpoint"
+    );
 }

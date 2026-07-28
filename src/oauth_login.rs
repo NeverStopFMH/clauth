@@ -491,10 +491,15 @@ pub(crate) fn login_summary(creds: &ClaudeCredentials) -> String {
     // The plan tier is stamped from a live `/profile` probe in `login_with`, so a
     // present value doubles as proof the minted token works against the API.
     let plan = match oauth.subscription_type.as_deref() {
-        Some(sub) => format!(
-            "  plan: {} (token verified against the API)",
-            crate::usage::PlanTier::from_subscription_type(Some(sub)).display()
-        ),
+        // An unclassifiable claim still proves the token works, so echo it raw
+        // rather than dropping the line or naming a tier the token never made.
+        Some(sub) => {
+            let tier = crate::usage::PlanTier::from_subscription_type(Some(sub)).display();
+            format!(
+                "  plan: {} (token verified against the API)",
+                tier.as_deref().unwrap_or(sub)
+            )
+        }
         None => "  plan: will populate on the first usage refresh".to_string(),
     };
     format!(

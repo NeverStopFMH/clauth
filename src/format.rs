@@ -89,9 +89,12 @@ pub(crate) fn truncate(s: &str, max: usize) -> String {
     out
 }
 
-pub(crate) fn endpoint_label(profile: &Profile) -> String {
+/// A third-party profile's raw endpoint, else the account's tier. `None` when
+/// no tier is known, so a surface renders its own no-data form rather than a
+/// bare "Claude" that reads as a real plan.
+pub(crate) fn endpoint_label(profile: &Profile) -> Option<String> {
     if let Some(url) = &profile.base_url {
-        return url.clone();
+        return Some(url.clone());
     }
     if let Some(plan) = profile.usage.as_ref().and_then(|u| u.plan.as_ref()) {
         return plan_label(plan);
@@ -105,7 +108,7 @@ pub(crate) fn endpoint_label(profile: &Profile) -> String {
     PlanTier::from_subscription_type(sub).display()
 }
 
-pub(crate) fn plan_label(plan: &PlanInfo) -> String {
+pub(crate) fn plan_label(plan: &PlanInfo) -> Option<String> {
     plan.tier.display()
 }
 

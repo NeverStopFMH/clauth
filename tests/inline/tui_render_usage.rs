@@ -309,7 +309,7 @@ fn header_lines_plan_falls_back_to_endpoint_label() {
         .first()
         .map(|l| l.spans.iter().map(|s| s.content.clone()).collect())
         .unwrap_or_default();
-    let expected = crate::format::endpoint_label(&profile);
+    let expected = crate::format::endpoint_label(&profile).expect("a 'max' token claims a tier");
     assert_eq!(expected, "Claude Max", "sanity: the tier label under test");
     assert!(
         plan_row.contains(&expected),
@@ -318,6 +318,48 @@ fn header_lines_plan_falls_back_to_endpoint_label() {
     assert!(
         !plan_row.contains("oauth"),
         "plan row must not fall back to the bare 'oauth' literal, got {plan_row:?}"
+    );
+}
+
+/// With no fetched plan AND no tier the token can claim, the `plan` row takes
+/// the house no-data dash in the faint no-data treatment. The bare "Claude" it
+/// printed before named a plan the account never had.
+#[test]
+fn header_lines_plan_dashes_when_no_tier_is_known() {
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    // Credentialed, so the row is a live OAuth account rather than an empty
+    // shell — but the token claims nothing clauth can classify.
+    let mut profile = crate::testutil::blank_profile("a");
+    profile.credentials = Some(crate::profile::ClaudeCredentials {
+        claude_ai_oauth: Some(crate::profile::OAuthToken {
+            access_token: "at".into(),
+            refresh_token: None,
+            expires_at: None,
+            scopes: None,
+            subscription_type: Some("something_new".into()),
+        }),
+    });
+    let header = HeaderState {
+        activity: ProfileActivity::Idle,
+        next_refresh_ms: None,
+        tick: 0,
+        streaks: StreakCounts::default(),
+        kick_block: None,
+        diag: DiagFlags::default(),
+    };
+    let lines = header_lines(&profile, &header, 52);
+    let plan_line = lines.first().expect("plan row");
+    let value = plan_line.spans.last().expect("plan value span");
+    assert_eq!(value.content, "—", "plan value, got {:?}", plan_line.spans);
+    assert_eq!(
+        value.style.fg,
+        theme::faint().fg,
+        "the no-data dash takes the faint treatment"
+    );
+    let plan_row: String = plan_line.spans.iter().map(|s| s.content.clone()).collect();
+    assert!(
+        !plan_row.contains("Claude"),
+        "an unfetched plan must not name a tier, got {plan_row:?}"
     );
 }
 
@@ -393,6 +435,21 @@ fn status_lines_shows_canceled_from_a_prior_sessions_cached_plan() {
 
     let rendered = text(status_lines(&profile, &header, 120));
     assert!(rendered.contains("canceled"), "got {rendered:?}");
+
+    // Both halves on one surface: the tier row names the TIER, the status row
+    // names the STATUS. Folding "canceled" into the tier is what made the JSON
+    // surfaces disagree about the same account, and this is where a reader
+    // would first be tempted to do it again.
+    let header_text = text(header_lines(&profile, &header, 120));
+    let plan_row = header_text.lines().next().expect("plan row");
+    assert!(
+        plan_row.contains("Claude Free") && !plan_row.contains("canceled"),
+        "the plan row carries the tier alone, got {plan_row:?}"
+    );
+    assert!(
+        header_text.contains("canceled"),
+        "the status block below it still says canceled, got {header_text:?}"
+    );
 }
 
 /// Regression guard the other direction: an un-canceled cached plan never

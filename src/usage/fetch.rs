@@ -343,8 +343,8 @@ impl PlanTier {
     /// Map the OAuth token's `subscription_type` so a not-yet-fetched profile
     /// still shows a sane tier label. A missing claim (a credential-less or
     /// never-fetched profile) or an unrecognized value → `Unknown`, never a
-    /// fabricated paid tier: `Unknown` renders neutrally (`short_label` omits it,
-    /// `display` shows the bare "Claude") instead of a "Pro" out of thin air.
+    /// fabricated paid tier: `Unknown` renders neutrally (both `short_label` and
+    /// `display` omit it) instead of a "Pro" out of thin air.
     pub(crate) fn from_subscription_type(s: Option<&str>) -> Self {
         match s {
             Some("pro") => PlanTier::Pro,
@@ -355,17 +355,20 @@ impl PlanTier {
         }
     }
 
-    /// Same strings the old `plan_label` emitted, for every tier.
-    pub(crate) fn display(&self) -> String {
-        match self {
+    /// Same strings the old `plan_label` emitted, for every known tier. `None`
+    /// for `Unknown`, mirroring [`PlanTier::short_label`]: a bare "Claude" reads
+    /// as a real plan the account never claimed, so each surface renders its own
+    /// no-data form instead.
+    pub(crate) fn display(&self) -> Option<String> {
+        Some(match self {
             PlanTier::Max(Some(n)) => format!("Claude Max {n}x"),
             PlanTier::Max(None) => "Claude Max".to_string(),
             PlanTier::Pro => "Claude Pro".to_string(),
             PlanTier::Team => "Claude Team".to_string(),
             PlanTier::Enterprise => "Claude Enterprise".to_string(),
             PlanTier::Free => "Claude Free".to_string(),
-            PlanTier::Unknown => "Claude".to_string(),
-        }
+            PlanTier::Unknown => return None,
+        })
     }
 
     /// Compact tier label without the `Claude ` prefix, for contexts that

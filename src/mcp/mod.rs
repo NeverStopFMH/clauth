@@ -1104,3 +1104,7 @@ mod tests;
 #[cfg(test)]
 #[path = "../../tests/inline/mcp_switch_tool.rs"]
 mod switch_tool_tests;
+
+#[cfg(test)]
+#[path = "../../tests/inline/mcp_which_tool.rs"]
+mod which_tool_tests;

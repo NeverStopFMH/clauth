@@ -4,6 +4,10 @@ use super::*;
 use std::collections::BTreeMap;
 
 use crate::profile::{AppConfig, AppState, ClaudeCredentials, OAuthToken, Profile, ProfileName};
+use crate::profile_cache::{USAGE_CACHE_FILE, write_profile_cache};
+use crate::providers::Provider;
+use crate::testutil::HomeSandbox;
+use crate::usage::{PlanInfo, PlanTier, UsageInfo};
 
 fn oauth_profile(name: &str, refresh: &str) -> Profile {
     Profile {
@@ -321,12 +325,40 @@ fn disabled_profile_is_never_resolved_as_credential_less_active() {
     assert_eq!(resolve_profile(&config, Some(&live), false, None), None);
 }
 
+/// An OAuth profile whose login token claims `sub`, the tier this field reported
+/// forever before the cache became the first answer.
+fn oauth_profile_claiming(name: &str, refresh: &str, sub: &str) -> Profile {
+    let mut profile = oauth_profile(name, refresh);
+    if let Some(oauth) = profile
+        .credentials
+        .as_mut()
+        .and_then(|c| c.claude_ai_oauth.as_mut())
+    {
+        oauth.subscription_type = Some(sub.to_string());
+    }
+    profile
+}
+
+/// Persist a `/profile` plan for `name` — the on-disk cache every JSON surface
+/// resolves a tier through. Needs a live [`HomeSandbox`].
+fn cache_plan(name: &str, tier: PlanTier, status: Option<&str>) {
+    let usage = UsageInfo {
+        plan: Some(PlanInfo {
+            tier,
+            subscription_status: status.map(str::to_string),
+        }),
+        ..Default::default()
+    };
+    write_profile_cache(name, USAGE_CACHE_FILE, &usage);
+}
+
 /// `which --json`'s `tier` is `null` when nothing on disk claims a tier, which
 /// is what `status.json` and the MCP tools already emit for the same account —
 /// the bare "Claude" this field used to print was a plan the account never had,
 /// and it made the three surfaces disagree.
 #[test]
 fn json_tier_is_null_when_no_tier_is_known() {
+    let _home = HomeSandbox::new();
     let config = config_with(vec![oauth_profile("work", "rt-work")], Some("work"));
     let resolved = ("work".to_string(), Source::RefreshMatch);
     let value = json_view(&config, Some(&resolved));
@@ -342,21 +374,88 @@ fn json_tier_is_null_when_no_tier_is_known() {
     );
 }
 
-/// The other direction: a token that DOES claim a tier still renders it.
+/// A never-fetched account has no cache to read, so the login token's claim is
+/// still the answer rather than a `null` that would read as "no plan".
 #[test]
-fn json_tier_renders_a_known_tier() {
-    let mut profile = oauth_profile("work", "rt-work");
-    if let Some(oauth) = profile
-        .credentials
-        .as_mut()
-        .and_then(|c| c.claude_ai_oauth.as_mut())
-    {
-        oauth.subscription_type = Some("max".to_string());
-    }
-    let config = config_with(vec![profile], Some("work"));
+fn json_tier_falls_back_to_the_token_claim_with_no_cache() {
+    let _home = HomeSandbox::new();
+    let config = config_with(
+        vec![oauth_profile_claiming("work", "rt-work", "max")],
+        Some("work"),
+    );
     let resolved = ("work".to_string(), Source::RefreshMatch);
 
-    assert_eq!(json_view(&config, Some(&resolved))["tier"], "Claude Max");
+    assert_eq!(json_view(&config, Some(&resolved))["tier"], "Max");
+}
+
+/// A cached plan outranks the token claim. The multiplier is the discriminator:
+/// the token carries a bare `max` and nothing else, so `Max 20x` is unreachable
+/// by the token path and can only have come off the cache.
+#[test]
+fn json_tier_reports_the_cached_plan_over_the_token_claim() {
+    let _home = HomeSandbox::new();
+    let config = config_with(
+        vec![oauth_profile_claiming("work", "rt-work", "max")],
+        Some("work"),
+    );
+    cache_plan("work", PlanTier::Max(Some(20)), None);
+    let resolved = ("work".to_string(), Source::RefreshMatch);
+
+    assert_eq!(json_view(&config, Some(&resolved))["tier"], "Max 20x");
+}
+
+/// The defect this field carried: a Pro account canceled AFTER login kept
+/// reporting `Claude Pro` here forever. `subscription_type` is written once at
+/// login and no refresh response carries a replacement, so the token cannot
+/// learn about the `claude_free` downgrade — while `status.json` and the MCP
+/// tools, reading the cache, had been reporting `Free` all along.
+#[test]
+fn json_tier_reports_a_canceled_accounts_real_tier_not_its_login_claim() {
+    let _home = HomeSandbox::new();
+    let profile = oauth_profile_claiming("kerry", "rt-kerry", "pro");
+    assert_eq!(
+        profile
+            .credentials
+            .as_ref()
+            .and_then(|c| c.claude_ai_oauth.as_ref())
+            .and_then(|o| o.subscription_type.as_deref()),
+        Some("pro"),
+        "fixture control: the stale login claim the cache has to outrank"
+    );
+    let config = config_with(vec![profile], Some("kerry"));
+    cache_plan("kerry", PlanTier::Free, Some("canceled"));
+    let resolved = ("kerry".to_string(), Source::RefreshMatch);
+
+    assert_eq!(json_view(&config, Some(&resolved))["tier"], "Free");
+}
+
+/// One account, one tier, on both surfaces reachable from here. `status.json` is
+/// driven through its own builder, so this is a real cross-surface check.
+///
+/// The MCP tools are NOT asserted here and cannot be: `ClauthServer::which` is
+/// private to `src/mcp/mod.rs`, so only a test mod inside that module can drive
+/// it. That pin lives in `tests/inline/mcp_which_tool.rs`. Recomputing
+/// `tier_label` in this test instead would re-evaluate the very expression
+/// `json_view` runs internally and assert a value against itself.
+#[test]
+fn json_tier_agrees_with_the_status_json_surface() {
+    let _home = HomeSandbox::new();
+    let config = config_with(
+        vec![oauth_profile_claiming("kerry", "rt-kerry", "pro")],
+        Some("kerry"),
+    );
+    cache_plan("kerry", PlanTier::Free, Some("canceled"));
+    let resolved = ("kerry".to_string(), Source::RefreshMatch);
+
+    let which = json_view(&config, Some(&resolved));
+    let status = crate::daemon::build_status(&config, 60_000, None, false);
+
+    assert_eq!(which["tier"], "Free", "fixture control: the cached tier");
+    assert_eq!(
+        status["profiles"][0]["name"], "kerry",
+        "fixture control: the status body's one row is this account"
+    );
+    assert_eq!(status["profiles"][0]["tier"], which["tier"]);
 }
 
 /// An unresolved session emits every field as `null` rather than dropping them,
@@ -368,6 +467,98 @@ fn json_tier_is_null_when_nothing_resolved() {
 
     assert!(value["profile"].is_null());
     assert!(value["tier"].is_null());
+    // `get`, not `value["base_url"]`: indexing answers `Null` for a key that was
+    // never emitted, so it cannot tell a null field from a dropped one — the
+    // very distinction this test's contract rests on.
+    assert_eq!(value.get("base_url"), Some(&serde_json::Value::Null));
+}
+
+/// A third-party profile publishes the endpoint its requests route to, matching
+/// what `status.json` publishes for the same profile. `tier` answers only for an
+/// Anthropic plan, so this field is the one thing on the surface that names where
+/// a third-party session actually goes.
+#[test]
+fn json_base_url_carries_a_third_partys_endpoint() {
+    let _home = HomeSandbox::new();
+    let mut profile = endpoint_profile("deepseek");
+    profile.base_url = Some("https://api.deepseek.com/anthropic".to_string());
+    profile.provider = Some(Provider::DeepSeek);
+    let config = config_with(vec![profile], Some("deepseek"));
+    let resolved = ("deepseek".to_string(), Source::CredentialLessActive);
+
+    let value = json_view(&config, Some(&resolved));
+    let status = crate::daemon::build_status(&config, 60_000, None, false);
+
+    assert_eq!(value["base_url"], "https://api.deepseek.com/anthropic");
+    assert!(
+        value["tier"].is_null(),
+        "a third-party profile claims no Anthropic plan, got {}",
+        value["tier"]
+    );
+    assert_eq!(
+        status["profiles"][0]["base_url"], value["base_url"],
+        "the endpoint reads the same on both JSON surfaces"
+    );
+}
+
+/// The other direction: an Anthropic account routes nowhere special, so the
+/// field is `null` while the tier still answers.
+#[test]
+fn json_base_url_is_null_for_an_anthropic_account() {
+    let _home = HomeSandbox::new();
+    let config = config_with(
+        vec![oauth_profile_claiming("work", "rt-work", "max")],
+        Some("work"),
+    );
+    let resolved = ("work".to_string(), Source::RefreshMatch);
+
+    let value = json_view(&config, Some(&resolved));
+    // Present-and-null, not absent: see `json_tier_is_null_when_nothing_resolved`.
+    assert_eq!(value.get("base_url"), Some(&serde_json::Value::Null));
+    assert_eq!(
+        value["tier"], "Max",
+        "fixture control: the account still reports its tier"
+    );
+}
+
+/// The shape a reader gets wrong: a profile can hold a `base_url` AND stored
+/// OAuth credentials, since setting an endpoint never drops them. On an
+/// UNRECOGNISED endpoint the two fields are independent — `is_third_party` is
+/// `provider.is_some()` and no provider was recognised, so the stored pair's
+/// tier still reports while requests route elsewhere.
+#[test]
+fn json_publishes_both_an_endpoint_and_a_tier_for_a_hybrid_profile() {
+    let _home = HomeSandbox::new();
+    let mut profile = oauth_profile_claiming("hybrid", "rt-hybrid", "max");
+    profile.base_url = Some("https://example.test".to_string());
+    let config = config_with(vec![profile], Some("hybrid"));
+    let resolved = ("hybrid".to_string(), Source::RefreshMatch);
+
+    let value = json_view(&config, Some(&resolved));
+    assert_eq!(value["base_url"], "https://example.test");
+    assert_eq!(value["tier"], "Max");
+}
+
+/// The arm the guard defends, and the limit of the independence above: give the
+/// same hybrid a RECOGNISED provider and `tier_label`'s `is_third_party` exit
+/// fires, so the endpoint's presence does rule the tier out — `null` despite a
+/// stored pair claiming `max`.
+#[test]
+fn json_tier_is_null_for_a_recognised_third_party_holding_oauth_creds() {
+    let _home = HomeSandbox::new();
+    let mut profile = oauth_profile_claiming("hybrid", "rt-hybrid", "max");
+    profile.base_url = Some("https://api.deepseek.com/anthropic".to_string());
+    profile.provider = Some(Provider::DeepSeek);
+    let config = config_with(vec![profile], Some("hybrid"));
+    let resolved = ("hybrid".to_string(), Source::RefreshMatch);
+
+    let value = json_view(&config, Some(&resolved));
+    assert_eq!(value["base_url"], "https://api.deepseek.com/anthropic");
+    assert!(
+        value["tier"].is_null(),
+        "a recognised provider outranks the stored pair's claim, got {}",
+        value["tier"]
+    );
 }
 
 #[test]

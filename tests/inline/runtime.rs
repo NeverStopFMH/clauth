@@ -4436,6 +4436,56 @@ fn a_bare_store_stamp_does_not_beat_a_sibling_sessions_relogin() {
     });
 }
 
+/// A chain-following session revisits members: A→B→A→B is three switches on a
+/// two-member chain. The value a swap records as "when these bytes were last
+/// written" is therefore often the PREVIOUS swap's own stamp, so it has to be
+/// resolved the same way the readers resolve it. Recording a raw mtime instead
+/// advances the reported write time by one stamp per revisit, and after a few
+/// cycles both decisions are back to reading a bump as a write.
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn a_second_swap_onto_a_member_keeps_reporting_its_real_last_write() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let launch = member("revisit-a");
+        let intended = member("revisit-b");
+        member_store(&launch);
+        let intended_store = member_store(&intended);
+        let (swap, _launch_markers) = lone_session(&launch, Isolation::Shared);
+
+        let last_write = SystemTime::now() - Duration::from_secs(300);
+        set_mtime(&intended_store, last_write);
+
+        // Onto B, back to A, onto B again — nothing writes B's bytes throughout.
+        assert_eq!(
+            swap.swap_to("revisit-b").expect("out"),
+            SwapOutcome::Swapped
+        );
+        assert_eq!(
+            swap.swap_to("revisit-a").expect("out"),
+            SwapOutcome::Swapped
+        );
+        assert_eq!(
+            swap.swap_to("revisit-b").expect("out"),
+            SwapOutcome::Swapped
+        );
+
+        assert_ne!(
+            fs::metadata(&intended_store)
+                .expect("meta")
+                .modified()
+                .expect("mtime"),
+            last_write,
+            "precondition: the revisit stamped the store again"
+        );
+        assert_eq!(
+            crate::profile_cache::effective_write_time(&intended_store),
+            Some(last_write),
+            "a stamp displacing an earlier stamp must carry the real write forward"
+        );
+    });
+}
+
 /// The other direction: a rotation genuinely writes B's store after the swap, so
 /// the stamp's receipt is retired and canonical is the more recent login again.
 /// An older re-login must NOT be adopted over it.

@@ -72,6 +72,10 @@ pub(crate) fn write_touch_receipt(
     let Some(file) = store.file_name().and_then(|f| f.to_str()) else {
         return;
     };
+    debug_assert!(
+        crate::profile::profile_dir(name).ok().as_deref() == store.parent(),
+        "the receipt is read back from the store's own directory, so it has to be written there",
+    );
     write_profile_cache(
         name,
         TOUCH_RECEIPT_FILE,

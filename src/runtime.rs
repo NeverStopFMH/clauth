@@ -1174,7 +1174,12 @@ struct SwapPlan {
 /// lets them tell the two apart; both resolve their store mtime through
 /// [`crate::profile_cache::effective_write_time`].
 fn touch_store(plan: &SwapPlan, memoized: Option<SystemTime>) -> Result<()> {
-    let displaced = file_mtime(&plan.store);
+    // Through the resolver, not the raw mtime: on a swap BACK onto a member the
+    // value being displaced is that member's own earlier stamp, and a receipt
+    // recording a stamp as a write time hands the readers the exact answer this
+    // exists to prevent — eroding by one stamp per revisit, on the chain churn
+    // the feature is for.
+    let displaced = crate::profile_cache::effective_write_time(&plan.store);
     let file = OpenOptions::new()
         .write(true)
         .open(&plan.store)
@@ -1184,20 +1189,27 @@ fn touch_store(plan: &SwapPlan, memoized: Option<SystemTime>) -> Result<()> {
             .with_context(|| format!("failed to touch {}", plan.store.display()))
     };
     let landed = || file.metadata().ok().and_then(|m| m.modified().ok());
-    stamp(SystemTime::now())?;
+    let asked = SystemTime::now();
+    stamp(asked)?;
+    // A receipt is only sound where the filesystem kept the EXACT value asked
+    // for. Where the mtime truncates, a genuine write landing in the same tick
+    // aliases onto the stamp, and a receipt resolving a real write back to
+    // `displaced` inverts both decisions — worse than no receipt at all. Read
+    // from the first stamp only: `memoized + 1s` below is already tick-aligned,
+    // so it round-trips exactly even on the filesystem this guards against.
+    let exact = landed() == Some(asked);
     // The clock is normally enough, because only EQUALITY hides the swap. The one
     // way `now` lands on `memoized` is a coarse-granularity filesystem truncating
     // it back onto a store written in the same second, so check what actually
     // landed rather than predict it. Stamping ahead of the clock stays the
-    // fallback rather than the default: the receipt below only holds while the
-    // store's mtime is still the stamped one, so a store left in the future
-    // outlives its receipt the moment anything writes it.
+    // fallback rather than the default: a store left in the future outlives any
+    // receipt the moment something writes it.
     if let Some(memoized) = memoized
         && landed() == Some(memoized)
     {
         stamp(memoized + Duration::from_secs(1))?;
     }
-    if let Some(stamped) = landed() {
+    if exact && let Some(stamped) = landed() {
         crate::profile_cache::write_touch_receipt(&plan.member, &plan.store, stamped, displaced);
     }
     Ok(())

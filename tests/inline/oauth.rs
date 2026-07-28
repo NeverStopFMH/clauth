@@ -1803,6 +1803,60 @@ fn guard_acquire_failure_names_the_filesystem_cause() {
     );
 }
 
+/// One condition, one sentence, across BOTH legs that report it. The rotate
+/// leg's `OpResult` toast and the switch gate's refusal describe the identical
+/// failure, and `5391a4c` reworded only the gate — leaving the toasts on
+/// `failed to acquire rotation lock`, which is exactly the "one condition
+/// printed four different sentences" that `format.rs` was created to end.
+/// Compares the two renderings against each other rather than against a
+/// literal, so it catches the divergence even if the copy changes again.
+#[test]
+fn the_unavailable_lock_has_one_spelling_across_both_legs() {
+    use std::sync::mpsc;
+    let _home = HomeSandbox::new();
+    let name = "rotate-lock-unavailable";
+    // Same fixture as the gate pin: a regular file where the profile DIRECTORY
+    // belongs, so `RotationGuard::acquire`'s `mkdir_700` fails.
+    #[allow(clippy::expect_used, reason = "test")]
+    let dir = crate::profile::profile_dir(name).expect("profile dir");
+    if let Some(parent) = dir.parent() {
+        #[allow(clippy::expect_used, reason = "test")]
+        std::fs::create_dir_all(parent).expect("profile parent");
+    }
+    #[allow(clippy::expect_used, reason = "test")]
+    std::fs::write(&dir, b"not a directory").expect("occupy the profile dir path");
+
+    let config = Arc::new(RankedMutex::new(oauth_config(
+        name,
+        Some("rt-ok"),
+        Some(past_expiry()),
+    )));
+    let activity: ActivityStore = Arc::new(RankedMutex::new(std::collections::HashMap::new()));
+    let refetch: crate::usage::RefetchQueue =
+        Arc::new(RankedMutex::new(std::collections::HashSet::new()));
+    let (tx, rx) = mpsc::channel();
+
+    assert!(
+        !rotate_one(&config, name, &refetch, &activity, &tx),
+        "an unacquirable lock persists nothing"
+    );
+    #[allow(clippy::expect_used, reason = "test")]
+    let OpResult { outcome, .. } = rx.try_recv().expect("the guard-fail leg emits an OpResult");
+    let toast = match outcome {
+        Ok(()) => panic!("an unacquirable lock is not a completed rotation"),
+        Err(e) => e.to_string(),
+    };
+
+    let AuthGate::Transient(gate) = ensure_installable(&config, name, never_refresh) else {
+        panic!("the gate must refuse the same condition transiently");
+    };
+    assert_eq!(
+        toast,
+        gate.text(),
+        "both legs report the same failure and must say it the same way"
+    );
+}
+
 /// A poisoned config mutex does not clear itself, so a retry hint would be a
 /// lie. Reached by panicking a thread while it holds the lock — the only way
 /// this arm happens in production too.

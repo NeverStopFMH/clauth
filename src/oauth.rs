@@ -759,6 +759,19 @@ pub(crate) fn auto_start_kick(
 /// failure (no `OpResult` emitted, no activity pre-stamp to clear) from every
 /// other path (which emits its own `OpResult` and clears activity). Lets
 /// `refresh_all` workers surface the guard-fail as a Danger toast.
+/// The ONE spelling for "this profile's rotation lock could not be taken",
+/// shared by both `OpResult` legs and the pre-install switch gate. Three call
+/// sites, one `Cause` arm: `format.rs` exists because this exact condition used
+/// to print a different sentence per surface, and `5391a4c` re-created that by
+/// rewording the gate's copy while leaving the two toasts on their own string.
+fn rotation_lock_unavailable(name: &str) -> crate::format::Transient {
+    crate::format::Transient::new(
+        crate::format::Cause::RotationLockUnavailable(name.to_string()),
+        // The cause names its own next step; a second one contradicts it.
+        crate::format::Retry::Stated,
+    )
+}
+
 enum RotateOutcome {
     /// `RotationGuard::acquire` failed — the lock file could not be created or
     /// opened. NOT contention: `acquire` blocks on the flock, so a sibling
@@ -956,7 +969,7 @@ pub(crate) fn refresh_all(
             Ok((n, RotateOutcome::GuardUnavailable)) => {
                 let _ = sender.send(OpResult {
                     name: n.clone(),
-                    outcome: Err(anyhow::anyhow!("failed to acquire rotation lock")),
+                    outcome: Err(anyhow::anyhow!("{}", rotation_lock_unavailable(&n).text())),
                 });
                 clear_activity(activity, &n);
             }
@@ -1002,7 +1015,10 @@ pub(crate) fn rotate_one(
         RotateOutcome::GuardUnavailable => {
             let _ = sender.send(OpResult {
                 name: name.to_string(),
-                outcome: Err(anyhow::anyhow!("failed to acquire rotation lock")),
+                outcome: Err(anyhow::anyhow!(
+                    "{}",
+                    rotation_lock_unavailable(name).text()
+                )),
             });
             clear_activity(activity, name);
             false
@@ -1468,12 +1484,7 @@ pub(crate) fn ensure_installable(
     // below: `acquire` blocks on the flock, so a sibling worker or live session
     // on this chain makes us wait. Only creating/opening the lock file can fail.
     let Ok(guard) = RotationGuard::acquire(name) else {
-        // `Stated`: this copy already names its own next step, and appending a
-        // second one gave the operator two incompatible reasons to retry.
-        return AuthGate::Transient(crate::format::Transient::new(
-            crate::format::Cause::RotationLockUnavailable(name.to_string()),
-            crate::format::Retry::Stated,
-        ));
+        return AuthGate::Transient(rotation_lock_unavailable(name));
     };
     // macOS only, same mechanism as the other rotation legs: a switch TARGET can
     // carry its own live `clauth start` session whose CC reads a Keychain item

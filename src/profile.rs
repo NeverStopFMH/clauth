@@ -15,7 +15,6 @@ pub(crate) enum DivergenceChoice {
     Discard,
 }
 
-use crate::claude::SessionTokenStatus;
 use crate::lock::with_state_lock;
 use crate::logline::logline;
 use crate::providers::{Provider, ThirdPartyStats};
@@ -916,27 +915,26 @@ pub(crate) fn app_state_mtime() -> Option<SystemTime> {
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub(crate) struct ReloadFingerprint {
     profiles_toml_mtime: Option<SystemTime>,
-    /// `(profile dir name, config.toml mtime, session-token.json status)`,
-    /// `None` when the file is absent, sorted by name so readdir order can't
+    /// `(profile dir name, config.toml mtime, session-token.json write time)`,
+    /// each `None` when the file is absent, sorted by name so readdir order can't
     /// spuriously flip equality. The sidecar rides here because a
     /// `login --setup-token` re-mint touches nothing else — without it the hot
-    /// reload never sees a new/changed long-lived token. It rides as its PARSED
-    /// status, not its mtime: a swap onto a token-mode member stamps that file's
-    /// mtime with no write behind it, and the status is what every consumer of
-    /// the sidecar actually reads, so a reload fires exactly when one of them
-    /// would see something new.
-    config_mtimes: Vec<(String, Option<SystemTime>, Option<SessionTokenStatus>)>,
+    /// reload never sees a new/changed long-lived token. Its WRITE time, not its
+    /// raw mtime: for a token-mode member that file is the store a swap stamps,
+    /// and a bare stamp is not a config change. Reading the mtime rather than the
+    /// contents also keeps the sidecar's bearer off this path, which runs per
+    /// TUI frame.
+    config_mtimes: Vec<(String, Option<SystemTime>, Option<SystemTime>)>,
 }
 
-/// Reads the reload triggers off disk: a stat per `config.toml`, and a read plus
-/// JSON parse of each `session-token.json` that exists. Holds NO locks —
-/// `config` sits high in the rank hierarchy, so this must stay lock-free — and
-/// fails soft: a readdir/stat/parse error contributes the empty value instead of
-/// erroring.
+/// Filesystem stat of the reload triggers, plus the swap receipt beside a
+/// `session-token.json` that exists — never that file's contents, since this runs
+/// per TUI frame. Holds NO locks — `config` sits high in the rank hierarchy, so
+/// this must stay lock-free — and fails soft: a readdir/stat error contributes
+/// the empty value instead of erroring.
 pub(crate) fn reload_fingerprint() -> ReloadFingerprint {
     let profiles_toml_mtime = app_state_mtime();
-    let mut config_mtimes: Vec<(String, Option<SystemTime>, Option<SessionTokenStatus>)> =
-        Vec::new();
+    let mut config_mtimes: Vec<(String, Option<SystemTime>, Option<SystemTime>)> = Vec::new();
     if let Ok(root) = profiles_root()
         && let Ok(entries) = std::fs::read_dir(&root)
     {
@@ -948,14 +946,13 @@ pub(crate) fn reload_fingerprint() -> ReloadFingerprint {
             let config_mtime = std::fs::metadata(entry.path().join("config.toml"))
                 .and_then(|m| m.modified())
                 .ok();
-            let token =
-                crate::claude::session_token_status_at(&entry.path().join("session-token.json"));
+            let token = crate::profile_cache::effective_write_time(
+                &entry.path().join("session-token.json"),
+            );
             config_mtimes.push((name, config_mtime, token));
         }
     }
-    // By dir name, which readdir gives at most once, rather than by the whole
-    // tuple: ordering two sidecar STATUSES against each other means nothing.
-    config_mtimes.sort_by(|a, b| a.0.cmp(&b.0));
+    config_mtimes.sort();
     ReloadFingerprint {
         profiles_toml_mtime,
         config_mtimes,

@@ -96,17 +96,20 @@ pub(crate) fn write_touch_receipt(
 /// unparseable, for the other store, or retired by a later write yields the raw
 /// mtime, so a lost or stale receipt costs exactly the pre-receipt answer.
 pub(crate) fn effective_write_time(store: &Path) -> Option<SystemTime> {
+    // Returns before the receipt read when the store is absent: nothing can have
+    // displaced a write that never happened, and a profile with no sidecar is the
+    // common case on the reload fingerprint's per-profile walk.
     let mtime = std::fs::metadata(store)
         .ok()
-        .and_then(|m| m.modified().ok());
+        .and_then(|m| m.modified().ok())?;
     let Some(file) = store.file_name().and_then(|f| f.to_str()) else {
-        return mtime;
+        return Some(mtime);
     };
     std::fs::read_to_string(store.with_file_name(TOUCH_RECEIPT_FILE))
         .ok()
         .and_then(|text| serde_json::from_str::<TouchReceipt>(&text).ok())
-        .filter(|receipt| receipt.store == file && mtime == Some(receipt.stamped))
-        .map_or(mtime, |receipt| receipt.prev)
+        .filter(|receipt| receipt.store == file && mtime == receipt.stamped)
+        .map_or(Some(mtime), |receipt| receipt.prev)
 }
 
 /// Resolve `<profile_dir>/<file>` for `name`. `None` only when the per-profile

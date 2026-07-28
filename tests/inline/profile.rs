@@ -1498,9 +1498,9 @@ fn reload_fingerprint_drops_when_a_config_toml_is_removed() {
 
 // A `login --setup-token` re-mint writes only `session-token.json` (touches no
 // config.toml, no profiles.toml), so the fingerprint must fold that file in or
-// the hot reload never sees a new / re-minted long-lived token. What rides is the
-// sidecar's parsed status, so the trigger is the mint changing — not the file's
-// timestamp moving, which a swap onto a token-mode member does with no write.
+// the hot reload never sees a new / re-minted long-lived token. What rides is
+// when the file was WRITTEN, so every real mint trips it — see the two tests
+// below for the timestamp that is not a write, and the write no expiry can see.
 #[test]
 fn reload_fingerprint_bumps_when_a_session_token_is_added_or_changed() {
     let _home = crate::testutil::HomeSandbox::new();
@@ -1525,13 +1525,50 @@ fn reload_fingerprint_bumps_when_a_session_token_is_added_or_changed() {
     let after_remint = reload_fingerprint();
     assert_ne!(
         after_add, after_remint,
-        "a re-mint carries a later expiry and must trip the fingerprint"
+        "a re-mint is a fresh write of the sidecar and must trip the fingerprint"
+    );
+}
+
+/// Two writes the sidecar's PARSED contents cannot tell apart, both of which the
+/// surfaces reading that file would render differently. A re-mint stamped with
+/// the same `expiresAt` (a mint inside the same clock tick, or a hand-edited
+/// horizon restored to its old value) changes the bearer and nothing else; an
+/// unparseable sidecar appearing is a state the reader reports as "no sidecar"
+/// while the operator sees a file. A write time catches both.
+#[test]
+fn reload_fingerprint_catches_a_sidecar_write_no_expiry_can_see() {
+    let _home = crate::testutil::HomeSandbox::new();
+    save_profile(&crate::testutil::blank_profile("p")).expect("save_profile");
+    let sidecar = profile_dir("p")
+        .expect("profile_dir")
+        .join("session-token.json");
+
+    let before_any = reload_fingerprint();
+    std::fs::write(&sidecar, b"{}\n").expect("write an unparseable sidecar");
+    let after_junk = reload_fingerprint();
+    assert_ne!(
+        before_any, after_junk,
+        "a sidecar that parses to nothing is still a file that appeared"
+    );
+
+    let minted_at: i64 = 1_700_000_000_000;
+    crate::claude::write_session_token("p", &format!("sk-ant-{}", "m".repeat(40)), minted_at)
+        .expect("mint");
+    let after_mint = reload_fingerprint();
+    crate::claude::write_session_token("p", &format!("sk-ant-{}", "r".repeat(40)), minted_at)
+        .expect("re-mint at the same stamped horizon");
+    assert_ne!(
+        after_mint,
+        reload_fingerprint(),
+        "a new bearer under an unchanged expiry is still a re-mint",
     );
 }
 
 /// The swap executor stamps the store it repoints to, and for a token-mode member
-/// that store IS `session-token.json`. Riding the mtime made that bump read as a
-/// re-mint and forced a full reload of every profile on the next tick.
+/// that store IS `session-token.json` (`claude::install_source_path`). Reading
+/// that bump as a re-mint forced a full reload of every profile on the next tick.
+/// Only a RECEIPTED stamp is discounted — a timestamp that moved with no receipt
+/// is indistinguishable from a write and must still trip the reload.
 #[test]
 fn reload_fingerprint_ignores_a_bare_session_token_stamp() {
     let _home = crate::testutil::HomeSandbox::new();
@@ -1545,15 +1582,34 @@ fn reload_fingerprint_ignores_a_bare_session_token_stamp() {
     let sidecar = profile_dir("p")
         .expect("profile_dir")
         .join("session-token.json");
+    let minted = std::fs::metadata(&sidecar)
+        .and_then(|m| m.modified())
+        .expect("mint mtime");
 
     let before = reload_fingerprint();
-    let later = std::time::SystemTime::now() + std::time::Duration::from_secs(30);
-    crate::testutil::set_mtime(&sidecar, later);
+    // What a swap onto this token-mode member leaves behind.
+    let stamped = std::time::SystemTime::now() + std::time::Duration::from_secs(30);
+    crate::profile_cache::write_touch_receipt("p", &sidecar, stamped, Some(minted));
+    crate::testutil::set_mtime(&sidecar, stamped);
 
     assert_eq!(
         before,
         reload_fingerprint(),
         "a timestamp that moved with no byte behind it is not a config change",
+    );
+
+    // And the receipt covers exactly that one stamp: the next real write retires
+    // it, so the reload fires again.
+    crate::claude::write_session_token(
+        "p",
+        &format!("sk-ant-{}", "r".repeat(40)),
+        1_700_000_000_000,
+    )
+    .expect("re-mint");
+    assert_ne!(
+        before,
+        reload_fingerprint(),
+        "a write landing on a stamped sidecar retires the receipt",
     );
 }
 

@@ -581,7 +581,6 @@ fn a_refused_with_fallback_start_never_probes_the_disk() {
 /// `acquire` and dies on the missing `~/.claude` this sandbox has no business
 /// creating.
 #[test]
-#[cfg(not(target_os = "macos"))]
 fn run_applies_the_chain_gate_only_to_an_opted_in_start() {
     let _sb = HomeSandbox::new();
     let _daemon = crate::daemon::hold_daemon_lock();
@@ -590,10 +589,20 @@ fn run_applies_the_chain_gate_only_to_an_opted_in_start() {
 
     let err = run(&loner, "wired", &[], Isolation::Shared, None, None, true)
         .expect_err("an opted-in start must be gated");
+    // WHICH gate answers is platform-decided, since `run` passes
+    // `cfg!(target_os = "macos")` in and the unsupported-host arm precedes the
+    // membership one. Each build sees one arm, so it is the ubuntu and macOS CI
+    // legs TOGETHER that reject a hardcoded value: a pinned `false` reds on macOS,
+    // a pinned `true` reds everywhere else.
     assert_eq!(
         err.to_string(),
-        "'wired': --with-fallback needs a fallback-chain member; add 'wired' on the \
-         fallback tab, or start without it"
+        if cfg!(target_os = "macos") {
+            "'wired': --with-fallback needs a per-session credential swap, but this host \
+             resolves credentials keychain-first; start without it"
+        } else {
+            "'wired': --with-fallback needs a fallback-chain member; add 'wired' on the \
+             fallback tab, or start without it"
+        }
     );
 
     let err = run(&loner, "wired", &[], Isolation::Shared, None, None, false)

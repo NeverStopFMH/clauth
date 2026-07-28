@@ -284,7 +284,6 @@ fn sync_runtime_wins_when_canonical_missing_expires_at() {
 }
 
 // Canonical unparseable → runtime wins (safer than discarding it).
-#[cfg(not(target_os = "macos"))]
 #[test]
 fn sync_runtime_wins_when_canonical_unparseable() {
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -3293,9 +3292,15 @@ fn a_registered_session_is_opted_out_of_the_chain() {
 /// `--with-fallback` is the only thing that sets `follows_chain`, so the flag has
 /// to survive the whole way to the on-disk row: the decision leg reads that field
 /// and nothing else decides whether a session is steerable.
-#[cfg(not(target_os = "macos"))]
+///
+/// On a host whose executor refuses every swap that same field is the CLAMP, so
+/// the expected value is forked on the platform rather than the test being skipped
+/// there: such a row would collect daemon intents nothing can execute.
+/// `a_fake_mode_host_never_registers_a_session_as_following_the_chain` covers
+/// `swap_support`'s other clamp arm, and it is the only pin on this call site
+/// passing the host's real value rather than a constant.
 #[test]
-fn an_opted_in_session_registers_as_following_the_chain() {
+fn the_with_fallback_flag_reaches_the_row_only_where_a_swap_can_land() {
     let tmp = tempfile::tempdir().expect("tempdir");
     with_fake_home(tmp.path(), || {
         fake_claude_home(tmp.path());
@@ -3313,9 +3318,16 @@ fn an_opted_in_session_registers_as_following_the_chain() {
             crate::live_sessions::get(&sid_of(plain.config_dir())).expect("the opted-out row");
         drop(plain);
 
-        assert!(
+        // Only the macOS axis is modelled here. A Windows host that probes into
+        // `LinkMode::Fake` clamps too, correctly, and reds this — the runners this
+        // suite gates on land on `Real`, so the narrower expectation is the honest
+        // one to write until one of them stops.
+        assert_eq!(
             opted_row.follows_chain,
-            "--with-fallback must reach the registry row"
+            !cfg!(target_os = "macos"),
+            "--with-fallback must reach the registry row, and must be clamped out of \
+             it wherever the executor refuses every swap (keychain-first here; a \
+             shared runtime tree is the other arm)"
         );
         assert!(
             !plain_row.follows_chain,
@@ -4283,7 +4295,6 @@ fn a_swap_back_onto_a_member_the_session_already_ran_on_succeeds() {
 /// no-op reached through an error path, permanent (`poll` filters on
 /// `member()` equality) and reported by one log line.
 #[cfg(all(unix, not(target_os = "macos")))]
-#[cfg(not(target_os = "macos"))]
 #[test]
 fn a_failed_repoint_leaves_the_session_on_the_member_its_link_resolves_to() {
     use std::os::unix::fs::PermissionsExt;
@@ -4496,7 +4507,12 @@ fn poll_executes_the_member_the_daemon_named() {
 /// A standing intent the executor refuses re-fires every tick, so announcing
 /// unconditionally writes one line per second for as long as it stands — but a
 /// refusal nothing ever says leaves the session on its launch account invisibly.
-#[cfg(not(target_os = "macos"))]
+///
+/// The dedupe itself is in-memory cell state with no platform dependency, so only
+/// the swap that clears it is gated. The refusals that actually stand in
+/// production are `swap_eligible`'s and `NoCredentialStore` — a keychain-first
+/// host reaches none of them, since the clamp on `follows_chain` keeps the daemon
+/// from ever writing an intent for that row.
 #[test]
 fn a_standing_refusal_is_announced_once_per_reason() {
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -4525,12 +4541,55 @@ fn a_standing_refusal_is_announced_once_per_reason() {
         );
 
         // A landed swap resets it: the next refusal on that member is new
-        // information, not a repeat.
-        assert!(!swap.should_announce("say-c", &SwapRefused::Disabled));
-        assert_eq!(swap.swap_to("say-b").expect("out"), SwapOutcome::Swapped);
-        assert!(
-            swap.should_announce("say-c", &SwapRefused::Disabled),
-            "a swap clears the announced state"
+        // information, not a repeat. Unreachable on a host that refuses the swap
+        // itself, where the reset has nothing to reset.
+        #[cfg(not(target_os = "macos"))]
+        {
+            assert!(!swap.should_announce("say-c", &SwapRefused::Disabled));
+            assert_eq!(swap.swap_to("say-b").expect("out"), SwapOutcome::Swapped);
+            assert!(
+                swap.should_announce("say-c", &SwapRefused::Disabled),
+                "a swap clears the announced state"
+            );
+        }
+    });
+}
+
+/// The executor's own platform refusal, which is why `swap_to`'s tests are gated
+/// off macOS: it is reached, refuses, and names the cause.
+/// `swap_support_refuses_a_shared_tree_and_a_keychain_first_host` pins the pure
+/// predicate; this pins that the executor still routes through it, so lifting the
+/// refusal without landing the per-config-dir Keychain write cannot pass in
+/// silence. Defence in depth rather than a live path: the `follows_chain` clamp
+/// means production never asks for a swap here in the first place.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_swap_on_a_keychain_first_host_refuses_with_the_platform_cause() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let launch = member("kc-a");
+        let intended = member("kc-b");
+        let launch_store = member_store(&launch);
+        member_store(&intended);
+        let (swap, _launch_markers) = lone_session(&launch, Isolation::Shared);
+
+        assert_eq!(
+            swap.swap_to("kc-b")
+                .expect("the refusal is an outcome, not an error"),
+            SwapOutcome::Refused(SwapRefused::Unsupported(SwapUnsupported::KeychainFirst))
+        );
+        assert_eq!(
+            swap.member(),
+            "kc-a",
+            "a refused swap moves the cell nowhere"
+        );
+        // The on-disk artifact, not the cell it was seeded from: `swap_to` moves
+        // the link before it publishes, so a refusal that repointed and failed to
+        // publish is invisible to `member()` alone.
+        assert_eq!(
+            fs::read_link(swap.runtime.join(".credentials.json")).expect("read link"),
+            launch_store,
+            "a refused swap leaves the link on the launch member's store"
         );
     });
 }

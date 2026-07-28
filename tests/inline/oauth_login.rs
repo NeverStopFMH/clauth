@@ -207,3 +207,48 @@ fn wait_for_code_times_out_at_the_deadline() {
         .to_string();
     assert!(err.contains("timed out"), "err was: {err}");
 }
+
+/// The `clauth login` summary names the account's plan from the token the login
+/// just stored. `login_profile_from_raw` mints `"free"` for a Free account, so
+/// this is the round trip that keeps the line reading `Claude Free` rather than
+/// echoing a raw wire token or claiming a tier the account never had.
+#[test]
+fn login_summary_names_the_plan_a_free_login_stored() {
+    let creds = crate::profile::ClaudeCredentials {
+        claude_ai_oauth: Some(crate::profile::OAuthToken {
+            access_token: "at".into(),
+            refresh_token: Some("rt".into()),
+            expires_at: None,
+            scopes: None,
+            subscription_type: Some("free".into()),
+        }),
+    };
+    assert!(
+        super::login_summary(&creds)
+            .contains("  plan: Claude Free (token verified against the API)"),
+        "got: {}",
+        super::login_summary(&creds)
+    );
+}
+
+/// No claim on the token is not a failed login: the probe is best-effort and the
+/// usage poll re-derives the tier within a cycle, so the line says so instead of
+/// naming a tier or reading as an error.
+#[test]
+fn login_summary_defers_when_the_token_claims_no_plan() {
+    let creds = crate::profile::ClaudeCredentials {
+        claude_ai_oauth: Some(crate::profile::OAuthToken {
+            access_token: "at".into(),
+            refresh_token: Some("rt".into()),
+            expires_at: None,
+            scopes: None,
+            subscription_type: None,
+        }),
+    };
+    let summary = super::login_summary(&creds);
+    assert!(
+        summary.contains("  plan: will populate on the first usage refresh"),
+        "got: {summary}"
+    );
+    assert!(!summary.contains("verified"), "got: {summary}");
+}

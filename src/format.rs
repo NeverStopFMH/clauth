@@ -96,8 +96,16 @@ pub(crate) fn endpoint_label(profile: &Profile) -> Option<String> {
     if let Some(url) = &profile.base_url {
         return Some(url.clone());
     }
-    if let Some(plan) = profile.usage.as_ref().and_then(|u| u.plan.as_ref()) {
-        return plan_label(plan);
+    // A fetched tier wins, but an UNCLASSIFIED one is not an answer: fall through
+    // the way `profile_json::tier_label` does, or this surface reads "no data"
+    // while that one shows the token's tier for the very same account.
+    if let Some(label) = profile
+        .usage
+        .as_ref()
+        .and_then(|u| u.plan.as_ref())
+        .and_then(plan_label)
+    {
+        return Some(label);
     }
     // No fetched plan yet — fall back to the OAuth token's subscription_type.
     let sub = profile

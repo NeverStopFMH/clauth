@@ -351,6 +351,9 @@ impl PlanTier {
             Some("max") => PlanTier::Max(None),
             Some("team") | Some("teams") => PlanTier::Team,
             Some("enterprise") => PlanTier::Enterprise,
+            // `login_profile_from_raw` mints this token for a `Free` account, so
+            // without the arm clauth fails to read back its own write.
+            Some("free") => PlanTier::Free,
             _ => PlanTier::Unknown,
         }
     }

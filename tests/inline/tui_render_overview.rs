@@ -928,13 +928,15 @@ fn no_tier_type_cell_does_not_pulse() {
     };
 
     // NOT 450ms, the crest the disabled-row pin above uses. That phase is the
-    // one value a ONE-CHARACTER label cannot express: the wave tints char `i` by
-    // `((i/len)·τ − progress·τ).cos()`, so a lone char sits at column 0 and at
-    // progress 0.5 the crest is exactly half a turn away — cos(π) drives the
-    // tint to zero, landing on the same base color as the flat 0ms frame. A `—`
-    // cell would then compare equal at both phases whether or not it pulsed, and
-    // the mutation that deletes the guard stays green. 135ms is near the peak
-    // `crest × envelope` for one char, where the tint is actually observable.
+    // one value a ONE-CHARACTER label cannot express. `pulse_name_spans` weights
+    // char `i` by `crest = ((col − head).cos() · 0.5 + 0.5)²` — note the remap,
+    // which is what turns the cosine's −1 into a 0 rather than a trough. A lone
+    // char sits at `col = 0`, and at progress 0.5 `head` is half a turn, so
+    // `crest = ((−1) · 0.5 + 0.5)² = 0`: no tint, landing on the same base color
+    // as the flat 0ms frame, whose `envelope = sin(0)` is 0 for its own reason.
+    // A `—` cell would then compare equal at both phases whether or not it
+    // pulsed, and the mutation deleting the guard stays green. 135ms is near the
+    // peak `crest × envelope` for one char, where the tint is observable.
     assert_eq!(
         snapshot(0, 0),
         snapshot(0, 135),
@@ -948,8 +950,13 @@ fn no_tier_type_cell_does_not_pulse() {
 }
 
 /// The dash joins the other no-data cells at `faint`, but only when it is the
-/// whole cell: a `·token` tag beside it is real data, and a disabled row still
-/// flattens to `dim` the way it outranks every other cell state.
+/// whole cell: a `·token` tag beside it is real data, a disabled row still
+/// flattens to `dim` the way it outranks every other cell state, and a row whose
+/// label is a REAL one keeps `dim` however it reached the un-pulsed branch.
+///
+/// That last leg is the one the `no_tier &&` conjunct exists for. An api-key row
+/// has a genuine `API` label AND no credentials, so it lands in the same branch
+/// a no-data dash does; without the conjunct every DeepSeek / Z.ai row fades.
 #[test]
 fn no_tier_type_cell_reads_faint_unless_something_real_shares_the_cell() {
     let _tier = crate::testutil::TierSandbox::new(theme::Tier::Full);
@@ -960,6 +967,12 @@ fn no_tier_type_cell_reads_faint_unless_something_real_shares_the_cell() {
             credentialed_profile("a", "something_new"),
             credentialed_profile("b", "something_new"),
             disabled,
+            Profile::new(
+                "d".to_string(),
+                Some("https://api.deepseek.com/anthropic".to_string()),
+                Some("sk-fixture".to_string()),
+            ),
+            Profile::new("e".to_string(), None, None),
         ],
         None,
         vec![],
@@ -1003,6 +1016,34 @@ fn no_tier_type_cell_reads_faint_unless_something_real_shares_the_cell() {
         disabled_fg,
         theme::dim().fg,
         "a disabled row flattens to dim, outranking no-data as it does stale"
+    );
+
+    let (api, api_fg) = cell(3, false);
+    assert_eq!(
+        api.trim_end(),
+        "API",
+        "fixture control: an api-key row carries a real label, not the dash"
+    );
+    assert_eq!(
+        api_fg,
+        theme::dim().fg,
+        "a real label never fades, however it reached the un-pulsed branch"
+    );
+
+    // An UNCREDENTIALED account reaches the same branch by a different route
+    // (no credentials rather than no tier), and it fades too — the cell is empty
+    // for the same reason, so it reads the same way. This one changed with the
+    // no-data dash and had no leg of its own.
+    let (uncredentialed, uncredentialed_fg) = cell(4, false);
+    assert_eq!(
+        uncredentialed.trim_end(),
+        "—",
+        "fixture control: an uncredentialed oauth row has no tier to show"
+    );
+    assert_eq!(
+        uncredentialed_fg,
+        theme::faint().fg,
+        "a bare dash is a no-data cell whether or not credentials exist"
     );
 }
 

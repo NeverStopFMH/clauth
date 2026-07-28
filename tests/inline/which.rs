@@ -429,11 +429,16 @@ fn json_tier_reports_a_canceled_accounts_real_tier_not_its_login_claim() {
     assert_eq!(json_view(&config, Some(&resolved))["tier"], "Free");
 }
 
-/// One account, one tier, whichever JSON surface asked. `status.json` is checked
-/// through its own builder; the MCP `which` / `list_profiles` leg is checked at
-/// `tier_label`, the call both of those tools make inline.
+/// One account, one tier, on both surfaces reachable from here. `status.json` is
+/// driven through its own builder, so this is a real cross-surface check.
+///
+/// The MCP tools are NOT asserted here and cannot be: `ClauthServer::which` is
+/// private to `src/mcp/mod.rs`, so only a test mod inside that module can drive
+/// it. That pin lives in `tests/inline/mcp_which_tool.rs`. Recomputing
+/// `tier_label` in this test instead would re-evaluate the very expression
+/// `json_view` runs internally and assert a value against itself.
 #[test]
-fn json_tier_agrees_with_the_status_json_and_mcp_surfaces() {
+fn json_tier_agrees_with_the_status_json_surface() {
     let _home = HomeSandbox::new();
     let config = config_with(
         vec![oauth_profile_claiming("kerry", "rt-kerry", "pro")],
@@ -444,7 +449,6 @@ fn json_tier_agrees_with_the_status_json_and_mcp_surfaces() {
 
     let which = json_view(&config, Some(&resolved));
     let status = crate::daemon::build_status(&config, 60_000, None, false);
-    let mcp = config.find("kerry").and_then(tier_label);
 
     assert_eq!(which["tier"], "Free", "fixture control: the cached tier");
     assert_eq!(
@@ -452,7 +456,6 @@ fn json_tier_agrees_with_the_status_json_and_mcp_surfaces() {
         "fixture control: the status body's one row is this account"
     );
     assert_eq!(status["profiles"][0]["tier"], which["tier"]);
-    assert_eq!(mcp.as_deref(), which["tier"].as_str());
 }
 
 /// An unresolved session emits every field as `null` rather than dropping them,
@@ -519,8 +522,10 @@ fn json_base_url_is_null_for_an_anthropic_account() {
 }
 
 /// The shape a reader gets wrong: a profile can hold a `base_url` AND stored
-/// OAuth credentials, since setting an endpoint never drops them. The two fields
-/// are independent — neither one's presence rules the other out.
+/// OAuth credentials, since setting an endpoint never drops them. On an
+/// UNRECOGNISED endpoint the two fields are independent — `is_third_party` is
+/// `provider.is_some()` and no provider was recognised, so the stored pair's
+/// tier still reports while requests route elsewhere.
 #[test]
 fn json_publishes_both_an_endpoint_and_a_tier_for_a_hybrid_profile() {
     let _home = HomeSandbox::new();
@@ -532,6 +537,28 @@ fn json_publishes_both_an_endpoint_and_a_tier_for_a_hybrid_profile() {
     let value = json_view(&config, Some(&resolved));
     assert_eq!(value["base_url"], "https://example.test");
     assert_eq!(value["tier"], "Max");
+}
+
+/// The arm the guard defends, and the limit of the independence above: give the
+/// same hybrid a RECOGNISED provider and `tier_label`'s `is_third_party` exit
+/// fires, so the endpoint's presence does rule the tier out — `null` despite a
+/// stored pair claiming `max`.
+#[test]
+fn json_tier_is_null_for_a_recognised_third_party_holding_oauth_creds() {
+    let _home = HomeSandbox::new();
+    let mut profile = oauth_profile_claiming("hybrid", "rt-hybrid", "max");
+    profile.base_url = Some("https://api.deepseek.com/anthropic".to_string());
+    profile.provider = Some(Provider::DeepSeek);
+    let config = config_with(vec![profile], Some("hybrid"));
+    let resolved = ("hybrid".to_string(), Source::RefreshMatch);
+
+    let value = json_view(&config, Some(&resolved));
+    assert_eq!(value["base_url"], "https://api.deepseek.com/anthropic");
+    assert!(
+        value["tier"].is_null(),
+        "a recognised provider outranks the stored pair's claim, got {}",
+        value["tier"]
+    );
 }
 
 #[test]

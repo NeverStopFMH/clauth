@@ -4393,6 +4393,94 @@ fn a_swap_moves_the_mtime_without_importing_the_old_stores_skew() {
     });
 }
 
+/// The stamp is a write-recency signal with no write behind it, and the runtime
+/// side is written by CLAUDE CODE — nothing can be attached there to compensate,
+/// so the stamp itself has to stop reading as a write. Otherwise, for one
+/// watchdog tick after a swap onto B, a SECOND live session on B whose Claude
+/// Code just wrote an interactive `/login` loses it: canonical looks newer, that
+/// session's tick keeps canonical and relinks over the regular file.
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn a_bare_store_stamp_does_not_beat_a_sibling_sessions_relogin() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let launch = member("sibling-a");
+        let intended = member("sibling-b");
+        member_store(&launch);
+        let intended_store = member_store(&intended);
+        let (swap, _launch_markers) = lone_session(&launch, Isolation::Shared);
+
+        let now = SystemTime::now();
+        set_mtime(&intended_store, now - Duration::from_secs(120));
+        assert_eq!(
+            swap.swap_to("sibling-b").expect("out"),
+            SwapOutcome::Swapped
+        );
+
+        // The sibling session on B, five seconds before that stamp landed: Claude
+        // Code replaced its symlink with a regular file holding a fresh login.
+        let sibling = tmp.path().join("sibling-runtime");
+        fs::create_dir_all(&sibling).expect("mkdir sibling runtime");
+        let sibling_link = cc_relogin(&sibling, CREDS_V1, now - Duration::from_secs(5));
+
+        let written = sync_credentials_unlocked(&sibling_link, &intended_store).expect("sync");
+        assert!(
+            written,
+            "an interactive re-login must survive a swap that only stamped the store"
+        );
+        assert_eq!(
+            fs::read(&intended_store).expect("read intended"),
+            CREDS_V1,
+            "the sibling's login bytes must land in canonical, not be relinked away"
+        );
+    });
+}
+
+/// The other direction: a rotation genuinely writes B's store after the swap, so
+/// the stamp's receipt is retired and canonical is the more recent login again.
+/// An older re-login must NOT be adopted over it.
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn a_real_write_after_a_stamp_still_keeps_canonical() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let launch = member("rewrite-a");
+        let intended = member("rewrite-b");
+        member_store(&launch);
+        let intended_store = member_store(&intended);
+        let (swap, _launch_markers) = lone_session(&launch, Isolation::Shared);
+
+        let now = SystemTime::now();
+        set_mtime(&intended_store, now - Duration::from_secs(120));
+        assert_eq!(
+            swap.swap_to("rewrite-b").expect("out"),
+            SwapOutcome::Swapped
+        );
+
+        // A rotation commits B's chain after the swap. Its own mtime already
+        // moves off the stamp; pinned to a later instant so the assertion does
+        // not rest on the filesystem's timestamp granularity.
+        crate::profile::save_profile(&intended).expect("commit rotation");
+        set_mtime(&intended_store, now + Duration::from_secs(30));
+        let canonical_before = fs::read(&intended_store).expect("read intended");
+
+        let sibling = tmp.path().join("sibling-runtime");
+        fs::create_dir_all(&sibling).expect("mkdir sibling runtime");
+        let sibling_link = cc_relogin(&sibling, CREDS_V1, now - Duration::from_secs(5));
+
+        let written = sync_credentials_unlocked(&sibling_link, &intended_store).expect("sync");
+        assert!(
+            !written,
+            "a store written after the stamp is a real commit and must keep canonical"
+        );
+        assert_eq!(
+            fs::read(&intended_store).expect("read intended"),
+            canonical_before,
+            "the rotated chain must not be overwritten by an older re-login"
+        );
+    });
+}
+
 /// `--isolated` and fallback-following are mutually exclusive (settled). The
 /// executor is the single chokepoint every phase goes through, so the refusal
 /// lives here rather than being re-remembered by the decision leg and the flag.

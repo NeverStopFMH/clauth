@@ -1149,9 +1149,8 @@ pub(crate) fn swap_eligible(
 /// `credentials.json.pending` sidecar and then removes it.
 ///
 /// [`touch_store`] takes one of these as its argument for exactly that reason:
-/// moving the store's mtime while a sidecar still sat beside it makes the store
-/// strictly newer, and `recover_pending_credentials` discards a sidecar older than
-/// the store — losing a refresh pair that may be the only live one. There is no
+/// the stamp it leaves is only readable as a non-write for as long as its receipt
+/// stands, so the sidecar is still resolved against real bytes first. There is no
 /// other constructor, so the touch cannot be reached without the load.
 struct SwapPlan {
     member: String,
@@ -1168,7 +1167,14 @@ struct SwapPlan {
 /// authenticating as the old member, and nothing anywhere reports a problem.
 ///
 /// Runs BEFORE the repoint, so a failure here leaves nothing moved.
+///
+/// The bump carries no write behind it, which is exactly what
+/// `profile::recover_pending_credentials` and [`resolve_credential_winner`] would
+/// read it as. A [`crate::profile_cache::TouchReceipt`] beside the store is what
+/// lets them tell the two apart; both resolve their store mtime through
+/// [`crate::profile_cache::effective_write_time`].
 fn touch_store(plan: &SwapPlan, memoized: Option<SystemTime>) -> Result<()> {
+    let displaced = file_mtime(&plan.store);
     let file = OpenOptions::new()
         .write(true)
         .open(&plan.store)
@@ -1177,20 +1183,22 @@ fn touch_store(plan: &SwapPlan, memoized: Option<SystemTime>) -> Result<()> {
         file.set_times(std::fs::FileTimes::new().set_modified(at))
             .with_context(|| format!("failed to touch {}", plan.store.display()))
     };
+    let landed = || file.metadata().ok().and_then(|m| m.modified().ok());
     stamp(SystemTime::now())?;
     // The clock is normally enough, because only EQUALITY hides the swap. The one
     // way `now` lands on `memoized` is a coarse-granularity filesystem truncating
     // it back onto a store written in the same second, so check what actually
-    // landed rather than predict it. Stamping ahead of the clock is the fallback,
-    // never the default: a store in the future makes
-    // `profile::recover_pending_credentials` discard every later crash-staged
-    // sidecar and `resolve_credential_winner` discard every later Claude Code
-    // re-login, for as long as it stands — on a member that had a healthy mtime
-    // until this ran.
+    // landed rather than predict it. Stamping ahead of the clock stays the
+    // fallback rather than the default: the receipt below only holds while the
+    // store's mtime is still the stamped one, so a store left in the future
+    // outlives its receipt the moment anything writes it.
     if let Some(memoized) = memoized
-        && file.metadata().ok().and_then(|m| m.modified().ok()) == Some(memoized)
+        && landed() == Some(memoized)
     {
         stamp(memoized + Duration::from_secs(1))?;
+    }
+    if let Some(stamped) = landed() {
+        crate::profile_cache::write_touch_receipt(&plan.member, &plan.store, stamped, displaced);
     }
     Ok(())
 }
@@ -2670,9 +2678,10 @@ fn sync_credentials_unlocked(link_path: &Path, canonical: &Path) -> Result<bool>
             .claude_ai_oauth
             .as_ref()
             .map(|o| o.expires_at.unwrap_or(0));
-        let canonical_mtime = std::fs::metadata(canonical)
-            .ok()
-            .and_then(|m| m.modified().ok());
+        // Not the raw mtime: a swap onto this member stamps its store without
+        // writing it, and the runtime side is written by Claude Code, so there is
+        // no marker to attach there to compensate.
+        let canonical_mtime = crate::profile_cache::effective_write_time(canonical);
         let runtime_mtime = meta.modified().ok();
         if resolve_credential_winner(canonical_exp, runtime_exp, canonical_mtime, runtime_mtime) {
             // Canonical written at/after the runtime re-login (or wins the

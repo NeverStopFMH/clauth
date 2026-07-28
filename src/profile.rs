@@ -1551,12 +1551,16 @@ fn recover_pending_credentials(
         // credentials.json at all → adopt. A tie means staging and committing
         // landed in one mtime tick; of the two ways to be wrong, dropping a
         // rotation that may never have landed is the unrecoverable one.
-        let adopt = match cred_path.metadata().and_then(|m| m.modified()) {
-            Ok(cred_mtime) => pending_meta
+        //
+        // The committed side's WRITE time, not its raw mtime: a per-session swap
+        // stamps a store it repoints to without writing it, and reading that
+        // stamp as a commit discards a sidecar staged moments earlier.
+        let adopt = match crate::profile_cache::effective_write_time(&cred_path) {
+            Some(cred_mtime) => pending_meta
                 .modified()
                 .map(|p| p >= cred_mtime)
                 .unwrap_or(true),
-            Err(_) => true,
+            None => true,
         };
         if !adopt {
             return None;

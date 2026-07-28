@@ -887,6 +887,108 @@ fn pending_sidecar_is_adopted_when_no_commit_exists_at_all() {
     );
 }
 
+/// The adopt rule compares WRITE times, and a per-session swap moves a store's
+/// mtime with no bytes behind it so Claude Code re-reads it. Reading that stamp
+/// as a commit discards a sidecar staged before it — a refresh pair that may be
+/// the only live one, gone on the next load with nothing left to recover it.
+#[test]
+fn a_bare_store_stamp_does_not_discard_a_sidecar_staged_before_it() {
+    let _home = HomeSandbox::new();
+    let name = "pending-stamped-store";
+    let committed = pair("old-access", "old-refresh");
+    seed_committed(name, &committed);
+
+    let staged = pair("orphan-access", "orphan-refresh");
+    stage_rotated_credentials(name, &staged).expect("stage_rotated_credentials");
+
+    let cred_path = profile_subpath(name, "credentials.json").expect("cred path");
+    let pending_path = profile_subpath(name, "credentials.json.pending").expect("pending path");
+    let now = std::time::SystemTime::now();
+    let last_write = now - std::time::Duration::from_secs(120);
+    crate::testutil::set_mtime(&cred_path, last_write);
+    crate::testutil::set_mtime(&pending_path, now - std::time::Duration::from_secs(60));
+
+    // What a swap onto this member leaves: the store's mtime moved to `now`, no
+    // byte of it written, and the receipt that says so.
+    crate::profile_cache::write_touch_receipt(name, &cred_path, now, Some(last_write));
+    crate::testutil::set_mtime(&cred_path, now);
+
+    assert_eq!(
+        refresh_token_of(&recover_pending_credentials(name, Some(committed))),
+        Some("orphan-refresh"),
+        "the stamp moved no bytes, so the staged pair is still the newest write",
+    );
+}
+
+/// The other direction of the same rule: a real commit landing after the stamp
+/// moves the store's mtime off the receipt, which retires it. The sidecar is a
+/// superseded predecessor again and reinstalling it would resurrect a spent
+/// refresh token.
+#[test]
+fn a_commit_landing_after_a_stamp_still_discards_the_sidecar() {
+    let _home = HomeSandbox::new();
+    let name = "pending-stamped-then-committed";
+    let superseded = pair("spent-access", "spent-refresh");
+    seed_committed(name, &superseded);
+    stage_rotated_credentials(name, &superseded).expect("stage_rotated_credentials");
+
+    let cred_path = profile_subpath(name, "credentials.json").expect("cred path");
+    let pending_path = profile_subpath(name, "credentials.json.pending").expect("pending path");
+    let now = std::time::SystemTime::now();
+    let stamped = now - std::time::Duration::from_secs(30);
+    crate::testutil::set_mtime(&pending_path, now - std::time::Duration::from_secs(60));
+    crate::profile_cache::write_touch_receipt(
+        name,
+        &cred_path,
+        stamped,
+        Some(now - std::time::Duration::from_secs(120)),
+    );
+    crate::testutil::set_mtime(&cred_path, stamped);
+
+    // A rotation commits after the swap: real bytes, and an mtime the receipt
+    // no longer describes.
+    let live = pair("live-access", "live-refresh");
+    seed_committed(name, &live);
+    crate::testutil::set_mtime(&cred_path, now);
+
+    assert_eq!(
+        refresh_token_of(&recover_pending_credentials(name, Some(live))),
+        Some("live-refresh"),
+        "a commit newer than the sidecar still wins; the stamp's receipt is spent",
+    );
+}
+
+/// A receipt names the store it stamped. A profile can hold both a
+/// `credentials.json` and a `session-token.json`, a swap stamps exactly one of
+/// them, and a coarse-granularity mtime ticks the two together — so resolving one
+/// store through the other's receipt would report a write time that never was.
+#[test]
+fn a_touch_receipt_only_resolves_the_store_it_names() {
+    let _home = HomeSandbox::new();
+    let name = "receipt-scope";
+    seed_committed(name, &pair("access", "refresh"));
+    let cred_path = profile_subpath(name, "credentials.json").expect("cred path");
+    let sidecar = profile_subpath(name, "session-token.json").expect("sidecar path");
+    std::fs::write(&sidecar, b"{}\n").expect("write sidecar");
+
+    let now = std::time::SystemTime::now();
+    let displaced = now - std::time::Duration::from_secs(300);
+    crate::testutil::set_mtime(&cred_path, now);
+    crate::testutil::set_mtime(&sidecar, now);
+    crate::profile_cache::write_touch_receipt(name, &sidecar, now, Some(displaced));
+
+    assert_eq!(
+        crate::profile_cache::effective_write_time(&sidecar),
+        Some(displaced),
+        "the stamped store resolves to the write its stamp displaced",
+    );
+    assert_eq!(
+        crate::profile_cache::effective_write_time(&cred_path),
+        Some(now),
+        "a store the receipt does not name keeps its own mtime, tie or not",
+    );
+}
+
 /// `scopes_joined` feeds the refresh `scope` field (Claude Code echoes its
 /// credential's granted scopes on refresh). Order must survive and an empty set
 /// must read as `None` so the refresh path falls back instead of sending `""`.

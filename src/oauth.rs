@@ -1242,6 +1242,17 @@ pub(crate) fn try_adopt_live_rotation(
 ) -> Option<(String, Option<String>)> {
     use crate::profile_cache::{ACCOUNT_ID_CACHE_FILE, load_profile_cache, write_profile_cache};
 
+    // CLA-SPLIT: this profile's live slot holds its STATIC session token, so
+    // `classify_credentials_link` judges it against `session-token.json` while
+    // every gate below reads and every write targets the clauth-private usage
+    // pair in `credentials.json`. A live slot that stops holding the static
+    // token classifies Diverged, and adopting would overwrite the usage chain
+    // with a login that is not it. Same invariant
+    // `snapshot_active_credentials_unchecked` carries for the capture sinks.
+    if crate::claude::has_session_token(name) {
+        return None;
+    }
+
     // Snapshot the store side under the config lock, then drop it — the
     // identity fetches below are HTTP and must never hold the mutex.
     let (stored_access, stored_expires) = {
@@ -1347,6 +1358,26 @@ pub(crate) fn try_adopt_live_rotation(
         "clauth: adopted the live session's rotated login for '{name}' \
          (the running claude refreshed first, so no token spent)"
     );
+    // Off macOS the hand-back path is the SYMLINK, and CC's refresh renames a
+    // temp sibling over the live slot — `rename(2)` acts on the link, so the
+    // divergence this adopt just resolved is the same event that destroyed it.
+    // Restore it or the live slot stays a regular file that now classifies
+    // LinkedTo (the tokens match), nothing relinks it, and our NEXT rotation
+    // writes the store alone: the running claude signs out at the token we
+    // just adopted. Content-neutral here — store and live hold the same pair.
+    // macOS is excluded on purpose: CC reads the Keychain there and already
+    // holds the pair it minted, so this would only issue a redundant
+    // `keychain_write_source`. Loud but non-fatal, like the rotation mirror:
+    // the adopted pair is already persisted, and dropping it would strand the
+    // caller's TokenList on the refresh token CC revoked.
+    #[cfg(not(target_os = "macos"))]
+    if let Err(e) = crate::claude::force_link_profile_credentials(name) {
+        logline!(
+            "clauth: adopted the live login for '{name}' but relinking \
+             .credentials.json failed: {e:#}. A running claude signs out when \
+             its token expires; run `clauth {name}` to reinstall"
+        );
+    }
     Some((
         live_oauth.access_token.clone(),
         live_oauth.refresh_token.clone(),

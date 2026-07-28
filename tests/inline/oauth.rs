@@ -1065,6 +1065,88 @@ mod adopt_live_rotation {
             "an adopted (alive) chain lifts a stale quarantine"
         );
     }
+
+    /// CLA-SPLIT: a session-token profile's live slot holds its STATIC token,
+    /// so `classify_credentials_link` compares against `session-token.json`
+    /// while the adopt's expiry gate and its write both target the
+    /// clauth-private usage pair in `credentials.json` — two different
+    /// surfaces. A live slot that stops holding the static token classifies
+    /// `Diverged`, and without the guard the adopt overwrites the usage chain
+    /// with the live login. Same invariant
+    /// `snapshot_active_credentials_unchecked` carries for every other sink.
+    #[test]
+    fn refuses_a_session_token_profile() {
+        let _home = HomeSandbox::new();
+        let name = "adopt-session-token";
+        let handle = setup(name, future_expiry(), future_expiry() + 3_600_000);
+        let mint = format!("sk-ant-oat01-{}", "x".repeat(40));
+        crate::claude::write_session_token(name, &mint, crate::usage::now_ms() as i64)
+            .expect("write session token");
+        assert_eq!(
+            crate::claude::classify_credentials_link(name).expect("classify"),
+            crate::claude::LinkState::Diverged,
+            "fixture precondition: the live slot no longer holds the static token"
+        );
+
+        let adopted =
+            try_adopt_live_rotation(&handle, name, &guard(name), &|_| Some("uuid-1".into()));
+        assert_eq!(adopted, None);
+        assert_eq!(
+            stored_access(&handle, name),
+            "at-old",
+            "the clauth-private usage pair must survive"
+        );
+        let on_disk: crate::profile::ClaudeCredentials = crate::profile::read_json_file(
+            &crate::profile::profile_dir(name)
+                .expect("profile dir")
+                .join("credentials.json"),
+        )
+        .expect("read stored");
+        assert_eq!(on_disk.refresh_token(), Some("at-old-refresh"));
+    }
+
+    /// Off macOS the hand-back path is the SYMLINK, and CC's routine refresh
+    /// renames a temp sibling over the live slot — `rename(2)` acts on the
+    /// link, so the very divergence this adopt fires on has already destroyed
+    /// it. Adopting the pair alone leaves a regular file that now classifies
+    /// `LinkedTo` (the access tokens match), so nothing relinks it, and the
+    /// next rotation writes only the store: the running claude never sees the
+    /// pair and signs out at the stale token's expiry. The symlink assert is
+    /// the discriminating one — `classify` reads `LinkedTo` either way.
+    #[cfg(all(unix, not(target_os = "macos")))]
+    #[test]
+    fn adopting_relinks_the_live_slot_so_the_next_rotation_reaches_claude() {
+        let _home = HomeSandbox::new();
+        let name = "adopt-relink";
+        let handle = setup(name, future_expiry(), future_expiry() + 3_600_000);
+        let live = crate::profile::claude_dir()
+            .expect("claude dir")
+            .join(".credentials.json");
+        assert!(
+            !live
+                .symlink_metadata()
+                .expect("live slot")
+                .file_type()
+                .is_symlink(),
+            "fixture precondition: CC's rename leaves a regular file, not our link"
+        );
+
+        let adopted =
+            try_adopt_live_rotation(&handle, name, &guard(name), &|_| Some("uuid-1".into()));
+        assert!(adopted.is_some(), "the fresher same-account pair adopts");
+
+        assert!(
+            live.symlink_metadata()
+                .expect("live slot")
+                .file_type()
+                .is_symlink(),
+            "the adopt must restore the symlink, or clauth's next rotation never reaches CC"
+        );
+        assert_eq!(
+            crate::claude::classify_credentials_link(name).expect("classify"),
+            crate::claude::LinkState::LinkedTo,
+        );
+    }
 }
 
 // ── post-guard re-read (the pre-RotationGuard token-snapshot race) ────────────

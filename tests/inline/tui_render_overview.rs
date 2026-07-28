@@ -222,6 +222,55 @@ fn third_party_profile(five_pct: f64, seven_pct: f64) -> Profile {
     }
 }
 
+/// A DeepSeek api-key profile with a cached `"total"` balance row carrying
+/// `total` (e.g. `"1.71 USD"`). `None` for `total` produces an empty-rows
+/// snapshot, matching an account whose balance fetch has not landed yet.
+fn deepseek_profile(name: &str, total: Option<&str>) -> Profile {
+    let rows = match total {
+        Some(t) => vec![
+            crate::providers::StatRow {
+                label: "USD balance".into(),
+                value: String::new(),
+                kind: crate::providers::StatRowKind::Heading,
+            },
+            crate::providers::StatRow {
+                label: "total".into(),
+                value: t.into(),
+                kind: crate::providers::StatRowKind::Body,
+            },
+        ],
+        None => Vec::new(),
+    };
+    Profile {
+        name: name.into(),
+        base_url: Some("https://api.deepseek.com/anthropic".into()),
+        api_key: Some("k".into()),
+        auto_start: false,
+        env: BTreeMap::new(),
+        models: Default::default(),
+        fallback_threshold: None,
+        weekly_threshold: None,
+        last_resort: false,
+        max_auto_spend: None,
+        check_weekly: true,
+        check_scoped: true,
+        bell_threshold: None,
+        disabled: false,
+        credentials: None,
+        usage: None,
+        fetch_status: None,
+        provider: Some(crate::providers::Provider::DeepSeek),
+        third_party_usage: Some(crate::providers::ThirdPartyStats {
+            is_available: true,
+            rows,
+            bars: Vec::new(),
+            plan: None,
+            endpoint: None,
+            best_effort: false,
+        }),
+    }
+}
+
 /// A chain-eligible OAuth profile with a live 5h window at `util`%, resetting
 /// in `reset_secs`.
 fn profile(name: &str, threshold: f64, util: f64, reset_secs: i64) -> Profile {
@@ -1461,7 +1510,7 @@ fn live_row(
 /// The cell sitting under the `live` header on `row`, padding included, so the
 /// pin is an exact value AND proves the cell is aligned under its own header.
 fn live_cell_text(widths: &OverviewWidths, row: &Line<'static>) -> String {
-    let header = line_text(&overview_header(widths));
+    let header = line_text(&overview_header(widths, false));
     let col = header
         .find("live")
         .expect("the accounts table carries a `live` header");
@@ -1568,12 +1617,12 @@ fn the_live_column_holds_its_place_while_nothing_is_live() {
     ));
 
     let idle_widths = OverviewWidths::new(160, &app);
-    let idle_header = line_text(&overview_header(&idle_widths));
+    let idle_header = line_text(&overview_header(&idle_widths, false));
     let idle_row = line_text(&render_overview_row(&app, 0, &idle_widths, false, false));
 
     app.live_sessions = crate::live_sessions::LiveTally::of([live_row("4242-0", "main", true)]);
     let busy_widths = OverviewWidths::new(160, &app);
-    let busy_header = line_text(&overview_header(&busy_widths));
+    let busy_header = line_text(&overview_header(&busy_widths, false));
     let busy_row = line_text(&render_overview_row(&app, 0, &busy_widths, false, false));
 
     assert_eq!(idle_header, busy_header, "the header must not move");
@@ -1602,7 +1651,7 @@ fn the_live_column_is_dropped_rather_than_clipped_when_it_does_not_fit() {
 
     for width in 34u16..=200 {
         let widths = OverviewWidths::new(width, &app);
-        let header = line_text(&overview_header(&widths));
+        let header = line_text(&overview_header(&widths, false));
         if widths.live == 0 {
             assert!(
                 !header.contains("live"),
@@ -1622,4 +1671,149 @@ fn the_live_column_is_dropped_rather_than_clipped_when_it_does_not_fit() {
             row.chars().count()
         );
     }
+}
+
+// ── DeepSeek balance in the 5h column ──────────────────────────────────────
+
+/// The cell sitting under the `5h` header on `row`, padding included. Finds the
+/// column from its header so the pin proves alignment, not just presence.
+fn five_hour_cell_text(widths: &OverviewWidths, deepseek: bool, row: &Line<'static>) -> String {
+    let header = line_text(&overview_header(widths, deepseek));
+    let col = header
+        .find("5h")
+        .expect("the accounts table carries a `5h` header");
+    line_text(row)
+        .chars()
+        .skip(col)
+        .take(widths.five_hour)
+        .collect()
+}
+
+/// DeepSeek accounts carry a USD balance where OAuth profiles carry a 5h
+/// utilization window. When one is on the overview the column header names
+/// both roles so the balance cell below it does not read as a mislabeled `%`.
+#[test]
+fn header_reads_5h_balance_when_a_deepseek_profile_is_present() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let app = App::new(config_with(
+        vec![
+            profile("main", 95.0, 10.0, 3600),
+            deepseek_profile("ds", Some("1.71 USD")),
+        ],
+        Some("main"),
+        vec![],
+    ));
+    let widths = OverviewWidths::new(120, &app);
+    let header = line_text(&overview_header(&widths, any_deepseek(&app)));
+    assert!(
+        header.contains("5h / balance"),
+        "header should name both roles when a DeepSeek account is present: {header:?}"
+    );
+}
+
+/// Without a DeepSeek account the column is a pure 5h window readout, so the
+/// header keeps its original label and does not advertise a balance it has no
+/// cell for.
+#[test]
+fn header_keeps_plain_5h_when_no_deepseek_profile_is_present() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let app = App::new(config_with(
+        vec![profile("main", 95.0, 10.0, 3600)],
+        Some("main"),
+        vec![],
+    ));
+    let widths = OverviewWidths::new(120, &app);
+    let header = line_text(&overview_header(&widths, any_deepseek(&app)));
+    assert!(
+        !header.contains("balance"),
+        "no DeepSeek account means no balance in the header: {header:?}"
+    );
+    assert!(
+        header.contains("5h"),
+        "the 5h label is still there: {header:?}"
+    );
+}
+
+/// A DeepSeek profile's total balance renders left-aligned and dim in the 5h
+/// column, replacing the bracketed bar an OAuth profile would show there.
+/// Pinned by header column so it also proves the cell sits under its header.
+#[test]
+fn deepseek_row_shows_total_balance_in_5h_column() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let app = App::new(config_with(
+        vec![
+            profile("main", 95.0, 10.0, 3600),
+            deepseek_profile("ds", Some("1.71 USD")),
+        ],
+        Some("main"),
+        vec![],
+    ));
+    let widths = OverviewWidths::new(120, &app);
+    let row = render_overview_row(&app, 1, &widths, false, false);
+    let cell = five_hour_cell_text(&widths, true, &row);
+    assert!(
+        cell.starts_with("[1.71 USD"),
+        "the balance is bracketed and left-aligned: {cell:?}"
+    );
+    assert_eq!(
+        cell.chars().count(),
+        widths.five_hour,
+        "the cell is exactly the column width so the next column does not shift"
+    );
+}
+
+/// A DeepSeek profile whose balance fetch has not landed (empty rows) renders
+/// the same no-data dash an OAuth profile with no window gets, so the column
+/// reads as "no data yet" rather than a blank cell.
+#[test]
+fn deepseek_row_without_balance_shows_no_data_dash() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let app = App::new(config_with(
+        vec![deepseek_profile("ds", None)],
+        Some("ds"),
+        vec![],
+    ));
+    let widths = OverviewWidths::new(120, &app);
+    let row = render_overview_row(&app, 0, &widths, false, false);
+    let cell = five_hour_cell_text(&widths, true, &row);
+    assert_eq!(
+        cell.trim(),
+        "—",
+        "no cached balance renders the no-data dash"
+    );
+}
+
+/// Currencies align across DeepSeek rows: amounts left-pad to the widest so
+/// every currency starts at the same column, with exactly one space after the
+/// longest amount. Without alignment a short amount would butt its currency
+/// against the column's left edge while a long one trails it.
+#[test]
+fn deepseek_balance_currencies_align_across_rows() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let app = App::new(config_with(
+        vec![
+            deepseek_profile("short", Some("1.71 USD")),
+            deepseek_profile("long", Some("197.50 CNY")),
+        ],
+        Some("short"),
+        vec![],
+    ));
+    let widths = OverviewWidths::new(120, &app);
+    let short_row = render_overview_row(&app, 0, &widths, false, false);
+    let long_row = render_overview_row(&app, 1, &widths, false, false);
+    let short_cell = five_hour_cell_text(&widths, true, &short_row);
+    let long_cell = five_hour_cell_text(&widths, true, &long_row);
+
+    let usd = short_cell.find("USD").expect("USD currency present");
+    let cny = long_cell.find("CNY").expect("CNY currency present");
+    assert_eq!(
+        usd, cny,
+        "currencies start at the same column:\n  {short_cell:?}\n  {long_cell:?}"
+    );
+    // The longest amount ("197.50") has exactly one space before its currency.
+    let before_cny = long_cell.chars().nth(cny.saturating_sub(1)).unwrap_or('!');
+    assert_eq!(
+        before_cny, ' ',
+        "the widest amount gets exactly one space gap: {long_cell:?}"
+    );
 }

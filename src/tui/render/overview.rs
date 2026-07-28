@@ -10,8 +10,8 @@ use super::super::app::{App, MainItemKind};
 use super::super::theme;
 use super::chain::reason_marker;
 use super::format::{
-    ResetFmt, account_type_label, cue_style, fetch_cue_color, fixed, fixed_split, is_past_reset,
-    reset_resume, spinner_frame, spinner_style, window_summary_spans_bracketed,
+    NO_DATA, ResetFmt, account_type_label, cue_style, fetch_cue_color, fixed, fixed_split,
+    is_past_reset, reset_resume, spinner_frame, spinner_style, window_summary_spans_bracketed,
 };
 use super::header::pulse_name_spans;
 use super::panes::{
@@ -22,6 +22,7 @@ use crate::fallback::{
     BlockedReason, SwitchAction, blocked_reason, next_target, soonest_resume, threshold_for,
 };
 use crate::profile::{AppConfig, Profile};
+use crate::providers::Provider;
 use crate::usage::{
     LABEL_5H, LABEL_7D, ProfileActivity, UsageWindow, humanize_duration, now_epoch_secs, now_ms,
     switch_grade_kick_lifts,
@@ -79,7 +80,7 @@ fn draw_overview_accounts(frame: &mut Frame<'_>, area: Rect, app: &App) {
         Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).areas(inner);
 
     let widths = OverviewWidths::new(list_area.width, app);
-    let header = overview_header(&widths);
+    let header = overview_header(&widths, any_deepseek(app));
     frame.render_widget(Paragraph::new(header).style(theme::base()), header_area);
 
     let items = app.main_items();
@@ -116,6 +117,9 @@ struct OverviewWidths {
     /// `LIVE_W` when the live-session column fits, `0` when it is dropped.
     live: usize,
     gap: usize,
+    /// Widest amount string (`"1.71"` of `"1.71 USD"`) across DeepSeek rows, so
+    /// currencies align in the column. `0` when no DeepSeek balance is cached.
+    deepseek_amount_w: usize,
 }
 
 /// Width of the live-session column: its `live` header text, which is also the
@@ -234,6 +238,16 @@ impl OverviewWidths {
         // real leftover instead.
         let gap = (gap_min + total.saturating_sub(base + TIMER_SLOT) / gap_slots).clamp(gap_min, 8);
 
+        let deepseek_amount_w = app
+            .config()
+            .profiles
+            .iter()
+            .filter(|p| p.provider == Some(Provider::DeepSeek))
+            .filter_map(|p| deepseek_balance_value(p))
+            .filter_map(|v| v.rsplit_once(' ').map(|(a, _)| a.chars().count()))
+            .max()
+            .unwrap_or(0);
+
         Self {
             name,
             kind,
@@ -241,6 +255,7 @@ impl OverviewWidths {
             seven_day,
             live,
             gap,
+            deepseek_amount_w,
         }
     }
 }
@@ -261,7 +276,7 @@ fn fixed_overview_width(
     4 + name + kind + five_hour + seven_day + live + standard_gaps * gap + narrow
 }
 
-fn overview_header(widths: &OverviewWidths) -> Line<'static> {
+fn overview_header(widths: &OverviewWidths, deepseek: bool) -> Line<'static> {
     let mut spans = vec![Span::styled("  ", theme::label())];
     spans.push(Span::raw("  ")); // bell slot (blank in header)
     spans.push(Span::styled(fixed("account", widths.name), theme::label()));
@@ -270,8 +285,11 @@ fn overview_header(widths: &OverviewWidths) -> Line<'static> {
     spans.push(narrow_gap(widths));
     // Blank TIMER_SLOT keeps the label aligned over the bar.
     spans.push(Span::raw(" ".repeat(TIMER_SLOT)));
+    // The column doubles as a balance readout for DeepSeek accounts (no 5h
+    // window, just a USD total), so the header names both when one is present.
+    let five_label = if deepseek { "5h / balance" } else { LABEL_5H };
     spans.push(Span::styled(
-        fixed(LABEL_5H, widths.five_hour),
+        fixed(five_label, widths.five_hour),
         theme::label(),
     ));
     if widths.seven_day > 0 {
@@ -473,14 +491,22 @@ fn render_overview_row(
         }
         spans
     };
-    let five_spans = flatten(window_summary_spans_bracketed(
-        five_window.as_ref(),
-        widths.five_hour,
-        true,
-        reset_style(LABEL_5H, five_window.as_ref()),
-        reset_fmt,
-        five_window.as_ref().is_some_and(is_past_reset),
-    ));
+    let five_spans = if profile.provider == Some(Provider::DeepSeek) {
+        flatten(deepseek_balance_cell(
+            profile,
+            widths.five_hour,
+            widths.deepseek_amount_w,
+        ))
+    } else {
+        flatten(window_summary_spans_bracketed(
+            five_window.as_ref(),
+            widths.five_hour,
+            true,
+            reset_style(LABEL_5H, five_window.as_ref()),
+            reset_fmt,
+            five_window.as_ref().is_some_and(is_past_reset),
+        ))
+    };
     let five_len: usize = five_spans.iter().map(|s| s.content.chars().count()).sum();
     let five_pad = widths.five_hour.saturating_sub(five_len);
     spans.extend(five_spans);
@@ -529,6 +555,57 @@ fn live_cell(sessions: crate::live_sessions::MemberSessions, width: usize) -> Sp
         format!("{}{marker}", fixed(&sessions.sessions.to_string(), count_w)),
         theme::dim(),
     )
+}
+
+/// `true` when any profile on the overview is a DeepSeek api-key account.
+/// Those report a USD balance instead of a 5h utilization window, so the
+/// column header and the per-row cell both swap to carry it.
+fn any_deepseek(app: &App) -> bool {
+    app.config()
+        .profiles
+        .iter()
+        .any(|p| p.provider == Some(Provider::DeepSeek))
+}
+
+/// The DeepSeek profile's total balance string (e.g. `"1.71 USD"`), taken from
+/// the first `"total"` row of its cached [`ThirdPartyStats`] — the same rows
+/// the Usage tab renders. `None` when there is no cached snapshot or no total
+/// row (an unavailable-balance response carries a Danger row instead).
+fn deepseek_balance_value(profile: &Profile) -> Option<&str> {
+    profile
+        .third_party_usage
+        .as_ref()?
+        .rows
+        .iter()
+        .find(|r| r.label == "total")
+        .map(|r| r.value.as_str())
+}
+
+/// The 5h-column cell for a DeepSeek profile: its total balance bracketed and
+/// dimmed (matching the OAuth bar's `[...]` shape), or [`NO_DATA`] when no
+/// cached balance row exists. `amount_w` is the widest amount string across all
+/// DeepSeek rows so currencies line up under each other; the longest amount
+/// gets exactly one space before its currency. Width is exact so the column
+/// boundary holds.
+fn deepseek_balance_cell(profile: &Profile, width: usize, amount_w: usize) -> Vec<Span<'static>> {
+    let Some(balance) = deepseek_balance_value(profile) else {
+        return vec![Span::styled(NO_DATA.to_string(), theme::faint())];
+    };
+    // Split "amount CURRENCY" so currencies align: amount left-padded to the
+    // widest amount, then one space, then the currency.
+    let inner = match balance.rsplit_once(' ') {
+        Some((amount, currency)) => format!("{amount:<amount_w$} {currency}"),
+        None => balance.to_string(),
+    };
+    // 2 cells reserved for brackets; truncate inner if it would overflow.
+    let inner_w = width.saturating_sub(2);
+    let inner: String = inner.chars().take(inner_w).collect();
+    let used = inner.chars().count() + 2;
+    let pad = width.saturating_sub(used);
+    vec![
+        Span::styled(format!("[{inner}]"), theme::dim()),
+        Span::raw(" ".repeat(pad)),
+    ]
 }
 
 /// The `(5h, 7d)` windows to show in the overview row. OAuth profiles use their

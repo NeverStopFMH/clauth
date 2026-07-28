@@ -156,10 +156,17 @@ fn no_data_dash_stays_faint() {
 /// The Overview kind column takes the same `—` every other no-data cell uses
 /// once no tier is known. The bare "Claude" it used to print sat in a column
 /// read side by side against real tiers, so it scanned as a plan of its own.
+///
+/// Asserted against `NO_DATA`, not a second copy of the literal, because
+/// `overview.rs` decides whether to animate the cell by comparing this return
+/// value to that const. A glyph change that moved only one of the two would stop
+/// the no-animation branch firing with nothing else red.
 #[test]
 fn account_type_label_dashes_an_unfetched_plan() {
+    assert_eq!(NO_DATA, "—", "the house no-data glyph");
+
     let unfetched = crate::testutil::blank_profile("a");
-    assert_eq!(account_type_label(&unfetched), "—");
+    assert_eq!(account_type_label(&unfetched), NO_DATA);
 
     let mut unclassified = crate::testutil::blank_profile("b");
     unclassified.credentials = Some(crate::profile::ClaudeCredentials {
@@ -171,7 +178,7 @@ fn account_type_label_dashes_an_unfetched_plan() {
             subscription_type: Some("something_new".into()),
         }),
     });
-    assert_eq!(account_type_label(&unclassified), "—");
+    assert_eq!(account_type_label(&unclassified), NO_DATA);
 }
 
 /// The other direction: a fetched tier still loses only its `Claude ` prefix,

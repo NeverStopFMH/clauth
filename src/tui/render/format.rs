@@ -67,21 +67,20 @@ pub(super) fn cue_style(cue: Option<Color>, resting: Style) -> Style {
     cue.map(|c| Style::default().fg(c)).unwrap_or(resting)
 }
 
+/// The house no-data glyph. A caller that has to branch on "is this cell empty"
+/// compares against this rather than a second copy of the literal.
+pub(super) const NO_DATA: &str = "—";
+
 /// The Overview kind column's tier chip. An account whose plan is not known yet
-/// gets the house no-data dash: the old bare "Claude" read as a real plan, and
-/// this column is the one place a reader compares tiers side by side.
-///
-/// Ceiling: this returns a bare `String`, so the caller styles the whole cell —
-/// the dash misses the `theme::faint()` the other no-data sites use, and on a
-/// credentialed row it rides the identity pulse, color-cycling while the static
-/// faint dashes elsewhere in the same row sit still. Upgrade path: return spans
-/// instead and have `overview.rs` skip `pulse_name_spans` for a no-data label.
+/// gets [`NO_DATA`]: the old bare "Claude" read as a real plan, and this column
+/// is the one place a reader compares tiers side by side. The caller styles the
+/// cell, so it is the caller that keeps a no-data dash out of the identity pulse.
 pub(super) fn account_type_label(profile: &Profile) -> String {
     if !profile.is_oauth() {
         return "API".to_string();
     }
     let Some(label) = endpoint_label(profile) else {
-        return "—".to_string();
+        return NO_DATA.to_string();
     };
     label
         .strip_prefix("Claude ")
@@ -119,7 +118,7 @@ pub(super) fn window_summary_spans_bracketed(
     stale: bool,
 ) -> Vec<Span<'static>> {
     let Some(window) = window else {
-        return vec![Span::styled("—".to_string(), theme::faint())];
+        return vec![Span::styled(NO_DATA.to_string(), theme::faint())];
     };
     let bracket = theme::dim();
     let pct = window.utilization.clamp(0.0, 100.0);

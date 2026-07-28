@@ -121,6 +121,7 @@ fn drain_reset_style_7d_runs_dry_first_is_warning() {
 /// the only source, and it needs only the window's utilization + `resets_at`.
 #[test]
 fn drain_rate_covers_third_party_windows_from_avg_pace() {
+    let _home = crate::testutil::HomeSandbox::new();
     let p = third_party_profile(60.0, 30.0);
     let config = config_with(vec![p], None, vec![]);
     let app = App::new(config);
@@ -165,6 +166,7 @@ fn drain_rate_covers_third_party_windows_from_avg_pace() {
 /// with no history recorded, it stays uncolored rather than falling back.
 #[test]
 fn drain_rate_oauth_five_hour_uses_recent_burn() {
+    let _home = crate::testutil::HomeSandbox::new();
     let a = profile("a", 95.0, 60.0, 9_000);
     let config = config_with(vec![a], None, vec![]);
     let app = App::new(config);
@@ -278,6 +280,7 @@ fn resumes_line(lines: &[Line<'static>]) -> Option<String> {
 // `next_target` returns `None`) — previously silent. b resets sooner than a.
 #[test]
 fn all_exhausted_wrap_mode_shows_resumes_hint() {
+    let _home = crate::testutil::HomeSandbox::new();
     let a = profile("a", 95.0, 100.0, 3600);
     let b = profile("b", 95.0, 100.0, 1800);
     let config = config_with(vec![a, b], Some("a"), vec!["a", "b"]);
@@ -295,6 +298,7 @@ fn all_exhausted_wrap_mode_shows_resumes_hint() {
 // not depend on an active profile being set at all.
 #[test]
 fn all_exhausted_wrap_off_active_cleared_shows_resumes_hint() {
+    let _home = crate::testutil::HomeSandbox::new();
     let a = profile("a", 95.0, 100.0, 900);
     let b = profile("b", 95.0, 100.0, 3600);
     let mut config = config_with(vec![a, b], None, vec!["a", "b"]);
@@ -310,6 +314,7 @@ fn all_exhausted_wrap_off_active_cleared_shows_resumes_hint() {
 // stay hidden (recovery would relink b on the next tick regardless).
 #[test]
 fn partially_exhausted_chain_hides_resumes_hint() {
+    let _home = crate::testutil::HomeSandbox::new();
     let a = profile("a", 95.0, 100.0, 3600);
     let b = profile("b", 95.0, 20.0, 3600);
     let config = config_with(vec![a, b], Some("a"), vec!["a", "b"]);
@@ -324,6 +329,7 @@ fn partially_exhausted_chain_hides_resumes_hint() {
 // Nobody near their threshold at all — the ordinary healthy-chain case.
 #[test]
 fn healthy_chain_hides_resumes_hint() {
+    let _home = crate::testutil::HomeSandbox::new();
     let a = profile("a", 95.0, 10.0, 3600);
     let b = profile("b", 95.0, 5.0, 3600);
     let config = config_with(vec![a, b], Some("a"), vec!["a", "b"]);
@@ -338,6 +344,7 @@ fn healthy_chain_hides_resumes_hint() {
 /// active dot (●) — usage alerts are moot until re-login.
 #[test]
 fn broken_login_marker_outranks_bell_and_active() {
+    let _home = crate::testutil::HomeSandbox::new();
     let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
     let a = profile("a", 95.0, 10.0, 3600);
     let mut config = config_with(vec![a], Some("a"), vec![]);
@@ -356,6 +363,7 @@ fn broken_login_marker_outranks_bell_and_active() {
 
 #[test]
 fn bell_marker_shows_when_login_is_fine() {
+    let _home = crate::testutil::HomeSandbox::new();
     let a = profile("a", 95.0, 10.0, 3600);
     let config = config_with(vec![a], None, vec![]);
     let mut app = App::new(config);
@@ -370,6 +378,7 @@ fn bell_marker_shows_when_login_is_fine() {
 /// the next switch would sign sessions out, so it beats a usage alert.
 #[test]
 fn token_danger_marker_outranks_bell_and_active() {
+    let _home = crate::testutil::HomeSandbox::new();
     let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
     let a = profile("a", 95.0, 10.0, 3600);
     let config = config_with(vec![a], Some("a"), vec![]); // active
@@ -395,6 +404,7 @@ fn token_danger_marker_outranks_bell_and_active() {
 /// hue, so the danger assertion below is what pins the canceled arm.
 #[test]
 fn canceled_marker_is_dead_first() {
+    let _home = crate::testutil::HomeSandbox::new();
     let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
     use crate::usage::{PlanInfo, PlanTier};
     let mut a = profile("a", 95.0, 10.0, 3600);
@@ -420,6 +430,7 @@ fn canceled_marker_is_dead_first() {
 /// But a broken login (×) still wins over a token-danger marker.
 #[test]
 fn broken_login_outranks_token_danger_marker() {
+    let _home = crate::testutil::HomeSandbox::new();
     let a = profile("a", 95.0, 10.0, 3600);
     let mut config = config_with(vec![a], Some("a"), vec![]);
     config.state.auth_broken.push("a".into());
@@ -436,6 +447,7 @@ fn broken_login_outranks_token_danger_marker() {
 /// an expired one raises the ⊘ danger marker.
 #[test]
 fn long_lived_token_tags_type_column_and_expired_marks() {
+    let _home = crate::testutil::HomeSandbox::new();
     use crate::claude::SessionTokenStatus as S;
     let day = 86_400_000_i64;
     let a = profile("a", 95.0, 10.0, 3600);
@@ -466,6 +478,7 @@ fn long_lived_token_tags_type_column_and_expired_marks() {
 /// would double-signal, and the bar brackets stay plain dim.
 #[test]
 fn cached_row_colors_countdown_amber_and_underlines_nothing() {
+    let _home = crate::testutil::HomeSandbox::new();
     let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
     let mut a = profile("a", 95.0, 10.0, 3600);
     a.fetch_status = Some(FetchStatus::Cached);
@@ -499,6 +512,7 @@ fn cached_row_colors_countdown_amber_and_underlines_nothing() {
 
 #[test]
 fn failed_row_colors_countdown_red() {
+    let _home = crate::testutil::HomeSandbox::new();
     let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
     let mut a = profile("a", 95.0, 10.0, 3600);
     a.fetch_status = Some(FetchStatus::Failed);
@@ -538,6 +552,7 @@ fn reset_suffixes(line: &Line<'static>) -> Vec<Span<'static>> {
 /// third-party row's countdowns stayed faint however fast the window drained.
 #[test]
 fn third_party_row_drain_colors_both_countdowns() {
+    let _home = crate::testutil::HomeSandbox::new();
     let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
     let config = config_with(vec![third_party_profile(60.0, 30.0)], None, vec![]);
     let app = App::new(config);
@@ -562,6 +577,7 @@ fn third_party_row_drain_colors_both_countdowns() {
 /// average pace, so it colors even though the 5h burn history is empty.
 #[test]
 fn oauth_row_drain_colors_the_seven_day_countdown() {
+    let _home = crate::testutil::HomeSandbox::new();
     let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
     let mut a = profile("a", 95.0, 60.0, 9_000);
     a.usage.as_mut().unwrap().seven_day = Some(UsageWindow {
@@ -593,6 +609,7 @@ fn oauth_row_drain_colors_the_seven_day_countdown() {
 /// gap-widened layout must still fit.
 #[test]
 fn gap_widening_never_clips_the_row() {
+    let _home = crate::testutil::HomeSandbox::new();
     let a = profile("ax-main", 95.0, 10.0, 3600);
     let b = profile("ax-backup", 95.0, 20.0, 3600);
     let config = config_with(vec![a, b], Some("ax-main"), vec![]);
@@ -657,6 +674,7 @@ fn credentialed_profile(name: &str, subscription_type: &str) -> Profile {
 /// column (6 chars) and bleed into the following gap/timer columns.
 #[test]
 fn credentialed_long_label_clamps_to_kind_width() {
+    let _home = crate::testutil::HomeSandbox::new();
     let a = credentialed_profile("acct", "enterprise");
     let config = config_with(vec![a], None, vec![]);
     let app = App::new(config);
@@ -694,6 +712,7 @@ fn credentialed_long_label_clamps_to_kind_width() {
 /// same config proves the dimming is per-profile, not global.
 #[test]
 fn disabled_row_dims_its_name_and_keeps_the_real_type_value() {
+    let _home = crate::testutil::HomeSandbox::new();
     let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
     let mut a = profile("a", 95.0, 10.0, 3600);
     a.disabled = true;
@@ -781,6 +800,7 @@ fn oauth_creds() -> ClaudeCredentials {
 /// every hue, which is what proves the flattening is per-row.
 #[test]
 fn disabled_row_flattens_every_semantic_hue_to_dim() {
+    let _home = crate::testutil::HomeSandbox::new();
     let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
     let mut a = profile("a", 95.0, 90.0, 3600);
     a.disabled = true;
@@ -838,6 +858,7 @@ fn disabled_row_flattens_every_semantic_hue_to_dim() {
 /// surviving pulse would differ between them.
 #[test]
 fn disabled_row_type_cell_does_not_pulse() {
+    let _home = crate::testutil::HomeSandbox::new();
     // The wave is a Full-tier effect: `pulse_name_spans` returns flat spans
     // below it. The tier auto-detects from `$COLORTERM`, which CI leaves unset,
     // so an unpinned tier renders every row flat. That makes the assertion
@@ -902,6 +923,7 @@ const KIND_SPAN: usize = 5;
 /// this as "no pulse".
 #[test]
 fn no_tier_type_cell_does_not_pulse() {
+    let _home = crate::testutil::HomeSandbox::new();
     // The wave is Full-tier only; an unpinned tier renders every row flat and
     // makes the equality below vacuous. Same guard the disabled-row pin carries.
     let _tier = crate::testutil::TierSandbox::new(theme::Tier::Full);
@@ -959,6 +981,7 @@ fn no_tier_type_cell_does_not_pulse() {
 /// a no-data dash does; without the conjunct every DeepSeek / Z.ai row fades.
 #[test]
 fn no_tier_type_cell_reads_faint_unless_something_real_shares_the_cell() {
+    let _home = crate::testutil::HomeSandbox::new();
     let _tier = crate::testutil::TierSandbox::new(theme::Tier::Full);
     let mut disabled = credentialed_profile("c", "something_new");
     disabled.disabled = true;
@@ -1052,6 +1075,7 @@ fn no_tier_type_cell_reads_faint_unless_something_real_shares_the_cell() {
 /// width, so no column downstream shifts.
 #[test]
 fn disabled_row_blanks_the_refresh_countdown_at_full_width() {
+    let _home = crate::testutil::HomeSandbox::new();
     let mut a = profile("a", 95.0, 10.0, 3600);
     a.disabled = true;
     let b = profile("b", 95.0, 10.0, 3600);
@@ -1126,6 +1150,7 @@ fn bar_fade_spans(line: &Line<'static>) -> (Style, Style, Style) {
 /// control keeps a real (non-faint) util color to red against.
 #[test]
 fn stale_window_fades_bar_fill_and_percent() {
+    let _home = crate::testutil::HomeSandbox::new();
     let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
     let stale = profile("a", 95.0, 73.0, -60); // reset 60s in the past
     let live = profile("b", 95.0, 73.0, 3600); // reset in 1h
@@ -1169,6 +1194,7 @@ fn stale_window_fades_bar_fill_and_percent() {
 /// a half-faint/half-dim bar — every span flattens to the same dim hue.
 #[test]
 fn disabled_and_past_reset_row_stays_fully_dim() {
+    let _home = crate::testutil::HomeSandbox::new();
     let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
     let mut a = profile("a", 95.0, 73.0, -60); // disabled + past-reset
     a.disabled = true;
@@ -1220,6 +1246,7 @@ fn chain_panel_height_floors_at_three_without_panicking() {
 /// content — NOT flung out to the panel's right edge.
 #[test]
 fn chain_row_switch_hint_rides_the_target_row() {
+    let _home = crate::testutil::HomeSandbox::new();
     let a = profile("a", 95.0, 10.0, 3600);
     let config = config_with(vec![a], Some("a"), vec!["a"]);
     let app = App::new(config);
@@ -1247,6 +1274,7 @@ fn chain_row_switch_hint_rides_the_target_row() {
 /// a wide panel, cells away from the data they mark.
 #[test]
 fn fallback_panel_parks_trailers_next_to_the_content() {
+    let _home = crate::testutil::HomeSandbox::new();
     // `ghost` sits in the chain with no profile behind it, so its row renders
     // the short `missing` arm. Leading with it proves the column is measured off
     // the WIDEST row rather than whichever one happens to come first.
@@ -1292,6 +1320,7 @@ fn fallback_panel_parks_trailers_next_to_the_content() {
 /// between a `95%` row and a `100%` row.
 #[test]
 fn chain_rows_align_the_threshold_percent_column() {
+    let _home = crate::testutil::HomeSandbox::new();
     let ninety_five = profile("a", 95.0, 10.0, 3600);
     let hundred = profile("b", 100.0, 10.0, 3600);
     let config = config_with(vec![ninety_five, hundred], Some("a"), vec!["a", "b"]);
@@ -1317,6 +1346,7 @@ fn chain_rows_align_the_threshold_percent_column() {
 /// imminent-switch projection.
 #[test]
 fn chain_row_shows_both_switch_hint_and_reason_marker_when_they_fit() {
+    let _home = crate::testutil::HomeSandbox::new();
     let a = profile("a", 95.0, 10.0, 3600);
     let config = config_with(vec![a], Some("a"), vec!["a"]);
     let app = App::new(config);
@@ -1345,6 +1375,7 @@ fn chain_row_shows_both_switch_hint_and_reason_marker_when_they_fit() {
 /// gauge/figure formatting changes.
 #[test]
 fn chain_row_drops_switch_hint_before_reason_marker_when_narrow() {
+    let _home = crate::testutil::HomeSandbox::new();
     let a = profile("a", 95.0, 10.0, 3600);
     let config = config_with(vec![a], Some("a"), vec!["a"]);
     let app = App::new(config);
@@ -1386,6 +1417,7 @@ fn chain_row_drops_switch_hint_before_reason_marker_when_narrow() {
 /// fallback panel — exercises the kick-lift read + `blocked_reason` wiring.
 #[test]
 fn fallback_panel_marks_a_blocked_member() {
+    let _home = crate::testutil::HomeSandbox::new();
     let a = profile("a", 95.0, 10.0, 3600);
     let mut config = config_with(vec![a], Some("a"), vec!["a"]);
     config.state.auth_broken.push("a".into());
@@ -1443,6 +1475,7 @@ fn live_cell_text(widths: &OverviewWidths, row: &Line<'static>) -> String {
 /// is why the header reads `live`: `active` is the `●` sense app-wide.
 #[test]
 fn the_live_column_counts_live_sessions_and_marks_chain_followers() {
+    let _home = crate::testutil::HomeSandbox::new();
     let mut app = App::new(config_with(
         vec![
             profile("main", 95.0, 10.0, 3600),
@@ -1481,6 +1514,7 @@ fn the_live_column_counts_live_sessions_and_marks_chain_followers() {
 /// header catches both the overflow and any future change to the budget.
 #[test]
 fn live_cell_stays_under_header_when_7d_reset_is_two_digit_hours() {
+    let _home = crate::testutil::HomeSandbox::new();
     let mut p = profile("main", 95.0, 10.0, 3600);
     if let Some(ref mut usage) = p.usage {
         // 37200s = 10h 20m → `humanize_duration` emits the 7-char form.
@@ -1506,6 +1540,7 @@ fn live_cell_stays_under_header_when_7d_reset_is_two_digit_hours() {
 /// it, and a table full of `0`s would drown the accounts that do host something.
 #[test]
 fn an_account_with_no_live_sessions_renders_a_blank_live_cell() {
+    let _home = crate::testutil::HomeSandbox::new();
     let mut app = App::new(config_with(
         vec![profile("main", 95.0, 10.0, 3600)],
         Some("main"),
@@ -1525,6 +1560,7 @@ fn an_account_with_no_live_sessions_renders_a_blank_live_cell() {
 /// table out exactly as a busy one does.
 #[test]
 fn the_live_column_holds_its_place_while_nothing_is_live() {
+    let _home = crate::testutil::HomeSandbox::new();
     let mut app = App::new(config_with(
         vec![profile("main", 95.0, 10.0, 3600)],
         Some("main"),
@@ -1556,6 +1592,7 @@ fn the_live_column_holds_its_place_while_nothing_is_live() {
 /// row must still fit.
 #[test]
 fn the_live_column_is_dropped_rather_than_clipped_when_it_does_not_fit() {
+    let _home = crate::testutil::HomeSandbox::new();
     let mut app = App::new(config_with(
         vec![profile("main", 95.0, 10.0, 3600)],
         Some("main"),

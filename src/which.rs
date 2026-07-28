@@ -237,8 +237,15 @@ fn emit_json(config: &AppConfig, resolved: Option<(String, Source)>) {
 }
 
 /// The `--json` payload, split from the print so its field shapes are assertable
-/// without capturing stdout. `tier` is `null` when nothing on disk claims a tier,
-/// and for a third-party profile, which has no Anthropic plan to report.
+/// without capturing stdout.
+///
+/// `tier` describes the credential the profile STORES and says nothing about
+/// where its requests route: `null` there means either that nothing on disk
+/// claims a tier or that the profile carries a RECOGNISED third-party provider,
+/// and an unrecognised endpoint (a local proxy, a self-hosted router) reports an
+/// Anthropic tier off its stored pair while routing elsewhere entirely. `oauth`
+/// is the field that answers routing — it is exactly `base_url.is_none()`, so
+/// `oauth: false` means requests leave Anthropic whatever `tier` says.
 ///
 /// `tier` goes through `profile_json::tier_label`, the same helper `status.json`
 /// and the MCP tools call, so one account cannot read a different tier depending

@@ -142,17 +142,126 @@ fn callback_aborts_on_a_state_mismatch() {
     assert!(response.starts_with("HTTP/1.1 400"), "got: {response}");
 }
 
+/// Bytes only the browser redirect could have supplied.
+const CALLBACK_CANARY: &str = "CALLBACK-BYTES-CANARY";
+
+/// An OAuth `error` param is still fatal, and its bytes now reach nothing. Both
+/// params are uncapped upstream text and used to be interpolated whole into the
+/// `bail!` — which lands on `clauth login`'s stderr and the TUI Setup toast.
+/// Worse than the token-endpoint bodies this module's sibling fix removed: those
+/// at least passed a first-line + 200-char trim first.
 #[test]
-fn callback_aborts_on_an_oauth_error_param() {
+fn callback_aborts_on_an_oauth_error_param_without_echoing_it() {
     let (verdict, response) = callback_roundtrip(
-        "GET /callback?error=access_denied&error_description=denied HTTP/1.1\r\n",
+        &format!(
+            "GET /callback?error=access_denied&error_description={CALLBACK_CANARY} HTTP/1.1\r\n"
+        ),
         "STATE",
     );
     let err = verdict
         .expect_err("an OAuth error param is fatal")
         .to_string();
-    assert!(err.contains("authorization failed"), "err was: {err}");
+    assert_eq!(err, "you declined the authorization request");
     assert!(response.starts_with("HTTP/1.1 400"), "got: {response}");
+    assert!(
+        !response.contains(CALLBACK_CANARY),
+        "the page must not reflect it either: {response}"
+    );
+
+    // An `error` code outside RFC 6749's set is where the bytes are least
+    // trustworthy, so NONE of them are kept — not even capped into the log.
+    let (verdict, _) = callback_roundtrip(
+        &format!(
+            "GET /callback?error={CALLBACK_CANARY}&error_description={CALLBACK_CANARY} HTTP/1.1\r\n"
+        ),
+        "STATE",
+    );
+    let err = verdict
+        .expect_err("an unrecognized error code is still fatal")
+        .to_string();
+    assert!(
+        !err.contains(CALLBACK_CANARY),
+        "an unrecognized code must not be echoed: {err}"
+    );
+    assert_eq!(err, "anthropic refused the login");
+}
+
+/// The parse is what drops the browser's bytes, so pin the whole map. Every
+/// value any arm carries onward is one of `parse`'s own literals — asserted by
+/// reading `log_detail` back, which is the only thing that still names a code.
+#[test]
+fn authorize_rejection_parses_rfc6749_codes_and_anonymizes_the_rest() {
+    use crate::oauth_login::AuthorizeRejection;
+    for (code, detail, user) in [
+        (
+            "access_denied",
+            "access_denied",
+            "you declined the authorization request",
+        ),
+        (
+            "server_error",
+            "server_error",
+            "anthropic is having trouble",
+        ),
+        (
+            "temporarily_unavailable",
+            "temporarily_unavailable",
+            "anthropic is having trouble",
+        ),
+        (
+            "invalid_request",
+            "invalid_request",
+            "anthropic refused the login",
+        ),
+        (
+            "unauthorized_client",
+            "unauthorized_client",
+            "anthropic refused the login",
+        ),
+        (
+            "unsupported_response_type",
+            "unsupported_response_type",
+            "anthropic refused the login",
+        ),
+        (
+            "invalid_scope",
+            "invalid_scope",
+            "anthropic refused the login",
+        ),
+    ] {
+        let r = AuthorizeRejection::parse(code);
+        assert_eq!(r.log_detail(), detail, "log detail for {code}");
+        assert_eq!(r.user_message(), user, "user copy for {code}");
+    }
+
+    let odd = AuthorizeRejection::parse(CALLBACK_CANARY);
+    assert!(
+        !odd.log_detail().contains(CALLBACK_CANARY),
+        "an unrecognized code must not survive into the log"
+    );
+    assert_eq!(
+        odd.log_detail(),
+        "an error code outside RFC 6749's set (withheld)"
+    );
+}
+
+/// Same structural guard as `oauth::TokenFailure`: no `Display` and no
+/// `Into<anyhow::Error>`, so a surface cannot print the browser's words even by
+/// accident. Positive controls prove the probe discriminates.
+#[test]
+fn authorize_rejection_has_no_printable_escape_hatch() {
+    use crate::oauth_login::AuthorizeRejection;
+    use crate::testutil::{NotDisplay as _, NotIntoAnyhow as _, Probe};
+    assert!(Probe::<String>::is_display(), "positive control");
+    assert!(Probe::<std::io::Error>::into_anyhow(), "positive control");
+    assert!(
+        !Probe::<AuthorizeRejection>::is_display(),
+        "AuthorizeRejection must stay Display-free"
+    );
+    assert!(
+        !Probe::<AuthorizeRejection>::into_anyhow(),
+        "AuthorizeRejection must not convert into anyhow::Error"
+    );
 }
 
 #[test]

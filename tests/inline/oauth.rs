@@ -1693,38 +1693,7 @@ fn rotate_one_inner_does_not_rotate_under_a_live_session_on_macos() {
 // the same condition through `format::refresh_transient`. With no `Display`,
 // that bypass is a compile error instead of something review has to catch.
 
-/// Compile-time probes for the two ways a value grows a printable form: an
-/// inherent method wins method lookup whenever its bound holds, and lookup falls
-/// through to the blanket trait method when it does not.
-struct Probe<T>(std::marker::PhantomData<T>);
-
-impl<T: std::fmt::Display> Probe<T> {
-    fn is_display() -> bool {
-        true
-    }
-}
-
-impl<T: Into<anyhow::Error>> Probe<T> {
-    fn into_anyhow() -> bool {
-        true
-    }
-}
-
-trait NotDisplay {
-    fn is_display() -> bool {
-        false
-    }
-}
-
-impl<T> NotDisplay for Probe<T> {}
-
-trait NotIntoAnyhow {
-    fn into_anyhow() -> bool {
-        false
-    }
-}
-
-impl<T> NotIntoAnyhow for Probe<T> {}
+use crate::testutil::{NotDisplay as _, NotIntoAnyhow as _, Probe};
 
 /// The structural half of the containment, covering BOTH escape hatches: a
 /// `Display` impl makes `{e}` compile again, and an `Into<anyhow::Error>` makes

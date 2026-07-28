@@ -244,6 +244,69 @@ fn write_response(mut stream: &TcpStream, status: &str, page: Page) {
 /// Handle one connection. `Ok(Some(code))` on the real `/callback` with matching
 /// `state`; `Ok(None)` for any unrelated request (keep waiting); `Err` on an
 /// OAuth error param or a state mismatch (a security stop).
+/// Why the authorize callback came back without a code — the browser-redirect
+/// twin of [`crate::oauth::TokenFailure`], typed for the same reason.
+///
+/// The callback's `error` / `error_description` query params are upstream text
+/// with NO cap (worse than the token-endpoint bodies, which at least passed a
+/// first-line + 200-char trim), and they used to be interpolated straight into
+/// `clauth login`'s stderr and the TUI Setup toast. So `error` is PARSED into
+/// RFC 6749 §4.1.2.1's closed code set at the boundary and its bytes dropped;
+/// `error_description` is free-form and never leaves the wire at all. No
+/// `Display`, no conversion into `anyhow::Error`.
+///
+/// An unrecognized code is anonymous rather than echoed-with-a-cap: `logline!`
+/// is line-oriented and nothing strips newlines, so echoing free upstream text
+/// even into a log forges entries.
+pub(crate) enum AuthorizeRejection {
+    /// `access_denied` — the operator declined the consent screen. The one arm
+    /// that is a choice rather than a failure.
+    Declined,
+    /// Anthropic's own side; a retry can clear it.
+    Upstream(&'static str),
+    /// The authorize REQUEST was refused, so a retry sends the same thing again.
+    Refused(&'static str),
+    /// An `error` value outside the spec's set — the case where the bytes are
+    /// least trustworthy, so none are kept.
+    Unrecognized,
+}
+
+impl AuthorizeRejection {
+    /// Parse the callback's `error` param. The input is discarded here: every
+    /// value any arm carries onward is one of this function's own literals, so
+    /// nothing downstream can be holding browser-supplied bytes.
+    fn parse(code: &str) -> Self {
+        match code {
+            "access_denied" => Self::Declined,
+            "server_error" => Self::Upstream("server_error"),
+            "temporarily_unavailable" => Self::Upstream("temporarily_unavailable"),
+            "invalid_request" => Self::Refused("invalid_request"),
+            "unauthorized_client" => Self::Refused("unauthorized_client"),
+            "unsupported_response_type" => Self::Refused("unsupported_response_type"),
+            "invalid_scope" => Self::Refused("invalid_scope"),
+            _ => Self::Unrecognized,
+        }
+    }
+
+    fn user_message(&self) -> &'static str {
+        match self {
+            Self::Declined => "you declined the authorization request",
+            Self::Upstream(_) => "anthropic is having trouble",
+            Self::Refused(_) | Self::Unrecognized => "anthropic refused the login",
+        }
+    }
+
+    /// Operator-log rendering: the spec code the user copy withholds, as our own
+    /// literal rather than the browser's bytes.
+    fn log_detail(&self) -> &'static str {
+        match self {
+            Self::Declined => "access_denied",
+            Self::Upstream(code) | Self::Refused(code) => code,
+            Self::Unrecognized => "an error code outside RFC 6749's set (withheld)",
+        }
+    }
+}
+
 fn handle_callback(stream: TcpStream, expected_state: &str) -> Result<Option<String>> {
     stream.set_read_timeout(Some(Duration::from_secs(10))).ok();
     let mut request_line = String::new();
@@ -288,9 +351,13 @@ fn handle_callback(stream: TcpStream, expected_state: &str) -> Result<Option<Str
         return Ok(None);
     }
     if let Some(err) = query_param(query, "error") {
-        let desc = query_param(query, "error_description").unwrap_or_default();
+        // Parse before anything else touches it: `err` and the `error_description`
+        // beside it are uncapped browser-supplied text, and interpolating them
+        // into the `bail!` below put them on `clauth login`'s stderr and the TUI
+        // Setup toast verbatim. `error_description` is not read at all.
+        let rejection = AuthorizeRejection::parse(&err);
         // A user-declined consent screen reads differently from a broken flow.
-        let page = if err == "access_denied" {
+        let page = if matches!(rejection, AuthorizeRejection::Declined) {
             Page {
                 tone: Tone::Warning,
                 title: "Login canceled",
@@ -308,7 +375,11 @@ fn handle_callback(stream: TcpStream, expected_state: &str) -> Result<Option<Str
             }
         };
         write_response(&stream, "400 Bad Request", page);
-        anyhow::bail!("authorization failed: {err} {desc}");
+        logline!(
+            "clauth: the authorize callback refused the login: {}",
+            rejection.log_detail()
+        );
+        anyhow::bail!("{}", rejection.user_message());
     }
     let Some(code) = query_param(query, "code") else {
         write_response(

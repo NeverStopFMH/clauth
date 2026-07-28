@@ -5,6 +5,7 @@ use std::collections::BTreeMap;
 
 use crate::profile::{AppConfig, AppState, ClaudeCredentials, OAuthToken, Profile, ProfileName};
 use crate::profile_cache::{USAGE_CACHE_FILE, write_profile_cache};
+use crate::providers::Provider;
 use crate::testutil::HomeSandbox;
 use crate::usage::{PlanInfo, PlanTier, UsageInfo};
 
@@ -463,6 +464,74 @@ fn json_tier_is_null_when_nothing_resolved() {
 
     assert!(value["profile"].is_null());
     assert!(value["tier"].is_null());
+    // `get`, not `value["base_url"]`: indexing answers `Null` for a key that was
+    // never emitted, so it cannot tell a null field from a dropped one — the
+    // very distinction this test's contract rests on.
+    assert_eq!(value.get("base_url"), Some(&serde_json::Value::Null));
+}
+
+/// A third-party profile publishes the endpoint its requests route to, matching
+/// what `status.json` publishes for the same profile. `tier` answers only for an
+/// Anthropic plan, so this field is the one thing on the surface that names where
+/// a third-party session actually goes.
+#[test]
+fn json_base_url_carries_a_third_partys_endpoint() {
+    let _home = HomeSandbox::new();
+    let mut profile = endpoint_profile("deepseek");
+    profile.base_url = Some("https://api.deepseek.com/anthropic".to_string());
+    profile.provider = Some(Provider::DeepSeek);
+    let config = config_with(vec![profile], Some("deepseek"));
+    let resolved = ("deepseek".to_string(), Source::CredentialLessActive);
+
+    let value = json_view(&config, Some(&resolved));
+    let status = crate::daemon::build_status(&config, 60_000, None, false);
+
+    assert_eq!(value["base_url"], "https://api.deepseek.com/anthropic");
+    assert!(
+        value["tier"].is_null(),
+        "a third-party profile claims no Anthropic plan, got {}",
+        value["tier"]
+    );
+    assert_eq!(
+        status["profiles"][0]["base_url"], value["base_url"],
+        "the endpoint reads the same on both JSON surfaces"
+    );
+}
+
+/// The other direction: an Anthropic account routes nowhere special, so the
+/// field is `null` while the tier still answers.
+#[test]
+fn json_base_url_is_null_for_an_anthropic_account() {
+    let _home = HomeSandbox::new();
+    let config = config_with(
+        vec![oauth_profile_claiming("work", "rt-work", "max")],
+        Some("work"),
+    );
+    let resolved = ("work".to_string(), Source::RefreshMatch);
+
+    let value = json_view(&config, Some(&resolved));
+    // Present-and-null, not absent: see `json_tier_is_null_when_nothing_resolved`.
+    assert_eq!(value.get("base_url"), Some(&serde_json::Value::Null));
+    assert_eq!(
+        value["tier"], "Max",
+        "fixture control: the account still reports its tier"
+    );
+}
+
+/// The shape a reader gets wrong: a profile can hold a `base_url` AND stored
+/// OAuth credentials, since setting an endpoint never drops them. The two fields
+/// are independent — neither one's presence rules the other out.
+#[test]
+fn json_publishes_both_an_endpoint_and_a_tier_for_a_hybrid_profile() {
+    let _home = HomeSandbox::new();
+    let mut profile = oauth_profile_claiming("hybrid", "rt-hybrid", "max");
+    profile.base_url = Some("https://example.test".to_string());
+    let config = config_with(vec![profile], Some("hybrid"));
+    let resolved = ("hybrid".to_string(), Source::RefreshMatch);
+
+    let value = json_view(&config, Some(&resolved));
+    assert_eq!(value["base_url"], "https://example.test");
+    assert_eq!(value["tier"], "Max");
 }
 
 #[test]

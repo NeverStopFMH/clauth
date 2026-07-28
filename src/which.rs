@@ -248,11 +248,17 @@ fn emit_json(config: &AppConfig, resolved: Option<(String, Source)>) {
 /// through to the OAuth token's `subscription_type` — written once at login and
 /// carried by no refresh response — and report a canceled account's
 /// pre-cancellation plan forever.
+///
+/// `base_url` carries the endpoint a third-party profile routes to, the same
+/// field `status.json` publishes for that profile: `tier` answers only for an
+/// Anthropic plan, so without it this surface could not name where a
+/// third-party session's requests actually go.
 fn json_view(config: &AppConfig, resolved: Option<&(String, Source)>) -> serde_json::Value {
     let profile = resolved.and_then(|(name, _)| config.find(name));
     serde_json::json!({
         "profile": profile.map(|p| &p.name),
         "source": resolved.map(|(_, s)| s.as_str()),
+        "base_url": profile.and_then(|p| p.base_url.as_ref()),
         "tier": profile.and_then(tier_label),
         "oauth": profile.map(Profile::is_oauth),
         "active": profile.is_some_and(|p| config.is_active(&p.name)),

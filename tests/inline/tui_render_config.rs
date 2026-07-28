@@ -377,6 +377,7 @@ fn disabled_hint_follows_the_gate_then_the_value() {
 /// choice; handing `picker_row` a style would only re-assert the argument.
 #[test]
 fn disabled_account_only_dims_its_name_in_the_setup_list() {
+    let _home = crate::testutil::HomeSandbox::new();
     let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
     use crate::profile::{AppConfig, AppState, ProfileName};
     use ratatui::Terminal;
@@ -433,6 +434,7 @@ fn disabled_account_only_dims_its_name_in_the_setup_list() {
 /// renders no row at all rather than a `[ enabled ]` non-status.
 #[test]
 fn setup_status_row_renders_only_while_disabled() {
+    let _home = crate::testutil::HomeSandbox::new();
     use crate::profile::{AppConfig, AppState};
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;

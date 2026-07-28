@@ -24,6 +24,7 @@ fn empty_app(tab: Tab) -> App {
 /// here instead of shipping undocumented.
 #[test]
 fn every_sub_focus_tab_documents_esc_in_help() {
+    let _home = crate::testutil::HomeSandbox::new();
     for tab in Tab::ALL {
         let mut app = empty_app(tab);
         // Drive every sub-focus field to its "descended" value; `has_sub_focus`
@@ -89,6 +90,7 @@ fn fallback_tab_key_grammar_rows_pin_exact_order_and_copy() {
 /// reaches the tail.
 #[test]
 fn the_help_modal_scrolls_its_overflow_instead_of_dropping_it() {
+    let _home = crate::testutil::HomeSandbox::new();
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
 
@@ -158,6 +160,7 @@ fn the_help_modal_scrolls_its_overflow_instead_of_dropping_it() {
 /// leave `help_scroll` stranded there once the terminal grew back.
 #[test]
 fn a_modal_with_no_room_to_draw_publishes_no_scroll_range() {
+    let _home = crate::testutil::HomeSandbox::new();
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
 
@@ -188,6 +191,7 @@ fn a_modal_with_no_room_to_draw_publishes_no_scroll_range() {
 /// apart, which is what that filter exists to prevent.
 #[test]
 fn a_help_modal_that_fits_renders_without_a_scrollbar() {
+    let _home = crate::testutil::HomeSandbox::new();
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
 
@@ -293,6 +297,7 @@ fn setup_tab_key_grammar_rows_pin_exact_order_and_copy() {
 /// and that nothing clipped it.
 #[test]
 fn the_help_modal_legend_names_every_marker_and_its_hue() {
+    let _home = crate::testutil::HomeSandbox::new();
     use ratatui::backend::TestBackend;
     use ratatui::{Terminal, style::Color};
 

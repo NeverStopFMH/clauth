@@ -2520,6 +2520,7 @@ fn divergence_default_never_captures_a_sibling_owned_login() {
 
 #[test]
 fn compact_entry_sets_flag_no_toast() {
+    let _home = crate::testutil::HomeSandbox::new();
     let mut app = bare_app();
     app.update_compact(13);
     assert!(app.compact);
@@ -2528,6 +2529,7 @@ fn compact_entry_sets_flag_no_toast() {
 
 #[test]
 fn compact_yields_warning_banner() {
+    let _home = crate::testutil::HomeSandbox::new();
     use super::{BannerSeverity, update_banner};
     let mut app = bare_app();
     app.update_compact(13);
@@ -2542,6 +2544,7 @@ fn compact_yields_warning_banner() {
 
 #[test]
 fn compact_exit_clears_banner() {
+    let _home = crate::testutil::HomeSandbox::new();
     use super::update_banner;
     let mut app = bare_app();
     app.update_compact(13);
@@ -2555,6 +2558,7 @@ fn compact_exit_clears_banner() {
 
 #[test]
 fn compact_rearm_after_exit() {
+    let _home = crate::testutil::HomeSandbox::new();
     use super::update_banner;
     let mut app = bare_app();
     app.update_compact(13);
@@ -2587,6 +2591,7 @@ fn theme_set_tier_round_trips() {
 
 #[test]
 fn global_config_cursor_wraps() {
+    let _home = crate::testutil::HomeSandbox::new();
     let mut app = bare_app();
     app.tab = Tab::Config;
     let last = GLOBAL_CONFIG_ROWS.len() - 1;
@@ -2627,6 +2632,7 @@ fn next_divergence_default_cycles_round_trip() {
 
 #[test]
 fn divergence_default_row_is_reachable_by_cursor() {
+    let _home = crate::testutil::HomeSandbox::new();
     let mut app = bare_app();
     app.tab = Tab::Config;
     let pos = GLOBAL_CONFIG_ROWS
@@ -2650,6 +2656,7 @@ fn divergence_default_row_is_reachable_by_cursor() {
 
 #[test]
 fn burn_aware_row_is_reachable_by_cursor() {
+    let _home = crate::testutil::HomeSandbox::new();
     let mut app = bare_app();
     app.tab = Tab::Config;
     let pos = GLOBAL_CONFIG_ROWS
@@ -2923,6 +2930,7 @@ fn parse_refresh_secs_accepts_in_range_only() {
 
 #[test]
 fn refresh_interval_enter_opens_editor_seeded_in_seconds() {
+    let _home = crate::testutil::HomeSandbox::new();
     let mut app = bare_app();
     on_refresh_row(&mut app);
 
@@ -3064,6 +3072,7 @@ fn refresh_interval_out_of_range_keeps_editor_open() {
 
 #[test]
 fn refresh_interval_esc_discards_editor() {
+    let _home = crate::testutil::HomeSandbox::new();
     let mut app = bare_app();
     on_refresh_row(&mut app);
     let before = app.refresh_interval.load(Ordering::Relaxed);
@@ -3111,6 +3120,7 @@ mod env_editor {
 
     #[test]
     fn config_rows_insert_env_entries_then_add_row() {
+        let _home = crate::testutil::HomeSandbox::new();
         let mut env = BTreeMap::new();
         env.insert("ALPHA".to_string(), "1".to_string());
         env.insert("ZED".to_string(), "2".to_string());
@@ -3135,6 +3145,7 @@ mod env_editor {
     /// order so a future edit can't silently drag it back to the top.
     #[test]
     fn disable_row_sits_in_the_account_actions_group_not_at_the_top() {
+        let _home = crate::testutil::HomeSandbox::new();
         let app = app_with_env(BTreeMap::new()); // OAuth, no stored creds, no custom env
 
         let rows = config_rows(&app);
@@ -3172,6 +3183,7 @@ mod env_editor {
 
     #[test]
     fn oauth_account_hides_api_key_keeps_auto_start() {
+        let _home = crate::testutil::HomeSandbox::new();
         let app = app_with_env(BTreeMap::new()); // no base url → OAuth
         let rows = config_rows(&app);
         assert!(
@@ -3186,6 +3198,7 @@ mod env_editor {
 
     #[test]
     fn api_account_shows_api_key_drops_auto_start() {
+        let _home = crate::testutil::HomeSandbox::new();
         let app = app_with_profile(Profile::new(
             "acct".to_string(),
             Some("https://api.test".to_string()),
@@ -3204,6 +3217,7 @@ mod env_editor {
 
     #[test]
     fn unset_overrides_collapse_behind_reveal_chip() {
+        let _home = crate::testutil::HomeSandbox::new();
         let app = app_with_env(BTreeMap::new());
         let rows = config_rows(&app);
         assert!(
@@ -3225,6 +3239,7 @@ mod env_editor {
 
     #[test]
     fn set_override_renders_others_stay_collapsed() {
+        let _home = crate::testutil::HomeSandbox::new();
         let mut profile = Profile::new("acct".to_string(), None, None);
         profile.models.opus = Some("claude-opus-4-8".to_string());
         let rows = config_rows(&app_with_profile(profile));
@@ -3244,6 +3259,7 @@ mod env_editor {
 
     #[test]
     fn reveal_chip_expands_all_overrides() {
+        let _home = crate::testutil::HomeSandbox::new();
         let mut app = app_with_env(BTreeMap::new());
         enter_detail(&mut app);
         let chip = config_rows(&app)
@@ -3389,6 +3405,7 @@ fn app_with_unlinked_profiles(profiles: Vec<crate::profile::Profile>) -> App {
 
 #[test]
 fn no_active_banner_without_spent_evidence() {
+    let _home = crate::testutil::HomeSandbox::new();
     use super::update_banner;
     let mut app = app_with_unlinked_profiles(vec![crate::testutil::blank_profile("a")]);
     update_banner(&mut app);
@@ -3400,6 +3417,7 @@ fn no_active_banner_without_spent_evidence() {
 
 #[test]
 fn all_spent_banner_needs_live_spent_window() {
+    let _home = crate::testutil::HomeSandbox::new();
     use super::update_banner;
     use crate::usage::{UsageInfo, UsageWindow, epoch_secs_to_iso, now_epoch_secs};
     let mut spent = crate::testutil::blank_profile("a");
@@ -3423,6 +3441,7 @@ fn all_spent_banner_needs_live_spent_window() {
 /// decision that clears the active in the first place) keys on the cap too.
 #[test]
 fn all_spent_banner_ignores_a_soft_blocked_member_that_still_serves() {
+    let _home = crate::testutil::HomeSandbox::new();
     use super::update_banner;
     use crate::usage::{UsageInfo, UsageWindow, epoch_secs_to_iso, now_epoch_secs};
     let mut soft = crate::testutil::blank_profile("a");
@@ -3452,6 +3471,7 @@ fn all_spent_banner_ignores_a_soft_blocked_member_that_still_serves() {
 /// folding revision passes it too.
 #[test]
 fn all_spent_banner_ignores_a_member_line_under_the_hard_cap() {
+    let _home = crate::testutil::HomeSandbox::new();
     use super::update_banner;
     use crate::usage::{UsageInfo, UsageWindow, epoch_secs_to_iso, now_epoch_secs};
     let mut overridden = crate::testutil::blank_profile("a");
@@ -3475,6 +3495,7 @@ fn all_spent_banner_ignores_a_member_line_under_the_hard_cap() {
 /// The same member at the hard cap IS spent.
 #[test]
 fn all_spent_banner_fires_at_the_weekly_hard_cap() {
+    let _home = crate::testutil::HomeSandbox::new();
     use super::update_banner;
     use crate::usage::{UsageInfo, UsageWindow, epoch_secs_to_iso, now_epoch_secs};
     let mut dead = crate::testutil::blank_profile("a");
@@ -4188,6 +4209,7 @@ mod new_account_model_row {
 
     #[test]
     fn create_form_carries_the_model_row_before_create() {
+        let _home = crate::testutil::HomeSandbox::new();
         let mut app = empty_app();
         enter_new_account_form(&mut app);
         let rows = config_rows(&app);
@@ -4208,6 +4230,7 @@ mod new_account_model_row {
 
     #[test]
     fn space_cycles_the_draft_model_buffer_with_no_profile_to_persist_into() {
+        let _home = crate::testutil::HomeSandbox::new();
         let mut app = empty_app();
         enter_new_account_form(&mut app);
 
@@ -5675,5 +5698,34 @@ fn fallback_add_enter_commits_directly_when_add_would_not_mix() {
             .iter()
             .any(|n| n == "carol"),
         "same-kind add commits directly without a confirm"
+    );
+}
+
+// ── `● daemon` header dot at startup ─────────────────────────────────────────
+
+/// The dot's health must be PROBED at construct, never seeded with a constant.
+/// The first paint happens before any `on_tick` and `poll_daemon_health` is
+/// throttled to 1 Hz, so a seeded `Absent` renders "no daemon runs" as fact for
+/// the first second of every launch while one is live. Two legs on one sandbox:
+/// with the singleton flock held the seed reads non-`Absent` (the dot shows),
+/// with it released `Absent` (the dot hides) — so no constant seed passes both.
+#[test]
+fn construct_probes_the_daemon_dot_instead_of_seeding_a_constant() {
+    use crate::daemon::{DaemonHealth, hold_daemon_lock};
+
+    let _home = crate::testutil::HomeSandbox::new();
+
+    let held = hold_daemon_lock();
+    assert_eq!(
+        app_with(Vec::new()).daemon_health,
+        DaemonHealth::Stale,
+        "a live daemon that has not published status.json yet → amber on frame 1"
+    );
+
+    drop(held);
+    assert_eq!(
+        app_with(Vec::new()).daemon_health,
+        DaemonHealth::Absent,
+        "no holder → the seed hides the dot, proving the probe reads the lock"
     );
 }

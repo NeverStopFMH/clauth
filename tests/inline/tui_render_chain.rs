@@ -516,6 +516,7 @@ fn disabled_and_canceled_share_the_marker_shape_and_split_on_hue() {
 /// `tests/inline/tui_app.rs`'s `chain_candidates_excludes_a_disabled_profile`.
 #[test]
 fn disabled_chain_member_dims_its_name_and_takes_the_blocked_reason_marker() {
+    let _home = crate::testutil::HomeSandbox::new();
     let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
     let mut a = profile("xqzacct", 95.0, 10.0, 3600);
     a.disabled = true;
@@ -858,6 +859,7 @@ fn member_detail_rows_start_indexes_the_first_fallback_row_at_every_header_heigh
 /// `typed_threshold_caret_is_not_set_when_the_row_is_clipped_off_the_pane`.
 #[test]
 fn typed_threshold_caret_lands_on_the_rotate_at_row_at_every_header_height() {
+    let _home = crate::testutil::HomeSandbox::new();
     let check = |cfg: AppConfig, label: &str, w: u16, h: u16| {
         let mut app = App::new(cfg);
         app.fallback_focus = FallbackFocus::Detail;
@@ -915,6 +917,7 @@ fn typed_threshold_caret_lands_on_the_rotate_at_row_at_every_header_height() {
 /// must also never be set past the pane.
 #[test]
 fn typed_threshold_row_scrolls_into_view_and_carries_the_caret() {
+    let _home = crate::testutil::HomeSandbox::new();
     let mut d = profile("a", 95.0, 10.0, 7200);
     d.disabled = true;
     let mut cfg = config_with(vec![d], Some("other"), vec!["a"]);
@@ -963,6 +966,7 @@ fn typed_threshold_row_scrolls_into_view_and_carries_the_caret() {
 /// walking the cursor down, not fall off the bottom.
 #[test]
 fn remove_row_stays_reachable_on_a_40x24_pane() {
+    let _home = crate::testutil::HomeSandbox::new();
     // One blocked member: the pill block + fix line eat header rows.
     let cfg = config_with(vec![profile("a", 95.0, 100.0, 7200)], Some("a"), vec!["a"]);
     let mut app = App::new(cfg);
@@ -1055,6 +1059,7 @@ fn member_detail_stacks_the_health_pill_under_disabled() {
 /// test that only renders a short chain.
 #[test]
 fn selector_rail_shows_hash_n_at_constant_width() {
+    let _home = crate::testutil::HomeSandbox::new();
     // 10 members so the list spans `#1` through `#10`. Names are deliberately
     // non-prefixing (`ma`..`mj`, never `m1`..`m10`): `m1` is a substring of `m10`
     // and `#1` of `#10`, so a naive `contains` lookup would match the wrong row
@@ -1416,6 +1421,7 @@ fn live_row(
 /// whole, plus an explicit absence of the follower glyph.
 #[test]
 fn a_chain_row_carries_no_live_session_tally() {
+    let _home = crate::testutil::HomeSandbox::new();
     let mut app = App::new(config_with(
         vec![
             profile("busy", 95.0, 10.0, 3600),
@@ -1645,6 +1651,7 @@ fn the_member_card_places_the_session_block_above_the_five_hour_gauge() {
 /// SAME fixture that proves the tally is non-empty.
 #[test]
 fn the_fallback_tab_reads_the_apps_live_session_tally() {
+    let _home = crate::testutil::HomeSandbox::new();
     let mut app = App::new(config_with(
         vec![profile("busy", 95.0, 10.0, 3600)],
         None,
@@ -1715,6 +1722,7 @@ fn marker_app() -> App {
 /// is its own pin below.
 #[test]
 fn the_blocked_reason_marker_holds_the_rows_last_content_column() {
+    let _home = crate::testutil::HomeSandbox::new();
     // 26 content cells: `⊖` and `◔` both sit one cell in from the pane's right
     // border, and the healthy active member carries no marker at all.
     assert_eq!(
@@ -1740,6 +1748,7 @@ fn the_blocked_reason_marker_holds_the_rows_last_content_column() {
 /// width; that is why the name column's width tracks blocked state.
 #[test]
 fn a_narrow_pane_clamps_a_marked_members_name_rather_than_dropping_its_marker() {
+    let _home = crate::testutil::HomeSandbox::new();
     // 16 content cells: the rail eats 6, the marker and its gap 2, leaving 8 for
     // the name — so `blockedname` truncates with `…` and keeps its `⊖`, while
     // `hot` fits with room to spare.

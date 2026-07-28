@@ -182,6 +182,7 @@ fn bar_chart_nonzero_keeps_the_floor_cell() {
 
 #[test]
 fn dashboard_reflows_to_two_columns_on_big_terminals() {
+    let _home = crate::testutil::HomeSandbox::new();
     let app = app_with_stats(TokenPeriod::Lifetime);
     let out = render_dashboard(&app, 160, 40);
     let row = |y: usize| -> String { out.chars().skip(y * 160).take(160).collect() };
@@ -211,6 +212,7 @@ fn dashboard_reflows_to_two_columns_on_big_terminals() {
 
 #[test]
 fn dashboard_clamps_to_a_centered_band_on_wide_short_terminals() {
+    let _home = crate::testutil::HomeSandbox::new();
     // Wide but under the 30-row reflow gate → the single-column centered band.
     let app = app_with_stats(TokenPeriod::Lifetime);
     let out = render_dashboard(&app, 160, 24);
@@ -232,6 +234,7 @@ fn dashboard_clamps_to_a_centered_band_on_wide_short_terminals() {
 
 #[test]
 fn total_card_groups_kv_rows_and_carries_the_range_meta() {
+    let _home = crate::testutil::HomeSandbox::new();
     let app = app_with_stats(TokenPeriod::Lifetime);
     let out = render_dashboard(&app, 120, 24);
     assert!(
@@ -490,6 +493,7 @@ fn activity_caption_names_the_granularity() {
 
 #[test]
 fn trend_and_activity_badges_read_by_week_and_by_month() {
+    let _home = crate::testutil::HomeSandbox::new();
     let weekly = render_dashboard(&app_with_stats(TokenPeriod::Weekly), 100, 44);
     assert!(weekly.contains("BY WEEK"), "trend title reads `by week`");
     assert!(weekly.contains("by week"), "activity meta reads `by week`");
@@ -506,6 +510,7 @@ fn trend_and_activity_badges_read_by_week_and_by_month() {
 
 #[test]
 fn placeholder_shows_the_full_width_bouncing_bar() {
+    let _home = crate::testutil::HomeSandbox::new();
     let mut app = App::new(AppConfig {
         state: AppState::default(),
         profiles: Vec::new(),

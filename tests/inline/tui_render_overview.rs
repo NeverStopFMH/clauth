@@ -889,6 +889,123 @@ fn disabled_row_type_cell_does_not_pulse() {
     );
 }
 
+/// The type cell's index in a row's span list: cursor, marker, name, name pad,
+/// gap, then the cell. Read positionally on purpose — identifying it by content
+/// would collide with the 5h/7d cells, which render the same `—` whenever a
+/// profile has no usage, which is exactly the fixture these tests use.
+const KIND_SPAN: usize = 5;
+
+/// A no-data dash is not a tier, so the identity wave must not carry it: a lone
+/// glyph color-cycling next to the row's static faint dashes reads as live data.
+/// Same two-phase shape as the disabled-row pin above, and the same reason it
+/// needs a control — without one, a harness that never animates anything passes
+/// this as "no pulse".
+#[test]
+fn no_tier_type_cell_does_not_pulse() {
+    // The wave is Full-tier only; an unpinned tier renders every row flat and
+    // makes the equality below vacuous. Same guard the disabled-row pin carries.
+    let _tier = crate::testutil::TierSandbox::new(theme::Tier::Full);
+    // `something_new` is a claim clauth cannot classify, so the row has no tier
+    // at all; `max` is the same row WITH one.
+    let config = config_with(
+        vec![
+            credentialed_profile("a", "something_new"),
+            credentialed_profile("b", "max"),
+        ],
+        None,
+        vec![],
+    );
+
+    let snapshot = |idx: usize, phase_ms: u64| -> Vec<(String, Option<ratatui::style::Color>)> {
+        let mut app = App::new(config.clone());
+        app.anim_phase_ms = Some(phase_ms);
+        let widths = OverviewWidths::new(110, &app);
+        render_overview_row(&app, idx, &widths, false, true)
+            .spans
+            .iter()
+            .map(|s| (s.content.to_string(), s.style.fg))
+            .collect()
+    };
+
+    // NOT 450ms, the crest the disabled-row pin above uses. That phase is the
+    // one value a ONE-CHARACTER label cannot express: the wave tints char `i` by
+    // `((i/len)·τ − progress·τ).cos()`, so a lone char sits at column 0 and at
+    // progress 0.5 the crest is exactly half a turn away — cos(π) drives the
+    // tint to zero, landing on the same base color as the flat 0ms frame. A `—`
+    // cell would then compare equal at both phases whether or not it pulsed, and
+    // the mutation that deletes the guard stays green. 135ms is near the peak
+    // `crest × envelope` for one char, where the tint is actually observable.
+    assert_eq!(
+        snapshot(0, 0),
+        snapshot(0, 135),
+        "a no-tier row must render identically at two wave phases (no pulse)"
+    );
+    assert_ne!(
+        snapshot(1, 0),
+        snapshot(1, 135),
+        "control: a row that HAS a tier really does animate, so the equality above is real"
+    );
+}
+
+/// The dash joins the other no-data cells at `faint`, but only when it is the
+/// whole cell: a `·token` tag beside it is real data, and a disabled row still
+/// flattens to `dim` the way it outranks every other cell state.
+#[test]
+fn no_tier_type_cell_reads_faint_unless_something_real_shares_the_cell() {
+    let _tier = crate::testutil::TierSandbox::new(theme::Tier::Full);
+    let mut disabled = credentialed_profile("c", "something_new");
+    disabled.disabled = true;
+    let config = config_with(
+        vec![
+            credentialed_profile("a", "something_new"),
+            credentialed_profile("b", "something_new"),
+            disabled,
+        ],
+        None,
+        vec![],
+    );
+
+    let cell = |idx: usize, token_mode: bool| -> (String, Option<ratatui::style::Color>) {
+        let mut app = App::new(config.clone());
+        app.anim_phase_ms = Some(0);
+        if token_mode {
+            let name = app.config().profiles[idx].name.to_string();
+            app.session_tokens
+                .insert(name, crate::claude::SessionTokenStatus::LongLived(None));
+        }
+        let widths = OverviewWidths::new(110, &app);
+        let span = render_overview_row(&app, idx, &widths, false, true).spans[KIND_SPAN].clone();
+        (span.content.to_string(), span.style.fg)
+    };
+
+    let (bare, bare_fg) = cell(0, false);
+    assert_eq!(
+        bare.trim_end(),
+        "—",
+        "fixture control: the cell is the dash"
+    );
+    assert_eq!(bare_fg, theme::faint().fg, "a bare dash is a no-data cell");
+
+    let (tagged, tagged_fg) = cell(1, true);
+    assert_eq!(
+        tagged.trim_end(),
+        "— ·token",
+        "fixture control: the tag shares the cell"
+    );
+    assert_eq!(
+        tagged_fg,
+        theme::dim().fg,
+        "`·token` is real data, so fading the cell would claim otherwise"
+    );
+
+    let (_, disabled_fg) = cell(2, false);
+    assert_eq!(
+        disabled_fg,
+        theme::dim().fg,
+        "a disabled row flattens to dim, outranking no-data as it does stale"
+    );
+}
+
 /// A disabled account is never polled, so its refresh countdown would tick to
 /// zero and then claim a refresh forever. The slot renders blank — at full
 /// width, so no column downstream shifts.

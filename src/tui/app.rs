@@ -1450,7 +1450,14 @@ pub(crate) struct App {
     pub(crate) pricing_refresh: std::sync::mpsc::Sender<()>,
 
     pub(crate) last_reload_fp: ReloadFingerprint,
+    /// Origin of the ambient-animation phase clock; read through [`App::anim_ms`].
     pub(crate) started_at: Instant,
+    /// Pinned animation phase for render tests that must sample a specific point
+    /// of the wave. Backdating `started_at` instead would subtract from
+    /// `Instant::now()`, which panics on a host whose uptime is shorter than the
+    /// offset. Never compiled into the binary.
+    #[cfg(test)]
+    pub(crate) anim_phase_ms: Option<u64>,
     /// Tick counter; advances the activity spinner frame each `on_tick`.
     pub(crate) tick_count: u64,
     pub(crate) quit: bool,
@@ -1462,8 +1469,11 @@ pub(crate) struct App {
     /// Active banner; recomputed each tick from sticky system conditions.
     /// `None` when no condition holds (banner row absent from layout).
     pub(crate) banner: Option<Banner>,
-    /// Last time the 1Hz divergence poll ran.
-    pub(crate) last_divergence_check: Instant,
+    /// Last time the 1Hz divergence poll ran. `None` means un-sampled, which the
+    /// gate reads as due — the state a fixture writes to force a poll, since
+    /// backdating an `Instant` panics on a host booted more recently than the
+    /// interval.
+    pub(crate) last_divergence_check: Option<Instant>,
     /// The non-blocking divergence banner's backing signal: `Some` while the
     /// live login no longer matches the active profile, `None` the moment the
     /// link is clean again. Set/refreshed by the 1Hz poll and startup
@@ -1516,7 +1526,11 @@ pub(crate) struct App {
     /// [`poll_live_sessions`] rather than on a config reload: sessions come and
     /// go without touching config.
     pub(crate) live_sessions: crate::live_sessions::LiveTally,
-    last_live_sessions_refresh: Instant,
+    /// Throttle for the per-tick re-tally; construct seeds the tally itself, so
+    /// this starts stamped. `None` means un-sampled, which the gate reads as due
+    /// — the state a fixture writes to force a re-tally, since backdating an
+    /// `Instant` panics on a host booted more recently than the interval.
+    last_live_sessions_refresh: Option<Instant>,
 }
 
 /// Read every named profile's long-lived-token status for the Overview cache.
@@ -1754,12 +1768,14 @@ impl App {
             pricing_refresh,
             last_reload_fp: reload_fingerprint(),
             started_at: Instant::now(),
+            #[cfg(test)]
+            anim_phase_ms: None,
             tick_count: 0,
             quit: false,
             armed_quit: false,
             footer_alert: None,
             banner: None,
-            last_divergence_check: Instant::now(),
+            last_divergence_check: Some(Instant::now()),
             divergence_pending: None,
             last_plugin_refresh: Instant::now(),
             reconcile_done: false,
@@ -1773,8 +1789,18 @@ impl App {
             history_mtimes,
             session_tokens,
             live_sessions,
-            last_live_sessions_refresh: Instant::now(),
+            last_live_sessions_refresh: Some(Instant::now()),
         }
+    }
+
+    /// Phase clock every ambient animation keys off: milliseconds since the TUI
+    /// opened, wrapped by each effect's own period.
+    pub(crate) fn anim_ms(&self) -> u64 {
+        #[cfg(test)]
+        if let Some(ms) = self.anim_phase_ms {
+            return ms;
+        }
+        self.started_at.elapsed().as_millis() as u64
     }
 
     /// Lock the shared AppConfig. Order: AppConfig outer, `with_state_lock` inner.
@@ -7384,10 +7410,13 @@ fn poll_daemon_health(app: &mut App) {
 /// a second stale on arrival would show the wrong fleet for that second.
 fn poll_live_sessions(app: &mut App) {
     const LIVE_SESSIONS_INTERVAL: Duration = Duration::from_secs(1);
-    if app.last_live_sessions_refresh.elapsed() < LIVE_SESSIONS_INTERVAL {
+    if app
+        .last_live_sessions_refresh
+        .is_some_and(|t| t.elapsed() < LIVE_SESSIONS_INTERVAL)
+    {
         return;
     }
-    app.last_live_sessions_refresh = Instant::now();
+    app.last_live_sessions_refresh = Some(Instant::now());
     let tally = crate::live_sessions::LiveTally::collect(&app.config());
     app.live_sessions = tally;
 }
@@ -7577,10 +7606,13 @@ fn maybe_spawn_bootstrap(app: &mut App) {
 fn poll_credentials_divergence(app: &mut App) {
     const POLL_INTERVAL: Duration = Duration::from_secs(1);
 
-    if app.last_divergence_check.elapsed() < POLL_INTERVAL {
+    if app
+        .last_divergence_check
+        .is_some_and(|t| t.elapsed() < POLL_INTERVAL)
+    {
         return;
     }
-    app.last_divergence_check = Instant::now();
+    app.last_divergence_check = Some(Instant::now());
 
     if !app.modals.is_empty() {
         return;

@@ -256,9 +256,8 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
         );
         let fit = gauge_fit(gauge_budget, g.name.chars().count(), g.pct.is_some());
         if fit.visible {
-            let elapsed = app.started_at.elapsed().as_millis() as u64;
             left_spans.push(Span::styled(sep.to_string(), theme::faint()));
-            left_spans.extend(gauge_spans(fit, &g.name, g.pct, elapsed));
+            left_spans.extend(gauge_spans(fit, &g.name, g.pct, app.anim_ms()));
         }
     }
     let left_w: usize = left_spans.iter().map(|s| s.content.chars().count()).sum();
@@ -305,8 +304,7 @@ fn daemon_dot_color(app: &App) -> Option<ratatui::style::Color> {
 }
 
 fn draw_logo(frame: &mut Frame<'_>, area: Rect, app: &App) {
-    let elapsed = app.started_at.elapsed().as_millis() as u64;
-    let blink = (elapsed % 6000) < 200;
+    let blink = (app.anim_ms() % 6000) < 200;
 
     let style = Style::default().fg(theme::accent_2_color());
 

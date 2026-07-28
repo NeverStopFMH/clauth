@@ -1382,7 +1382,7 @@ fn write_live_creds(creds: &crate::profile::ClaudeCredentials) {
 
 /// Force the 1Hz divergence poll to run now, bypassing its interval throttle.
 fn force_poll(app: &mut App) {
-    app.last_divergence_check = std::time::Instant::now() - std::time::Duration::from_secs(2);
+    app.last_divergence_check = None;
     super::poll_credentials_divergence(app);
 }
 
@@ -5262,7 +5262,6 @@ fn startup_overwrite_default_routes_a_shell_through_the_guarded_sink() {
 #[test]
 fn a_tick_re_tallies_live_sessions_that_appeared_after_startup() {
     use crate::profile::{AppConfig, AppState, Profile};
-    use std::time::{Duration, Instant};
     let _home = crate::testutil::HomeSandbox::new();
     let mut app = App::new(AppConfig {
         state: AppState::default(),
@@ -5303,10 +5302,9 @@ fn a_tick_re_tallies_live_sessions_that_appeared_after_startup() {
     for tab in super::Tab::ALL {
         app.tab = tab;
         app.live_sessions = crate::live_sessions::LiveTally::default();
-        // Past the refresh interval, which `App::new` starts the clock on.
-        app.last_live_sessions_refresh = Instant::now()
-            .checked_sub(Duration::from_secs(5))
-            .expect("a clock 5s in the past");
+        // Un-sampled, which the gate reads as due — past the refresh interval
+        // that `App::new` starts the clock on.
+        app.last_live_sessions_refresh = None;
         super::on_tick(&mut app);
 
         assert_eq!(

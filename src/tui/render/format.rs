@@ -69,9 +69,13 @@ pub(super) fn cue_style(cue: Option<Color>, resting: Style) -> Style {
 
 /// The Overview kind column's tier chip. An account whose plan is not known yet
 /// gets the house no-data dash: the old bare "Claude" read as a real plan, and
-/// this column is the one place a reader compares tiers side by side. The cell's
-/// own dim/pulse styling carries it — the column is uniformly styled by its
-/// caller, so the dash cannot take the faint treatment the other dash sites use.
+/// this column is the one place a reader compares tiers side by side.
+///
+/// Ceiling: this returns a bare `String`, so the caller styles the whole cell —
+/// the dash misses the `theme::faint()` the other no-data sites use, and on a
+/// credentialed row it rides the identity pulse, color-cycling while the static
+/// faint dashes elsewhere in the same row sit still. Upgrade path: return spans
+/// instead and have `overview.rs` skip `pulse_name_spans` for a no-data label.
 pub(super) fn account_type_label(profile: &Profile) -> String {
     if !profile.is_oauth() {
         return "API".to_string();

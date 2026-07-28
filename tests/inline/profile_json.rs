@@ -27,9 +27,11 @@ fn tier_label_reports_the_tier_of_a_canceled_account() {
     assert_eq!(tier_label(&profile), Some("Free".to_string()));
 }
 
-/// A canceled account whose cached tier is a paid one (the pre-downgrade
-/// reading, or an org that never dropped) reports THAT tier — no arm anywhere
-/// substitutes the status for the tier.
+/// Code invariant, not a claim about any observed account: whatever tier the
+/// cache holds is what this reports, `subscription_status` notwithstanding. A
+/// paid tier is the fixture that can tell the two apart — `Free` alone cannot
+/// prove the status was not substituted, since the canceled arm returned a
+/// different string but the free one returns the same tier either way.
 #[test]
 fn tier_label_never_substitutes_canceled_for_a_paid_tier() {
     let _home = HomeSandbox::new();

@@ -32,9 +32,11 @@ struct Row {
     /// `*` for the active profile, a space otherwise.
     marker: char,
     name: String,
-    /// Tier for an anthropic account (`Max 5x`, `canceled`), else the provider
-    /// name for a third-party one; `entry["tier"]` already folds in the plan and
-    /// cancellation logic, so reading it keeps this in lockstep with `status`.
+    /// Tier for an anthropic account (`Max 5x`), else the provider name for a
+    /// third-party one. Reading `entry["tier"]` keeps this in lockstep with
+    /// `status`. A canceled subscription reads as its post-cancellation tier
+    /// (`Free`) — this table has no status column, so it carries no cancellation
+    /// signal at all.
     plan: String,
     /// 5h / 7d window utilization as `NN%` (share consumed), `-` when no cache.
     five_h: String,

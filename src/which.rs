@@ -237,9 +237,14 @@ fn emit_json(config: &AppConfig, resolved: Option<(String, Source)>) {
 }
 
 /// The `--json` payload, split from the print so its field shapes are assertable
-/// without capturing stdout. `tier` is `null` for an account whose plan was
-/// never fetched — same contract `profile_json::tier_label` gives `status.json`
-/// and the MCP tools, so the three can't disagree about one account.
+/// without capturing stdout. `tier` is `null` when nothing on disk claims a tier.
+///
+/// It is the TOKEN's tier, not the cached one: `Profile` is built by `load_config`
+/// and only the TUI ever fills `Profile::usage`, so this reads `subscription_type`
+/// and renders the `Claude `-prefixed long form. `status.json` and the MCP tools
+/// go through `profile_json::tier_label`, which prefers the on-disk usage cache
+/// and renders the short form — so one account can read `Claude Max` here and
+/// `Max 20x` there.
 fn json_view(config: &AppConfig, resolved: Option<&(String, Source)>) -> serde_json::Value {
     let profile = resolved.and_then(|(name, _)| config.find(name));
     serde_json::json!({

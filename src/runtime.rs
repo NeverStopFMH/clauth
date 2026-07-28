@@ -67,18 +67,6 @@ use crate::profile::{
     profile_subpath,
 };
 
-/// Watchdog tick. 1s instead of a longer interval because fake-symlink mode
-/// needs a tight upper bound on how long a session can read stale credentials
-/// after a sibling refreshes — every additional second is another window in
-/// which a 401 could revoke an already-rotated refresh token chain.
-const WATCHDOG_INTERVAL: Duration = Duration::from_secs(1);
-
-/// `.claude.json` cross-profile sync cadence. Tighter than the credential
-/// watchdog because Claude Code rewrites `.claude.json` constantly; 100ms keeps
-/// the window in which one profile observes another's stale shared state small.
-/// Also bounds watchdog-thread shutdown latency to one tick of this interval.
-const CJSON_INTERVAL: Duration = Duration::from_millis(100);
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LinkMode {
     /// OS-level symlinks. Used on Unix unconditionally and on Windows when
@@ -1816,121 +1804,49 @@ impl ProfileRuntime {
             ..
         } = paths;
 
+        // This session's three reconcile legs, as one value the watchdog loop
+        // calls back into.
+        struct WatchdogLegs {
+            claude_home: PathBuf,
+            swap: std::sync::Arc<SessionSwap>,
+        }
+        impl crate::watchdog::Reconcile for WatchdogLegs {
+            fn config(&self) {
+                if let Err(e) = crate::claude_json::sync_once() {
+                    logline!("clauth: .claude.json sync failed: {e}");
+                }
+                if let Err(e) = crate::settings_sync::sync_once() {
+                    logline!("clauth: settings.json sync failed: {e}");
+                }
+            }
+            fn credentials(&self) {
+                if let Err(e) = tick(&self.claude_home, &self.swap) {
+                    logline!("clauth: watchdog tick failed: {e}");
+                }
+            }
+            fn swap_poll(&self) {
+                self.swap.poll();
+            }
+        }
+
         let (watchdog_tx, watchdog_rx) = crossbeam_channel::bounded::<()>(1);
-        let watchdog_swap = std::sync::Arc::clone(&swap);
-        let watchdog_claude_home = claude_home.clone();
+        let legs = WatchdogLegs {
+            claude_home: claude_home.clone(),
+            swap: std::sync::Arc::clone(&swap),
+        };
         #[allow(clippy::expect_used, reason = "thread spawn failure is unrecoverable")]
         let watchdog_handle = thread::Builder::new()
             .name(format!("clauth-wdog-{name}"))
             .spawn(move || {
-                // Filesystem-event-driven reconcile with a 30 s fallback
-                // timer. Falls back to 1 Hz polling when notify is
-                // unavailable. Loop exits when the shutdown sender is
-                // dropped (see ProfileRuntime::Drop).
-                let reconcile = || {
-                    if let Err(e) = crate::claude_json::sync_once() {
-                        logline!("clauth: .claude.json sync failed: {e}");
-                    }
-                    if let Err(e) = crate::settings_sync::sync_once() {
-                        logline!("clauth: settings.json sync failed: {e}");
-                    }
-                    if let Err(e) = tick(&watchdog_claude_home, &watchdog_swap) {
-                        logline!("clauth: watchdog tick failed: {e}");
-                    }
-                    watchdog_swap.poll();
-                };
-
-                let wpaths = crate::watchdog::watch_paths(
-                    watchdog_swap.runtime.as_path(),
-                    watchdog_swap.canonical().as_path(),
-                    &watchdog_claude_home,
+                // Event-driven reconcile, polling only where events are
+                // unavailable. Exits when the shutdown sender is dropped (see
+                // ProfileRuntime::Drop).
+                let specs = crate::watchdog::watch_specs(
+                    legs.swap.runtime.as_path(),
+                    legs.swap.canonical().as_path(),
+                    &legs.claude_home,
                 );
-                let watcher = crate::watchdog::try_start(&wpaths);
-
-                if let Some(ew) = watcher {
-                    // Event-driven: fs events trigger full reconcile,
-                    // a 1 s ticker runs poll() so daemon-requested swaps
-                    // are picked up promptly, and a 30 s fallback ticker
-                    // catches lost events. Cooldown on events prevents
-                    // self-trigger loops when tick() writes to a watched
-                    // file. On debouncer death (channel disconnect) the
-                    // loop falls through to the polling fallback.
-                    let fallback_ticker =
-                        crossbeam_channel::tick(crate::watchdog::FALLBACK_INTERVAL);
-                    let poll_ticker = crossbeam_channel::tick(std::time::Duration::from_secs(1));
-                    let mut last_reconcile = std::time::Instant::now();
-                    // Past by one cooldown so the first event always fires.
-                    last_reconcile -= crate::watchdog::WRITE_COOLDOWN;
-
-                    loop {
-                        crossbeam_channel::select! {
-                            recv(watchdog_rx) -> _ => return,
-                            recv(poll_ticker) -> _ => {
-                                watchdog_swap.poll();
-                            }
-                            recv(ew.wake) -> res => {
-                                // Err(RecvError): debouncer thread died
-                                // (panic or premature exit). Fall through
-                                // to polling — the tight select on a
-                                // disconnected channel would busy-spin.
-                                if res.is_err() {
-                                    logline!("clauth: fs watcher event channel \
-                                              disconnected, switching to poll");
-                                    break;
-                                }
-                                if last_reconcile.elapsed()
-                                    < crate::watchdog::WRITE_COOLDOWN
-                                {
-                                    continue;
-                                }
-                                last_reconcile = std::time::Instant::now();
-                                reconcile();
-                            }
-                            recv(fallback_ticker) -> _ => {
-                                last_reconcile = std::time::Instant::now();
-                                reconcile();
-                            }
-                        }
-                    }
-                    // Fall through to the polling loop below.
-                }
-
-                // Polling fallback — reached when:
-                // - notify is unavailable (watcher creation failed), or
-                // - the event channel disconnected (debouncer died).
-                // Config reconcilers (.claude.json + settings.json) run every
-                // CJSON_INTERVAL (100 ms); credentials reconcile every
-                // ~WATCHDOG_INTERVAL (1 s). Shutdown exits the thread.
-                let cred_every =
-                    (WATCHDOG_INTERVAL.as_millis() / CJSON_INTERVAL.as_millis()).max(1);
-                let mut until_cred = cred_every;
-                let ticker = crossbeam_channel::tick(CJSON_INTERVAL);
-                loop {
-                    crossbeam_channel::select! {
-                        recv(watchdog_rx) -> _ => return,
-                        recv(ticker) -> _ => {
-                            if let Err(e) = crate::claude_json::sync_once() {
-                                logline!("clauth: .claude.json sync failed: {e}");
-                            }
-                            if let Err(e) = crate::settings_sync::sync_once() {
-                                logline!("clauth: settings.json sync failed: {e}");
-                            }
-                            until_cred -= 1;
-                            if until_cred == 0 {
-                                until_cred = cred_every;
-                                if let Err(e) = tick(
-                                    &watchdog_claude_home,
-                                    &watchdog_swap,
-                                ) {
-                                    logline!(
-                                        "clauth: watchdog tick failed: {e}"
-                                    );
-                                }
-                                watchdog_swap.poll();
-                            }
-                        }
-                    }
-                }
+                crate::watchdog::run(&specs, &watchdog_rx, &crate::watchdog::PRODUCTION, &legs);
             })
             .expect("failed to spawn watchdog thread");
 
@@ -2880,14 +2796,25 @@ fn mirror_tree(claude_home: &Path, runtime: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Unioned child-name set of two directories. Absent/unreadable side
-/// contributes nothing. Names sorted for deterministic, stable iteration.
+/// Unioned child-name set of two directories, minus the publishes in flight.
+/// Absent/unreadable side contributes nothing. Names sorted for deterministic,
+/// stable iteration.
 fn union_children(a: &Path, b: &Path) -> Vec<std::ffi::OsString> {
     let mut names: HashSet<std::ffi::OsString> = HashSet::new();
     for dir in [a, b] {
         if let Ok(entries) = std::fs::read_dir(dir) {
             for entry in entries.flatten() {
-                names.insert(entry.file_name());
+                let name = entry.file_name();
+                // A staging sibling belongs to a `copy_file` mid-publish — one
+                // of the several a shared fake-mode tree has running at once.
+                // Walking it either fails the whole tick when the source is
+                // renamed away between the stat and the copy, or lands an
+                // orphan on the other side that nothing ever removes, since the
+                // mirror never deletes.
+                if crate::watchdog::is_staging(&name) {
+                    continue;
+                }
+                names.insert(name);
             }
         }
     }

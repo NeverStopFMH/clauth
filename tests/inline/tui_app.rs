@@ -5675,3 +5675,32 @@ fn fallback_add_enter_commits_directly_when_add_would_not_mix() {
         "same-kind add commits directly without a confirm"
     );
 }
+
+// ── `● daemon` header dot at startup ─────────────────────────────────────────
+
+/// The dot's health must be PROBED at construct, never seeded with a constant.
+/// The first paint happens before any `on_tick` and `poll_daemon_health` is
+/// throttled to 1 Hz, so a seeded `Absent` renders "no daemon runs" as fact for
+/// the first second of every launch while one is live. Two legs on one sandbox:
+/// with the singleton flock held the seed reads non-`Absent` (the dot shows),
+/// with it released `Absent` (the dot hides) — so no constant seed passes both.
+#[test]
+fn construct_probes_the_daemon_dot_instead_of_seeding_a_constant() {
+    use crate::daemon::{DaemonHealth, hold_daemon_lock};
+
+    let _home = crate::testutil::HomeSandbox::new();
+
+    let held = hold_daemon_lock();
+    assert_eq!(
+        app_with(Vec::new()).daemon_health,
+        DaemonHealth::Stale,
+        "a live daemon that has not published status.json yet → amber on frame 1"
+    );
+
+    drop(held);
+    assert_eq!(
+        app_with(Vec::new()).daemon_health,
+        DaemonHealth::Absent,
+        "no holder → the seed hides the dot, proving the probe reads the lock"
+    );
+}

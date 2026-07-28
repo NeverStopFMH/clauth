@@ -1405,7 +1405,10 @@ pub(crate) struct App {
     /// `● daemon` header-dot state: daemon presence + `status.json` health,
     /// re-probed on a throttled cadence in `on_tick`. UI-thread-only.
     pub(crate) daemon_health: crate::daemon::DaemonHealth,
-    /// Throttle for the `daemon_health` flock probe.
+    /// Throttle for the `daemon_health` flock probe; construct probes once
+    /// itself, so this starts stamped over a real answer. Seeding a placeholder
+    /// instead would render `Absent` — "no daemon runs" — as fact for the whole
+    /// first interval, and the first paint happens before any `on_tick`.
     pub(crate) last_daemon_probe: Instant,
     /// Single-fetcher lease (#27), shared with the scheduler tick. The bootstrap
     /// switch one-shot runs only if THIS instance holds it.
@@ -1749,7 +1752,7 @@ impl App {
             status: StatusState::default(),
             status_events,
             status_refresh,
-            daemon_health: crate::daemon::DaemonHealth::Absent,
+            daemon_health: crate::daemon::daemon_health(),
             last_daemon_probe: Instant::now(),
             fetch_lease: Arc::new(crate::daemon::FetchLease::new()),
             plugin: PluginState::default(),

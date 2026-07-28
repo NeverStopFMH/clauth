@@ -4795,3 +4795,230 @@ fn gc_takes_no_state_flock_when_no_bare_marker_exists() {
         );
     });
 }
+
+// ── event-driven reconcile ───────────────────────────────────────────────────
+
+/// A Claude Code re-login lands in ONE session's runtime file. It must reach the
+/// profile's credential store — and through it every sibling session's view — on
+/// the filesystem event, not on the fallback ticker: the point of the event path
+/// is that a contended rotation does not sit on a 30 s timer.
+///
+/// This is the WIRING pin — specs → watcher → reconcile → the sibling's view. It
+/// does not on its own separate an event from the 1 Hz credential leg of the
+/// polling fallback, since both fit the window; that separation is
+/// `watchdog::tests::a_store_publish_reconciles_with_every_ticker_disabled`,
+/// which leaves no ticker able to explain a reconcile.
+#[cfg(unix)]
+#[test]
+fn a_relogin_reaches_a_sibling_session_without_waiting_for_the_fallback() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        fake_claude_home(tmp.path());
+        let profile = make_profile("evented");
+        let canonical = tmp
+            .path()
+            .join(".clauth")
+            .join("profiles")
+            .join("evented")
+            .join("credentials.json");
+        fs::create_dir_all(canonical.parent().expect("canonical parent")).expect("mkdir store");
+        fs::write(&canonical, CREDS_V1).expect("write canonical");
+        // Back-date the store so the re-login is unambiguously the later write:
+        // `resolve_credential_winner` keeps canonical on an mtime tie.
+        set_mtime(&canonical, SystemTime::now() - Duration::from_secs(60));
+
+        let a =
+            ProfileRuntime::acquire(&profile, Isolation::Shared, &[], false).expect("acquire a");
+        let b =
+            ProfileRuntime::acquire(&profile, Isolation::Shared, &[], false).expect("acquire b");
+
+        // What makes the measurement discriminating: inside this window nothing
+        // but an event can have driven the reconcile.
+        let window = Duration::from_secs(5);
+        assert!(
+            crate::watchdog::PRODUCTION.fallback > window,
+            "fixture: the fallback ticker must not be able to meet the window, \
+             or a pass says nothing about the event path"
+        );
+
+        // Claude Code's re-login shape: unlink the link, write a regular file.
+        let live = a.config_dir().join(".credentials.json");
+        fs::remove_file(&live).expect("unlink runtime creds");
+        fs::write(&live, CREDS_V2).expect("write re-login");
+
+        let sibling = b.config_dir().join(".credentials.json");
+        let started = std::time::Instant::now();
+        while started.elapsed() < window {
+            if fs::read(&canonical).ok().as_deref() == Some(CREDS_V2)
+                && fs::read(&sibling).ok().as_deref() == Some(CREDS_V2)
+            {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let took = started.elapsed();
+
+        assert_eq!(
+            fs::read(&canonical).expect("read canonical"),
+            CREDS_V2,
+            "the re-login never reached the store within {window:?}"
+        );
+        assert_eq!(
+            fs::read(&sibling).expect("read sibling"),
+            CREDS_V2,
+            "the sibling session still resolves the pre-re-login chain after {window:?}"
+        );
+        assert!(
+            took < window,
+            "reconcile took {took:?}, which only the fallback ticker explains"
+        );
+
+        drop(b);
+        drop(a);
+    });
+}
+
+/// `LinkMode::Fake` shares ONE tree across every session of a profile, so
+/// `copy_tree`, `merge_path` and `mirror_credentials` publish into it
+/// concurrently — one set per live session. Under a storm of those publishes the
+/// mirror must never observe a torn file, and it must not turn each of its own
+/// writes into the next event: the watch now sits on the directory the mirror
+/// writes into, so a non-convergent reconcile would feed itself forever.
+#[test]
+fn the_fake_mode_mirror_converges_under_concurrent_publishes() {
+    const WRITERS: usize = 3;
+    const ROUNDS: usize = 24;
+    const TOKEN: usize = 8;
+    const REPEATS: usize = 512;
+
+    /// One payload is `REPEATS` copies of an 8-byte token, so a partially
+    /// published file is detectable by shape alone rather than by guessing which
+    /// writer's round should have won.
+    fn payload(writer: usize, round: usize) -> Vec<u8> {
+        format!("w{writer}r{round:05}").repeat(REPEATS).into_bytes()
+    }
+    fn intact(bytes: &[u8]) -> bool {
+        bytes.len() == TOKEN * REPEATS && bytes.chunks(TOKEN).all(|c| c == &bytes[..TOKEN])
+    }
+
+    struct Mirror {
+        home: PathBuf,
+        runtime: PathBuf,
+        passes: std::sync::atomic::AtomicUsize,
+        torn: std::sync::Mutex<Vec<String>>,
+    }
+    impl Mirror {
+        fn passes(&self) -> usize {
+            self.passes.load(std::sync::atomic::Ordering::Relaxed)
+        }
+        fn torn(&self) -> Vec<String> {
+            self.torn.lock().unwrap_or_else(|p| p.into_inner()).clone()
+        }
+    }
+    impl crate::watchdog::Reconcile for Mirror {
+        fn config(&self) {}
+        fn credentials(&self) {
+            mirror_tree(&self.home, &self.runtime).expect("mirror");
+            self.passes
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            for side in [&self.home, &self.runtime] {
+                for entry in fs::read_dir(side).expect("read side").flatten() {
+                    let path = entry.path();
+                    let Ok(bytes) = fs::read(&path) else { continue };
+                    if !intact(&bytes) {
+                        self.torn
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner())
+                            .push(path.display().to_string());
+                    }
+                }
+            }
+        }
+        fn swap_poll(&self) {}
+    }
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let home = tmp.path().join(".claude");
+    let runtime = tmp.path().join("runtime");
+    let store = tmp.path().join("store").join("credentials.json");
+    let src = tmp.path().join("src");
+    for dir in [&home, &runtime, &src] {
+        fs::create_dir_all(dir).expect("mkdir");
+    }
+    fs::create_dir_all(store.parent().expect("store parent")).expect("mkdir store");
+
+    let cooldown = Duration::from_millis(100);
+    let timings = crate::watchdog::Timings {
+        debounce: Duration::from_millis(30),
+        cooldown,
+        // The fallback must not be able to explain a reconcile, or the
+        // quiescence check below cannot tell a write loop from a ticker.
+        fallback: Duration::from_secs(600),
+        config_poll: Duration::from_secs(600),
+        credential_poll: Duration::from_secs(600),
+    };
+    let specs = crate::watchdog::watch_specs(&runtime, &store, &home);
+    let mirror = Mirror {
+        home: home.clone(),
+        runtime: runtime.clone(),
+        passes: std::sync::atomic::AtomicUsize::new(0),
+        torn: std::sync::Mutex::new(Vec::new()),
+    };
+    let (shutdown_tx, shutdown_rx) = crossbeam_channel::bounded::<()>(1);
+
+    std::thread::scope(|scope| {
+        scope.spawn(|| crate::watchdog::run(&specs, &shutdown_rx, &timings, &mirror));
+
+        for writer in 0..WRITERS {
+            let (home, runtime, src) = (&home, &runtime, &src);
+            scope.spawn(move || {
+                for round in 0..ROUNDS {
+                    let staged = src.join(format!("w{writer}"));
+                    fs::write(&staged, payload(writer, round)).expect("stage");
+                    // The one publish primitive fake mode uses, into whichever
+                    // side of the mirror this round targets.
+                    let side = if round % 2 == 0 { home } else { runtime };
+                    copy_file(&staged, &side.join(format!("shared-{writer}.json")))
+                        .expect("publish");
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+            });
+        }
+
+        // The writers are done. A convergent mirror goes quiet: at most one more
+        // pass (the one that observes the last publish), then every file is
+        // byte-equal and it writes nothing. A self-feeding one keeps climbing.
+        std::thread::sleep(cooldown * 4);
+        let settled = mirror.passes();
+        std::thread::sleep(cooldown * 8);
+        let after = mirror.passes();
+        drop(shutdown_tx);
+
+        assert!(
+            settled >= 2,
+            "fixture: the mirror ran {settled} times, so the soak never reached the code under test"
+        );
+        assert!(
+            after - settled <= 1,
+            "the mirror kept re-triggering with no writer running: {} further passes",
+            after - settled
+        );
+        assert!(
+            mirror.torn().is_empty(),
+            "the mirror observed torn files: {:?}",
+            mirror.torn()
+        );
+    });
+
+    // One final pass stands in for the next tick: the last publish may have
+    // landed after the last mirror ran, and the mirror's contract is that it
+    // converges, not that it is instantaneous.
+    mirror_tree(&home, &runtime).expect("final mirror");
+    for writer in 0..WRITERS {
+        let name = format!("shared-{writer}.json");
+        let left = fs::read(home.join(&name)).expect("read home side");
+        let right = fs::read(runtime.join(&name)).expect("read runtime side");
+        assert!(intact(&left), "{name} is torn on the ~/.claude side");
+        assert_eq!(left, right, "{name} did not converge across the mirror");
+    }
+}

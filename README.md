@@ -53,7 +53,7 @@ Most account tools do one half. clauth pairs instant **switching between multipl
 - **Account-change detection**: if Claude Code logged into a different account while clauth was closed, you get a `[Y/n]` prompt before stored tokens are overwritten.
 - **Non-destructive**: a switch touches only the API keys and the profile's declared `env` block in `settings.json`. Nothing else moves.
 - **Isolated launch**: `clauth start [--isolated] <profile> [claude args...]` runs `claude` in a per-profile `CLAUDE_CONFIG_DIR` (symlink mirror; copies on Windows without symlink privilege), so account identity and billing caches never leak between profiles. Add `--isolated` for a clean session that keeps the account's auth but drops your global `CLAUDE.md` memory, plugins, and hooks, for headless or blind runs (run it in an empty directory to skip project memory too).
-- **Status-line aware**: `clauth which [--json]` prints which profile owns the loaded `credentials.json`, and with `--json` adds its plan tier.
+- **Status-line aware**: `clauth which [--json]` prints which profile owns the loaded `credentials.json`, and with `--json` adds its plan tier and the endpoint it routes to.
 - **Per-profile model routing**: each account can carry its own model overrides on the Setup tab (a default model plus per-tier opus / sonnet / haiku / subagent ids), so a switch or `clauth start` pins which models that account drives.
 - **Shell completions**: `clauth completions install [shell]` wires up bash, zsh, or fish.
 

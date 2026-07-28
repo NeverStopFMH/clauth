@@ -4,6 +4,9 @@ use super::*;
 use std::collections::BTreeMap;
 
 use crate::profile::{AppConfig, AppState, ClaudeCredentials, OAuthToken, Profile, ProfileName};
+use crate::profile_cache::{USAGE_CACHE_FILE, write_profile_cache};
+use crate::testutil::HomeSandbox;
+use crate::usage::{PlanInfo, PlanTier, UsageInfo};
 
 fn oauth_profile(name: &str, refresh: &str) -> Profile {
     Profile {
@@ -321,12 +324,40 @@ fn disabled_profile_is_never_resolved_as_credential_less_active() {
     assert_eq!(resolve_profile(&config, Some(&live), false, None), None);
 }
 
+/// An OAuth profile whose login token claims `sub`, the tier this field reported
+/// forever before the cache became the first answer.
+fn oauth_profile_claiming(name: &str, refresh: &str, sub: &str) -> Profile {
+    let mut profile = oauth_profile(name, refresh);
+    if let Some(oauth) = profile
+        .credentials
+        .as_mut()
+        .and_then(|c| c.claude_ai_oauth.as_mut())
+    {
+        oauth.subscription_type = Some(sub.to_string());
+    }
+    profile
+}
+
+/// Persist a `/profile` plan for `name` — the on-disk cache every JSON surface
+/// resolves a tier through. Needs a live [`HomeSandbox`].
+fn cache_plan(name: &str, tier: PlanTier, status: Option<&str>) {
+    let usage = UsageInfo {
+        plan: Some(PlanInfo {
+            tier,
+            subscription_status: status.map(str::to_string),
+        }),
+        ..Default::default()
+    };
+    write_profile_cache(name, USAGE_CACHE_FILE, &usage);
+}
+
 /// `which --json`'s `tier` is `null` when nothing on disk claims a tier, which
 /// is what `status.json` and the MCP tools already emit for the same account —
 /// the bare "Claude" this field used to print was a plan the account never had,
 /// and it made the three surfaces disagree.
 #[test]
 fn json_tier_is_null_when_no_tier_is_known() {
+    let _home = HomeSandbox::new();
     let config = config_with(vec![oauth_profile("work", "rt-work")], Some("work"));
     let resolved = ("work".to_string(), Source::RefreshMatch);
     let value = json_view(&config, Some(&resolved));
@@ -342,21 +373,85 @@ fn json_tier_is_null_when_no_tier_is_known() {
     );
 }
 
-/// The other direction: a token that DOES claim a tier still renders it.
+/// A never-fetched account has no cache to read, so the login token's claim is
+/// still the answer rather than a `null` that would read as "no plan".
 #[test]
-fn json_tier_renders_a_known_tier() {
-    let mut profile = oauth_profile("work", "rt-work");
-    if let Some(oauth) = profile
-        .credentials
-        .as_mut()
-        .and_then(|c| c.claude_ai_oauth.as_mut())
-    {
-        oauth.subscription_type = Some("max".to_string());
-    }
-    let config = config_with(vec![profile], Some("work"));
+fn json_tier_falls_back_to_the_token_claim_with_no_cache() {
+    let _home = HomeSandbox::new();
+    let config = config_with(
+        vec![oauth_profile_claiming("work", "rt-work", "max")],
+        Some("work"),
+    );
     let resolved = ("work".to_string(), Source::RefreshMatch);
 
-    assert_eq!(json_view(&config, Some(&resolved))["tier"], "Claude Max");
+    assert_eq!(json_view(&config, Some(&resolved))["tier"], "Max");
+}
+
+/// A cached plan outranks the token claim. The multiplier is the discriminator:
+/// the token carries a bare `max` and nothing else, so `Max 20x` is unreachable
+/// by the token path and can only have come off the cache.
+#[test]
+fn json_tier_reports_the_cached_plan_over_the_token_claim() {
+    let _home = HomeSandbox::new();
+    let config = config_with(
+        vec![oauth_profile_claiming("work", "rt-work", "max")],
+        Some("work"),
+    );
+    cache_plan("work", PlanTier::Max(Some(20)), None);
+    let resolved = ("work".to_string(), Source::RefreshMatch);
+
+    assert_eq!(json_view(&config, Some(&resolved))["tier"], "Max 20x");
+}
+
+/// The defect this field carried: a Pro account canceled AFTER login kept
+/// reporting `Claude Pro` here forever. `subscription_type` is written once at
+/// login and no refresh response carries a replacement, so the token cannot
+/// learn about the `claude_free` downgrade — while `status.json` and the MCP
+/// tools, reading the cache, had been reporting `Free` all along.
+#[test]
+fn json_tier_reports_a_canceled_accounts_real_tier_not_its_login_claim() {
+    let _home = HomeSandbox::new();
+    let profile = oauth_profile_claiming("kerry", "rt-kerry", "pro");
+    assert_eq!(
+        profile
+            .credentials
+            .as_ref()
+            .and_then(|c| c.claude_ai_oauth.as_ref())
+            .and_then(|o| o.subscription_type.as_deref()),
+        Some("pro"),
+        "fixture control: the stale login claim the cache has to outrank"
+    );
+    let config = config_with(vec![profile], Some("kerry"));
+    cache_plan("kerry", PlanTier::Free, Some("canceled"));
+    let resolved = ("kerry".to_string(), Source::RefreshMatch);
+
+    assert_eq!(json_view(&config, Some(&resolved))["tier"], "Free");
+}
+
+/// One account, one tier, whichever JSON surface asked. `status.json` is checked
+/// through its own builder; the MCP `which` / `list_profiles` leg is checked at
+/// `tier_label`, the call both of those tools make inline.
+#[test]
+fn json_tier_agrees_with_the_status_json_and_mcp_surfaces() {
+    let _home = HomeSandbox::new();
+    let config = config_with(
+        vec![oauth_profile_claiming("kerry", "rt-kerry", "pro")],
+        Some("kerry"),
+    );
+    cache_plan("kerry", PlanTier::Free, Some("canceled"));
+    let resolved = ("kerry".to_string(), Source::RefreshMatch);
+
+    let which = json_view(&config, Some(&resolved));
+    let status = crate::daemon::build_status(&config, 60_000, None, false);
+    let mcp = config.find("kerry").and_then(tier_label);
+
+    assert_eq!(which["tier"], "Free", "fixture control: the cached tier");
+    assert_eq!(
+        status["profiles"][0]["name"], "kerry",
+        "fixture control: the status body's one row is this account"
+    );
+    assert_eq!(status["profiles"][0]["tier"], which["tier"]);
+    assert_eq!(mcp.as_deref(), which["tier"].as_str());
 }
 
 /// An unresolved session emits every field as `null` rather than dropping them,

@@ -19,8 +19,8 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 
-use crate::format::endpoint_label;
 use crate::profile::{AppConfig, ClaudeCredentials, Profile, claude_dir, load_config};
+use crate::profile_json::tier_label;
 
 /// Which resolution branch attributed the loaded credentials to a profile.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -237,20 +237,23 @@ fn emit_json(config: &AppConfig, resolved: Option<(String, Source)>) {
 }
 
 /// The `--json` payload, split from the print so its field shapes are assertable
-/// without capturing stdout. `tier` is `null` when nothing on disk claims a tier.
+/// without capturing stdout. `tier` is `null` when nothing on disk claims a tier,
+/// and for a third-party profile, which has no Anthropic plan to report.
 ///
-/// It is the TOKEN's tier, not the cached one: `Profile` is built by `load_config`
-/// and only the TUI ever fills `Profile::usage`, so this reads `subscription_type`
-/// and renders the `Claude `-prefixed long form. `status.json` and the MCP tools
-/// go through `profile_json::tier_label`, which prefers the on-disk usage cache
-/// and renders the short form — so one account can read `Claude Max` here and
-/// `Max 20x` there.
+/// `tier` goes through `profile_json::tier_label`, the same helper `status.json`
+/// and the MCP tools call, so one account cannot read a different tier depending
+/// on which JSON surface asked. Reading the `Profile` in hand instead would be
+/// frozen, not merely differently formatted: `load_config` leaves
+/// `Profile::usage` at `None` and only the TUI ever fills it, so this would fall
+/// through to the OAuth token's `subscription_type` — written once at login and
+/// carried by no refresh response — and report a canceled account's
+/// pre-cancellation plan forever.
 fn json_view(config: &AppConfig, resolved: Option<&(String, Source)>) -> serde_json::Value {
     let profile = resolved.and_then(|(name, _)| config.find(name));
     serde_json::json!({
         "profile": profile.map(|p| &p.name),
         "source": resolved.map(|(_, s)| s.as_str()),
-        "tier": profile.and_then(endpoint_label),
+        "tier": profile.and_then(tier_label),
         "oauth": profile.map(Profile::is_oauth),
         "active": profile.is_some_and(|p| config.is_active(&p.name)),
     })

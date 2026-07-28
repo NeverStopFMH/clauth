@@ -5712,7 +5712,7 @@ fn a_failed_retry_keeps_the_pair_and_queues_a_refetch() {
 /// read-write — one of the IO failures `acquire` returns `Err` for in production.
 #[cfg(not(target_os = "macos"))]
 #[test]
-fn a_busy_rotation_guard_bails_without_spending_the_chain() {
+fn an_unacquirable_rotation_guard_bails_without_spending_the_chain() {
     let home = crate::testutil::HomeSandbox::new();
     let name = "guard-busy";
     // Zero token requests expected; `max` is above the one `/usage` call so a

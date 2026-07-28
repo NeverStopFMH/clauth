@@ -884,6 +884,26 @@ fn with_link_mode<T>(mode: LinkMode, f: impl FnOnce() -> T) -> T {
     f()
 }
 
+/// Truncate `touch_store`'s READ-BACK to whole seconds for the duration of `f` —
+/// the one thing the receipt guard consults, not a model of a coarse filesystem
+/// end to end. `file_mtime` is untouched, so `memoized` stays full-precision and
+/// the stamp-ahead fallback cannot fire here the way it could on a genuine 1s
+/// mount; that branch is out of scope for what this poses. Every filesystem a
+/// Linux/macOS run can reach keeps the exact value, so the guard is otherwise
+/// unreachable. Call INSIDE [`with_fake_home`], whose `HOME_TEST_LOCK` hold
+/// serializes this process-global override.
+fn with_coarse_mtime<T>(f: impl FnOnce() -> T) -> T {
+    struct ClearOnDrop;
+    impl Drop for ClearOnDrop {
+        fn drop(&mut self) {
+            set_coarse_mtime_override(false);
+        }
+    }
+    set_coarse_mtime_override(true);
+    let _clear = ClearOnDrop;
+    f()
+}
+
 /// Build `~/.claude/` (required by `acquire`).
 fn fake_claude_home(root: &Path) -> PathBuf {
     let claude = root.join(".claude");
@@ -4455,6 +4475,185 @@ fn a_swap_moves_the_mtime_without_importing_the_old_stores_skew() {
             after <= SystemTime::now(),
             "the swap stamped the new member's store ahead of the clock, which \
              discards its later sidecars and re-logins for as long as it stands"
+        );
+    });
+}
+
+/// The stamp is a write-recency signal with no write behind it, and the runtime
+/// side is written by CLAUDE CODE — nothing can be attached there to compensate,
+/// so the stamp itself has to stop reading as a write. Otherwise, for one
+/// watchdog tick after a swap onto B, a SECOND live session on B whose Claude
+/// Code just wrote an interactive `/login` loses it: canonical looks newer, that
+/// session's tick keeps canonical and relinks over the regular file.
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn a_bare_store_stamp_does_not_beat_a_sibling_sessions_relogin() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let launch = member("sibling-a");
+        let intended = member("sibling-b");
+        member_store(&launch);
+        let intended_store = member_store(&intended);
+        let (swap, _launch_markers) = lone_session(&launch, Isolation::Shared);
+
+        let now = SystemTime::now();
+        set_mtime(&intended_store, now - Duration::from_secs(120));
+        assert_eq!(
+            swap.swap_to("sibling-b").expect("out"),
+            SwapOutcome::Swapped
+        );
+
+        // The sibling session on B, five seconds before that stamp landed: Claude
+        // Code replaced its symlink with a regular file holding a fresh login.
+        let sibling = tmp.path().join("sibling-runtime");
+        fs::create_dir_all(&sibling).expect("mkdir sibling runtime");
+        let sibling_link = cc_relogin(&sibling, CREDS_V1, now - Duration::from_secs(5));
+
+        let written = sync_credentials_unlocked(&sibling_link, &intended_store).expect("sync");
+        assert!(
+            written,
+            "an interactive re-login must survive a swap that only stamped the store"
+        );
+        assert_eq!(
+            fs::read(&intended_store).expect("read intended"),
+            CREDS_V1,
+            "the sibling's login bytes must land in canonical, not be relinked away"
+        );
+    });
+}
+
+/// A chain-following session revisits members: A→B→A→B is three switches on a
+/// two-member chain. The value a swap records as "when these bytes were last
+/// written" is therefore often the PREVIOUS swap's own stamp, so it has to be
+/// resolved the same way the readers resolve it. Recording a raw mtime instead
+/// advances the reported write time by one stamp per revisit, and after a few
+/// cycles both decisions are back to reading a bump as a write.
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn a_second_swap_onto_a_member_keeps_reporting_its_real_last_write() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let launch = member("revisit-a");
+        let intended = member("revisit-b");
+        member_store(&launch);
+        let intended_store = member_store(&intended);
+        let (swap, _launch_markers) = lone_session(&launch, Isolation::Shared);
+
+        let last_write = SystemTime::now() - Duration::from_secs(300);
+        set_mtime(&intended_store, last_write);
+
+        // Onto B, back to A, onto B again — nothing writes B's bytes throughout.
+        assert_eq!(
+            swap.swap_to("revisit-b").expect("out"),
+            SwapOutcome::Swapped
+        );
+        assert_eq!(
+            swap.swap_to("revisit-a").expect("out"),
+            SwapOutcome::Swapped
+        );
+        assert_eq!(
+            swap.swap_to("revisit-b").expect("out"),
+            SwapOutcome::Swapped
+        );
+
+        assert_ne!(
+            fs::metadata(&intended_store)
+                .expect("meta")
+                .modified()
+                .expect("mtime"),
+            last_write,
+            "precondition: the revisit stamped the store again"
+        );
+        assert_eq!(
+            crate::profile_cache::effective_write_time(&intended_store),
+            Some(last_write),
+            "a stamp displacing an earlier stamp must carry the real write forward"
+        );
+    });
+}
+
+/// On a filesystem whose mtimes truncate, a receipt is WORSE than none: a real
+/// write landing in the same tick as the stamp carries the stamp's own mtime, so
+/// the receipt would resolve that write back to the value it displaced and invert
+/// both credential decisions — on a member whose store was just committed. The
+/// swap must therefore leave no receipt there and fall back to the raw mtime,
+/// which is the pre-receipt answer rather than a wrong one. This fails silently:
+/// drop the guard and every other test still passes.
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn a_truncating_filesystem_gets_no_receipt_at_all() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let launch = member("coarse-a");
+        let intended = member("coarse-b");
+        member_store(&launch);
+        let intended_store = member_store(&intended);
+        let (swap, _launch_markers) = lone_session(&launch, Isolation::Shared);
+
+        let last_write = SystemTime::now() - Duration::from_secs(300);
+        set_mtime(&intended_store, last_write);
+
+        with_coarse_mtime(|| {
+            assert_eq!(swap.swap_to("coarse-b").expect("out"), SwapOutcome::Swapped);
+        });
+
+        let receipt = intended_store.with_file_name(crate::profile_cache::TOUCH_RECEIPT_FILE);
+        assert!(
+            !receipt.exists(),
+            "a receipt whose stamp a later write can alias onto must never be written"
+        );
+        assert_ne!(
+            fs::metadata(&intended_store)
+                .expect("meta")
+                .modified()
+                .expect("mtime"),
+            last_write,
+            "precondition: the swap still stamped, so the refusal is the receipt's alone"
+        );
+    });
+}
+
+/// The other direction: a rotation genuinely writes B's store after the swap, so
+/// the stamp's receipt is retired and canonical is the more recent login again.
+/// An older re-login must NOT be adopted over it.
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn a_real_write_after_a_stamp_still_keeps_canonical() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let launch = member("rewrite-a");
+        let intended = member("rewrite-b");
+        member_store(&launch);
+        let intended_store = member_store(&intended);
+        let (swap, _launch_markers) = lone_session(&launch, Isolation::Shared);
+
+        let now = SystemTime::now();
+        set_mtime(&intended_store, now - Duration::from_secs(120));
+        assert_eq!(
+            swap.swap_to("rewrite-b").expect("out"),
+            SwapOutcome::Swapped
+        );
+
+        // A rotation commits B's chain after the swap. Its own mtime already
+        // moves off the stamp; pinned to a later instant so the assertion does
+        // not rest on the filesystem's timestamp granularity.
+        crate::profile::save_profile(&intended).expect("commit rotation");
+        set_mtime(&intended_store, now + Duration::from_secs(30));
+        let canonical_before = fs::read(&intended_store).expect("read intended");
+
+        let sibling = tmp.path().join("sibling-runtime");
+        fs::create_dir_all(&sibling).expect("mkdir sibling runtime");
+        let sibling_link = cc_relogin(&sibling, CREDS_V1, now - Duration::from_secs(5));
+
+        let written = sync_credentials_unlocked(&sibling_link, &intended_store).expect("sync");
+        assert!(
+            !written,
+            "a store written after the stamp is a real commit and must keep canonical"
+        );
+        assert_eq!(
+            fs::read(&intended_store).expect("read intended"),
+            canonical_before,
+            "the rotated chain must not be overwritten by an older re-login"
         );
     });
 }

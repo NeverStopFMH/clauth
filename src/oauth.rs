@@ -212,9 +212,31 @@ impl TokenFailure {
     /// [`Self::log_detail`] into a `logline!`.
     pub(crate) fn user_message(&self) -> &'static str {
         match self {
+            // Register borrowed from the shipped `anthropic is throttling usage
+            // reads` (`tui/render/usage.rs`, copy-rework #28) so the two throttle
+            // surfaces read alike instead of each inventing a word for it.
+            Self::Status(429) => "anthropic is throttling requests",
+            // "rejected" is only true of a 4xx: a 503 from a CDN in front of the
+            // endpoint is not Anthropic rejecting anything.
+            Self::Status(s) if *s >= 500 => "anthropic is having trouble",
             Self::Status(_) => "anthropic rejected the request",
             Self::Transport => "could not reach anthropic",
             Self::Body { .. } => "anthropic's reply was unreadable",
+        }
+    }
+
+    /// The shared transient value: canned cause, the status for the surfaces
+    /// allowed to name it, and the next step this kind actually warrants.
+    pub(crate) fn as_transient(&self) -> crate::format::Transient {
+        use crate::format::{Retry, Transient};
+        match self {
+            Self::Status(s) => Transient::with_status(self.user_message(), *s, Retry::Wait),
+            // No status was ever seen, and the connection is the one thing the
+            // operator can act on.
+            Self::Transport => Transient::new(self.user_message(), Retry::Connection),
+            Self::Body { status, .. } => {
+                Transient::with_status(self.user_message(), *status, Retry::Wait)
+            }
         }
     }
 
@@ -444,7 +466,7 @@ pub(crate) fn exchange_code(
 /// Carries no `Display` and no conversion into `anyhow::Error` (the latter
 /// existed only to give a test a panic string, and was the same smuggling shape
 /// [`RefreshError`] documents): a kick failure can only be rendered through
-/// [`describe_kick_failure`], whose only sink is a `logline!`.
+/// [`describe_kick_failure`].
 enum KickError {
     /// The Messages endpoint returned this >=400 status; a 429 carries the
     /// limiter's own metadata when the response held any.
@@ -807,14 +829,15 @@ fn rotate_one_inner(
         Ok(tok) => apply_rotated_tokens_locked(config, name, tok),
         Err(e) => {
             logline!("clauth: refresh for '{name}' failed: {}", e.log_detail());
+            // This `OpResult`'s only sink is the TUI's Danger toast, whose first
+            // line already reads `refresh for '<name>' failed` — so both arms
+            // carry the NEXT STEP alone rather than restating the condition and
+            // the account name under it.
             Err(match e {
-                // `.toast()`, not `.line()`: this `OpResult`'s only sink is the
-                // TUI's Danger toast, which is also what the switch path feeds
-                // this same condition — one spelling AND one renderer.
                 RefreshError::Invalid(_) => {
-                    anyhow::anyhow!("{}", crate::format::login_expired(name).toast())
+                    anyhow::anyhow!("{}", crate::format::login_expired(name).detail())
                 }
-                RefreshError::Transient(f) => anyhow::anyhow!("{}", f.user_message()),
+                RefreshError::Transient(f) => anyhow::anyhow!("{}", f.as_transient().text()),
             })
         }
     };
@@ -1360,7 +1383,10 @@ pub(crate) enum AuthGate {
     /// A transient failure (network/429/5xx, a busy rotation lock, or a poisoned
     /// mutex) blocked a needed refresh. Do not install now; retry on a later
     /// tick. The account is NOT quarantined.
-    Transient(anyhow::Error),
+    /// Carries the kind so each surface renders it honestly: the CLI names the
+    /// HTTP status, the TUI toast and the MCP payload do not, and the retry
+    /// advice follows the failure instead of being one hardcoded sentence.
+    Transient(crate::format::Transient),
 }
 
 /// Pre-install auth gate (AUTH-1 / Incident C). Installing `name`'s stored
@@ -1429,8 +1455,11 @@ pub(crate) fn ensure_installable(
     // acquired with no config lock held. A busy guard means a live session or
     // sibling worker is already on this chain — refuse this switch and retry.
     let Ok(guard) = RotationGuard::acquire(name) else {
-        return AuthGate::Transient(anyhow::anyhow!(
-            "'{name}' rotation lock busy; retry after the in-flight refresh"
+        // `Stated`: this copy already names its own next step, and appending a
+        // second one gave the operator two incompatible reasons to retry.
+        return AuthGate::Transient(crate::format::Transient::new(
+            format!("'{name}' rotation lock busy; retry after the in-flight refresh"),
+            crate::format::Retry::Stated,
         ));
     };
     // macOS only, same mechanism as the other rotation legs: a switch TARGET can
@@ -1465,8 +1494,11 @@ fn oauth_shape(
     name: &str,
 ) -> std::result::Result<(Option<i64>, Option<String>, Option<String>, bool), AuthGate> {
     let Ok(cfg) = config.lock() else {
-        return Err(AuthGate::Transient(anyhow::anyhow!(
-            "config mutex poisoned"
+        // A poisoned mutex means another thread panicked; it does not clear on
+        // its own, so a retry hint would be a lie.
+        return Err(AuthGate::Transient(crate::format::Transient::new(
+            "clauth hit an internal lock error, restart clauth",
+            crate::format::Retry::Stated,
         )));
     };
     let Some(profile) = cfg.find(name) else {
@@ -1565,8 +1597,9 @@ fn gate_under_guard(
     match refresher(&rt, scopes.as_deref()) {
         Ok(tok) => {
             if apply_rotated_tokens_locked(config, name, tok).is_err() {
-                return AuthGate::Transient(anyhow::anyhow!(
-                    "refreshed '{name}' but failed to persist the rotated tokens"
+                return AuthGate::Transient(crate::format::Transient::new(
+                    format!("refreshed '{name}' but failed to persist the rotated tokens"),
+                    crate::format::Retry::Wait,
                 ));
             }
             // A successful refresh clears any prior quarantine.
@@ -1583,9 +1616,7 @@ fn gate_under_guard(
                     mark_auth_broken(config, name, true);
                     AuthGate::Broken
                 }
-                RefreshError::Transient(f) => {
-                    AuthGate::Transient(anyhow::anyhow!("{}", f.user_message()))
-                }
+                RefreshError::Transient(f) => AuthGate::Transient(f.as_transient()),
             }
         }
     }

@@ -194,7 +194,13 @@ impl super::Daemon {
                 return;
             }
             crate::oauth::AuthGate::Transient(e) => {
-                self.fail_switch(target, now, &format!("refresh failed transiently ({e})"));
+                // The daemon log is an operator surface with no companion log of
+                // its own, so it names the status like CLI stderr does.
+                self.fail_switch(
+                    target,
+                    now,
+                    &format!("refresh failed transiently ({})", e.text_with_status()),
+                );
                 return;
             }
         }

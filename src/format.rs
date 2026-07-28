@@ -45,6 +45,87 @@ impl Message {
             None => self.head.clone(),
         }
     }
+
+    /// The next step alone, for a surface whose own first line ALREADY states
+    /// the condition — the rotate toast opens with `refresh for 'X' failed`, so
+    /// rendering a whole `Message` under it named the account three times.
+    /// Falls back to `head` when there is no detail, so a caller never has to
+    /// mint copy of its own; minting is the drift this module exists to stop.
+    pub(crate) fn detail(&self) -> &str {
+        self.detail.as_deref().unwrap_or(&self.head)
+    }
+}
+
+/// What to tell the operator to do about a transient failure.
+///
+/// Travels INSIDE [`Transient`] rather than arriving as a parameter: three
+/// surfaces render [`refresh_transient`], and a `kind` argument would re-scatter
+/// this choice across exactly the call sites this module exists to unify.
+pub(crate) enum Retry {
+    /// A transport failure — the connection is the thing worth checking.
+    Connection,
+    /// Upstream is throttling, busy, or briefly broken. Waiting is the fix, and
+    /// telling someone to check their connection over a 429 is wrong advice.
+    Wait,
+    /// The cause already names its own next step, so a second one would
+    /// contradict it (`rotation lock busy; retry after the in-flight refresh`
+    /// followed by `check your connection and retry` gives two different and
+    /// incompatible reasons to retry).
+    Stated,
+}
+
+/// A transient failure carrying its own next step, and the HTTP status when the
+/// failure had one.
+///
+/// `cause` is always clauth-authored or already-canned copy — an upstream
+/// response body can never reach it, which is `oauth::TokenFailure`'s job one
+/// layer down. The status is deliberately separable: CLI stderr shows it (the
+/// `main.rs` backstop is a terminal with no log beside it) while a toast and the
+/// MCP payload do not.
+pub(crate) struct Transient {
+    cause: String,
+    status: Option<u16>,
+    retry: Retry,
+}
+
+impl Transient {
+    pub(crate) fn new(cause: impl Into<String>, retry: Retry) -> Self {
+        Self {
+            cause: cause.into(),
+            status: None,
+            retry,
+        }
+    }
+
+    pub(crate) fn with_status(cause: impl Into<String>, status: u16, retry: Retry) -> Self {
+        Self {
+            cause: cause.into(),
+            status: Some(status),
+            retry,
+        }
+    }
+
+    fn suffix(&self) -> &'static str {
+        match self.retry {
+            Retry::Connection => ": check your connection and retry",
+            Retry::Wait => ": retry in a moment",
+            Retry::Stated => "",
+        }
+    }
+
+    /// Cause + next step, no status. TUI toasts and the MCP `reason`.
+    pub(crate) fn text(&self) -> String {
+        format!("{}{}", self.cause, self.suffix())
+    }
+
+    /// Cause + status + next step. CLI stderr and the daemon log, the two
+    /// surfaces with no companion log to read the status out of.
+    pub(crate) fn text_with_status(&self) -> String {
+        match self.status {
+            Some(s) => format!("{} (HTTP {s}){}", self.cause, self.suffix()),
+            None => self.text(),
+        }
+    }
 }
 
 /// A login whose refresh token is dead: re-login is the only fix. Shared by the
@@ -58,12 +139,24 @@ pub(crate) fn login_expired(name: &str) -> Message {
     }
 }
 
-/// A refresh that failed for a transient reason (network): this switch is
-/// refused but the login is not quarantined. Retry is the fix.
-pub(crate) fn refresh_transient(name: &str, err: &str) -> Message {
+/// A refresh that failed for a transient reason: this switch is refused but the
+/// login is not quarantined. The next step comes from `err`'s own [`Retry`], so
+/// a throttle is never told to check its connection.
+pub(crate) fn refresh_transient(name: &str, err: &Transient) -> Message {
     Message {
         head: format!("could not refresh '{name}' before switching"),
-        detail: Some(format!("{err}: check your connection and retry")),
+        detail: Some(err.text()),
+    }
+}
+
+/// [`refresh_transient`] for CLI stderr, which additionally names the HTTP
+/// status. Split as a second constructor rather than a flag, because `line()`
+/// serves BOTH the CLI bail and the MCP payload — the surface split cannot be
+/// made on the renderer.
+pub(crate) fn refresh_transient_cli(name: &str, err: &Transient) -> Message {
+    Message {
+        head: format!("could not refresh '{name}' before switching"),
+        detail: Some(err.text_with_status()),
     }
 }
 

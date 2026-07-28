@@ -7544,7 +7544,7 @@ fn drain_switch_gates(app: &mut App) {
             ),
             oauth::AuthGate::Transient(e) => app.toast(
                 ToastKind::Danger,
-                crate::format::refresh_transient(&name, &e.to_string()).toast(),
+                crate::format::refresh_transient(&name, &e).toast(),
             ),
         }
     }

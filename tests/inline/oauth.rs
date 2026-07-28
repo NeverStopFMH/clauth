@@ -1813,8 +1813,10 @@ fn rotate_refusal_carries_no_wire_bytes_in_either_direction() {
         "the endpoint's page reached the rotate toast: {msg}"
     );
     // Copy pin, not the structural guard: this wording is what the toast's
-    // "refresh for '<name>' failed" line completes.
-    assert_eq!(msg, "anthropic rejected the request");
+    // "refresh for '<name>' failed" line completes. Both arms now end on a next
+    // step — the dead one says re-login, this one says wait — because a toast
+    // that only names a condition leaves the operator nothing to do.
+    assert_eq!(msg, "anthropic is having trouble: retry in a moment");
 
     #[allow(clippy::expect_used, reason = "test")]
     let seen = server.join().expect("listener");
@@ -1869,12 +1871,27 @@ fn refresh_classification_survives_the_real_wire_in_both_directions() {
         "a 5xx must never quarantine — the retry is what recovers it"
     );
     // This value is what the CLI bail, the TUI toast, the MCP `reason` and the
-    // daemon's deferral line are all built from.
-    let msg = e.to_string();
+    // daemon's deferral line are all built from. Both renderings are asserted
+    // together so neither half drifts alone: the CLI form MUST name the status
+    // (an operator at a terminal has no log open beside it) and MUST NOT carry a
+    // byte of the body; the canned form carries neither.
+    let cli = e.text_with_status();
+    let canned = e.text();
     assert!(
-        !msg.contains(WIRE_CANARY) && !msg.contains("HTTP") && !msg.contains("html"),
-        "the endpoint's page reached the switch refusal: {msg}"
+        cli.contains("HTTP 503"),
+        "CLI stderr must still name the status: {cli}"
     );
+    assert!(
+        !cli.contains(WIRE_CANARY) && !cli.contains("html"),
+        "the endpoint's page reached CLI stderr: {cli}"
+    );
+    assert!(
+        !canned.contains("503") && !canned.contains(WIRE_CANARY) && !canned.contains("html"),
+        "the toast/MCP form must carry neither the status nor the body: {canned}"
+    );
+    // A 5xx is not Anthropic "rejecting" anything, and telling the operator to
+    // check their connection over one is wrong advice.
+    assert_eq!(canned, "anthropic is having trouble: retry in a moment");
 
     #[allow(clippy::expect_used, reason = "test")]
     let seen = server.join().expect("listener");

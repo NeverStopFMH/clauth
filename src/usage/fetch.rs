@@ -325,8 +325,8 @@ pub(crate) enum PlanTier {
 }
 
 impl PlanTier {
-    /// Reproduce the old `plan_label` classification exactly from the raw
-    /// `/profile` fields. `rate_limit_tier` carries the Max multiplier when present.
+    /// Classify a tier from the raw `/profile` fields. `rate_limit_tier` carries
+    /// the Max multiplier when present.
     pub(crate) fn from_profile(
         org_type: Option<&str>,
         has_max: bool,
@@ -370,7 +370,7 @@ impl PlanTier {
         }
     }
 
-    /// Same strings the old `plan_label` emitted, for every known tier. `None`
+    /// The long `Claude <tier>` form, for every known tier. `None`
     /// for `Unknown`, mirroring [`PlanTier::short_label`]: a bare "Claude" reads
     /// as a real plan the account never claimed, so each surface renders its own
     /// no-data form instead.

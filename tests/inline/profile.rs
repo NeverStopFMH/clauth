@@ -1496,6 +1496,45 @@ fn reload_fingerprint_drops_when_a_config_toml_is_removed() {
     assert_ne!(before, after);
 }
 
+/// Block until a fresh write beside `sidecar` lands a mtime strictly later than
+/// `sidecar`'s own, by writing one and reading back what the filesystem stored.
+///
+/// The two `write_session_token` calls in the tests below are microseconds
+/// apart, and a filesystem only stores what its resolution allows: NTFS tied
+/// them on a GitHub runner, and any 1 s-granularity mount (HFS+, FAT32, ext3,
+/// some NFS) would tie them every run rather than intermittently. Without this
+/// the assertions are claims about timestamp resolution, not about the
+/// fingerprint.
+///
+/// Deliberately NOT `testutil::set_mtime`, which is how the sibling tests force
+/// a stamp: stamping by hand skips the production write path, so a write that
+/// genuinely stopped moving the mtime would still pass. This keeps the real
+/// write as the thing under test and only waits for it to be observable. The
+/// probe is invisible to `reload_fingerprint`, which stats `config.toml` and
+/// `session-token.json` by name and never reads the directory.
+fn wait_for_a_distinguishable_mtime(sidecar: &std::path::Path) {
+    let after = std::fs::metadata(sidecar)
+        .and_then(|m| m.modified())
+        .expect("sidecar mtime");
+    let probe = sidecar.with_file_name(".mtime-probe");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    loop {
+        std::fs::write(&probe, b"x").expect("probe write");
+        let stored = std::fs::metadata(&probe)
+            .and_then(|m| m.modified())
+            .expect("probe mtime");
+        let _ = std::fs::remove_file(&probe);
+        if stored > after {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "no write got a mtime past {after:?} within 2 s"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+}
+
 // A `login --setup-token` re-mint writes only `session-token.json` (touches no
 // config.toml, no profiles.toml), so the fingerprint must fold that file in or
 // the hot reload never sees a new / re-minted long-lived token. What rides is
@@ -1516,6 +1555,11 @@ fn reload_fingerprint_bumps_when_a_session_token_is_added_or_changed() {
         "adding a session-token.json must trip the fingerprint"
     );
 
+    wait_for_a_distinguishable_mtime(
+        &profile_dir("p")
+            .expect("profile_dir")
+            .join("session-token.json"),
+    );
     crate::claude::write_session_token(
         "p",
         &format!("sk-ant-{}", "r".repeat(40)),
@@ -1555,6 +1599,7 @@ fn reload_fingerprint_catches_a_sidecar_write_no_expiry_can_see() {
     crate::claude::write_session_token("p", &format!("sk-ant-{}", "m".repeat(40)), minted_at)
         .expect("mint");
     let after_mint = reload_fingerprint();
+    wait_for_a_distinguishable_mtime(&sidecar);
     crate::claude::write_session_token("p", &format!("sk-ant-{}", "r".repeat(40)), minted_at)
         .expect("re-mint at the same stamped horizon");
     assert_ne!(

@@ -1106,6 +1106,23 @@ fn credential_and_cache_files_have_restricted_permissions() {
         "profiles.toml mode should be 0o600, got {:#o}",
         state_mode & 0o777,
     );
+
+    // The swap executor's touch receipt: it holds no secret, but it is a writer
+    // under `~/.clauth` and the invariant is the whole tree, so a future writer
+    // swapped off the per-profile cache path has to fail here.
+    crate::profile_cache::write_touch_receipt(name, &cred_path, std::time::SystemTime::now(), None);
+    let receipt_mode = std::fs::metadata(
+        profile_subpath(name, crate::profile_cache::TOUCH_RECEIPT_FILE).expect("receipt path"),
+    )
+    .expect("touch-receipt.json metadata")
+    .permissions()
+    .mode();
+    assert_eq!(
+        receipt_mode & 0o777,
+        0o600,
+        "touch-receipt.json mode should be 0o600, got {:#o}",
+        receipt_mode & 0o777,
+    );
 }
 
 /// Disabling an account is a `config.toml`-only edit: flipping it must persist

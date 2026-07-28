@@ -43,9 +43,9 @@ fn every_shell_completes_start_isolated_flag() {
 }
 
 /// Every shell's script must offer `--with-fallback` under `start`, gated to
-/// that subcommand. The tree walk below catches a missing token, but it is
-/// context-blind — it only proves the pair appears SOMEWHERE in the script — so
-/// the branch each shell spells is pinned here.
+/// that subcommand. The tree walk below scopes each flag to its subcommand's
+/// branch; what it does not pin is the exact spelling and ordering inside that
+/// branch, which is what these needles hold.
 #[test]
 fn every_shell_completes_start_with_fallback_flag() {
     let cases = [
@@ -123,6 +123,11 @@ fn every_shell_completes_login_setup_token_flag() {
 /// subcommands and a root flag behind it. This walks the real clap `Command`
 /// tree and fails on the next drift instead of waiting for someone to notice.
 ///
+/// Each flag is looked up inside its own subcommand's completion branch, not
+/// anywhere in the script: spellings repeat across subcommands (`--all` under
+/// both `status` and `list`), so a whole-script match would let one of them be
+/// deleted while a sibling kept the token alive.
+///
 /// `help` and `version` are excluded: clap generates them for every command and
 /// no shell needs them completed.
 #[test]
@@ -162,14 +167,37 @@ fn every_visible_subcommand_and_long_flag_is_offered_by_all_three_scripts() {
          so a green run would prove nothing",
         expected.len()
     );
+    // The owner half is the dimension the scoping below rests on: a walk that
+    // collapsed every pair onto `<root>` would still clear the count guard.
+    let owners = expected
+        .iter()
+        .map(|(owner, _)| owner.as_str())
+        .collect::<std::collections::BTreeSet<_>>();
+    assert!(
+        owners.len() > 10,
+        "the walk attributed tokens to only {} owners — it stopped seeing the \
+         subcommands, so the per-subcommand scoping below would prove nothing",
+        owners.len()
+    );
 
     let mut missing: Vec<String> = Vec::new();
     for (shell, script) in [("bash", BASH), ("zsh", ZSH), ("fish", FISH)] {
         for (owner, token) in &expected {
-            // A bare `contains` would let `--standby` pass on `--no-standby`
-            // alone, so match the token with no `-`/alphanumeric neighbour.
-            if !offers_token(script, token) {
-                missing.push(format!("{shell}: {owner} → {token}"));
+            // A subcommand's own name is offered by the first-word branch; only
+            // its flags live under the branch named after it.
+            let branch = if owner == "<root>" || owner == token {
+                root_branch(shell, script)
+            } else {
+                subcommand_branch(shell, script, owner)
+            };
+            match branch {
+                // A bare `contains` would let `--standby` pass on `--no-standby`
+                // alone, so match the token with no `-`/alphanumeric neighbour.
+                Some(branch) if offers_token(&branch, token) => {}
+                Some(_) => missing.push(format!("{shell}: {owner} → {token}")),
+                None => missing.push(format!(
+                    "{shell}: {owner} → {token} (no `{owner}` branch in the script)"
+                )),
             }
         }
     }
@@ -178,6 +206,138 @@ fn every_visible_subcommand_and_long_flag_is_offered_by_all_three_scripts() {
         "completion scripts have drifted from the clap grammar:\n  {}",
         missing.join("\n  ")
     );
+}
+
+/// The slice of `script` that completes the word right after `clauth`: the
+/// subcommand names and the root's own flags.
+fn root_branch(shell: &str, script: &str) -> Option<String> {
+    match shell {
+        "bash" => guarded_arms(script, |guard| guard.contains("\"$COMP_CWORD\" -eq 1")),
+        "zsh" => guarded_arms(script, |guard| guard.contains("(( CURRENT == 2 ))")),
+        "fish" => joined(
+            script
+                .lines()
+                .filter(|l| l.contains("__fish_is_first_token")),
+        ),
+        _ => None,
+    }
+}
+
+/// The slice of `script` that completes `name`'s own flags. `None` means the
+/// script has no such branch at all — the caller reports that as drift, because
+/// falling back to a whole-script search is exactly the hole the scoping closes.
+fn subcommand_branch(shell: &str, script: &str, name: &str) -> Option<String> {
+    match shell {
+        // bash pins the subcommand either as the first word (the flag arms) or
+        // as the word just typed (the arms offering a profile after it).
+        "bash" => guarded_arms(script, |guard| {
+            guard.contains(&format!("\"${{COMP_WORDS[1]}}\" = \"{name}\""))
+                || guard.contains(&format!("\"$prev\" = \"{name}\""))
+        }),
+        // zsh pins it in `[[ "${words[2]}" == … ]]`, bare or as an alternation.
+        "zsh" => guarded_arms(script, |guard| {
+            guard
+                .split("\"${words[2]}\" == ")
+                .skip(1)
+                .filter_map(|rest| rest.split_whitespace().next())
+                .any(|pat| pat.trim_matches(['(', ')']).split('|').any(|a| a == name))
+        }),
+        // fish pins it in a `__fish_seen_subcommand_from` condition, which may
+        // name several subcommands.
+        "fish" => joined(script.lines().filter(|l| {
+            l.split("__fish_seen_subcommand_from ")
+                .skip(1)
+                .filter_map(|rest| rest.split('"').next())
+                .any(|list| list.split_whitespace().any(|w| w == name))
+        })),
+        _ => None,
+    }
+}
+
+/// Every arm of the script's `if`/`elif` chain whose guard line satisfies
+/// `owns`, joined. Both the bash and the zsh script are one such chain, and a
+/// subcommand can hold more than one arm (zsh spells `resume` in two). An arm
+/// is closed at `else`/`fi` as well as opened at `if`/`elif`: without that, the
+/// catch-all body and everything trailing the chain inherit the last `elif`'s
+/// owner, which is the "right token, wrong place" pass this scoping exists to
+/// stop. A closed arm leads with `else`/`fi`, which no `owns` matches, so it is
+/// unowned with no extra filtering.
+fn guarded_arms(script: &str, owns: impl Fn(&str) -> bool) -> Option<String> {
+    let mut arms: Vec<String> = Vec::new();
+    let mut arm = String::new();
+    for line in script.lines() {
+        let head = line.trim_start();
+        let opens = head.starts_with("if ") || head.starts_with("elif ");
+        let closes = head.starts_with("else") || head == "fi";
+        if (opens || closes) && !arm.is_empty() {
+            arms.push(std::mem::take(&mut arm));
+        }
+        arm.push_str(line);
+        arm.push('\n');
+    }
+    arms.push(arm);
+    joined(
+        arms.iter()
+            .filter(|a| owns(a.lines().next().unwrap_or("")))
+            .map(String::as_str),
+    )
+}
+
+fn joined<'a>(parts: impl Iterator<Item = &'a str>) -> Option<String> {
+    let text = parts.collect::<Vec<_>>().join("\n");
+    (!text.is_empty()).then_some(text)
+}
+
+/// An `else` body, and anything trailing the chain, belong to no subcommand.
+/// Without closing the arm there they inherit the last `elif`'s owner, so a flag
+/// moved into the catch-all still reads as offered under `list`. The real
+/// scripts have neither shape, so only a fixture can hold this.
+#[test]
+fn a_branch_stops_at_the_catch_all_and_at_the_end_of_the_chain() {
+    let script = r#"if [ "${COMP_WORDS[1]}" = "status" ]; then
+    COMPREPLY=--json
+elif [ "${COMP_WORDS[1]}" = "list" ]; then
+    COMPREPLY=--all
+else
+    COMPREPLY=--catch-all
+fi
+trailing --after-chain
+"#;
+    let list = subcommand_branch("bash", script, "list").expect("list branch");
+    assert!(offers_token(&list, "--all"), "its own arm is in");
+    assert!(
+        !offers_token(&list, "--catch-all"),
+        "the `else` body is nobody's branch",
+    );
+    assert!(
+        !offers_token(&list, "--after-chain"),
+        "text past `fi` is nobody's branch",
+    );
+    assert!(
+        !offers_token(&list, "--json"),
+        "the sibling arm above stays out",
+    );
+}
+
+/// The scoping's two load-bearing properties: a branch is a slice of the script
+/// and not the whole of it, and an absent branch is `None` rather than a
+/// whole-script fallback.
+#[test]
+fn subcommand_branch_isolates_one_subcommand_or_reports_none() {
+    for (shell, script) in [("bash", BASH), ("zsh", ZSH), ("fish", FISH)] {
+        let list = subcommand_branch(shell, script, "list")
+            .unwrap_or_else(|| panic!("{shell} must have a `list` branch"));
+        assert!(offers_token(&list, "--all"), "{shell}: list offers --all");
+        assert!(
+            !offers_token(&list, "--json"),
+            "{shell}: `list` takes no --json, so its branch must not span the \
+             sibling branches that do",
+        );
+        assert!(
+            subcommand_branch(shell, script, "nonesuch").is_none(),
+            "{shell}: an absent branch must report itself, not fall back",
+        );
+    }
 }
 
 /// Whether `script` offers `token` as a whole word. `--rescue` must not match on

@@ -915,17 +915,23 @@ pub(crate) fn app_state_mtime() -> Option<SystemTime> {
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub(crate) struct ReloadFingerprint {
     profiles_toml_mtime: Option<SystemTime>,
-    /// `(profile dir name, config.toml mtime, session-token.json mtime)`, each
-    /// mtime `None` when the file is absent, sorted by name so readdir order
-    /// can't spuriously flip equality. The sidecar rides here because a
+    /// `(profile dir name, config.toml mtime, session-token.json write time)`,
+    /// each `None` when the file is absent, sorted by name so readdir order can't
+    /// spuriously flip equality. The sidecar rides here because a
     /// `login --setup-token` re-mint touches nothing else — without it the hot
-    /// reload never sees a new/changed long-lived token.
+    /// reload never sees a new/changed long-lived token. Its WRITE time, not its
+    /// raw mtime: for a token-mode member that file is the store a swap stamps,
+    /// and a bare stamp is not a config change. Reading the mtime rather than the
+    /// contents also keeps the sidecar's bearer off this path, which runs per
+    /// TUI frame.
     config_mtimes: Vec<(String, Option<SystemTime>, Option<SystemTime>)>,
 }
 
-/// Pure filesystem stat of the reload triggers. Holds NO locks — `config` sits
-/// high in the rank hierarchy, so this must stay lock-free — and fails soft: a
-/// readdir/stat error contributes the empty value instead of erroring.
+/// Filesystem stat of the reload triggers, plus the swap receipt beside a
+/// `session-token.json` that exists — never that file's contents, since this runs
+/// per TUI frame. Holds NO locks — `config` sits high in the rank hierarchy, so
+/// this must stay lock-free — and fails soft: a readdir/stat error contributes
+/// the empty value instead of erroring.
 pub(crate) fn reload_fingerprint() -> ReloadFingerprint {
     let profiles_toml_mtime = app_state_mtime();
     let mut config_mtimes: Vec<(String, Option<SystemTime>, Option<SystemTime>)> = Vec::new();
@@ -937,16 +943,13 @@ pub(crate) fn reload_fingerprint() -> ReloadFingerprint {
                 continue;
             }
             let name = entry.file_name().to_string_lossy().into_owned();
-            let mtime_of = |file: &str| {
-                std::fs::metadata(entry.path().join(file))
-                    .and_then(|m| m.modified())
-                    .ok()
-            };
-            config_mtimes.push((
-                name,
-                mtime_of("config.toml"),
-                mtime_of("session-token.json"),
-            ));
+            let config_mtime = std::fs::metadata(entry.path().join("config.toml"))
+                .and_then(|m| m.modified())
+                .ok();
+            let token = crate::profile_cache::effective_write_time(
+                &entry.path().join("session-token.json"),
+            );
+            config_mtimes.push((name, config_mtime, token));
         }
     }
     config_mtimes.sort();
@@ -1551,12 +1554,16 @@ fn recover_pending_credentials(
         // credentials.json at all → adopt. A tie means staging and committing
         // landed in one mtime tick; of the two ways to be wrong, dropping a
         // rotation that may never have landed is the unrecoverable one.
-        let adopt = match cred_path.metadata().and_then(|m| m.modified()) {
-            Ok(cred_mtime) => pending_meta
+        //
+        // The committed side's WRITE time, not its raw mtime: a per-session swap
+        // stamps a store it repoints to without writing it, and reading that
+        // stamp as a commit discards a sidecar staged moments earlier.
+        let adopt = match crate::profile_cache::effective_write_time(&cred_path) {
+            Some(cred_mtime) => pending_meta
                 .modified()
                 .map(|p| p >= cred_mtime)
                 .unwrap_or(true),
-            Err(_) => true,
+            None => true,
         };
         if !adopt {
             return None;

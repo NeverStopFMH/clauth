@@ -6,10 +6,10 @@
 //! module owns that shared IO once; the two layers only differ in their cache
 //! filename and the concrete type.
 
-use std::path::PathBuf;
-use std::time::UNIX_EPOCH;
+use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
-use serde::{Serialize, de::DeserializeOwned};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
 /// Filename of the OAuth usage cache, relative to the per-profile dir.
 pub(crate) const USAGE_CACHE_FILE: &str = "usage_cache.json";
@@ -32,6 +32,85 @@ pub(crate) const PROFILE_FETCHED_CACHE_FILE: &str = "profile_fetched.json";
 /// fetching instance so a standdown TUI can mirror the judgment and a restart
 /// doesn't forget a live block mid-outage; removed the moment a kick lands.
 pub(crate) const KICK_BLOCK_CACHE_FILE: &str = "kick_block.json";
+
+/// The one credential-store mtime bump clauth makes with NO bytes behind it
+/// ([`TouchReceipt`]). Sits beside the store it describes, so
+/// [`effective_write_time`] resolves it from the store's own path.
+pub(crate) const TOUCH_RECEIPT_FILE: &str = "touch-receipt.json";
+
+/// A store mtime clauth moved without writing the store.
+///
+/// The per-session swap executor must move the mtime of the store it repoints to
+/// — Claude Code re-reads credentials only when that value changes, so an
+/// mtime-preserving repoint is a silent no-op — but every OTHER reader of that
+/// mtime is asking when the bytes were last WRITTEN, and answers a bare stamp as
+/// "just now". This is what separates the two.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct TouchReceipt {
+    /// File name of the stamped store. A profile can hold both a
+    /// `credentials.json` and a `session-token.json` and only ever one of them
+    /// is stamped, so a receipt for one must not resolve the other.
+    store: String,
+    /// The mtime the stamp actually landed on, read back rather than predicted —
+    /// a coarse filesystem truncates the value asked for. A store whose mtime has
+    /// moved off this has been genuinely written since, which retires the
+    /// receipt.
+    stamped: SystemTime,
+    /// The mtime the stamp displaced: when the store's bytes were last written.
+    prev: Option<SystemTime>,
+}
+
+/// Record that `name`'s `store` carries a bare stamp. Best-effort like every
+/// other per-profile cache — a receipt that never lands leaves the readers on the
+/// raw mtime, which is the pre-receipt answer rather than a worse one.
+pub(crate) fn write_touch_receipt(
+    name: &str,
+    store: &Path,
+    stamped: SystemTime,
+    prev: Option<SystemTime>,
+) {
+    let Some(file) = store.file_name().and_then(|f| f.to_str()) else {
+        return;
+    };
+    debug_assert!(
+        crate::profile::profile_dir(name).ok().as_deref() == store.parent(),
+        "the receipt is read back from the store's own directory, so it has to be written there",
+    );
+    write_profile_cache(
+        name,
+        TOUCH_RECEIPT_FILE,
+        &TouchReceipt {
+            store: file.to_string(),
+            stamped,
+            prev,
+        },
+    );
+}
+
+/// When `store`'s bytes were last written: its mtime, unless a [`TouchReceipt`]
+/// beside it identifies that exact mtime as a bare stamp — in which case the
+/// value that stamp displaced.
+///
+/// Every decision that compares store mtimes to answer "which side was written
+/// last" resolves through here. A receipt that is absent, unreadable,
+/// unparseable, for the other store, or retired by a later write yields the raw
+/// mtime, so a lost or stale receipt costs exactly the pre-receipt answer.
+pub(crate) fn effective_write_time(store: &Path) -> Option<SystemTime> {
+    // Returns before the receipt read when the store is absent: nothing can have
+    // displaced a write that never happened, and a profile with no sidecar is the
+    // common case on the reload fingerprint's per-profile walk.
+    let mtime = std::fs::metadata(store)
+        .ok()
+        .and_then(|m| m.modified().ok())?;
+    let Some(file) = store.file_name().and_then(|f| f.to_str()) else {
+        return Some(mtime);
+    };
+    std::fs::read_to_string(store.with_file_name(TOUCH_RECEIPT_FILE))
+        .ok()
+        .and_then(|text| serde_json::from_str::<TouchReceipt>(&text).ok())
+        .filter(|receipt| receipt.store == file && mtime == receipt.stamped)
+        .map_or(Some(mtime), |receipt| receipt.prev)
+}
 
 /// Resolve `<profile_dir>/<file>` for `name`. `None` only when the per-profile
 /// dir itself can't be resolved (matches the prior per-layer `cache_path`).

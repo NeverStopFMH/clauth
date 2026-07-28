@@ -884,6 +884,26 @@ fn with_link_mode<T>(mode: LinkMode, f: impl FnOnce() -> T) -> T {
     f()
 }
 
+/// Truncate `touch_store`'s READ-BACK to whole seconds for the duration of `f` —
+/// the one thing the receipt guard consults, not a model of a coarse filesystem
+/// end to end. `file_mtime` is untouched, so `memoized` stays full-precision and
+/// the stamp-ahead fallback cannot fire here the way it could on a genuine 1s
+/// mount; that branch is out of scope for what this poses. Every filesystem a
+/// Linux/macOS run can reach keeps the exact value, so the guard is otherwise
+/// unreachable. Call INSIDE [`with_fake_home`], whose `HOME_TEST_LOCK` hold
+/// serializes this process-global override.
+fn with_coarse_mtime<T>(f: impl FnOnce() -> T) -> T {
+    struct ClearOnDrop;
+    impl Drop for ClearOnDrop {
+        fn drop(&mut self) {
+            set_coarse_mtime_override(false);
+        }
+    }
+    set_coarse_mtime_override(true);
+    let _clear = ClearOnDrop;
+    f()
+}
+
 /// Build `~/.claude/` (required by `acquire`).
 fn fake_claude_home(root: &Path) -> PathBuf {
     let claude = root.join(".claude");
@@ -4459,6 +4479,185 @@ fn a_swap_moves_the_mtime_without_importing_the_old_stores_skew() {
     });
 }
 
+/// The stamp is a write-recency signal with no write behind it, and the runtime
+/// side is written by CLAUDE CODE — nothing can be attached there to compensate,
+/// so the stamp itself has to stop reading as a write. Otherwise, for one
+/// watchdog tick after a swap onto B, a SECOND live session on B whose Claude
+/// Code just wrote an interactive `/login` loses it: canonical looks newer, that
+/// session's tick keeps canonical and relinks over the regular file.
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn a_bare_store_stamp_does_not_beat_a_sibling_sessions_relogin() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let launch = member("sibling-a");
+        let intended = member("sibling-b");
+        member_store(&launch);
+        let intended_store = member_store(&intended);
+        let (swap, _launch_markers) = lone_session(&launch, Isolation::Shared);
+
+        let now = SystemTime::now();
+        set_mtime(&intended_store, now - Duration::from_secs(120));
+        assert_eq!(
+            swap.swap_to("sibling-b").expect("out"),
+            SwapOutcome::Swapped
+        );
+
+        // The sibling session on B, five seconds before that stamp landed: Claude
+        // Code replaced its symlink with a regular file holding a fresh login.
+        let sibling = tmp.path().join("sibling-runtime");
+        fs::create_dir_all(&sibling).expect("mkdir sibling runtime");
+        let sibling_link = cc_relogin(&sibling, CREDS_V1, now - Duration::from_secs(5));
+
+        let written = sync_credentials_unlocked(&sibling_link, &intended_store).expect("sync");
+        assert!(
+            written,
+            "an interactive re-login must survive a swap that only stamped the store"
+        );
+        assert_eq!(
+            fs::read(&intended_store).expect("read intended"),
+            CREDS_V1,
+            "the sibling's login bytes must land in canonical, not be relinked away"
+        );
+    });
+}
+
+/// A chain-following session revisits members: A→B→A→B is three switches on a
+/// two-member chain. The value a swap records as "when these bytes were last
+/// written" is therefore often the PREVIOUS swap's own stamp, so it has to be
+/// resolved the same way the readers resolve it. Recording a raw mtime instead
+/// advances the reported write time by one stamp per revisit, and after a few
+/// cycles both decisions are back to reading a bump as a write.
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn a_second_swap_onto_a_member_keeps_reporting_its_real_last_write() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let launch = member("revisit-a");
+        let intended = member("revisit-b");
+        member_store(&launch);
+        let intended_store = member_store(&intended);
+        let (swap, _launch_markers) = lone_session(&launch, Isolation::Shared);
+
+        let last_write = SystemTime::now() - Duration::from_secs(300);
+        set_mtime(&intended_store, last_write);
+
+        // Onto B, back to A, onto B again — nothing writes B's bytes throughout.
+        assert_eq!(
+            swap.swap_to("revisit-b").expect("out"),
+            SwapOutcome::Swapped
+        );
+        assert_eq!(
+            swap.swap_to("revisit-a").expect("out"),
+            SwapOutcome::Swapped
+        );
+        assert_eq!(
+            swap.swap_to("revisit-b").expect("out"),
+            SwapOutcome::Swapped
+        );
+
+        assert_ne!(
+            fs::metadata(&intended_store)
+                .expect("meta")
+                .modified()
+                .expect("mtime"),
+            last_write,
+            "precondition: the revisit stamped the store again"
+        );
+        assert_eq!(
+            crate::profile_cache::effective_write_time(&intended_store),
+            Some(last_write),
+            "a stamp displacing an earlier stamp must carry the real write forward"
+        );
+    });
+}
+
+/// On a filesystem whose mtimes truncate, a receipt is WORSE than none: a real
+/// write landing in the same tick as the stamp carries the stamp's own mtime, so
+/// the receipt would resolve that write back to the value it displaced and invert
+/// both credential decisions — on a member whose store was just committed. The
+/// swap must therefore leave no receipt there and fall back to the raw mtime,
+/// which is the pre-receipt answer rather than a wrong one. This fails silently:
+/// drop the guard and every other test still passes.
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn a_truncating_filesystem_gets_no_receipt_at_all() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let launch = member("coarse-a");
+        let intended = member("coarse-b");
+        member_store(&launch);
+        let intended_store = member_store(&intended);
+        let (swap, _launch_markers) = lone_session(&launch, Isolation::Shared);
+
+        let last_write = SystemTime::now() - Duration::from_secs(300);
+        set_mtime(&intended_store, last_write);
+
+        with_coarse_mtime(|| {
+            assert_eq!(swap.swap_to("coarse-b").expect("out"), SwapOutcome::Swapped);
+        });
+
+        let receipt = intended_store.with_file_name(crate::profile_cache::TOUCH_RECEIPT_FILE);
+        assert!(
+            !receipt.exists(),
+            "a receipt whose stamp a later write can alias onto must never be written"
+        );
+        assert_ne!(
+            fs::metadata(&intended_store)
+                .expect("meta")
+                .modified()
+                .expect("mtime"),
+            last_write,
+            "precondition: the swap still stamped, so the refusal is the receipt's alone"
+        );
+    });
+}
+
+/// The other direction: a rotation genuinely writes B's store after the swap, so
+/// the stamp's receipt is retired and canonical is the more recent login again.
+/// An older re-login must NOT be adopted over it.
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn a_real_write_after_a_stamp_still_keeps_canonical() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let launch = member("rewrite-a");
+        let intended = member("rewrite-b");
+        member_store(&launch);
+        let intended_store = member_store(&intended);
+        let (swap, _launch_markers) = lone_session(&launch, Isolation::Shared);
+
+        let now = SystemTime::now();
+        set_mtime(&intended_store, now - Duration::from_secs(120));
+        assert_eq!(
+            swap.swap_to("rewrite-b").expect("out"),
+            SwapOutcome::Swapped
+        );
+
+        // A rotation commits B's chain after the swap. Its own mtime already
+        // moves off the stamp; pinned to a later instant so the assertion does
+        // not rest on the filesystem's timestamp granularity.
+        crate::profile::save_profile(&intended).expect("commit rotation");
+        set_mtime(&intended_store, now + Duration::from_secs(30));
+        let canonical_before = fs::read(&intended_store).expect("read intended");
+
+        let sibling = tmp.path().join("sibling-runtime");
+        fs::create_dir_all(&sibling).expect("mkdir sibling runtime");
+        let sibling_link = cc_relogin(&sibling, CREDS_V1, now - Duration::from_secs(5));
+
+        let written = sync_credentials_unlocked(&sibling_link, &intended_store).expect("sync");
+        assert!(
+            !written,
+            "a store written after the stamp is a real commit and must keep canonical"
+        );
+        assert_eq!(
+            fs::read(&intended_store).expect("read intended"),
+            canonical_before,
+            "the rotated chain must not be overwritten by an older re-login"
+        );
+    });
+}
+
 /// `--isolated` and fallback-following are mutually exclusive (settled). The
 /// executor is the single chokepoint every phase goes through, so the refusal
 /// lives here rather than being re-remembered by the decision leg and the flag.
@@ -4794,4 +4993,314 @@ fn gc_takes_no_state_flock_when_no_bare_marker_exists() {
             "an existing-but-empty marker dir must not wait on the lock either"
         );
     });
+}
+
+// ── event-driven reconcile ───────────────────────────────────────────────────
+
+/// A Claude Code re-login lands in ONE session's runtime file. It must reach the
+/// profile's credential store — and through it every sibling session's view — on
+/// the filesystem event, not on the fallback ticker: the point of the event path
+/// is that a contended rotation does not sit on a 30 s timer.
+///
+/// This is the WIRING pin — specs → watcher → reconcile → the sibling's view. It
+/// does not on its own separate an event from the 1 Hz credential leg of the
+/// polling fallback, since both fit the window; that separation is
+/// `watchdog::tests::a_store_publish_reconciles_with_every_ticker_disabled`,
+/// which leaves no ticker able to explain a reconcile.
+#[cfg(unix)]
+#[test]
+fn a_relogin_reaches_a_sibling_session_without_waiting_for_the_fallback() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        fake_claude_home(tmp.path());
+        let profile = make_profile("evented");
+        let canonical = tmp
+            .path()
+            .join(".clauth")
+            .join("profiles")
+            .join("evented")
+            .join("credentials.json");
+        fs::create_dir_all(canonical.parent().expect("canonical parent")).expect("mkdir store");
+        fs::write(&canonical, CREDS_V1).expect("write canonical");
+        // Back-date the store so the re-login is unambiguously the later write:
+        // `resolve_credential_winner` keeps canonical on an mtime tie.
+        set_mtime(&canonical, SystemTime::now() - Duration::from_secs(60));
+
+        let a =
+            ProfileRuntime::acquire(&profile, Isolation::Shared, &[], false).expect("acquire a");
+        let b =
+            ProfileRuntime::acquire(&profile, Isolation::Shared, &[], false).expect("acquire b");
+
+        // Sized at the credential cadence the poll fallback would run: measured
+        // convergence here is ~30 ms, so this is a ~30x margin that still fails
+        // the moment the event path stops being the thing driving it.
+        let window = crate::watchdog::PRODUCTION.credential_poll;
+        assert!(
+            crate::watchdog::PRODUCTION.fallback > window,
+            "fixture: the fallback ticker must not be able to meet the window, \
+             or a pass says nothing about the event path"
+        );
+
+        // Claude Code's re-login shape: unlink the link, write a regular file.
+        let live = a.config_dir().join(".credentials.json");
+        fs::remove_file(&live).expect("unlink runtime creds");
+        fs::write(&live, CREDS_V2).expect("write re-login");
+
+        let sibling = b.config_dir().join(".credentials.json");
+        let started = std::time::Instant::now();
+        while started.elapsed() < window {
+            if fs::read(&canonical).ok().as_deref() == Some(CREDS_V2)
+                && fs::read(&sibling).ok().as_deref() == Some(CREDS_V2)
+            {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+
+        assert_eq!(
+            fs::read(&canonical).expect("read canonical"),
+            CREDS_V2,
+            "the re-login never reached the store within {window:?}"
+        );
+        assert_eq!(
+            fs::read(&sibling).expect("read sibling"),
+            CREDS_V2,
+            "the sibling session still resolves the pre-re-login chain after {window:?}"
+        );
+
+        drop(b);
+        drop(a);
+    });
+}
+
+/// `LinkMode::Fake` shares ONE tree across every session of a profile, so
+/// `copy_tree`, `merge_path` and `mirror_credentials` publish into it
+/// concurrently — one set per live session. Under a storm of those publishes the
+/// mirror must never observe a torn file, and it must not turn each of its own
+/// writes into the next event: the watch now sits on the directory the mirror
+/// writes into, so a non-convergent reconcile would feed itself forever.
+#[test]
+fn the_fake_mode_mirror_converges_under_concurrent_publishes() {
+    const WRITERS: usize = 3;
+    const ROUNDS: usize = 24;
+    const TOKEN: usize = 8;
+    const REPEATS: usize = 512;
+
+    /// One payload is `REPEATS` copies of an 8-byte token, so a partially
+    /// published file is detectable by shape alone rather than by guessing which
+    /// writer's round should have won.
+    fn payload(writer: usize, round: usize) -> Vec<u8> {
+        format!("w{writer}r{round:05}").repeat(REPEATS).into_bytes()
+    }
+    fn intact(bytes: &[u8]) -> bool {
+        bytes.len() == TOKEN * REPEATS && bytes.chunks(TOKEN).all(|c| c == &bytes[..TOKEN])
+    }
+
+    /// Every published entry on one side, as `(name, len, mtime)`. What a write
+    /// loop moves and a converged mirror does not — including a rewrite of
+    /// identical bytes, which `copy_file`'s rename stamps with a fresh mtime.
+    /// Staging siblings are excluded for the same reason production excludes
+    /// them: they are not published yet.
+    fn shape(side: &Path) -> Vec<(std::ffi::OsString, u64, SystemTime)> {
+        let mut out: Vec<_> = fs::read_dir(side)
+            .expect("read side")
+            .flatten()
+            .filter(|e| !crate::watchdog::is_staging(&e.file_name()))
+            .filter_map(|e| {
+                let meta = e.metadata().ok()?;
+                Some((e.file_name(), meta.len(), meta.modified().ok()?))
+            })
+            .collect();
+        out.sort();
+        out
+    }
+
+    struct Mirror {
+        home: PathBuf,
+        runtime: PathBuf,
+        /// Passes that actually PUBLISHED something. Counting passes instead
+        /// cannot tell a self-feeding loop from a notify reader draining a
+        /// backlog in dribs — the latter reconciles at the cooldown cap for as
+        /// long as the backlog lasts, which is correct behavior.
+        writes: std::sync::atomic::AtomicUsize,
+        torn: std::sync::Mutex<Vec<String>>,
+    }
+    impl Mirror {
+        fn writes(&self) -> usize {
+            self.writes.load(std::sync::atomic::Ordering::Relaxed)
+        }
+        fn torn(&self) -> Vec<String> {
+            self.torn.lock().unwrap_or_else(|p| p.into_inner()).clone()
+        }
+    }
+    impl crate::watchdog::Reconcile for Mirror {
+        fn config(&self) {}
+        fn credentials(&self) {
+            let before = (shape(&self.home), shape(&self.runtime));
+            mirror_tree(&self.home, &self.runtime).expect("mirror");
+            let after = (shape(&self.home), shape(&self.runtime));
+            if before != after {
+                self.writes
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            for side in [&self.home, &self.runtime] {
+                for entry in fs::read_dir(side).expect("read side").flatten() {
+                    // A staging sibling a concurrent `copy_file` is mid-copy into
+                    // is half-written by definition and not yet published, so it
+                    // is not torn — the same filter production applies.
+                    if crate::watchdog::is_staging(&entry.file_name()) {
+                        continue;
+                    }
+                    let path = entry.path();
+                    let Ok(bytes) = fs::read(&path) else { continue };
+                    if !intact(&bytes) {
+                        self.torn
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner())
+                            .push(path.display().to_string());
+                    }
+                }
+            }
+        }
+        fn swap_poll(&self) {}
+    }
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let home = tmp.path().join(".claude");
+    let runtime = tmp.path().join("runtime");
+    let store = tmp.path().join("store").join("credentials.json");
+    let src = tmp.path().join("src");
+    for dir in [&home, &runtime, &src] {
+        fs::create_dir_all(dir).expect("mkdir");
+    }
+    fs::create_dir_all(store.parent().expect("store parent")).expect("mkdir store");
+
+    let cooldown = Duration::from_millis(100);
+    let timings = crate::watchdog::Timings {
+        debounce: Duration::from_millis(30),
+        cooldown,
+        // The fallback must not be able to explain a reconcile, or the
+        // quiescence check below cannot tell a write loop from a ticker.
+        fallback: Duration::from_secs(600),
+        config_poll: Duration::from_secs(600),
+        credential_poll: Duration::from_secs(600),
+        swap_poll: Duration::from_secs(600),
+    };
+    let specs = crate::watchdog::watch_specs(&runtime, &store, &home);
+    let mirror = Mirror {
+        home: home.clone(),
+        runtime: runtime.clone(),
+        writes: std::sync::atomic::AtomicUsize::new(0),
+        torn: std::sync::Mutex::new(Vec::new()),
+    };
+    let (shutdown_tx, shutdown_rx) = crossbeam_channel::bounded::<()>(1);
+
+    std::thread::scope(|scope| {
+        scope.spawn(|| crate::watchdog::run(&specs, &shutdown_rx, &timings, &mirror));
+
+        let writers: Vec<_> = (0..WRITERS)
+            .map(|writer| {
+                let (home, runtime, src) = (&home, &runtime, &src);
+                scope.spawn(move || {
+                    for round in 0..ROUNDS {
+                        let staged = src.join(format!("w{writer}"));
+                        fs::write(&staged, payload(writer, round)).expect("stage");
+                        // The one publish primitive fake mode uses, into
+                        // whichever side of the mirror this round targets.
+                        let side = if round % 2 == 0 { home } else { runtime };
+                        copy_file(&staged, &side.join(format!("shared-{writer}.json")))
+                            .expect("publish");
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                })
+            })
+            .collect();
+        // JOINED, not slept past: the quiescence measurement below asserts "with
+        // no writer running", and a writer the box was too loaded to finish on
+        // time turns its own legitimate wakes into a write-loop verdict.
+        for writer in writers {
+            writer.join().expect("writer");
+        }
+
+        // A convergent mirror stops PUBLISHING once the writers stop. It may
+        // still run any number of passes — a notify reader draining the writer
+        // phase's backlog keeps waking it, which is correct — so the oracle is
+        // bytes moved, not passes taken.
+        std::thread::sleep(cooldown * 4);
+        let settled = mirror.writes();
+        std::thread::sleep(cooldown * 8);
+        let after = mirror.writes();
+        drop(shutdown_tx);
+
+        assert!(
+            settled >= 2,
+            "fixture: the mirror published {settled} times during the soak, \
+             so quiescence below would hold no matter what the code does"
+        );
+        assert_eq!(
+            after,
+            settled,
+            "the mirror published {} more times with no writer running: it is \
+             feeding on its own writes",
+            after - settled
+        );
+        assert!(
+            mirror.torn().is_empty(),
+            "the mirror observed torn files: {:?}",
+            mirror.torn()
+        );
+    });
+
+    // One final pass stands in for the next tick: the last publish may have
+    // landed after the last mirror ran, and the mirror's contract is that it
+    // converges, not that it is instantaneous.
+    mirror_tree(&home, &runtime).expect("final mirror");
+    for writer in 0..WRITERS {
+        let name = format!("shared-{writer}.json");
+        let left = fs::read(home.join(&name)).expect("read home side");
+        let right = fs::read(runtime.join(&name)).expect("read runtime side");
+        assert!(intact(&left), "{name} is torn on the ~/.claude side");
+        assert_eq!(left, right, "{name} did not converge across the mirror");
+    }
+    for side in [&home, &runtime] {
+        let orphans: Vec<_> = dir_entry_names(side)
+            .into_iter()
+            .filter(|n| crate::watchdog::is_staging(n.as_ref()))
+            .collect();
+        assert!(
+            orphans.is_empty(),
+            "{} holds staging files the mirror can never delete: {orphans:?}",
+            side.display()
+        );
+    }
+}
+
+/// A staging sibling is a publish in flight, on its way to being renamed away.
+/// The mirror must walk past one: treating it as tree content fails the tick
+/// when the source vanishes between the stat and the copy, and succeeding is
+/// worse — the mirror never deletes, so the copy is a permanent orphan.
+#[test]
+fn the_mirror_walks_past_a_publish_in_flight() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let home = tmp.path().join(".claude");
+    let runtime = tmp.path().join("runtime");
+    fs::create_dir_all(home.join("plugins")).expect("mkdir home");
+    fs::create_dir_all(&runtime).expect("mkdir runtime");
+    fs::write(home.join("statusline.sh"), b"#!/bin/sh\n").expect("write real");
+    // Nested, because `mirror_tree`'s top-level skip list would mask a walk that
+    // recurses into staging siblings one level down.
+    let staging = crate::profile::tmp_sibling(&home.join("plugins").join("config.json"));
+    fs::write(&staging, b"half-written").expect("write staging");
+
+    mirror_tree(&home, &runtime).expect("mirror");
+
+    assert!(
+        runtime.join("statusline.sh").exists(),
+        "a real entry must still mirror"
+    );
+    let name = staging.file_name().expect("staging name");
+    assert!(
+        !runtime.join("plugins").join(name).exists(),
+        "a publish in flight was mirrored as tree content"
+    );
 }

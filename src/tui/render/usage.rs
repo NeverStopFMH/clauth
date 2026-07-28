@@ -727,23 +727,26 @@ fn header_lines(profile: &Profile, header: &HeaderState, inner_w: u16) -> Vec<Li
                 .usage
                 .as_ref()
                 .and_then(|u| u.plan.as_ref())
-                .map(plan_label)
+                .and_then(plan_label)
         })
         // With no fetched plan, show the OAuth token's tier (what the Overview
         // shows) instead of a bare "oauth"; api-key profiles keep "api".
         // `is_oauth` gates out the base-url branch of `endpoint_label`, so it
         // only ever resolves to a tier here, never a raw endpoint url.
-        .unwrap_or_else(|| {
+        .or_else(|| {
             if profile.is_oauth() {
                 endpoint_label(profile)
             } else {
-                "api".to_string()
+                Some("api".to_string())
             }
         });
-    let mut lines = vec![Line::from(vec![
-        key_span("plan"),
-        Span::styled(plan, theme::body()),
-    ])];
+    // No tier known yet takes the house no-data dash: a bare "Claude" here read
+    // as a real plan on the one row an operator checks their plan from.
+    let plan_span = match plan {
+        Some(label) => Span::styled(label, theme::body()),
+        None => Span::styled("—".to_string(), theme::faint()),
+    };
+    let mut lines = vec![Line::from(vec![key_span("plan"), plan_span])];
     lines.extend(status_lines(profile, header, inner_w));
     lines
 }

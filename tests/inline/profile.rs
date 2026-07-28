@@ -887,6 +887,108 @@ fn pending_sidecar_is_adopted_when_no_commit_exists_at_all() {
     );
 }
 
+/// The adopt rule compares WRITE times, and a per-session swap moves a store's
+/// mtime with no bytes behind it so Claude Code re-reads it. Reading that stamp
+/// as a commit discards a sidecar staged before it — a refresh pair that may be
+/// the only live one, gone on the next load with nothing left to recover it.
+#[test]
+fn a_bare_store_stamp_does_not_discard_a_sidecar_staged_before_it() {
+    let _home = HomeSandbox::new();
+    let name = "pending-stamped-store";
+    let committed = pair("old-access", "old-refresh");
+    seed_committed(name, &committed);
+
+    let staged = pair("orphan-access", "orphan-refresh");
+    stage_rotated_credentials(name, &staged).expect("stage_rotated_credentials");
+
+    let cred_path = profile_subpath(name, "credentials.json").expect("cred path");
+    let pending_path = profile_subpath(name, "credentials.json.pending").expect("pending path");
+    let now = std::time::SystemTime::now();
+    let last_write = now - std::time::Duration::from_secs(120);
+    crate::testutil::set_mtime(&cred_path, last_write);
+    crate::testutil::set_mtime(&pending_path, now - std::time::Duration::from_secs(60));
+
+    // What a swap onto this member leaves: the store's mtime moved to `now`, no
+    // byte of it written, and the receipt that says so.
+    crate::profile_cache::write_touch_receipt(name, &cred_path, now, Some(last_write));
+    crate::testutil::set_mtime(&cred_path, now);
+
+    assert_eq!(
+        refresh_token_of(&recover_pending_credentials(name, Some(committed))),
+        Some("orphan-refresh"),
+        "the stamp moved no bytes, so the staged pair is still the newest write",
+    );
+}
+
+/// The other direction of the same rule: a real commit landing after the stamp
+/// moves the store's mtime off the receipt, which retires it. The sidecar is a
+/// superseded predecessor again and reinstalling it would resurrect a spent
+/// refresh token.
+#[test]
+fn a_commit_landing_after_a_stamp_still_discards_the_sidecar() {
+    let _home = HomeSandbox::new();
+    let name = "pending-stamped-then-committed";
+    let superseded = pair("spent-access", "spent-refresh");
+    seed_committed(name, &superseded);
+    stage_rotated_credentials(name, &superseded).expect("stage_rotated_credentials");
+
+    let cred_path = profile_subpath(name, "credentials.json").expect("cred path");
+    let pending_path = profile_subpath(name, "credentials.json.pending").expect("pending path");
+    let now = std::time::SystemTime::now();
+    let stamped = now - std::time::Duration::from_secs(30);
+    crate::testutil::set_mtime(&pending_path, now - std::time::Duration::from_secs(60));
+    crate::profile_cache::write_touch_receipt(
+        name,
+        &cred_path,
+        stamped,
+        Some(now - std::time::Duration::from_secs(120)),
+    );
+    crate::testutil::set_mtime(&cred_path, stamped);
+
+    // A rotation commits after the swap: real bytes, and an mtime the receipt
+    // no longer describes.
+    let live = pair("live-access", "live-refresh");
+    seed_committed(name, &live);
+    crate::testutil::set_mtime(&cred_path, now);
+
+    assert_eq!(
+        refresh_token_of(&recover_pending_credentials(name, Some(live))),
+        Some("live-refresh"),
+        "a commit newer than the sidecar still wins; the stamp's receipt is spent",
+    );
+}
+
+/// A receipt names the store it stamped. A profile can hold both a
+/// `credentials.json` and a `session-token.json`, a swap stamps exactly one of
+/// them, and a coarse-granularity mtime ticks the two together — so resolving one
+/// store through the other's receipt would report a write time that never was.
+#[test]
+fn a_touch_receipt_only_resolves_the_store_it_names() {
+    let _home = HomeSandbox::new();
+    let name = "receipt-scope";
+    seed_committed(name, &pair("access", "refresh"));
+    let cred_path = profile_subpath(name, "credentials.json").expect("cred path");
+    let sidecar = profile_subpath(name, "session-token.json").expect("sidecar path");
+    std::fs::write(&sidecar, b"{}\n").expect("write sidecar");
+
+    let now = std::time::SystemTime::now();
+    let displaced = now - std::time::Duration::from_secs(300);
+    crate::testutil::set_mtime(&cred_path, now);
+    crate::testutil::set_mtime(&sidecar, now);
+    crate::profile_cache::write_touch_receipt(name, &sidecar, now, Some(displaced));
+
+    assert_eq!(
+        crate::profile_cache::effective_write_time(&sidecar),
+        Some(displaced),
+        "the stamped store resolves to the write its stamp displaced",
+    );
+    assert_eq!(
+        crate::profile_cache::effective_write_time(&cred_path),
+        Some(now),
+        "a store the receipt does not name keeps its own mtime, tie or not",
+    );
+}
+
 /// `scopes_joined` feeds the refresh `scope` field (Claude Code echoes its
 /// credential's granted scopes on refresh). Order must survive and an empty set
 /// must read as `None` so the refresh path falls back instead of sending `""`.
@@ -1003,6 +1105,23 @@ fn credential_and_cache_files_have_restricted_permissions() {
         0o600,
         "profiles.toml mode should be 0o600, got {:#o}",
         state_mode & 0o777,
+    );
+
+    // The swap executor's touch receipt: it holds no secret, but it is a writer
+    // under `~/.clauth` and the invariant is the whole tree, so a future writer
+    // swapped off the per-profile cache path has to fail here.
+    crate::profile_cache::write_touch_receipt(name, &cred_path, std::time::SystemTime::now(), None);
+    let receipt_mode = std::fs::metadata(
+        profile_subpath(name, crate::profile_cache::TOUCH_RECEIPT_FILE).expect("receipt path"),
+    )
+    .expect("touch-receipt.json metadata")
+    .permissions()
+    .mode();
+    assert_eq!(
+        receipt_mode & 0o777,
+        0o600,
+        "touch-receipt.json mode should be 0o600, got {:#o}",
+        receipt_mode & 0o777,
     );
 }
 
@@ -1379,28 +1498,118 @@ fn reload_fingerprint_drops_when_a_config_toml_is_removed() {
 
 // A `login --setup-token` re-mint writes only `session-token.json` (touches no
 // config.toml, no profiles.toml), so the fingerprint must fold that file in or
-// the hot reload never sees a new / re-minted long-lived token.
+// the hot reload never sees a new / re-minted long-lived token. What rides is
+// when the file was WRITTEN, so every real mint trips it — see the two tests
+// below for the timestamp that is not a write, and the write no expiry can see.
 #[test]
 fn reload_fingerprint_bumps_when_a_session_token_is_added_or_changed() {
     let _home = crate::testutil::HomeSandbox::new();
     save_profile(&crate::testutil::blank_profile("p")).expect("save_profile");
-    let sidecar = profile_dir("p")
-        .expect("profile_dir")
-        .join("session-token.json");
+    let minted_at: i64 = 1_700_000_000_000;
     let before = reload_fingerprint();
-    std::fs::write(&sidecar, b"{}\n").expect("write sidecar");
+
+    crate::claude::write_session_token("p", &format!("sk-ant-{}", "m".repeat(40)), minted_at)
+        .expect("mint a session token");
     let after_add = reload_fingerprint();
     assert_ne!(
         before, after_add,
         "adding a session-token.json must trip the fingerprint"
     );
 
-    let later = std::time::SystemTime::now() + std::time::Duration::from_secs(30);
-    crate::testutil::set_mtime(&sidecar, later);
-    let after_edit = reload_fingerprint();
+    crate::claude::write_session_token(
+        "p",
+        &format!("sk-ant-{}", "r".repeat(40)),
+        minted_at + 60 * 60 * 1000,
+    )
+    .expect("re-mint");
+    let after_remint = reload_fingerprint();
     assert_ne!(
-        after_add, after_edit,
-        "a re-mint (session-token.json mtime change) must trip the fingerprint"
+        after_add, after_remint,
+        "a re-mint is a fresh write of the sidecar and must trip the fingerprint"
+    );
+}
+
+/// Two writes the sidecar's PARSED contents cannot tell apart, both of which the
+/// surfaces reading that file would render differently. A re-mint stamped with
+/// the same `expiresAt` (a mint inside the same clock tick, or a hand-edited
+/// horizon restored to its old value) changes the bearer and nothing else; an
+/// unparseable sidecar appearing is a state the reader reports as "no sidecar"
+/// while the operator sees a file. A write time catches both.
+#[test]
+fn reload_fingerprint_catches_a_sidecar_write_no_expiry_can_see() {
+    let _home = crate::testutil::HomeSandbox::new();
+    save_profile(&crate::testutil::blank_profile("p")).expect("save_profile");
+    let sidecar = profile_dir("p")
+        .expect("profile_dir")
+        .join("session-token.json");
+
+    let before_any = reload_fingerprint();
+    std::fs::write(&sidecar, b"{}\n").expect("write an unparseable sidecar");
+    let after_junk = reload_fingerprint();
+    assert_ne!(
+        before_any, after_junk,
+        "a sidecar that parses to nothing is still a file that appeared"
+    );
+
+    let minted_at: i64 = 1_700_000_000_000;
+    crate::claude::write_session_token("p", &format!("sk-ant-{}", "m".repeat(40)), minted_at)
+        .expect("mint");
+    let after_mint = reload_fingerprint();
+    crate::claude::write_session_token("p", &format!("sk-ant-{}", "r".repeat(40)), minted_at)
+        .expect("re-mint at the same stamped horizon");
+    assert_ne!(
+        after_mint,
+        reload_fingerprint(),
+        "a new bearer under an unchanged expiry is still a re-mint",
+    );
+}
+
+/// The swap executor stamps the store it repoints to, and for a token-mode member
+/// that store IS `session-token.json` (`claude::install_source_path`). Reading
+/// that bump as a re-mint forced a full reload of every profile on the next tick.
+/// Only a RECEIPTED stamp is discounted — a timestamp that moved with no receipt
+/// is indistinguishable from a write and must still trip the reload.
+#[test]
+fn reload_fingerprint_ignores_a_bare_session_token_stamp() {
+    let _home = crate::testutil::HomeSandbox::new();
+    save_profile(&crate::testutil::blank_profile("p")).expect("save_profile");
+    crate::claude::write_session_token(
+        "p",
+        &format!("sk-ant-{}", "m".repeat(40)),
+        1_700_000_000_000,
+    )
+    .expect("mint a session token");
+    let sidecar = profile_dir("p")
+        .expect("profile_dir")
+        .join("session-token.json");
+    let minted = std::fs::metadata(&sidecar)
+        .and_then(|m| m.modified())
+        .expect("mint mtime");
+
+    let before = reload_fingerprint();
+    // What a swap onto this token-mode member leaves behind.
+    let stamped = std::time::SystemTime::now() + std::time::Duration::from_secs(30);
+    crate::profile_cache::write_touch_receipt("p", &sidecar, stamped, Some(minted));
+    crate::testutil::set_mtime(&sidecar, stamped);
+
+    assert_eq!(
+        before,
+        reload_fingerprint(),
+        "a timestamp that moved with no byte behind it is not a config change",
+    );
+
+    // And the receipt covers exactly that one stamp: the next real write retires
+    // it, so the reload fires again.
+    crate::claude::write_session_token(
+        "p",
+        &format!("sk-ant-{}", "r".repeat(40)),
+        1_700_000_000_000,
+    )
+    .expect("re-mint");
+    assert_ne!(
+        before,
+        reload_fingerprint(),
+        "a write landing on a stamped sidecar retires the receipt",
     );
 }
 

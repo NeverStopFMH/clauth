@@ -27,10 +27,17 @@ fn login_expired_shares_one_head_across_line_and_toast() {
 
 #[test]
 fn refresh_transient_carries_the_error_in_the_detail() {
-    let m = refresh_transient("flaky", "no network");
+    let m = refresh_transient(
+        "flaky",
+        &Transient::new(
+            Cause::Endpoint("could not reach anthropic"),
+            Retry::Connection,
+        ),
+    );
     assert_eq!(
         m.line(),
-        "could not refresh 'flaky' before switching: no network: check your connection and retry"
+        "could not refresh 'flaky' before switching: could not reach anthropic: check your \
+         connection and retry"
     );
     // The head stays fixed-length regardless of the (arbitrary, possibly long)
     // error text, so it can never wrap the toast's bold first line.
@@ -40,8 +47,134 @@ fn refresh_transient_carries_the_error_in_the_detail() {
     );
     assert_eq!(
         m.toast().lines().nth(1).unwrap(),
-        "no network: check your connection and retry"
+        "could not reach anthropic: check your connection and retry"
     );
+}
+
+/// The whole reason the kind travels inside the value: `check your connection`
+/// is wrong advice for a throttle or a 5xx, and it used to be appended
+/// unconditionally to all four `AuthGate::Transient` causes — including the
+/// rotation-lock one, which already tells you to retry for a different reason.
+#[test]
+fn the_retry_hint_follows_the_kind_not_the_call_site() {
+    let connection = Transient::new(
+        Cause::Endpoint("could not reach anthropic"),
+        Retry::Connection,
+    );
+    assert_eq!(
+        connection.text(),
+        "could not reach anthropic: check your connection and retry"
+    );
+
+    let wait = Transient::with_status(
+        Cause::Endpoint("anthropic is throttling requests"),
+        429,
+        Retry::Wait,
+    );
+    assert_eq!(
+        wait.text(),
+        "anthropic is throttling requests: retry in a moment"
+    );
+    assert!(
+        !wait.text().contains("connection"),
+        "a 429 must never be blamed on the operator's connection: {}",
+        wait.text()
+    );
+
+    // `Stated` adds nothing: the cause already names its own next step, and a
+    // second one contradicts it.
+    let stated = Transient::new(
+        Cause::RotationLockUnavailable("work".to_string()),
+        Retry::Stated,
+    );
+    assert_eq!(
+        stated.text(),
+        "could not lock 'work' for a token refresh; check permissions on ~/.clauth"
+    );
+}
+
+/// The CLI/daemon surfaces name the HTTP status; the toast and MCP forms do not.
+/// Asserted together so neither half can drift alone — a status that silently
+/// stops reaching stderr looks exactly like one that was never added.
+#[test]
+fn only_the_status_bearing_form_names_the_status() {
+    let t = Transient::with_status(
+        Cause::Endpoint("anthropic is having trouble"),
+        503,
+        Retry::Wait,
+    );
+    assert_eq!(
+        t.text_with_status(),
+        "anthropic is having trouble (HTTP 503): retry in a moment"
+    );
+    assert_eq!(t.text(), "anthropic is having trouble: retry in a moment");
+    assert!(
+        !t.text().contains("503"),
+        "the canned form must not leak the status: {}",
+        t.text()
+    );
+
+    assert_eq!(
+        refresh_transient_cli("work", &t).line(),
+        "could not refresh 'work' before switching: anthropic is having trouble (HTTP 503): \
+         retry in a moment"
+    );
+    assert!(
+        !refresh_transient("work", &t).line().contains("503"),
+        "the non-CLI constructor must stay status-free"
+    );
+
+    // A failure that never saw a status has nothing honest to add, so the two
+    // forms coincide rather than inventing one.
+    let no_status = Transient::new(
+        Cause::Endpoint("could not reach anthropic"),
+        Retry::Connection,
+    );
+    assert_eq!(no_status.text_with_status(), no_status.text());
+}
+
+/// Every arm of the closed cause set renders, and the two name-bearing ones
+/// interpolate the profile. Pinned because `Cause` is what replaced a
+/// `cause: String` that would have accepted a response body: if an arm is ever
+/// added, this is where its copy has to be stated rather than passed in.
+#[test]
+fn every_transient_cause_renders_its_own_copy() {
+    for (cause, want) in [
+        (
+            Cause::Endpoint("anthropic is throttling requests"),
+            "anthropic is throttling requests",
+        ),
+        (
+            Cause::RotationLockUnavailable("work".to_string()),
+            "could not lock 'work' for a token refresh; check permissions on ~/.clauth",
+        ),
+        (
+            Cause::InternalLock,
+            "clauth hit an internal lock error, restart clauth",
+        ),
+        (
+            Cause::PersistFailed("work".to_string()),
+            "refreshed 'work' but failed to persist the rotated tokens",
+        ),
+    ] {
+        assert_eq!(Transient::new(cause, Retry::Stated).text(), want);
+    }
+}
+
+/// `detail()` is what lets a surface whose own first line states the condition
+/// avoid restating it. The fallback arm matters: a detail-less `Message` must
+/// still render something, or a caller would mint copy of its own.
+#[test]
+fn detail_returns_the_next_step_alone_and_falls_back_to_the_head() {
+    assert_eq!(
+        login_expired("work").detail(),
+        "refresh token revoked or invalid: run clauth login work"
+    );
+    let bare = Message {
+        head: "done".to_string(),
+        detail: None,
+    };
+    assert_eq!(bare.detail(), "done");
 }
 
 #[test]
@@ -77,7 +210,7 @@ fn plan_label_renders_the_tier_only_the_canceled_marker_is_on_the_status_line() 
         tier: PlanTier::Free,
         subscription_status: Some("canceled".to_string()),
     };
-    assert_eq!(plan_label(&canceled), "Claude Free");
+    assert_eq!(plan_label(&canceled).as_deref(), Some("Claude Free"));
 
     // A genuine, never-subscribed free account looks the same here — the
     // canceled distinction lives on the status line, not the plan label.
@@ -85,5 +218,155 @@ fn plan_label_renders_the_tier_only_the_canceled_marker_is_on_the_status_line() 
         tier: PlanTier::Free,
         subscription_status: None,
     };
-    assert_eq!(plan_label(&free), "Claude Free");
+    assert_eq!(plan_label(&free).as_deref(), Some("Claude Free"));
+}
+
+/// An unfetched plan has no tier at all. `endpoint_label` says so with `None`
+/// so each surface picks its own no-data form — a bare "Claude" here read as a
+/// real plan, and shipped to the Overview chip, the Usage `plan` row and
+/// `which --json`'s `tier` alike.
+#[test]
+fn endpoint_label_reports_no_tier_for_an_unfetched_plan() {
+    // No credentials at all: nothing on disk claims a tier.
+    let bare = crate::testutil::blank_profile("a");
+    assert_eq!(endpoint_label(&bare), None);
+
+    // A token whose `subscription_type` is not one clauth classifies is the
+    // same "we do not know" — never a fabricated tier.
+    let mut unclassified = crate::testutil::blank_profile("b");
+    unclassified.credentials = Some(crate::profile::ClaudeCredentials {
+        claude_ai_oauth: Some(crate::profile::OAuthToken {
+            access_token: "at".into(),
+            refresh_token: None,
+            expires_at: None,
+            scopes: None,
+            subscription_type: Some("something_new".into()),
+        }),
+    });
+    assert_eq!(endpoint_label(&unclassified), None);
+
+    // A fetched plan whose tier never classified, with no token claim to fall
+    // through to, reads the same way.
+    let mut unknown_plan = crate::testutil::blank_profile("c");
+    unknown_plan.usage = Some(crate::usage::UsageInfo {
+        plan: Some(PlanInfo {
+            tier: PlanTier::Unknown,
+            subscription_status: None,
+        }),
+        ..Default::default()
+    });
+    assert_eq!(endpoint_label(&unknown_plan), None);
+}
+
+/// An UNCLASSIFIED fetched plan is not an answer, so it falls through to the
+/// token claim exactly the way `profile_json::tier_label` does. Short-circuiting
+/// on it instead left this surface reporting "no data" while `status.json` showed
+/// a tier for the same account at the same instant.
+#[test]
+fn endpoint_label_falls_through_an_unclassified_fetched_plan_to_the_token() {
+    let token = |sub: &str| {
+        Some(crate::profile::ClaudeCredentials {
+            claude_ai_oauth: Some(crate::profile::OAuthToken {
+                access_token: "at".into(),
+                refresh_token: None,
+                expires_at: None,
+                scopes: None,
+                subscription_type: Some(sub.into()),
+            }),
+        })
+    };
+    let plan = |tier| {
+        Some(crate::usage::UsageInfo {
+            plan: Some(PlanInfo {
+                tier,
+                subscription_status: None,
+            }),
+            ..Default::default()
+        })
+    };
+
+    let mut unclassified = crate::testutil::blank_profile("a");
+    unclassified.usage = plan(PlanTier::Unknown);
+    unclassified.credentials = token("max");
+    assert_eq!(
+        endpoint_label(&unclassified).as_deref(),
+        Some("Claude Max"),
+        "an unclassified fetched tier must not mask the token's claim"
+    );
+
+    // The other arm of the same branch: a fetched tier that DID classify still
+    // wins over a disagreeing token, so the fall-through cannot invert priority.
+    let mut disagreeing = crate::testutil::blank_profile("b");
+    disagreeing.usage = plan(PlanTier::Max(Some(20)));
+    disagreeing.credentials = token("pro");
+    assert_eq!(
+        endpoint_label(&disagreeing).as_deref(),
+        Some("Claude Max 20x"),
+        "the fetched tier is the better source and still wins"
+    );
+}
+
+/// A `Free` login round-trips end to end: `login_profile_from_raw` stores
+/// `"free"`, and this surface reads it back as the plan rather than the no-data
+/// form. Free has no `has_claude_*` flag to recover it, so the token is the only
+/// pre-fetch source it has.
+#[test]
+fn endpoint_label_reads_back_a_free_logins_stored_token() {
+    let mut free = crate::testutil::blank_profile("a");
+    free.credentials = Some(crate::profile::ClaudeCredentials {
+        claude_ai_oauth: Some(crate::profile::OAuthToken {
+            access_token: "at".into(),
+            refresh_token: None,
+            expires_at: None,
+            scopes: None,
+            subscription_type: Some("free".into()),
+        }),
+    });
+    assert_eq!(endpoint_label(&free).as_deref(), Some("Claude Free"));
+}
+
+/// The other direction, all three branches: a real tier still renders, `Free`
+/// is untouched by the unfetched-plan change, and a third-party profile still
+/// gets its raw endpoint url back.
+#[test]
+fn endpoint_label_still_renders_every_known_tier_and_the_endpoint_url() {
+    let mut fetched = crate::testutil::blank_profile("a");
+    fetched.usage = Some(crate::usage::UsageInfo {
+        plan: Some(PlanInfo {
+            tier: PlanTier::Max(Some(20)),
+            subscription_status: None,
+        }),
+        ..Default::default()
+    });
+    assert_eq!(endpoint_label(&fetched).as_deref(), Some("Claude Max 20x"));
+
+    let mut free = crate::testutil::blank_profile("b");
+    free.usage = Some(crate::usage::UsageInfo {
+        plan: Some(PlanInfo {
+            tier: PlanTier::Free,
+            subscription_status: None,
+        }),
+        ..Default::default()
+    });
+    assert_eq!(endpoint_label(&free).as_deref(), Some("Claude Free"));
+
+    let mut token_only = crate::testutil::blank_profile("c");
+    token_only.credentials = Some(crate::profile::ClaudeCredentials {
+        claude_ai_oauth: Some(crate::profile::OAuthToken {
+            access_token: "at".into(),
+            refresh_token: None,
+            expires_at: None,
+            scopes: None,
+            subscription_type: Some("pro".into()),
+        }),
+    });
+    assert_eq!(endpoint_label(&token_only).as_deref(), Some("Claude Pro"));
+
+    let mut third_party = crate::testutil::blank_profile("d");
+    third_party.base_url = Some("https://api.deepseek.com/anthropic".to_string());
+    assert_eq!(
+        endpoint_label(&third_party).as_deref(),
+        Some("https://api.deepseek.com/anthropic"),
+        "the base-url branch must keep returning the raw endpoint"
+    );
 }

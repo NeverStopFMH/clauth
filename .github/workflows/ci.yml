@@ -85,8 +85,11 @@ jobs:
       - uses: taiki-e/install-action@nextest
       - name: clippy (-D warnings)
         run: cargo clippy --all-targets --all-features --release -- -D warnings
+      # `--no-fail-fast` so a red run reports every failure instead of a prefix: nextest
+      # cancels at the first one, so you fix what you were shown, push, and are handed
+      # more — which reads like a regression your own fix caused, at a build per round.
       - name: test
-        run: cargo nextest run --release --all-targets --all-features
+        run: cargo nextest run --release --all-targets --all-features --no-fail-fast
       # nextest can't run doctests, so cover them with cargo test. Self-gates on
       # a doctest target so a bin-only crate skips instead of erroring with "no
       # library targets found". shell: bash so all 3 OS legs get grep (windows

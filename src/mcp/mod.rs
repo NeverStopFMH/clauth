@@ -161,8 +161,9 @@ impl ClauthServer {
         description = "List all clauth profiles from disk cache (zero quota). Per profile: \
 `name`, `active` (is this the currently active profile), `provider` (`anthropic` or a recognised \
 third-party name), and `base_url` (endpoint URL, null for a default OAuth profile) identify it; \
-`tier` is the account plan label (e.g. `Max 5x`, or `canceled` once the org's subscription is \
-dead), null for a third-party/API-key profile or when no plan data is cached yet; \
+`tier` is the account plan label (e.g. `Max 5x`), null for a third-party/API-key profile or when \
+no plan data is cached yet; a dead subscription reports the org's post-cancellation tier (`Free`), \
+never the word `canceled` — cancellation is a status, not a tier; \
 `windows[]` carries the 5h, 7d, and per-model weekly (`7d <model>`) `{label, utilization_pct, \
 resets_at}` where `utilization_pct` is the percent of that window already USED (higher = less \
 headroom) and `resets_at` is ISO-8601; \

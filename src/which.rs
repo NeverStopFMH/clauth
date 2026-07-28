@@ -233,15 +233,27 @@ fn emit_plain(matched: Option<&str>) {
 }
 
 fn emit_json(config: &AppConfig, resolved: Option<(String, Source)>) {
-    let profile = resolved.as_ref().and_then(|(name, _)| config.find(name));
-    let value = serde_json::json!({
+    println!("{}", json_view(config, resolved.as_ref()));
+}
+
+/// The `--json` payload, split from the print so its field shapes are assertable
+/// without capturing stdout. `tier` is `null` when nothing on disk claims a tier.
+///
+/// It is the TOKEN's tier, not the cached one: `Profile` is built by `load_config`
+/// and only the TUI ever fills `Profile::usage`, so this reads `subscription_type`
+/// and renders the `Claude `-prefixed long form. `status.json` and the MCP tools
+/// go through `profile_json::tier_label`, which prefers the on-disk usage cache
+/// and renders the short form — so one account can read `Claude Max` here and
+/// `Max 20x` there.
+fn json_view(config: &AppConfig, resolved: Option<&(String, Source)>) -> serde_json::Value {
+    let profile = resolved.and_then(|(name, _)| config.find(name));
+    serde_json::json!({
         "profile": profile.map(|p| &p.name),
-        "source": resolved.as_ref().map(|(_, s)| s.as_str()),
-        "tier": profile.map(endpoint_label),
+        "source": resolved.map(|(_, s)| s.as_str()),
+        "tier": profile.and_then(endpoint_label),
         "oauth": profile.map(Profile::is_oauth),
         "active": profile.is_some_and(|p| config.is_active(&p.name)),
-    });
-    println!("{value}");
+    })
 }
 
 #[cfg(test)]

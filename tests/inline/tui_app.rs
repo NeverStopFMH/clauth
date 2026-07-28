@@ -4382,7 +4382,9 @@ fn tui_switch_gate_refuses_a_dead_target_before_its_flag_is_set() {
     assert!(!app.config().is_auth_broken("dead"), "flag starts clear");
 
     super::spawn_switch_gate(&mut app, "dead".to_string(), |_, _| {
-        Err(crate::oauth::RefreshError::Invalid("revoked".to_string()))
+        Err(crate::oauth::RefreshError::Invalid(
+            crate::oauth::TokenFailure::Status(400),
+        ))
     });
     super::drain_switch_gates(&mut app);
 
@@ -4431,9 +4433,9 @@ fn tui_switch_gate_transient_failure_refuses_without_quarantine() {
         app_with_unlinked_profiles(vec![stored_oauth_profile("flaky", already_expired())]);
 
     super::spawn_switch_gate(&mut app, "flaky".to_string(), |_, _| {
-        Err(crate::oauth::RefreshError::Transient(anyhow::anyhow!(
-            "no network"
-        )))
+        Err(crate::oauth::RefreshError::Transient(
+            crate::oauth::TokenFailure::Transport,
+        ))
     });
     super::drain_switch_gates(&mut app);
 

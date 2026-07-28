@@ -107,6 +107,108 @@ fn list_table_reveals_disabled_with_a_trailing_marker_when_included() {
     );
 }
 
+/// Warm `name`'s cache as a CANCELED account: the org has already dropped to
+/// `claude_free`, which is what makes the tier alone unable to carry the fact.
+fn warm_canceled(name: &str) {
+    write_profile_cache(
+        name,
+        USAGE_CACHE_FILE,
+        &UsageInfo {
+            plan: Some(PlanInfo {
+                tier: PlanTier::Free,
+                subscription_status: Some("canceled".to_string()),
+            }),
+            ..Default::default()
+        },
+    );
+}
+
+/// This table has no status column, so the trailing marker is the only place a
+/// cancellation can appear. The PLAN column keeps the real tier — a canceled org
+/// reads `Free`, which is indistinguishable from a genuine free account without
+/// the marker.
+#[test]
+fn list_table_marks_a_canceled_account_and_keeps_its_real_tier() {
+    let _home = HomeSandbox::new();
+    let mut config = AppConfig {
+        state: AppState::default(),
+        profiles: vec![oauth("work"), oauth("dead")],
+    };
+    config.state.active_profile = Some("work".into());
+    warm_usage("work", 42.4, 17.6);
+    warm_canceled("dead");
+
+    let table = render_table(
+        &config,
+        &build_status(&config, config.state.refresh_interval_ms, None, true),
+    );
+    let lines: Vec<&str> = table.lines().collect();
+    assert_eq!(
+        lines,
+        [
+            HEADER,
+            WORK_ROW,
+            "  dead     Free        -      -  - (canceled)",
+        ],
+        "the canceled row keeps its tier in PLAN and carries the marker"
+    );
+}
+
+/// A healthy account carries no marker at all — the guard that the suffix is
+/// driven by the cached status and not by merely having a cache.
+#[test]
+fn list_table_leaves_a_live_account_unmarked() {
+    let _home = HomeSandbox::new();
+    let mut config = AppConfig {
+        state: AppState::default(),
+        profiles: vec![oauth("work")],
+    };
+    config.state.active_profile = Some("work".into());
+    warm_usage("work", 42.4, 17.6);
+
+    let table = render_table(
+        &config,
+        &build_status(&config, config.state.refresh_interval_ms, None, true),
+    );
+    assert_eq!(table.lines().collect::<Vec<_>>(), [HEADER, WORK_ROW]);
+    assert!(
+        !table.contains('('),
+        "a live account carries no state marker, got {table:?}"
+    );
+}
+
+/// Both facts render. An operator usually disables an account BECAUSE it died,
+/// so a `disabled` that masked `canceled` would hide the reason for the state it
+/// is reporting — the same erasure the Fallback tab's stacked pills prevent.
+#[test]
+fn list_table_stacks_disabled_and_canceled_rather_than_letting_one_win() {
+    let _home = HomeSandbox::new();
+    let mut dead = oauth("dead");
+    dead.disabled = true;
+    let mut config = AppConfig {
+        state: AppState::default(),
+        profiles: vec![oauth("work"), dead],
+    };
+    config.state.active_profile = Some("work".into());
+    warm_usage("work", 42.4, 17.6);
+    warm_canceled("dead");
+
+    let table = render_table(
+        &config,
+        &build_status(&config, config.state.refresh_interval_ms, None, true),
+    );
+    let lines: Vec<&str> = table.lines().collect();
+    assert_eq!(
+        lines,
+        [
+            HEADER,
+            WORK_ROW,
+            "  dead     Free        -      -  - (disabled, canceled)",
+        ],
+        "neither state may hide the other"
+    );
+}
+
 #[test]
 fn list_table_shows_provider_as_plan_and_the_base_url_endpoint_for_a_third_party() {
     let _home = HomeSandbox::new();

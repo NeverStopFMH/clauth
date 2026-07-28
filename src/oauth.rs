@@ -168,27 +168,123 @@ pub(crate) struct TokenResponse {
     pub(crate) scope: Option<String>,
 }
 
-/// Build a safe error for a **2xx** token-endpoint body that failed to parse
-/// into [`TokenResponse`]. The body still holds the live access+refresh tokens,
-/// so neither it nor serde's `Display` (which echoes the offending scalar — a
-/// possible token substring) may reach an error surfaced on `clauth login` or a
-/// TUI toast; a leaked token is account takeover. The value-free channel
-/// (category + position + status + length) is pinned by
-/// `token_parse_error_redacts_the_2xx_body`.
-fn token_parse_error(e: serde_json::Error, status: u16, body_len: usize) -> anyhow::Error {
-    let kind = match e.classify() {
-        serde_json::error::Category::Io => "io",
-        serde_json::error::Category::Syntax => "malformed json",
-        serde_json::error::Category::Data => "unexpected shape",
-        serde_json::error::Category::Eof => "truncated",
-    };
-    anyhow::anyhow!(
-        "token endpoint returned HTTP {status} but its body did not parse as a token \
-         response ({kind} at line {}, column {}); {body_len} bytes withheld \
-         (contains live credentials)",
-        e.line(),
-        e.column(),
-    )
+/// Why a token-endpoint call failed, holding none of the endpoint's own bytes.
+///
+/// Deliberately implements NO `Display` (and no `std::error::Error`, and no
+/// conversion into `anyhow::Error`): a bare `{e}` on this type does not
+/// compile, so a toast, a `bail!`, or an MCP JSON `reason` cannot print
+/// Anthropic's words even by accident. [`Self::user_message`] and
+/// [`Self::log_detail`] are the only ways out and both are built from the
+/// variant alone.
+///
+/// The rejected alternative was one humanize() every surface agrees to call —
+/// which is what `format::refresh_transient` already is, and the manual-rotate
+/// toast bypassed it from four hundred lines away. A convention that has failed
+/// once here is not the containment; the missing `Display` is.
+pub(crate) enum TokenFailure {
+    /// The endpoint answered `>= 400`. Its body decided the terminal-vs-transient
+    /// split ([`refresh_rejection_is_terminal`]) and is dropped at that decision:
+    /// upstream prose (`invalid_grant`, an `invalid_request_error` envelope, a
+    /// WAF challenge page) names nothing a user can act on, and it is what used
+    /// to reach toasts verbatim.
+    Status(u16),
+    /// No status was ever seen — transport, TLS, timeout, a truncated read, or a
+    /// request body that failed to encode.
+    Transport,
+    /// A **2xx** body that did not parse into [`TokenResponse`]. That body still
+    /// holds the live access+refresh tokens, so neither it nor serde's `Display`
+    /// (which echoes the offending scalar — a possible token substring) may
+    /// leave this type; a leaked token is account takeover. The value-free
+    /// channel below is what [`Self::log_detail`] renders, pinned by
+    /// `token_parse_error_redacts_the_2xx_body`.
+    Body {
+        status: u16,
+        kind: &'static str,
+        line: usize,
+        column: usize,
+        len: usize,
+    },
+}
+
+impl TokenFailure {
+    /// What a user is told. No status and no body: neither is actionable, and
+    /// the body is the leak. The operator-facing detail rides
+    /// [`Self::log_detail`] into a `logline!`.
+    pub(crate) fn user_message(&self) -> &'static str {
+        match self {
+            // Register borrowed from the shipped `anthropic is throttling usage
+            // reads` (`tui/render/usage.rs`, copy-rework #28) so the two throttle
+            // surfaces read alike instead of each inventing a word for it.
+            Self::Status(429) => "anthropic is throttling requests",
+            // "rejected" is only true of a 4xx: a 503 from a CDN in front of the
+            // endpoint is not Anthropic rejecting anything.
+            Self::Status(s) if *s >= 500 => "anthropic is having trouble",
+            Self::Status(_) => "anthropic rejected the request",
+            Self::Transport => "could not reach anthropic",
+            Self::Body { .. } => "anthropic's reply was unreadable",
+        }
+    }
+
+    /// The REFRESH path's transient value: canned cause, the status for the
+    /// surfaces allowed to name it, and the next step a refresh warrants.
+    ///
+    /// Named for its path because the retry hint is NOT a property of the
+    /// failure alone — it depends on what the caller can still do. A refresh is
+    /// re-attempted on the next tick, so `Wait` is right here; a login has no
+    /// next tick and its code is spent, so `oauth_login` maps the same statuses
+    /// to `Restart` instead. A third caller must pick, not inherit.
+    pub(crate) fn as_refresh_transient(&self) -> crate::format::Transient {
+        use crate::format::{Cause, Retry, Transient};
+        // `Cause::Endpoint` takes `&'static str`, which is exactly what
+        // `user_message` returns — a response body is a runtime `String` and
+        // structurally cannot be substituted here.
+        let cause = Cause::Endpoint(self.user_message());
+        match self {
+            Self::Status(s) => Transient::with_status(cause, *s, Retry::Wait),
+            // No status was ever seen, and the connection is the one thing the
+            // operator can act on.
+            Self::Transport => Transient::new(cause, Retry::Connection),
+            Self::Body { status, .. } => Transient::with_status(cause, *status, Retry::Wait),
+        }
+    }
+
+    /// The `logline!` rendering: the status and parse position the user text
+    /// withholds, still without a byte of the response.
+    pub(crate) fn log_detail(&self) -> String {
+        match self {
+            Self::Status(status) => format!("HTTP {status}"),
+            Self::Transport => "no response".to_string(),
+            Self::Body {
+                status,
+                kind,
+                line,
+                column,
+                len,
+            } => format!(
+                "HTTP {status} but the body did not parse as a token response \
+                 ({kind} at line {line}, column {column}); {len} bytes withheld \
+                 (contains live credentials)"
+            ),
+        }
+    }
+}
+
+/// Classify a failed [`TokenResponse`] deserialization into [`TokenFailure::Body`]
+/// — taking `e` by reference so the serde error itself cannot be moved into the
+/// result and carried onward.
+fn token_parse_error(e: &serde_json::Error, status: u16, body_len: usize) -> TokenFailure {
+    TokenFailure::Body {
+        status,
+        kind: match e.classify() {
+            serde_json::error::Category::Io => "io",
+            serde_json::error::Category::Syntax => "malformed json",
+            serde_json::error::Category::Data => "unexpected shape",
+            serde_json::error::Category::Eof => "truncated",
+        },
+        line: e.line(),
+        column: e.column(),
+        len: body_len,
+    }
 }
 
 static AGENT: LazyLock<ureq::Agent> = LazyLock::new(|| {
@@ -205,44 +301,32 @@ static AGENT: LazyLock<ureq::Agent> = LazyLock::new(|| {
         .into()
 });
 
-/// Cap a raw HTTP error body to its first line, max 200 chars, before it
-/// reaches a user-facing toast — an upstream error page must not flood a
-/// one-line surface.
-fn http_error(status: u16, body: &str) -> anyhow::Error {
-    let detail: String = body
-        .lines()
-        .next()
-        .unwrap_or("")
-        .chars()
-        .take(200)
-        .collect();
-    if detail.is_empty() {
-        anyhow::anyhow!("HTTP {status}")
-    } else {
-        anyhow::anyhow!("HTTP {status}: {detail}")
-    }
-}
-
 /// A token-refresh failure, split so the AUTH-1 gate can tell a *permanently*
 /// revoked/invalid refresh token (quarantine the account — `clauth login` is the
 /// only fix) from a *transient* network/429/5xx blip (refuse this one switch,
 /// retry next tick — never quarantine a healthy account on a hiccup).
+///
+/// No `From<RefreshError> for anyhow::Error`: that conversion collapsed the
+/// split back into one opaque error AND smuggled the endpoint's raw body past
+/// the classification into whatever surface caught it. Every caller now matches
+/// the variant it cares about.
 pub(crate) enum RefreshError {
     /// The endpoint confirmed the refresh token itself is dead — quarantine the
     /// account (`clauth login` is the only fix). See
     /// [`refresh_rejection_is_terminal`] for the status/body split.
-    Invalid(String),
+    Invalid(TokenFailure),
     /// The refresh token may still be good: a transport failure, 429, 5xx, or a
     /// rejection the endpoint did not confirm as `invalid_grant`. Retry; never
     /// quarantine.
-    Transient(anyhow::Error),
+    Transient(TokenFailure),
 }
 
-impl From<RefreshError> for anyhow::Error {
-    fn from(e: RefreshError) -> Self {
-        match e {
-            RefreshError::Invalid(msg) => anyhow::anyhow!(msg),
-            RefreshError::Transient(e) => e,
+impl RefreshError {
+    /// The `logline!` rendering of either arm — the only place the endpoint's
+    /// status still surfaces now that the user-facing text is canned.
+    fn log_detail(&self) -> String {
+        match self {
+            Self::Invalid(f) | Self::Transient(f) => f.log_detail(),
         }
     }
 }
@@ -285,8 +369,8 @@ pub(crate) fn refresh_result(
     refresh_token: &str,
     scopes: Option<&str>,
 ) -> std::result::Result<TokenResponse, RefreshError> {
-    let body =
-        refresh_body(refresh_token, scopes).map_err(|e| RefreshError::Transient(e.into()))?;
+    let body = refresh_body(refresh_token, scopes)
+        .map_err(|_| RefreshError::Transient(TokenFailure::Transport))?;
 
     let mut response = AGENT
         .post(token_endpoint().as_ref())
@@ -294,21 +378,23 @@ pub(crate) fn refresh_result(
         .header("Accept", TOKEN_ACCEPT)
         .header("User-Agent", TOKEN_USER_AGENT)
         .send(&body)
-        .map_err(|e| RefreshError::Transient(anyhow::Error::from(e)))?;
+        .map_err(|_| RefreshError::Transient(TokenFailure::Transport))?;
     let status = response.status().as_u16();
     let text = response
         .body_mut()
         .read_to_string()
-        .map_err(|e| RefreshError::Transient(anyhow::Error::from(e)))?;
+        .map_err(|_| RefreshError::Transient(TokenFailure::Transport))?;
+    // `text` decides the split here and goes no further: [`TokenFailure`] has
+    // nowhere to put it.
     if refresh_rejection_is_terminal(status, &text) {
-        return Err(RefreshError::Invalid(http_error(status, &text).to_string()));
+        return Err(RefreshError::Invalid(TokenFailure::Status(status)));
     }
     if status >= 400 {
-        return Err(RefreshError::Transient(http_error(status, &text)));
+        return Err(RefreshError::Transient(TokenFailure::Status(status)));
     }
 
     serde_json::from_str(&text)
-        .map_err(|e| RefreshError::Transient(token_parse_error(e, status, text.len())))
+        .map_err(|e| RefreshError::Transient(token_parse_error(&e, status, text.len())))
 }
 
 /// Whether a token-endpoint rejection means the refresh token itself is dead
@@ -333,10 +419,6 @@ fn refresh_rejection_is_terminal(status: u16, body: &str) -> bool {
     }
 }
 
-pub(crate) fn refresh(refresh_token: &str, scopes: Option<&str>) -> Result<TokenResponse> {
-    refresh_result(refresh_token, scopes).map_err(Into::into)
-}
-
 /// A profile's stored granted scopes, space-joined, for the refresh `scope`
 /// field — read under the config lock and returned owned so no lock is held
 /// across the HTTP refresh. `None` (→ [`REFRESH_SCOPES_FALLBACK`]) for an
@@ -348,17 +430,22 @@ pub(crate) fn stored_scopes(config: &crate::profile::ConfigHandle, name: &str) -
 
 /// Exchange an authorization code (from the interactive loopback login in
 /// `oauth_login`) for an OAuth token pair. Uses the same client + HTTP agent as
-/// [`refresh`], against [`TOKEN_ENDPOINT`] (the `platform.claude.com` host the
-/// current Claude Code binary uses), carrying the same axios-mimicking headers.
-/// `redirect_uri` MUST byte-match the one sent to the authorize endpoint, and
-/// `state` echoes the value round-tripped through the browser.
+/// [`refresh_result`], against [`TOKEN_ENDPOINT`] (the `platform.claude.com`
+/// host the current Claude Code binary uses), carrying the same axios-mimicking
+/// headers. `redirect_uri` MUST byte-match the one sent to the authorize
+/// endpoint, and `state` echoes the value round-tripped through the browser.
+///
+/// Errs as [`TokenFailure`] rather than `anyhow::Error` so the rejection body —
+/// which reached a login toast and `clauth login`'s stderr verbatim — has
+/// nowhere to ride.
 pub(crate) fn exchange_code(
     code: &str,
     code_verifier: &str,
     redirect_uri: &str,
     state: &str,
-) -> Result<TokenResponse> {
-    let body = exchange_body(code, code_verifier, redirect_uri, state)?;
+) -> std::result::Result<TokenResponse, TokenFailure> {
+    let body = exchange_body(code, code_verifier, redirect_uri, state)
+        .map_err(|_| TokenFailure::Transport)?;
 
     let mut response = AGENT
         .post(token_endpoint().as_ref())
@@ -366,43 +453,46 @@ pub(crate) fn exchange_code(
         .header("Accept", TOKEN_ACCEPT)
         .header("User-Agent", TOKEN_USER_AGENT)
         .send(&body)
-        .map_err(anyhow::Error::from)?;
+        .map_err(|_| TokenFailure::Transport)?;
     let status = response.status().as_u16();
     let text = response
         .body_mut()
         .read_to_string()
-        .map_err(anyhow::Error::from)?;
+        .map_err(|_| TokenFailure::Transport)?;
     if status >= 400 {
-        return Err(http_error(status, &text));
+        return Err(TokenFailure::Status(status));
     }
 
-    serde_json::from_str(&text).map_err(|e| token_parse_error(e, status, text.len()))
+    serde_json::from_str(&text).map_err(|e| token_parse_error(&e, status, text.len()))
 }
 
 /// A kick failure. Distinguishes a 401 (access token expired — rotate the chain
 /// and retry) from every other failure (body encode, transport, or any non-401
 /// HTTP status), which is terminal for this attempt. Mirrors `FetchError::Status`
 /// so the auto-start rotation leg reacts to the same signal the fetch path does.
+///
+/// Carries no `Display` and no conversion into `anyhow::Error` (the latter
+/// existed only to give a test a panic string, and was the same smuggling shape
+/// [`RefreshError`] documents): a kick failure can only be rendered through
+/// [`describe_kick_failure`].
 enum KickError {
     /// The Messages endpoint returned this >=400 status; a 429 carries the
     /// limiter's own metadata when the response held any.
     Status(u16, Option<KickRateLimit>),
-    /// Body encode or transport failure before a status was seen.
+    /// Body encode or transport failure before a status was seen. [`kick_to`]
+    /// never reads a response BODY, so one cannot arrive here — but a ureq
+    /// transport error can still echo a server-supplied HEADER (`ureq_proto`'s
+    /// `BadLocationHeader` Display's the raw `Location` value), so treat this as
+    /// log-only rather than as clauth-authored text.
     Other(anyhow::Error),
 }
 
-impl From<KickError> for anyhow::Error {
-    fn from(e: KickError) -> Self {
-        match e {
-            KickError::Status(s, _) => anyhow::anyhow!("HTTP {s}"),
-            KickError::Other(e) => e,
-        }
-    }
-}
-
-/// Human string for a kick failure, for the diagnostic `logline!` when a kick
-/// dies on something the recovery paths don't handle (non-401/429 status,
-/// transport, body encode). Pure so the mapping is unit-testable without HTTP.
+/// Operator-log rendering of a kick failure, for the diagnostic `logline!` when
+/// a kick dies on something the recovery paths don't handle (non-401/429 status,
+/// transport, body encode). Never a notification surface: `logline!` writes the
+/// daemon log or `~/.clauth/clauth.log`, which is where the status belongs now
+/// that user-facing copy withholds it. Pure so the mapping is unit-testable
+/// without HTTP.
 fn describe_kick_failure(err: &KickError) -> String {
     match err {
         KickError::Status(status, _) => format!("HTTP {status}"),
@@ -616,7 +706,7 @@ pub(crate) fn auto_start_kick(
     if let Some(activity) = activity {
         mark_activity(activity, name, ProfileActivity::Refreshing);
     }
-    let refreshed = refresh(rt, stored_scopes(config, name).as_deref());
+    let refreshed = refresh_result(rt, stored_scopes(config, name).as_deref());
     if let Some(activity) = activity {
         mark_activity(activity, name, ProfileActivity::Fetching);
     }
@@ -669,10 +759,25 @@ pub(crate) fn auto_start_kick(
 /// failure (no `OpResult` emitted, no activity pre-stamp to clear) from every
 /// other path (which emits its own `OpResult` and clears activity). Lets
 /// `refresh_all` workers surface the guard-fail as a Danger toast.
+/// The ONE spelling for "this profile's rotation lock could not be taken",
+/// shared by both `OpResult` legs and the pre-install switch gate. Three call
+/// sites, one `Cause` arm: `format.rs` exists because this exact condition used
+/// to print a different sentence per surface, and `5391a4c` re-created that by
+/// rewording the gate's copy while leaving the two toasts on their own string.
+fn rotation_lock_unavailable(name: &str) -> crate::format::Transient {
+    crate::format::Transient::new(
+        crate::format::Cause::RotationLockUnavailable(name.to_string()),
+        // The cause names its own next step; a second one contradicts it.
+        crate::format::Retry::Stated,
+    )
+}
+
 enum RotateOutcome {
-    /// `RotationGuard::acquire` failed — a live session or sibling worker holds
-    /// the per-profile rotation lock. No `OpResult` was emitted.
-    GuardBusy,
+    /// `RotationGuard::acquire` failed — the lock file could not be created or
+    /// opened. NOT contention: `acquire` blocks on the flock, so a sibling
+    /// worker or a live session holding it makes this leg wait rather than
+    /// arrive here. No `OpResult` was emitted.
+    GuardUnavailable,
     /// The HTTP/persist leg ran and emitted its `OpResult`. The bool is whether
     /// the rotated pair was persisted.
     Persisted(bool),
@@ -690,7 +795,7 @@ enum RotateOutcome {
 /// next request rather than racing for the chain.
 ///
 /// HTTP/persist leg emits one `OpResult { kind: Refreshing }` and clears the
-/// activity slot. Returns [`RotateOutcome::GuardBusy`] without emitting an
+/// activity slot. Returns [`RotateOutcome::GuardUnavailable`] without emitting an
 /// `OpResult` when the lock can't be acquired (slot never pre-stamped here;
 /// `refresh_all` pre-stamps and clears it). The no-refresh-token leg returns
 /// [`RotateOutcome::Persisted(false)`] silently.
@@ -701,7 +806,7 @@ fn rotate_one_inner(
     sender: &OpResultSender,
 ) -> RotateOutcome {
     let Ok(_rotation_guard) = RotationGuard::acquire(name) else {
-        return RotateOutcome::GuardBusy;
+        return RotateOutcome::GuardUnavailable;
     };
     let token = {
         #[allow(clippy::expect_used, reason = "mutex poisoning is unrecoverable")]
@@ -738,8 +843,29 @@ fn rotate_one_inner(
     let Some((rt, scopes)) = token else {
         return RotateOutcome::Persisted(false);
     };
-    let outcome = refresh(&rt, scopes.as_deref())
-        .and_then(|tok| apply_rotated_tokens_locked(config, name, tok));
+    // `refresh_result`, not a collapsing wrapper: this leg's `OpResult` becomes a
+    // Danger toast, and a dead chain has a different next step from a network
+    // blip. Flattening the split here is what put `HTTP 400: {"error":
+    // "invalid_grant", …}` on screen while the switch gate and the poll — both
+    // matching the variant — showed the canned line.
+    let outcome = match refresh_result(&rt, scopes.as_deref()) {
+        Ok(tok) => apply_rotated_tokens_locked(config, name, tok),
+        Err(e) => {
+            logline!("clauth: refresh for '{name}' failed: {}", e.log_detail());
+            // This `OpResult`'s only sink is the TUI's Danger toast, whose first
+            // line already reads `refresh for '<name>' failed` — so both arms
+            // carry the NEXT STEP alone rather than restating the condition and
+            // the account name under it.
+            Err(match e {
+                RefreshError::Invalid(_) => {
+                    anyhow::anyhow!("{}", crate::format::login_expired(name).detail())
+                }
+                RefreshError::Transient(f) => {
+                    anyhow::anyhow!("{}", f.as_refresh_transient().text())
+                }
+            })
+        }
+    };
     let applied = outcome.is_ok();
     if let Some(activity) = activity {
         clear_activity(activity, name);
@@ -840,10 +966,10 @@ pub(crate) fn refresh_all(
             // Guard-fail leg never emits an OpResult, so this pre-stamped slot
             // would freeze the spinner AND swallow the failure. Emit the Danger
             // toast (matches the pre-collapse worker) and clear.
-            Ok((n, RotateOutcome::GuardBusy)) => {
+            Ok((n, RotateOutcome::GuardUnavailable)) => {
                 let _ = sender.send(OpResult {
                     name: n.clone(),
-                    outcome: Err(anyhow::anyhow!("failed to acquire rotation lock")),
+                    outcome: Err(anyhow::anyhow!("{}", rotation_lock_unavailable(&n).text())),
                 });
                 clear_activity(activity, &n);
             }
@@ -885,11 +1011,14 @@ pub(crate) fn rotate_one(
     let persisted = match rotate_one_inner(config, name, Some(activity), sender) {
         RotateOutcome::Persisted(true) => true,
         // Guard-fail never emits an OpResult; surface the failure + clear, exactly
-        // as refresh_all's join loop does for a busy guard.
-        RotateOutcome::GuardBusy => {
+        // as refresh_all's join loop does for an unavailable guard.
+        RotateOutcome::GuardUnavailable => {
             let _ = sender.send(OpResult {
                 name: name.to_string(),
-                outcome: Err(anyhow::anyhow!("failed to acquire rotation lock")),
+                outcome: Err(anyhow::anyhow!(
+                    "{}",
+                    rotation_lock_unavailable(name).text()
+                )),
             });
             clear_activity(activity, name);
             false
@@ -1282,7 +1411,10 @@ pub(crate) enum AuthGate {
     /// A transient failure (network/429/5xx, a busy rotation lock, or a poisoned
     /// mutex) blocked a needed refresh. Do not install now; retry on a later
     /// tick. The account is NOT quarantined.
-    Transient(anyhow::Error),
+    /// Carries the kind so each surface renders it honestly: the CLI names the
+    /// HTTP status, the TUI toast and the MCP payload do not, and the retry
+    /// advice follows the failure instead of being one hardcoded sentence.
+    Transient(crate::format::Transient),
 }
 
 /// Pre-install auth gate (AUTH-1 / Incident C). Installing `name`'s stored
@@ -1348,12 +1480,11 @@ pub(crate) fn ensure_installable(
     }
 
     // RotationGuard across the HTTP window (single-use double-spend guard),
-    // acquired with no config lock held. A busy guard means a live session or
-    // sibling worker is already on this chain — refuse this switch and retry.
+    // acquired with no config lock held. Contention does NOT land in the `else`
+    // below: `acquire` blocks on the flock, so a sibling worker or live session
+    // on this chain makes us wait. Only creating/opening the lock file can fail.
     let Ok(guard) = RotationGuard::acquire(name) else {
-        return AuthGate::Transient(anyhow::anyhow!(
-            "'{name}' rotation lock busy; retry after the in-flight refresh"
-        ));
+        return AuthGate::Transient(rotation_lock_unavailable(name));
     };
     // macOS only, same mechanism as the other rotation legs: a switch TARGET can
     // carry its own live `clauth start` session whose CC reads a Keychain item
@@ -1387,8 +1518,11 @@ fn oauth_shape(
     name: &str,
 ) -> std::result::Result<(Option<i64>, Option<String>, Option<String>, bool), AuthGate> {
     let Ok(cfg) = config.lock() else {
-        return Err(AuthGate::Transient(anyhow::anyhow!(
-            "config mutex poisoned"
+        // A poisoned mutex means another thread panicked; it does not clear on
+        // its own, so a retry hint would be a lie.
+        return Err(AuthGate::Transient(crate::format::Transient::new(
+            crate::format::Cause::InternalLock,
+            crate::format::Retry::Stated,
         )));
     };
     let Some(profile) = cfg.find(name) else {
@@ -1487,19 +1621,28 @@ fn gate_under_guard(
     match refresher(&rt, scopes.as_deref()) {
         Ok(tok) => {
             if apply_rotated_tokens_locked(config, name, tok).is_err() {
-                return AuthGate::Transient(anyhow::anyhow!(
-                    "refreshed '{name}' but failed to persist the rotated tokens"
+                return AuthGate::Transient(crate::format::Transient::new(
+                    crate::format::Cause::PersistFailed(name.to_string()),
+                    crate::format::Retry::Wait,
                 ));
             }
             // A successful refresh clears any prior quarantine.
             mark_auth_broken(config, name, false);
             AuthGate::Refreshed
         }
-        Err(RefreshError::Invalid(_)) => {
-            mark_auth_broken(config, name, true);
-            AuthGate::Broken
+        Err(e) => {
+            // The endpoint's status no longer reaches any refusal copy, so this
+            // is where an operator reads it — the daemon's `deferring switch`
+            // line and the CLI/TUI/MCP refusals all carry canned text now.
+            logline!("clauth: refresh for '{name}' failed: {}", e.log_detail());
+            match e {
+                RefreshError::Invalid(_) => {
+                    mark_auth_broken(config, name, true);
+                    AuthGate::Broken
+                }
+                RefreshError::Transient(f) => AuthGate::Transient(f.as_refresh_transient()),
+            }
         }
-        Err(RefreshError::Transient(e)) => AuthGate::Transient(e),
     }
 }
 

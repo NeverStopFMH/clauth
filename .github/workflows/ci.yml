@@ -90,6 +90,23 @@ jobs:
       # more — which reads like a regression your own fix caused, at a build per round.
       - name: test
         run: cargo nextest run --release --all-targets --all-features --no-fail-fast
+      # Every leg above is --release, where debug_assertions is off and
+      # `#[cfg(debug_assertions)]` code is not merely unlinted but absent: a test
+      # gated on it cannot run at all, so the local gate was catching regressions
+      # CI could not. clippy first so the debug artifacts it builds are reused by
+      # the test leg. Both self-gate on the cfg appearing in the crate, so a repo
+      # without one skips instead of paying a second full compile. A bare
+      # `debug_assert!` is deliberately not a trigger: it expands to a
+      # `cfg!`-guarded assert that release still type- and lint-checks.
+      - name: debug clippy + test
+        shell: bash
+        run: |
+          if grep -rqs --include='*.rs' --exclude-dir=target --exclude-dir=.git -e debug_assertions .; then
+            cargo clippy --all-targets --all-features -- -D warnings
+            cargo nextest run --all-targets --all-features --no-fail-fast
+          else
+            echo "no debug_assertions in crate; skipping debug legs"
+          fi
       # nextest can't run doctests, so cover them with cargo test. Self-gates on
       # a doctest target so a bin-only crate skips instead of erroring with "no
       # library targets found". shell: bash so all 3 OS legs get grep (windows

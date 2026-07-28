@@ -5500,7 +5500,6 @@ fn expired_lazy_config(name: &str) -> crate::profile::ConfigHandle {
     config
 }
 
-#[cfg(not(target_os = "macos"))]
 fn rotation_entry(name: &str, access_expires_at: Option<i64>) -> super::TokenEntry {
     super::TokenEntry {
         name: name.to_string(),
@@ -5516,7 +5515,6 @@ fn rotation_entry(name: &str, access_expires_at: Option<i64>) -> super::TokenEnt
 /// refuses on its own and the ONLY thing that can still pull `/profile` is
 /// `force_profile`. Without this the first attempt spends the hourly slot itself
 /// and the force is invisible.
-#[cfg(not(target_os = "macos"))]
 fn silence_profile_ttl(name: &str) {
     use crate::profile_cache::{
         ACCOUNT_ID_CACHE_FILE, PROFILE_FETCHED_CACHE_FILE, write_profile_cache,
@@ -5532,7 +5530,6 @@ fn silence_profile_ttl(name: &str) {
 /// A disk cache to fall back onto, so a bail's status is the one the leg chose
 /// rather than the `Failed` downgrade `load_cached_with_status` applies when
 /// there is nothing cached at all.
-#[cfg(not(target_os = "macos"))]
 fn seed_usage_cache(name: &str) {
     crate::profile_cache::write_profile_cache(
         name,
@@ -5546,9 +5543,6 @@ fn seed_usage_cache(name: &str) {
 /// temp sibling over the destination and `rename(2)` acts on the link rather
 /// than its target. Against the fixture's stored `at-old` this classifies
 /// `LinkState::Diverged`, the adopt's second gate.
-///
-/// Gated with its callers, like `expired_lazy_config` above.
-#[cfg(not(target_os = "macos"))]
 fn write_live_mirror(access: &str, expires_at: i64) {
     let live = crate::profile::claude_dir()
         .expect("claude dir")
@@ -5569,7 +5563,6 @@ fn write_live_mirror(access: &str, expires_at: i64) {
 
 /// A `/profile` body answering the uuid `silence_profile_ttl` anchors the
 /// profile to, so the live mirror's token proves the SAME account.
-#[cfg(not(target_os = "macos"))]
 const ANCHOR_PROFILE_BODY: &str = r#"{"account":{"uuid":"uuid-anchor"}}"#;
 
 /// A `/profile` body for an account whose subscription was canceled — the tier
@@ -5920,13 +5913,17 @@ fn a_rotation_carries_its_pair_back_when_the_persist_fails() {
 // behind a `keychain_live()` term that is `false` under `cfg(test)` on macOS and
 // hardcoded `false` everywhere else, so no test on any platform could enter
 // them. Deleting that term is what these two pin.
+//
+// Ungated on purpose, unlike their neighbours above: both call sites sit BEFORE
+// `rotation_blocked_for`, the macOS live-session refusal, and neither fixture
+// arms a live session. The one platform-conditional step inside the adopt is
+// the post-adopt relink, which no assertion here reads.
 
 /// The pre-spend adopt. CC's routine refresh renames a fresh regular file over
 /// clauth's symlink, so the live slot holds a fresher same-account pair while
 /// the store lags — and the store's refresh token is already spent. Adopting
 /// costs zero requests to the token endpoint; spending is what lands the
 /// profile in `auth_broken` on the next tick.
-#[cfg(not(target_os = "macos"))]
 #[test]
 fn a_fresher_live_mirror_is_adopted_before_any_refresh_is_spent() {
     let home = crate::testutil::HomeSandbox::new();
@@ -5994,7 +5991,6 @@ fn a_fresher_live_mirror_is_adopted_before_any_refresh_is_spent() {
 /// second call site exists for — so the leg adopts instead of quarantining.
 /// Without the adopt, `carry_external_rotation` reads a store nothing advanced
 /// and `mark_auth_broken` fires, which only a login, a carry, or an adopt lifts.
-#[cfg(not(target_os = "macos"))]
 #[test]
 fn an_adopt_after_a_rejected_refresh_keeps_the_profile_out_of_quarantine() {
     let home = crate::testutil::HomeSandbox::new();

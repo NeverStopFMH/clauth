@@ -437,7 +437,8 @@ fn token_clock_expired(access_expires_at: Option<i64>, now_ms: i64) -> bool {
 }
 
 /// Status + server hint for a rotation-leg bail that couldn't complete a
-/// refresh (busy guard, live session, missing refresh token, failed refresh).
+/// refresh (unwritable rotation lock, live session, missing refresh token,
+/// failed refresh).
 /// A bail that entered the rotation leg through the clock-expired-429 unmask
 /// (`unmask_429` = the 429's `retry-after`) keeps that endpoint-level context
 /// — `RateLimited` plus the hint — so `apply_outcome`'s deferral and streak

@@ -1408,8 +1408,8 @@ pub(crate) enum AuthGate {
     /// `auth_broken` (persisted). The caller MUST NOT install: a dead token in
     /// the Keychain logs out every running `claude` (Incident C).
     Broken,
-    /// A transient failure (network/429/5xx, a busy rotation lock, or a poisoned
-    /// mutex) blocked a needed refresh. Do not install now; retry on a later
+    /// A transient failure (network/429/5xx, an unwritable rotation lock, or a
+    /// poisoned mutex) blocked a needed refresh. Do not install now; retry on a later
     /// tick. The account is NOT quarantined.
     /// Carries the kind so each surface renders it honestly: the CLI names the
     /// HTTP status, the TUI toast and the MCP payload do not, and the retry

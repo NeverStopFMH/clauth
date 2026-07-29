@@ -97,6 +97,20 @@ pub(crate) trait NotIntoAnyhow {
 
 impl<T> NotIntoAnyhow for Probe<T> {}
 
+impl<T: Send> Probe<T> {
+    pub(crate) fn is_send() -> bool {
+        true
+    }
+}
+
+pub(crate) trait NotSend {
+    fn is_send() -> bool {
+        false
+    }
+}
+
+impl<T> NotSend for Probe<T> {}
+
 // ── offline rotation-leg harness ─────────────────────────────────────────────
 //
 // Every rotation decision sits BEHIND an HTTP call, so a refusal deleted from

@@ -905,6 +905,130 @@ fn a_quiet_watcher_is_never_accused() {
     }
 }
 
+/// Short enough that the three intervals the detector waits out cost the suite
+/// nothing, long enough to read as a duration in the line it prints.
+const TICK: Duration = Duration::from_millis(10);
+
+/// Run `run_events` over `health` until `ticks` fallback reconciles have
+/// returned, and hand back every line the loop raised on its OWN thread.
+///
+/// The wait is on the reconciles rather than on the buffer filling, because it
+/// is counting TICKS, not lines: a silent loop is one of the outcomes under
+/// test, and polling a buffer that stays empty cannot tell it from a loop that
+/// has not run yet. The lines are read after the scope joins, so nothing here
+/// rests on where the detector sits inside one iteration.
+///
+/// Every caller runs PAST the horizon rather than up to it. A tick budget of
+/// exactly `DEAD_FILTER_INTERVALS` is derived from the constant under test, so
+/// it tracks that constant wherever it moves and can never observe it moving;
+/// spare ticks are also what makes a per-interval repeat visible as extra lines.
+fn drive_fallback_ticks(health: &FilterHealth, ticks: u32) -> Vec<String> {
+    let t = Timings {
+        debounce: Duration::from_millis(20),
+        cooldown: Duration::ZERO,
+        fallback: TICK,
+        config_poll: NEVER,
+        credential_poll: NEVER,
+        swap_poll: NEVER,
+    };
+    // Held for the whole run: dropping the sender disconnects `wake`, and the
+    // loop then exits `WatcherLost` before its first fallback tick.
+    let (_wake_tx, wake_rx) = crossbeam_channel::bounded::<()>(1);
+    let (shutdown_tx, shutdown_rx) = crossbeam_channel::bounded::<()>(1);
+    let (done_tx, done_rx) = unbounded();
+    let rec = Recorder::new(Duration::ZERO, done_tx);
+    let lines = crate::logline::LogLines::new();
+    let sink = lines.clone();
+
+    std::thread::scope(|scope| {
+        scope.spawn(move || {
+            let _capture = sink.capture_here();
+            run_events(&wake_rx, &shutdown_rx, &t, &rec, Some(health))
+        });
+        for tick in 1..=ticks {
+            done_rx
+                .recv_timeout(BOUND)
+                .unwrap_or_else(|_| panic!("fallback reconcile {tick} never returned"));
+        }
+        drop(shutdown_tx);
+    });
+
+    lines.snapshot()
+}
+
+/// The counters and the wording are pinned above without a loop; what nothing
+/// said is that the fallback arm ever reaches the `logline!`, or which of the
+/// two lines it raises. A detector nobody hears is the defect it exists to
+/// report, one layer up.
+#[test]
+fn the_loop_raises_the_unaccountable_line_once() {
+    let health = FilterHealth::new(&[WatchSpec::new("/home/u/.claude", Interest::AnyChild)]);
+    health.saw(&took());
+    let delivered = Path::new("/private/var/u/.claude/settings.json");
+    for _ in 0..DEAD_FILTER_MIN_EVENTS {
+        health.saw(&orphaned(delivered));
+    }
+
+    let lines = drive_fallback_ticks(&health, DEAD_FILTER_INTERVALS + 2);
+
+    assert_eq!(
+        lines,
+        vec![
+            "clauth: fs watcher is being handed events under a directory it cannot \
+             account for (16 of 17 seen, e.g. /private/var/u/.claude/settings.json), \
+             so that surface reconciles on the 10ms fallback rather than on its own \
+             events. Watched: /home/u/.claude"
+                .to_string()
+        ],
+        "the operator's whole diagnosis is this line: the counters, the spelling \
+         the backend delivered, and what the surface now costs"
+    );
+}
+
+/// The other arm through the same loop. Both are reachable from one `match`, so
+/// a swapped pair formats perfectly and accuses the wrong subsystem.
+#[test]
+fn the_loop_raises_the_nothing_matched_line_once() {
+    let health = FilterHealth::new(&[WatchSpec::new("/home/u/.claude", Interest::AnyChild)]);
+    for _ in 0..DEAD_FILTER_MIN_EVENTS {
+        health.saw(&refused());
+    }
+
+    let lines = drive_fallback_ticks(&health, DEAD_FILTER_INTERVALS + 2);
+
+    assert_eq!(
+        lines,
+        vec![
+            "clauth: fs watcher armed every directory but matched none of its 16 \
+             events, so every change reconciles on the 10ms fallback rather than on \
+             its own event. Watched: /home/u/.claude"
+                .to_string()
+        ],
+        "every spelling here is accounted for, so the line must name the interest \
+         lists rather than the directories"
+    );
+}
+
+/// The silent arm, over the same harness the two above are shown to fill: a
+/// healthy watcher's log stays a log. Four times the horizon, each tick waited
+/// out rather than slept through, so an empty buffer is a loop that ran and
+/// said nothing.
+#[test]
+fn the_loop_says_nothing_about_a_watcher_that_matched() {
+    let health = FilterHealth::new(&[WatchSpec::new("/home/u/.claude", Interest::AnyChild)]);
+    health.saw(&took());
+    for _ in 0..DEAD_FILTER_MIN_EVENTS * 4 {
+        health.saw(&refused());
+    }
+
+    let lines = drive_fallback_ticks(&health, DEAD_FILTER_INTERVALS * 4);
+
+    assert!(
+        lines.is_empty(),
+        "a working watcher was reported as broken: {lines:?}"
+    );
+}
+
 /// `watch_specs` covers every file the reconcile reads, and covers them by
 /// their PARENT so no entry is armed on an inode a rename will unlink.
 #[test]

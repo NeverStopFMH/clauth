@@ -808,17 +808,24 @@ fn the_watched_list_names_both_spellings_when_they_differ() {
     // Resolved, or the "resolves to itself" half is untrue wherever TMPDIR is
     // itself symlinked: the `cargo.sh` test leg and every macOS run.
     let real = std::fs::canonicalize(&real).expect("realpath");
-    let link = tmp.path().join("link");
-    std::os::unix::fs::symlink(&real, &link).expect("symlink");
 
-    let linked = FilterHealth::new(&[WatchSpec::new(&link, Interest::AnyChild)]);
-    assert!(
-        linked.dirs.contains(&real.display().to_string())
-            && linked.dirs.contains(&link.display().to_string()),
-        "a spec armed through a symlink must name what it watches AND what the \
-         backend will deliver: {}",
-        linked.dirs
-    );
+    // Gated for want of `std::os::unix::fs::symlink`, not because the rule is
+    // unix-only. Ungated it is E0433 on windows, and a test module that cannot
+    // compile takes every sibling test in this file down with it.
+    #[cfg(unix)]
+    {
+        let link = tmp.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).expect("symlink");
+
+        let linked = FilterHealth::new(&[WatchSpec::new(&link, Interest::AnyChild)]);
+        assert!(
+            linked.dirs.contains(&real.display().to_string())
+                && linked.dirs.contains(&link.display().to_string()),
+            "a spec armed through a symlink must name what it watches AND what \
+             the backend will deliver: {}",
+            linked.dirs
+        );
+    }
 
     let plain = FilterHealth::new(&[WatchSpec::new(&real, Interest::AnyChild)]);
     assert_eq!(

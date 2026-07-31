@@ -252,11 +252,13 @@ pub(crate) struct StartArgs {
     /// Follow the fallback chain, moving to the next account as each runs out
     ///
     /// The session starts on this profile and swaps onto the next chain member
-    /// when its window is spent, instead of stopping where the account does.
-    /// Needs a running `clauth daemon` to decide the switches, and a profile
-    /// that is already a chain member. Not available with --isolated, on a
-    /// non-OAuth account, on macOS, or on a Windows host without symlink
-    /// privilege — each of those is refused by name at launch.
+    /// when its window is spent, instead of stopping where the account does. If
+    /// a chain member is marked preferred (the home account), the session also
+    /// returns to it once it reads clear and fresh again. Needs a running
+    /// `clauth daemon` to decide the switches, and a profile that is already a
+    /// chain member. Not available with --isolated, on a non-OAuth account, on
+    /// macOS, or on a Windows host without symlink privilege — each of those is
+    /// refused by name at launch.
     #[arg(long, conflicts_with = "isolated")]
     pub(crate) with_fallback: bool,
     /// Profile to launch under.

@@ -1039,6 +1039,7 @@ fn credential_and_cache_files_have_restricted_permissions() {
         fallback_threshold: None,
         weekly_threshold: None,
         last_resort: false,
+        preferred: false,
         max_auto_spend: None,
         check_weekly: true,
         check_scoped: true,

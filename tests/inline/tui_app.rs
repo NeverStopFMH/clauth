@@ -3548,6 +3548,133 @@ fn fallback_threshold_plus_minus_still_nudge_both_ways() {
     );
 }
 
+// ── preferred / last_resort mutual exclusion ────────────────────────────────
+//
+// The two flags are contradictory ("come home here" vs "park here to the end"),
+// so each toggle clears the other, and `preferred` is a radio across the chain
+// exactly like `last_resort`. All three properties are asserted by driving the
+// real toggle handlers, so a regression in either clear or in the radio walk
+// reds here.
+
+#[test]
+fn marking_preferred_clears_last_resort_on_the_same_member() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut a = crate::testutil::blank_profile("a");
+    a.last_resort = true;
+    let mut app = app_with_unlinked_profiles(vec![a, crate::testutil::blank_profile("b")]);
+    app.chain_cursor = 0;
+
+    super::toggle_preferred(&mut app);
+
+    let cfg = app.config();
+    let a = cfg.find("a").expect("profile a");
+    assert!(a.preferred, "the member is now preferred");
+    assert!(
+        !a.last_resort,
+        "turning preferred on clears last_resort — the two never coexist"
+    );
+}
+
+#[test]
+fn marking_last_resort_clears_preferred_on_the_same_member() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut a = crate::testutil::blank_profile("a");
+    a.preferred = true;
+    let mut app = app_with_unlinked_profiles(vec![a, crate::testutil::blank_profile("b")]);
+    app.chain_cursor = 0;
+
+    super::toggle_last_resort(&mut app);
+
+    let cfg = app.config();
+    let a = cfg.find("a").expect("profile a");
+    assert!(a.last_resort, "the member is now last resort");
+    assert!(
+        !a.preferred,
+        "turning last_resort on clears preferred — the reciprocal of the above"
+    );
+}
+
+#[test]
+fn preferred_is_exclusive_across_the_chain() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut b = crate::testutil::blank_profile("b");
+    b.preferred = true;
+    let mut app = app_with_unlinked_profiles(vec![
+        crate::testutil::blank_profile("a"),
+        b,
+        crate::testutil::blank_profile("c"),
+    ]);
+    app.chain_cursor = 0; // select "a"
+
+    super::toggle_preferred(&mut app);
+
+    let cfg = app.config();
+    assert!(
+        cfg.find("a").expect("a").preferred,
+        "the newly-marked member"
+    );
+    assert!(
+        !cfg.find("b").expect("b").preferred,
+        "the previously-preferred sibling is cleared — a radio, only one home"
+    );
+    assert!(!cfg.find("c").expect("c").preferred, "untouched member");
+    drop(cfg);
+    assert!(
+        app.toasts
+            .iter()
+            .any(|t| t.kind == super::ToastKind::Info && t.body == "preferred moved from 'b'"),
+        "a radio move names where preferred came from, so the operator sees the home account shifted",
+    );
+}
+
+// A save failure on the target's own write rolls BOTH flags back — preferred
+// off again and the last_resort it cleared restored — and surfaces the danger
+// rather than leaving the on-disk state and the in-memory config diverged.
+// Twin of `toggle_last_resort`'s rollback leg. Unix-only: it forces the failure
+// by dropping write on the profiles parent, the same posture the repo's other
+// save-failure probes take.
+#[cfg(unix)]
+#[test]
+fn toggle_preferred_rolls_back_both_flags_when_the_save_fails() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let home = crate::testutil::HomeSandbox::new();
+    let mut a = crate::testutil::blank_profile("a");
+    a.last_resort = true;
+    let mut app = app_with_unlinked_profiles(vec![a, crate::testutil::blank_profile("b")]);
+    app.chain_cursor = 0;
+
+    // Block the very first write: `save_profile` does `mkdir_700` under
+    // `~/.clauth/profiles`, which fails once the home dir refuses new children.
+    let restore = home.home().to_path_buf();
+    std::fs::set_permissions(&restore, std::fs::Permissions::from_mode(0o500))
+        .expect("chmod home read-only");
+
+    super::toggle_preferred(&mut app);
+
+    // Restore before any assertion so a failure still lets the sandbox clean up.
+    std::fs::set_permissions(&restore, std::fs::Permissions::from_mode(0o700))
+        .expect("restore home perms");
+
+    let cfg = app.config();
+    let a = cfg.find("a").expect("profile a");
+    assert!(
+        !a.preferred,
+        "preferred rolls back to off when its save never landed",
+    );
+    assert!(
+        a.last_resort,
+        "the last_resort the toggle cleared is restored on the rollback",
+    );
+    drop(cfg);
+    assert!(
+        app.toasts
+            .iter()
+            .any(|t| t.kind == super::ToastKind::Danger && t.body.starts_with("save failed")),
+        "the operator sees the save failure rather than a silent divergence",
+    );
+}
+
 // `weekly at` joins `rotate at` as the second CONTINUOUS row (owner call,
 // 2026-07-23): it now takes the same ±5 nudge alongside its existing `⏎`
 // typed editor. `max spend` (a dollar ceiling) has no natural step unit and
@@ -5485,6 +5612,7 @@ fn mini_profile(name: &str, api_key: Option<&str>) -> Profile {
         fallback_threshold: None,
         weekly_threshold: None,
         last_resort: false,
+        preferred: false,
         max_auto_spend: None,
         check_weekly: true,
         check_scoped: true,

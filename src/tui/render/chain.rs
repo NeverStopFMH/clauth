@@ -609,6 +609,7 @@ fn member_detail(
             profile.check_weekly,
             profile.check_scoped,
             profile.last_resort,
+            profile.preferred,
             profile.max_auto_spend.unwrap_or(0.0),
             cfg.state.spend_budget_switching,
             armed_remove,
@@ -676,6 +677,12 @@ fn member_detail(
                 width,
             ));
         }
+        if *row == FallbackRow::Preferred && selected {
+            lines.extend(help_tooltip_lines(
+                &preferred_hint(cfg, name, profile.preferred),
+                width,
+            ));
+        }
         // `max spend` mirrors `rotate at`: a range tooltip while typing, else a
         // hint naming the state the current value produces. The hint calls out
         // the OTHER half of the opt-in when it is the one holding spending
@@ -735,6 +742,19 @@ fn last_resort_hint(cfg: &AppConfig, name: &str, on: bool) -> String {
             marked.name
         ),
         None => "keep using this account once every other one is spent".to_string(),
+    }
+}
+
+/// Hint under the `preferred` toggle — twin of [`last_resort_hint`]: on →
+/// describes the standing return behavior; off → what turning it on does,
+/// naming the member the (exclusive) mark would move away from.
+fn preferred_hint(cfg: &AppConfig, name: &str, on: bool) -> String {
+    if on {
+        return "work returns to this account once it's free again".to_string();
+    }
+    match cfg.profiles.iter().find(|p| p.preferred && p.name != *name) {
+        Some(marked) => format!("make this the home account instead of '{}'", marked.name),
+        None => "return work to this account once it's free again".to_string(),
     }
 }
 
@@ -813,6 +833,7 @@ fn detail_row(
     check_weekly: bool,
     check_scoped: bool,
     last_resort: bool,
+    preferred: bool,
     max_spend: f64,
     spend_budget: bool,
     armed_remove: bool,
@@ -918,10 +939,14 @@ fn detail_row(
             }
             Line::from(spans)
         }
-        FallbackRow::CheckWeekly | FallbackRow::CheckScoped | FallbackRow::LastResort => {
+        FallbackRow::CheckWeekly
+        | FallbackRow::CheckScoped
+        | FallbackRow::LastResort
+        | FallbackRow::Preferred => {
             let (key, on) = match row {
                 FallbackRow::CheckWeekly => ("weekly gate", check_weekly),
                 FallbackRow::CheckScoped => ("scoped gate", check_scoped),
+                FallbackRow::Preferred => ("preferred", preferred),
                 _ => ("last resort", last_resort),
             };
             let (value, style) = if on {

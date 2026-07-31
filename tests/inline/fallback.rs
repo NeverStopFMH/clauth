@@ -70,6 +70,7 @@ fn profile_with_usage(name: &str, threshold: Option<f64>, usage: Option<UsageInf
         fallback_threshold: threshold,
         weekly_threshold: None,
         last_resort: false,
+        preferred: false,
         max_auto_spend: None,
         check_weekly: true,
         check_scoped: true,
@@ -113,6 +114,15 @@ fn mark_disabled(mut p: Profile) -> Profile {
 /// The snapshot twin carries the same judgment on `ChainSnapshot::fresh`.
 fn mark_fresh(mut p: Profile) -> Profile {
     p.fetch_status = Some(FetchStatus::Fresh);
+    p
+}
+
+/// Marks a profile the chain's preferred (home) account (`Profile::preferred`).
+/// The snapshot twin carries it on `ChainMember::preferred`, derived under the
+/// config lock in `build_chain_snapshot`, so `snapshot_chain` alone suffices to
+/// exercise the return-to-preferred pass.
+fn mark_preferred(mut p: Profile) -> Profile {
+    p.preferred = true;
     p
 }
 
@@ -903,6 +913,7 @@ fn find_recovered_returns_first_member_below_threshold() {
             name: "a".into(),
             threshold: 95.0,
             last_resort: false,
+            preferred: false,
             max_spend: 0.0,
             weekly_line: 98.0,
             scoped_line: 98.0,
@@ -912,6 +923,7 @@ fn find_recovered_returns_first_member_below_threshold() {
             name: "b".into(),
             threshold: 95.0,
             last_resort: false,
+            preferred: false,
             max_spend: 0.0,
             weekly_line: 98.0,
             scoped_line: 98.0,
@@ -938,6 +950,7 @@ fn find_recovered_skips_exhausted_members() {
             name: "a".into(),
             threshold: 95.0,
             last_resort: false,
+            preferred: false,
             max_spend: 0.0,
             weekly_line: 98.0,
             scoped_line: 98.0,
@@ -947,6 +960,7 @@ fn find_recovered_skips_exhausted_members() {
             name: "b".into(),
             threshold: 95.0,
             last_resort: false,
+            preferred: false,
             max_spend: 0.0,
             weekly_line: 98.0,
             scoped_line: 98.0,
@@ -964,6 +978,7 @@ fn find_recovered_returns_none_when_no_member_has_data() {
             name: "a".into(),
             threshold: 95.0,
             last_resort: false,
+            preferred: false,
             max_spend: 0.0,
             weekly_line: 98.0,
             scoped_line: 98.0,
@@ -973,6 +988,7 @@ fn find_recovered_returns_none_when_no_member_has_data() {
             name: "b".into(),
             threshold: 95.0,
             last_resort: false,
+            preferred: false,
             max_spend: 0.0,
             weekly_line: 98.0,
             scoped_line: 98.0,
@@ -990,6 +1006,7 @@ fn find_recovered_uses_threshold_per_member() {
             name: "a".into(),
             threshold: 90.0,
             last_resort: false,
+            preferred: false,
             max_spend: 0.0,
             weekly_line: 98.0,
             scoped_line: 98.0,
@@ -999,6 +1016,7 @@ fn find_recovered_uses_threshold_per_member() {
             name: "b".into(),
             threshold: 95.0,
             last_resort: false,
+            preferred: false,
             max_spend: 0.0,
             weekly_line: 98.0,
             scoped_line: 98.0,
@@ -1021,6 +1039,7 @@ fn find_recovered_recovers_when_window_expired() {
         name: "a".into(),
         threshold: 95.0,
         last_resort: false,
+        preferred: false,
         max_spend: 0.0,
         weekly_line: 98.0,
         scoped_line: 98.0,
@@ -1044,6 +1063,7 @@ fn find_recovered_recovers_when_windowless() {
         name: "a".into(),
         threshold: 95.0,
         last_resort: false,
+        preferred: false,
         max_spend: 0.0,
         weekly_line: 98.0,
         scoped_line: 98.0,
@@ -1064,6 +1084,7 @@ fn find_recovered_treats_missing_resets_at_as_lapsed() {
         name: "a".into(),
         threshold: 95.0,
         last_resort: false,
+        preferred: false,
         max_spend: 0.0,
         weekly_line: 98.0,
         scoped_line: 98.0,
@@ -1602,6 +1623,199 @@ fn auto_switch_still_picks_a_stale_member_when_no_fresh_one_has_headroom() {
         next_auto_switch_target(&snap, &store),
         Some(SwitchAction::To("b".to_string())),
         "freshness is a preference, not a gate: the stale escape must stay open"
+    );
+}
+
+// ── return-to-preferred ────────────────────────────────────────────────────
+// A healthy active that is not the operator's preferred (home) account walks
+// back the moment preferred reads clear AND fresh. 3-member chains throughout,
+// so the pass is actually selecting a target rather than accepting the only
+// candidate — a bug that returned "first clear member" instead of "preferred"
+// would pass on a 2-member chain and fail here.
+
+// The core: work has drifted to the tail while the head is the home account.
+// Preferred is clear and fresh, the active is healthy and fresh → come home.
+// The pick is "a" specifically, never merely "some clear member": "b" is
+// reached first in chain order from the active yet must be passed over.
+#[test]
+fn return_to_preferred_walks_a_drifted_active_home() {
+    let config = config_with_chain(
+        vec![
+            mark_preferred(profile_with_util("a", Some(95.0), None)),
+            profile_with_util("b", Some(95.0), None),
+            profile_with_util("c", Some(95.0), None),
+        ],
+        "c",
+    );
+    let mut snap = snapshot_chain(&config).expect("snapshot");
+    snap.fresh = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+    let store = store_with_utils(&[("a", 10.0), ("b", 10.0), ("c", 10.0)]);
+    assert_eq!(
+        next_auto_switch_target(&snap, &store),
+        Some(SwitchAction::To("a".to_string())),
+        "a healthy active that is not preferred returns to the clear, fresh home account"
+    );
+}
+
+// Self-limiting, no dwell timer: once the active IS preferred there is nothing
+// to return to, so the pass produces no move even with the whole chain clear
+// and fresh. This is what makes the return one-shot — the instant it fires the
+// active becomes preferred and this guard bars any re-fire, so it can never
+// ping-pong.
+#[test]
+fn return_to_preferred_is_a_no_op_once_already_home() {
+    let config = config_with_chain(
+        vec![
+            mark_preferred(profile_with_util("a", Some(95.0), None)),
+            profile_with_util("b", Some(95.0), None),
+            profile_with_util("c", Some(95.0), None),
+        ],
+        "a",
+    );
+    let mut snap = snapshot_chain(&config).expect("snapshot");
+    snap.fresh = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+    let store = store_with_utils(&[("a", 10.0), ("b", 10.0), ("c", 10.0)]);
+    assert_eq!(
+        next_auto_switch_target(&snap, &store),
+        None,
+        "already on the preferred account, there is nothing to return to"
+    );
+}
+
+// The other half of the self-limiting argument: when preferred is the SPENT
+// member (the only way the exhaustion walk could ever have left it), the return
+// pass does not fire — the exhausted preferred active drops out of the
+// healthy-active branch entirely and the exhaustion walk owns the move, leaving
+// for a clear sibling. Return only ever pulls work TOWARD a clear preferred,
+// never keeps it pinned to a spent one.
+#[test]
+fn a_spent_preferred_active_is_left_not_kept() {
+    let config = config_with_chain(
+        vec![
+            mark_preferred(profile_with_util("a", Some(95.0), None)),
+            profile_with_util("b", Some(95.0), None),
+            profile_with_util("c", Some(95.0), None),
+        ],
+        "a",
+    );
+    let mut snap = snapshot_chain(&config).expect("snapshot");
+    snap.fresh = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+    // Preferred active spent; b and c clear.
+    let store = store_with_utils(&[("a", 100.0), ("b", 10.0), ("c", 10.0)]);
+    assert_eq!(
+        next_auto_switch_target(&snap, &store),
+        Some(SwitchAction::To("b".to_string())),
+        "a spent preferred active is left for a clear sibling, not held on numbers it can't serve"
+    );
+}
+
+// Freshness is a HARD gate on the TARGET here, unlike the exhaustion walk where
+// a stale member is still an accepted escape. Preferred is clear but its read is
+// NOT fresh (a Cached window hydrated idle but possibly near-blocked). A healthy
+// active has no forced escape to preserve, so the return must NOT fire — moving
+// live work onto an untrusted account is worse than staying on a working one.
+#[test]
+fn return_to_preferred_gated_on_target_freshness() {
+    let config = config_with_chain(
+        vec![
+            mark_preferred(profile_with_util("a", Some(95.0), None)),
+            profile_with_util("b", Some(95.0), None),
+            profile_with_util("c", Some(95.0), None),
+        ],
+        "c",
+    );
+    let mut snap = snapshot_chain(&config).expect("snapshot");
+    // Active is fresh; preferred "a" is deliberately absent from `fresh`.
+    snap.fresh = vec!["b".to_string(), "c".to_string()];
+    let store = store_with_utils(&[("a", 10.0), ("b", 10.0), ("c", 10.0)]);
+    assert_eq!(
+        next_auto_switch_target(&snap, &store),
+        None,
+        "a clear but stale preferred must not pull a healthy active home on an untrusted read"
+    );
+}
+
+// Freshness is also a hard gate on the ACTIVE. A stuck-RateLimited active is
+// frozen at an idle-looking read and is therefore never in `fresh`; its headroom
+// numbers are the ones the scheduler declared untrustworthy. Preferred is clear
+// AND fresh, yet the return must NOT fire, because moving off the active would
+// act on numbers the code refuses to trust (scheduler.rs stuck-RateLimited
+// invariant: real headroom stays put).
+#[test]
+fn return_to_preferred_gated_on_active_freshness() {
+    let config = config_with_chain(
+        vec![
+            mark_preferred(profile_with_util("a", Some(95.0), None)),
+            profile_with_util("b", Some(95.0), None),
+            profile_with_util("c", Some(95.0), None),
+        ],
+        "c",
+    );
+    let mut snap = snapshot_chain(&config).expect("snapshot");
+    // Preferred "a" is fresh; the active "c" is deliberately NOT (stuck).
+    snap.fresh = vec!["a".to_string(), "b".to_string()];
+    let store = store_with_utils(&[("a", 10.0), ("b", 10.0), ("c", 10.0)]);
+    assert_eq!(
+        next_auto_switch_target(&snap, &store),
+        None,
+        "a stuck (non-fresh) active must not be moved even toward a clear, fresh preferred"
+    );
+}
+
+// A preferred that cannot actually serve is skipped, each exclusion in turn:
+// broken (dead token), kick-rejected (limiter refusing inference), and canceled
+// (subscription 403). Its idle-looking usage must never pull work home onto an
+// account that would reject every request.
+#[test]
+fn return_to_preferred_skips_a_broken_kick_rejected_or_canceled_preferred() {
+    let base = || {
+        config_with_chain(
+            vec![
+                mark_preferred(profile_with_util("a", Some(95.0), None)),
+                profile_with_util("b", Some(95.0), None),
+                profile_with_util("c", Some(95.0), None),
+            ],
+            "c",
+        )
+    };
+    let fresh_all = || vec!["a".to_string(), "b".to_string(), "c".to_string()];
+
+    // Broken preferred.
+    let config = base();
+    let mut snap = snapshot_chain(&config).expect("snapshot");
+    snap.broken = vec!["a".to_string()];
+    snap.fresh = fresh_all();
+    let store = store_with_utils(&[("a", 10.0), ("b", 10.0), ("c", 10.0)]);
+    assert_eq!(
+        next_auto_switch_target(&snap, &store),
+        None,
+        "a broken preferred is unusable — no return"
+    );
+
+    // Kick-rejected preferred.
+    let config = base();
+    let mut snap = snapshot_chain(&config).expect("snapshot");
+    snap.kick_rejected = vec!["a".to_string()];
+    snap.fresh = fresh_all();
+    assert_eq!(
+        next_auto_switch_target(&snap, &store),
+        None,
+        "a kick-rejected preferred rejects inference — no return"
+    );
+
+    // Canceled preferred: sourced from usage, not a snapshot flag.
+    let config = base();
+    let mut snap = snapshot_chain(&config).expect("snapshot");
+    snap.fresh = fresh_all();
+    let store_canceled = store_with_infos(vec![
+        ("a", canceled_usage()),
+        ("b", usage_info(Some(window(10.0, Some(live_reset()))))),
+        ("c", usage_info(Some(window(10.0, Some(live_reset()))))),
+    ]);
+    assert_eq!(
+        next_auto_switch_target(&snap, &store_canceled),
+        None,
+        "a canceled preferred 403s every request — no return"
     );
 }
 
@@ -2994,6 +3208,7 @@ fn weekly_dead_member_never_recovers() {
         name: "b".into(),
         threshold: 95.0,
         last_resort: false,
+        preferred: false,
         max_spend: 0.0,
         weekly_line: 98.0,
         scoped_line: 98.0,
@@ -3849,6 +4064,7 @@ fn snapshot_for_lock_consolidation(spend_budget: bool) -> ChainSnapshot {
                 name: "a".into(),
                 threshold: 95.0,
                 last_resort: false,
+                preferred: false,
                 max_spend: 0.0,
                 weekly_line: 98.0,
                 scoped_line: 98.0,
@@ -3858,6 +4074,7 @@ fn snapshot_for_lock_consolidation(spend_budget: bool) -> ChainSnapshot {
                 name: "b".into(),
                 threshold: 95.0,
                 last_resort: false,
+                preferred: false,
                 max_spend: 0.0,
                 weekly_line: 98.0,
                 scoped_line: 98.0,
@@ -3867,6 +4084,7 @@ fn snapshot_for_lock_consolidation(spend_budget: bool) -> ChainSnapshot {
                 name: "c".into(),
                 threshold: 95.0,
                 last_resort: false,
+                preferred: false,
                 max_spend: 100.0,
                 weekly_line: 98.0,
                 scoped_line: 98.0,
@@ -3934,6 +4152,7 @@ fn snapshot_evaluation_isolates_predicate_reads_from_between_pass_mutation() {
         name: "b".into(),
         threshold: 95.0,
         last_resort: false,
+        preferred: false,
         max_spend: 0.0,
         weekly_line: 98.0,
         scoped_line: 98.0,
@@ -4667,6 +4886,7 @@ fn find_recovered_prefers_member_clear_of_scoped_windows() {
             name: "b".into(),
             threshold: 95.0,
             last_resort: false,
+            preferred: false,
             max_spend: 0.0,
             weekly_line: 98.0,
             scoped_line: 98.0,
@@ -4676,6 +4896,7 @@ fn find_recovered_prefers_member_clear_of_scoped_windows() {
             name: "c".into(),
             threshold: 95.0,
             last_resort: false,
+            preferred: false,
             max_spend: 0.0,
             weekly_line: 98.0,
             scoped_line: 98.0,
@@ -4711,6 +4932,7 @@ fn find_recovered_prefers_member_clear_of_scoped_windows() {
         name: "b".into(),
         threshold: 95.0,
         last_resort: false,
+        preferred: false,
         max_spend: 0.0,
         weekly_line: 98.0,
         scoped_line: 98.0,
@@ -4719,6 +4941,64 @@ fn find_recovered_prefers_member_clear_of_scoped_windows() {
     assert_eq!(
         find_recovered_member(&chain_b, &store, &[]),
         Some("b".to_string()),
+    );
+}
+
+// Preferred-wins recovery: the same scoped-blocked-head / fully-clear-tail
+// shape as above, but with the head marked preferred (the home account). It is
+// aggregate-recovered (its per-model window still gates it), so the scoped-clear
+// pass would normally hand recovery to the fully-clear tail `c`. Preferred
+// overrides that: relink home rather than to a lower-priority member that merely
+// cleared its per-model windows first. The chain has 3 members so the pick is a
+// genuine selection — `b` is chosen over BOTH `a` (not recovered) and `c`.
+#[test]
+fn find_recovered_prefers_the_preferred_member_over_a_scoped_clear_one() {
+    let mkmember = |name: &str, preferred: bool| ChainMember {
+        name: name.into(),
+        threshold: 95.0,
+        last_resort: false,
+        preferred,
+        max_spend: 0.0,
+        weekly_line: 98.0,
+        scoped_line: 98.0,
+        check_scoped: true,
+    };
+    let chain = vec![
+        mkmember("a", false),
+        mkmember("b", true),
+        mkmember("c", false),
+    ];
+    let store = store_with_infos(vec![
+        // a: weekly-dead — never recovers.
+        ("a", usage_with_scoped(0.0, 100.0, vec![])),
+        // b (preferred): aggregate-clear but its 7d fable window still gates it.
+        (
+            "b",
+            usage_with_scoped(
+                0.0,
+                40.0,
+                vec![scoped_window("7d fable", 100.0, Some(week_reset()))],
+            ),
+        ),
+        // c: fully clear — the scoped-clear pass would take it absent preferred.
+        ("c", usage_with_scoped(5.0, 30.0, vec![])),
+    ]);
+    assert_eq!(
+        find_recovered_member(&chain, &store, &[]),
+        Some("b".to_string()),
+        "an aggregate-recovered preferred wins over a lower-priority scoped-clear member"
+    );
+    // Guard: preferred wins only when it is ITSELF recovered. Drop b to
+    // weekly-dead and recovery falls through to the fully-clear c.
+    let store_b_dead = store_with_infos(vec![
+        ("a", usage_with_scoped(0.0, 100.0, vec![])),
+        ("b", usage_with_scoped(0.0, 100.0, vec![])),
+        ("c", usage_with_scoped(5.0, 30.0, vec![])),
+    ]);
+    assert_eq!(
+        find_recovered_member(&chain, &store_b_dead, &[]),
+        Some("c".to_string()),
+        "a preferred that has not recovered does not block a clear member from relinking"
     );
 }
 
@@ -4731,6 +5011,7 @@ fn recovery_respects_each_members_gates() {
         name: name.into(),
         threshold: 95.0,
         last_resort: false,
+        preferred: false,
         max_spend: 0.0,
         // Snapshot-folded shape: a gate-off weekly reads as the hard cap.
         weekly_line: if check_weekly { 98.0 } else { 100.0 },

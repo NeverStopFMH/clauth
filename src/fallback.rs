@@ -744,6 +744,11 @@ pub(crate) struct ChainMember {
     /// decoupled from `threshold` (issue #8 follow-up: a threshold no longer
     /// doubles as a sink marker).
     pub(crate) last_resort: bool,
+    /// Mirrors `Profile::preferred` — the operator's home account. At most one
+    /// chain member carries it (radio toggle). Drives the return-to-preferred
+    /// pass in [`next_auto_switch_target`] and preferred-wins wrap-off recovery
+    /// in [`find_recovered_member`].
+    pub(crate) preferred: bool,
     /// Mirrors `Profile::max_auto_spend` in dollars, `0` when unset — the
     /// member's own ceiling on unattended pay-as-you-go spending.
     pub(crate) max_spend: f64,
@@ -905,6 +910,7 @@ fn build_chain_snapshot(
                 name: name.to_string(),
                 threshold: profile.map(threshold_for).unwrap_or(DEFAULT_THRESHOLD),
                 last_resort: profile.is_some_and(|p| p.last_resort),
+                preferred: profile.is_some_and(|p| p.preferred),
                 max_spend: profile.and_then(|p| p.max_auto_spend).unwrap_or(0.0),
                 weekly_line: profile
                     .map(|p| member_weekly_line(p, weekly_pct))
@@ -1347,6 +1353,36 @@ fn next_auto_switch_target_with_usage(
         {
             return Some(SwitchAction::To(name));
         }
+        // Return-to-preferred: a healthy active that is not itself the operator's
+        // preferred (home) account walks back the instant preferred reads clear
+        // AND fresh. No dwell timer, no hysteresis — it is self-limiting: had
+        // preferred stayed clear this whole time, the exhaustion walk could only
+        // ever have left it when preferred was the SPENT member, so a clear
+        // preferred that is not the active means work drifted off it on
+        // preferred's own exhaustion and can now come home. The one-shot nature
+        // is structural, not timed: the moment it fires, the active IS preferred
+        // and the `pref != active.name` guard bars any re-fire.
+        //
+        // Freshness is a HARD gate on BOTH sides here, unlike the exhaustion
+        // walk below where target freshness is only a PREFERENCE (2026-06-28
+        // asymmetry). That exemption exists to never strand an EXHAUSTED active
+        // without an escape; a HEALTHY active has no forced escape to preserve,
+        // so it does not transfer. A stale/Cached preferred (hydrated idle at
+        // the last read but really near-blocked) must not pull live work — and
+        // every following session — onto a near-dead account; and a
+        // stuck-RateLimited active, frozen at an idle-looking read and therefore
+        // never in `snapshot.fresh`, must not be moved on numbers the scheduler
+        // declared untrustworthy (mirrors the ACTIVE-side `decision_fresh` gate).
+        if let Some(pref) = snapshot.chain.iter().find(|m| m.preferred)
+            && pref.name != active.name
+            && snapshot.fresh.iter().any(|n| n == &active.name)
+            && let Some(pi) = snapshot.chain.iter().position(|m| m.name == pref.name)
+            && !skip(pi)
+            && clear(&snapshot.chain[pi])
+            && snapshot.fresh.iter().any(|n| n == &pref.name)
+        {
+            return Some(SwitchAction::To(pref.name.clone()));
+        }
         return None;
     }
 
@@ -1507,6 +1543,18 @@ pub(crate) fn find_recovered_member(
             Err(_) => None,
         }
     };
+    // The operator's preferred (home) account wins recovery outright: if it is
+    // among the recovered members, re-arm onto it rather than let the
+    // scoped-clear pass below hand recovery to a lower-priority member that
+    // merely cleared its per-model windows first. The caller has already gated
+    // `chain` on `decision_fresh_any`, so a preferred reaching here is a trusted
+    // read; `recovered(_, false)` matches "recovered on the aggregate" — home
+    // beats staying off even while a per-model window still gates it.
+    if let Some(pref) = chain.iter().find(|m| m.preferred)
+        && recovered(pref, false) == Some(true)
+    {
+        return Some(pref.name.clone());
+    }
     // Prefer a member clear of every per-model weekly window it gates on,
     // then fall back to the aggregate-only recovery — the chain is OFF here,
     // so relinking onto a model-blocked member beats staying off, but only

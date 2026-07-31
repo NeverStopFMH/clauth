@@ -220,6 +220,15 @@ pub(crate) struct Profile {
     /// headroom (issue #8 follow-up: a threshold no longer doubles as a sink
     /// marker).
     pub(crate) last_resort: bool,
+    /// The operator's home account (fallback chain only, at most one across the
+    /// chain — the toggle is a radio, like `last_resort`). Opt-in return: once
+    /// live work has drifted off it onto a later member and it reads clear and
+    /// fresh again, the daemon walks the active — and every following session —
+    /// back to it. Mutually exclusive with `last_resort`: a member marked one
+    /// clears the other, since "park here to the end" and "always come home
+    /// here" are contradictory verdicts. Default off. See
+    /// `fallback::next_auto_switch_target`'s return-to-preferred pass.
+    pub(crate) preferred: bool,
     /// Ceiling in US dollars on what the auto-switch chain may spend of this
     /// account's pay-as-you-go budget on its own (fallback chain only, and only
     /// while `AppState::spend_budget_switching` is on). `None`/`0` — the
@@ -270,6 +279,7 @@ impl Profile {
             fallback_threshold: None,
             weekly_threshold: None,
             last_resort: false,
+            preferred: false,
             max_auto_spend: None,
             check_weekly: true,
             check_scoped: true,
@@ -839,6 +849,8 @@ struct ProfileConfig {
     weekly_threshold: Option<f64>,
     #[serde(default)]
     last_resort: bool,
+    #[serde(default)]
+    preferred: bool,
     #[serde(default)]
     max_auto_spend: Option<f64>,
     /// `Option` (not `bool`) so the derived `Default` and an absent key agree:
@@ -1423,6 +1435,7 @@ pub(crate) fn load_profile(name: &str) -> Result<Profile> {
             .weekly_threshold
             .filter(|v| (MIN_WEEKLY_SWITCH_PCT..=MAX_WEEKLY_SWITCH_PCT).contains(v)),
         last_resort: config.last_resort,
+        preferred: config.preferred,
         // Normalize at the LOAD boundary so the on-disk value is never a live
         // trap for a direct reader (the 2026-07-14 weekly-line lesson). `inf`
         // and `nan` are both valid TOML floats, and an infinite ceiling means
@@ -1464,6 +1477,7 @@ fn maybe_rewrite_config_toml(config_path: &Path, raw_config: &str, profile: &Pro
                 fallback_threshold: profile.fallback_threshold,
                 weekly_threshold: profile.weekly_threshold,
                 last_resort: profile.last_resort,
+                preferred: profile.preferred,
                 max_auto_spend: profile.max_auto_spend,
                 // Default-on booleans render as commented examples when on, so
                 // the canonical form is `None` (unset) — an explicit `= true`
@@ -1653,6 +1667,18 @@ fn render_config_toml(profile: &Profile) -> String {
         out.push_str("last_resort = true\n");
     } else {
         out.push_str("# last_resort = true\n");
+    }
+    out.push('\n');
+
+    out.push_str("# Marks this profile as the fallback chain's preferred (home) account.\n");
+    out.push_str("# At most one member is preferred; the toggle is a radio. Once live work\n");
+    out.push_str("# has drifted off it and it reads clear and fresh again, the daemon walks\n");
+    out.push_str("# the active account — and every following session — back to it. Mutually\n");
+    out.push_str("# exclusive with last_resort.\n");
+    if profile.preferred {
+        out.push_str("preferred = true\n");
+    } else {
+        out.push_str("# preferred = true\n");
     }
     out.push('\n');
 

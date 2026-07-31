@@ -199,6 +199,7 @@ fn third_party_profile(five_pct: f64, seven_pct: f64) -> Profile {
         fallback_threshold: None,
         weekly_threshold: None,
         last_resort: false,
+        preferred: false,
         max_auto_spend: None,
         check_weekly: true,
         check_scoped: true,
@@ -251,6 +252,7 @@ fn deepseek_profile(name: &str, total: Option<&str>) -> Profile {
         fallback_threshold: None,
         weekly_threshold: None,
         last_resort: false,
+        preferred: false,
         max_auto_spend: None,
         check_weekly: true,
         check_scoped: true,
@@ -284,6 +286,7 @@ fn profile(name: &str, threshold: f64, util: f64, reset_secs: i64) -> Profile {
         fallback_threshold: Some(threshold),
         weekly_threshold: None,
         last_resort: false,
+        preferred: false,
         max_auto_spend: None,
         check_weekly: true,
         check_scoped: true,
@@ -696,6 +699,7 @@ fn credentialed_profile(name: &str, subscription_type: &str) -> Profile {
         fallback_threshold: None,
         weekly_threshold: None,
         last_resort: false,
+        preferred: false,
         max_auto_spend: None,
         check_weekly: true,
         check_scoped: true,
@@ -1314,6 +1318,38 @@ fn chain_row_switch_hint_rides_the_target_row() {
     assert!(
         line.width() < 60,
         "a 60-wide panel must leave slack past the hint: {text}",
+    );
+}
+
+/// A projected switch LANDING on the preferred (home) member carries the `⌂`
+/// homecoming glyph, while a switch onto any other member carries the plain `↩`.
+/// Pins the wording that distinguishes a return from an exhaustion hop (spec
+/// item 6) — an inverted glyph (⌂/↩ swapped) would otherwise ship green.
+#[test]
+fn chain_row_marks_a_homecoming_onto_preferred_with_the_house_glyph() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut home = profile("home", 95.0, 10.0, 3600);
+    home.preferred = true;
+    let plain = profile("plain", 95.0, 10.0, 3600);
+    let config = config_with(vec![home, plain], Some("plain"), vec!["home", "plain"]);
+    let app = App::new(config);
+    let cfg = app.config();
+
+    let hint = |name: &str| {
+        let row = chain_row(&cfg, name, 0, 0, 8, GAUGE_W, 3, None, Some(7200));
+        let base = row.base_width();
+        line_text(&row.into_line(base + TRAILER_GAP, 60))
+    };
+
+    let home_hint = hint("home");
+    assert!(
+        home_hint.contains('⌂') && !home_hint.contains('↩'),
+        "a switch onto the preferred member reads as a homecoming: {home_hint}",
+    );
+    let plain_hint = hint("plain");
+    assert!(
+        plain_hint.contains('↩') && !plain_hint.contains('⌂'),
+        "a switch onto a non-preferred member keeps the plain glyph: {plain_hint}",
     );
 }
 

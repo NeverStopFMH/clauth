@@ -216,17 +216,27 @@ impl super::Daemon {
                 reason = "config mutex poisoning is unrecoverable"
             )]
             let mut cfg = self.config.lock().expect("config poisoned");
+            // Destination-based: a move landing on the preferred (home) account
+            // logs as a return whether the return pass or an exhaustion walk onto
+            // a clear preferred put us there. Captured under the same lock so the
+            // log names the two apart without threading the cause through the
+            // switch action.
+            let returning = cfg.find(&target).is_some_and(|p| p.preferred);
             crate::lock::with_state_lock(|| {
                 switch_profile(&mut cfg, &target)?;
-                Ok(reload_fingerprint())
+                Ok((reload_fingerprint(), returning))
             })
         };
         match result {
-            Ok(fp) => {
+            Ok((fp, returning)) => {
                 self.rebuild_tokens();
                 self.last_reload_fp = fp;
                 self.switch_backoff = None;
-                logline!("clauth daemon: switched to '{target}'");
+                if returning {
+                    logline!("clauth daemon: returned to preferred account '{target}'");
+                } else {
+                    logline!("clauth daemon: switched to '{target}'");
+                }
             }
             Err(e) => {
                 self.fail_switch(target, now, &format!("switch failed: {e}"));

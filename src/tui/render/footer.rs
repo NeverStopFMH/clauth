@@ -204,7 +204,8 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
             }
             FallbackHint::DetailCheckWeekly
             | FallbackHint::DetailCheckScoped
-            | FallbackHint::DetailLastResort => &[
+            | FallbackHint::DetailLastResort
+            | FallbackHint::DetailPreferred => &[
                 ("↑↓", "row"),
                 ("space/↵", "toggle"),
                 ("a", "actions"),

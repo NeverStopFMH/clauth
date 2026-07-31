@@ -161,7 +161,8 @@ impl InputState {
 
 /// One interactive line in the Fallback tab's detail pane for a chain member.
 /// `Threshold` is a stepper (±5 on `+`/`-`); `CheckWeekly`/`CheckScoped`/
-/// `LastResort` are boolean toggles (space/⏎, per the enumerated-row grammar);
+/// `LastResort`/`Preferred` are boolean toggles (space/⏎, per the
+/// enumerated-row grammar);
 /// `Remove` arms then confirms. The chain-global wrap-off setting lives on the
 /// program-wide Config tab, not here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -182,6 +183,12 @@ pub(crate) enum FallbackRow {
     /// account stays in rotation for use with other models.
     CheckScoped,
     LastResort,
+    /// Whether this member is the chain's preferred (home) account
+    /// (`Profile::preferred`, off by default). A pure on/off toggle, exclusive
+    /// across the chain (a radio, like `LastResort`) and mutually exclusive with
+    /// it. Marking it opts the chain into returning here once it reads clear and
+    /// fresh again.
+    Preferred,
     /// Dollar ceiling on what the chain may spend of this member's
     /// pay-as-you-go budget unattended (`Profile::max_auto_spend`, $0 default).
     /// Inert unless `AppState::spend_budget_switching` is also on — see
@@ -655,6 +662,7 @@ pub(crate) enum ActionMenuAction {
     ToggleCheckWeekly,
     ToggleCheckScoped,
     ToggleLastResort,
+    TogglePreferred,
     EditMaxSpend,
     RemoveMember,
     // Config detail actions (proxied through run_config_row)
@@ -765,6 +773,7 @@ impl ActionMenuAction {
             Self::ToggleCheckWeekly => "toggle weekly gate",
             Self::ToggleCheckScoped => "toggle scoped gate",
             Self::ToggleLastResort => "toggle last resort",
+            Self::TogglePreferred => "toggle preferred",
             Self::EditMaxSpend => "edit max auto-spend",
             Self::RemoveMember => "remove member",
             Self::DisableProfile => "disable account",
@@ -1979,7 +1988,16 @@ impl App {
         };
         match switched {
             Some(SwitchAction::To(target)) => {
-                self.toast(ToastKind::Warning, format!("auto-switched to '{target}'"));
+                // Destination-based, as in the pending-switch drain: landing on
+                // the home account reads as a return whether the return pass or
+                // an exhaustion walk onto a clear preferred put us there.
+                let returned = self.config().find(&target).is_some_and(|p| p.preferred);
+                let msg = if returned {
+                    format!("returned to preferred account '{target}'")
+                } else {
+                    format!("auto-switched to '{target}'")
+                };
+                self.toast(ToastKind::Warning, msg);
             }
             Some(SwitchAction::Off) => {
                 self.refresh_tokens();
@@ -3614,13 +3632,15 @@ pub(crate) fn chain_items(app: &App) -> Vec<ChainItemKind> {
     items
 }
 
-/// Detail rows for a chain member: threshold stepper, last-resort toggle, remove.
-pub(crate) const FALLBACK_ROWS: [FallbackRow; 7] = [
+/// Detail rows for a chain member: threshold stepper, last-resort/preferred
+/// toggles, remove.
+pub(crate) const FALLBACK_ROWS: [FallbackRow; 8] = [
     FallbackRow::Threshold,
     FallbackRow::WeeklyAt,
     FallbackRow::CheckWeekly,
     FallbackRow::CheckScoped,
     FallbackRow::LastResort,
+    FallbackRow::Preferred,
     FallbackRow::MaxSpend,
     FallbackRow::Remove,
 ];
@@ -3788,6 +3808,7 @@ pub(crate) enum FallbackHint {
     DetailCheckWeekly,
     DetailCheckScoped,
     DetailLastResort,
+    DetailPreferred,
     DetailMaxSpend,
     DetailMaxSpendEdit,
     DetailRemove,
@@ -3825,6 +3846,7 @@ pub(crate) fn fallback_hint(app: &App) -> FallbackHint {
                 FallbackRow::CheckWeekly => FallbackHint::DetailCheckWeekly,
                 FallbackRow::CheckScoped => FallbackHint::DetailCheckScoped,
                 FallbackRow::LastResort => FallbackHint::DetailLastResort,
+                FallbackRow::Preferred => FallbackHint::DetailPreferred,
                 FallbackRow::MaxSpend => FallbackHint::DetailMaxSpend,
                 FallbackRow::Remove if app.fallback_armed_remove => FallbackHint::DetailRemoveArmed,
                 FallbackRow::Remove => FallbackHint::DetailRemove,
@@ -4452,6 +4474,7 @@ fn run_fallback_row(app: &mut App, row: FallbackRow) {
         FallbackRow::CheckWeekly => toggle_member_flag(app, MemberFlag::CheckWeekly),
         FallbackRow::CheckScoped => toggle_member_flag(app, MemberFlag::CheckScoped),
         FallbackRow::LastResort => toggle_last_resort(app),
+        FallbackRow::Preferred => toggle_preferred(app),
         FallbackRow::MaxSpend => {
             // Inert while spend budget is off (rendered dimmed): opening the editor
             // would let a ceiling be typed that does nothing, so no-op.
@@ -4773,6 +4796,14 @@ fn toggle_last_resort(app: &mut App) {
             Some(profile) => {
                 profile.last_resort = !profile.last_resort;
                 let now_on = profile.last_resort;
+                // Never both on one profile: "park here to the end" and "always
+                // come home here" are contradictory. Clear preferred before the
+                // single save so the pair persists atomically; remember the
+                // prior value so a save failure rolls back both.
+                let cleared_preferred = now_on && profile.preferred;
+                if now_on {
+                    profile.preferred = false;
+                }
                 match save_profile(profile) {
                     Ok(()) => {
                         let mut moved_from = None;
@@ -4796,6 +4827,9 @@ fn toggle_last_resort(app: &mut App) {
                     Err(e) => {
                         if let Some(p) = cfg.find_mut(&name) {
                             p.last_resort = !now_on;
+                            if cleared_preferred {
+                                p.preferred = true;
+                            }
                         }
                         Outcome::SaveFailed(e)
                     }
@@ -4808,6 +4842,81 @@ fn toggle_last_resort(app: &mut App) {
         Outcome::Saved { moved_from } => {
             if let Some(prev) = moved_from {
                 app.toast(ToastKind::Info, format!("last resort moved from '{prev}'"));
+            }
+            app.refresh_tokens();
+        }
+        Outcome::SaveFailed(e) => app.toast(ToastKind::Danger, format!("save failed\n{e}")),
+    }
+}
+
+/// Mark the selected member as the chain's preferred (home) account, or clear
+/// it. Twin of [`toggle_last_resort`]: exclusive across the chain (target-first
+/// radio, per-sibling rollback) with a `"preferred moved from '{prev}'"` toast,
+/// and reciprocally mutually exclusive — turning preferred on clears
+/// last_resort on the same profile.
+fn toggle_preferred(app: &mut App) {
+    enum Outcome {
+        Missing,
+        Saved { moved_from: Option<String> },
+        SaveFailed(anyhow::Error),
+    }
+    let Some(pos) = selected_chain_member(app) else {
+        return;
+    };
+    let outcome = {
+        let mut cfg = app.config();
+        let Some(name) = cfg.state.fallback_chain.get(pos).cloned() else {
+            return;
+        };
+        match cfg.find_mut(&name) {
+            None => Outcome::Missing,
+            Some(profile) => {
+                profile.preferred = !profile.preferred;
+                let now_on = profile.preferred;
+                // Reciprocal of the clear in `toggle_last_resort` — the two
+                // flags never coexist on one profile.
+                let cleared_last_resort = now_on && profile.last_resort;
+                if now_on {
+                    profile.last_resort = false;
+                }
+                match save_profile(profile) {
+                    Ok(()) => {
+                        let mut moved_from = None;
+                        if now_on {
+                            for p in cfg
+                                .profiles
+                                .iter_mut()
+                                .filter(|p| p.preferred && p.name != name)
+                            {
+                                p.preferred = false;
+                                match save_profile(p) {
+                                    Ok(()) => {
+                                        moved_from.get_or_insert_with(|| p.name.to_string());
+                                    }
+                                    Err(_) => p.preferred = true,
+                                }
+                            }
+                        }
+                        Outcome::Saved { moved_from }
+                    }
+                    Err(e) => {
+                        if let Some(p) = cfg.find_mut(&name) {
+                            p.preferred = !now_on;
+                            if cleared_last_resort {
+                                p.last_resort = true;
+                            }
+                        }
+                        Outcome::SaveFailed(e)
+                    }
+                }
+            }
+        }
+    };
+    match outcome {
+        Outcome::Missing => {}
+        Outcome::Saved { moved_from } => {
+            if let Some(prev) = moved_from {
+                app.toast(ToastKind::Info, format!("preferred moved from '{prev}'"));
             }
             app.refresh_tokens();
         }
@@ -5024,6 +5133,7 @@ fn build_action_menu(app: &App) -> ActionMenuState {
                         FallbackRow::CheckWeekly => actions.push(ToggleCheckWeekly),
                         FallbackRow::CheckScoped => actions.push(ToggleCheckScoped),
                         FallbackRow::LastResort => actions.push(ToggleLastResort),
+                        FallbackRow::Preferred => actions.push(TogglePreferred),
                         FallbackRow::MaxSpend => actions.push(EditMaxSpend),
                         FallbackRow::Remove => actions.push(RemoveMember),
                     }
@@ -5174,6 +5284,9 @@ fn dispatch_action_menu_action(app: &mut App, action: ActionMenuAction) {
         }
         ActionMenuAction::ToggleLastResort => {
             run_fallback_row(app, FallbackRow::LastResort);
+        }
+        ActionMenuAction::TogglePreferred => {
+            run_fallback_row(app, FallbackRow::Preferred);
         }
         ActionMenuAction::EditMaxSpend => {
             run_fallback_row(app, FallbackRow::MaxSpend);
@@ -7378,7 +7491,19 @@ pub(crate) fn on_tick(app: &mut App) {
         if switch_gate_in_flight(&app.activity) || !is_idle(&app.activity, &name) {
             continue;
         }
-        app.toast(ToastKind::Warning, format!("auto-switching to '{name}'"));
+        // The label keys on the DESTINATION, not on which pass fired: any move
+        // landing on the preferred (home) account reads as a homecoming. The
+        // healthy-active return pass is the usual source, but the exhaustion walk
+        // can also land here when the preferred is the only clear member left —
+        // both are genuinely "now on home", so the destination-based label holds
+        // without threading the cause through `SwitchAction`.
+        let returning = app.config().find(&name).is_some_and(|p| p.preferred);
+        let msg = if returning {
+            format!("returning to preferred account '{name}'")
+        } else {
+            format!("auto-switching to '{name}'")
+        };
+        app.toast(ToastKind::Warning, msg);
         app.set_tab_activity(Tab::Overview, ToastKind::Warning);
         perform_switch(app, &name);
     }

@@ -342,6 +342,45 @@ fn copy_tree_replicates_files_and_subdirs() {
     );
 }
 
+/// `copy_tree` must skip a `copy_file` staging sibling, exactly as
+/// `union_children` does for the watchdog mirror.
+///
+/// A shared fake-mode tree has publishes in flight whenever the watchdog's
+/// lockless `mirror_tree` runs, so an `acquire` walking `~/.claude` can meet a
+/// `.tmp.<pid>.<seq>` about to be renamed away. Copying one lands an orphan
+/// nothing ever removes; on Windows it does worse, because the publishing
+/// thread still has the file OPEN and `copy_file` fails with "used by another
+/// process" — which this walk propagates, failing the whole acquire rather
+/// than a tick that would have re-converged. Seen for real on a Windows CI leg
+/// in `fake_mode_second_session_does_not_rebuild_the_tree`, where the sentinel
+/// the test writes into the runtime was mid-mirror back into `~/.claude`.
+#[test]
+fn copy_tree_skips_a_publish_in_flight() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let src = tmp.path().join("src");
+    fs::create_dir_all(src.join("nested")).expect("mkdir");
+    fs::write(src.join("real.txt"), b"keep me").expect("write real");
+    // What `copy_file` leaves visible mid-publish, at both levels.
+    fs::write(src.join(".real.txt.tmp.4242.7"), b"in flight").expect("write staging");
+    fs::write(src.join("nested").join(".b.txt.tmp.4242.8"), b"in flight").expect("write nested");
+
+    let dst = tmp.path().join("dst");
+    copy_tree(&src, &dst).expect("copy_tree");
+
+    assert_eq!(
+        fs::read(dst.join("real.txt")).expect("read real"),
+        b"keep me"
+    );
+    assert!(
+        !dst.join(".real.txt.tmp.4242.7").exists(),
+        "a staging sibling must never be copied — nothing here ever deletes it again"
+    );
+    assert!(
+        !dst.join("nested").join(".b.txt.tmp.4242.8").exists(),
+        "the skip has to hold at every level of the recursion, not just the top"
+    );
+}
+
 #[test]
 fn mirror_credentials_newer_runtime_wins() {
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -1317,6 +1356,60 @@ fn build_runtime_dir_real_keeps_invalid_runtime_credentials_for_retry() {
             b"partial write"
         );
     });
+}
+
+/// The top-level materialize walk must skip a `copy_file` publish in flight,
+/// the same way `union_children` does for the watchdog mirror.
+///
+/// This is the walk that actually bit: a shared fake-mode tree has the
+/// watchdog's lockless `mirror_tree` publishing runtime-side files back into
+/// `~/.claude` while a sibling session acquires, so `read_dir(claude_home)`
+/// hands `pending` a `.tmp.<pid>.<seq>` that is about to be renamed away. On
+/// Windows the publishing thread still holds it OPEN, so the copy fails with
+/// "used by another process" — and this walk PROPAGATES, failing the whole
+/// `acquire` rather than a tick that would have re-converged. Caught on a
+/// Windows CI leg in `fake_mode_second_session_does_not_rebuild_the_tree`.
+///
+/// Both link modes, because real mode is no better: it would land a symlink
+/// pointing at a path that is about to vanish.
+#[test]
+fn build_runtime_dir_skips_a_publish_in_flight() {
+    for mode in [LinkMode::Fake, LinkMode::Real] {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        with_fake_home(tmp.path(), || {
+            let claude_home = fake_claude_home(tmp.path());
+            fs::write(claude_home.join("history.jsonl"), b"{}").expect("write history");
+            // What the watchdog's publish looks like from this walk's side.
+            fs::write(claude_home.join(".history.jsonl.tmp.4242.9"), b"in flight")
+                .expect("write staging");
+            let runtime = tmp.path().join("runtime");
+            fs::create_dir_all(&runtime).expect("mkdir runtime");
+            let profile = make_profile("staging");
+            let canonical = tmp.path().join("creds.json");
+
+            build_runtime_dir(
+                &runtime,
+                &claude_home,
+                &profile,
+                &canonical,
+                mode,
+                Isolation::Shared,
+            )
+            .expect("build must not fail on a publish in flight");
+
+            assert!(
+                runtime.join("history.jsonl").exists(),
+                "real content still materializes"
+            );
+            assert!(
+                runtime
+                    .join(".history.jsonl.tmp.4242.9")
+                    .symlink_metadata()
+                    .is_err(),
+                "a staging sibling must never be materialized ({mode:?})"
+            );
+        });
+    }
 }
 
 #[test]

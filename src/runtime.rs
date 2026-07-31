@@ -2361,14 +2361,17 @@ fn build_runtime_dir_with_active_env(
         if file_name == "settings.json" || file_name == ".credentials.json" {
             continue;
         }
-        // Same skip rule the mirror side applies in `union_children`, and for
-        // the same reason: a sibling session's `copy_file` publishes through a
-        // staging sibling, so this walk can meet one that is still being
-        // written. Copying it fails outright where the source is open for
-        // writing (Windows share modes are per-handle, so one process is no
-        // exemption) or where the rename lands mid-copy, and otherwise lands an
-        // orphan the mirror never deletes. Real mode needs it too: the link it
-        // would make dangles the moment that rename lands.
+        // A `copy_file` publish in flight, not content. `union_children` skips
+        // these for the watchdog mirror; this walk has the same exposure and a
+        // sharper consequence, because it PROPAGATES its error — the whole
+        // `acquire` fails instead of a tick that would have re-converged.
+        //
+        // The shared fake-mode tree is where it bites: the watchdog's lockless
+        // `mirror_tree` publishes a runtime-side file back into `~/.claude`
+        // while a sibling session is acquiring, and on Windows the publishing
+        // thread still has the staging file OPEN, so the copy fails with
+        // "used by another process". Linking one in real mode is no better —
+        // it lands a link to a path that is about to be renamed away.
         if crate::watchdog::is_staging(&file_name) {
             continue;
         }
@@ -2656,10 +2659,19 @@ fn copy_tree(src: &Path, dst: &Path) -> Result<()> {
             std::fs::read_dir(src).with_context(|| format!("failed to read {}", src.display()))?
         {
             let entry = entry?;
+            // Same staging-sibling skip `union_children` makes, and for the
+            // same reason: a shared fake-mode tree has a `copy_file` publish or
+            // several in flight at any moment (the watchdog's `mirror_tree`
+            // runs lockless), so this walk can meet a `.tmp.<pid>.<seq>` that
+            // is about to be renamed away.
+            //
+            // Here it is worse than in the mirror, because THIS walk propagates
+            // its error: on Windows the staging file is still open by the
+            // publishing thread and `copy_file` fails with "used by another
+            // process", which fails the whole `acquire` rather than a tick that
+            // would have re-converged. Copying one would also land an orphan
+            // nothing ever removes, since nothing here deletes.
             let name = entry.file_name();
-            // The recursion's half of the caller's skip: a subtree under
-            // `~/.claude/` (`projects/`, `plugins/`) carries publishes in
-            // flight too, and this walk is what meets them.
             if crate::watchdog::is_staging(&name) {
                 continue;
             }

@@ -1819,6 +1819,7 @@ fn session_row(session_id: &str, start_profile: &str) -> crate::live_sessions::L
         chain_cursor: None,
         current_member: None,
         last_swap_at: None,
+        launch_store: None,
     }
 }
 

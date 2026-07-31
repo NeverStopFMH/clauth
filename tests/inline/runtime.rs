@@ -3351,6 +3351,7 @@ fn gc_drops_a_registry_row_whose_marker_is_unlocked_and_keeps_a_held_one() {
             chain_cursor: None,
             current_member: None,
             last_swap_at: None,
+            launch_store: None,
         };
         crate::live_sessions::register(&dead).expect("register dead");
         dead.session_id = "6001-1".into();
@@ -3550,6 +3551,7 @@ fn lone_session(
         name,
         isolation == Isolation::Isolated,
         false,
+        Some(store.to_path_buf()),
     );
     crate::live_sessions::register(&row).expect("register row");
     let swap = std::sync::Arc::new(SessionSwap::new(
@@ -5640,4 +5642,208 @@ fn the_mirror_walks_past_a_publish_in_flight() {
         !runtime.join("plugins").join(name).exists(),
         "a publish in flight was mirrored as tree content"
     );
+}
+
+// ── the rotation refusal's content narrowing ─────────────────────────────────
+//
+// `rotation_blocked_for` refuses on macOS whenever a `clauth start` session is
+// live, because that session's Claude Code holds the pair in a Keychain item
+// clauth cannot write. `live_session_holds_rotatable` narrows it to the
+// sessions the mechanism can actually reach: signing a session out takes an
+// `invalid_grant`, which takes a refresh token to spend. These pin the
+// narrowing AND every fail-closed direction, since each unknown here is a
+// rotation that must still be refused.
+
+/// A live marker plus its registry row, launched on `store`.
+fn live_session_launched_on(profile: &str, sid: &str, store: &Path) -> std::fs::File {
+    let sessions = crate::profile::profile_dir(profile)
+        .expect("profile_dir")
+        .join("sessions");
+    fs::create_dir_all(&sessions).expect("mkdir sessions");
+    let file = open_pid_file(&sessions.join(sid)).expect("open pid");
+    file.lock().expect("lock pid");
+    register_row(profile, sid, Some(store.to_path_buf()));
+    file
+}
+
+/// A registry row built as a literal, so these tests can mint an arbitrary
+/// session id and an arbitrary `launch_store` (including the pre-upgrade
+/// `None`) without going through `SessionId::mint`.
+fn register_row(profile: &str, sid: &str, launch_store: Option<std::path::PathBuf>) {
+    crate::live_sessions::register(&crate::live_sessions::LiveSession {
+        session_id: sid.to_string(),
+        start_profile: profile.to_string(),
+        pid: std::process::id(),
+        started_at: 1_700_000_000_000,
+        cwd: None,
+        isolated: false,
+        follows_chain: false,
+        intended_member: None,
+        chain_cursor: None,
+        current_member: None,
+        last_swap_at: None,
+        launch_store,
+    })
+    .expect("register row");
+}
+
+fn write_creds(path: &Path, refresh: Option<&str>) {
+    fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+    let body = match refresh {
+        Some(rt) => format!(
+            r#"{{"claudeAiOauth":{{"accessToken":"at","expiresAt":9999999999999,"refreshToken":"{rt}"}}}}"#
+        ),
+        None => r#"{"claudeAiOauth":{"accessToken":"at","expiresAt":9999999999999}}"#.to_string(),
+    };
+    fs::write(path, body).expect("write creds");
+}
+
+#[test]
+fn a_session_launched_on_a_rotating_pair_still_blocks_rotation() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let store = crate::profile::profile_dir("rot")
+            .expect("profile_dir")
+            .join("credentials.json");
+        write_creds(&store, Some("rt-live"));
+        let _held = live_session_launched_on("rot", "11111-0", &store);
+        assert!(
+            live_session_holds_rotatable("rot"),
+            "a session holding a refresh token is exactly what the refusal protects"
+        );
+    });
+}
+
+#[test]
+fn a_session_launched_on_a_refreshless_sidecar_does_not_block_rotation() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let store = crate::profile::profile_dir("roll")
+            .expect("profile_dir")
+            .join("session-token.json");
+        write_creds(&store, None);
+        let _held = live_session_launched_on("roll", "22222-0", &store);
+        assert!(
+            !live_session_holds_rotatable("roll"),
+            "no refresh token means no invalid_grant, so there is nothing to strand"
+        );
+    });
+}
+
+/// The narrowing is feed-agnostic by construction: nothing here sets a flag.
+/// An upstream #53 `setup-token` mint answers the same way a rolling token
+/// does, and one rotatable session is enough to refuse for the whole profile.
+#[test]
+fn one_rotatable_session_refuses_for_the_whole_profile() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let dir = crate::profile::profile_dir("mixed").expect("profile_dir");
+        write_creds(&dir.join("session-token.json"), None);
+        write_creds(&dir.join("credentials.json"), Some("rt-live"));
+        let _a = live_session_launched_on("mixed", "33333-0", &dir.join("session-token.json"));
+        let _b = live_session_launched_on("mixed", "44444-0", &dir.join("credentials.json"));
+        assert!(live_session_holds_rotatable("mixed"));
+    });
+}
+
+/// Every unknown is a rotation that must still be refused. `acquire` tolerates
+/// a failed registration, a row predating `launch_store` deserializes to
+/// `None`, and a half-written credential file must never read as "safe".
+#[test]
+fn every_unknown_launch_store_reads_as_rotatable() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        // (a) a live marker with no registry row at all.
+        let sessions = crate::profile::profile_dir("orphan")
+            .expect("profile_dir")
+            .join("sessions");
+        fs::create_dir_all(&sessions).expect("mkdir");
+        let held = open_pid_file(&sessions.join("55555-0")).expect("open pid");
+        held.lock().expect("lock");
+        assert!(
+            live_session_holds_rotatable("orphan"),
+            "a marker with no row is an unknown, and unknowns block"
+        );
+        drop(held);
+
+        // (b) a row from a clauth that predates the field.
+        let store = crate::profile::profile_dir("legacy")
+            .expect("profile_dir")
+            .join("session-token.json");
+        write_creds(&store, None);
+        let _l = live_session_launched_on("legacy", "66666-0", &store);
+        register_row("legacy", "66666-0", None); // overwrite with a pre-field row
+        assert!(
+            live_session_holds_rotatable("legacy"),
+            "serde(default) must fail CLOSED, or an upgrade silently unblocks rotation"
+        );
+
+        // (c) a marker whose name is not a session id at all, so no row can
+        // ever be found for it.
+        let odd = crate::profile::profile_dir("odd")
+            .expect("profile_dir")
+            .join("sessions");
+        fs::create_dir_all(&odd).expect("mkdir");
+        let stray = open_pid_file(&odd.join("not-a-sid")).expect("open pid");
+        stray.lock().expect("lock");
+        assert!(
+            live_session_holds_rotatable("odd"),
+            "an unparseable marker name is an unknown, and unknowns block"
+        );
+        drop(stray);
+
+        // (d) the store is unreadable / half-written.
+        let torn = crate::profile::profile_dir("torn")
+            .expect("profile_dir")
+            .join("session-token.json");
+        fs::create_dir_all(torn.parent().expect("parent")).expect("mkdir");
+        fs::write(&torn, b"{\"claudeAiOauth\":{\"acc").expect("write partial");
+        let _t = live_session_launched_on("torn", "77777-0", &torn);
+        assert!(
+            live_session_holds_rotatable("torn"),
+            "a partial read is not proof of absence"
+        );
+    });
+}
+
+#[test]
+fn no_live_session_is_not_rotatable() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        assert!(
+            !live_session_holds_rotatable("idle"),
+            "with nothing live there is nothing to strand"
+        );
+    });
+}
+
+/// The narrowing has to be WIRED, not merely defined. Every test above drives
+/// `live_session_holds_rotatable` directly, so deleting its conjunct from
+/// `rotation_blocked_for` would leave them all green. macOS-gated because that
+/// is the only host where the refusal is armed at all.
+#[cfg(target_os = "macos")]
+#[test]
+fn rotation_blocked_for_reads_what_the_live_session_holds() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let rotating = crate::profile::profile_dir("wired-rot")
+            .expect("profile_dir")
+            .join("credentials.json");
+        write_creds(&rotating, Some("rt-live"));
+        let _a = live_session_launched_on("wired-rot", "88888-0", &rotating);
+        assert!(
+            rotation_blocked_for("wired-rot"),
+            "a live session on a rotating pair must still refuse"
+        );
+
+        let refreshless = crate::profile::profile_dir("wired-roll")
+            .expect("profile_dir")
+            .join("session-token.json");
+        write_creds(&refreshless, None);
+        let _b = live_session_launched_on("wired-roll", "99999-0", &refreshless);
+        assert!(
+            !rotation_blocked_for("wired-roll"),
+            "the narrowing is not wired into rotation_blocked_for"
+        );
+    });
 }

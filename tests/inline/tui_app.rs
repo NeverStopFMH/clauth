@@ -259,6 +259,7 @@ fn runtime_check_counts_a_swapped_session_once_on_the_member_it_moved_to() {
         chain_cursor: None,
         current_member: Some("swap-b".to_string()),
         last_swap_at: Some(1_700_000_060_000),
+        launch_store: None,
     };
     crate::live_sessions::register(&row).expect("register row");
     // Both markers, exactly as a swapped session holds them.
@@ -5905,6 +5906,7 @@ fn a_tick_re_tallies_live_sessions_that_appeared_after_startup() {
         chain_cursor: None,
         current_member: None,
         last_swap_at: None,
+        launch_store: None,
     };
     crate::live_sessions::register(&row).expect("register row");
     let _marker = crate::runtime::hold_session_row_marker("late", false, sid)
@@ -5965,6 +5967,7 @@ fn runtime_check_names_a_multi_session_account_with_its_count() {
             chain_cursor: None,
             current_member: None,
             last_swap_at: None,
+            launch_store: None,
         })
         .expect("register row");
         markers.push(
@@ -6026,6 +6029,7 @@ fn runtime_check_says_one_account_when_every_live_session_shares_it() {
             chain_cursor: None,
             current_member: None,
             last_swap_at: None,
+            launch_store: None,
         })
         .expect("register row");
         markers.push(

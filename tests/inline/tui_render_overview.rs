@@ -1521,6 +1521,7 @@ fn live_row(
         chain_cursor: None,
         current_member: None,
         last_swap_at: None,
+        launch_store: None,
     }
 }
 

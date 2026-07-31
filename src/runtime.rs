@@ -498,6 +498,63 @@ fn rotation_blocked_by_live_session(has_live_session: bool, is_macos: bool) -> b
     is_macos && has_live_session
 }
 
+/// Whether ANY live `clauth start` session for `name` launched on a credential
+/// that carries a refresh token — the only kind a rotation can strand.
+///
+/// [`rotation_blocked_by_live_session`] spells out why a live session blocks
+/// rotation on macOS: that session's Claude Code holds the pair in a Keychain
+/// item clauth cannot write, so a rotation leaves it spending a superseded
+/// refresh token, and the `invalid_grant` that follows blanks its item and
+/// signs the session out mid-task. Every step of that mechanism needs a refresh
+/// token to attempt. A session launched on a `session-token.json` sidecar has
+/// none — CLA-SPLIT put it there exactly so sessions hold nothing rotatable —
+/// so there is nothing for it to spend and nothing for a rotation to strand.
+///
+/// Deliberately feed-agnostic: it asks what the session HOLDS, never whether a
+/// feature is enabled. An upstream #53 `claude setup-token` mint answers the
+/// same way a rolling token does, and gets the same exemption for the same
+/// reason, which is why this is a narrowing of the refusal rather than a
+/// carve-out bolted beside it.
+///
+/// Read at ROTATION time and keyed on the row's PATH, not on a verdict frozen
+/// at launch: the content at that path can change under a running session
+/// ([`crate::claude::heal_misfilled_sidecar`] exists because a rotating pair
+/// can land in a sidecar), and a frozen bool would keep saying "refresh-less"
+/// while the file the session reads holds a live chain.
+///
+/// EVERY unknown reads as rotatable, matching [`has_live_session`]'s own
+/// fail-closed asymmetry: an unreadable marker dir, a marker with no registry
+/// row (`acquire` tolerates a failed registration), a row from a clauth that
+/// predates `launch_store`, an unreadable or half-written credential file, and
+/// a live BARE-marker stand-in all return `true` and refuse exactly as today.
+fn live_session_holds_rotatable(name: &str) -> bool {
+    let Some(dirs) = session_marker_dirs(name) else {
+        return true;
+    };
+    for dir in &dirs {
+        let Some(ids) = live_marker_names(dir) else {
+            return true;
+        };
+        for id in ids {
+            let Some(session_id) = id.to_str() else {
+                return true;
+            };
+            let Some(store) = crate::live_sessions::get(session_id).and_then(|r| r.launch_store)
+            else {
+                return true;
+            };
+            let refreshless =
+                crate::profile::read_json_file::<crate::profile::ClaudeCredentials>(&store)
+                    .ok()
+                    .is_some_and(|c| c.refresh_token().is_none());
+            if !refreshless {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 /// [`rotation_blocked_by_live_session`] against the live host and marker state —
 /// what every rotation leg and both TUI pre-refusals call.
 ///
@@ -505,8 +562,15 @@ fn rotation_blocked_by_live_session(has_live_session: bool, is_macos: bool) -> b
 /// [`has_live_session`] is a `read_dir` plus an `open` + `try_lock` per marker,
 /// and passing it as an argument would pay that on every Linux poll of every
 /// profile for a value the predicate discards.
+///
+/// [`live_session_holds_rotatable`] is tested LAST for the same reason: it is
+/// strictly the more expensive probe (a registry read plus a credential parse
+/// per live session), and it only ever narrows an answer that is already
+/// `true`, so it is never paid by a profile that was not about to be refused.
 pub(crate) fn rotation_blocked_for(name: &str) -> bool {
-    cfg!(target_os = "macos") && rotation_blocked_by_live_session(has_live_session(name), true)
+    cfg!(target_os = "macos")
+        && rotation_blocked_by_live_session(has_live_session(name), true)
+        && live_session_holds_rotatable(name)
 }
 
 /// Count of live `clauth start` sessions for the profile, deduped by marker NAME
@@ -1824,6 +1888,10 @@ impl ProfileRuntime {
                 name,
                 isolation == Isolation::Isolated,
                 opt_in,
+                // The SAME value the runtime tree is built from below, so the
+                // row can never disagree with what this session actually
+                // reads. See `live_session_holds_rotatable`.
+                Some(canonical.clone()),
             );
             if let Err(e) = crate::live_sessions::register(&row) {
                 logline!("clauth: registering the live session failed: {e}");

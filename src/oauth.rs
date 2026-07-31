@@ -1703,7 +1703,7 @@ fn vanilla_install_gate(
 }
 
 /// CLA-ROLL: the complete install gate for a rolling-token profile. Every
-/// sidecar state is decided here (review round 1, findings #2/#5/#6):
+/// sidecar state is decided here:
 ///
 ///   * mis-filled sidecar → healed (evidence quarantined, static mint
 ///     restored) when a backup exists; without one the disengaged-vanilla
@@ -1757,7 +1757,8 @@ fn rolling_install_gate(
     // with real life left. A static MINT (~1yr stamp) is deliberately NOT
     // "fresh" here — on a rolling-token profile it is the live *fallback*, and the
     // gate's job is to supersede it with a plan-capable rolling bearer (the
-    // deploy-day bug: the mint's far-future expiry read as fresh, so arming
+    // the bug that made this explicit: a mint's far-future expiry read as
+    // fresh, so arming
     // never stamped anything). A live mint also means the profile is ARMED
     // (`has_session_token` true), so every degrade path below can fall back
     // to Ready on it rather than deferring the switch.

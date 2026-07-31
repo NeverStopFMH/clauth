@@ -125,6 +125,13 @@ struct Snap {
     /// not-long-lived shape the split disengages for. Read per frame for the
     /// selected profile only (one small file).
     session_token: Option<crate::claude::SessionTokenStatus>,
+    /// What the sidecar HOLDS, not what the profile is flagged for. The two
+    /// disagree in a state that is both reachable and permanent: a terminally
+    /// dead chain degrades a rolling profile onto its static mint and leaves
+    /// the flag set, and nothing clears it. Keyed on the flag, the row then
+    /// promises a re-stamp in ~8760h for a year-scale mint no one is going to
+    /// re-stamp — which is the same class of comfortable-looking lie the
+    /// honest hours-scale countdown exists to prevent.
     rolling_token: bool,
 }
 
@@ -226,7 +233,10 @@ fn build_snap(app: &App, with_text: bool) -> Snap {
             provider: p.provider.map(|p| p.display_name()),
             console_login: p.console_login_target().is_some(),
             session_token: crate::claude::session_token_status(p.name.as_str()),
-            rolling_token: p.rolling_token,
+            rolling_token: matches!(
+                crate::claude::sidecar_summary(p.name.as_str()),
+                Some((crate::claude::SidecarKind::Rolling, _))
+            ),
         },
         None => Snap::blank("settings"),
     }

@@ -577,20 +577,21 @@ fn rotate_lead_ms(interval_ms: u64) -> i64 {
 /// and a bare `claude` both read the very credential file a rotation writes,
 /// so neither is a reason to hold off. An unknown expiry never rotates
 /// proactively (never spend a single-use refresh on a token whose expiry we
-/// can't prove) — including for a `feed` profile, whose rolling sidecar carries an
-/// honest expiry precisely so this stays provable.
+/// can't prove). That rule is unconditional: the CHAIN's own stored expiry is
+/// what gates this leg, and the CLA-ROLL flag only widens WHEN a rotation is
+/// due, never WHETHER a provable expiry is required first.
 fn proactive_rotation_due(
     enabled: bool,
-    feed: bool,
+    rolling: bool,
     access_expires_at: Option<i64>,
     now_ms: i64,
     interval_ms: u64,
 ) -> bool {
-    // CLA-ROLL (`feed`): a fed profile forces the preemptive leg regardless of
-    // the global toggle, because here the rotation is not only about the chain
-    // — its persist re-stamps the fed session token, and a stale sidecar has a
-    // live claude reading it.
-    (enabled || feed)
+    // CLA-ROLL: a rolling profile forces the preemptive leg regardless of the
+    // global toggle, because here the rotation is not only about the chain —
+    // its persist re-stamps the session token, and a stale sidecar has a live
+    // claude reading it.
+    (enabled || rolling)
         && access_expires_at.is_some_and(|exp| now_ms + rotate_lead_ms(interval_ms) >= exp)
 }
 

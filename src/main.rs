@@ -952,7 +952,7 @@ fn cmd_rolling_token(name: &str) -> Result<()> {
     if claude::quarantine_misfilled_sidecar(&canonical)? {
         println!(
             "clauth: '{canonical}' had a mis-filled sidecar (a rotating pair). It was \
-             quarantined under ~/.clauth/quarantine/ before arming."
+             quarantined under the profile's quarantine/ dir before arming."
         );
     }
     if let Some(profile) = config.find_mut(&canonical) {
@@ -963,7 +963,14 @@ fn cmd_rolling_token(name: &str) -> Result<()> {
     let handle: profile::ConfigHandle =
         std::sync::Arc::new(crate::lockorder::RankedMutex::new(config));
     oauth::arm_rolling_token(&handle, &canonical, oauth::refresh_result)?;
-    report_armed_sidecar(&canonical);
+    // Re-read under the handle: the gate marks a terminally dead chain
+    // `auth_broken` on its way to degrading, and that is what separates
+    // "nothing to retry" from "the daemon will get it".
+    let chain_is_broken = handle
+        .lock()
+        .ok()
+        .is_some_and(|c| c.state.auth_broken.contains(&canonical.as_str().into()));
+    report_armed_sidecar(&canonical, chain_is_broken)?;
     if is_active {
         claude::force_link_profile_credentials(&canonical)?;
         println!("clauth: installed live. New sessions run on it immediately.");
@@ -985,16 +992,27 @@ fn cmd_rolling_token(name: &str) -> Result<()> {
 /// No confirm prompt: a security prompt on a repeatable command gets clicked
 /// through. The printed scope list plus the SECURITY.md row is the honest
 /// middle, and it is printed AFTER the fact, when it describes something real.
-fn report_armed_sidecar(canonical: &str) {
+fn report_armed_sidecar(canonical: &str, chain_is_broken: bool) -> Result<()> {
     let Some((kind, token)) = claude::sidecar_summary(canonical) else {
         println!("clauth: rolling token armed for '{canonical}'.");
-        return;
+        return Ok(());
     };
     match kind {
+        // The gate returns `Ready` on three paths that armed NOTHING and left
+        // the mint in place, and they do not deserve one message. A dead chain
+        // is not something the daemon retries out of — it needs a re-login, and
+        // a script has to be able to tell that from success.
+        claude::SidecarKind::Mint if chain_is_broken => {
+            anyhow::bail!(
+                "'{canonical}' is flagged for a rolling token, but its usage chain is dead, \
+                 so sessions stay on the static mint and nothing will re-stamp them. Run \
+                 `clauth login {canonical}` to revive the chain, then re-run."
+            );
+        }
         claude::SidecarKind::Mint => {
             println!(
-                "clauth: '{canonical}' is flagged for a rolling token, but the usage chain \
-                 could not be read, so sessions stay on the static mint for now. The daemon \
+                "clauth: '{canonical}' is flagged for a rolling token, but its usage chain \
+                 could not be read just now, so sessions stay on the static mint. The daemon \
                  retries on its next rotation."
             );
         }
@@ -1025,6 +1043,7 @@ fn report_armed_sidecar(canonical: &str) {
             );
         }
     }
+    Ok(())
 }
 
 /// `clauth static-token <profile>` — put the preserved `claude setup-token`
@@ -1040,8 +1059,13 @@ fn cmd_static_token(name: &str) -> Result<()> {
     // rotation guard: without it, a concurrent rotation that still sees the
     // flag set can re-stamp the sidecar AFTER the restore, leaving the flag
     // off, an hours-horizon live credential, and no backup.
+    // NOT a contention hint: `RotationGuard::acquire` ends in a BLOCKING
+    // `File::lock()`, so a sibling refresh makes this WAIT rather than fail.
+    // Arriving at the error means the lock file could not be created or opened
+    // — a filesystem or permissions problem under `~/.clauth` — and the
+    // original error says which, so it is kept rather than replaced.
     let _guard = runtime::RotationGuard::acquire(&canonical)
-        .map_err(|_| anyhow::anyhow!("'{canonical}' is mid-rotation; retry in a moment"))?;
+        .with_context(|| format!("could not lock '{canonical}' to restore its static token"))?;
     if let Some(profile) = config.find_mut(&canonical) {
         profile.rolling_token = false;
         profile::save_profile(profile)?;

@@ -525,8 +525,11 @@ fn rotation_blocked_by_live_session(has_live_session: bool, is_macos: bool) -> b
 /// EVERY unknown reads as rotatable, matching [`has_live_session`]'s own
 /// fail-closed asymmetry: an unreadable marker dir, a marker with no registry
 /// row (`acquire` tolerates a failed registration), a row from a clauth that
-/// predates `launch_store`, an unreadable or half-written credential file, and
-/// a live BARE-marker stand-in all return `true` and refuse exactly as today.
+/// predates `launch_store`, and an unreadable or half-written credential file
+/// all return `true` and refuse exactly as today. Bare `claude` sessions never
+/// reach this predicate at all — their stand-in markers live under
+/// [`live_bare_dir`], not the profile — so the refusal is unchanged for them
+/// by construction rather than by this check.
 fn live_session_holds_rotatable(name: &str) -> bool {
     let Some(dirs) = session_marker_dirs(name) else {
         return true;

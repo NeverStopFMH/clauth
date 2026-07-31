@@ -2467,16 +2467,16 @@ fn heal_misfilled_sidecar_quarantines_and_restores_the_mint() {
         !dir.join("session-token.static.json").exists(),
         "backup consumed"
     );
-    let quarantine = crate::profile::clauth_dir()
-        .expect("dir")
-        .join("quarantine");
+    // Under the PROFILE, so `clauth delete` sweeps the rotating pair it holds
+    // along with everything else that account owns.
+    let quarantine = dir.join("quarantine");
     let quarantined = std::fs::read_dir(&quarantine)
         .expect("quarantine dir")
         .filter_map(|e| e.ok())
         .any(|e| {
             e.file_name()
                 .to_string_lossy()
-                .ends_with(&format!("{name}.session-token.json"))
+                .ends_with(".session-token.json")
         });
     assert!(quarantined, "mis-fill evidence preserved in quarantine");
 
@@ -2579,26 +2579,25 @@ fn a_mint_in_its_final_month_is_still_preserved() {
     assert_eq!(sidecar_kind(name), Some(SidecarKind::Rolling));
 }
 
-/// The other side of the same inference: a rolling bearer whose stamp happens
-/// to sit beyond the horizon must never be snapshotted as "the mint", or a
-/// later restore installs a token that died hours after it was taken.
+/// The other side of the same inference: a rolling bearer must never be
+/// snapshotted as "the mint", or a later restore installs a token that died
+/// hours after it was taken. Marked `rolling`, and mint-shaped on neither axis
+/// the veto checks — which is what a roll actually writes.
 #[test]
-fn a_rolling_bearer_is_never_preserved_however_far_out_its_stamp_sits() {
+fn a_rolling_bearer_is_never_preserved_as_the_mint() {
     let _home = HomeSandbox::new();
-    let name = "kind-long-roll";
+    let name = "kind-roll-shape";
     let dir = crate::profile::profile_dir(name).expect("dir");
     std::fs::create_dir_all(&dir).expect("mkdir");
     let now = crate::usage::now_ms() as i64;
 
-    // Marked rolling, but wearing a year-scale stamp and no subscriptionType —
-    // i.e. mint-shaped to every content test the old code applied.
     let rolling = ClaudeCredentials {
         claude_ai_oauth: Some(OAuthToken {
-            access_token: "at-rolling-but-long".to_string(),
+            access_token: "at-rolling".to_string(),
             refresh_token: None,
-            expires_at: Some(now + 300 * 86_400_000),
+            expires_at: Some(now + 8 * 3_600_000),
             scopes: None,
-            subscription_type: None,
+            subscription_type: Some("max".into()),
         }),
     };
     std::fs::write(
@@ -2780,5 +2779,137 @@ fn arming_from_disk_stamps_the_post_guard_chain_not_a_stale_snapshot() {
     assert!(
         creds.refresh_token().is_none(),
         "nothing rotatable ever reaches the sidecar"
+    );
+}
+
+/// The restore paths consume the backup, so they are the one place where a
+/// lost marker is not self-repairing: a stale `rolling` claim left over the
+/// restored mint makes the next roll skip the snapshot and overwrite the only
+/// copy. So the mark happens BEFORE the backup is removed and its failure is
+/// propagated — leaving sidecar=mint, backup intact, and the whole restore
+/// retryable.
+///
+/// The failure is induced by putting a DIRECTORY where the marker file goes,
+/// which is the portable way to make `atomic_write_600`'s publish fail.
+#[test]
+fn a_restore_that_cannot_mark_keeps_the_backup() {
+    let _home = HomeSandbox::new();
+    let name = "kind-restore-fails";
+    let dir = crate::profile::profile_dir(name).expect("dir");
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    let now = crate::usage::now_ms() as i64;
+
+    let mint = ClaudeCredentials {
+        claude_ai_oauth: Some(OAuthToken {
+            access_token: "sk-ant-oat01-the-preserved-mint-000000000".to_string(),
+            refresh_token: None,
+            expires_at: Some(now + 300 * 86_400_000),
+            scopes: None,
+            subscription_type: None,
+        }),
+    };
+    let bytes = serde_json::to_vec_pretty(&mint).expect("ser");
+    std::fs::write(dir.join("session-token.static.json"), &bytes).expect("write backup");
+    std::fs::write(dir.join("session-token.json"), b"{}").expect("write sidecar");
+    mark_sidecar(name, SidecarKind::Rolling).expect("pre-mark");
+    // Make the marker unwritable: a dir cannot be replaced by a file rename.
+    std::fs::remove_file(dir.join("session-token.kind")).expect("rm marker");
+    std::fs::create_dir(dir.join("session-token.kind")).expect("block the marker path");
+
+    let err = restore_static_mint(name);
+    assert!(
+        err.is_err(),
+        "a restore that cannot mark must not report success"
+    );
+    assert!(
+        dir.join("session-token.static.json").exists(),
+        "the backup must survive, or the mint has no second copy anywhere"
+    );
+}
+
+/// And on the happy path the marker really does say `mint` afterwards, so the
+/// next roll snapshots it instead of skipping it.
+#[test]
+fn a_restore_marks_the_sidecar_as_the_mint() {
+    let _home = HomeSandbox::new();
+    let name = "kind-restore-ok";
+    let dir = crate::profile::profile_dir(name).expect("dir");
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    let now = crate::usage::now_ms() as i64;
+    let mint = ClaudeCredentials {
+        claude_ai_oauth: Some(OAuthToken {
+            access_token: "sk-ant-oat01-the-preserved-mint-111111111".to_string(),
+            refresh_token: None,
+            expires_at: Some(now + 300 * 86_400_000),
+            scopes: None,
+            subscription_type: None,
+        }),
+    };
+    std::fs::write(
+        dir.join("session-token.static.json"),
+        serde_json::to_vec_pretty(&mint).expect("ser"),
+    )
+    .expect("write backup");
+    std::fs::write(dir.join("session-token.json"), b"{}").expect("write sidecar");
+    mark_sidecar(name, SidecarKind::Rolling).expect("pre-mark");
+
+    assert!(restore_static_mint(name).expect("restore"));
+    assert_eq!(sidecar_kind(name), Some(SidecarKind::Mint));
+    assert!(
+        !dir.join("session-token.static.json").exists(),
+        "backup consumed"
+    );
+}
+
+/// A marker can go stale — a write that failed after the sidecar already
+/// moved. A stale `rolling` over a genuine mint is the one disagreement that
+/// destroys data, because the snapshot is skipped and the next roll overwrites
+/// the only copy. Content vetoes that direction: a mint-SHAPED sidecar is
+/// preserved whatever the marker claims.
+#[test]
+fn a_stale_rolling_marker_cannot_destroy_a_mint() {
+    let _home = HomeSandbox::new();
+    let name = "kind-stale-marker";
+    let dir = crate::profile::profile_dir(name).expect("dir");
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    let now = crate::usage::now_ms() as i64;
+
+    // A genuine mint on disk, but the marker still claims `rolling`.
+    let mint = ClaudeCredentials {
+        claude_ai_oauth: Some(OAuthToken {
+            access_token: "sk-ant-oat01-mint-under-a-stale-marker-1".to_string(),
+            refresh_token: None,
+            expires_at: Some(now + 300 * 86_400_000),
+            scopes: None,
+            subscription_type: None,
+        }),
+    };
+    std::fs::write(
+        dir.join("session-token.json"),
+        serde_json::to_vec_pretty(&mint).expect("ser"),
+    )
+    .expect("write mint");
+    mark_sidecar(name, SidecarKind::Rolling).expect("stale mark");
+
+    stamp_rolling_token(
+        name,
+        &OAuthToken {
+            access_token: "at-rolling".to_string(),
+            refresh_token: None,
+            expires_at: Some(now + 8 * 3_600_000),
+            scopes: None,
+            subscription_type: Some("max".into()),
+        },
+    )
+    .expect("roll");
+
+    let backup: ClaudeCredentials = serde_json::from_slice(
+        &std::fs::read(dir.join("session-token.static.json"))
+            .expect("a stale marker must not be allowed to destroy the mint"),
+    )
+    .expect("parse");
+    assert_eq!(
+        backup.access_token(),
+        Some("sk-ant-oat01-mint-under-a-stale-marker-1")
     );
 }

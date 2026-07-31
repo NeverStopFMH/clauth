@@ -26,6 +26,9 @@ date. The one copy that lives elsewhere is the macOS Keychain item below.
 |------|----------|-----------|
 | `~/.clauth/profiles/<name>/credentials.json` | OAuth token snapshot | file `0600`, dirs `0700` |
 | `~/.clauth/profiles/<name>/session-token.json` | long-lived `claude setup-token` login, if captured (sessions run on this; no refresh token) | file `0600`, dirs `0700` |
+| `~/.clauth/profiles/<name>/session-token.static.json` | the `claude setup-token` mint a rolling token superseded, kept so `clauth static-token <p>` (or a dead chain) can restore it | file `0600`, dirs `0700` |
+| `~/.clauth/profiles/<name>/session-token.kind` | one word (`mint` or `rolling`) recording which of the two the sidecar holds, so nothing has to infer it from the token's shape | file `0600`, dirs `0700` |
+| `~/.clauth/quarantine/<ts>-<seq>-<name>.session-token.json` | a mis-filled sidecar moved aside before repair, kept as evidence. By definition it carries a refresh token — that is what made it a mis-fill — which is why the dir is `0700` and why nothing prunes it automatically | file `0600`, dir `0700` |
 | `~/.clauth/profiles/<name>/config.toml` | base URL, API key (endpoint profiles), env block | `0600` |
 | `~/.clauth/profiles/<name>/usage_cache.json` | last-known utilization and plan | `0600` |
 | `~/.clauth/profiles/<name>/runtime-<sid>/settings.json` | one live session's Claude Code settings. An endpoint profile's key is **not** in it: the file carries an `apiKeyHelper` line naming `clauth __api-key <profile>`, which Claude Code runs per request to mint the key | `0600` |
@@ -127,6 +130,22 @@ User-invoked, only when you run the command:
 - **`clauth start` / `clauth resume`.** Spawns `claude` against the profile you named,
   so everything that session sends bills to that account. clauth forwards your args and
   sends nothing of its own.
+
+- **Rolling session token (`clauth rolling-token <profile>`).** Points the
+  profile's `session-token.json` at that profile's own OAuth usage chain: the
+  daemon re-stamps the file with the chain's current access token, minus the
+  refresh token, so sessions still hold nothing rotatable. It also **widens what
+  that credential can reach**. A `claude setup-token` mint carries two scopes,
+  `user:inference` and `user:sessions:claude_code`. The rolling bearer carries
+  the chain's full granted set — for a standard Pro/Max browser login that is
+  `user:profile`, `user:inference`, `user:sessions:claude_code`,
+  `user:mcp_servers` and `user:file_upload`, plus `org:create_api_key` when the
+  chain was minted with it. Anything that can read the sidecar, or the live
+  `~/.claude/.credentials.json` a switch installs it into, can use every one of
+  those scopes until the token expires — which is hours rather than the mint's
+  year. The command prints the scope list when it arms, so the widening is
+  stated where the decision is made. `clauth static-token <profile>` restores
+  the narrower mint; a terminally dead chain does the same automatically.
 
 Agent-invoked, only when the Claude Code plugin is installed:
 

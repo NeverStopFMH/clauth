@@ -411,6 +411,7 @@ pub(crate) fn blank_profile(name: &str) -> crate::profile::Profile {
         weekly_threshold: None,
         last_resort: false,
         preferred: false,
+        rolling_token: false,
         max_auto_spend: None,
         check_weekly: true,
         check_scoped: true,

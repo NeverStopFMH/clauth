@@ -113,6 +113,20 @@ pub(crate) enum Cause {
     InternalLock,
     /// The refresh landed but the rotated pair could not be written.
     PersistFailed(String),
+    /// CLA-ROLL: the rolling session token could not be written to (or restored
+    /// into) the profile's sidecar. The chain itself is fine — what failed is
+    /// the file in front of it, so this is a filesystem problem and not an
+    /// account one.
+    SidecarWriteFailed(String),
+    /// CLA-ROLL: a live `clauth start` session is holding this profile's
+    /// ROTATING pair, because it started before the sidecar was armed. Spending
+    /// the refresh now revokes the chain under a running session, which is the
+    /// exact death the static-token split exists to prevent.
+    ///
+    /// Distinct from [`Self::RotationLockUnavailable`] on purpose: nothing is
+    /// locked and nothing is broken. The next step is the operator's, and it is
+    /// specific enough that a generic retry hint would be wrong.
+    LiveSessionOnRotatingChain(String),
 }
 
 impl Cause {
@@ -125,6 +139,16 @@ impl Cause {
                 )
             }
             Self::InternalLock => "clauth hit an internal lock error, restart clauth".to_string(),
+            Self::SidecarWriteFailed(profile) => {
+                format!("could not write '{profile}' session token; check permissions on ~/.clauth")
+            }
+            Self::LiveSessionOnRotatingChain(profile) => {
+                format!(
+                    "'{profile}' has a live clauth start session holding its rotating chain \
+                     (it started before the rolling token was armed); restart that session or \
+                     retry once it ends"
+                )
+            }
             Self::PersistFailed(profile) => {
                 format!("refreshed '{profile}' but failed to persist the rotated tokens")
             }

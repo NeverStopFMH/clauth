@@ -44,6 +44,12 @@ const FEATURE_MAP: &[(&str, &[&str])] = &[
             "relogin_is_diverged",
             "overwrite_confirm",
             "overwrite_cancel",
+            // rolling session token (#59): the arm/restore verbs and the
+            // sidecar state they manage — what a switch installs.
+            "rolling_gate_",
+            "stamp_rolling_token_writes",
+            "first_stamp_preserves_the_mint",
+            "restore_static_mint_round_trip",
         ],
     ),
     (
@@ -134,6 +140,11 @@ const FEATURE_MAP: &[(&str, &[&str])] = &[
             "live_session_included",
             "force_true_bypasses",
             "rotation_guard_is_independent",
+            // rolling session token (#59): the daemon leg — the tick that
+            // re-stamps the sidecar and the gate it goes through.
+            "claude_rolling_tick_",
+            "restamp_",
+            "rolling_token_forces_the_preemptive_leg",
         ],
     ),
     (

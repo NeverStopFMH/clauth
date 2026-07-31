@@ -1040,6 +1040,7 @@ fn credential_and_cache_files_have_restricted_permissions() {
         weekly_threshold: None,
         last_resort: false,
         preferred: false,
+        rolling_token: false,
         max_auto_spend: None,
         check_weekly: true,
         check_scoped: true,
@@ -2048,4 +2049,33 @@ fn pending_recovery_preserves_the_stores_mcp_oauth() {
         after["mcpOAuth"]["linear"]["accessToken"], "mock-linear",
         "the MCP-server login survives an interrupted rotation"
     );
+}
+
+#[test]
+fn rolling_token_round_trips_through_config_toml() {
+    let mut profile = Profile::new("p".to_string(), None, None);
+    profile.rolling_token = true;
+    let rendered = render_config_toml(&profile);
+    let parsed: ProfileConfig = toml::from_str(&rendered).expect("parse rendered toml");
+    assert!(parsed.rolling_token);
+}
+
+/// The pre-rename spelling has to keep loading. `serde(default)` swallows an
+/// unknown key silently, so without the alias every profile armed before the
+/// rename would read as OFF, and the very next `render_config_toml` would
+/// rewrite its config without the key — flag gone, sidecar still in front of
+/// sessions, and nothing left to re-stamp it. That is the silent-disengage
+/// failure this feature exists to end, so it must not be how it ships.
+#[test]
+fn the_pre_rename_session_feed_key_still_loads() {
+    let legacy: ProfileConfig =
+        toml::from_str("session_feed = true\n").expect("parse legacy config");
+    assert!(
+        legacy.rolling_token,
+        "the `session_feed` alias is what carries an armed profile across the rename"
+    );
+    // And the new spelling still wins on a config that carries it.
+    let current: ProfileConfig =
+        toml::from_str("rolling_token = true\n").expect("parse current config");
+    assert!(current.rolling_token);
 }

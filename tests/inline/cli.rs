@@ -374,10 +374,17 @@ fn static_token(args: &[&str]) -> (String, bool, bool) {
 }
 
 /// The clear half of the sidecar is a VERB, not a flag on `login`: it removes a
-/// credential, and `login` is the command that adds one. `--clear` is required,
-/// so the bare verb stays reserved rather than silently meaning "clear".
+/// credential, and `login` is the command that adds one. The bare verb is the
+/// restore (the inverse of `rolling-token`), `--clear` selects the removal, and
+/// `--yes` belongs to the clear alone — the restore never prompts, so a `--yes`
+/// beside the bare form would be accepted noise that later grew a meaning.
 #[test]
-fn static_token_needs_clear_and_takes_an_unprompted_yes() {
+fn static_token_bare_restores_and_clear_takes_an_unprompted_yes() {
+    let (profile, clear, yes) = static_token(&["static-token", "acme"]);
+    assert_eq!(profile, "acme");
+    assert!(!clear, "the bare verb is the restore, not the clear");
+    assert!(!yes);
+
     let (profile, clear, yes) = static_token(&["static-token", "acme", "--clear"]);
     assert_eq!(profile, "acme");
     assert!(clear);
@@ -388,10 +395,11 @@ fn static_token_needs_clear_and_takes_an_unprompted_yes() {
         "-y is the short spelling"
     );
 
-    let err = parse(&["static-token", "acme"]).expect_err("the bare verb must be refused");
+    let err =
+        parse(&["static-token", "acme", "--yes"]).expect_err("--yes without --clear must be refused");
     assert!(
         err.to_string().contains("--clear"),
-        "the error must name what is missing, got: {err}"
+        "the error must name what --yes requires, got: {err}"
     );
     assert_eq!(err.exit_code(), 2);
 }

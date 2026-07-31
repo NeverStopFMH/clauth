@@ -7,11 +7,11 @@ use crate::oauth::RefreshError;
 use crate::profile::DEFAULT_REFRESH_INTERVAL_MS as REFRESH_INTERVAL_MS;
 
 use super::{
-    ActivityStore, EpochMs, LastFetchedAt, ProfileActivity, RESET_ANCHOR_GRACE_MS,
-    SuppressedGenericStore, ThirdPartyEntry, TokenEntry, anchor_post_reset_oauth, clear_activity,
-    clear_orphaned_forced, collect_oauth_seed_names, collect_third_party_entries, collect_tokens,
-    filter_suppressed, mark_activity, memoized_identity, partition_due, should_anchor_fetch,
-    window_lapsed,
+    ActivityStore, ClaudeRollingPacing, EpochMs, LastFetchedAt, ProfileActivity,
+    RESET_ANCHOR_GRACE_MS, SuppressedGenericStore, ThirdPartyEntry, TokenEntry,
+    anchor_post_reset_oauth, clear_activity, clear_orphaned_forced, collect_oauth_seed_names,
+    collect_third_party_entries, collect_tokens, filter_suppressed, mark_activity,
+    memoized_identity, partition_due, should_anchor_fetch, window_lapsed,
 };
 
 fn token(name: &str) -> TokenEntry {
@@ -3444,8 +3444,9 @@ fn pre_rotation_other_errors_bail_to_cache() {
 }
 
 // `proactive_rotation_due` decides whether a profile rotates AHEAD of expiry
-// instead of waiting for a 401. Two inputs only: the `preemptive_rotation`
-// toggle (default ON) and whether the stored expiry sits inside the lead
+// instead of waiting for a 401. Three inputs: the `preemptive_rotation`
+// toggle (default ON), the CLA-ROLL flag (which ORs over the toggle, never
+// over the clock), and whether the stored expiry sits inside the lead
 // window. Liveness, active-ness and the Keychain are NOT inputs — every
 // non-isolated session reads the same credential file clauth rotates.
 
@@ -3454,6 +3455,7 @@ fn preemptive_rotation_is_on_by_default_and_the_toggle_still_disables_it() {
     assert!(crate::profile::AppState::default().preemptive_rotation);
     // Toggled off, a token deep inside the lead window stays lazy.
     assert!(!super::proactive_rotation_due(
+        false,
         false,
         Some(10_000),
         10_000,
@@ -3469,12 +3471,14 @@ fn proactive_rotation_fires_only_inside_the_lead_window() {
     // the 5-minute mark where the running claude would refresh it itself.
     assert!(super::proactive_rotation_due(
         true,
+        false,
         Some(10_000 + lead),
         10_000,
         interval
     ));
     assert!(super::proactive_rotation_due(
         true,
+        false,
         Some(10_000),
         10_000,
         interval
@@ -3482,6 +3486,7 @@ fn proactive_rotation_fires_only_inside_the_lead_window() {
     // Beyond the lead window → plain poll; nothing at stake yet.
     assert!(!super::proactive_rotation_due(
         true,
+        false,
         Some(10_000 + lead + 1),
         10_000,
         interval
@@ -3523,7 +3528,9 @@ fn the_rotation_lead_clears_claude_codes_own_five_minute_refresh_threshold() {
 #[test]
 fn proactive_rotation_never_fires_on_unknown_expiry() {
     // Never spend a single-use refresh on a token whose expiry we can't prove.
-    assert!(!super::proactive_rotation_due(true, None, 10_000, 90_000));
+    assert!(!super::proactive_rotation_due(
+        true, false, None, 10_000, 90_000
+    ));
 }
 
 /// Liveness is not an input. Under the old gate a running `clauth start`
@@ -3537,11 +3544,13 @@ fn proactive_rotation_decides_on_the_toggle_and_the_clock_alone() {
     for now in [0i64, 10_000, 1_700_000_000_000] {
         assert!(super::proactive_rotation_due(
             true,
+            false,
             Some(now + lead),
             now,
             interval
         ));
         assert!(!super::proactive_rotation_due(
+            false,
             false,
             Some(now + lead),
             now,
@@ -3705,6 +3714,7 @@ fn standdown_tick_drains_forced_and_publishes_countdowns() {
         fetch_lease: Arc::new(crate::daemon::FetchLease::new()),
         standdown_active: AtomicBool::new(true),
         last_history_prune: AtomicU64::new(crate::usage::now_ms()),
+        claude_feed: std::sync::Mutex::new(ClaudeRollingPacing::default()),
     };
 
     // A manual `r` landed just before this tick: forced name + Queued mark.
@@ -3786,6 +3796,7 @@ fn standdown_sweeps_bootstrap_queued_marks() {
         fetch_lease: Arc::new(crate::daemon::FetchLease::new()),
         standdown_active: AtomicBool::new(true),
         last_history_prune: AtomicU64::new(crate::usage::now_ms()),
+        claude_feed: std::sync::Mutex::new(ClaudeRollingPacing::default()),
     };
 
     // Bootstrap pre-marked a cache-due profile; a rotate worker from the last
@@ -3867,6 +3878,7 @@ fn tick_stands_down_when_another_instance_holds_the_fetch_lease() {
         fetch_lease: Arc::new(crate::daemon::FetchLease::new()),
         standdown_active: AtomicBool::new(false),
         last_history_prune: AtomicU64::new(crate::usage::now_ms()),
+        claude_feed: std::sync::Mutex::new(ClaudeRollingPacing::default()),
     };
 
     // Stamp `kitty` as just-fetched so it is NOT due this tick: an armed tick
@@ -3962,6 +3974,7 @@ fn tick_fetches_the_third_party_leg_under_its_own_lease() {
         fetch_lease: Arc::new(crate::daemon::FetchLease::new()),
         standdown_active: AtomicBool::new(false),
         last_history_prune: AtomicU64::new(crate::usage::now_ms()),
+        claude_feed: std::sync::Mutex::new(ClaudeRollingPacing::default()),
     };
 
     super::tick(&state);
@@ -4074,6 +4087,7 @@ fn tick_prunes_histories_and_throttles_a_second_tick_inside_the_cadence_window()
         fetch_lease: Arc::new(crate::daemon::FetchLease::new()),
         standdown_active: AtomicBool::new(false),
         last_history_prune: AtomicU64::new(stale_prune),
+        claude_rolling: crate::lockorder::RankedMutex::new(ClaudeRollingPacing::default()),
     };
 
     // First tick: wins the lease, prunes histories, fetches.
@@ -4311,6 +4325,7 @@ fn completion_order_state() -> super::SchedulerState {
         fetch_lease: Arc::new(crate::daemon::FetchLease::new()),
         standdown_active: AtomicBool::new(false),
         last_history_prune: AtomicU64::new(crate::usage::now_ms()),
+        claude_feed: std::sync::Mutex::new(ClaudeRollingPacing::default()),
     }
 }
 
@@ -6228,4 +6243,235 @@ fn an_adopt_after_a_rejected_refresh_keeps_the_profile_out_of_quarantine() {
         .and_then(|p| p.access_token().map(str::to_string));
     assert_eq!(stored.as_deref(), Some("at-mirror-retry"));
     assert_eq!(outcome.status, super::FetchStatus::Cached);
+}
+
+/// CLA-ROLL: a fed profile forces the preemptive leg regardless of the global
+/// toggle, because here the rotation is not only about the chain — its persist
+/// re-stamps the fed session token, and a stale sidecar has a live claude
+/// reading it.
+///
+/// The feed axis ORs over `enabled` and NOTHING else. The last two rows are the
+/// ones that earn their keep: letting `feed` short-circuit the whole predicate
+/// (`feed || expiry_inside_window`) survives every other assertion in this file,
+/// so without them the conjunct is unpinned on exactly the axis this feature
+/// adds.
+#[test]
+fn rolling_token_forces_the_preemptive_leg() {
+    let interval = 90_000u64;
+    let lead = super::rotate_lead_ms(interval);
+    // Toggle OFF + feed ON → rotates inside the lead window anyway.
+    assert!(super::proactive_rotation_due(
+        false,
+        true,
+        Some(10_000 + lead),
+        10_000,
+        interval
+    ));
+    // Both off → inert, the stock pre-stamp behavior.
+    assert!(!super::proactive_rotation_due(
+        false,
+        false,
+        Some(10_000),
+        10_000,
+        interval
+    ));
+    // Feed OFF + toggle ON keeps the pre-stamp contract byte-for-byte.
+    assert!(super::proactive_rotation_due(
+        true,
+        false,
+        Some(10_000 + lead),
+        10_000,
+        interval
+    ));
+    // ── the conjunct, pinned on the feed axis ──
+    // A fed profile BEYOND the lead window still waits its turn.
+    assert!(!super::proactive_rotation_due(
+        false,
+        true,
+        Some(10_000 + lead + 1),
+        10_000,
+        interval
+    ));
+    // A fed profile whose expiry we cannot prove never spends a single-use
+    // refresh — the rule in the doc comment holds on this axis too.
+    assert!(!super::proactive_rotation_due(
+        false, true, None, 10_000, interval
+    ));
+}
+
+fn rolling_profile_config(
+    rolling_names: &[&str],
+    plain_names: &[&str],
+) -> crate::profile::ConfigHandle {
+    let profiles = rolling_names
+        .iter()
+        .map(|n| {
+            let mut p = crate::testutil::blank_profile(n);
+            p.rolling_token = true;
+            p
+        })
+        .chain(
+            plain_names
+                .iter()
+                .map(|n| crate::testutil::blank_profile(n)),
+        )
+        .collect();
+    Arc::new(RankedMutex::new(crate::profile::AppConfig {
+        state: crate::profile::AppState {
+            profiles: rolling_names
+                .iter()
+                .chain(plain_names.iter())
+                .map(|n| (*n).into())
+                .collect(),
+            ..Default::default()
+        },
+        profiles,
+    }))
+}
+
+/// A fed (refresh-less) sidecar expiring `exp_in_ms` from now.
+fn write_rolling_sidecar(name: &str, exp_in_ms: i64) {
+    crate::claude::stamp_rolling_token(
+        name,
+        &crate::profile::OAuthToken {
+            access_token: format!("{name}-fed"),
+            refresh_token: None,
+            expires_at: Some(crate::usage::now_ms() as i64 + exp_in_ms),
+            scopes: None,
+            subscription_type: None,
+        },
+    )
+    .expect("feed sidecar");
+}
+
+/// A dying fed bearer gets the gate; a second tick inside the scan gap does
+/// not re-run it.
+#[test]
+fn claude_rolling_tick_restamps_a_dying_rolling_sidecar() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let config = rolling_profile_config(&["cl-feed"], &[]);
+    write_rolling_sidecar("cl-feed", 60 * 60 * 1000); // +1h, inside the 2h horizon
+    let pacing = std::sync::Mutex::new(super::ClaudeRollingPacing::default());
+    let now = crate::usage::now_ms();
+
+    let calls = std::sync::atomic::AtomicUsize::new(0);
+    super::claude_rolling_tick(&config, &pacing, now, &|name| {
+        calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(name, "cl-feed");
+        crate::oauth::AuthGate::Ready
+    });
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+    // Inside the scan gap: no re-run even though the sidecar is still dying.
+    super::claude_rolling_tick(&config, &pacing, now + 1_000, &|_| {
+        panic!("inside the scan gap — must not re-run")
+    });
+}
+
+/// Fresh sidecars and non-rolling profiles are never the timer's business.
+#[test]
+fn claude_rolling_tick_ignores_fresh_and_non_rolling_profiles() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let config = rolling_profile_config(&["cl-fresh"], &["cl-plain"]);
+    write_rolling_sidecar("cl-fresh", 6 * 60 * 60 * 1000); // clear of the horizon
+    write_rolling_sidecar("cl-plain", 60 * 60 * 1000); // dying, but the rolling token is OFF
+    let pacing = std::sync::Mutex::new(super::ClaudeRollingPacing::default());
+    super::claude_rolling_tick(&config, &pacing, crate::usage::now_ms(), &|name| {
+        panic!("'{name}' must not be re-stamped")
+    });
+}
+
+/// A Ready that leaves the sidecar STILL due (the degrade leg serving a live
+/// mint/bearer through transient chain trouble) paces like a transient — no
+/// per-scan re-run of the gate.
+#[test]
+fn claude_rolling_tick_ready_but_still_due_paces_like_transient() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let config = rolling_profile_config(&["cl-degrade"], &[]);
+    write_rolling_sidecar("cl-degrade", 60 * 60 * 1000);
+    let pacing = std::sync::Mutex::new(super::ClaudeRollingPacing::default());
+    let now = crate::usage::now_ms();
+
+    let calls = std::sync::atomic::AtomicUsize::new(0);
+    let degrading = |_: &str| {
+        // Ready without advancing the sidecar — the degrade posture.
+        calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        crate::oauth::AuthGate::Ready
+    };
+    super::claude_rolling_tick(&config, &pacing, now, &degrading);
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+    // Re-open the scan gate: the still-due Ready must have widened.
+    pacing.lock().unwrap().next_scan_ms = 0;
+    super::claude_rolling_tick(&config, &pacing, now + 60_000, &degrading);
+    assert_eq!(
+        calls.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "a degrade-masked Ready paces like a transient, not per scan"
+    );
+
+    // Past the widening → retried.
+    pacing.lock().unwrap().next_scan_ms = 0;
+    super::claude_rolling_tick(
+        &config,
+        &pacing,
+        now + super::ROLLING_RETRY_MS + 1,
+        &degrading,
+    );
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+}
+
+/// A transient gate failure widens the per-profile retry past the scan gap.
+#[test]
+fn claude_rolling_tick_transient_failure_widens_the_retry() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let config = rolling_profile_config(&["cl-flaky"], &[]);
+    write_rolling_sidecar("cl-flaky", 60 * 60 * 1000);
+    let pacing = std::sync::Mutex::new(super::ClaudeRollingPacing::default());
+    let now = crate::usage::now_ms();
+
+    let calls = std::sync::atomic::AtomicUsize::new(0);
+    let flaky = |_: &str| {
+        calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        crate::oauth::AuthGate::Transient(crate::format::Transient::new(
+            crate::format::Cause::Endpoint("connection reset"),
+            crate::format::Retry::Connection,
+        ))
+    };
+    super::claude_rolling_tick(&config, &pacing, now, &flaky);
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+    // Re-open the scan gate; the per-profile widening must still hold.
+    pacing.lock().unwrap().next_scan_ms = 0;
+    super::claude_rolling_tick(&config, &pacing, now + 60_000, &flaky);
+    assert_eq!(
+        calls.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "transient failure widens past the scan cadence"
+    );
+
+    // Past the widening → retried.
+    pacing.lock().unwrap().next_scan_ms = 0;
+    super::claude_rolling_tick(&config, &pacing, now + super::ROLLING_RETRY_MS + 1, &flaky);
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+}
+
+/// A DISABLED profile is off every operational surface by definition, and this
+/// leg can reach a guarded refresh — so sourcing candidates from the raw
+/// profile list instead of `enabled_profiles()` spends single-use refresh
+/// tokens, every 5 minutes, on accounts the operator took out of service.
+#[test]
+fn claude_rolling_tick_skips_a_disabled_profile() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let config = rolling_profile_config(&["cl-off"], &[]);
+    // Disable it the way `clauth disable` does.
+    {
+        let mut cfg = config.lock().expect("lock");
+        cfg.find_mut("cl-off").expect("profile").disabled = true;
+    }
+    write_rolling_sidecar("cl-off", 60 * 60 * 1000); // dying, inside the horizon
+    let pacing = std::sync::Mutex::new(super::ClaudeRollingPacing::default());
+    super::claude_rolling_tick(&config, &pacing, crate::usage::now_ms(), &|name| {
+        panic!("'{name}' is disabled and must never reach the re-stamp leg")
+    });
 }

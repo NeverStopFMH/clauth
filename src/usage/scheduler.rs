@@ -577,14 +577,21 @@ fn rotate_lead_ms(interval_ms: u64) -> i64 {
 /// and a bare `claude` both read the very credential file a rotation writes,
 /// so neither is a reason to hold off. An unknown expiry never rotates
 /// proactively (never spend a single-use refresh on a token whose expiry we
-/// can't prove).
+/// can't prove) — including for a `feed` profile, whose rolling sidecar carries an
+/// honest expiry precisely so this stays provable.
 fn proactive_rotation_due(
     enabled: bool,
+    feed: bool,
     access_expires_at: Option<i64>,
     now_ms: i64,
     interval_ms: u64,
 ) -> bool {
-    enabled && access_expires_at.is_some_and(|exp| now_ms + rotate_lead_ms(interval_ms) >= exp)
+    // CLA-ROLL (`feed`): a fed profile forces the preemptive leg regardless of
+    // the global toggle, because here the rotation is not only about the chain
+    // — its persist re-stamps the fed session token, and a stale sidecar has a
+    // live claude reading it.
+    (enabled || feed)
+        && access_expires_at.is_some_and(|exp| now_ms + rotate_lead_ms(interval_ms) >= exp)
 }
 
 /// Backing store for [`memoized_identity`], keyed by the SHA-256 of the access
@@ -735,7 +742,7 @@ fn fetch_with_rotation(
     // persisted the fresh expiry there, while the entry still carries the
     // pre-kick one, and a stale past expiry here would read as clock-expired
     // and re-spend the just-minted single-use pair.
-    let (is_active, access_expires_at, interval_ms, preemptive) = config
+    let (is_active, access_expires_at, interval_ms, preemptive, rolling_token) = config
         .lock()
         .map(|c| {
             (
@@ -743,20 +750,29 @@ fn fetch_with_rotation(
                 c.find(name).and_then(|p| p.access_token_expires_at()),
                 c.state.refresh_interval_ms,
                 c.state.preemptive_rotation,
+                c.find(name).is_some_and(|p| p.rolling_token),
             )
         })
         // Poisoned-lock fallback. The `None` expiry alone already forces the
-        // lazy path, so the other three are unreachable rather than chosen —
+        // lazy path, so the other four are unreachable rather than chosen —
         // they still mirror the shipped defaults so a future reader isn't told
-        // preemptive rotation is off by default.
+        // preemptive rotation is off by default. `rolling_token` falls back to
+        // OFF: the feed axis only ever ADDS a rotation, so the safe unreachable
+        // value is the one that adds none.
         .unwrap_or((
             false,
             None,
             crate::profile::DEFAULT_REFRESH_INTERVAL_MS,
             true,
+            false,
         ));
-    let proactive =
-        proactive_rotation_due(preemptive, access_expires_at, now_ms() as i64, interval_ms);
+    let proactive = proactive_rotation_due(
+        preemptive,
+        rolling_token,
+        access_expires_at,
+        now_ms() as i64,
+        interval_ms,
+    );
     let mut unmask_429: Option<Option<Duration>> = None;
     if !proactive {
         let result = fetch_raw(name, access_token, prev_plan.clone(), false, Some(activity));
@@ -2338,6 +2354,8 @@ pub(crate) struct SchedulerState {
     /// as epoch ms. Seeded at the startup pass in [`spawn_refresher`]; the tick
     /// re-runs the trim once [`HISTORY_PRUNE_INTERVAL_MS`] has elapsed.
     last_history_prune: AtomicU64,
+    /// CLA-ROLL pacing for the rolling-sidecar freshness scan.
+    claude_feed: std::sync::Mutex<ClaudeRollingPacing>,
 }
 
 /// One scheduler tick: drain forced refetches, partition both legs, publish
@@ -2374,6 +2392,13 @@ fn tick(state: &SchedulerState) {
     // it never races its own appends, and ahead of the fetch legs so a long-run
     // process re-trims before adding to the file rather than after.
     prune_histories_if_due(&state.last_history_prune, &state.config, now_ms());
+
+    // CLA-ROLL: rolling-sidecar freshness scan — renew a rolling-token profile's
+    // session bearer hours ahead of its clock death instead of relying on
+    // rotation side effects (lease-holder only, like every other leg).
+    claude_rolling_tick(&state.config, &state.claude_feed, now_ms(), &|name| {
+        crate::oauth::restamp_rolling_token(&state.config, name, crate::oauth::refresh_result)
+    });
 
     // Names pushed by rotation or manual refresh — bypass cadence this tick.
     // Drained once and handed to both legs; a forced name only matches the leg
@@ -2741,6 +2766,7 @@ pub(crate) fn spawn_refresher(
         fetch_lease,
         standdown_active: AtomicBool::new(false),
         last_history_prune,
+        claude_feed: std::sync::Mutex::new(ClaudeRollingPacing::default()),
     };
     // Same test-skip rationale as the status/tokens/pricing workers in
     // `tui/app.rs`: a detached tick thread is never joined, so it could run
@@ -3444,3 +3470,117 @@ fn clear_orphaned_forced(
 #[cfg(test)]
 #[path = "../../tests/inline/scheduler.rs"]
 mod tests;
+
+/// CLA-ROLL cadence for the rolling-sidecar freshness scan. The due predicate is
+/// stateless against the wall clock ([`crate::oauth::rolling_sidecar_restamp_due`]),
+/// so a machine-sleep gap self-corrects on the first tick after wake — no
+/// monotonic bookkeeping needed.
+const ROLLING_SCAN_GAP_MS: u64 = 5 * 60 * 1000;
+/// Widening after a transient re-stamp failure (network trouble, a busy
+/// rotation lock) — the horizon is hours wide, so minutes-scale retries lose
+/// nothing while avoiding per-scan log spam.
+const ROLLING_RETRY_MS: u64 = 15 * 60 * 1000;
+/// A Broken verdict (dead chain, no mint to degrade to) only changes via
+/// re-login — which re-arms the feed anyway — so retry on a long leash.
+const ROLLING_BROKEN_RETRY_MS: u64 = 6 * 60 * 60 * 1000;
+
+/// Pacing for the re-stamp scan: an in-memory throttle only — the durable
+/// truth is the sidecar's own expiry, which every leg re-reads.
+#[derive(Default)]
+pub(super) struct ClaudeRollingPacing {
+    next_scan_ms: u64,
+    retry_after_ms: HashMap<String, u64>,
+}
+
+/// CLA-ROLL: rolling-sidecar freshness scan. For every rolling-token claude
+/// profile whose armed sidecar is inside the re-stamp horizon of its clock
+/// death, run the full feed decision table (no-spend re-stamp / guarded
+/// refresh / mint degrade) NOW instead of waiting for a rotation side effect
+/// — the failure this exists for was exactly a rolling bearer expiring under a running session
+/// while rotations sat parked (spent-window poll parking, daemon idle,
+/// machine sleep). Lease-holder tick only, like every other leg.
+///
+/// Deliberately scans every ENABLED rolling profile, not just the active one
+/// (`AppConfig::enabled_profiles`): a parked profile's sessions may still be
+/// running on its rolling bearer (sessions
+/// survive switches by design), and a fresh sidecar makes the next switch-in
+/// instant. The extra rotation pressure is nil — claude usage chains already
+/// rotate on the ~8h access-token cadence for usage polling, and the daemon
+/// is the single writer for parked chains either way.
+///
+/// `gate_fn` is injected (production: [`crate::oauth::restamp_rolling_token`])
+/// so the orchestration — candidates → due → pace/widen — is testable
+/// offline; only the injected closure ever touches locks or the network.
+pub(super) fn claude_rolling_tick(
+    config: &crate::profile::ConfigHandle,
+    pacing: &std::sync::Mutex<ClaudeRollingPacing>,
+    now: u64,
+    gate_fn: &dyn Fn(&str) -> crate::oauth::AuthGate,
+) {
+    {
+        let Ok(mut p) = pacing.lock() else { return };
+        if now < p.next_scan_ms {
+            return;
+        }
+        p.next_scan_ms = now + ROLLING_SCAN_GAP_MS;
+    }
+    let candidates: Vec<String> = {
+        let Ok(cfg) = config.lock() else { return };
+        // `enabled_profiles()`, not `profiles`: a disabled profile is off every
+        // operational surface by definition, and this leg can reach a GUARDED
+        // REFRESH, so sourcing the raw list spends single-use refresh tokens on
+        // accounts the operator took out of service. Same view `collect_tokens`
+        // uses one screen up.
+        cfg.enabled_profiles()
+            .filter(|p| p.rolling_token)
+            .map(|p| p.name.as_str().to_string())
+            .collect()
+    };
+    for name in candidates {
+        let widened = pacing
+            .lock()
+            .ok()
+            .and_then(|p| p.retry_after_ms.get(&name).copied())
+            .is_some_and(|at| now < at);
+        if widened {
+            continue;
+        }
+        if !crate::oauth::rolling_sidecar_restamp_due(&name, now as i64) {
+            continue;
+        }
+        match gate_fn(&name) {
+            // Ready = re-stamped no-spend or degraded to a serving fallback;
+            // Refreshed = the rotation hook fed (and, active, mirrored). Both
+            // logged at their source. A Ready that left the sidecar STILL due
+            // is the degrade leg masking transient chain trouble behind a
+            // live mint/bearer (review LOW) — pace it like a transient
+            // instead of re-running the gate every scan.
+            crate::oauth::AuthGate::Ready | crate::oauth::AuthGate::Refreshed => {
+                if let Ok(mut p) = pacing.lock() {
+                    if crate::oauth::rolling_sidecar_restamp_due(&name, now as i64) {
+                        p.retry_after_ms
+                            .insert(name.clone(), now + ROLLING_RETRY_MS);
+                    } else {
+                        p.retry_after_ms.remove(&name);
+                    }
+                }
+            }
+            crate::oauth::AuthGate::Transient(e) => {
+                logline!(
+                    "clauth: re-stamp for '{name}' failed (will retry): {}",
+                    e.text_with_status()
+                );
+                if let Ok(mut p) = pacing.lock() {
+                    p.retry_after_ms
+                        .insert(name.clone(), now + ROLLING_RETRY_MS);
+                }
+            }
+            crate::oauth::AuthGate::Broken => {
+                if let Ok(mut p) = pacing.lock() {
+                    p.retry_after_ms
+                        .insert(name.clone(), now + ROLLING_BROKEN_RETRY_MS);
+                }
+            }
+        }
+    }
+}

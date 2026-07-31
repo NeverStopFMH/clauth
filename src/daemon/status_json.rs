@@ -237,6 +237,13 @@ pub(crate) fn build_status(
             serde_json::json!({
                 "name": name,
                 "active": config.is_active(name),
+                // Additive (CLA-ROLL): the session-token feed — the sidecar's
+                // hours-scale countdown is routine maintenance while true
+                // (daemon re-stamps on rotation and on the freshness timer), a
+                // dying credential while false. Readers key their token-row
+                // rendering off this so a rolling token never displays as an
+                // expiring mint.
+                "rolling_token": p.rolling_token,
                 "provider": provider_label(p),
                 "base_url": p.base_url,
                 "tier": tier_label(p),

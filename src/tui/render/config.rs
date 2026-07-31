@@ -125,6 +125,7 @@ struct Snap {
     /// not-long-lived shape the split disengages for. Read per frame for the
     /// selected profile only (one small file).
     session_token: Option<crate::claude::SessionTokenStatus>,
+    rolling_token: bool,
 }
 
 impl Snap {
@@ -154,6 +155,7 @@ impl Snap {
             provider: None,
             console_login: false,
             session_token: None,
+            rolling_token: false,
         }
     }
 }
@@ -224,6 +226,7 @@ fn build_snap(app: &App, with_text: bool) -> Snap {
             provider: p.provider.map(|p| p.display_name()),
             console_login: p.console_login_target().is_some(),
             session_token: crate::claude::session_token_status(p.name.as_str()),
+            rolling_token: p.rolling_token,
         },
         None => Snap::blank("settings"),
     }
@@ -264,6 +267,7 @@ fn draw_settings(frame: &mut Frame<'_>, area: Rect, app: &App) {
 /// tooltip wrap.
 fn session_token_lines(
     status: &crate::claude::SessionTokenStatus,
+    rolling: bool,
     now_ms: i64,
     width: usize,
 ) -> Vec<Line<'static>> {
@@ -283,7 +287,19 @@ fn session_token_lines(
     match status {
         SessionTokenStatus::LongLived(Some(ms)) => {
             if now_ms >= *ms {
-                charged("expired".to_string(), "re-mint with claude setup-token")
+                if rolling {
+                    charged(
+                        "rolling token stalled".to_string(),
+                        "expired, daemon down or chain dead; clauth rolling-token <p> re-arms",
+                    )
+                } else {
+                    charged("expired".to_string(), "re-mint with claude setup-token")
+                }
+            } else if rolling {
+                // Hours-scale countdown, accent not warning: the daemon
+                // re-stamps well inside this window.
+                let hours = (ms - now_ms).max(0) / 3_600_000;
+                plain(format!("rolling · re-stamps in ~{hours}h"), theme::accent())
             } else {
                 // Truncating division: an expiry inside the next 24h reads
                 // "~0d" and still warns; only a past expiry (handled above) is
@@ -301,7 +317,11 @@ fn session_token_lines(
             }
         }
         SessionTokenStatus::LongLived(None) => plain(
-            "long-lived · no recorded expiry".to_string(),
+            if rolling {
+                "rolling · no recorded expiry".to_string()
+            } else {
+                "long-lived · no recorded expiry".to_string()
+            },
             theme::accent(),
         ),
         SessionTokenStatus::NotLongLived => charged(
@@ -366,6 +386,7 @@ fn draw_settings_rows(
     if let Some(status) = &snap.session_token {
         lines.extend(session_token_lines(
             status,
+            snap.rolling_token,
             crate::usage::now_ms() as i64,
             inner.width as usize,
         ));

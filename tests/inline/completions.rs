@@ -477,3 +477,144 @@ fn answer_is_yes_declines_on_n_or_other_input() {
         assert!(!answer_is_yes(a), "{a:?} must decline");
     }
 }
+
+// ── the scripts must parse in the shells that source them ────────────────────
+//
+// The grammar walk above compares clap's command tree against the script TEXT
+// with `str::contains`. It models no shell lexical state at all, so a quoting
+// break is invisible to it — and worse, it DEMANDS the offending line be
+// present, so the assertion that should have caught the CLA-ROLL apostrophe
+// (`'feed[feed a profile's …]'`, which terminated the zsh single-quoted spec
+// and left the whole `_clauth` function unparseable) is the one that certified
+// it. `clauth completions install zsh` writes that file and sources it from the
+// user's rc, so the blast radius was completion for the ENTIRE `clauth`
+// command, plus a parse error on every new shell.
+//
+// The only thing that can see that class is the shell itself.
+
+/// Run one dialect's own parser over a script. `Ok(None)` = that shell is not
+/// installed here.
+#[cfg(unix)]
+fn parse_check(bin: &str, args: &[&str], script: &str, ext: &str) -> Option<std::process::Output> {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join(format!("clauth{ext}"));
+    std::fs::write(&path, script).expect("write script");
+    match std::process::Command::new(bin)
+        .args(args)
+        .arg(&path)
+        .output()
+    {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => panic!("could not run `{bin}`: {e}"),
+        Ok(out) => Some(out),
+    }
+}
+
+/// The parser reports where it ran out of input, not where the quote opened —
+/// on the real regression it said line 65 (the closing `}`) for a fault on
+/// line 13. So the message does the localizing the parser refuses to.
+#[cfg(unix)]
+fn lint_failure(shell: &str, bin: &str, script: &str, out: &std::process::Output) -> String {
+    let mut msg = format!(
+        "the {shell} completion script does not parse: `{bin}` exited {}.\n\
+         This ships verbatim — `clauth completions install {shell}` writes it and sources it \
+         from the user's rc, so a parse error here kills completion for the ENTIRE clauth \
+         command, not just the new verb.\n{bin} said:\n{}\n",
+        out.status.code().map_or(-1, |c| c),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    if shell == "zsh" {
+        for (i, line) in script.lines().enumerate() {
+            if line.matches('\'').count() % 2 == 1 {
+                msg.push_str(&format!(
+                    "\nLIKELY CAUSE — odd number of single quotes on script line {}:\n  {line}\n\
+                     Every _values/_describe spec in the zsh script is SINGLE-quoted, so an \
+                     apostrophe inside a description (a possessive like `profile's`) ends the \
+                     string. Reword to drop the apostrophe; do NOT backslash-escape it, since \
+                     a backslash is literal inside zsh single quotes.\n",
+                    i + 1,
+                ));
+            }
+        }
+    }
+    msg
+}
+
+#[cfg(unix)]
+#[test]
+fn every_completion_script_parses_in_its_own_shell() {
+    // A skip must not be able to masquerade as a pass. nextest (what CI runs)
+    // discards a passing test's output, so the eprintln alone would be silent:
+    // CI sets CLAUTH_REQUIRE_SHELL_LINT=1 and a missing shell becomes a
+    // failure there, while a dev box without fish still gets a useful run.
+    let strict = std::env::var("CLAUTH_REQUIRE_SHELL_LINT").as_deref() == Ok("1");
+    let mut parsed: Vec<&str> = Vec::new();
+    for (shell, bin, args, script, ext) in [
+        ("bash", "bash", &["-n"][..], BASH, ".bash"),
+        ("zsh", "zsh", &["-n"][..], ZSH, ".zsh"),
+        ("fish", "fish", &["--no-execute"][..], FISH, ".fish"),
+    ] {
+        match parse_check(bin, args, script, ext) {
+            None => {
+                assert!(
+                    !strict,
+                    "{bin} is not installed, but CLAUTH_REQUIRE_SHELL_LINT=1 demands it"
+                );
+                eprintln!("SKIP: {bin} not installed; the {shell} script was NOT parsed");
+            }
+            Some(out) => {
+                parsed.push(shell);
+                assert!(
+                    out.status.success(),
+                    "{}",
+                    lint_failure(shell, bin, script, &out)
+                );
+            }
+        }
+    }
+    // Floor: on a host with no shell at all this test would otherwise pass
+    // three times over having parsed nothing.
+    assert!(
+        parsed.contains(&"bash"),
+        "no shell parsed anything — this leg proved nothing"
+    );
+}
+
+/// Proof the leg can actually fail. Without this, a refactor that swallows the
+/// exit status turns it into a permanently green no-op and the class silently
+/// reopens — which is exactly how the first one shipped.
+#[cfg(unix)]
+#[test]
+fn the_zsh_leg_would_catch_an_apostrophe_in_a_description() {
+    let broken = concat!(
+        "_clauth() {\n",
+        "    _values 'subcommand' 'feed[feed a profile's session token]'\n",
+        "}\n"
+    );
+    match parse_check("zsh", &["-n"], broken, ".zsh") {
+        None => eprintln!("SKIP: zsh not installed; the mutation guard did not run"),
+        Some(out) => assert!(
+            !out.status.success(),
+            "`zsh -n` accepted an apostrophe inside a single-quoted _values spec, so the real \
+             leg would not have caught the CLA-ROLL regression either"
+        ),
+    }
+}
+
+/// Portable backstop: runs even on the Windows leg and on a shell-less host.
+/// Scoped to ZSH deliberately — the same parity scan over FISH false-positives
+/// on `-d "Launch claude with that profile's runtime"`, where the apostrophe is
+/// legitimately inside DOUBLE quotes. It is sound for ZSH only because that
+/// const never puts an apostrophe inside a double-quoted string: every
+/// `"`-bearing line there is a `[[ "${words[N]}" == … ]]` test or a
+/// `profiles=("${(@f)…}")`, and none contains one.
+#[test]
+fn no_zsh_spec_line_has_an_unbalanced_single_quote() {
+    for (i, line) in ZSH.lines().enumerate() {
+        assert!(
+            line.matches('\'').count() % 2 == 0,
+            "odd number of single quotes on ZSH line {}: {line}",
+            i + 1
+        );
+    }
+}

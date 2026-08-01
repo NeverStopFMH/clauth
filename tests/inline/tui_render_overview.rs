@@ -223,25 +223,26 @@ fn third_party_profile(five_pct: f64, seven_pct: f64) -> Profile {
     }
 }
 
-/// A DeepSeek api-key profile with a cached `"total"` balance row carrying
-/// `total` (e.g. `"1.71 USD"`). `None` for `total` produces an empty-rows
-/// snapshot, matching an account whose balance fetch has not landed yet.
-fn deepseek_profile(name: &str, total: Option<&str>) -> Profile {
-    let rows = match total {
-        Some(t) => vec![
-            crate::providers::StatRow {
-                label: "USD balance".into(),
+/// A DeepSeek api-key profile with cached balance rows built from `totals`
+/// (e.g. `["1.71 USD", "100.00 CNY"]`). Each total is preceded by a heading row
+/// whose currency is extracted from the total value. An empty slice produces an
+/// empty-rows snapshot, matching an account whose balance fetch has not landed.
+fn deepseek_profile(name: &str, totals: &[&str]) -> Profile {
+    let mut rows = Vec::new();
+    for t in totals {
+        if let Some((_, currency)) = t.rsplit_once(' ') {
+            rows.push(crate::providers::StatRow {
+                label: format!("{currency} balance"),
                 value: String::new(),
                 kind: crate::providers::StatRowKind::Heading,
-            },
-            crate::providers::StatRow {
-                label: "total".into(),
-                value: t.into(),
-                kind: crate::providers::StatRowKind::Body,
-            },
-        ],
-        None => Vec::new(),
-    };
+            });
+        }
+        rows.push(crate::providers::StatRow {
+            label: "total".into(),
+            value: (*t).to_string(),
+            kind: crate::providers::StatRowKind::Body,
+        });
+    }
     Profile {
         name: name.into(),
         base_url: Some("https://api.deepseek.com/anthropic".into()),
@@ -1734,7 +1735,7 @@ fn header_reads_5h_balance_when_a_deepseek_profile_is_present() {
     let app = App::new(config_with(
         vec![
             profile("main", 95.0, 10.0, 3600),
-            deepseek_profile("ds", Some("1.71 USD")),
+            deepseek_profile("ds", &["1.71 USD"]),
         ],
         Some("main"),
         vec![],
@@ -1779,7 +1780,7 @@ fn deepseek_row_shows_total_balance_in_5h_column() {
     let app = App::new(config_with(
         vec![
             profile("main", 95.0, 10.0, 3600),
-            deepseek_profile("ds", Some("1.71 USD")),
+            deepseek_profile("ds", &["1.71 USD"]),
         ],
         Some("main"),
         vec![],
@@ -1805,7 +1806,7 @@ fn deepseek_row_shows_total_balance_in_5h_column() {
 fn deepseek_row_without_balance_shows_no_data_dash() {
     let _home = crate::testutil::HomeSandbox::new();
     let app = App::new(config_with(
-        vec![deepseek_profile("ds", None)],
+        vec![deepseek_profile("ds", &[])],
         Some("ds"),
         vec![],
     ));
@@ -1828,8 +1829,8 @@ fn deepseek_balance_currencies_align_across_rows() {
     let _home = crate::testutil::HomeSandbox::new();
     let app = App::new(config_with(
         vec![
-            deepseek_profile("short", Some("1.71 USD")),
-            deepseek_profile("long", Some("197.50 CNY")),
+            deepseek_profile("short", &["1.71 USD"]),
+            deepseek_profile("long", &["197.50 CNY"]),
         ],
         Some("short"),
         vec![],
@@ -1851,5 +1852,107 @@ fn deepseek_balance_currencies_align_across_rows() {
     assert_eq!(
         before_cny, ' ',
         "the widest amount gets exactly one space gap: {long_cell:?}"
+    );
+}
+
+/// A DeepSeek profile with multiple currencies above 0 shows both in the 5h
+/// column, comma-joined and sorted by amount descending (highest first).
+#[test]
+fn deepseek_multi_currency_shows_all_above_zero() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let app = App::new(config_with(
+        vec![deepseek_profile("ds", &["1.71 USD", "100.00 CNY"])],
+        None,
+        vec![],
+    ));
+    let widths = OverviewWidths::new(120, &app);
+    let row = render_overview_row(&app, 0, &widths, false, false);
+    let cell = five_hour_cell_text(&widths, true, &row);
+    assert!(
+        cell.contains("USD") && cell.contains("CNY"),
+        "both currencies render: {cell:?}"
+    );
+    // Higher amount first: 100.00 > 1.71, so CNY comes before USD.
+    let cny = cell.find("CNY").expect("CNY present");
+    let usd = cell.find("USD").expect("USD present");
+    assert!(
+        cny < usd,
+        "higher balance (100.00 CNY) renders before 1.71 USD: {cell:?}"
+    );
+}
+
+/// When only one currency is above 0, only that one shows — the zero-balance
+/// currency is dropped.
+#[test]
+fn deepseek_multi_currency_only_shows_above_zero() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let app = App::new(config_with(
+        vec![deepseek_profile("ds", &["0.00 USD", "100.00 CNY"])],
+        None,
+        vec![],
+    ));
+    let widths = OverviewWidths::new(120, &app);
+    let row = render_overview_row(&app, 0, &widths, false, false);
+    let cell = five_hour_cell_text(&widths, true, &row);
+    assert!(
+        cell.contains("CNY") && !cell.contains("USD"),
+        "only the above-zero balance renders: {cell:?}"
+    );
+}
+
+/// When every currency is 0, the highest one still renders — an account with
+/// no funds is still a real account, and a blank cell would read as no-data.
+#[test]
+fn deepseek_all_zero_shows_the_highest() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let app = App::new(config_with(
+        vec![deepseek_profile("ds", &["0.00 USD", "0.00 CNY"])],
+        None,
+        vec![],
+    ));
+    let widths = OverviewWidths::new(120, &app);
+    let row = render_overview_row(&app, 0, &widths, false, false);
+    let cell = five_hour_cell_text(&widths, true, &row);
+    assert!(
+        !cell.contains('—'),
+        "a zero balance still renders, not the no-data dash: {cell:?}"
+    );
+    assert!(
+        cell.starts_with('['),
+        "still rendered as a bracketed balance: {cell:?}"
+    );
+}
+
+/// `deepseek_amount_w` accounts for all totals across all currencies, so the
+/// widest amount from any currency sets the padding for every profile. The
+/// first currency in each cell starts at the same column across profiles.
+#[test]
+fn deepseek_amount_w_spans_all_currencies() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let app = App::new(config_with(
+        vec![
+            deepseek_profile("multi", &["1.71 USD", "197.50 CNY"]),
+            deepseek_profile("single", &["3.14 USD"]),
+        ],
+        None,
+        vec![],
+    ));
+    let widths = OverviewWidths::new(120, &app);
+    assert_eq!(
+        widths.deepseek_amount_w, 6,
+        "amount_w must be 6 (from '197.50'), not capped at 4 or 5"
+    );
+
+    let multi_row = render_overview_row(&app, 0, &widths, false, false);
+    let single_row = render_overview_row(&app, 1, &widths, false, false);
+    let multi_cell = five_hour_cell_text(&widths, true, &multi_row);
+    let single_cell = five_hour_cell_text(&widths, true, &single_row);
+
+    // The first currency in both cells starts at the same column: position
+    // 1 (bracket) + amount_w (6) + 1 (space) = 8.
+    assert_eq!(
+        multi_cell.find("CNY"),
+        single_cell.find("USD"),
+        "first currencies in both cells start at the same column:\n  {multi_cell:?}\n  {single_cell:?}"
     );
 }

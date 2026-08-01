@@ -243,8 +243,10 @@ impl OverviewWidths {
             .profiles
             .iter()
             .filter(|p| p.provider == Some(Provider::DeepSeek))
-            .filter_map(|p| deepseek_balance_value(p))
-            .filter_map(|v| v.rsplit_once(' ').map(|(a, _)| a.chars().count()))
+            .filter_map(|p| p.third_party_usage.as_ref())
+            .flat_map(|s| s.rows.iter())
+            .filter(|r| r.label == "total")
+            .filter_map(|r| r.value.rsplit_once(' ').map(|(a, _)| a.chars().count()))
             .max()
             .unwrap_or(0);
 
@@ -567,36 +569,62 @@ fn any_deepseek(app: &App) -> bool {
         .any(|p| p.provider == Some(Provider::DeepSeek))
 }
 
-/// The DeepSeek profile's total balance string (e.g. `"1.71 USD"`), taken from
-/// the first `"total"` row of its cached [`ThirdPartyStats`] — the same rows
-/// the Usage tab renders. `None` when there is no cached snapshot or no total
-/// row (an unavailable-balance response carries a Danger row instead).
-fn deepseek_balance_value(profile: &Profile) -> Option<&str> {
-    profile
+/// DeepSeek balance total strings (e.g. `"1.71 USD"`, `"100.00 CNY"`) to show
+/// in the overview cell, sorted by numeric amount descending. All balances above
+/// 0 are included; when none are above 0, only the highest one is returned.
+/// Empty when there is no cached snapshot or no total rows.
+fn deepseek_balances_to_show(profile: &Profile) -> Vec<&str> {
+    let mut parsed: Vec<(f64, &str)> = profile
         .third_party_usage
-        .as_ref()?
-        .rows
+        .as_ref()
+        .map(|s| &s.rows)
+        .into_iter()
+        .flatten()
+        .filter(|r| r.label == "total")
+        .filter_map(|r| {
+            let (amount_str, _) = r.value.rsplit_once(' ')?;
+            let amount: f64 = amount_str.parse().ok()?;
+            Some((amount, r.value.as_str()))
+        })
+        .collect();
+    if parsed.is_empty() {
+        return Vec::new();
+    }
+    parsed.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+    let above_zero: Vec<&str> = parsed
         .iter()
-        .find(|r| r.label == "total")
-        .map(|r| r.value.as_str())
+        .filter(|(a, _)| *a > 0.0)
+        .map(|(_, s)| *s)
+        .collect();
+    if above_zero.is_empty() {
+        vec![parsed[0].1]
+    } else {
+        above_zero
+    }
 }
 
 /// The 5h-column cell for a DeepSeek profile: its total balance bracketed and
 /// dimmed (matching the OAuth bar's `[...]` shape), or [`NO_DATA`] when no
-/// cached balance row exists. `amount_w` is the widest amount string across all
+/// cached balance row exists. Multiple balances are comma-joined (e.g.
+/// `[1.71 USD, 100.00 CNY]`). `amount_w` is the widest amount string across all
 /// DeepSeek rows so currencies line up under each other; the longest amount
 /// gets exactly one space before its currency. Width is exact so the column
 /// boundary holds.
 fn deepseek_balance_cell(profile: &Profile, width: usize, amount_w: usize) -> Vec<Span<'static>> {
-    let Some(balance) = deepseek_balance_value(profile) else {
+    let balances = deepseek_balances_to_show(profile);
+    if balances.is_empty() {
         return vec![Span::styled(NO_DATA.to_string(), theme::faint())];
     };
-    // Split "amount CURRENCY" so currencies align: amount left-padded to the
-    // widest amount, then one space, then the currency.
-    let inner = match balance.rsplit_once(' ') {
-        Some((amount, currency)) => format!("{amount:<amount_w$} {currency}"),
-        None => balance.to_string(),
-    };
+    // Align each "amount CURRENCY": amount left-padded to the widest amount,
+    // then one space, then the currency. Multiple balances are comma-joined.
+    let inner: String = balances
+        .iter()
+        .map(|b| match b.rsplit_once(' ') {
+            Some((amount, currency)) => format!("{amount:<amount_w$} {currency}"),
+            None => (*b).to_string(),
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
     // 2 cells reserved for brackets; truncate inner if it would overflow.
     let inner_w = width.saturating_sub(2);
     let inner: String = inner.chars().take(inner_w).collect();

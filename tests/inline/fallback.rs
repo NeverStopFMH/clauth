@@ -1735,6 +1735,31 @@ fn return_to_preferred_gated_on_target_freshness() {
     );
 }
 
+// The `clear` guard on the preferred TARGET: a fresh but exhausted preferred
+// (live 5h window at 100%) must NOT pull a healthy active home. Without this
+// guard the return fires on any fresh preferred regardless of headroom,
+// stranding the operator on an account that can't serve. 3-member chain so
+// "a" is genuinely selected past the other guards, not the only candidate.
+#[test]
+fn return_to_preferred_gated_on_target_clearance() {
+    let config = config_with_chain(
+        vec![
+            mark_preferred(profile_with_util("a", Some(95.0), None)),
+            profile_with_util("b", Some(95.0), None),
+            profile_with_util("c", Some(95.0), None),
+        ],
+        "c",
+    );
+    let mut snap = snapshot_chain(&config).expect("snapshot");
+    snap.fresh = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+    let store = store_with_utils(&[("a", 100.0), ("b", 10.0), ("c", 10.0)]);
+    assert_eq!(
+        next_auto_switch_target(&snap, &store),
+        None,
+        "an exhausted preferred must not pull a healthy active onto an account that can't serve"
+    );
+}
+
 // Freshness is also a hard gate on the ACTIVE. A stuck-RateLimited active is
 // frozen at an idle-looking read and is therefore never in `fresh`; its headroom
 // numbers are the ones the scheduler declared untrustworthy. Preferred is clear

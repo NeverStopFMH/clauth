@@ -1373,6 +1373,11 @@ fn next_auto_switch_target_with_usage(
         // stuck-RateLimited active, frozen at an idle-looking read and therefore
         // never in `snapshot.fresh`, must not be moved on numbers the scheduler
         // declared untrustworthy (mirrors the ACTIVE-side `decision_fresh` gate).
+        //
+        // No `!active.last_resort` guard here, unlike the scoped trigger above:
+        // a `last_resort` sink is a refuge ("serve here for free until dead"),
+        // not a permanent park — the operator's home account outranks it when
+        // home is clear and fresh.
         if let Some(pref) = snapshot.chain.iter().find(|m| m.preferred)
             && pref.name != active.name
             && snapshot.fresh.iter().any(|n| n == &active.name)

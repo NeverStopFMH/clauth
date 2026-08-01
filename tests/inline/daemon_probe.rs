@@ -149,11 +149,11 @@ fn claim_now(dir: &std::path::Path, standby: bool) -> Claim {
 /// retry wins — the first holds by construction (the release is armed
 /// immediately before the retried call), the second is pinned below.
 ///
-/// 60 ms, not 150: the release is armed at the retried call rather than when the
-/// probe took the locks, so the whole remaining window is slack for
-/// `thread::sleep` to overshoot into. At 150 ms with the hold running from the
-/// lock take, that slack was 50 ms, and the macOS debug leg — slower code on a
-/// 3-core runner — spent it and failed.
+/// The sleep runs INSIDE the probe thread (not a separate release thread), so
+/// the locks drop the instant it wakes — no inter-thread channel hop between
+/// the timer and the `drop`. That hop was the macOS debug-leg flake: a 3-core
+/// runner under load scheduled the release thread's wakeup past the retry
+/// margin, so all three attempts saw the probe holding.
 const PROBE_HOLD: std::time::Duration = std::time::Duration::from_millis(60);
 // The shipped schedule must outlive PROBE_HOLD, or the recovery this test proves
 // cannot happen and it reds for a fixture reason instead of a real one.
@@ -176,7 +176,7 @@ const _: () = assert!(
 /// probes.
 fn probe_holding_both(dir: &std::path::Path) -> ProbeHold {
     let (held_tx, held_rx) = std::sync::mpsc::channel();
-    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<std::time::Duration>();
     let dir = dir.to_path_buf();
     let handle = std::thread::spawn(move || {
         let a = crate::profile::open_state_file(&dir.join(super::super::LOCK_FILE)).expect("open");
@@ -185,9 +185,8 @@ fn probe_holding_both(dir: &std::path::Path) -> ProbeHold {
             .expect("open");
         s.try_lock().expect("probe takes the free standby lock");
         held_tx.send(()).expect("signal held");
-        let _ = release_rx.recv();
-        drop(s);
-        drop(a);
+        let hold = release_rx.recv().unwrap_or(std::time::Duration::ZERO);
+        std::thread::sleep(hold);
     });
     held_rx.recv().expect("probe reports both flocks held");
     ProbeHold {
@@ -196,17 +195,15 @@ fn probe_holding_both(dir: &std::path::Path) -> ProbeHold {
     }
 }
 
-/// A probe sitting on both flocks with no expiry of its own.
+/// A probe sitting on both flocks until told to release.
 ///
-/// Open-ended rather than a timed sleep so the fixture's two jobs stop competing
-/// for one timer. A `sleep(PROBE_HOLD)` started when the probe took the locks had
-/// to keep every assertion that runs DURING the hold valid AND leave the retry
-/// window room to clear it, so the margin was the window minus `PROBE_HOLD`
-/// minus however far the sleep overshot. Holding until told means a control
-/// running under the hold cannot expire it, and the margin is whatever the
-/// caller arms.
+/// The probe thread receives the hold duration from [`release_after`] and sleeps
+/// in-thread, so the locks drop the instant the sleep ends — no separate release
+/// thread to schedule. The duration is armed at the retried call (not when the
+/// probe took the locks), so a control running under the hold cannot expire it,
+/// and the margin is whatever the caller arms.
 struct ProbeHold {
-    release: std::sync::mpsc::Sender<()>,
+    release: std::sync::mpsc::Sender<std::time::Duration>,
     handle: std::thread::JoinHandle<()>,
 }
 
@@ -215,11 +212,7 @@ impl ProbeHold {
     /// under test, so the margin is measured from that call and not from however
     /// long the assertions before it took.
     fn release_after(self, after: std::time::Duration) -> std::thread::JoinHandle<()> {
-        let release = self.release;
-        std::thread::spawn(move || {
-            std::thread::sleep(after);
-            let _ = release.send(());
-        });
+        let _ = self.release.send(after);
         self.handle
     }
 }

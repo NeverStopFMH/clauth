@@ -5673,9 +5673,28 @@ fn the_fake_mode_mirror_converges_under_concurrent_publishes() {
         // A convergent mirror stops PUBLISHING once the writers stop. It may
         // still run any number of passes — a notify reader draining the writer
         // phase's backlog keeps waking it, which is correct — so the oracle is
-        // bytes moved, not passes taken.
-        std::thread::sleep(cooldown * 4);
-        let settled = mirror.writes();
+        // bytes moved, not passes taken. And its LAST legitimate publish can
+        // land arbitrarily late on a loaded box (the debounce + cooldown
+        // pacing runs behind the backlog), so quiescence is measured from an
+        // OBSERVED plateau, never a fixed sleep: a fixed pre-sample wait
+        // turned exactly one late-but-correct convergence pass into a
+        // "feeding on its own writes" verdict on the Windows runner. A real
+        // self-feed never plateaus and exits through the deadline instead.
+        let deadline = std::time::Instant::now() + cooldown * 40;
+        let mut settled = mirror.writes();
+        loop {
+            std::thread::sleep(cooldown * 4);
+            let now = mirror.writes();
+            if now == settled {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the mirror was still publishing {now} passes in with no writer \
+                 running: it is feeding on its own writes"
+            );
+            settled = now;
+        }
         std::thread::sleep(cooldown * 8);
         let after = mirror.writes();
         drop(shutdown_tx);

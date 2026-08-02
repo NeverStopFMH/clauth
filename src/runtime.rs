@@ -510,8 +510,8 @@ fn rotation_blocked_by_live_session(has_live_session: bool, is_macos: bool) -> b
 /// none — CLA-SPLIT put it there exactly so sessions hold nothing rotatable —
 /// so there is nothing for it to spend and nothing for a rotation to strand.
 ///
-/// Deliberately feed-agnostic: it asks what the session HOLDS, never whether a
-/// feature is enabled. An upstream #53 `claude setup-token` mint answers the
+/// Deliberately feature-agnostic: it asks what the session HOLDS, never
+/// whether the rolling token is enabled. An upstream #53 `claude setup-token` mint answers the
 /// same way a rolling token does, and gets the same exemption for the same
 /// reason, which is why this is a narrowing of the refusal rather than a
 /// carve-out bolted beside it.
@@ -1898,8 +1898,14 @@ impl ProfileRuntime {
                 isolation == Isolation::Isolated,
                 opt_in,
                 // The SAME value the runtime tree is built from below, so the
-                // row can never disagree with what this session actually
-                // reads. See `live_session_holds_rotatable`.
+                // row cannot disagree with what this session actually reads —
+                // on macOS, which is the only place it is consulted. The
+                // stronger "never" would need `swap_to` to update it when it
+                // moves `cell.canonical`, and it deliberately does not: swaps
+                // refuse macOS (`swap_support`), and macOS is where
+                // `live_session_holds_rotatable` reads this. A platform that
+                // gains both swaps and the rotation refusal inherits that
+                // update as a prerequisite.
                 Some(canonical.clone()),
             );
             if let Err(e) = crate::live_sessions::register(&row) {

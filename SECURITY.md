@@ -27,7 +27,6 @@ date. The one copy that lives elsewhere is the macOS Keychain item below.
 | `~/.clauth/profiles/<name>/credentials.json` | OAuth token snapshot | file `0600`, dirs `0700` |
 | `~/.clauth/profiles/<name>/session-token.json` | long-lived `claude setup-token` login, if captured (sessions run on this; no refresh token) | file `0600`, dirs `0700` |
 | `~/.clauth/profiles/<name>/session-token.static.json` | the `claude setup-token` mint a rolling token superseded, kept so `clauth static-token <p>` (or a dead chain) can restore it | file `0600`, dirs `0700` |
-| `~/.clauth/profiles/<name>/session-token.kind` | one word (`mint` or `rolling`) recording which of the two the sidecar holds, so nothing has to infer it from the token's shape | file `0600`, dirs `0700` |
 | `~/.clauth/profiles/<name>/quarantine/<ts>-<seq>.session-token.json` | a mis-filled sidecar moved aside before repair, kept as evidence. By definition it carries a refresh token — that is what made it a mis-fill — which is why the dir is `0700`, why nothing prunes it automatically, and why it lives under the profile so `clauth delete` removes it with everything else that account owns | file `0600`, dir `0700` |
 | `~/.clauth/profiles/<name>/config.toml` | base URL, API key (endpoint profiles), env block | `0600` |
 | `~/.clauth/profiles/<name>/usage_cache.json` | last-known utilization and plan | `0600` |

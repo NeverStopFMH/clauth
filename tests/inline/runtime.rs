@@ -3493,6 +3493,22 @@ fn acquire_registers_a_row_and_teardown_removes_it() {
         assert_eq!(registered.current_member, None);
         assert_eq!(registered.chain_cursor, None);
         assert_eq!(registered.last_swap_at, None);
+        // The CANONICAL store, by exact path — `live_session_holds_rotatable`
+        // re-reads this very file, so `None` here degrades the refusal to
+        // always-refuse (fails closed, silently costs the exemption) while a
+        // runtime-side copy would fail OPEN: the copy is refresh-less by
+        // construction, every session would read "holds nothing rotatable",
+        // and a rotation would strand a session that launched on the pair.
+        assert_eq!(
+            registered.launch_store.as_deref(),
+            Some(
+                crate::profile::profile_dir("registered")
+                    .expect("profile dir")
+                    .join("credentials.json")
+                    .as_path()
+            ),
+            "acquire must record the canonical credential store it launched on"
+        );
 
         drop(rt);
 

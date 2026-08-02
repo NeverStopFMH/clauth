@@ -2060,22 +2060,15 @@ fn rolling_token_round_trips_through_config_toml() {
     assert!(parsed.rolling_token);
 }
 
-/// The pre-rename spelling has to keep loading. `serde(default)` swallows an
-/// unknown key silently, so without the alias every profile armed before the
-/// rename would read as OFF, and the very next `render_config_toml` would
-/// rewrite its config without the key — flag gone, sidecar still in front of
-/// sessions, and nothing left to re-stamp it. That is the silent-disengage
-/// failure this feature exists to end, so it must not be how it ships.
+/// The pre-rename `session_feed` spelling is deliberately NOT aliased: no
+/// released clauth ever wrote it, and a permanent alias for something that
+/// never shipped is pure legacy surface. An unknown key parses as OFF.
 #[test]
-fn the_pre_rename_session_feed_key_still_loads() {
+fn the_pre_rename_session_feed_key_is_not_carried() {
     let legacy: ProfileConfig =
         toml::from_str("session_feed = true\n").expect("parse legacy config");
     assert!(
-        legacy.rolling_token,
-        "the `session_feed` alias is what carries an armed profile across the rename"
+        !legacy.rolling_token,
+        "installs that ran the feature branch re-run `clauth rolling-token <p>` once"
     );
-    // And the new spelling still wins on a config that carries it.
-    let current: ProfileConfig =
-        toml::from_str("rolling_token = true\n").expect("parse current config");
-    assert!(current.rolling_token);
 }

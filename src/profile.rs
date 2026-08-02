@@ -969,20 +969,12 @@ struct ProfileConfig {
     weekly_threshold: Option<f64>,
     #[serde(default)]
     last_resort: bool,
-    /// CLA-ROLL. `session_feed` is the spelling this feature carried before the
-    /// rename, aliased on the `kick_timer` precedent one field above.
-    ///
-    /// Worth being precise about who it is for, since no released clauth ever
-    /// wrote it: only installs that ran this branch under its old name have the
-    /// key on disk. For them the alias is load-bearing rather than tidy —
-    /// `serde(default)` swallows an unknown key silently, so an armed profile
-    /// would read as OFF and the next `render_config_toml` would rewrite the
-    /// file without it: flag gone, sidecar still in front of sessions, nothing
-    /// left to re-stamp it. That is the exact silent-disengage failure this
-    /// feature exists to end, which is why it is here and not left to chance.
-    /// If that population is judged not worth an alias, this is a one-line
-    /// deletion plus its test.
-    #[serde(default, alias = "session_feed")]
+    /// CLA-ROLL. No alias for the pre-rename `session_feed` spelling: no
+    /// released clauth ever wrote that key, so carrying it here would be a
+    /// permanent legacy alias for something that never shipped. Installs that
+    /// ran the feature branch under its old name re-run
+    /// `clauth rolling-token <profile>` once after upgrading.
+    #[serde(default)]
     rolling_token: bool,
     #[serde(default)]
     preferred: bool,

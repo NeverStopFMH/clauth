@@ -729,3 +729,69 @@ fn clear_session_token_hint_names_the_gate_then_what_the_clear_falls_back_to() {
         Some("the next switch installs this account's own login again"),
     );
 }
+
+/// `build_snap` derives the token row from what the sidecar HOLDS, never from
+/// the config flag. The two part ways exactly when honesty matters: a dead
+/// chain degrades the sidecar onto its static mint while the flag stays on,
+/// and a flag-driven row would promise a re-stamp in ~8760h for a mint nobody
+/// is going to re-stamp — the same comfortable-looking lie the honest
+/// countdown exists to prevent, from the other direction.
+#[test]
+fn snap_rolling_token_is_the_sidecar_content_not_the_config_flag() {
+    use crate::profile::{AppConfig, AppState, ClaudeCredentials, OAuthToken};
+    let _home = crate::testutil::HomeSandbox::new();
+    let name = "cfg-snap-roll";
+    let dir = crate::profile::profile_dir(name).expect("dir");
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    let app_with_flag = |rolling_token: bool| {
+        let mut p = crate::profile::Profile::new(name.to_string(), None, None);
+        p.rolling_token = rolling_token;
+        App::new(AppConfig {
+            state: AppState {
+                profiles: vec![p.name.clone()],
+                ..AppState::default()
+            },
+            profiles: vec![p],
+        })
+    };
+    let sidecar = |scopes: Vec<&str>, plan: Option<&str>| ClaudeCredentials {
+        claude_ai_oauth: Some(OAuthToken {
+            access_token: "sk-ant-oat01-snap-fixture".to_string(),
+            refresh_token: None,
+            expires_at: Some(crate::usage::now_ms() as i64 + 3_600_000),
+            scopes: Some(scopes.into_iter().map(String::from).collect()),
+            subscription_type: plan.map(String::from),
+        }),
+    };
+
+    // Flag ON, sidecar degraded onto the mint: the row must say mint.
+    std::fs::write(
+        dir.join("session-token.json"),
+        serde_json::to_vec_pretty(&sidecar(
+            vec!["user:inference", "user:sessions:claude_code"],
+            None,
+        ))
+        .expect("ser"),
+    )
+    .expect("write mint");
+    assert!(
+        !build_snap(&app_with_flag(true), true).rolling_token,
+        "a degraded profile must render the mint it is actually on"
+    );
+
+    // Flag OFF, sidecar holding a rolling bearer (`clauth static-token` flips
+    // the flag before the restore lands): the row must say rolling.
+    std::fs::write(
+        dir.join("session-token.json"),
+        serde_json::to_vec_pretty(&sidecar(
+            vec!["user:inference", "user:profile"],
+            Some("max"),
+        ))
+        .expect("ser"),
+    )
+    .expect("write rolling");
+    assert!(
+        build_snap(&app_with_flag(false), true).rolling_token,
+        "what sessions actually hold outranks the flag in both directions"
+    );
+}

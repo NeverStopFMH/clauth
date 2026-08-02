@@ -122,80 +122,45 @@ pub(crate) const SETUP_TOKEN_ASSUMED_LIFETIME_MS: i64 = 365 * 24 * 60 * 60 * 100
 /// usage pair stays separate). Recorded in the sidecar for the record.
 const SETUP_TOKEN_SCOPES: [&str; 2] = ["user:inference", "user:sessions:claude_code"];
 
-/// CLA-ROLL: the mint-vs-rolling horizon discriminator, now the FALLBACK only.
-/// A genuine `setup-token` mint is stamped ~1 year out; a rolling access token
-/// dies in hours, so an expiry under this horizon is ROLLING-shaped and one at
-/// or beyond it is MINT-shaped.
-///
-/// This inference is wrong on both sides of itself, which is why
-/// [`sidecar_kind`] exists: a real mint in its final month reads as rolling
-/// (so arming no-ops and reports success), and a fresh mint reads as not-rolling
-/// (so a degraded profile re-spends a guaranteed-failing refresh). It survives
-/// for exactly one case — a sidecar written before the marker existed, or by
-/// something that never wrote one — where it is not a second source of truth
-/// but the only one.
-pub(crate) const MINT_HORIZON_MS: i64 = 30 * 24 * 60 * 60 * 1000;
-
-/// CLA-ROLL: what `session-token.json` holds, when clauth knows exactly.
+/// CLA-ROLL: what `session-token.json` holds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SidecarKind {
-    /// A `claude setup-token` mint: year-scale, two scopes, worth preserving.
+    /// A `claude setup-token` mint: year-scale, the setup-token scope pair,
+    /// worth preserving.
     Mint,
-    /// A bearer stamped from the usage chain: hours-scale, full scopes, and
-    /// never to be snapshotted as a backup.
+    /// A bearer stamped from the usage chain: hours-scale, the chain's full
+    /// grant, and never to be snapshotted as a backup.
     Rolling,
 }
 
-/// The marker's path. Beside the sidecar rather than inside it: the sidecar's
-/// JSON is a wire contract Claude Code and external readers already consume, so
-/// nothing may be added to it. A sibling file also keeps the marker out of
-/// `config.toml`, which means a profile that never arms a rolling token has its
-/// write path untouched, and an older clauth simply ignores a file it does not
-/// know rather than dropping a key it cannot parse.
-fn sidecar_kind_path(name: &str) -> Result<PathBuf> {
-    Ok(profile_dir(name)?.join("session-token.kind"))
-}
-
-/// What the sidecar holds. `None` means UNMARKED — a sidecar older than this
-/// marker, or one written by something that does not maintain it — and every
-/// reader must then fall back to the [`MINT_HORIZON_MS`] content heuristic
-/// rather than assuming either answer. Assuming `Mint` there would let a legacy
-/// rolling bearer be snapshotted as the degrade backup, permanently.
-pub(crate) fn sidecar_kind(name: &str) -> Option<SidecarKind> {
-    let raw = std::fs::read_to_string(sidecar_kind_path(name).ok()?).ok()?;
-    match raw.trim() {
-        "mint" => Some(SidecarKind::Mint),
-        "rolling" => Some(SidecarKind::Rolling),
-        _ => None,
-    }
-}
-
-/// Record what the sidecar holds.
+/// CLA-ROLL: classify a sidecar's content EXACTLY, from the one signal every
+/// sidecar ever written carries — its scope set. [`write_session_token`] stamps
+/// [`SETUP_TOKEN_SCOPES`]; [`stamp_rolling_token`] clones the usage chain's
+/// grant, and a chain fit to BE a usage chain can never carry the mint's set:
+/// `/api/oauth/usage` 403s exactly those scopes (the #52 root cause), so a
+/// chain that has polled usage even once proves it holds something more. This
+/// is the same discrimination the split itself rests on, read back.
 ///
-/// ORDERING RULE, and the reason this is two files rather than one: the marker
-/// may only read `Mint` while the sidecar has definitely been a mint since the
-/// marker was written. So a rolling write marks `Rolling` BEFORE it writes the
-/// sidecar, and a mint write marks `Mint` AFTER. Both orders make a crash in
-/// between land on the same side — the marker claims rolling over a sidecar
-/// that is still a mint — which costs at worst a skipped backup the next write
-/// repairs. The other order would snapshot a dies-in-hours bearer as "the
-/// mint", and a restore from that installs a dead token.
-fn mark_sidecar(name: &str, kind: SidecarKind) -> Result<()> {
-    let body = match kind {
-        SidecarKind::Mint => "mint\n",
-        SidecarKind::Rolling => "rolling\n",
-    };
-    atomic_write_600(&sidecar_kind_path(name)?, body.as_bytes()).context("write session-token.kind")
-}
-
-/// Drop the marker, for the paths that remove the sidecar itself. An orphaned
-/// marker would describe a file that is not there, and the next writer would
-/// inherit a claim it never made.
-fn clear_sidecar_mark(name: &str) -> Result<()> {
-    match std::fs::remove_file(sidecar_kind_path(name)?) {
-        Ok(()) => Ok(()),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(e).context("remove session-token.kind"),
+/// Rolling ⇔ a plan stamp (`subscriptionType`, which no mint write ever sets)
+/// or any scope beyond the setup pair. Everything else — the pair, a subset,
+/// an absent list — reads `Mint`, because THIS classifier's failure direction
+/// decides what gets overwritten without a backup, and only
+/// [`stamp_rolling_token`] (which refuses to write a mint-classifying bearer)
+/// can put rolling content on disk. Expiry is deliberately not consulted: a
+/// hand-edited `expiresAt` (which `SETUP_TOKEN_ASSUMED_LIFETIME_MS`'s doc
+/// invites) must never reclassify a credential.
+pub(crate) fn sidecar_kind_of(oauth: &crate::profile::OAuthToken) -> SidecarKind {
+    if oauth.subscription_type.is_some() {
+        return SidecarKind::Rolling;
+    }
+    let beyond_mint = oauth.scopes.as_ref().is_some_and(|s| {
+        s.iter()
+            .any(|sc| !SETUP_TOKEN_SCOPES.contains(&sc.as_str()))
+    });
+    if beyond_mint {
+        SidecarKind::Rolling
+    } else {
+        SidecarKind::Mint
     }
 }
 
@@ -262,19 +227,7 @@ pub(crate) fn write_session_token(name: &str, token: &str, now_ms: i64) -> Resul
     };
     let bytes = serde_json::to_vec_pretty(&sidecar).context("serialize session token")?;
     let path = profile_dir(name)?.join("session-token.json");
-    with_state_lock(|| {
-        atomic_write_600(&path, &bytes).context("write session-token.json")?;
-        // Marked AFTER the sidecar lands, per `mark_sidecar`'s ordering rule.
-        // Best-effort on purpose: this is the plain `--setup-token` capture
-        // path, which a profile that never arms a rolling token also takes, and
-        // a marker write must never be able to fail a capture whose credential
-        // is already on disk. An unwritten marker degrades to UNMARKED, which
-        // is the heuristic — exactly today's behavior.
-        if let Err(e) = mark_sidecar(name, SidecarKind::Mint) {
-            logline!("clauth: '{name}' session-token.kind not written ({e:#})");
-        }
-        Ok(())
-    })?;
+    with_state_lock(|| atomic_write_600(&path, &bytes).context("write session-token.json"))?;
     Ok(expires_at)
 }
 
@@ -293,28 +246,35 @@ pub(crate) fn write_session_token(name: &str, token: &str, now_ms: i64) -> Resul
 /// switching back to the static token — or a terminally dead chain — can restore Sonnet-cap
 /// service instead of signing sessions out.
 pub(crate) fn stamp_rolling_token(name: &str, chain: &crate::profile::OAuthToken) -> Result<()> {
+    let rolled = crate::profile::OAuthToken {
+        access_token: chain.access_token.clone(),
+        refresh_token: None,
+        expires_at: chain.expires_at,
+        scopes: chain.scopes.clone(),
+        subscription_type: chain.subscription_type.clone(),
+    };
+    // [`sidecar_kind_of`]'s totality is enforced HERE, at the only writer of
+    // rolling content: a chain whose recorded grant would classify as a mint
+    // (no plan stamp AND nothing beyond the setup scope pair) cannot produce a
+    // bearer this code could later tell from a real mint — and a chain shaped
+    // like that could never have polled usage anyway (#52: those scopes 403),
+    // so refusing to roll it costs nothing real.
+    if sidecar_kind_of(&rolled) == SidecarKind::Mint {
+        anyhow::bail!(
+            "'{name}' usage chain's recorded grant is indistinguishable from a setup-token \
+             mint (no scope beyond the setup pair, no subscription type) — refusing to stamp \
+             a rolling bearer that could later be preserved as the static mint. Re-run \
+             `clauth login {name}` to record the chain's real grant"
+        );
+    }
     let sidecar = ClaudeCredentials {
-        claude_ai_oauth: Some(crate::profile::OAuthToken {
-            access_token: chain.access_token.clone(),
-            refresh_token: None,
-            expires_at: chain.expires_at,
-            scopes: chain.scopes.clone(),
-            subscription_type: chain.subscription_type.clone(),
-        }),
+        claude_ai_oauth: Some(rolled),
     };
     let bytes = serde_json::to_vec_pretty(&sidecar).context("serialize rolling session token")?;
     let path = profile_dir(name)?.join("session-token.json");
     with_state_lock(|| {
         preserve_static_mint(name)?;
-        // Marked BEFORE the sidecar is overwritten, per `mark_sidecar`'s
-        // ordering rule: a crash between the two must never leave a marker
-        // saying "mint" over a rolling bearer. Not best-effort here — if the
-        // marker cannot be written, the next `preserve_static_mint` would fall
-        // back to the horizon heuristic and could snapshot this bearer as the
-        // degrade backup, so the write is refused instead.
-        mark_sidecar(name, SidecarKind::Rolling)?;
-        atomic_write_600(&path, &bytes).context("write rolling session-token.json")?;
-        Ok(())
+        atomic_write_600(&path, &bytes).context("write rolling session-token.json")
     })
 }
 
@@ -323,24 +283,6 @@ pub(crate) fn stamp_rolling_token(name: &str, chain: &crate::profile::OAuthToken
 /// (the first preserved mint is the real one — later sidecar contents are rolling
 /// values), and a sidecar that is absent or holds a rolling/mis-filled value has
 /// no mint to preserve. Callers hold the state flock.
-/// Whether a sidecar's own content looks like a `claude setup-token` mint: a
-/// year-scale stamp and no `subscriptionType`. A rolling bearer carries the
-/// chain's real expiry (hours) and its plan stamp, so the two shapes do not
-/// overlap in practice. The FALLBACK discriminator for an unmarked sidecar,
-/// and the veto that stops a stale marker from destroying a mint.
-fn mint_shaped(oauth: &crate::profile::OAuthToken) -> bool {
-    if oauth.subscription_type.is_some() {
-        return false;
-    }
-    let now = crate::usage::now_ms() as i64;
-    // `None` counts as mint-shaped: an unstamped sidecar is not evidence of a
-    // rolling bearer, and the whole point of this test is to fail toward
-    // KEEPING a copy.
-    oauth
-        .expires_at
-        .is_none_or(|exp| exp >= now + MINT_HORIZON_MS)
-}
-
 fn preserve_static_mint(name: &str) -> Result<()> {
     let dir = profile_dir(name)?;
     let sidecar = dir.join("session-token.json");
@@ -360,35 +302,19 @@ fn preserve_static_mint(name: &str) -> Result<()> {
     let Some(oauth) = creds.claude_ai_oauth.as_ref() else {
         return Ok(());
     };
-    // A mis-filled sidecar (a whole rotating pair) is never a mint, whatever
-    // the marker says — this one is a content fact, not an inference.
+    // A mis-filled sidecar (a whole rotating pair) is never a mint — a content
+    // fact checked before classification, since a mis-fill carries the chain's
+    // scopes and must not reach the scope test at all.
     if oauth.refresh_token.is_some() {
         return Ok(());
     }
-    match sidecar_kind(name) {
-        // Exact, and the whole point of the marker: a real mint is preserved
-        // whatever its remaining life. Under the old horizon test a mint in its
-        // final month was destroyed with nothing kept, precisely when a backup
-        // was about to matter most.
-        Some(SidecarKind::Mint) => {}
-        // Equally exact in the other direction — with one veto. A `rolling`
-        // claim normally means "not the mint, do not snapshot it". But a
-        // marker can go stale (a write that failed after the sidecar moved),
-        // and a stale `rolling` over a genuine mint is the one disagreement
-        // that DESTROYS data: the snapshot is skipped and the next roll
-        // overwrites the only copy. So content gets a veto in that direction
-        // only: a mint-SHAPED sidecar is preserved whatever the marker claims.
-        // The reverse veto would be wrong, since snapshotting a rolling bearer
-        // is exactly what must not happen — and in production a rolling stamp
-        // is hours out, so this can only fire on a marker that is lying.
-        Some(SidecarKind::Rolling) if !mint_shaped(oauth) => return Ok(()),
-        Some(SidecarKind::Rolling) => {}
-        // UNMARKED: written before the marker existed, so the content
-        // heuristic is not a second source of truth here — it is the only one.
-        // Keeping it is what stops an upgrade from snapshotting an in-flight
-        // rolling bearer as "the mint" on its very first rotation.
-        None if !mint_shaped(oauth) => return Ok(()),
-        None => {}
+    // Whatever remains classifies exactly by its scope set — a real mint is
+    // preserved whatever its remaining life (under the old horizon heuristic a
+    // mint in its final month was destroyed with nothing kept, precisely when
+    // a backup was about to matter most), and a rolling bearer is never
+    // snapshotted as the degrade backup, whatever its stamped expiry.
+    if sidecar_kind_of(oauth) == SidecarKind::Rolling {
+        return Ok(());
     }
     atomic_write_600(&backup, raw).context("write session-token.static.json")
 }
@@ -417,19 +343,12 @@ pub(crate) fn write_session_token_with_backup(name: &str, token: &str, now_ms: i
         atomic_write_600(&dir.join("session-token.json"), &bytes)
             .context("write session-token.json")?;
         atomic_write_600(&dir.join("session-token.static.json"), &bytes)
-            .context("write session-token.static.json")?;
-        // Marked AFTER, per `mark_sidecar`'s ordering rule. Best-effort for the
-        // same reason as `write_session_token`: the credential is already on
-        // disk and a marker must not be able to fail a landed capture.
-        if let Err(e) = mark_sidecar(name, SidecarKind::Mint) {
-            logline!("clauth: '{name}' session-token.kind not written ({e:#})");
-        }
-        Ok(())
+            .context("write session-token.static.json")
     })?;
     Ok(expires_at)
 }
 
-/// CLA-ROLL: heal a mis-filled sidecar on a FEED profile — quarantine the
+/// CLA-ROLL: heal a mis-filled sidecar on a rolling-token profile — quarantine the
 /// evidence (`~/.clauth/quarantine/…-<name>.session-token.json`), restore the
 /// preserved static mint over it. `Ok(true)` = healed; `Ok(false)` = no
 /// backup to restore (the caller keeps the disengaged-vanilla posture) OR the
@@ -451,14 +370,6 @@ pub(crate) fn heal_misfilled_sidecar(name: &str) -> Result<bool> {
         quarantine_sidecar_locked(name, &sidecar)?;
         let bytes = std::fs::read(&backup).context("read session-token.static.json")?;
         atomic_write_600(&sidecar, bytes).context("restore session-token.json")?;
-        // Marked BEFORE the backup is consumed, and NOT best-effort here.
-        // This is the one path where the general "a lost marker costs at worst
-        // a skipped backup the next write repairs" reasoning does not hold:
-        // the backup is about to be deleted, so a stale `rolling` claim over
-        // the restored mint would make the next roll destroy the only copy.
-        // Failing first leaves sidecar=mint + backup intact + marker unmarked,
-        // which is consistent, safe, and retryable.
-        mark_sidecar(name, SidecarKind::Mint)?;
         std::fs::remove_file(&backup).context("remove consumed static backup")?;
         Ok(true)
     })
@@ -480,9 +391,6 @@ pub(crate) fn quarantine_misfilled_sidecar(name: &str) -> Result<bool> {
         }
         quarantine_sidecar_locked(name, &sidecar)?;
         std::fs::remove_file(&sidecar).context("remove mis-filled session-token.json")?;
-        // The sidecar is gone; a marker left behind would describe a file that
-        // is not there and hand the next writer a claim it never made.
-        clear_sidecar_mark(name)?;
         Ok(true)
     })
 }
@@ -523,7 +431,16 @@ fn quarantine_sidecar_locked(name: &str, sidecar: &Path) -> Result<()> {
 /// block a session start (the vanilla fallback still works; the daemon heals
 /// the sidecar on its next rotation).
 pub(crate) fn arm_rolling_from_disk(name: &str) {
-    const FEED_ARM_GRACE_MS: i64 = 30 * 60 * 1000;
+    arm_rolling_from_disk_synced(name, || {});
+}
+
+/// The injected closure runs after the pre-guard pre-filter and immediately
+/// before `RotationGuard::acquire` — a sync point for the regression test that
+/// holds the guard while this thread parks, so "the write uses the post-guard
+/// re-read" is pinned by construction rather than by a sleep long enough to
+/// probably lose a race. Production passes a no-op.
+fn arm_rolling_from_disk_synced(name: &str, pre_guard_done: impl FnOnce()) {
+    const ROLLING_ARM_GRACE_MS: i64 = 30 * 60 * 1000;
     let Ok(profile) = crate::profile::load_profile(name) else {
         return;
     };
@@ -536,7 +453,7 @@ pub(crate) fn arm_rolling_from_disk(name: &str) {
         Some(SessionTokenStatus::NotLongLived) => return,
         // A comfortably live rolling token (or a healthy mint) needs nothing.
         Some(SessionTokenStatus::LongLived(exp))
-            if exp.is_none_or(|e| now + FEED_ARM_GRACE_MS < e) =>
+            if exp.is_none_or(|e| now + ROLLING_ARM_GRACE_MS < e) =>
         {
             return;
         }
@@ -551,13 +468,13 @@ pub(crate) fn arm_rolling_from_disk(name: &str) {
     };
     if oauth
         .expires_at
-        .is_none_or(|e| now + FEED_ARM_GRACE_MS >= e)
+        .is_none_or(|e| now + ROLLING_ARM_GRACE_MS >= e)
     {
         return; // chain itself stale — the daemon's guarded refresh will stamp
     }
     // Everything above is a CHEAP PRE-FILTER on a pre-guard read — it decides
     // only whether this is worth serializing for, never what gets written.
-    //
+    pre_guard_done();
     // `RotationGuard::acquire` BLOCKS on the flock, so arriving at the `else`
     // is a filesystem or permissions problem under `~/.clauth`, not contention:
     // the ordinary interleaving is that we WAIT here while the daemon's
@@ -581,13 +498,28 @@ pub(crate) fn arm_rolling_from_disk(name: &str) {
     else {
         return;
     };
+    // The clock is re-taken with the state: `acquire` can block for a full
+    // rotation round trip, and judging post-guard freshness against the
+    // pre-guard `now` biases toward "fresh" by exactly that wait.
+    let now = crate::usage::now_ms() as i64;
     // Re-check the freshness gate too: the rotation we waited for may have
     // already re-stamped the sidecar through the rotation hook, in which case
     // there is nothing left to do and no reason to write.
     if matches!(
         session_token_status(name),
-        Some(SessionTokenStatus::LongLived(exp)) if exp.is_none_or(|e| now + FEED_ARM_GRACE_MS < e)
+        Some(SessionTokenStatus::LongLived(exp)) if exp.is_none_or(|e| now + ROLLING_ARM_GRACE_MS < e)
     ) {
+        return;
+    }
+    // And the chain-staleness gate: the pre-guard pass proved a comfortable
+    // chain existed THEN. The chain re-read under the guard is the one about
+    // to be stamped, and stamping a bearer already inside the grace window
+    // installs a token with less life than a session can rely on — the
+    // daemon's guarded refresh owns that case.
+    if oauth
+        .expires_at
+        .is_none_or(|e| now + ROLLING_ARM_GRACE_MS >= e)
+    {
         return;
     }
     if let Err(e) = stamp_rolling_token(name, oauth) {
@@ -611,44 +543,24 @@ pub(crate) fn restore_static_mint(name: &str) -> Result<bool> {
         }
         let bytes = std::fs::read(&backup).context("read session-token.static.json")?;
         atomic_write_600(&sidecar, bytes).context("restore session-token.json")?;
-        // Marked BEFORE the backup is consumed, and NOT best-effort here.
-        // This is the one path where the general "a lost marker costs at worst
-        // a skipped backup the next write repairs" reasoning does not hold:
-        // the backup is about to be deleted, so a stale `rolling` claim over
-        // the restored mint would make the next roll destroy the only copy.
-        // Failing first leaves sidecar=mint + backup intact + marker unmarked,
-        // which is consistent, safe, and retryable.
-        mark_sidecar(name, SidecarKind::Mint)?;
         std::fs::remove_file(&backup).context("remove consumed static backup")?;
         Ok(true)
     })
 }
 
 /// CLA-ROLL: what the sidecar holds right now, with the token behind it, for
-/// the arming report. `None` when there is no readable sidecar at all.
+/// the arming report and every rendering surface. `None` when there is no
+/// readable sidecar at all.
 ///
-/// The kind comes from [`sidecar_kind`], never from the token's shape, so the
-/// CLI can tell "armed a rolling bearer" from "the gate degraded and left the
-/// mint in place" — two outcomes that both arrive as `AuthGate::Ready` and
-/// both leave `has_session_token` true.
+/// The kind comes from [`sidecar_kind_of`] — the same exact classification
+/// every other reader uses — so the CLI can tell "armed a rolling bearer" from
+/// "the gate degraded and left the mint in place", two outcomes that both
+/// arrive as `AuthGate::Ready` and both leave `has_session_token` true.
 pub(crate) fn sidecar_summary(name: &str) -> Option<(SidecarKind, crate::profile::OAuthToken)> {
     let path = profile_dir(name).ok()?.join("session-token.json");
     let creds = read_json_file::<ClaudeCredentials>(&path).ok()?;
     let oauth = creds.claude_ai_oauth?;
-    // Unmarked falls back to the same horizon heuristic every other reader
-    // uses, so an upgraded install still reports honestly.
-    let kind = sidecar_kind(name).unwrap_or({
-        let now = crate::usage::now_ms() as i64;
-        if oauth
-            .expires_at
-            .is_some_and(|exp| exp < now + MINT_HORIZON_MS)
-        {
-            SidecarKind::Rolling
-        } else {
-            SidecarKind::Mint
-        }
-    });
-    Some((kind, oauth))
+    Some((sidecar_kind_of(&oauth), oauth))
 }
 
 /// The file a switch INSTALLS as the live login: the profile's

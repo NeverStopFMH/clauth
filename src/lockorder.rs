@@ -164,6 +164,14 @@ pub(crate) mod rank {
         /// a manual refresh (`usage::scheduler`). Leaf — acquired standalone in
         /// `tick`/`fetch_third_party_due`, never under another lock.
         SuppressedGeneric = 1300;
+        /// CLA-ROLL re-stamp pacing (`usage::scheduler::ClaudeRollingPacing`).
+        /// A true leaf today — every acquisition is take-check-release, before
+        /// `gate_fn` runs and before any other lock — but "today" is exactly
+        /// what a rankless `std::sync::Mutex` cannot defend: the ordering
+        /// `debug_assert` is blind to it, so a future edit taking `Config`
+        /// inside a pacing scope would sail past the one check built to catch
+        /// it. Ranked as a standalone leaf like its neighbors.
+        RollingPacing = 1400;
         PendingSwitch = 1500;
         PendingSwitchOff = 1700;
     }

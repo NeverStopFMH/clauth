@@ -758,7 +758,7 @@ fn fetch_with_rotation(
         // lazy path, so the other four are unreachable rather than chosen —
         // they still mirror the shipped defaults so a future reader isn't told
         // preemptive rotation is off by default. `rolling_token` falls back to
-        // OFF: the feed axis only ever ADDS a rotation, so the safe unreachable
+        // OFF: the rolling-token axis only ever ADDS a rotation, so the safe unreachable
         // value is the one that adds none.
         .unwrap_or((
             false,
@@ -2356,7 +2356,8 @@ pub(crate) struct SchedulerState {
     /// re-runs the trim once [`HISTORY_PRUNE_INTERVAL_MS`] has elapsed.
     last_history_prune: AtomicU64,
     /// CLA-ROLL pacing for the rolling-sidecar freshness scan.
-    claude_feed: std::sync::Mutex<ClaudeRollingPacing>,
+    claude_rolling:
+        crate::lockorder::RankedMutex<ClaudeRollingPacing, crate::lockorder::rank::RollingPacing>,
 }
 
 /// One scheduler tick: drain forced refetches, partition both legs, publish
@@ -2397,7 +2398,17 @@ fn tick(state: &SchedulerState) {
     // CLA-ROLL: rolling-sidecar freshness scan — renew a rolling-token profile's
     // session bearer hours ahead of its clock death instead of relying on
     // rotation side effects (lease-holder only, like every other leg).
-    claude_rolling_tick(&state.config, &state.claude_feed, now_ms(), &|name| {
+    //
+    // Inline and serial on the tick thread, ahead of the fanned-out fetch
+    // legs, ON PURPOSE — a deliberate departure from the `fetch_oauth_due_with`
+    // worker pattern, not an oversight of it. The steady state is one due
+    // profile per chain lifetime (~hours), so the fan-out's reason to exist
+    // (one slow account stalling every other account's poll, every tick) has
+    // no analogue here; what the gate can cost (a rotation-lock wait, one
+    // token round trip) delays a single tick, bounded by the same timeouts the
+    // fetch legs run under. Anyone adding per-tick work to this leg inherits
+    // the fan-out question.
+    claude_rolling_tick(&state.config, &state.claude_rolling, now_ms(), &|name| {
         crate::oauth::restamp_rolling_token(&state.config, name, crate::oauth::refresh_result)
     });
 
@@ -2767,7 +2778,7 @@ pub(crate) fn spawn_refresher(
         fetch_lease,
         standdown_active: AtomicBool::new(false),
         last_history_prune,
-        claude_feed: std::sync::Mutex::new(ClaudeRollingPacing::default()),
+        claude_rolling: crate::lockorder::RankedMutex::new(ClaudeRollingPacing::default()),
     };
     // Same test-skip rationale as the status/tokens/pricing workers in
     // `tui/app.rs`: a detached tick thread is never joined, so it could run
@@ -3482,7 +3493,7 @@ const ROLLING_SCAN_GAP_MS: u64 = 5 * 60 * 1000;
 /// nothing while avoiding per-scan log spam.
 const ROLLING_RETRY_MS: u64 = 15 * 60 * 1000;
 /// A Broken verdict (dead chain, no mint to degrade to) only changes via
-/// re-login — which re-arms the feed anyway — so retry on a long leash.
+/// re-login — which re-arms the rolling token anyway — so retry on a long leash.
 const ROLLING_BROKEN_RETRY_MS: u64 = 6 * 60 * 60 * 1000;
 
 /// Pacing for the re-stamp scan: an in-memory throttle only — the durable
@@ -3514,7 +3525,10 @@ pub(super) struct ClaudeRollingPacing {
 /// offline; only the injected closure ever touches locks or the network.
 pub(super) fn claude_rolling_tick(
     config: &crate::profile::ConfigHandle,
-    pacing: &std::sync::Mutex<ClaudeRollingPacing>,
+    pacing: &crate::lockorder::RankedMutex<
+        ClaudeRollingPacing,
+        crate::lockorder::rank::RollingPacing,
+    >,
     now: u64,
     gate_fn: &dyn Fn(&str) -> crate::oauth::AuthGate,
 ) {
@@ -3549,7 +3563,22 @@ pub(super) fn claude_rolling_tick(
         if !crate::oauth::rolling_sidecar_restamp_due(&name, now as i64) {
             continue;
         }
-        match gate_fn(&name) {
+        let gate = gate_fn(&name);
+        // A standing `auth_broken` changes only via re-login, which re-arms
+        // the rolling token anyway — so a quarantined chain takes the Broken
+        // leash on EVERY verdict, not just a literal `Broken`. Without this, a
+        // quarantined profile whose sidecar is running out its clock lands in
+        // the Ready-still-due / Transient arms below and picks up a second
+        // 15-minute cadence on top of the poll leg's own backoff, retrying a
+        // roll that `roll_from_stored_chain` routes to `ChainStale` by flag.
+        // Read AFTER the gate, which is what may have just raised it.
+        let flagged = config.lock().ok().is_some_and(|c| c.is_auth_broken(&name));
+        let retry_ms = if flagged {
+            ROLLING_BROKEN_RETRY_MS
+        } else {
+            ROLLING_RETRY_MS
+        };
+        match gate {
             // Ready = re-stamped no-spend or degraded to a serving fallback;
             // Refreshed = the rotation hook fed (and, active, mirrored). Both
             // logged at their source. A Ready that left the sidecar STILL due
@@ -3559,8 +3588,7 @@ pub(super) fn claude_rolling_tick(
             crate::oauth::AuthGate::Ready | crate::oauth::AuthGate::Refreshed => {
                 if let Ok(mut p) = pacing.lock() {
                     if crate::oauth::rolling_sidecar_restamp_due(&name, now as i64) {
-                        p.retry_after_ms
-                            .insert(name.clone(), now + ROLLING_RETRY_MS);
+                        p.retry_after_ms.insert(name.clone(), now + retry_ms);
                     } else {
                         p.retry_after_ms.remove(&name);
                     }
@@ -3572,8 +3600,7 @@ pub(super) fn claude_rolling_tick(
                     e.text_with_status()
                 );
                 if let Ok(mut p) = pacing.lock() {
-                    p.retry_after_ms
-                        .insert(name.clone(), now + ROLLING_RETRY_MS);
+                    p.retry_after_ms.insert(name.clone(), now + retry_ms);
                 }
             }
             crate::oauth::AuthGate::Broken => {

@@ -2463,8 +2463,9 @@ fn refresh_classification_survives_the_real_wire_in_both_directions() {
     );
 }
 
-/// `oauth_config` with the feed enabled and a plan-capable chain (full
-/// scopes + subscriptionType) — the shape `clauth feed <p> on` requires.
+/// `oauth_config` with the rolling token enabled and a plan-capable chain
+/// (full scopes + subscriptionType) — the shape `clauth rolling-token <p>`
+/// requires.
 fn rolling_config(name: &str, refresh_token: Option<&str>, expires_at: Option<i64>) -> AppConfig {
     let mut config = oauth_config(name, refresh_token, expires_at);
     let p = config.profiles.first_mut().expect("profile");
@@ -2647,7 +2648,7 @@ fn rolling_gate_dead_chain_restores_static_mint() {
     // A genuine mint first (1yr horizon, no subscriptionType)…
     crate::claude::write_session_token(name, "sk-ant-oat01-mint", crate::usage::now_ms() as i64)
         .expect("mint");
-    // …then the feed takes over, preserving it…
+    // …then the roll takes over, preserving it…
     crate::claude::stamp_rolling_token(
         name,
         &OAuthToken {
@@ -2736,11 +2737,11 @@ fn rotation_hook_stamps_enabled_profiles_and_preserves_the_mint() {
     assert_eq!(
         backed.access_token(),
         Some("sk-ant-oat01-mint"),
-        "first feed preserved the mint"
+        "first roll preserved the mint"
     );
 }
 
-/// Same rotation on a split profile WITHOUT the feed: the sidecar is the
+/// Same rotation on a split profile WITHOUT the rolling token: the sidecar is the
 /// static mint and stays byte-identical (the designed quiet steady state).
 #[test]
 fn rotation_hook_leaves_non_rolling_split_sidecars_alone() {
@@ -2766,7 +2767,7 @@ fn rotation_hook_leaves_non_rolling_split_sidecars_alone() {
     assert_eq!(oauth.access_token, "sk-ant-oat01-mint", "mint untouched");
 }
 
-/// A mis-filled sidecar (rotating pair) is never overwritten by the feed —
+/// A mis-filled sidecar (rotating pair) is never overwritten by the roll —
 /// the DANGER evidence survives for the operator to see.
 #[test]
 fn rotation_hook_never_overwrites_a_misfilled_sidecar() {
@@ -2962,14 +2963,17 @@ fn restamp_due_fires_inside_the_horizon_only() {
     crate::claude::stamp_rolling_token(
         name,
         &OAuthToken {
-            access_token: "at-fed".to_string(),
+            access_token: "at-rolled".to_string(),
             refresh_token: None,
             expires_at: Some(beyond_horizon_expiry()),
-            scopes: None,
+            scopes: Some(vec![
+                "user:inference".to_string(),
+                "user:profile".to_string(),
+            ]),
             subscription_type: None,
         },
     )
-    .expect("feed");
+    .expect("stamp");
     assert!(
         !rolling_sidecar_restamp_due(name, now),
         "a bearer clear of the horizon is left alone"
@@ -2977,14 +2981,17 @@ fn restamp_due_fires_inside_the_horizon_only() {
     crate::claude::stamp_rolling_token(
         name,
         &OAuthToken {
-            access_token: "at-fed-dying".to_string(),
+            access_token: "at-rolled-dying".to_string(),
             refresh_token: None,
             expires_at: Some(future_expiry()), // +1h, inside the 2h horizon
-            scopes: None,
+            scopes: Some(vec![
+                "user:inference".to_string(),
+                "user:profile".to_string(),
+            ]),
             subscription_type: None,
         },
     )
-    .expect("feed");
+    .expect("stamp");
     assert!(
         rolling_sidecar_restamp_due(name, now),
         "a bearer inside the horizon is due"

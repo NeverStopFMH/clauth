@@ -237,13 +237,21 @@ pub(crate) fn build_status(
             serde_json::json!({
                 "name": name,
                 "active": config.is_active(name),
-                // Additive (CLA-ROLL): the session-token feed — the sidecar's
-                // hours-scale countdown is routine maintenance while true
-                // (daemon re-stamps on rotation and on the freshness timer), a
-                // dying credential while false. Readers key their token-row
-                // rendering off this so a rolling token never displays as an
-                // expiring mint.
-                "rolling_token": p.rolling_token,
+                // Additive (CLA-ROLL): what the sidecar actually HOLDS — the
+                // same content classification the TUI renders, not the config
+                // flag. The two part ways exactly when honesty matters: a dead
+                // chain degrades the sidecar onto its static mint while the
+                // flag stays on, and the flag would promise readers a re-stamp
+                // for a mint nobody is going to re-stamp. While true, the
+                // sidecar's hours-scale countdown is routine maintenance
+                // (daemon re-stamps on rotation and on the freshness timer);
+                // while false it is a real credential clock. Readers key their
+                // token-row rendering off this so a rolling token never
+                // displays as an expiring mint — nor the reverse.
+                "rolling_token": matches!(
+                    crate::claude::sidecar_summary(name),
+                    Some((crate::claude::SidecarKind::Rolling, _))
+                ),
                 "provider": provider_label(p),
                 "base_url": p.base_url,
                 "tier": tier_label(p),

@@ -1051,7 +1051,7 @@ fn report_armed_sidecar(canonical: &str, chain_is_broken: bool) -> Result<()> {
 ///
 /// The inverse of `rolling-token`: flips the flag and restores the backup. Not
 /// gated on the profile being enabled — walking a disabled profile back to a
-/// mint that needs no feeder is always allowed.
+/// mint that needs no re-stamping is always allowed.
 fn cmd_static_token(name: &str) -> Result<()> {
     let mut config = load_config()?;
     let canonical = resolve_or_bail(&config, name)?;

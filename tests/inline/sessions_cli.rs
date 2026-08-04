@@ -491,7 +491,15 @@ fn a_nested_isolated_transcript_does_not_shadow_latest() {
 #[test]
 fn info_prints_the_resume_command_workspace_and_storage() {
     let sb = HomeSandbox::new();
-    let path = sb.home().join(".claude/projects/-w/known-session.jsonl");
+    // Componentwise: `storage:` prints the index walk's own `DirEntry::path`,
+    // which is natively separated. A one-shot `join(".claude/projects/…")`
+    // stores its `/` verbatim and mismatches that spelling on windows.
+    let path = sb
+        .home()
+        .join(".claude")
+        .join("projects")
+        .join("-w")
+        .join("known-session.jsonl");
     write_jsonl(&path, &[user_line("known-session", "/ws/a", "hi")]);
 
     let Resolved::Ready(session) = resolve_session("known-session") else {

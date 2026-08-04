@@ -1200,7 +1200,7 @@ fn rescue_preserves_the_source_file_mode() {
     );
 }
 
-// ── targeted workspace lookup (the `delegate` resume path) ───────────────────
+// ── targeted lookup (`clauth resume`/`info` and the `delegate` resume path) ──
 
 /// `--resume` only resolves a session under its own workspace, so the delegate
 /// path needs one transcript's recorded `cwd` and nothing else. This lookup is
@@ -1241,4 +1241,156 @@ fn workspace_of_treats_a_cwd_less_transcript_as_unresolvable() {
         &[json!({"sessionId": "sbare", "message": {"role": "user", "content": "hi"}}).to_string()],
     );
     assert_eq!(workspace_of("sbare"), None);
+}
+
+/// A duplicated id must resolve to the same file the index would pick, or
+/// `clauth info` prints one path while `clauth sessions` lists another.
+#[test]
+fn find_session_picks_the_same_duplicate_the_index_does() {
+    let sb = HomeSandbox::new();
+    let old = sb.home().join(".claude/projects/-w-a/sdup.jsonl");
+    let new = sb.home().join(".claude/projects/-w-b/sdup.jsonl");
+    write_jsonl(&old, &[user_line("sdup", "/w/a", "older copy")]);
+    write_jsonl(&new, &[user_line("sdup", "/w/b", "newer copy")]);
+    set_mtime(&old, SystemTime::UNIX_EPOCH + Duration::from_secs(1_000));
+    set_mtime(&new, SystemTime::UNIX_EPOCH + Duration::from_secs(2_000));
+
+    let found = find_session("sdup").expect("the id resolves");
+    assert_eq!(found.path, new, "the newest copy of an id wins");
+    assert_eq!(
+        found.workspace(),
+        Some(PathBuf::from("/w/b")),
+        "the workspace comes from the file that won"
+    );
+    let indexed = build_index();
+    assert_eq!(
+        found.workspace(),
+        find(&indexed, "sdup").map(|s| PathBuf::from(&s.workspace)),
+        "the targeted lookup and the index must agree on one id"
+    );
+
+    // Equal mtimes fall back to the greater path, matching `insert_newest`.
+    set_mtime(&old, SystemTime::UNIX_EPOCH + Duration::from_secs(2_000));
+    assert_eq!(
+        find_session("sdup").map(|f| f.path),
+        Some(new),
+        "an mtime tie takes the lexicographically greater path"
+    );
+
+    assert!(find_session("nosuchsession").is_none());
+}
+
+/// The `latest` target. Its ordering is the index's own newest-first key, which
+/// `sessions_cli` pins against the emitted listing.
+#[test]
+fn newest_session_takes_the_greatest_mtime_then_the_smallest_id() {
+    let sb = HomeSandbox::new();
+    // The smaller id sits at the smaller path, so the id rule and the path rule
+    // below it disagree: a fixture where they agree stays green even with the
+    // id tie-break deleted outright.
+    let smaller_id = sb.home().join(".claude/projects/-w-a/s-aaa.jsonl");
+    let greater_path = sb.home().join(".claude/projects/-w-b/s-bbb.jsonl");
+    write_jsonl(&smaller_id, &[user_line("s-aaa", "/w/a", "aaa")]);
+    write_jsonl(&greater_path, &[user_line("s-bbb", "/w/b", "bbb")]);
+    set_mtime(
+        &smaller_id,
+        SystemTime::UNIX_EPOCH + Duration::from_secs(1_000),
+    );
+    set_mtime(
+        &greater_path,
+        SystemTime::UNIX_EPOCH + Duration::from_secs(2_000),
+    );
+
+    assert_eq!(
+        newest_session().map(|s| s.id).as_deref(),
+        Some("s-bbb"),
+        "the greatest mtime wins over both tie-breaks"
+    );
+
+    // On an mtime tie the index's own key breaks it by smallest id, so the
+    // pick can't depend on `read_dir` order.
+    set_mtime(
+        &smaller_id,
+        SystemTime::UNIX_EPOCH + Duration::from_secs(2_000),
+    );
+    assert_eq!(
+        newest_session().map(|s| s.id).as_deref(),
+        Some("s-aaa"),
+        "an mtime tie takes the smallest id, not the greater path"
+    );
+}
+
+/// A live isolated store is invisible to the lookups, so its transcripts have to
+/// be reachable some other way — otherwise a resume can only report a session
+/// `clauth sessions` just listed as "not found".
+#[test]
+fn live_isolated_holds_reports_what_the_lookup_excludes() {
+    let sb = HomeSandbox::new();
+    let iso = sb
+        .home()
+        .join(".clauth/profiles/iso/runtime-isolated/projects/-w-iso/siso.jsonl");
+    write_jsonl(&iso, &[user_line("siso", "/w/iso", "hi iso")]);
+    set_mtime(&iso, SystemTime::UNIX_EPOCH + Duration::from_secs(5_000));
+    let global = sb.home().join(".claude/projects/-w-g/sglobal.jsonl");
+    write_jsonl(&global, &[user_line("sglobal", "/w/g", "hi global")]);
+
+    let sessions_dir = sb.home().join(".clauth/profiles/iso/sessions-isolated");
+    fs::create_dir_all(&sessions_dir).unwrap();
+    let lock_file = crate::runtime::open_pid_file(&sessions_dir.join("12345")).unwrap();
+    lock_file.lock().unwrap(); // held so the runtime reads as live
+
+    let holds = live_isolated_holds();
+    drop(lock_file);
+
+    assert_eq!(holds.len(), 1, "the global store is not a hold");
+    assert_eq!(holds[0].session.id, "siso");
+    assert_eq!(holds[0].profile, "iso", "the owning profile is named");
+    assert_eq!(holds[0].session.path, iso);
+    assert_eq!(
+        holds[0].session.updated,
+        SystemTime::UNIX_EPOCH + Duration::from_secs(5_000),
+        "the mtime a `latest` comparison needs comes back with it"
+    );
+}
+
+/// A dead isolated runtime's store is GC territory, not a hold: reporting one
+/// would tell the operator to wait for a run that already ended.
+#[test]
+fn live_isolated_holds_ignores_a_runtime_with_no_live_session() {
+    let sb = HomeSandbox::new();
+    write_jsonl(
+        &sb.home()
+            .join(".clauth/profiles/iso/runtime-isolated/projects/-w-iso/sdead.jsonl"),
+        &[user_line("sdead", "/w/iso", "over")],
+    );
+    fs::create_dir_all(sb.home().join(".clauth/profiles/iso/sessions-isolated")).unwrap();
+
+    assert!(live_isolated_holds().is_empty());
+}
+
+/// The targeted lookup reads the GLOBAL store only, unlike `build_index`.
+/// `clauth resume` spawns against the shared store, so an id that lives only in
+/// a live isolated runtime is one Claude Code would answer `No conversation
+/// found` for — refusing it by name beats spawning a session that can't work.
+#[test]
+fn the_targeted_lookup_never_reaches_a_live_isolated_store() {
+    let sb = HomeSandbox::new();
+    let iso = sb
+        .home()
+        .join(".clauth/profiles/iso/runtime-isolated/projects/-w-iso/siso.jsonl");
+    write_jsonl(&iso, &[user_line("siso", "/w/iso", "hi iso")]);
+    let sessions_dir = sb.home().join(".clauth/profiles/iso/sessions-isolated");
+    fs::create_dir_all(&sessions_dir).unwrap();
+    let lock_file = crate::runtime::open_pid_file(&sessions_dir.join("12345")).unwrap();
+    lock_file.lock().unwrap(); // held so the runtime reads as live
+
+    // The index does see it, so the fixture is a live isolated store and not a
+    // dead one the walk would have skipped anyway.
+    assert!(
+        find(&build_index(), "siso").is_some(),
+        "the index covers a live isolated store"
+    );
+    assert!(find_session("siso").is_none(), "the lookup does not");
+    assert!(newest_session().is_none(), "not even as the newest session");
+    drop(lock_file);
 }

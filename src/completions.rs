@@ -31,7 +31,7 @@ const BASH: &str = r#"_clauth() {
     elif [ "$COMP_CWORD" -eq 2 ] && [ "$prev" = "which" ]; then
         COMPREPLY=( $(compgen -W "--json" -- "${cur}") )
     elif [ "$COMP_CWORD" -eq 2 ] && [ "$prev" = "sessions" ]; then
-        COMPREPLY=( $(compgen -W "--json" -- "${cur}") )
+        COMPREPLY=( $(compgen -W "--json --tokens" -- "${cur}") )
     elif [ "${COMP_WORDS[1]}" = "resume" ] && [ "${cur:0:2}" = "--" ]; then
         COMPREPLY=( $(compgen -W "--profile" -- "${cur}") )
     elif [ "${COMP_WORDS[1]}" = "delete" ] && [ "${cur:0:2}" = "--" ]; then
@@ -62,7 +62,7 @@ _clauth() {
             'enable[restore a disabled profile]' \
             'which[print profile owning the loaded credentials]' \
             'list[list accounts as a table with per-profile usage]' \
-            'sessions[list Claude Code sessions (add --json)]' \
+            'sessions[list Claude Code sessions (add --json / --tokens)]' \
             'resume[resume a session under a chosen profile]' \
             'info[print resume command + storage path for a session]' \
             'daemon[run the headless scheduler with no TUI]' \
@@ -91,7 +91,8 @@ _clauth() {
     elif (( CURRENT == 3 )) && [[ "${words[2]}" == which ]]; then
         _values 'flag' '--json[emit JSON instead of plain name]'
     elif (( CURRENT == 3 )) && [[ "${words[2]}" == sessions ]]; then
-        _values 'flag' '--json[emit the stable machine-readable array]'
+        _values 'flag' '--json[emit the stable machine-readable array]' \
+            '--tokens[add token totals + cost; reads every transcript in full]'
     elif (( CURRENT >= 3 )) && [[ "${words[2]}" == resume ]]; then
         _values 'flag' '--profile[resume under this profile instead of prompting]'
     elif (( CURRENT >= 4 )) && [[ "${words[2]}" == login ]]; then
@@ -143,6 +144,7 @@ complete -c clauth -f -n "__fish_seen_subcommand_from start" -a --no-rescue -d "
 complete -c clauth -f -n "__fish_seen_subcommand_from start" -a --with-fallback -d "Follow the fallback chain; needs a running daemon"
 complete -c clauth -f -n "__fish_seen_subcommand_from which" -a --json -d "Emit JSON"
 complete -c clauth -f -n "__fish_seen_subcommand_from sessions" -a --json -d "Emit the stable machine-readable array"
+complete -c clauth -f -n "__fish_seen_subcommand_from sessions" -a --tokens -d "Add token totals + cost; reads every transcript in full"
 complete -c clauth -f -n "__fish_seen_subcommand_from resume" -a --profile -d "Resume under this profile instead of prompting"
 complete -c clauth -f -n "__fish_seen_subcommand_from login" -a --base-url -d "API base url"
 complete -c clauth -f -n "__fish_seen_subcommand_from login" -a --api-key -d "API key (prompted echo-off if omitted)"

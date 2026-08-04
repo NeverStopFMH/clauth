@@ -125,9 +125,14 @@ pub(crate) enum Command {
     ///
     /// Exits 0 on success, 2 on a usage error, 1 on any other failure.
     Sessions {
-        /// Emit a stable newest-first JSON array instead of the table.
+        /// Emit a stable newest-first JSON array instead of the table. The field
+        /// set is fixed; `tokens` and `cost` are null without `--tokens`.
         #[arg(long)]
         json: bool,
+        /// Add each session's token total and cost. Reads every transcript in
+        /// full, so a large store takes a while; omitted, both stay blank.
+        #[arg(long)]
+        tokens: bool,
     },
 
     /// Resume a session under a chosen profile

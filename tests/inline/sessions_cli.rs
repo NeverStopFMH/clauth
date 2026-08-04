@@ -9,6 +9,7 @@
 use super::*;
 use std::collections::HashMap;
 use std::fs;
+use std::path::Path;
 use std::time::{Duration, SystemTime};
 
 use serde_json::json;
@@ -147,12 +148,84 @@ fn sessions_json_has_exact_fields_newest_first_with_null_and_redaction() {
     );
 }
 
+// ── --tokens gates the full-transcript annotation ──
+
+#[test]
+fn the_listing_costs_a_full_read_of_every_transcript_only_under_tokens() {
+    let sb = HomeSandbox::new();
+    let a = sb.home().join(".claude/projects/-w-a/aaaa-1111.jsonl");
+    write_jsonl(
+        &a,
+        &[
+            user_line("aaaa-1111", "/ws/a", "hello"),
+            usage_line("aaaa-1111", "/ws/a", "m1", "claude-sonnet-4", 100, 50),
+        ],
+    );
+
+    // Default: the index only, so the figure the annotation would fill stays
+    // absent. Its `None` is the same one a session with no usage row gets.
+    let plain = build_listing(false);
+    let row = &plain[0].sessions[0];
+    assert_eq!(row.tokens, None, "no annotation ⇒ no token total");
+    assert_eq!(
+        row.first_message.as_deref(),
+        Some("hello"),
+        "the preview still comes from the index, which the flag never gates"
+    );
+
+    // Opt in and the same store yields a real total — so the `None` above is
+    // the flag's doing, not a fixture that had nothing to report. Cost stays
+    // absent either way here: the sandbox has no price cache, and a cold cache
+    // prices nothing.
+    let annotated = build_listing(true);
+    let row = &annotated[0].sessions[0];
+    assert_eq!(row.tokens, Some(150), "--tokens sums input+output");
+}
+
+#[test]
+fn the_table_carries_the_token_columns_only_under_tokens() {
+    let sb = HomeSandbox::new();
+    let a = sb.home().join(".claude/projects/-w-a/aaaa-1111.jsonl");
+    write_jsonl(
+        &a,
+        &[
+            user_line("aaaa-1111", "/ws/a", "hello"),
+            usage_line("aaaa-1111", "/ws/a", "m1", "claude-sonnet-4", 100, 50),
+        ],
+    );
+    // A fixed mtime keeps the timestamp cell out of the substring assertions.
+    set_mtime(&a, SystemTime::UNIX_EPOCH + Duration::from_secs(3_000));
+
+    // Annotated through the same call the flag makes, so the row has real
+    // figures to print and a missing column is the flag's doing, not an empty
+    // fixture rendering blank either way.
+    let mut groups = build_listing(false);
+    crate::sessions::annotate_all(
+        &mut groups,
+        Some(&price_table(&[("claude-sonnet-4", 0.000003, 0.000015)])),
+    );
+    let session = &groups[0].sessions[0];
+
+    let plain = session_row(session, false);
+    assert!(
+        !plain.contains("150") && !plain.contains('$'),
+        "the default row carries neither figure: {plain}"
+    );
+    assert!(plain.contains("hello"), "it still carries the preview");
+
+    let annotated = session_row(session, true);
+    assert!(
+        annotated.contains("150") && annotated.contains("$0."),
+        "--tokens adds both cells: {annotated}"
+    );
+}
+
 // ── exit-code contract (0 / 1 / 2) ──
 
 #[test]
 fn no_sessions_found_maps_to_exit_one() {
     let _sb = HomeSandbox::new(); // empty tree ⇒ empty index
-    let err = run_sessions(true).expect_err("empty index must error");
+    let err = run_sessions(true, false).expect_err("empty index must error");
     assert!(
         err.to_string().contains("no sessions"),
         "error must say no sessions were found: {err}"
@@ -217,6 +290,195 @@ fn resume_profile_choice_tty_unknown_prompts_defaulting_to_active() {
     assert_eq!(
         resume_profile_choice(None, true, None, "active"),
         ("active".to_string(), true)
+    );
+}
+
+// ── resolve_session: the targeted lookup behind resume/info ──
+
+/// `resume latest` and the emitted listing must name the same session. They read
+/// the store two different ways now — a filename-and-mtime walk vs the full
+/// index — so the agreement is a real invariant, not a tautology.
+#[test]
+fn latest_resolves_to_the_first_row_the_listing_emits() {
+    let sb = HomeSandbox::new();
+    let older = sb.home().join(".claude/projects/-w-a/s-older.jsonl");
+    let newer = sb.home().join(".claude/projects/-w-b/s-newer.jsonl");
+    write_jsonl(&older, &[user_line("s-older", "/ws/a", "older")]);
+    write_jsonl(&newer, &[user_line("s-newer", "/ws/b", "newer")]);
+    set_mtime(&older, SystemTime::UNIX_EPOCH + Duration::from_secs(1_000));
+    set_mtime(&newer, SystemTime::UNIX_EPOCH + Duration::from_secs(2_000));
+
+    let groups = build_listing(false);
+    let flat = flatten_newest_first(&groups);
+    let Resolved::Ready(latest) = resolve_session("latest") else {
+        panic!("`latest` must resolve against a store with no live isolated run");
+    };
+    assert_eq!(
+        Some(latest.id.as_str()),
+        flat.first().map(|s| s.id.as_str()),
+        "`latest` must be the session `clauth sessions` lists first"
+    );
+    assert_eq!(latest.id, "s-newer");
+}
+
+/// Seed a live isolated runtime for `profile` holding one transcript, and return
+/// its lock file — the runtime reads as live only while that stays held.
+fn live_isolated_session(
+    sb: &HomeSandbox,
+    profile: &str,
+    id: &str,
+    workspace: &str,
+    mtime_secs: u64,
+) -> std::fs::File {
+    let iso = sb.home().join(format!(
+        ".clauth/profiles/{profile}/runtime-isolated/projects/-w-iso/{id}.jsonl"
+    ));
+    write_jsonl(&iso, &[user_line(id, workspace, "hi iso")]);
+    set_mtime(
+        &iso,
+        SystemTime::UNIX_EPOCH + Duration::from_secs(mtime_secs),
+    );
+    let sessions_dir = sb
+        .home()
+        .join(format!(".clauth/profiles/{profile}/sessions-isolated"));
+    fs::create_dir_all(&sessions_dir).unwrap();
+    let lock_file = crate::runtime::open_pid_file(&sessions_dir.join("12345")).unwrap();
+    lock_file.lock().unwrap();
+    lock_file
+}
+
+/// An id that only exists in a live isolated runtime is not resumable: the spawn
+/// is `Isolation::Shared`, so Claude Code would look in the shared store and
+/// answer `No conversation found`. Refusing it is right; calling it missing is
+/// not, when `clauth sessions` lists it two lines up.
+#[test]
+fn resume_refuses_an_isolated_held_session_without_calling_it_missing() {
+    let sb = HomeSandbox::new();
+    let ws = sb.home().join("workspace");
+    fs::create_dir_all(&ws).unwrap();
+    let lock_file = live_isolated_session(&sb, "iso", "siso", &ws.to_string_lossy(), 5_000);
+
+    // The listing still browses it — only the resume path refuses.
+    assert!(
+        flatten_newest_first(&build_listing(false))
+            .iter()
+            .any(|s| s.id == "siso"),
+        "the listing covers a live isolated store"
+    );
+
+    let err = run_resume("siso", None).expect_err("an isolated-held id must be refused");
+    drop(lock_file);
+    let msg = err.to_string();
+    assert!(
+        msg.contains("'siso'") && msg.contains("profile 'iso'"),
+        "the refusal must name the session and the run holding it: {msg}"
+    );
+    assert!(
+        !msg.contains("no session found"),
+        "a listed session is not missing: {msg}"
+    );
+    assert!(
+        msg.contains("--rescue"),
+        "and must say what makes it reachable: {msg}"
+    );
+    assert_eq!(crate::exit_code(Err(err)), 1);
+}
+
+/// `latest` means the newest session. When a live isolated run holds that one,
+/// silently resolving to the second newest would spend an account window on a
+/// conversation the operator never named — and `clauth sessions` would still be
+/// listing the one they meant, first.
+#[test]
+fn latest_refuses_rather_than_substituting_when_an_isolated_run_holds_the_newest() {
+    let sb = HomeSandbox::new();
+    let ws = sb.home().join("workspace");
+    fs::create_dir_all(&ws).unwrap();
+    let global = sb.home().join(".claude/projects/-w-g/sglobal.jsonl");
+    write_jsonl(
+        &global,
+        &[user_line("sglobal", &ws.to_string_lossy(), "hi")],
+    );
+    set_mtime(&global, SystemTime::UNIX_EPOCH + Duration::from_secs(1_000));
+
+    // Isolated transcript NEWER than the reachable one.
+    let lock_file = live_isolated_session(&sb, "iso", "siso", &ws.to_string_lossy(), 5_000);
+    let err = run_resume("latest", None).expect_err("a shadowed `latest` must be refused");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("'siso'") && msg.contains("profile 'iso'"),
+        "the refusal names the session that shadowed `latest`: {msg}"
+    );
+    assert!(
+        !msg.contains("sglobal"),
+        "and never quietly offers the second newest: {msg}"
+    );
+
+    // Same fixture, isolated transcript OLDER: `latest` is the reachable one and
+    // resolves normally. Proves the refusal is the shadowing, not the presence
+    // of any live isolated run at all.
+    set_mtime(
+        &sb.home()
+            .join(".clauth/profiles/iso/runtime-isolated/projects/-w-iso/siso.jsonl"),
+        SystemTime::UNIX_EPOCH + Duration::from_secs(500),
+    );
+    let resolved = resolve_session("latest");
+    drop(lock_file);
+    assert!(
+        matches!(resolved, Resolved::Ready(ref s) if s.id == "sglobal"),
+        "an older isolated transcript shadows nothing"
+    );
+}
+
+// ── clauth info ──
+
+#[test]
+fn info_prints_the_resume_command_workspace_and_storage() {
+    let sb = HomeSandbox::new();
+    let path = sb.home().join(".claude/projects/-w/known-session.jsonl");
+    write_jsonl(&path, &[user_line("known-session", "/ws/a", "hi")]);
+
+    let Resolved::Ready(session) = resolve_session("known-session") else {
+        panic!("the id must resolve");
+    };
+    assert_eq!(
+        info_lines(&session, None),
+        format!(
+            "resume:    clauth resume known-session\nworkspace: /ws/a\nstorage:   {}",
+            path.display()
+        )
+    );
+}
+
+/// A held session is reportable where it is not resumable: `info` launches
+/// nothing, and its storage path is the only place any surface says where the
+/// transcript actually lives. What it must NOT print is a resume command that
+/// Claude Code would refuse.
+#[test]
+fn info_reports_a_held_session_without_offering_a_resume_command() {
+    let sb = HomeSandbox::new();
+    let lock_file = live_isolated_session(&sb, "iso", "siso", "/w/iso", 5_000);
+    let resolved = resolve_session("siso");
+    drop(lock_file);
+
+    let Resolved::Held(hold) = resolved else {
+        panic!("a live isolated run must resolve as held");
+    };
+    let lines = info_lines(&hold.session, Some(&hold.profile));
+    assert!(
+        !lines.contains("clauth resume"),
+        "no resume command for a session a resume can't reach: {lines}"
+    );
+    assert!(
+        lines.contains("under 'iso'"),
+        "the holding profile is named: {lines}"
+    );
+    assert!(
+        lines.contains("workspace: /w/iso"),
+        "the recorded workspace still comes from the transcript: {lines}"
+    );
+    assert!(
+        lines.contains("runtime-isolated"),
+        "and the storage path points into the isolated store: {lines}"
     );
 }
 

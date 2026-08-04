@@ -143,7 +143,7 @@ fn dispatch(cli: Cli) -> Result<()> {
         Command::Enable { profile } => cmd_enable(&profile),
         Command::Which { json } => which::run(json),
         Command::List { all, disabled } => list::run(all || disabled),
-        Command::Sessions { json } => sessions_cli::run_sessions(json),
+        Command::Sessions { json, tokens } => sessions_cli::run_sessions(json, tokens),
         Command::Resume { target, profile } => {
             sessions_cli::run_resume(&target, profile.as_deref())
         }

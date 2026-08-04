@@ -85,7 +85,8 @@ pub(crate) struct SessionInfo {
     /// break grouping and gut the path display. Only the previews below are.
     pub(crate) workspace: String,
     /// Source file path — the tie-breaker when the same session id shows up in
-    /// two stores at an equal mtime. Module-private: consumers key off `id`.
+    /// two stores at an equal mtime. Module-private: consumers key off `id`, and
+    /// a caller that wants one session's path takes [`find_session`].
     path: PathBuf,
     /// File mtime — a cheap freshness key that needs no parse.
     pub(crate) updated: SystemTime,
@@ -101,15 +102,6 @@ pub(crate) struct SessionInfo {
     pub(crate) cost: Option<f64>,
     /// Profile the session last ran under — A3 fills this; `None` = unknown.
     pub(crate) last_ran_profile: Option<String>,
-}
-
-impl SessionInfo {
-    /// The transcript's on-disk path — the storage line `clauth info` prints.
-    /// An accessor keeps the field module-private (consumers still key off `id`
-    /// for dedup) while exposing it for display.
-    pub(crate) fn path(&self) -> &Path {
-        &self.path
-    }
 }
 
 /// Sessions that share one workspace (`cwd`), newest-first within the group.
@@ -419,11 +411,18 @@ fn session_id_from_path(path: &Path) -> Option<String> {
     Some(stem.to_string())
 }
 
+/// A file's mtime — the freshness key every ordering here is built on. `None`
+/// when it can't be read, which drops the file from that ordering rather than
+/// ranking it at an invented time.
+fn mtime_of(path: &Path) -> Option<SystemTime> {
+    std::fs::metadata(path).ok()?.modified().ok()
+}
+
 /// Index one file into a [`SessionInfo`], or `None` when it has no usable
 /// filename stem or its metadata can't be read. Head metadata is best-effort.
 fn scan_file(path: &Path, source: &SessionSource) -> Option<SessionInfo> {
     let id = session_id_from_path(path)?;
-    let updated = std::fs::metadata(path).ok()?.modified().ok()?;
+    let updated = mtime_of(path)?;
     let head = read_head(path);
     Some(SessionInfo {
         id,
@@ -533,6 +532,132 @@ pub(crate) fn build_index() -> Vec<WorkspaceGroup> {
     }
 
     group_by_workspace(by_id.into_values().collect())
+}
+
+// ── Targeted lookup: one session, without the index's per-transcript reads ────
+//
+// [`build_index`] head- AND tail-reads every transcript to build previews, which
+// a by-id caller then throws away: 11.3 s for `clauth info latest` over a
+// 12k-session store, against 44 ms for the same answer here. The lookups below
+// walk that store for filenames and mtimes, then read the head of the ONE file
+// they resolved to.
+//
+// The GLOBAL store only, unlike the index. A live isolated runtime's own store
+// belongs to a session another process is running; `clauth resume` and the
+// `delegate` resume both spawn against the shared store, where Claude Code would
+// answer `No conversation found` for an id that only exists in an isolated tree.
+// An isolated run's transcript reaches this store once the rescue lifts it out.
+
+/// One session located by id, carrying only what a targeted caller needs. The
+/// [`SessionInfo`] fields absent here — previews, token totals — are exactly the
+/// per-transcript reads this lookup exists to avoid.
+#[derive(Debug, Clone)]
+pub(crate) struct SessionRef {
+    /// The transcript filename stem: the id `--resume` resolves by.
+    pub(crate) id: String,
+    /// The transcript's on-disk path.
+    pub(crate) path: PathBuf,
+    /// File mtime — free here (the walk stats every candidate to order them)
+    /// and what a caller compares one store's answer against another's.
+    pub(crate) updated: SystemTime,
+}
+
+/// A transcript in a live isolated runtime's own store: real, listed by
+/// `clauth sessions`, and unreachable by a resume until that run ends and the
+/// rescue lifts it into the shared store.
+#[derive(Debug, Clone)]
+pub(crate) struct IsolatedHold {
+    pub(crate) session: SessionRef,
+    /// The profile whose live isolated run owns that store.
+    pub(crate) profile: String,
+}
+
+impl SessionRef {
+    /// The workspace this session was recorded in, from the head of its own
+    /// transcript. `None` when the head records no `cwd` — a resume then has
+    /// nowhere to run, the same dead end as no transcript at all.
+    pub(crate) fn workspace(&self) -> Option<PathBuf> {
+        let workspace = read_head(&self.path).workspace;
+        (!workspace.is_empty()).then(|| PathBuf::from(workspace))
+    }
+}
+
+/// Every `*.jsonl` path in the global store, none of them opened.
+fn global_transcripts() -> Vec<PathBuf> {
+    let Ok(projects) = claude_dir().map(|d| d.join("projects")) else {
+        return Vec::new();
+    };
+    let mut paths = Vec::new();
+    collect_jsonl(&projects, WALK_MAX_DEPTH, &mut paths);
+    paths
+}
+
+/// Locate one session by exact id. When the same id sits in more than one
+/// project-slug dir, the newest mtime wins and an equal mtime falls back to the
+/// greater path — [`insert_newest`]'s rule, so a targeted lookup and the index
+/// resolve one id to the same file.
+pub(crate) fn find_session(session_id: &str) -> Option<SessionRef> {
+    let (updated, path) = global_transcripts()
+        .into_iter()
+        .filter(|p| session_id_from_path(p).as_deref() == Some(session_id))
+        .filter_map(|p| mtime_of(&p).map(|t| (t, p)))
+        .max_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)))?;
+    Some(SessionRef {
+        id: session_id.to_owned(),
+        path,
+        updated,
+    })
+}
+
+/// The newest session in the store — what a `latest` target resolves to. The
+/// ordering is the index's own newest-first key ([`group_by_workspace`] then
+/// `flatten_newest_first`): greatest mtime, then the smallest id, then
+/// [`insert_newest`]'s greater-path duplicate rule. Paths are unique, so the
+/// comparison is total and the pick never depends on `read_dir` order.
+pub(crate) fn newest_session() -> Option<SessionRef> {
+    global_transcripts()
+        .into_iter()
+        .filter_map(|p| Some((mtime_of(&p)?, session_id_from_path(&p)?, p)))
+        .max_by(|a, b| {
+            a.0.cmp(&b.0)
+                .then_with(|| b.1.cmp(&a.1))
+                .then_with(|| a.2.cmp(&b.2))
+        })
+        .map(|(updated, id, path)| SessionRef { id, path, updated })
+}
+
+/// The workspace one session was recorded in, located by transcript filename —
+/// [`find_session`] plus [`SessionRef::workspace`] in one call, which is all the
+/// `delegate` resume path needs. `None` covers both dead ends it reports as one:
+/// no transcript of that id, and a transcript recording no workspace.
+pub(crate) fn workspace_of(session_id: &str) -> Option<PathBuf> {
+    find_session(session_id)?.workspace()
+}
+
+/// Every transcript a live isolated runtime is holding, at the same tier-1 cost
+/// (filenames and mtimes, nothing opened).
+///
+/// These are never resolutions — a resume spawns against the shared store and
+/// cannot read any of them. They exist to EXPLAIN what the shared store alone
+/// cannot: a session `clauth sessions` just listed is not "no session found",
+/// and the newest session on the machine going missing from `latest` is not a
+/// reason to silently resume the second newest.
+pub(crate) fn live_isolated_holds() -> Vec<IsolatedHold> {
+    let mut out = Vec::new();
+    for (profile, projects) in crate::runtime::live_isolated_stores() {
+        let mut paths = Vec::new();
+        collect_jsonl(&projects, WALK_MAX_DEPTH, &mut paths);
+        for path in paths {
+            let (Some(id), Some(updated)) = (session_id_from_path(&path), mtime_of(&path)) else {
+                continue;
+            };
+            out.push(IsolatedHold {
+                session: SessionRef { id, path, updated },
+                profile: profile.clone(),
+            });
+        }
+    }
+    out
 }
 
 /// Annotate one session in place with its token total and API-equivalent cost —
@@ -662,10 +787,7 @@ fn run_session_ids(projects_dir: &Path, isolated: bool, run_start: SystemTime) -
 /// Whether `path`'s mtime is at or after `since`. Fail-soft: an unreadable mtime
 /// counts as outside the window (not this run's), so it is left unstamped.
 fn touched_since(path: &Path, since: SystemTime) -> bool {
-    std::fs::metadata(path)
-        .and_then(|m| m.modified())
-        .map(|mtime| mtime >= since)
-        .unwrap_or(false)
+    mtime_of(path).is_some_and(|mtime| mtime >= since)
 }
 
 /// Record which sessions a `clauth start` run owned into the global store.
@@ -707,6 +829,21 @@ pub(crate) fn stamp_run_sessions(
     }
 }
 
+/// One session's owner, or `None` when it is absent or `Contested` — both mean
+/// unknown, and a `Contested` id must never resolve to either contender.
+fn owner_in(store: &SessionProfiles, session_id: &str) -> Option<String> {
+    match store.sessions.get(session_id)? {
+        SessionOwner::Known(p) => Some(p.clone()),
+        SessionOwner::Contested => None,
+    }
+}
+
+/// The profile one session last ran under — the single-id counterpart to
+/// [`annotate_owners`], for a caller holding an id rather than an index.
+pub(crate) fn owner_of(session_id: &str) -> Option<String> {
+    owner_in(&load_store(&store_path()?), session_id)
+}
+
 /// Annotate each session's `last_ran_profile` from the global owner store.
 /// Loads the store once, so a caller can attach owners without paying the
 /// per-session full-transcript parse [`annotate`] costs. Leaves `None` for a
@@ -718,10 +855,7 @@ pub(crate) fn annotate_owners(groups: &mut [WorkspaceGroup]) {
     let store = load_store(&path);
     for group in groups.iter_mut() {
         for session in group.sessions.iter_mut() {
-            session.last_ran_profile = match store.sessions.get(&session.id) {
-                Some(SessionOwner::Known(p)) => Some(p.clone()),
-                Some(SessionOwner::Contested) | None => None,
-            };
+            session.last_ran_profile = owner_in(&store, &session.id);
         }
     }
 }
@@ -878,29 +1012,6 @@ fn rescue_file(src: &Path, target: &Path) -> std::io::Result<PathBuf> {
 /// rest — the isolated store is discarded right after this call, so a skipped
 /// file is at worst a lost rescue, never corruption. Each move is collision- and
 /// crash-safe (see [`rescue_session_transcript`]).
-/// The workspace one session was recorded in, located by transcript filename.
-///
-/// Deliberately not [`build_index`]: that head- AND tail-reads every transcript
-/// in the store to build previews (21 s over a 12k-session store), which is the
-/// right cost for a browser and the wrong one for a lookup that needs a single
-/// file's `cwd`. `Ok(None)` means no transcript of that id, `Ok(Some(path))` its
-/// recorded workspace, and an empty recorded workspace is `Ok(None)` too — both
-/// leave a resume with nowhere to run, and the caller says so once.
-///
-/// The GLOBAL store only: a live isolated runtime's own store belongs to a
-/// session another process is running, and an isolated run reaches this store
-/// only once the rescue has lifted it out.
-pub(crate) fn workspace_of(session_id: &str) -> Option<PathBuf> {
-    let projects = claude_dir().ok()?.join("projects");
-    let mut paths = Vec::new();
-    collect_jsonl(&projects, WALK_MAX_DEPTH, &mut paths);
-    let path = paths
-        .into_iter()
-        .find(|p| session_id_from_path(p).as_deref() == Some(session_id))?;
-    let workspace = read_head(&path).workspace;
-    (!workspace.is_empty()).then(|| PathBuf::from(workspace))
-}
-
 pub(crate) fn rescue_isolated_store(iso_projects: &Path, global_projects: &Path) -> usize {
     let mut paths = Vec::new();
     collect_jsonl(iso_projects, WALK_MAX_DEPTH, &mut paths);

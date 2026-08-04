@@ -41,6 +41,7 @@ fn run_with_depth(depth: &str) -> CallToolResult {
                 args: None,
                 timeout_secs: None,
                 idle_secs: None,
+                resume: None,
                 isolated: None,
                 background: None,
                 monitor: None,
@@ -114,6 +115,7 @@ fn run_delegate_refuses_a_disabled_target_before_acquiring_a_runtime() {
         extra_args: Vec::new(),
         timeout_secs: Some(30),
         idle_secs: None,
+        resume: None,
         isolation: Isolation::Shared,
         depth: 0,
     })
@@ -357,6 +359,7 @@ fn background_depth_guard_refuses_without_writing_job() {
                 args: None,
                 timeout_secs: None,
                 idle_secs: None,
+                resume: None,
                 isolated: None,
                 background: Some(true),
                 monitor: None,
@@ -711,11 +714,16 @@ fn a_delegate_killed_mid_block_still_returns_the_text_it_wrote() {
         Duration::from_secs(612),
         Duration::from_secs(300),
         &capture,
+        true,
     );
     assert_eq!(envelope["is_error"], true);
     assert_eq!(envelope["timed_out"], "idle");
     assert_eq!(envelope["elapsed_secs"], 612);
     assert_eq!(envelope["partial_result"], "alpha");
+    assert_eq!(
+        envelope["session_id"], "s1",
+        "the handle a resume needs comes off the stream, not the envelope the run never reached"
+    );
     assert!(
         envelope["result"]
             .as_str()
@@ -734,9 +742,114 @@ fn a_delegate_killed_before_writing_anything_carries_no_partial_key() {
         Duration::from_secs(3600),
         Duration::from_secs(3600),
         &super::StreamCapture::default(),
+        true,
     );
     assert_eq!(envelope["timed_out"], "wall_clock");
     assert!(envelope.get("partial_result").is_none());
+    assert!(envelope.get("session_id").is_none());
+}
+
+/// An isolated run without auto-rescue loses its transcript to the runtime
+/// teardown. Handing back a session id there would be a handle to nothing, so the
+/// envelope says why instead.
+#[test]
+fn an_unrescuable_killed_run_offers_no_resume_handle() {
+    let mut capture = super::StreamCapture::default();
+    for line in STREAM.lines().take(4) {
+        capture.push_line(line);
+    }
+    let envelope = super::timeout_envelope(
+        "work",
+        super::Expiry::Idle,
+        Duration::from_secs(400),
+        Duration::from_secs(300),
+        &capture,
+        false,
+    );
+    assert!(
+        envelope.get("session_id").is_none(),
+        "no handle for a transcript that is already gone"
+    );
+    assert_eq!(
+        envelope["partial_result"], "alpha",
+        "the salvage still comes back"
+    );
+    let reason = envelope["result"].as_str().expect("reason");
+    assert!(
+        reason.contains("auto-rescue"),
+        "the operator learns about the toggle here, not by losing a second run: {reason}"
+    );
+}
+
+/// Which runs are resumable at all: the shared tree writes straight into the
+/// global store, the isolated one needs the opt-in rescue to survive its own
+/// teardown.
+#[test]
+fn only_a_shared_or_rescued_runtime_leaves_a_transcript_behind() {
+    assert!(super::transcript_survives(Isolation::Shared, false));
+    assert!(super::transcript_survives(Isolation::Shared, true));
+    assert!(!super::transcript_survives(Isolation::Isolated, false));
+    assert!(super::transcript_survives(Isolation::Isolated, true));
+}
+
+/// Claude Code finds a session only under its own workspace, so a `cwd` that
+/// disagrees is refused by name instead of spawning where the transcript is
+/// invisible. Both sides canonicalize: one spelling of a path is still that path,
+/// which is not academic on macOS, where a tempdir's `/var` is a symlink to
+/// `/private/var`.
+#[test]
+fn a_resume_refuses_a_cwd_that_is_not_the_recorded_workspace() {
+    let home = HomeSandbox::new();
+    let workspace = home.home().join("ws");
+    let elsewhere = home.home().join("other");
+    std::fs::create_dir_all(&workspace).expect("workspace");
+    std::fs::create_dir_all(&elsewhere).expect("other dir");
+
+    super::check_resume_cwd(workspace.to_str().expect("utf8"), &workspace)
+        .expect("the recorded workspace agrees with itself");
+    let respelled = workspace.join("..").join("ws");
+    super::check_resume_cwd(respelled.to_str().expect("utf8"), &workspace)
+        .expect("another spelling of one directory is not another directory");
+
+    let err = super::check_resume_cwd(elsewhere.to_str().expect("utf8"), &workspace)
+        .expect_err("a different directory is refused");
+    assert!(
+        err.contains("not the workspace"),
+        "the refusal names what went wrong: {err}"
+    );
+}
+
+#[test]
+fn a_resume_refuses_the_cli_only_latest_shorthand() {
+    let err = super::resolve_resume_workspace("latest").expect_err("latest is refused");
+    assert!(
+        err.contains("exact session id"),
+        "a delegate resuming whatever ran last would spend a window on an unrelated session: {err}"
+    );
+}
+
+/// The stream is the only source for these two on a run that never reached its
+/// terminal envelope.
+#[test]
+fn the_capture_keeps_the_session_id_and_the_newest_throttle_line() {
+    let mut capture = super::StreamCapture::default();
+    capture.push_line(r#"{"type":"system","subtype":"init","session_id":"s1"}"#);
+    capture.push_line(
+        r#"{"type":"rate_limit_event","session_id":"s1","rate_limit_info":{"status":"allowed"}}"#,
+    );
+    capture.push_line(
+        r#"{"type":"rate_limit_event","session_id":"s1","rate_limit_info":{"status":"rejected"}}"#,
+    );
+    assert_eq!(capture.session_id.as_deref(), Some("s1"));
+    let throttle = capture.rate_limit_line.as_deref().expect("throttle line");
+    assert!(
+        throttle.contains("rejected"),
+        "the newest throttle line is the one that describes now: {throttle}"
+    );
+    assert!(
+        !capture.envelope_src().contains("rate_limit_event"),
+        "a throttle line is not a terminal envelope"
+    );
 }
 
 /// Salvage is bounded, and the tail is what's kept: the newest text is the part

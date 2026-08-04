@@ -1199,3 +1199,46 @@ fn rescue_preserves_the_source_file_mode() {
         "the mode is copied, not hardcoded"
     );
 }
+
+// ── targeted workspace lookup (the `delegate` resume path) ───────────────────
+
+/// `--resume` only resolves a session under its own workspace, so the delegate
+/// path needs one transcript's recorded `cwd` and nothing else. This lookup is
+/// deliberately not `build_index`, which head- and tail-reads every transcript in
+/// the store to build previews it would then throw away.
+#[test]
+fn workspace_of_finds_a_sessions_recorded_cwd() {
+    let sb = HomeSandbox::new();
+    write_jsonl(
+        &sb.home().join(".claude/projects/-w-res/sres.jsonl"),
+        &[user_line("sres", "/w/res", "hello")],
+    );
+    write_jsonl(
+        &sb.home().join(".claude/projects/-w-other/sother.jsonl"),
+        &[user_line("sother", "/w/other", "unrelated")],
+    );
+
+    assert_eq!(
+        workspace_of("sres"),
+        Some(PathBuf::from("/w/res")),
+        "the workspace comes from the transcript, not from the lossy dir slug"
+    );
+    assert_eq!(
+        workspace_of("sother"),
+        Some(PathBuf::from("/w/other")),
+        "a store with several sessions still resolves each to its own"
+    );
+    assert_eq!(workspace_of("nosuchsession"), None);
+}
+
+/// A transcript recording no `cwd` leaves a resume nowhere to run, which is the
+/// same dead end as no transcript at all.
+#[test]
+fn workspace_of_treats_a_cwd_less_transcript_as_unresolvable() {
+    let sb = HomeSandbox::new();
+    write_jsonl(
+        &sb.home().join(".claude/projects/-w-bare/sbare.jsonl"),
+        &[json!({"sessionId": "sbare", "message": {"role": "user", "content": "hi"}}).to_string()],
+    );
+    assert_eq!(workspace_of("sbare"), None);
+}

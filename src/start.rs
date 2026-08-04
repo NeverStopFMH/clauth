@@ -60,7 +60,11 @@ pub(crate) fn rescue_effective(rescue_override: Option<bool>, auto_rescue: bool)
 /// all-or-nothing on the last session's clean exit — SIGKILL the last one and GC
 /// discards the tree with every session's transcripts in it. Not separable while
 /// the tree is shared: the sidecar trees carry no per-session attribution.
-fn rescue_teardown(iso_root: &Path, sessions: &Path, claude_home: &Path) -> (usize, usize) {
+pub(crate) fn rescue_teardown(
+    iso_root: &Path,
+    sessions: &Path,
+    claude_home: &Path,
+) -> (usize, usize) {
     // An unreadable marker dir falls to "do not move": this leg pulls
     // `shell-snapshots/` out from under whatever is reading the tree, so an
     // unknown has to read the same way a live sibling does.

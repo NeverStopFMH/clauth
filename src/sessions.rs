@@ -878,6 +878,29 @@ fn rescue_file(src: &Path, target: &Path) -> std::io::Result<PathBuf> {
 /// rest — the isolated store is discarded right after this call, so a skipped
 /// file is at worst a lost rescue, never corruption. Each move is collision- and
 /// crash-safe (see [`rescue_session_transcript`]).
+/// The workspace one session was recorded in, located by transcript filename.
+///
+/// Deliberately not [`build_index`]: that head- AND tail-reads every transcript
+/// in the store to build previews (21 s over a 12k-session store), which is the
+/// right cost for a browser and the wrong one for a lookup that needs a single
+/// file's `cwd`. `Ok(None)` means no transcript of that id, `Ok(Some(path))` its
+/// recorded workspace, and an empty recorded workspace is `Ok(None)` too — both
+/// leave a resume with nowhere to run, and the caller says so once.
+///
+/// The GLOBAL store only: a live isolated runtime's own store belongs to a
+/// session another process is running, and an isolated run reaches this store
+/// only once the rescue has lifted it out.
+pub(crate) fn workspace_of(session_id: &str) -> Option<PathBuf> {
+    let projects = claude_dir().ok()?.join("projects");
+    let mut paths = Vec::new();
+    collect_jsonl(&projects, WALK_MAX_DEPTH, &mut paths);
+    let path = paths
+        .into_iter()
+        .find(|p| session_id_from_path(p).as_deref() == Some(session_id))?;
+    let workspace = read_head(&path).workspace;
+    (!workspace.is_empty()).then(|| PathBuf::from(workspace))
+}
+
 pub(crate) fn rescue_isolated_store(iso_projects: &Path, global_projects: &Path) -> usize {
     let mut paths = Vec::new();
     collect_jsonl(iso_projects, WALK_MAX_DEPTH, &mut paths);

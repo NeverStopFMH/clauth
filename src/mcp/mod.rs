@@ -147,6 +147,11 @@ pub(crate) struct DelegateArgs {
     /// than the default (a long build). Ignored when `args` pins its own
     /// `--output-format`, which turns the event stream off.
     idle_secs: Option<u64>,
+    /// Continue an earlier delegate instead of starting fresh: the `session_id`
+    /// a killed run handed back. `prompt` becomes the next turn of that
+    /// conversation. clauth runs it in the workspace the session was recorded in,
+    /// so `cwd` is unnecessary (and refused when it disagrees).
+    resume: Option<String>,
     /// Run authenticated but without operator memory/plugins/hooks (a clean
     /// blind session). Defaults to false.
     isolated: Option<bool>,
@@ -343,7 +348,10 @@ project's house-style. Optional cwd/env/args/timeout_secs/idle_secs/isolated sha
 hits the `timeout_secs` wall clock (default 3600), so a run that keeps working is never cut off; \
 raise `idle_secs` when the task makes one long blocking call. A killed delegate returns \
 `timed_out` plus whatever text it had produced in `partial_result` (its window is spent either \
-way). Returns the delegate envelope (`result`, \
+way), and a `session_id` when the run can be picked back up: pass it as `resume` with a new \
+`prompt` to continue that conversation instead of paying for the work again. An `isolated` run is \
+resumable only with clauth's auto-rescue on, and the killed envelope says which case it is. \
+Returns the delegate envelope (`result`, \
 `is_error`, `total_cost_usd`, token usage): read `total_cost_usd`/usage to self-throttle; the \
 `result` is the delegate's own self-report, so spot-verify it like any subagent. Set \
 `background: true` to get a `{job_id}` back at once instead of blocking; the result auto-arrives \
@@ -361,6 +369,7 @@ via a hook, or fetch it with `delegate_result({job_id})`. Add `monitor: true` so
             args,
             timeout_secs,
             idle_secs,
+            resume,
             isolated,
             background,
             monitor,
@@ -421,6 +430,7 @@ via a hook, or fetch it with `delegate_result({job_id})`. Add `monitor: true` so
                         extra_args: args.unwrap_or_default(),
                         timeout_secs,
                         idle_secs,
+                        resume: resume.as_deref(),
                         isolation,
                         depth,
                     })
@@ -463,6 +473,7 @@ via a hook, or fetch it with `delegate_result({job_id})`. Add `monitor: true` so
                 extra_args: args.unwrap_or_default(),
                 timeout_secs,
                 idle_secs,
+                resume: resume.as_deref(),
                 isolation,
                 depth,
             })
@@ -714,6 +725,7 @@ struct DelegateOpts<'a> {
     extra_args: Vec<String>,
     timeout_secs: Option<u64>,
     idle_secs: Option<u64>,
+    resume: Option<&'a str>,
     isolation: Isolation,
     depth: u32,
 }
@@ -779,6 +791,14 @@ fn sets_output_format(extra_args: &[String]) -> bool {
 /// that lets a killed run still return something.
 #[derive(Default)]
 struct StreamCapture {
+    /// The child's own session id, from the first event carrying one. The handle
+    /// a later `resume` needs, and the only way to get it out of a run that never
+    /// reached its terminal envelope.
+    session_id: Option<String>,
+    /// The newest `rate_limit_event` line. Kept because stdout is no longer
+    /// buffered whole: without it a throttle that shows up only there would stop
+    /// being detectable on a non-zero exit.
+    rate_limit_line: Option<String>,
     /// Last line tagged `type:"result"`.
     result_line: Option<String>,
     /// Last parseable non-delta line, whatever its type: the same fallback
@@ -814,7 +834,18 @@ impl StreamCapture {
         let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
             return;
         };
+        // Every event carries it, deltas included, so this is read before the
+        // type match returns early for one.
+        if self.session_id.is_none()
+            && let Some(id) = value.get("session_id").and_then(serde_json::Value::as_str)
+        {
+            self.session_id = Some(id.to_string());
+        }
         match value.get("type").and_then(serde_json::Value::as_str) {
+            Some("rate_limit_event") => {
+                self.rate_limit_line = Some(line.to_string());
+                return;
+            }
             // Token-level deltas: liveness plus the in-flight block's text. Kept
             // out of `last_line` so a parse-failure report shows a real event.
             Some("stream_event") => {
@@ -914,12 +945,18 @@ fn elapsed_ms(start: Instant) -> u64 {
 /// it carries the text the run had already produced: the target account's window
 /// is spent whether or not clauth keeps the output, so discarding it is a second
 /// loss on top of the first.
+///
+/// `resumable` is whether the killed run's transcript outlives its runtime tree
+/// (see [`transcript_survives`]). When it does, the session id is a handle the
+/// caller can hand back as `resume`; when it does not, saying so is what stops
+/// the operator learning about the toggle by losing a second run.
 fn timeout_envelope(
     profile: &str,
     expiry: Expiry,
     elapsed: Duration,
     limit: Duration,
     capture: &StreamCapture,
+    resumable: bool,
 ) -> serde_json::Value {
     let elapsed_secs = elapsed.as_secs();
     let limit_secs = limit.as_secs();
@@ -943,6 +980,16 @@ fn timeout_envelope(
     if !partial.is_empty() {
         reason.push_str(". the text it had written is in `partial_result`");
     }
+    match (&capture.session_id, resumable) {
+        (Some(_), true) => {
+            reason.push_str(". pick the run back up with `resume: \"<session_id>\"`");
+        }
+        (_, false) => reason.push_str(
+            ". its transcript went with the isolated runtime, so it cannot be resumed; \
+             `clauth config` auto-rescue keeps one",
+        ),
+        (None, true) => {}
+    }
     let mut payload = serde_json::json!({
         "profile": profile,
         "is_error": true,
@@ -953,7 +1000,67 @@ fn timeout_envelope(
     if !partial.is_empty() {
         payload["partial_result"] = serde_json::Value::String(partial);
     }
+    if resumable && let Some(id) = &capture.session_id {
+        payload["session_id"] = serde_json::Value::String(id.clone());
+    }
     payload
+}
+
+/// Whether a delegate's transcript outlives its runtime tree, which decides
+/// whether the run can ever be resumed. A shared runtime's `projects/` is a
+/// symlink into the global store, so its transcript is already there; an
+/// isolated one writes to a throwaway tree `ProfileRuntime::drop` removes, and
+/// only the opt-in rescue lifts it out first.
+fn transcript_survives(isolation: Isolation, auto_rescue: bool) -> bool {
+    isolation != Isolation::Isolated || auto_rescue
+}
+
+/// Resolve a `resume` id to the workspace its transcript was recorded under.
+/// Claude Code resolves `--resume <id>` only within `projects/<slug-of-cwd>/`, so
+/// a resume spawned anywhere else is told the conversation does not exist.
+///
+/// `latest` is refused, though `clauth resume` takes it: the newest session in
+/// the whole store is usually the operator's own live one, and spending an
+/// account's window continuing that is never what a delegate meant by it.
+fn resolve_resume_workspace(session_id: &str) -> std::result::Result<std::path::PathBuf, String> {
+    if session_id == "latest" {
+        return Err(
+            "resume needs an exact session id; `latest` is a `clauth resume` shorthand".to_string(),
+        );
+    }
+    let workspace = crate::sessions::workspace_of(session_id).ok_or_else(|| {
+        format!("can't resume '{session_id}': no transcript for it, or none recording a workspace")
+    })?;
+    if !workspace.is_dir() {
+        return Err(format!(
+            "can't resume '{session_id}': workspace '{}' no longer exists",
+            workspace.display()
+        ));
+    }
+    Ok(workspace)
+}
+
+/// Refuse a `cwd` that disagrees with the workspace a `resume` must run in,
+/// rather than spawning where Claude Code will not find the transcript. Both
+/// sides are canonicalized: one spelling of a path is not the same string as
+/// another spelling of it.
+fn check_resume_cwd(given: &str, workspace: &std::path::Path) -> std::result::Result<(), String> {
+    let given_real = std::fs::canonicalize(given)
+        .map_err(|e| format!("cwd '{given}' cannot be resolved: {e}"))?;
+    let workspace_real = std::fs::canonicalize(workspace).map_err(|e| {
+        format!(
+            "workspace '{}' cannot be resolved: {e}",
+            workspace.display()
+        )
+    })?;
+    if given_real != workspace_real {
+        return Err(format!(
+            "cwd '{given}' is not the workspace this session was recorded in ('{}'); \
+             drop `cwd` and clauth uses the recorded one",
+            workspace.display()
+        ));
+    }
+    Ok(())
 }
 
 /// Compose a delegate's environment on `command`: drop inherited provider
@@ -984,8 +1091,10 @@ fn apply_delegate_env(
 /// parse its JSON envelope. Returns `Ok(envelope)` on a clean parse or a
 /// [`timeout_envelope`] for a killed run, and `Err(reason)` for a non-zero exit
 /// or unparseable output (the caller wraps that in an `is_error` envelope).
-/// Records observed throughput / rate-limit hits as a side effect. Never bubbles
-/// a transport-level error.
+/// Records observed throughput / rate-limit hits as a side effect, and runs
+/// `start::run`'s own transcript-stamp and opt-in isolated-rescue legs on the way
+/// out so a delegate's sessions are attributable and (with the toggle on)
+/// resumable. Never bubbles a transport-level error.
 fn run_delegate(opts: DelegateOpts<'_>) -> std::result::Result<serde_json::Value, String> {
     let config = load_config().map_err(|e| format!("failed to load config: {e}"))?;
     let target = config
@@ -1003,6 +1112,20 @@ fn run_delegate(opts: DelegateOpts<'_>) -> std::result::Result<serde_json::Value
     {
         return Err(format!("cwd does not exist or is not a directory: {dir}"));
     }
+
+    // A resume must land in the workspace its transcript was recorded under, so
+    // that resolution REPLACES the caller's cwd instead of sitting beside it; a
+    // `cwd` that disagrees is a mistake worth naming, not one to spawn into.
+    let workspace = match opts.resume {
+        Some(id) => {
+            let workspace = resolve_resume_workspace(id)?;
+            if let Some(dir) = opts.cwd {
+                check_resume_cwd(dir, &workspace)?;
+            }
+            Some(workspace)
+        }
+        None => None,
+    };
 
     // Strip the active profile's custom env so a delegate for `<target>` does
     // not inherit whoever is globally active (mirrors `clauth start`).
@@ -1060,20 +1183,24 @@ fn run_delegate(opts: DelegateOpts<'_>) -> std::result::Result<serde_json::Value
     if let Some(m) = opts.model {
         command.args(["--model", m]);
     }
-    if let Some(dir) = opts.cwd {
+    if let Some(id) = opts.resume {
+        command.args(["--resume", id]);
+    }
+    // Resolve the cwd the spawned `claude` will actually run in: a resume's
+    // recorded workspace, else the caller's override, else this process's own cwd
+    // (inherited like `start.rs`). If it's the real `$HOME`, guard against the
+    // project-settings leak.
+    let explicit_cwd = workspace.or_else(|| opts.cwd.map(std::path::PathBuf::from));
+    if let Some(dir) = explicit_cwd.as_deref() {
         command.current_dir(dir);
     }
-    // Resolve the cwd the spawned `claude` will actually run in: the caller's
-    // override, else this process's own cwd (inherited like `start.rs`). If
-    // it's the real `$HOME`, guard against the project-settings leak.
-    let effective_cwd = match opts.cwd {
-        Some(dir) => Some(std::path::PathBuf::from(dir)),
-        None => std::env::current_dir().ok(),
-    };
+    let effective_cwd = explicit_cwd.or_else(|| std::env::current_dir().ok());
     if let Some(dir) = effective_cwd.as_deref() {
         crate::runtime::guard_home_project_settings(&mut command, dir);
     }
     command.args(&opts.extra_args);
+
+    let run_start = std::time::SystemTime::now();
 
     let mut child = command
         .spawn()
@@ -1120,6 +1247,32 @@ fn run_delegate(opts: DelegateOpts<'_>) -> std::result::Result<serde_json::Value
         .and_then(|h| h.join().ok())
         .unwrap_or_default();
     let stderr_bytes = join_reader(stderr_reader);
+
+    // Mirrors `start::run`'s own teardown legs, in the same window: the child has
+    // exited and the guard is still alive, so the tree is there to read. Stamp
+    // this run's transcripts with the profile that produced them, then (isolated
+    // + opt-in) lift the throwaway store into the global one before
+    // `drop(runtime)` discards it. Best-effort; a completed delegate never fails
+    // on either.
+    let isolated = opts.isolation == Isolation::Isolated;
+    let projects_dir = if isolated {
+        Some(runtime.config_dir().join("projects"))
+    } else {
+        crate::profile::claude_dir()
+            .ok()
+            .map(|d| d.join("projects"))
+    };
+    if let Some(projects_dir) = projects_dir {
+        crate::sessions::stamp_run_sessions(opts.profile, &projects_dir, isolated, run_start);
+    }
+    let auto_rescue = config.state.auto_rescue;
+    if isolated
+        && auto_rescue
+        && let Ok(claude_home) = crate::profile::claude_dir()
+    {
+        crate::start::rescue_teardown(runtime.config_dir(), runtime.sessions_dir(), &claude_home);
+    }
+
     let status = match outcome {
         Ok(status) => status,
         Err(expiry) => {
@@ -1133,6 +1286,7 @@ fn run_delegate(opts: DelegateOpts<'_>) -> std::result::Result<serde_json::Value
                 start.elapsed(),
                 limit,
                 &capture,
+                transcript_survives(opts.isolation, auto_rescue),
             ));
         }
     };
@@ -1143,7 +1297,11 @@ fn run_delegate(opts: DelegateOpts<'_>) -> std::result::Result<serde_json::Value
         // A non-zero exit can be a throttle; record it so `which`/`list_profiles`
         // can flag the model as rate-limited (clauth never sees inference 429s
         // any other way).
-        if let Some(retry_after) = rate_limit_hint(&format!("{stderr}{stdout}")) {
+        let throttle_scan = format!(
+            "{stderr}{stdout}{}",
+            capture.rate_limit_line.as_deref().unwrap_or_default()
+        );
+        if let Some(retry_after) = rate_limit_hint(&throttle_scan) {
             crate::throughput::record_rate_limit(opts.profile, opts.model, retry_after, now);
         }
         return Err(format!(

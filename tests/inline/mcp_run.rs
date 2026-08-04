@@ -40,6 +40,7 @@ fn run_with_depth(depth: &str) -> CallToolResult {
                 env: None,
                 args: None,
                 timeout_secs: None,
+                idle_secs: None,
                 isolated: None,
                 background: None,
                 monitor: None,
@@ -111,7 +112,8 @@ fn run_delegate_refuses_a_disabled_target_before_acquiring_a_runtime() {
         cwd: None,
         env: HashMap::new(),
         extra_args: Vec::new(),
-        timeout: Duration::from_secs(30),
+        timeout_secs: Some(30),
+        idle_secs: None,
         isolation: Isolation::Shared,
         depth: 0,
     })
@@ -139,8 +141,12 @@ fn run_delegate_refuses_a_disabled_target_before_acquiring_a_runtime() {
 //      live, `delegate` P; the delegate shares P's runtime + `RotationGuard` flock and
 //      gets a fresh token chain only after the live watchdog reconciles.
 //   3. happy path: a valid prompt returns `{is_error:false, result, ...}` parsed
-//      from `claude -p --output-format json`, and the child inherits
-//      `CLAUTH_MCP_DEPTH=1` + `--strict-mcp-config`.
+//      from `claude -p --output-format stream-json --verbose
+//      --include-partial-messages`, and the child inherits `CLAUTH_MCP_DEPTH=1`
+//      + `--strict-mcp-config`.
+//   4. idle kill + salvage: `delegate` a prompt that writes a few paragraphs and
+//      then runs a `sleep` past `idle_secs: 30`; the envelope comes back
+//      `timed_out:"idle"` carrying those paragraphs in `partial_result`.
 
 // ---- delegate env composition (provider-routing isolation) ----
 
@@ -350,6 +356,7 @@ fn background_depth_guard_refuses_without_writing_job() {
                 env: None,
                 args: None,
                 timeout_secs: None,
+                idle_secs: None,
                 isolated: None,
                 background: Some(true),
                 monitor: None,
@@ -509,6 +516,274 @@ fn parse_envelope_recovers_result_from_ndjson_stream() {
 fn parse_envelope_errors_on_unparseable_output() {
     let err = super::parse_delegate_envelope("not json at all").expect_err("garbage is an error");
     assert!(err.contains("failed to parse claude output"));
+}
+
+// ── delegate deadlines ───────────────────────────────────────────────────────
+
+// The regression these pin: a wall-clock-only deadline cannot see whether the
+// child is producing anything, so a delegate mid-answer was killed at 300s
+// exactly like a hung one, and its output (already paid for in the target
+// account's window) was thrown away with it.
+
+#[test]
+fn a_delegate_still_streaming_outlives_the_old_wall_clock() {
+    // 50 minutes in, last event a second ago: working, so nothing fires.
+    assert_eq!(
+        super::expiry(
+            Duration::from_secs(3000),
+            Duration::from_secs(2999),
+            Duration::from_secs(3600),
+            Duration::from_secs(300),
+            true,
+        ),
+        None
+    );
+}
+
+#[test]
+fn silence_past_the_idle_window_kills_the_delegate() {
+    assert_eq!(
+        super::expiry(
+            Duration::from_secs(400),
+            Duration::from_secs(50),
+            Duration::from_secs(3600),
+            Duration::from_secs(300),
+            true,
+        ),
+        Some(super::Expiry::Idle)
+    );
+}
+
+#[test]
+fn the_wall_clock_still_bounds_a_delegate_that_never_goes_quiet() {
+    assert_eq!(
+        super::expiry(
+            Duration::from_secs(3600),
+            Duration::from_secs(3599),
+            Duration::from_secs(3600),
+            Duration::from_secs(300),
+            true,
+        ),
+        Some(super::Expiry::Wall)
+    );
+    // Stalled AT the ceiling trips both legs in one poll. The wall clock is the
+    // outer bound, so that is the reason reported.
+    assert_eq!(
+        super::expiry(
+            Duration::from_secs(3600),
+            Duration::from_secs(100),
+            Duration::from_secs(3600),
+            Duration::from_secs(300),
+            true,
+        ),
+        Some(super::Expiry::Wall)
+    );
+}
+
+/// A caller-pinned `--output-format` means no event stream, so silence carries
+/// no information and only the wall clock may fire.
+#[test]
+fn without_the_stream_silence_never_kills() {
+    // Silent from the first second, well past the idle window: only the wall
+    // clock may end it.
+    let quiet_forever = |elapsed| {
+        super::expiry(
+            Duration::from_secs(elapsed),
+            Duration::from_secs(0),
+            Duration::from_secs(1800),
+            Duration::from_secs(300),
+            false,
+        )
+    };
+    assert_eq!(quiet_forever(1799), None);
+    assert_eq!(quiet_forever(1800), Some(super::Expiry::Wall));
+}
+
+#[test]
+fn deadline_defaults_follow_whether_the_child_streams() {
+    // Streaming: the idle deadline governs, the wall clock is the hour backstop.
+    assert_eq!(
+        super::resolve_deadlines(None, None, true),
+        (Duration::from_secs(3600), Duration::from_secs(300))
+    );
+    // Not streaming: an unset wall clock drops to the idle default so a hung
+    // child never sits for the full hour unwatched.
+    assert_eq!(
+        super::resolve_deadlines(None, None, false),
+        (Duration::from_secs(300), Duration::from_secs(300))
+    );
+}
+
+#[test]
+fn caller_deadlines_clamp_to_the_supported_range() {
+    let (wall, idle) = super::resolve_deadlines(Some(99_999), Some(0), true);
+    assert_eq!(wall, Duration::from_secs(3600));
+    assert_eq!(idle, Duration::from_secs(1));
+}
+
+#[test]
+fn a_pinned_output_format_is_recognized_in_both_spellings() {
+    assert!(super::sets_output_format(&[
+        "--output-format".to_string(),
+        "json".to_string()
+    ]));
+    assert!(super::sets_output_format(&[
+        "--output-format=stream-json".to_string()
+    ]));
+    assert!(!super::sets_output_format(&[
+        "--verbose".to_string(),
+        "--model".to_string(),
+        "haiku".to_string()
+    ]));
+}
+
+// ── streamed-output capture + salvage ────────────────────────────────────────
+
+/// One NDJSON event per line, in the order a real `claude -p --output-format
+/// stream-json --verbose --include-partial-messages` emits them: a thinking
+/// delta, then the deltas of a text block, then the completed `assistant`
+/// message carrying that same text, then the terminal envelope.
+const STREAM: &str = concat!(
+    r#"{"type":"system","subtype":"init","session_id":"s1","blob":"AAAAAAAAAAAA"}"#,
+    "\n",
+    r#"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"weighing it"}}}"#,
+    "\n",
+    r#"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"al"}}}"#,
+    "\n",
+    r#"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"pha"}}}"#,
+    "\n",
+    r#"{"type":"assistant","message":{"content":[{"type":"text","text":"alpha"}]}}"#,
+    "\n",
+    r#"{"type":"result","is_error":false,"result":"final report","total_cost_usd":0.5}"#,
+    "\n",
+    // A Stop hook fires after the envelope, so the terminal result is not
+    // reliably the last line on the wire.
+    r#"{"type":"system","subtype":"hook_response","hook_event":"Stop","exit_code":0}"#,
+    "\n",
+);
+
+#[test]
+fn a_finished_stream_yields_only_its_terminal_envelope() {
+    let mut capture = super::StreamCapture::default();
+    for line in STREAM.lines() {
+        capture.push_line(line);
+    }
+    let envelope = super::parse_delegate_envelope(capture.envelope_src()).expect("result parses");
+    assert_eq!(envelope["result"], "final report");
+    assert!(
+        envelope.get("blob").is_none(),
+        "transcript noise never reaches the caller"
+    );
+}
+
+/// The deltas and the completed block carry the same text. Counting both would
+/// hand a killed delegate's salvage back doubled.
+#[test]
+fn streamed_deltas_are_not_counted_twice_against_their_own_block() {
+    let mut capture = super::StreamCapture::default();
+    for line in STREAM.lines() {
+        capture.push_line(line);
+    }
+    assert_eq!(capture.partial_text(), "alpha");
+}
+
+/// The case the whole salvage exists for: killed mid-block, so only deltas
+/// arrived and no `assistant` event ever completed them.
+#[test]
+fn a_delegate_killed_mid_block_still_returns_the_text_it_wrote() {
+    let mut capture = super::StreamCapture::default();
+    for line in STREAM.lines().take(4) {
+        capture.push_line(line);
+    }
+    assert_eq!(
+        capture.partial_text(),
+        "alpha",
+        "the salvage is the answer, not the reasoning"
+    );
+    assert!(
+        capture.envelope_src().contains(r#""subtype":"init""#),
+        "the fallback report shows a real event, never a token delta: {}",
+        capture.envelope_src()
+    );
+    let envelope = super::timeout_envelope(
+        "work",
+        super::Expiry::Idle,
+        Duration::from_secs(612),
+        Duration::from_secs(300),
+        &capture,
+    );
+    assert_eq!(envelope["is_error"], true);
+    assert_eq!(envelope["timed_out"], "idle");
+    assert_eq!(envelope["elapsed_secs"], 612);
+    assert_eq!(envelope["partial_result"], "alpha");
+    assert!(
+        envelope["result"]
+            .as_str()
+            .expect("reason")
+            .contains("no output for 300s"),
+        "the reason names the deadline that fired: {}",
+        envelope["result"]
+    );
+}
+
+#[test]
+fn a_delegate_killed_before_writing_anything_carries_no_partial_key() {
+    let envelope = super::timeout_envelope(
+        "work",
+        super::Expiry::Wall,
+        Duration::from_secs(3600),
+        Duration::from_secs(3600),
+        &super::StreamCapture::default(),
+    );
+    assert_eq!(envelope["timed_out"], "wall_clock");
+    assert!(envelope.get("partial_result").is_none());
+}
+
+/// Salvage is bounded, and the tail is what's kept: the newest text is the part
+/// closest to a usable answer.
+#[test]
+fn salvaged_text_keeps_its_tail_on_a_char_boundary() {
+    let mut s = "ä".repeat(40); // 80 bytes, 2 per char
+    super::keep_tail(&mut s, 15);
+    assert_eq!(s.chars().count(), 7, "clipped to whole chars under the cap");
+    assert!(s.chars().all(|c| c == 'ä'));
+}
+
+/// The reader is the liveness source: every line it consumes stamps the progress
+/// clock the wait loop reads.
+#[test]
+fn the_stdout_reader_stamps_progress_and_keeps_the_result() {
+    let progress = super::AtomicU64::new(u64::MAX);
+    let capture = super::read_stdout(
+        std::io::Cursor::new(STREAM.as_bytes()),
+        true,
+        std::time::Instant::now(),
+        &progress,
+    );
+    assert_ne!(
+        progress.load(super::Ordering::Relaxed),
+        u64::MAX,
+        "each event resets the idle clock"
+    );
+    assert!(capture.envelope_src().contains("final report"));
+    assert_eq!(capture.partial_text(), "alpha");
+}
+
+/// A caller-pinned format is read whole: it is one JSON document, and splitting
+/// it on lines would break a pretty-printed one.
+#[test]
+fn a_pinned_output_format_is_captured_as_one_document() {
+    let raw = "{\n  \"type\": \"result\",\n  \"result\": \"pinned\"\n}\n";
+    let progress = super::AtomicU64::new(0);
+    let capture = super::read_stdout(
+        std::io::Cursor::new(raw.as_bytes()),
+        false,
+        std::time::Instant::now(),
+        &progress,
+    );
+    let envelope = super::parse_delegate_envelope(capture.envelope_src().trim())
+        .expect("whole document parses");
+    assert_eq!(envelope["result"], "pinned");
 }
 
 // ── bare-session marker gate ─────────────────────────────────────────────────

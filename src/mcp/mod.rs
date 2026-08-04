@@ -11,6 +11,7 @@ mod render;
 
 use std::collections::HashMap;
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
@@ -36,10 +37,22 @@ use render::ProfileSnapshot;
 /// an env marker beats inferring it from the client's `initialize`.
 pub(crate) const MCP_PROBE_ENV: &str = "CLAUTH_MCP_PROBE";
 
-/// Default per-call delegate timeout (seconds) when the caller doesn't set one.
-const DEFAULT_RUN_TIMEOUT_SECS: u64 = 300;
+/// Default wall-clock ceiling (seconds) on one delegate. A wall clock cannot see
+/// whether the child is producing anything, so it kills a delegate mid-answer
+/// exactly like a hung one; it is the backstop and [`DEFAULT_IDLE_SECS`] is what
+/// normally ends a stuck run.
+const DEFAULT_RUN_TIMEOUT_SECS: u64 = MAX_RUN_TIMEOUT_SECS;
 /// Hard ceiling on a caller-supplied delegate timeout (seconds).
 const MAX_RUN_TIMEOUT_SECS: u64 = 3600;
+/// Default idle deadline (seconds): kill only once the delegate has emitted
+/// NOTHING for this long. Every streamed event resets it, so a working delegate
+/// runs to the wall clock no matter how long it takes. It must stay above the
+/// longest single blocking tool call a delegate makes (a release build), since
+/// no event arrives while one runs.
+const DEFAULT_IDLE_SECS: u64 = 300;
+/// Cap on the salvaged assistant text carried back by a killed delegate. The
+/// tail is kept: it is the part closest to a usable answer.
+const PARTIAL_TEXT_CAP: usize = 8 * 1024;
 /// Raise the delegate's max output budget above CC's default so a long headless
 /// build doesn't die on the 32k cap. Overridable via the `env` arg.
 const DEFAULT_MAX_OUTPUT_TOKENS: &str = "64000";
@@ -121,11 +134,19 @@ pub(crate) struct DelegateArgs {
     /// are always set by clauth and cannot be overridden here.
     env: Option<HashMap<String, String>>,
     /// Extra arguments appended to the `claude` invocation (after clauth's own
-    /// `-p`/`--output-format json`, the isolated-only `--strict-mcp-config`, and
-    /// `--model <model>` when `model` is set).
+    /// `-p` and streaming flags, the isolated-only `--strict-mcp-config`, and
+    /// `--model <model>` when `model` is set). Pinning `--output-format` here
+    /// replaces clauth's, which also turns the idle deadline off.
     args: Option<Vec<String>>,
-    /// Per-call timeout in seconds (1..=3600). Defaults to 300.
+    /// Wall-clock ceiling in seconds (1..=3600). Backstop only; `idle_secs` is
+    /// what normally ends a stuck delegate. Defaults to 3600.
     timeout_secs: Option<u64>,
+    /// Kill the delegate after this many seconds with NO output at all
+    /// (1..=3600). Defaults to 300. A delegate that keeps streaming is never cut
+    /// off, so raise this only when the task makes one blocking tool call longer
+    /// than the default (a long build). Ignored when `args` pins its own
+    /// `--output-format`, which turns the event stream off.
+    idle_secs: Option<u64>,
     /// Run authenticated but without operator memory/plugins/hooks (a clean
     /// blind session). Defaults to false.
     isolated: Option<bool>,
@@ -317,8 +338,12 @@ that persona plus the runtime config-dir's MCP servers; use it only when the tas
 / codebase nav. Scope a shared delegate with `args:[\"--mcp-config\",\"<json|path>\",\"--strict-mcp-config\"]`. \
 Separately, a delegate loads the project `CLAUDE.md` of its `cwd` (defaults to this server's cwd) \
 regardless of `isolated`, so set `cwd` to a clean dir for a one-shot to avoid an unrelated \
-project's house-style. Optional cwd/env/args/timeout_secs/isolated shape the spawned `claude`. \
-Returns the delegate envelope (`result`, \
+project's house-style. Optional cwd/env/args/timeout_secs/idle_secs/isolated shape the spawned \
+`claude`. A delegate is killed only once it has emitted nothing for `idle_secs` (default 300) or \
+hits the `timeout_secs` wall clock (default 3600), so a run that keeps working is never cut off; \
+raise `idle_secs` when the task makes one long blocking call. A killed delegate returns \
+`timed_out` plus whatever text it had produced in `partial_result` (its window is spent either \
+way). Returns the delegate envelope (`result`, \
 `is_error`, `total_cost_usd`, token usage): read `total_cost_usd`/usage to self-throttle; the \
 `result` is the delegate's own self-report, so spot-verify it like any subagent. Set \
 `background: true` to get a `{job_id}` back at once instead of blocking; the result auto-arrives \
@@ -335,6 +360,7 @@ via a hook, or fetch it with `delegate_result({job_id})`. Add `monitor: true` so
             env,
             args,
             timeout_secs,
+            idle_secs,
             isolated,
             background,
             monitor,
@@ -358,11 +384,9 @@ via a hook, or fetch it with `delegate_result({job_id})`. Add `monitor: true` so
             )]));
         }
 
-        let timeout = Duration::from_secs(
-            timeout_secs
-                .unwrap_or(DEFAULT_RUN_TIMEOUT_SECS)
-                .clamp(1, MAX_RUN_TIMEOUT_SECS),
-        );
+        // Both deadlines resolve inside `run_delegate`: the wall clock's fallback
+        // depends on whether the child ends up streaming, which only the composed
+        // arg list knows.
         let isolation = if isolated.unwrap_or(false) {
             Isolation::Isolated
         } else {
@@ -395,7 +419,8 @@ via a hook, or fetch it with `delegate_result({job_id})`. Add `monitor: true` so
                         cwd: cwd.as_deref(),
                         env: env.unwrap_or_default(),
                         extra_args: args.unwrap_or_default(),
-                        timeout,
+                        timeout_secs,
+                        idle_secs,
                         isolation,
                         depth,
                     })
@@ -436,7 +461,8 @@ via a hook, or fetch it with `delegate_result({job_id})`. Add `monitor: true` so
                 cwd: cwd.as_deref(),
                 env: env.unwrap_or_default(),
                 extra_args: args.unwrap_or_default(),
-                timeout,
+                timeout_secs,
+                idle_secs,
                 isolation,
                 depth,
             })
@@ -677,7 +703,8 @@ fn find_job_id(v: &serde_json::Value) -> Option<String> {
 
 /// Inputs for one delegated `delegate`. Grouped into a struct so `run_delegate`
 /// avoids a too-many-arguments signature as the surface grew (cwd/env/args/
-/// timeout/isolation).
+/// timeouts/isolation). Both deadlines stay raw here: their defaults depend on
+/// whether the composed arg list leaves the child streaming.
 struct DelegateOpts<'a> {
     profile: &'a str,
     prompt: &'a str,
@@ -685,9 +712,248 @@ struct DelegateOpts<'a> {
     cwd: Option<&'a str>,
     env: HashMap<String, String>,
     extra_args: Vec<String>,
-    timeout: Duration,
+    timeout_secs: Option<u64>,
+    idle_secs: Option<u64>,
     isolation: Isolation,
     depth: u32,
+}
+
+/// Which deadline killed a delegate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Expiry {
+    /// Nothing arrived on stdout for the idle window.
+    Idle,
+    /// The run outlived its wall-clock ceiling while still producing output.
+    Wall,
+}
+
+/// Resolve a delegate's `(wall, idle)` deadlines. Without the event stream there
+/// is no liveness signal, so an unset wall clock falls back to the idle default
+/// rather than leaving a hung child to sit for the full hour.
+fn resolve_deadlines(
+    timeout_secs: Option<u64>,
+    idle_secs: Option<u64>,
+    streaming: bool,
+) -> (Duration, Duration) {
+    let idle = idle_secs
+        .unwrap_or(DEFAULT_IDLE_SECS)
+        .clamp(1, MAX_RUN_TIMEOUT_SECS);
+    let wall = match timeout_secs {
+        Some(secs) => secs.clamp(1, MAX_RUN_TIMEOUT_SECS),
+        None if streaming => DEFAULT_RUN_TIMEOUT_SECS,
+        None => idle,
+    };
+    (Duration::from_secs(wall), Duration::from_secs(idle))
+}
+
+/// Which deadline (if either) a still-running delegate has tripped.
+/// `last_progress` is how far into the run its most recent output arrived; the
+/// idle leg is off entirely without the stream, where silence means nothing.
+fn expiry(
+    elapsed: Duration,
+    last_progress: Duration,
+    wall: Duration,
+    idle: Duration,
+    streaming: bool,
+) -> Option<Expiry> {
+    // Wall clock first: it is the outer bound, and a delegate that stalls near
+    // the ceiling trips both in the same poll.
+    if elapsed >= wall {
+        return Some(Expiry::Wall);
+    }
+    (streaming && elapsed.saturating_sub(last_progress) >= idle).then_some(Expiry::Idle)
+}
+
+/// True when the caller pins its own `--output-format` in `args`. clauth then
+/// spawns no format flag of its own, and the child's output shape is unknown, so
+/// the idle deadline is off (silence would no longer mean "stuck").
+fn sets_output_format(extra_args: &[String]) -> bool {
+    extra_args
+        .iter()
+        .any(|a| a == "--output-format" || a.starts_with("--output-format="))
+}
+
+/// What the stdout reader keeps from a streamed delegate. The transcript runs to
+/// megabytes and only the terminal envelope is wanted, so lines are inspected and
+/// dropped rather than buffered, alongside a bounded tail of the assistant text
+/// that lets a killed run still return something.
+#[derive(Default)]
+struct StreamCapture {
+    /// Last line tagged `type:"result"`.
+    result_line: Option<String>,
+    /// Last parseable non-delta line, whatever its type: the same fallback
+    /// [`result_event`] applies to a transcript array.
+    last_line: String,
+    /// Assistant text from completed message blocks.
+    text: String,
+    /// Deltas of the block still in flight. Cleared by that block's own
+    /// `assistant` event, which carries the same text, so nothing lands twice.
+    pending: String,
+}
+
+impl StreamCapture {
+    /// The whole of stdout as one buffer, for a caller-pinned output format.
+    fn from_raw(bytes: &[u8]) -> Self {
+        Self {
+            last_line: String::from_utf8_lossy(bytes).into_owned(),
+            ..Self::default()
+        }
+    }
+
+    /// The bytes to parse as the delegate's terminal envelope.
+    fn envelope_src(&self) -> &str {
+        self.result_line.as_deref().unwrap_or(&self.last_line)
+    }
+
+    /// Assistant text produced so far: completed blocks plus the in-flight one.
+    fn partial_text(&self) -> String {
+        format!("{}{}", self.text, self.pending)
+    }
+
+    fn push_line(&mut self, line: &str) {
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+            return;
+        };
+        match value.get("type").and_then(serde_json::Value::as_str) {
+            // Token-level deltas: liveness plus the in-flight block's text. Kept
+            // out of `last_line` so a parse-failure report shows a real event.
+            Some("stream_event") => {
+                self.push_delta(&value);
+                return;
+            }
+            Some("result") => self.result_line = Some(line.to_string()),
+            Some("assistant") => self.push_assistant(&value),
+            _ => {}
+        }
+        self.last_line = line.to_string();
+    }
+
+    /// Fold a completed assistant message's text blocks into the salvage buffer.
+    fn push_assistant(&mut self, value: &serde_json::Value) {
+        self.pending.clear();
+        let Some(blocks) = value.pointer("/message/content").and_then(|c| c.as_array()) else {
+            return;
+        };
+        for block in blocks {
+            if block.get("type").and_then(serde_json::Value::as_str) == Some("text")
+                && let Some(text) = block.get("text").and_then(serde_json::Value::as_str)
+            {
+                self.text.push_str(text);
+            }
+        }
+        keep_tail(&mut self.text, PARTIAL_TEXT_CAP);
+    }
+
+    /// Append a `content_block_delta` chunk. Thinking deltas are skipped: the
+    /// salvage is the answer, not the reasoning behind it.
+    fn push_delta(&mut self, value: &serde_json::Value) {
+        if value
+            .pointer("/event/delta/type")
+            .and_then(serde_json::Value::as_str)
+            == Some("text_delta")
+            && let Some(text) = value
+                .pointer("/event/delta/text")
+                .and_then(serde_json::Value::as_str)
+        {
+            self.pending.push_str(text);
+            keep_tail(&mut self.pending, PARTIAL_TEXT_CAP);
+        }
+    }
+}
+
+/// Trim a salvage buffer to its last `cap` bytes, on a char boundary.
+fn keep_tail(s: &mut String, cap: usize) {
+    if s.len() <= cap {
+        return;
+    }
+    let mut start = s.len() - cap;
+    while !s.is_char_boundary(start) {
+        start += 1;
+    }
+    s.replace_range(..start, "");
+}
+
+/// Read the child's stdout to EOF, stamping `progress` with the elapsed
+/// milliseconds at every line so the wait loop can tell a working delegate from
+/// a stalled one. Non-streaming mode drains the pipe whole (there is nothing to
+/// stamp until the child exits).
+fn read_stdout<R: std::io::Read>(
+    reader: R,
+    streaming: bool,
+    start: Instant,
+    progress: &AtomicU64,
+) -> StreamCapture {
+    let mut reader = reader;
+    if !streaming {
+        return StreamCapture::from_raw(&drain_pipe(&mut reader));
+    }
+    let mut buffered = std::io::BufReader::new(reader);
+    let mut capture = StreamCapture::default();
+    let mut raw = Vec::new();
+    loop {
+        raw.clear();
+        // read_until over lines(): a single event can carry a multi-megabyte tool
+        // result, and invalid UTF-8 must not end the capture early.
+        match std::io::BufRead::read_until(&mut buffered, b'\n', &mut raw) {
+            Ok(0) | Err(_) => break,
+            Ok(_) => {}
+        }
+        progress.store(elapsed_ms(start), Ordering::Relaxed);
+        capture.push_line(String::from_utf8_lossy(&raw).trim());
+    }
+    capture
+}
+
+/// Milliseconds since `start`, saturating (a delegate is capped at an hour, so
+/// the cast never truncates in practice).
+fn elapsed_ms(start: Instant) -> u64 {
+    u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX)
+}
+
+/// Envelope for a delegate clauth killed. `is_error` like any other failure, but
+/// it carries the text the run had already produced: the target account's window
+/// is spent whether or not clauth keeps the output, so discarding it is a second
+/// loss on top of the first.
+fn timeout_envelope(
+    profile: &str,
+    expiry: Expiry,
+    elapsed: Duration,
+    limit: Duration,
+    capture: &StreamCapture,
+) -> serde_json::Value {
+    let elapsed_secs = elapsed.as_secs();
+    let limit_secs = limit.as_secs();
+    let (kind, mut reason) = match expiry {
+        Expiry::Idle => (
+            "idle",
+            format!(
+                "delegate killed after {elapsed_secs}s: it produced no output for {limit_secs}s. \
+                 raise `idle_secs` if the task makes one blocking call longer than that"
+            ),
+        ),
+        Expiry::Wall => (
+            "wall_clock",
+            format!(
+                "delegate killed at its {limit_secs}s wall-clock ceiling. \
+                 raise `timeout_secs` for a longer run"
+            ),
+        ),
+    };
+    let partial = capture.partial_text();
+    if !partial.is_empty() {
+        reason.push_str(". the text it had written is in `partial_result`");
+    }
+    let mut payload = serde_json::json!({
+        "profile": profile,
+        "is_error": true,
+        "timed_out": kind,
+        "elapsed_secs": elapsed_secs,
+        "result": reason,
+    });
+    if !partial.is_empty() {
+        payload["partial_result"] = serde_json::Value::String(partial);
+    }
+    payload
 }
 
 /// Compose a delegate's environment on `command`: drop inherited provider
@@ -714,11 +980,12 @@ fn apply_delegate_env(
 }
 
 /// Blocking delegate: acquire the target profile's runtime, spawn a headless
-/// `claude -p` with piped stdio, enforce the timeout, and parse its JSON
-/// envelope. Returns `Ok(envelope)` on a clean parse, or `Err(reason)` for a
-/// timeout, non-zero exit, or unparseable output (the caller wraps it in an
-/// `is_error` envelope). Records observed throughput / rate-limit hits as a side
-/// effect. Never bubbles a transport-level error.
+/// `claude -p` with piped stdio, enforce the idle + wall-clock deadlines, and
+/// parse its JSON envelope. Returns `Ok(envelope)` on a clean parse or a
+/// [`timeout_envelope`] for a killed run, and `Err(reason)` for a non-zero exit
+/// or unparseable output (the caller wraps that in an `is_error` envelope).
+/// Records observed throughput / rate-limit hits as a side effect. Never bubbles
+/// a transport-level error.
 fn run_delegate(opts: DelegateOpts<'_>) -> std::result::Result<serde_json::Value, String> {
     let config = load_config().map_err(|e| format!("failed to load config: {e}"))?;
     let target = config
@@ -761,11 +1028,26 @@ fn run_delegate(opts: DelegateOpts<'_>) -> std::result::Result<serde_json::Value
         runtime.config_dir(),
         opts.depth,
     );
+    // Stream the child's events as NDJSON instead of waiting for one terminal
+    // blob: the wait loop needs a liveness signal to tell a working delegate from
+    // a hung one, and a killed run must still hand back the text it wrote.
+    // `stream-json` refuses to run under `-p` without `--verbose`;
+    // `--include-partial-messages` adds the token deltas, so a single long
+    // generation counts as progress instead of reading as silence.
+    let streaming = !sets_output_format(&opts.extra_args);
     command
-        .args(["-p", opts.prompt, "--output-format", "json"])
+        .args(["-p", opts.prompt])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .stdin(Stdio::null());
+    if streaming {
+        command.args([
+            "--output-format",
+            "stream-json",
+            "--verbose",
+            "--include-partial-messages",
+        ]);
+    }
     // Isolated only: suppress operator/project MCP servers for a clean blind
     // session (mirrors `start.rs`). A shared delegate inherits its config-dir's
     // MCP servers so it can do research/nav. Recursion stays capped either way:
@@ -801,27 +1083,29 @@ fn run_delegate(opts: DelegateOpts<'_>) -> std::result::Result<serde_json::Value
     // try_wait loop never reads, so a >~64KiB result blocks the child on a full
     // pipe and it never exits — a false timeout that drops a valid result. Killing
     // the child closes the write ends, the readers hit EOF, and the joins return.
-    let stdout_reader = child
-        .stdout
-        .take()
-        .map(|mut h| std::thread::spawn(move || drain_pipe(&mut h)));
+    let start = Instant::now();
+    let progress = std::sync::Arc::new(AtomicU64::new(0));
+    let stdout_reader = child.stdout.take().map(|h| {
+        let progress = std::sync::Arc::clone(&progress);
+        std::thread::spawn(move || read_stdout(h, streaming, start, &progress))
+    });
     let stderr_reader = child
         .stderr
         .take()
         .map(|mut h| std::thread::spawn(move || drain_pipe(&mut h)));
 
-    let start = Instant::now();
-    let status = loop {
+    let (wall, idle) = resolve_deadlines(opts.timeout_secs, opts.idle_secs, streaming);
+
+    let outcome = loop {
         match child.try_wait() {
-            Ok(Some(status)) => break status,
+            Ok(Some(status)) => break Ok(status),
             Ok(None) => {
-                if start.elapsed() >= opts.timeout {
+                let last_progress = Duration::from_millis(progress.load(Ordering::Relaxed));
+                if let Some(expiry) = expiry(start.elapsed(), last_progress, wall, idle, streaming)
+                {
                     let _ = child.kill();
                     let _ = child.wait();
-                    return Err(format!(
-                        "delegate timed out after {}s",
-                        opts.timeout.as_secs()
-                    ));
+                    break Err(expiry);
                 }
                 std::thread::sleep(RUN_POLL_INTERVAL);
             }
@@ -829,9 +1113,30 @@ fn run_delegate(opts: DelegateOpts<'_>) -> std::result::Result<serde_json::Value
         }
     };
 
-    let stdout_bytes = join_reader(stdout_reader);
+    // Joined before the timeout branch returns: the kill above closed the write
+    // ends, so the readers are at EOF and the capture holds everything the run
+    // produced before it died.
+    let capture = stdout_reader
+        .and_then(|h| h.join().ok())
+        .unwrap_or_default();
     let stderr_bytes = join_reader(stderr_reader);
-    let stdout = String::from_utf8_lossy(&stdout_bytes);
+    let status = match outcome {
+        Ok(status) => status,
+        Err(expiry) => {
+            let limit = match expiry {
+                Expiry::Idle => idle,
+                Expiry::Wall => wall,
+            };
+            return Ok(timeout_envelope(
+                opts.profile,
+                expiry,
+                start.elapsed(),
+                limit,
+                &capture,
+            ));
+        }
+    };
+    let stdout = capture.envelope_src();
     let now = now_epoch_secs();
     if !status.success() {
         let stderr = String::from_utf8_lossy(&stderr_bytes);
@@ -868,13 +1173,14 @@ fn run_delegate(opts: DelegateOpts<'_>) -> std::result::Result<serde_json::Value
 }
 
 /// Reduce `claude`'s captured stdout to its single terminal `type:"result"`
-/// envelope. Plain `--output-format json` already emits exactly that object, but
-/// a caller-supplied `--verbose` flips the format to the full transcript ARRAY
-/// (every `system` thinking-token / tool-io / `assistant` event) and `stream-json`
-/// emits the same events as NDJSON — either is valid input that would otherwise be
-/// stored and dumped into the caller's context verbatim (a multi-minute run leaks
-/// ~1000x the envelope). Collapse all three to the terminal result object so the
-/// delegate envelope stays the documented shape regardless of caller `args`.
+/// envelope. Under clauth's own `stream-json` the reader already retained just
+/// that line, but a caller-pinned `--output-format json` emits the bare object
+/// and a `--verbose` one the full transcript ARRAY (every `system`
+/// thinking-token / tool-io / `assistant` event) — valid input that would
+/// otherwise be stored and dumped into the caller's context verbatim (a
+/// multi-minute run leaks ~1000x the envelope). Collapse all three to the
+/// terminal result object so the delegate envelope stays the documented shape
+/// regardless of caller `args`.
 fn parse_delegate_envelope(stdout: &str) -> std::result::Result<serde_json::Value, String> {
     match serde_json::from_str::<serde_json::Value>(stdout) {
         Ok(serde_json::Value::Array(items)) => result_event(items).ok_or_else(|| {

@@ -1320,6 +1320,45 @@ fn newest_session_takes_the_greatest_mtime_then_the_smallest_id() {
     );
 }
 
+/// Claude Code resolves `--resume` by UUID or session title, so the stems of the
+/// transcripts it nests under a conversation (`agent-<hex>`, a workflow's
+/// `journal`) match nothing: `--print` errors out and the interactive path opens
+/// the session picker with no match (CC 2.1.221). `latest` has to end in a
+/// session CC will open, so it takes the newest of those even when a nested file
+/// is newer — while the listing and the exact-id lookup keep carrying them.
+#[test]
+fn newest_session_skips_the_nested_transcripts_a_resume_cannot_open() {
+    let sb = HomeSandbox::new();
+    let projects = sb.home().join(".claude/projects/-w-a");
+    let top = projects.join("s-top.jsonl");
+    let agent = projects.join("s-top/subagents/agent-a0722a48260618b8a.jsonl");
+    let journal = projects.join("s-top/subagents/workflows/wf-1/journal.jsonl");
+    write_jsonl(&top, &[user_line("s-top", "/w/a", "top")]);
+    write_jsonl(&agent, &[user_line("s-top", "/w/a", "subagent")]);
+    write_jsonl(&journal, &[user_line("s-top", "/w/a", "workflow")]);
+    set_mtime(&top, SystemTime::UNIX_EPOCH + Duration::from_secs(1_000));
+    set_mtime(&agent, SystemTime::UNIX_EPOCH + Duration::from_secs(9_000));
+    set_mtime(
+        &journal,
+        SystemTime::UNIX_EPOCH + Duration::from_secs(8_000),
+    );
+
+    assert_eq!(
+        newest_session().map(|s| s.id).as_deref(),
+        Some("s-top"),
+        "`latest` is the newest RESUMABLE session, not the newest file"
+    );
+    assert_eq!(
+        find_session("agent-a0722a48260618b8a").map(|s| s.path),
+        Some(agent),
+        "the exact-id lookup still reaches a nested transcript"
+    );
+    assert!(
+        find(&build_index(), "agent-a0722a48260618b8a").is_some(),
+        "and so does the listing"
+    );
+}
+
 /// A live isolated store is invisible to the lookups, so its transcripts have to
 /// be reachable some other way — otherwise a resume can only report a session
 /// `clauth sessions` just listed as "not found".

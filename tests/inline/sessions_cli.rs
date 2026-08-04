@@ -295,9 +295,11 @@ fn resume_profile_choice_tty_unknown_prompts_defaulting_to_active() {
 
 // ── resolve_session: the targeted lookup behind resume/info ──
 
-/// `resume latest` and the emitted listing must name the same session. They read
-/// the store two different ways now — a filename-and-mtime walk vs the full
-/// index — so the agreement is a real invariant, not a tautology.
+/// `resume latest` and the emitted listing must name the same session whenever
+/// the listing's first row is one a resume can open. They read the store two
+/// different ways now — a filename-and-mtime walk vs the full index — so the
+/// agreement is a real invariant, not a tautology. The one exception is pinned by
+/// `newest_session_skips_the_nested_transcripts_a_resume_cannot_open`.
 #[test]
 fn latest_resolves_to_the_first_row_the_listing_emits() {
     let sb = HomeSandbox::new();
@@ -426,6 +428,61 @@ fn latest_refuses_rather_than_substituting_when_an_isolated_run_holds_the_newest
     assert!(
         matches!(resolved, Resolved::Ready(ref s) if s.id == "sglobal"),
         "an older isolated transcript shadows nothing"
+    );
+}
+
+/// The shadowing check ranges over the same kind of file `latest` itself does.
+/// A nested transcript in a live isolated store can be newer than everything and
+/// is still never anybody's `latest`, so refusing on one would strand the resume
+/// waiting for a rescue that changes nothing. Named exactly, it is still held —
+/// the listing shows it, so "no session found" would be false.
+#[test]
+fn a_nested_isolated_transcript_does_not_shadow_latest() {
+    let sb = HomeSandbox::new();
+    let ws = sb.home().join("workspace");
+    fs::create_dir_all(&ws).unwrap();
+    let global = sb.home().join(".claude/projects/-w-g/sglobal.jsonl");
+    write_jsonl(
+        &global,
+        &[user_line("sglobal", &ws.to_string_lossy(), "hi")],
+    );
+    set_mtime(&global, SystemTime::UNIX_EPOCH + Duration::from_secs(1_000));
+
+    let iso = sb
+        .home()
+        .join(".clauth/profiles/iso/runtime-isolated/projects/-w-iso");
+    let nested = iso.join("siso/subagents/agent-abc.jsonl");
+    write_jsonl(
+        &nested,
+        &[user_line("siso", &ws.to_string_lossy(), "nested")],
+    );
+    set_mtime(&nested, SystemTime::UNIX_EPOCH + Duration::from_secs(9_000));
+    let sessions_dir = sb.home().join(".clauth/profiles/iso/sessions-isolated");
+    fs::create_dir_all(&sessions_dir).unwrap();
+    let lock_file = crate::runtime::open_pid_file(&sessions_dir.join("12345")).unwrap();
+    lock_file.lock().unwrap(); // held so the runtime reads as live
+
+    let resolved = resolve_session("latest");
+    let by_name = resolve_session("agent-abc");
+    // Control: the same store's TOP-LEVEL transcript at that mtime does shadow,
+    // so the pass above is the nesting and not an isolated run reading as dead.
+    let top = iso.join("siso.jsonl");
+    write_jsonl(&top, &[user_line("siso", &ws.to_string_lossy(), "top")]);
+    set_mtime(&top, SystemTime::UNIX_EPOCH + Duration::from_secs(9_000));
+    let shadowed = resolve_session("latest");
+    drop(lock_file);
+
+    assert!(
+        matches!(resolved, Resolved::Ready(ref s) if s.id == "sglobal"),
+        "a nested isolated transcript shadows nothing"
+    );
+    assert!(
+        matches!(by_name, Resolved::Held(ref h) if h.session.id == "agent-abc"),
+        "but naming it exactly still reports the run holding it"
+    );
+    assert!(
+        matches!(shadowed, Resolved::Held(_)),
+        "the same store's top-level transcript still shadows"
     );
 }
 

@@ -52,6 +52,12 @@ const PREVIEW_MAX_CHARS: usize = 200;
 /// them; the cap bounds the descent and (with symlink dirs treated as files)
 /// avoids cycles.
 const WALK_MAX_DEPTH: usize = 8;
+/// Walk depth that stops at `projects/<slug>/<id>.jsonl`, the only shape Claude
+/// Code's `--resume` resolves. Everything the deeper walk adds is a nested
+/// per-session tree (`subagents/`, `workflows/`, `tool-results/`) whose ids CC
+/// answers no-match for, so a target that has to end in a spawned session picks
+/// from this set and the browsing surfaces keep the full one.
+const TOP_LEVEL_DEPTH: usize = 2;
 
 /// The fixed mask a secret-shaped substring is replaced with.
 const MASK: &str = "[REDACTED]";
@@ -582,13 +588,15 @@ impl SessionRef {
     }
 }
 
-/// Every `*.jsonl` path in the global store, none of them opened.
-fn global_transcripts() -> Vec<PathBuf> {
+/// Every `*.jsonl` path in the global store, none of them opened. `depth` picks
+/// how much of it the caller means: [`WALK_MAX_DEPTH`] for every transcript the
+/// listing shows, [`TOP_LEVEL_DEPTH`] for the ones a resume can reach.
+fn global_transcripts(depth: usize) -> Vec<PathBuf> {
     let Ok(projects) = claude_dir().map(|d| d.join("projects")) else {
         return Vec::new();
     };
     let mut paths = Vec::new();
-    collect_jsonl(&projects, WALK_MAX_DEPTH, &mut paths);
+    collect_jsonl(&projects, depth, &mut paths);
     paths
 }
 
@@ -597,7 +605,7 @@ fn global_transcripts() -> Vec<PathBuf> {
 /// greater path — [`insert_newest`]'s rule, so a targeted lookup and the index
 /// resolve one id to the same file.
 pub(crate) fn find_session(session_id: &str) -> Option<SessionRef> {
-    let (updated, path) = global_transcripts()
+    let (updated, path) = global_transcripts(WALK_MAX_DEPTH)
         .into_iter()
         .filter(|p| session_id_from_path(p).as_deref() == Some(session_id))
         .filter_map(|p| mtime_of(&p).map(|t| (t, p)))
@@ -614,8 +622,17 @@ pub(crate) fn find_session(session_id: &str) -> Option<SessionRef> {
 /// `flatten_newest_first`): greatest mtime, then the smallest id, then
 /// [`insert_newest`]'s greater-path duplicate rule. Paths are unique, so the
 /// comparison is total and the pick never depends on `read_dir` order.
+///
+/// Only [`TOP_LEVEL_DEPTH`] of the store, unlike the listing. `latest` has to
+/// end in a session Claude Code will actually open, and CC resolves `--resume`
+/// against a UUID or a session title: handed a nested transcript's `agent-<hex>`
+/// stem it answers no-match, in `--print` as an error and interactively by
+/// dropping the operator into the session picker with nothing selected
+/// (observed on CC 2.1.221; see `docs/domain-knowledge.md`). So a store whose
+/// newest file is a subagent transcript resolves `latest` to the newest session
+/// under it, and the listing keeps naming that transcript first.
 pub(crate) fn newest_session() -> Option<SessionRef> {
-    global_transcripts()
+    global_transcripts(TOP_LEVEL_DEPTH)
         .into_iter()
         .filter_map(|p| Some((mtime_of(&p)?, session_id_from_path(&p)?, p)))
         .max_by(|a, b| {
@@ -643,10 +660,22 @@ pub(crate) fn workspace_of(session_id: &str) -> Option<PathBuf> {
 /// and the newest session on the machine going missing from `latest` is not a
 /// reason to silently resume the second newest.
 pub(crate) fn live_isolated_holds() -> Vec<IsolatedHold> {
+    isolated_holds(WALK_MAX_DEPTH)
+}
+
+/// The same holds, cut to the transcripts a rescue could make resumable —
+/// [`newest_session`]'s own depth, so the two sides of a `latest` comparison
+/// range over the same kind of file. A nested transcript can never become
+/// `latest`, so one being newer is no reason to refuse a resume.
+pub(crate) fn live_isolated_top_level_holds() -> Vec<IsolatedHold> {
+    isolated_holds(TOP_LEVEL_DEPTH)
+}
+
+fn isolated_holds(depth: usize) -> Vec<IsolatedHold> {
     let mut out = Vec::new();
     for (profile, projects) in crate::runtime::live_isolated_stores() {
         let mut paths = Vec::new();
-        collect_jsonl(&projects, WALK_MAX_DEPTH, &mut paths);
+        collect_jsonl(&projects, depth, &mut paths);
         for path in paths {
             let (Some(id), Some(updated)) = (session_id_from_path(&path), mtime_of(&path)) else {
                 continue;

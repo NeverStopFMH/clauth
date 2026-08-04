@@ -282,7 +282,9 @@ enum Resolved {
 /// Both forms are the targeted lookup, never [`crate::sessions::build_index`]:
 /// `resume` and `info` each use one row, and building the whole index to find it
 /// reads every transcript in the store twice over. `latest` keeps the index's
-/// own newest-first ordering, so the two surfaces agree on which session that is.
+/// own newest-first ordering over the sessions a resume can reach, so the two
+/// surfaces agree except where the listing's first row is a nested transcript
+/// Claude Code will not open.
 fn resolve_session(target: &str) -> Resolved {
     let found = if target == "latest" {
         crate::sessions::newest_session()
@@ -304,9 +306,12 @@ fn resolve_session(target: &str) -> Resolved {
 ///
 /// For `latest`: a transcript strictly newer than the newest reachable session.
 /// Without this the newest session on the machine drops out of the search and
-/// `latest` quietly names the second newest — the same word resolving to a
-/// different session than the one `clauth sessions` lists first. An exact mtime
-/// tie leaves the reachable session the answer.
+/// `latest` quietly names the second newest — a session the operator never
+/// asked for, spending an account window on the wrong conversation. An exact
+/// mtime tie leaves the reachable session the answer. Only the isolated
+/// transcripts a rescue could make resumable count here, matching what
+/// [`crate::sessions::newest_session`] ranges over; a nested one is never
+/// anybody's `latest`, in either store.
 fn shadowing_hold(target: &str, found: Option<&SessionRef>) -> Option<IsolatedHold> {
     if target != "latest" {
         if found.is_some() {
@@ -316,7 +321,7 @@ fn shadowing_hold(target: &str, found: Option<&SessionRef>) -> Option<IsolatedHo
             .into_iter()
             .find(|h| h.session.id == target);
     }
-    let newest = crate::sessions::live_isolated_holds()
+    let newest = crate::sessions::live_isolated_top_level_holds()
         .into_iter()
         .max_by(|a, b| {
             a.session

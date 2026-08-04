@@ -51,7 +51,7 @@ use anyhow::{Context, Result};
 use clap::Parser as _;
 
 use crate::cli::{Cli, Command, LoginArgs, ThemeArg};
-use crate::out::{out, outln};
+use crate::out::{errln, out, outln};
 use crate::profile::{AppConfig, ThemeName, load_config};
 use crate::runtime::Isolation;
 
@@ -105,7 +105,9 @@ pub(crate) fn exit_code(result: Result<()>) -> i32 {
     match result {
         Ok(()) => 0,
         Err(e) => {
-            eprintln!("Error: {e:?}");
+            // `errln!`, so a reader that walked away from `2>&1 | head` still
+            // gets this code rather than the 101 `eprintln!` panicked with.
+            errln!("Error: {e:?}");
             if e.downcast_ref::<UsageError>().is_some() {
                 2
             } else {
@@ -337,7 +339,7 @@ fn collect_api_endpoint(
                 anyhow::bail!("api key is required for an API account");
             }
             claude::validate_api_key(k)?;
-            eprintln!(
+            errln!(
                 "clauth: warning: --api-key is visible in shell history and process listings; prefer the prompt"
             );
             Some(k.to_string())
@@ -377,7 +379,7 @@ fn run_oauth_browser(reauth: bool, target: &str) -> Result<actions::CaptureSnaps
             outln!("\nIf the browser didn't open, visit this URL to authorize:\n{url}\n");
         }
     })
-    // CLI stderr: name the HTTP status too. This lands on the `eprintln!`
+    // CLI stderr: name the HTTP status too. This lands on the `errln!`
     // backstop below, a terminal with no companion log open, and a fresh login
     // failing on a 400 is the case that ruling exists for.
     .map_err(|e| anyhow::anyhow!("{}", e.cli_message()))?;

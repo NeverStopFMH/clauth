@@ -177,7 +177,7 @@ pub(crate) fn switch_profile_cli(config: AppConfig, canonical: &str) -> Result<(
             oauth::AuthGate::Ready | oauth::AuthGate::Refreshed => {}
             oauth::AuthGate::Broken => bail!("{}", crate::format::login_expired(canonical).line()),
             // CLI stderr: name the HTTP status too. This lands on `main.rs`'s
-            // `eprintln!` backstop, a terminal with no companion log open, so the
+            // `errln!` backstop, a terminal with no companion log open, so the
             // status is the one wire fact the operator has nowhere else to read.
             oauth::AuthGate::Transient(e) => {
                 bail!(

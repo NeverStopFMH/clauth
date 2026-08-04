@@ -71,11 +71,24 @@ pub(crate) fn line(args: std::fmt::Arguments<'_>) {
     let now = crate::usage::now_epoch_secs();
     let stamped = STAMP.load(Ordering::Relaxed);
     match route(stamped, std::io::stderr().is_terminal()) {
-        Sink::Stderr => eprintln!("{}", render(stamped, now, &raw)),
+        Sink::Stderr => write_stderr_line(&render(stamped, now, &raw)),
         // Always stamp in the file — a bare diagnostic log is useless for the
         // forensics this exists for.
         Sink::LogFile => append_logfile(&render(true, now, &raw)),
     }
+}
+
+/// Best-effort, on the same terms as [`write_log_line`]: the caller is usually
+/// a background scheduler or watchdog thread, and an event line that cannot
+/// reach its sink must never end it. `eprintln!` did exactly that, and the
+/// sink this arm writes is the daemon's redirected `daemon.log`, where a closed
+/// pipe is unreachable and a full disk is the error that actually shows up.
+///
+/// `out::errln!` is the strict form and belongs to the foreground CLI, where a
+/// write failure that is not a departed reader means the run has lost its only
+/// channel to the operator. Nothing on a background thread may reach for it.
+fn write_stderr_line(rendered: &str) {
+    let _ = writeln!(std::io::stderr().lock(), "{rendered}");
 }
 
 /// `~/.clauth/clauth.log`, resolved and size-capped once per process. `None`

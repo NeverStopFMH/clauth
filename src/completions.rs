@@ -2,7 +2,7 @@ use std::fs;
 
 use anyhow::{Context, Result, bail};
 
-use crate::out::{out, outln};
+use crate::out::{errln, out, outln};
 use crate::profile::{home_dir, load_config};
 
 const BASH: &str = r#"_clauth() {
@@ -323,8 +323,8 @@ pub(crate) fn auto_install_once() {
     if matches!(consent, Consent::Yes)
         && let Err(e) = install(Some(&shell))
     {
-        eprintln!("clauth: could not install completions: {e}");
-        eprintln!("clauth: run `clauth completions install` later to retry");
+        errln!("clauth: could not install completions: {e}");
+        errln!("clauth: run `clauth completions install` later to retry");
     }
 }
 

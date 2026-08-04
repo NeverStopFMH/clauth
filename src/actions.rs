@@ -17,6 +17,7 @@ use crate::claude::{
 use crate::lock::with_state_lock;
 use crate::lockorder::RankedMutex;
 use crate::oauth;
+use crate::out::{out, outln};
 use crate::profile::{
     AccountId, AppConfig, ClaudeCredentials, DivergenceChoice, ModelSettings, Profile, profile_dir,
     save_app_state, save_profile,
@@ -197,12 +198,10 @@ pub(crate) fn switch_profile_cli(config: AppConfig, canonical: &str) -> Result<(
                 .unwrap_or("")
                 .to_string()
         };
-        print!(
+        out!(
             "clauth: '{active}' has a newer login in ~/.claude. save it into '{active}' \
              and switch to '{canonical}'? [Y/n] "
         );
-        use std::io::Write;
-        std::io::stdout().flush()?;
         let mut answer = String::new();
         std::io::stdin().read_line(&mut answer)?;
         let answer = answer.trim().to_ascii_lowercase();
@@ -211,7 +210,7 @@ pub(crate) fn switch_profile_cli(config: AppConfig, canonical: &str) -> Result<(
             let mut cfg = config.lock().expect("config mutex poisoned");
             switch_profile_reconciled(&mut cfg, canonical)?;
         } else {
-            println!("clauth: aborted, no changes made");
+            outln!("clauth: aborted, no changes made");
             return Ok(());
         }
     } else {
@@ -227,7 +226,7 @@ pub(crate) fn switch_profile_cli(config: AppConfig, canonical: &str) -> Result<(
         let _spinner = Spinner::start("clauth: priming usage window");
         let _ = oauth::prime_window(&config, canonical);
     }
-    println!("clauth: switched to '{canonical}'");
+    outln!("clauth: switched to '{canonical}'");
     Ok(())
 }
 

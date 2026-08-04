@@ -24,6 +24,7 @@ use rmcp::{
 use serde::Deserialize;
 
 use crate::logline::logline;
+use crate::out::outln;
 use crate::profile::{AppConfig, load_config};
 use crate::profile_cache::{THIRD_PARTY_CACHE_FILE, USAGE_CACHE_FILE, load_profile_cache};
 use crate::profile_json::{provider_label, tier_label, windows_json};
@@ -664,11 +665,11 @@ pub(crate) fn await_job() -> ! {
                         "result": "job finished without an envelope",
                     })
                 });
-                println!("{envelope}");
+                outln!("{envelope}");
                 std::process::exit(2); // wake the model with the result
             }
             Some(_) if start.elapsed() >= deadline => {
-                println!(
+                outln!(
                     "delegate job {job_id} still running; call `delegate_result` to retrieve it"
                 );
                 std::process::exit(2);

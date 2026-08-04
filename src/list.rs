@@ -14,6 +14,7 @@ use anyhow::Result;
 
 use crate::daemon::build_status;
 use crate::format::format_pct;
+use crate::out::out;
 use crate::profile::{AppConfig, load_config};
 
 /// `clauth list [--all|--disabled]` — print the account table. `include_disabled`
@@ -27,7 +28,7 @@ pub(crate) fn run(include_disabled: bool) -> Result<()> {
         None,
         include_disabled,
     );
-    print!("{}", render_table(&config, &body));
+    out!("{}", render_table(&config, &body));
     Ok(())
 }
 

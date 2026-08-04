@@ -2,6 +2,7 @@ use std::fs;
 
 use anyhow::{Context, Result, bail};
 
+use crate::out::{out, outln};
 use crate::profile::{home_dir, load_config};
 
 const BASH: &str = r#"_clauth() {
@@ -175,7 +176,7 @@ pub(crate) fn print_script(shell: &str) -> Result<()> {
         "fish" => FISH,
         _ => bail!("unsupported shell '{shell}', expected: bash, zsh, fish"),
     };
-    print!("{script}");
+    out!("{script}");
     Ok(())
 }
 
@@ -184,7 +185,7 @@ pub(crate) fn print_profile_names() {
         return;
     };
     for name in config.names() {
-        println!("{name}");
+        outln!("{name}");
     }
 }
 
@@ -272,12 +273,11 @@ fn answer_is_yes(input: &str) -> bool {
 /// Returns `CannotAsk` (never `Yes`) when stdin/stdout isn't a terminal, so a
 /// shell rc is never edited non-interactively.
 fn ask_install_completions(rc_name: &str) -> Consent {
-    use std::io::{IsTerminal as _, Write as _};
+    use std::io::IsTerminal as _;
     if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
         return Consent::CannotAsk;
     }
-    print!("clauth: install shell completions? appends a source line to ~/{rc_name} [Y/n] ");
-    let _ = std::io::stdout().flush();
+    out!("clauth: install shell completions? appends a source line to ~/{rc_name} [Y/n] ");
     let mut line = String::new();
     if std::io::stdin().read_line(&mut line).is_err() {
         return Consent::CannotAsk;

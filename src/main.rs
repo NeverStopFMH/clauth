@@ -19,6 +19,7 @@ mod logline;
 mod mcp;
 mod oauth;
 mod oauth_login;
+mod out;
 mod platform;
 mod plugin_probe;
 mod poll;
@@ -50,6 +51,7 @@ use anyhow::{Context, Result};
 use clap::Parser as _;
 
 use crate::cli::{Cli, Command, LoginArgs, ThemeArg};
+use crate::out::{out, outln};
 use crate::profile::{AppConfig, ThemeName, load_config};
 use crate::runtime::Isolation;
 
@@ -275,7 +277,7 @@ fn reauth_confirmed(input: &str) -> bool {
 /// Non-TTY stdin proceeds (a piped script can't be prompted), matching the
 /// OAuth reauth contract. `is_api` tailors the copy (endpoint + key vs tokens).
 fn confirm_reauth(target: &str, is_api: bool) -> Result<bool> {
-    use std::io::{IsTerminal as _, Write as _};
+    use std::io::IsTerminal as _;
     if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
         return Ok(true);
     }
@@ -284,10 +286,9 @@ fn confirm_reauth(target: &str, is_api: bool) -> Result<bool> {
     } else {
         "stored credentials"
     };
-    print!(
+    out!(
         "clauth: profile '{target}' already exists. Re-authenticating replaces its {object}. Continue? [y/N] "
     );
-    std::io::stdout().flush()?;
     let mut answer = String::new();
     std::io::stdin().read_line(&mut answer)?;
     Ok(reauth_confirmed(&answer))
@@ -301,7 +302,7 @@ fn collect_api_endpoint(
     base_url: Option<&str>,
     api_key: Option<&str>,
 ) -> Result<(Option<String>, Option<String>)> {
-    use std::io::{IsTerminal as _, Write as _};
+    use std::io::IsTerminal as _;
     let interactive = std::io::stdin().is_terminal();
 
     let base_url = match base_url {
@@ -318,8 +319,7 @@ fn collect_api_endpoint(
             if !interactive {
                 anyhow::bail!("non-interactive stdin: pass --base-url (and --api-key) explicitly");
             }
-            print!("Base URL: ");
-            std::io::stdout().flush()?;
+            out!("Base URL: ");
             let mut line = String::new();
             std::io::stdin().read_line(&mut line)?;
             let trimmed = line.trim().to_string();
@@ -366,22 +366,22 @@ fn collect_api_endpoint(
 /// in lockstep.
 fn run_oauth_browser(reauth: bool, target: &str) -> Result<actions::CaptureSnapshot> {
     if reauth {
-        println!("clauth: re-authenticating existing profile '{target}', opening a browser…");
+        outln!("clauth: re-authenticating existing profile '{target}', opening a browser…");
     } else {
-        println!("clauth: opening a browser to log in to a new account for '{target}'…");
+        outln!("clauth: opening a browser to log in to a new account for '{target}'…");
     }
     let outcome = oauth_login::login_with(|progress| {
         // The CLI surfaces only the paste-fallback URL; the later milestones
         // are TUI-modal fodder and would just be noise between the prints here.
         if let oauth_login::LoginProgress::AuthorizeUrl(url) = progress {
-            println!("\nIf the browser didn't open, visit this URL to authorize:\n{url}\n");
+            outln!("\nIf the browser didn't open, visit this URL to authorize:\n{url}\n");
         }
     })
     // CLI stderr: name the HTTP status too. This lands on the `eprintln!`
     // backstop below, a terminal with no companion log open, and a fresh login
     // failing on a 400 is the case that ruling exists for.
     .map_err(|e| anyhow::anyhow!("{}", e.cli_message()))?;
-    println!(
+    outln!(
         "clauth: login complete.\n{}",
         oauth_login::login_summary(&outcome.credentials)
     );
@@ -447,7 +447,7 @@ fn cmd_login(args: LoginArgs) -> Result<()> {
     // Confirm a reauth BEFORE collecting anything (browser or key prompt): a
     // declined overwrite must not open a browser or read a secret.
     if reauth && !confirm_reauth(&target, is_api)? {
-        println!("clauth: aborted. '{target}' left unchanged.");
+        outln!("clauth: aborted. '{target}' left unchanged.");
         return Ok(());
     }
 
@@ -472,7 +472,7 @@ fn cmd_login(args: LoginArgs) -> Result<()> {
             actions::set_profile_default_model(&mut config, &target, model)?;
         }
         let what = if is_api { "endpoint + key" } else { "tokens" };
-        println!("clauth: re-authenticated '{target}'. Fresh {what} are in place.");
+        outln!("clauth: re-authenticated '{target}'. Fresh {what} are in place.");
     } else if is_api {
         // A new API profile goes through `create_blank_profile` (the TUI's
         // path), NOT `capture_into_profile`: the latter auto-activates the
@@ -491,7 +491,7 @@ fn cmd_login(args: LoginArgs) -> Result<()> {
             api_key,
             args.model.clone(),
         )?;
-        println!("clauth: captured into profile '{target}'. Switch to it with:  clauth {target}");
+        outln!("clauth: captured into profile '{target}'. Switch to it with:  clauth {target}");
     } else {
         let snapshot = run_oauth_browser(false, &target)?;
         actions::capture_into_profile(&mut config, target.clone(), snapshot)?;
@@ -500,7 +500,7 @@ fn cmd_login(args: LoginArgs) -> Result<()> {
         if let Some(model) = args.model.as_deref() {
             actions::set_profile_default_model(&mut config, &target, model)?;
         }
-        println!("clauth: captured into profile '{target}'. Switch to it with:  clauth {target}");
+        outln!("clauth: captured into profile '{target}'. Switch to it with:  clauth {target}");
     }
     Ok(())
 }
@@ -532,21 +532,20 @@ fn cmd_login_setup_token(
                 "'{target}' already has a long-lived token; pass --yes to replace it non-interactively"
             );
         }
-        print!("Replace the stored long-lived token for '{target}'? [y/N] ");
-        std::io::Write::flush(&mut std::io::stdout())?;
+        out!("Replace the stored long-lived token for '{target}'? [y/N] ");
         let mut answer = String::new();
         std::io::stdin().read_line(&mut answer)?;
         if !reauth_confirmed(&answer) {
-            println!("clauth: aborted. '{target}' left unchanged.");
+            outln!("clauth: aborted. '{target}' left unchanged.");
             return Ok(());
         }
     }
 
     let raw = if interactive {
-        println!("clauth: capturing a long-lived token for '{target}'.");
-        println!("  1. in another terminal, run:  claude setup-token");
-        println!("  2. complete the browser flow it opens");
-        println!("  3. paste the minted token below (input stays hidden)");
+        outln!("clauth: capturing a long-lived token for '{target}'.");
+        outln!("  1. in another terminal, run:  claude setup-token");
+        outln!("  2. complete the browser flow it opens");
+        outln!("  3. paste the minted token below (input stays hidden)");
         rpassword::prompt_password("Setup token: ")
             .map_err(|e| anyhow::anyhow!("failed to read the token: {e}"))?
     } else {
@@ -573,11 +572,11 @@ fn cmd_login_setup_token(
 
     let expires_at = claude::write_session_token(target, &token, crate::usage::now_ms() as i64)?;
     let days = (expires_at - crate::usage::now_ms() as i64) / 86_400_000;
-    println!(
+    outln!(
         "clauth: long-lived token installed for '{target}' · assumed to expire in ~{days}d \
          (`claude setup-token` mints last about a year)."
     );
-    println!(
+    outln!(
         "clauth: it takes effect on the next switch:  clauth {target}{}",
         if exists {
             ""
@@ -601,27 +600,26 @@ fn cmd_delete(name: &str, yes: bool, force: bool) -> Result<()> {
     let mut config = load_config()?;
     let canonical = resolve_or_bail(&config, name)?;
     if !yes {
-        use std::io::{IsTerminal as _, Write as _};
+        use std::io::IsTerminal as _;
         if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
             anyhow::bail!(
                 "refusing to delete '{canonical}' without confirmation; pass --yes for a non-interactive delete"
             );
         }
-        print!("clauth: delete profile '{canonical}' and all its credentials? [y/N] ");
-        std::io::stdout().flush()?;
+        out!("clauth: delete profile '{canonical}' and all its credentials? [y/N] ");
         let mut answer = String::new();
         std::io::stdin().read_line(&mut answer)?;
         if !reauth_confirmed(&answer) {
-            println!("clauth: aborted. '{canonical}' left in place.");
+            outln!("clauth: aborted. '{canonical}' left in place.");
             return Ok(());
         }
     }
     let was_active = config.is_active(&canonical);
     actions::delete_profile(&mut config, &canonical, force)?;
     if was_active {
-        println!("clauth: deleted profile '{canonical}' (was active; live credentials cleared).");
+        outln!("clauth: deleted profile '{canonical}' (was active; live credentials cleared).");
     } else {
-        println!("clauth: deleted profile '{canonical}'.");
+        outln!("clauth: deleted profile '{canonical}'.");
     }
     Ok(())
 }
@@ -652,32 +650,31 @@ fn cmd_disable(name: &str, yes: bool) -> Result<()> {
     let canonical = resolve_or_bail(&config, name)?;
 
     if config.find(&canonical).is_some_and(|p| p.is_disabled()) {
-        println!("clauth: '{canonical}' is already disabled.");
+        outln!("clauth: '{canonical}' is already disabled.");
         return Ok(());
     }
 
     if !yes {
-        use std::io::{IsTerminal as _, Write as _};
+        use std::io::IsTerminal as _;
         if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
             anyhow::bail!(
                 "refusing to disable '{canonical}' without confirmation; pass --yes for a non-interactive run"
             );
         }
-        print!(
+        out!(
             "clauth: disable profile '{canonical}'? it drops out of auto-switch and usage \
              polling until re-enabled. [y/N] "
         );
-        std::io::stdout().flush()?;
         let mut answer = String::new();
         std::io::stdin().read_line(&mut answer)?;
         if !reauth_confirmed(&answer) {
-            println!("clauth: aborted. '{canonical}' left unchanged.");
+            outln!("clauth: aborted. '{canonical}' left unchanged.");
             return Ok(());
         }
     }
 
     actions::disable_profile(&mut config, &canonical)?;
-    println!("clauth: disabled '{canonical}'.");
+    outln!("clauth: disabled '{canonical}'.");
     Ok(())
 }
 
@@ -689,9 +686,9 @@ fn cmd_enable(name: &str) -> Result<()> {
     let mut config = load_config()?;
     let canonical = resolve_or_bail(&config, name)?;
     if actions::enable_profile(&mut config, &canonical)? {
-        println!("clauth: enabled '{canonical}'.");
+        outln!("clauth: enabled '{canonical}'.");
     } else {
-        println!("clauth: '{canonical}' is already enabled.");
+        outln!("clauth: '{canonical}' is already enabled.");
     }
     Ok(())
 }

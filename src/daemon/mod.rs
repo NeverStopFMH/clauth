@@ -39,6 +39,7 @@ use anyhow::{Context, Result};
 use crate::claude::link_profile_credentials;
 use crate::lockorder::RankedMutex;
 use crate::logline::logline;
+use crate::out::outln;
 use crate::profile::{
     AppConfig, ConfigHandle, ReloadFingerprint, atomic_write_600, clauth_dir, load_config,
     mkdir_700, reload_fingerprint,
@@ -301,7 +302,7 @@ pub(crate) fn status_probe() -> Result<()> {
     } else {
         ""
     };
-    println!("running (pid {pid}, feed {feed}{standby})");
+    outln!("running (pid {pid}, feed {feed}{standby})");
     Ok(())
 }
 
@@ -314,7 +315,7 @@ pub(crate) fn status_oneshot(include_disabled: bool) -> Result<()> {
     let config = load_config()?;
     let interval = config.state.refresh_interval_ms;
     let body = build_status(&config, interval, None, include_disabled);
-    println!("{}", serde_json::to_string_pretty(&body)?);
+    outln!("{}", serde_json::to_string_pretty(&body)?);
     Ok(())
 }
 

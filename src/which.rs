@@ -19,6 +19,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 
+use crate::out::outln;
 use crate::profile::{AppConfig, ClaudeCredentials, Profile, claude_dir, load_config};
 use crate::profile_json::tier_label;
 
@@ -227,13 +228,13 @@ fn match_by_refresh_token<'a>(config: &'a AppConfig, refresh_token: &str) -> Opt
 
 fn emit_plain(matched: Option<&str>) {
     match matched {
-        Some(name) => println!("{name}"),
-        None => println!("unknown"),
+        Some(name) => outln!("{name}"),
+        None => outln!("unknown"),
     }
 }
 
 fn emit_json(config: &AppConfig, resolved: Option<(String, Source)>) {
-    println!("{}", json_view(config, resolved.as_ref()));
+    outln!("{}", json_view(config, resolved.as_ref()));
 }
 
 /// The `--json` payload, split from the print so its field shapes are assertable

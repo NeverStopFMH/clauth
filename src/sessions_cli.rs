@@ -34,6 +34,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
 
+use crate::out::{out, outln};
 use crate::profile::{AppConfig, load_config};
 use crate::runtime::Isolation;
 use crate::sessions::{IsolatedHold, SessionInfo, SessionRef, WorkspaceGroup};
@@ -51,7 +52,7 @@ pub(crate) fn run_sessions(json: bool, tokens: bool) -> Result<()> {
         anyhow::bail!("no sessions found");
     }
     if json {
-        println!("{}", sessions_json(&flat));
+        outln!("{}", sessions_json(&flat));
     } else {
         emit_sessions_table(&groups, tokens);
     }
@@ -154,7 +155,7 @@ pub(crate) fn run_info(target: &str) -> Result<()> {
         Resolved::Held(hold) => (hold.session, Some(hold.profile)),
         Resolved::Missing => anyhow::bail!("no session found for '{target}'"),
     };
-    println!("{}", info_lines(&session, held_by.as_deref()));
+    outln!("{}", info_lines(&session, held_by.as_deref()));
     Ok(())
 }
 
@@ -235,15 +236,13 @@ fn resume_candidates<'a>(config: &'a AppConfig, default: &'a str) -> (Vec<&'a st
 /// explicit `--profile <disabled>` skips this prompt entirely and is still
 /// caught by `start::run`'s authoritative refusal.
 fn prompt_profile(config: &AppConfig, default: &str) -> Result<String> {
-    use std::io::Write as _;
     let (enabled, default) = resume_candidates(config, default);
-    println!("resume under which account?");
+    outln!("resume under which account?");
     for name in enabled.iter().copied() {
         let marker = if name == default { "  (default)" } else { "" };
-        println!("  {name}{marker}");
+        outln!("  {name}{marker}");
     }
-    print!("profile [{default}]: ");
-    std::io::stdout().flush()?;
+    out!("profile [{default}]: ");
     let mut line = String::new();
     std::io::stdin().read_line(&mut line)?;
     let picked = line.trim();
@@ -387,9 +386,9 @@ fn emit_sessions_table(groups: &[WorkspaceGroup], tokens: bool) {
         } else {
             &group.workspace
         };
-        println!("{ws}");
+        outln!("{ws}");
         for s in &group.sessions {
-            println!("{}", session_row(s, tokens));
+            outln!("{}", session_row(s, tokens));
         }
     }
 }

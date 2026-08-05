@@ -1291,3 +1291,156 @@ mod api_key_helper_tests {
         dispatch_api_key("ghost-profile").expect_err("missing profile must fail closed");
     }
 }
+
+/// The `static-token` verdicts, distinguished by what the sidecar HOLDS — a
+/// profile already on its mint is a successful no-op, a rolling bearer left
+/// with nothing re-stamping it is exit-non-zero, and an expired backup is
+/// named rather than left for the operator to hunt down. This module is also
+/// the exit-contract pin the review measured as missing: reverting any bail
+/// to a print + `Ok(())` reds here.
+mod static_token_verdicts {
+    use super::*;
+    use crate::testutil::HomeSandbox;
+
+    fn seeded_profile(name: &str, rolling_flag: bool) {
+        let mut profile = crate::profile::Profile::new(name.to_string(), None, None);
+        profile.rolling_token = rolling_flag;
+        crate::profile::save_profile(&profile).expect("save profile");
+        let state = crate::profile::AppState {
+            profiles: vec![profile.name.clone()],
+            ..Default::default()
+        };
+        crate::profile::save_app_state(&state).expect("save state");
+    }
+
+    fn rolling_sidecar(name: &str, exp_in_ms: i64) {
+        crate::claude::stamp_rolling_token(
+            name,
+            &crate::profile::OAuthToken {
+                access_token: "at-rolled".to_string(),
+                refresh_token: None,
+                expires_at: Some(crate::usage::now_ms() as i64 + exp_in_ms),
+                scopes: Some(vec![
+                    "user:inference".to_string(),
+                    "user:profile".to_string(),
+                ]),
+                subscription_type: Some("max".into()),
+            },
+        )
+        .expect("stamp");
+    }
+
+    #[test]
+    fn a_mint_profile_is_a_noop_success() {
+        let _home = HomeSandbox::new();
+        seeded_profile("st-mint", false);
+        crate::claude::write_session_token(
+            "st-mint",
+            "sk-ant-oat01-static-verdicts-mint-000",
+            crate::usage::now_ms() as i64,
+        )
+        .expect("mint");
+        cmd_static_token("st-mint").expect("already on the mint is a no-op, not a failure");
+    }
+
+    #[test]
+    fn a_rolling_bearer_with_no_backup_fails_loud() {
+        let _home = HomeSandbox::new();
+        seeded_profile("st-roll", true);
+        rolling_sidecar("st-roll", 8 * 3_600_000);
+        let err = cmd_static_token("st-roll")
+            .expect_err("a bearer left with nothing re-stamping it is a failed restore");
+        assert!(
+            format!("{err:#}").contains("no static mint to restore"),
+            "{err:#}"
+        );
+        // The flag flip IS durable on this path — stopping the re-stamps is
+        // what the operator asked for; the missing mint is the error.
+        let p = crate::profile::load_profile("st-roll").expect("reload");
+        assert!(
+            !p.rolling_token,
+            "the rolling flag turns off even when the restore fails"
+        );
+    }
+
+    #[test]
+    fn an_expired_backup_is_named_and_kept() {
+        let _home = HomeSandbox::new();
+        seeded_profile("st-aged", true);
+        rolling_sidecar("st-aged", 8 * 3_600_000);
+        let dir = crate::profile::profile_dir("st-aged").expect("dir");
+        let expired = crate::profile::ClaudeCredentials {
+            claude_ai_oauth: Some(crate::profile::OAuthToken {
+                access_token: "sk-ant-oat01-aged".to_string(),
+                refresh_token: None,
+                expires_at: Some(crate::usage::now_ms() as i64 - 86_400_000),
+                scopes: Some(vec![
+                    "user:inference".to_string(),
+                    "user:sessions:claude_code".to_string(),
+                ]),
+                subscription_type: None,
+            }),
+        };
+        std::fs::write(
+            dir.join("session-token.static.json"),
+            serde_json::to_vec_pretty(&expired).expect("ser"),
+        )
+        .expect("write backup");
+        let err = cmd_static_token("st-aged").expect_err("an expired backup restores nothing");
+        assert!(
+            format!("{err:#}").contains("expired"),
+            "the backup that exists but cannot serve is NAMED: {err:#}"
+        );
+        assert!(
+            dir.join("session-token.static.json").exists(),
+            "and left on disk"
+        );
+    }
+
+    /// `rolling-token` on a quarantined chain bails BEFORE anything
+    /// destructive: the sidecar (even a mis-filled one) is untouched and the
+    /// flag stays off — a failed command leaves nothing durable behind.
+    #[test]
+    fn rolling_token_on_a_dead_chain_touches_nothing() {
+        let _home = HomeSandbox::new();
+        let mut profile = crate::profile::Profile::new("rt-dead".to_string(), None, None);
+        profile.credentials = Some(crate::profile::ClaudeCredentials {
+            claude_ai_oauth: Some(crate::profile::OAuthToken {
+                access_token: "at-dead".to_string(),
+                refresh_token: Some("rt-dead".to_string()),
+                expires_at: Some(crate::usage::now_ms() as i64 + 3_600_000),
+                scopes: Some(vec![
+                    "user:inference".to_string(),
+                    "user:profile".to_string(),
+                ]),
+                subscription_type: Some("max".into()),
+            }),
+        });
+        crate::profile::save_profile(&profile).expect("save profile");
+        let state = crate::profile::AppState {
+            profiles: vec![profile.name.clone()],
+            auth_broken: vec![profile.name.clone()],
+            ..Default::default()
+        };
+        crate::profile::save_app_state(&state).expect("save state");
+        // A mis-filled sidecar that the pre-clear would have quarantined away.
+        let dir = crate::profile::profile_dir("rt-dead").expect("dir");
+        std::fs::write(
+            dir.join("session-token.json"),
+            serde_json::to_vec_pretty(&profile.credentials).expect("ser"),
+        )
+        .expect("write misfill");
+
+        let err = cmd_rolling_token("rt-dead").expect_err("a dead chain refuses up front");
+        assert!(
+            format!("{err:#}").contains("usage chain is dead"),
+            "{err:#}"
+        );
+        assert!(
+            dir.join("session-token.json").exists(),
+            "the mis-fill is NOT quarantined away by a command that then failed"
+        );
+        let p = crate::profile::load_profile("rt-dead").expect("reload");
+        assert!(!p.rolling_token, "nothing durable from a failed arm");
+    }
+}

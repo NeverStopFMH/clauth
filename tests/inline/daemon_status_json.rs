@@ -752,3 +752,46 @@ fn build_status_rolling_token_is_the_sidecar_content_not_the_config_flag() {
         "what sessions actually hold outranks the flag in both directions"
     );
 }
+
+/// A mis-fill (rotating pair) publishes `rolling_token: false` even though its
+/// chain-shaped scopes would scope-classify as rolling — the classifier's
+/// refresh-token arm pre-empts the inference. Without it, status.json told
+/// external readers "routine hours-scale maintenance" over the exact state the
+/// TUI renders `[ mis-filled ]` for, on the same file, same frame.
+#[test]
+fn build_status_rolling_token_is_false_for_a_misfill() {
+    let _home = HomeSandbox::new();
+    let name = "roll-misfill";
+    let dir = crate::profile::profile_dir(name).expect("dir");
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    let mut p = oauth_profile(name);
+    p.rolling_token = true;
+    let config = AppConfig {
+        state: AppState::default(),
+        profiles: vec![p],
+    };
+    // What a mis-fill IS: a copy of credentials.json — refresh token, chain
+    // scopes, plan stamp and all.
+    let misfill = ClaudeCredentials {
+        claude_ai_oauth: Some(OAuthToken {
+            access_token: "at-misfill".to_string(),
+            refresh_token: Some("rt-misfill".to_string()),
+            expires_at: Some(crate::usage::now_ms() as i64 + 3_600_000),
+            scopes: Some(vec![
+                "user:inference".to_string(),
+                "user:profile".to_string(),
+            ]),
+            subscription_type: Some("max".to_string()),
+        }),
+    };
+    std::fs::write(
+        dir.join("session-token.json"),
+        serde_json::to_vec_pretty(&misfill).unwrap(),
+    )
+    .unwrap();
+    let v = build_status(&config, 300_000, None, false);
+    assert_eq!(
+        v["profiles"][0]["rolling_token"], false,
+        "a mis-fill is the state the split exists to detect, not a rolling token"
+    );
+}

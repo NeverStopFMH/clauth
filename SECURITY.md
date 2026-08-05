@@ -138,8 +138,8 @@ User-invoked, only when you run the command:
   `user:inference` and `user:sessions:claude_code`. The rolling bearer carries
   the chain's full granted set — for a standard Pro/Max browser login that is
   `user:profile`, `user:inference`, `user:sessions:claude_code`,
-  `user:mcp_servers` and `user:file_upload`, plus `org:create_api_key` when the
-  chain was minted with it. Anything that can read the sidecar, or the live
+  `user:mcp_servers` and `user:file_upload` — the five every real Pro/Max
+  browser login grants. Anything that can read the sidecar, or the live
   `~/.claude/.credentials.json` a switch installs it into, can use every one of
   those scopes until the token expires — which is hours rather than the mint's
   year. The command prints the scope list when it arms, so the widening is

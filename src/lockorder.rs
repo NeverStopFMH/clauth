@@ -165,12 +165,15 @@ pub(crate) mod rank {
         /// `tick`/`fetch_third_party_due`, never under another lock.
         SuppressedGeneric = 1300;
         /// CLA-ROLL re-stamp pacing (`usage::scheduler::ClaudeRollingPacing`).
-        /// A true leaf today — every acquisition is take-check-release, before
-        /// `gate_fn` runs and before any other lock — but "today" is exactly
-        /// what a rankless `std::sync::Mutex` cannot defend: the ordering
-        /// `debug_assert` is blind to it, so a future edit taking `Config`
-        /// inside a pacing scope would sail past the one check built to catch
-        /// it. Ranked as a standalone leaf like its neighbors.
+        /// A true leaf: every acquisition — the scan gate up front and the
+        /// per-verdict bookkeeping inside the `match gate` arms — is
+        /// take-mutate-release with no other lock and no IO under it (the due
+        /// re-read that precedes the Ready arm's insert runs BEFORE the lock
+        /// is taken, for exactly that reason). A rankless `std::sync::Mutex`
+        /// could not defend that shape: the ordering `debug_assert` is blind
+        /// to it, so a future edit taking `Config` inside a pacing scope
+        /// would sail past the one check built to catch it. Ranked as a
+        /// standalone leaf like its neighbors.
         RollingPacing = 1400;
         PendingSwitch = 1500;
         PendingSwitchOff = 1700;

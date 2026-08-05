@@ -99,6 +99,10 @@ jobs:
             Linux)   sudo apt-get update && sudo apt-get install -y zsh fish ;;
             macOS)   brew install fish ;;
             Windows) echo "completion lint is cfg(unix); nothing to install" ;;
+            # Fail with the REAL signal: without this arm an unrecognised
+            # runner.os installs nothing and the job reds later inside the
+            # lint with a missing-shell message that reads like a test bug.
+            *)       echo "unrecognised runner.os '${{ runner.os }}'" >&2; exit 1 ;;
           esac
           echo "CLAUTH_REQUIRE_SHELL_LINT=1" >> "$GITHUB_ENV"
       - name: clippy (-D warnings)

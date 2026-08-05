@@ -526,7 +526,10 @@ fn rotation_blocked_by_live_session(has_live_session: bool, is_macos: bool) -> b
 /// fail-closed asymmetry: an unreadable marker dir, a marker with no registry
 /// row (`acquire` tolerates a failed registration), a row from a clauth that
 /// predates `launch_store`, and an unreadable or half-written credential file
-/// all return `true` and refuse exactly as today. Bare `claude` sessions never
+/// all return `true` and refuse exactly as today. The one readable shape that
+/// ALLOWS is a file that parses with no `claudeAiOauth` block at all (`{}`):
+/// it holds no refresh token to strand, so permitting the rotation is the
+/// verdict, not a hole in the enumeration. Bare `claude` sessions never
 /// reach this predicate at all — their stand-in markers live under
 /// [`live_bare_dir`], not the profile — so the refusal is unchanged for them
 /// by construction rather than by this check.
@@ -981,6 +984,31 @@ impl RotationGuard {
         // trip, before `config` and the state flock are ever taken.
         let _rank = crate::lockorder::RankGuard::enter::<crate::lockorder::rank::Rotation>();
         Ok(Self { _file: file, _rank })
+    }
+
+    /// Like [`RotationGuard::acquire`], but `Ok(None)` when another holder has
+    /// the lock instead of parking behind it. For callers on threads that must
+    /// never wait an unbounded time — the scheduler's tick thread above all,
+    /// where a `clauth start` holding this lock across its recursive
+    /// `~/.claude` copy would otherwise stall every account's poll while the
+    /// heartbeat (stamped in the main loop, not here) stays fresh.
+    pub(crate) fn try_acquire(name: &str) -> Result<Option<Self>> {
+        let path = rotation_lock_path(name)?;
+        if let Some(parent) = path.parent() {
+            crate::profile::mkdir_700(parent)
+                .with_context(|| format!("failed to create {}", parent.display()))?;
+        }
+        let file =
+            open_pid_file(&path).with_context(|| format!("failed to open {}", path.display()))?;
+        match file.try_lock() {
+            Ok(()) => {}
+            Err(std::fs::TryLockError::WouldBlock) => return Ok(None),
+            Err(std::fs::TryLockError::Error(e)) => {
+                return Err(e).with_context(|| format!("failed to lock {}", path.display()));
+            }
+        }
+        let _rank = crate::lockorder::RankGuard::enter::<crate::lockorder::rank::Rotation>();
+        Ok(Some(Self { _file: file, _rank }))
     }
 }
 

@@ -443,8 +443,13 @@ fn token_danger_marker_outranks_bell_and_active() {
     let config = config_with(vec![a], Some("a"), vec![]); // active
     let mut app = App::new(config);
     app.bell_fired.insert("a".into(), true); // bell also fired
-    app.session_tokens
-        .insert("a".into(), crate::claude::SessionTokenStatus::NotLongLived);
+    app.session_tokens.insert(
+        "a".into(),
+        (
+            crate::claude::SessionTokenStatus::NotLongLived,
+            crate::claude::SidecarKind::Misfilled,
+        ),
+    );
     let widths = OverviewWidths::new(80, &app);
     let line = render_overview_row(&app, 0, &widths, false, true);
     let text = line_text(&line);
@@ -494,8 +499,13 @@ fn broken_login_outranks_token_danger_marker() {
     let mut config = config_with(vec![a], Some("a"), vec![]);
     config.state.auth_broken.push("a".into());
     let mut app = App::new(config);
-    app.session_tokens
-        .insert("a".into(), crate::claude::SessionTokenStatus::NotLongLived);
+    app.session_tokens.insert(
+        "a".into(),
+        (
+            crate::claude::SessionTokenStatus::NotLongLived,
+            crate::claude::SidecarKind::Misfilled,
+        ),
+    );
     let widths = OverviewWidths::new(80, &app);
     let text = line_text(&render_overview_row(&app, 0, &widths, false, true));
     assert!(text.contains('×'), "broken login wins: {text}");
@@ -513,16 +523,26 @@ fn long_lived_token_expired_marks() {
     let mut app = App::new(config);
     let widths = OverviewWidths::new(120, &app);
 
-    app.session_tokens
-        .insert("a".into(), S::LongLived(Some(now_ms() as i64 + 340 * day)));
+    app.session_tokens.insert(
+        "a".into(),
+        (
+            S::LongLived(Some(now_ms() as i64 + 340 * day)),
+            crate::claude::SidecarKind::Mint,
+        ),
+    );
     let live = line_text(&render_overview_row(&app, 0, &widths, false, true));
     assert!(
         !live.contains('⊘'),
         "a live token raises no danger marker: {live}"
     );
 
-    app.session_tokens
-        .insert("a".into(), S::LongLived(Some(now_ms() as i64 - day)));
+    app.session_tokens.insert(
+        "a".into(),
+        (
+            S::LongLived(Some(now_ms() as i64 - day)),
+            crate::claude::SidecarKind::Mint,
+        ),
+    );
     let dead = line_text(&render_overview_row(&app, 0, &widths, false, true));
     assert!(dead.contains('⊘'), "expired token raises ⊘: {dead}");
 }

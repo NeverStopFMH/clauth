@@ -2404,10 +2404,14 @@ fn tick(state: &SchedulerState) {
     // worker pattern, not an oversight of it. The steady state is one due
     // profile per chain lifetime (~hours), so the fan-out's reason to exist
     // (one slow account stalling every other account's poll, every tick) has
-    // no analogue here; what the gate can cost (a rotation-lock wait, one
-    // token round trip) delays a single tick, bounded by the same timeouts the
-    // fetch legs run under. Anyone adding per-tick work to this leg inherits
-    // the fan-out question.
+    // no analogue here. What makes inline SAFE is `LockWait::NoWait`: the
+    // gate's rotation-lock acquisition is a try-lock on this leg, because
+    // `rotation.lock` itself has no timeout of any kind and a `clauth start`
+    // holding it across its recursive `~/.claude` copy would otherwise park
+    // this thread — and with it every account's poll — while the heartbeat
+    // (stamped in the main loop, not here) kept reading fresh. What remains
+    // is one token round trip on a cold re-stamp, which delays a single tick.
+    // Anyone adding per-tick work to this leg inherits the fan-out question.
     claude_rolling_tick(&state.config, &state.claude_rolling, now_ms(), &|name| {
         crate::oauth::restamp_rolling_token(&state.config, name, crate::oauth::refresh_result)
     });
@@ -3534,6 +3538,14 @@ pub(super) fn claude_rolling_tick(
 ) {
     {
         let Ok(mut p) = pacing.lock() else { return };
+        // Clamped, not just compared: these are WALL-CLOCK epoch-ms, and a
+        // backwards NTP step of ΔT would otherwise suppress the entire scan
+        // for ΔT while the sidecar this leg exists to renew keeps running its
+        // clock down. A stamp further out than one full gap can only mean the
+        // clock moved back under it, so it is pulled back into range.
+        if p.next_scan_ms > now + ROLLING_SCAN_GAP_MS {
+            p.next_scan_ms = now + ROLLING_SCAN_GAP_MS;
+        }
         if now < p.next_scan_ms {
             return;
         }
@@ -3555,7 +3567,14 @@ pub(super) fn claude_rolling_tick(
         let widened = pacing
             .lock()
             .ok()
-            .and_then(|p| p.retry_after_ms.get(&name).copied())
+            .and_then(|mut p| {
+                // Same backwards-clock clamp as the scan stamp: a retry stamp
+                // further out than the longest leash can only mean the wall
+                // clock moved back under it.
+                let at = p.retry_after_ms.get_mut(&name)?;
+                *at = (*at).min(now + ROLLING_BROKEN_RETRY_MS);
+                Some(*at)
+            })
             .is_some_and(|at| now < at);
         if widened {
             continue;
@@ -3586,8 +3605,12 @@ pub(super) fn claude_rolling_tick(
             // live mint/bearer (review LOW) — pace it like a transient
             // instead of re-running the gate every scan.
             crate::oauth::AuthGate::Ready | crate::oauth::AuthGate::Refreshed => {
+                // The due re-read (a file read) runs BEFORE the pacing lock is
+                // taken — the rank is a leaf precisely because nothing else,
+                // locks or IO, ever happens under it.
+                let still_due = crate::oauth::rolling_sidecar_restamp_due(&name, now as i64);
                 if let Ok(mut p) = pacing.lock() {
-                    if crate::oauth::rolling_sidecar_restamp_due(&name, now as i64) {
+                    if still_due {
                         p.retry_after_ms.insert(name.clone(), now + retry_ms);
                     } else {
                         p.retry_after_ms.remove(&name);

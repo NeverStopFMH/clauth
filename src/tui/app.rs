@@ -1641,7 +1641,13 @@ pub(crate) struct App {
     /// stamp it carries is compared to live `now_ms` at render time, so the
     /// clock ticking past expiry never needs a re-read — only an add / delete /
     /// re-mint does, which `reload_fingerprint` now catches.
-    pub(crate) session_tokens: HashMap<String, crate::claude::SessionTokenStatus>,
+    pub(crate) session_tokens: HashMap<
+        String,
+        (
+            crate::claude::SessionTokenStatus,
+            crate::claude::SidecarKind,
+        ),
+    >,
     /// Live `clauth start` sessions per account, for the Overview `active`
     /// column and the Fallback tab's compact equivalent. Cached because
     /// collecting it is a readdir plus an `open` + `try_lock` per row per marker
@@ -1660,10 +1666,30 @@ pub(crate) struct App {
 /// Reads each `session-token.json` off disk, so callers gather the names under a
 /// brief config guard and call this with the guard already dropped — the read
 /// never happens while the config lock is held.
-fn collect_session_tokens(names: &[String]) -> HashMap<String, crate::claude::SessionTokenStatus> {
+fn collect_session_tokens(
+    names: &[String],
+) -> HashMap<
+    String,
+    (
+        crate::claude::SessionTokenStatus,
+        crate::claude::SidecarKind,
+    ),
+> {
     names
         .iter()
-        .filter_map(|n| crate::claude::session_token_status(n).map(|s| (n.clone(), s)))
+        .filter_map(|n| {
+            // ONE sidecar read per profile yields both the status and the
+            // kind, the same derivation `build_snap` uses: Misfilled ⇔
+            // NotLongLived, everything readable else is LongLived.
+            let (kind, oauth) = crate::claude::sidecar_summary(n)?;
+            let status = match kind {
+                crate::claude::SidecarKind::Misfilled => {
+                    crate::claude::SessionTokenStatus::NotLongLived
+                }
+                _ => crate::claude::SessionTokenStatus::LongLived(oauth.expires_at),
+            };
+            Some((n.clone(), (status, kind)))
+        })
         .collect()
 }
 

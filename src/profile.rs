@@ -1067,6 +1067,14 @@ pub(crate) struct ReloadFingerprint {
     /// and a bare stamp is not a config change. Reading the mtime rather than the
     /// contents also keeps the sidecar's bearer off this path, which runs per
     /// TUI frame.
+    ///
+    /// A CHOSEN consequence, not an accident (CLA-ROLL review): a rolling
+    /// re-stamp genuinely rewrites the sidecar every couple of hours, so each
+    /// re-stamp moves this fingerprint and triggers one full `load_config` in
+    /// the TUI and the daemon. Telling a re-stamp apart from a re-mint would
+    /// need content reads on this per-frame path, and the reload it costs is a
+    /// milliseconds-scale walk per rolling profile per ~2h — accepted over
+    /// giving the fingerprint eyes into credential bytes.
     config_mtimes: Vec<(String, Option<SystemTime>, Option<SystemTime>)>,
 }
 

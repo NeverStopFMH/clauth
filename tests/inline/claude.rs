@@ -3021,3 +3021,166 @@ fn arming_from_disk_rechecks_chain_staleness_after_the_guard_wait() {
         "a chain that went stale during the guard wait must not be stamped"
     );
 }
+
+/// A mis-fill classifies as ITSELF, never as the rolling bearer its
+/// chain-shaped scopes would suggest — the refresh token is a content fact
+/// that pre-empts the scope inference. This is the arm `status.json` rides
+/// on: without it a mis-fill published `rolling_token: true` while the TUI
+/// rendered `[ mis-filled ]` on the same file, same frame.
+#[test]
+fn a_rotating_pair_classifies_misfilled_never_rolling() {
+    let with_refresh = OAuthToken {
+        access_token: "at".to_string(),
+        refresh_token: Some("rt".to_string()),
+        expires_at: Some(crate::usage::now_ms() as i64 + 3_600_000),
+        scopes: Some(vec![
+            "user:inference".to_string(),
+            "user:profile".to_string(),
+        ]),
+        subscription_type: Some("max".into()),
+    };
+    assert_eq!(sidecar_kind_of(&with_refresh), SidecarKind::Misfilled);
+    // And a mis-fill is never preserved as the mint, through the classifier
+    // rather than a sibling check.
+    let _home = HomeSandbox::new();
+    let name = "misfill-preserve";
+    let dir = crate::profile::profile_dir(name).expect("dir");
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    std::fs::write(
+        dir.join("session-token.json"),
+        serde_json::to_vec_pretty(&ClaudeCredentials {
+            claude_ai_oauth: Some(with_refresh),
+        })
+        .expect("ser"),
+    )
+    .expect("write");
+    stamp_rolling_token(
+        name,
+        &OAuthToken {
+            access_token: "at-next".to_string(),
+            refresh_token: None,
+            expires_at: Some(crate::usage::now_ms() as i64 + 8 * 3_600_000),
+            scopes: None,
+            subscription_type: Some("max".into()),
+        },
+    )
+    .expect("roll");
+    assert!(
+        !dir.join("session-token.static.json").exists(),
+        "a rotating pair must never become the degrade backup"
+    );
+}
+
+/// An EXPIRED backup is refused by every restore path and left on disk:
+/// installing it would sign sessions out on first use, and consuming it would
+/// also destroy whatever life the current sidecar has left.
+#[test]
+fn an_expired_backup_is_never_restored() {
+    let _home = HomeSandbox::new();
+    let name = "expired-backup";
+    let dir = crate::profile::profile_dir(name).expect("dir");
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    let now = crate::usage::now_ms() as i64;
+    let expired = ClaudeCredentials {
+        claude_ai_oauth: Some(OAuthToken {
+            access_token: "sk-ant-oat01-aged-out".to_string(),
+            refresh_token: None,
+            expires_at: Some(now - 86_400_000),
+            scopes: Some(vec![
+                "user:inference".to_string(),
+                "user:sessions:claude_code".to_string(),
+            ]),
+            subscription_type: None,
+        }),
+    };
+    std::fs::write(
+        dir.join("session-token.static.json"),
+        serde_json::to_vec_pretty(&expired).expect("ser"),
+    )
+    .expect("write backup");
+    let live_bearer = ClaudeCredentials {
+        claude_ai_oauth: Some(OAuthToken {
+            access_token: "at-still-alive".to_string(),
+            refresh_token: None,
+            expires_at: Some(now + 2 * 3_600_000),
+            scopes: Some(vec![
+                "user:inference".to_string(),
+                "user:profile".to_string(),
+            ]),
+            subscription_type: Some("max".into()),
+        }),
+    };
+    std::fs::write(
+        dir.join("session-token.json"),
+        serde_json::to_vec_pretty(&live_bearer).expect("ser"),
+    )
+    .expect("write sidecar");
+
+    assert!(
+        !restore_static_mint(name).expect("restore"),
+        "an expired backup reads as nothing-to-restore"
+    );
+    assert!(
+        dir.join("session-token.static.json").exists(),
+        "and stays on disk as evidence"
+    );
+    let sidecar_now: ClaudeCredentials =
+        serde_json::from_slice(&std::fs::read(dir.join("session-token.json")).expect("read"))
+            .expect("parse");
+    assert_eq!(
+        sidecar_now.access_token(),
+        Some("at-still-alive"),
+        "the sidecar's remaining live bearer is not destroyed for a dead mint"
+    );
+
+    // The heal path refuses the same way: a mis-fill plus an expired backup
+    // keeps the disengaged-but-working posture instead of installing a dead
+    // credential over it.
+    std::fs::write(
+        dir.join("session-token.json"),
+        serde_json::to_vec(&creds("at-misfill", Some("rt-misfill"))).expect("ser"),
+    )
+    .expect("misfill");
+    assert!(!heal_misfilled_sidecar(name).expect("heal"));
+    assert!(
+        matches!(
+            session_token_status(name),
+            Some(SessionTokenStatus::NotLongLived)
+        ),
+        "the mis-fill stays in place rather than trading working-vanilla for a dead mint"
+    );
+    assert!(dir.join("session-token.static.json").exists());
+}
+
+/// One transient read failure on the sidecar must ABORT the roll, not forfeit
+/// the mint: `preserve_static_mint`'s verdict decides whether the stamp may
+/// overwrite the file, and a swallowed `EISDIR`/`EIO` there would destroy a
+/// genuine mint with no backup written — the one unrecoverable direction.
+#[test]
+fn an_unreadable_sidecar_aborts_the_roll_instead_of_forfeiting_the_mint() {
+    let _home = HomeSandbox::new();
+    let name = "unreadable-sidecar";
+    let dir = crate::profile::profile_dir(name).expect("dir");
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    // A directory where the sidecar goes: reads fail with a non-NotFound
+    // error on every platform, which is the shape of a transient fault.
+    std::fs::create_dir(dir.join("session-token.json")).expect("block the sidecar path");
+    let err = stamp_rolling_token(
+        name,
+        &OAuthToken {
+            access_token: "at-next".to_string(),
+            refresh_token: None,
+            expires_at: Some(crate::usage::now_ms() as i64 + 8 * 3_600_000),
+            scopes: None,
+            subscription_type: Some("max".into()),
+        },
+    );
+    assert!(
+        err.is_err(),
+        "a roll that cannot read what it is about to overwrite must not proceed"
+    );
+    assert!(
+        !dir.join("session-token.static.json").exists(),
+        "and no half-truth backup appears"
+    );
+}

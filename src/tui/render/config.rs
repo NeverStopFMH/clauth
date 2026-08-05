@@ -187,57 +187,68 @@ fn build_snap(app: &App, with_text: bool) -> Snap {
         return snap;
     }
     match cfg.profiles.get(app.profile_cursor) {
-        Some(p) => Snap {
-            title: p.name.to_string(),
-            name: if with_text {
-                p.name.to_string()
-            } else {
-                String::new()
-            },
-            base_url: text(&p.base_url),
-            api_key: text(&p.api_key),
-            model: text(&p.models.default),
-            opus: text(&p.models.opus),
-            sonnet: text(&p.models.sonnet),
-            haiku: text(&p.models.haiku),
-            fable: text(&p.models.fable),
-            subagent: text(&p.models.subagent),
-            // Env rows render from the snapshot (no per-entry draft buffer), so
-            // they're always populated — even while a draft owns the text fields.
-            env: p.env.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
-            auto_start: p.auto_start,
-            disabled: p.is_disabled(),
-            is_active: cfg.is_active(&p.name),
-            // Read per frame for the selected profile only, same as
-            // `session_token` below — a single small directory stat, not a
-            // per-profile loop.
-            has_live_session: crate::runtime::has_live_session(p.name.as_str()),
-            // OAuth accounts carry a token; API accounts carry an api key. Either
-            // one flips the Login row to "re-login" and shows the log-out row.
-            // A console account's `log in` row captures the SESSION, so that
-            // is the credential its done-state names. Its api key is a
-            // different credential on a different row and cannot stand in:
-            // a keyless account with a live session is logged in for this
-            // row's purposes, and a keyed one with no session is not.
-            logged_in: if p.console_login_target().is_some() {
-                p.console.is_some()
-            } else if p.login_is_oauth() {
-                p.credentials.is_some()
-            } else {
-                p.api_key.as_deref().is_some_and(|k| !k.trim().is_empty())
-            },
-            login_is_oauth: p.login_is_oauth(),
-            has_other_login: p.credentials.is_some() || p.api_key.is_some(),
-            clear_falls_back_to_oauth: p.credentials.is_some(),
-            captured: false,
-            provider: p.provider.map(|p| p.display_name()),
-            console_login: p.console_login_target().is_some(),
-            session_token: crate::claude::session_token_status(p.name.as_str()),
-            rolling_token: matches!(
-                crate::claude::sidecar_summary(p.name.as_str()),
-                Some((crate::claude::SidecarKind::Rolling, _))
-            ),
-        },
+        Some(p) => {
+            let sidecar = crate::claude::sidecar_summary(p.name.as_str());
+            Snap {
+                title: p.name.to_string(),
+                name: if with_text {
+                    p.name.to_string()
+                } else {
+                    String::new()
+                },
+                base_url: text(&p.base_url),
+                api_key: text(&p.api_key),
+                model: text(&p.models.default),
+                opus: text(&p.models.opus),
+                sonnet: text(&p.models.sonnet),
+                haiku: text(&p.models.haiku),
+                fable: text(&p.models.fable),
+                subagent: text(&p.models.subagent),
+                // Env rows render from the snapshot (no per-entry draft buffer), so
+                // they're always populated — even while a draft owns the text fields.
+                env: p.env.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+                auto_start: p.auto_start,
+                disabled: p.is_disabled(),
+                is_active: cfg.is_active(&p.name),
+                // Read per frame for the selected profile only, same as
+                // `session_token` below — a single small directory stat, not a
+                // per-profile loop.
+                has_live_session: crate::runtime::has_live_session(p.name.as_str()),
+                // OAuth accounts carry a token; API accounts carry an api key. Either
+                // one flips the Login row to "re-login" and shows the log-out row.
+                // A console account's `log in` row captures the SESSION, so that
+                // is the credential its done-state names. Its api key is a
+                // different credential on a different row and cannot stand in:
+                // a keyless account with a live session is logged in for this
+                // row's purposes, and a keyed one with no session is not.
+                logged_in: if p.console_login_target().is_some() {
+                    p.console.is_some()
+                } else if p.login_is_oauth() {
+                    p.credentials.is_some()
+                } else {
+                    p.api_key.as_deref().is_some_and(|k| !k.trim().is_empty())
+                },
+                login_is_oauth: p.login_is_oauth(),
+                has_other_login: p.credentials.is_some() || p.api_key.is_some(),
+                clear_falls_back_to_oauth: p.credentials.is_some(),
+                captured: false,
+                provider: p.provider.map(|p| p.display_name()),
+                console_login: p.console_login_target().is_some(),
+                // ONE sidecar read per frame feeds both facts. The status is
+                // derived from the same classification rather than a second
+                // parse: Misfilled ⇔ `NotLongLived` (both mean "refresh token
+                // present"), everything readable else is `LongLived` with its
+                // recorded expiry, and an absent/corrupt sidecar is `None` on
+                // both readers.
+                session_token: sidecar.as_ref().map(|(kind, oauth)| match kind {
+                    crate::claude::SidecarKind::Misfilled => {
+                        crate::claude::SessionTokenStatus::NotLongLived
+                    }
+                    _ => crate::claude::SessionTokenStatus::LongLived(oauth.expires_at),
+                }),
+                rolling_token: matches!(&sidecar, Some((crate::claude::SidecarKind::Rolling, _))),
+            }
+        }
         None => Snap::blank("settings"),
     }
 }
@@ -278,6 +289,7 @@ fn draw_settings(frame: &mut Frame<'_>, area: Rect, app: &App) {
 fn session_token_lines(
     status: &crate::claude::SessionTokenStatus,
     rolling: bool,
+    name: &str,
     now_ms: i64,
     width: usize,
 ) -> Vec<Line<'static>> {
@@ -300,16 +312,26 @@ fn session_token_lines(
                 if rolling {
                     charged(
                         "rolling token stalled".to_string(),
-                        "expired, daemon down or chain dead; clauth rolling-token <p> re-arms",
+                        &format!(
+                            "nothing re-stamped it before expiry · clauth rolling-token {name} re-arms"
+                        ),
                     )
                 } else {
                     charged("expired".to_string(), "re-mint with claude setup-token")
                 }
             } else if rolling {
                 // Hours-scale countdown, accent not warning: the daemon
-                // re-stamps well inside this window.
-                let hours = (ms - now_ms).max(0) / 3_600_000;
-                plain(format!("rolling · re-stamps in ~{hours}h"), theme::accent())
+                // re-stamps well inside this window. Counted to the RE-STAMP
+                // (expiry minus the renewal horizon), not to the expiry — the
+                // leg fires `ROLLING_RESTAMP_HORIZON_MS` ahead, so an
+                // expiry-based label read 2h high everywhere except zero.
+                let until_restamp = (ms - crate::oauth::ROLLING_RESTAMP_HORIZON_MS - now_ms).max(0);
+                let label = if until_restamp < 3_600_000 {
+                    "rolling · re-stamp due".to_string()
+                } else {
+                    format!("rolling · re-stamps in ~{}h", until_restamp / 3_600_000)
+                };
+                plain(label, theme::accent())
             } else {
                 // Truncating division: an expiry inside the next 24h reads
                 // "~0d" and still warns; only a past expiry (handled above) is
@@ -397,6 +419,7 @@ fn draw_settings_rows(
         lines.extend(session_token_lines(
             status,
             snap.rolling_token,
+            &snap.title,
             crate::usage::now_ms() as i64,
             inner.width as usize,
         ));

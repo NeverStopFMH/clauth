@@ -127,6 +127,19 @@ pub(crate) enum Cause {
     /// locked and nothing is broken. The next step is the operator's, and it is
     /// specific enough that a generic retry hint would be wrong.
     LiveSessionOnRotatingChain(String),
+    /// CLA-ROLL: another holder has the profile's rotation lock and the caller
+    /// runs on a thread that must not park behind it (the scheduler's re-stamp
+    /// leg). Genuine contention — the opposite claim from
+    /// [`Self::RotationLockUnavailable`], which is why it is not that arm: the
+    /// holder's own path usually re-stamps the sidecar itself, and the scan
+    /// retries in minutes against an hours-wide horizon either way.
+    RotationLockHeld(String),
+    /// CLA-ROLL: the usage chain's RECORDED grant cannot be told from a
+    /// setup-token mint (no scope beyond the setup pair, no plan stamp), so
+    /// stamping a rolling bearer from it is refused — the bearer could later
+    /// be preserved as "the mint". Not a filesystem problem and not retryable
+    /// in-process: only a fresh `clauth login` records the chain's real grant.
+    RollingGrantUnrecorded(String),
 }
 
 impl Cause {
@@ -140,13 +153,28 @@ impl Cause {
             }
             Self::InternalLock => "clauth hit an internal lock error, restart clauth".to_string(),
             Self::SidecarWriteFailed(profile) => {
-                format!("could not write '{profile}' session token; check permissions on ~/.clauth")
+                format!(
+                    "could not write '{profile}' session token · check permissions on ~/.clauth"
+                )
             }
             Self::LiveSessionOnRotatingChain(profile) => {
                 format!(
                     "'{profile}' has a live clauth start session holding its rotating chain \
                      (it started before the rolling token was armed); restart that session or \
                      retry once it ends"
+                )
+            }
+            Self::RotationLockHeld(profile) => {
+                format!(
+                    "an in-flight rotation holds '{profile}'; the re-stamp retries on its \
+                     next scan"
+                )
+            }
+            Self::RollingGrantUnrecorded(profile) => {
+                format!(
+                    "'{profile}' usage chain has no recorded grant beyond the setup-token \
+                     scopes, so a rolling bearer cannot be told from a mint; run \
+                     `clauth login {profile}` to record the chain's real grant"
                 )
             }
             Self::PersistFailed(profile) => {

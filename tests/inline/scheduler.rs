@@ -6532,3 +6532,143 @@ fn claude_rolling_tick_quarantined_chain_takes_the_broken_leash() {
     );
     assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
 }
+
+/// The OUTER scan gate itself: a second tick inside `ROLLING_SCAN_GAP_MS`
+/// runs no candidate scan at all — without touching `next_scan_ms`, which is
+/// how every other tick test opens the gate and why none of them could see
+/// this one. Deleting the gate ran the full scan every tick, silently.
+#[test]
+fn claude_rolling_tick_scan_gap_holds_a_second_tick_off() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let config = rolling_profile_config(&["cl-gap"], &[]);
+    write_rolling_sidecar("cl-gap", 60 * 60 * 1000); // dying, always due
+    let pacing = crate::lockorder::RankedMutex::new(super::ClaudeRollingPacing::default());
+    let now = crate::usage::now_ms();
+
+    let calls = std::sync::atomic::AtomicUsize::new(0);
+    let counting = |_: &str| {
+        calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        crate::oauth::AuthGate::Refreshed // clears any widening
+    };
+    super::claude_rolling_tick(&config, &pacing, now, &counting);
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+    // Inside the gap, gate untouched: the scan must not run. Pinned on the
+    // SCAN STAMP, not only the gate_fn count — the per-profile retry widening
+    // can absorb a deleted gate's extra scans and leave the count intact,
+    // which is exactly how the deletion stayed invisible to every earlier
+    // test in this family.
+    super::claude_rolling_tick(
+        &config,
+        &pacing,
+        now + super::ROLLING_SCAN_GAP_MS - 1,
+        &counting,
+    );
+    assert_eq!(
+        pacing.lock().unwrap().next_scan_ms,
+        now + super::ROLLING_SCAN_GAP_MS,
+        "a tick inside the gap must return before touching the scan stamp"
+    );
+    assert_eq!(
+        calls.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "a tick inside the scan gap runs no candidate scan"
+    );
+
+    // Past the gap it runs again, the gate still untouched. (The per-profile
+    // retry widening is cleared first — a stub gate never advances the
+    // sidecar, and this test pins the OUTER gate, not the widening the
+    // still-due tests already own.)
+    pacing.lock().unwrap().retry_after_ms.clear();
+    super::claude_rolling_tick(
+        &config,
+        &pacing,
+        now + super::ROLLING_SCAN_GAP_MS + 1,
+        &counting,
+    );
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+}
+
+/// Wall-clock stamps get CLAMPED against a backwards NTP step: a scan stamp
+/// or retry leash further out than its own maximum can only mean the clock
+/// moved back under it, and comparing alone would suppress the scan for the
+/// whole step while the sidecar it renews runs its clock down.
+#[test]
+fn claude_rolling_tick_survives_a_backwards_clock_step() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let config = rolling_profile_config(&["cl-ntp"], &[]);
+    write_rolling_sidecar("cl-ntp", 60 * 60 * 1000);
+    let pacing = crate::lockorder::RankedMutex::new(super::ClaudeRollingPacing::default());
+    let now = crate::usage::now_ms();
+
+    // What a backwards step leaves behind: stamps hours in the "future".
+    pacing.lock().unwrap().next_scan_ms = now + 40 * super::ROLLING_SCAN_GAP_MS;
+    pacing.lock().unwrap().retry_after_ms.insert(
+        "cl-ntp".to_string(),
+        now + 10 * super::ROLLING_BROKEN_RETRY_MS,
+    );
+
+    let calls = std::sync::atomic::AtomicUsize::new(0);
+    let counting = |_: &str| {
+        calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        crate::oauth::AuthGate::Refreshed
+    };
+    // Tick 1 clamps the scan stamp back into range (and runs nothing).
+    super::claude_rolling_tick(&config, &pacing, now, &counting);
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    // Tick 2, one gap later: the scan runs and clamps the retry leash to at
+    // most one Broken leash from NOW — the profile is still leashed here.
+    let t2 = now + super::ROLLING_SCAN_GAP_MS + 1;
+    super::claude_rolling_tick(&config, &pacing, t2, &counting);
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    // Tick 3, one clamped leash later: the profile runs. Unclamped, the
+    // ten-leash stamp would have held it for most of a day longer.
+    super::claude_rolling_tick(
+        &config,
+        &pacing,
+        t2 + super::ROLLING_BROKEN_RETRY_MS + 1,
+        &counting,
+    );
+    assert_eq!(
+        calls.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "a backwards clock step delays the scan by at most its own bounds"
+    );
+}
+
+/// A Broken verdict takes the LONG leash: without it, a profile whose chain
+/// is terminally dead re-runs the whole gate — `RotationGuard` acquisition
+/// included — every scan, forever, for a condition only a re-login changes.
+#[test]
+fn claude_rolling_tick_broken_verdict_takes_the_long_leash() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let config = rolling_profile_config(&["cl-dead"], &[]);
+    write_rolling_sidecar("cl-dead", 60 * 60 * 1000);
+    let pacing = crate::lockorder::RankedMutex::new(super::ClaudeRollingPacing::default());
+    let now = crate::usage::now_ms();
+
+    let calls = std::sync::atomic::AtomicUsize::new(0);
+    let broken = |_: &str| {
+        calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        crate::oauth::AuthGate::Broken
+    };
+    super::claude_rolling_tick(&config, &pacing, now, &broken);
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+    // Where a transient would retry, Broken must still be leashed.
+    pacing.lock().unwrap().next_scan_ms = 0;
+    super::claude_rolling_tick(&config, &pacing, now + super::ROLLING_RETRY_MS + 1, &broken);
+    assert_eq!(
+        calls.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "a dead chain is not retried on the transient cadence"
+    );
+    pacing.lock().unwrap().next_scan_ms = 0;
+    super::claude_rolling_tick(
+        &config,
+        &pacing,
+        now + super::ROLLING_BROKEN_RETRY_MS + 1,
+        &broken,
+    );
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+}

@@ -3080,3 +3080,117 @@ fn restamp_rotates_when_the_chain_is_inside_the_horizon_too() {
     );
     assert!(oauth.refresh_token.is_none());
 }
+
+/// The missing arm of the dead-chain degrade: a preserved mint whose stamped
+/// `expiresAt` has PASSED. Restoring it would install a credential that signs
+/// every session out on first use (the Incident C shape the vanilla gate's
+/// clock check guards), so the restore refuses, the backup survives as
+/// evidence, and with nothing live to serve the verdict is Broken — never
+/// Ready-on-a-dead-mint.
+#[test]
+fn rolling_gate_dead_chain_with_expired_backup_stays_broken() {
+    let _home = HomeSandbox::new();
+    let name = "test-expired-backup";
+    let config = rolling_config(name, Some("rt-dead"), Some(past_expiry()));
+    crate::profile::save_profile(&config.profiles[0]).expect("save profile");
+    let dir = profile_dir(name).expect("dir");
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    // A backup that aged out on the shelf: mint-scoped, stamped in the past.
+    let expired_mint = crate::profile::ClaudeCredentials {
+        claude_ai_oauth: Some(OAuthToken {
+            access_token: "sk-ant-oat01-aged-out".to_string(),
+            refresh_token: None,
+            expires_at: Some(past_expiry()),
+            scopes: Some(vec![
+                "user:inference".to_string(),
+                "user:sessions:claude_code".to_string(),
+            ]),
+            subscription_type: None,
+        }),
+    };
+    std::fs::write(
+        dir.join("session-token.static.json"),
+        serde_json::to_vec_pretty(&expired_mint).expect("ser"),
+    )
+    .expect("write backup");
+    // The sidecar holds the last rolling bearer, itself past its clock.
+    crate::claude::stamp_rolling_token(
+        name,
+        &OAuthToken {
+            access_token: "at-rolled-dead".to_string(),
+            refresh_token: None,
+            expires_at: Some(past_expiry()),
+            scopes: None,
+            subscription_type: Some("max".into()),
+        },
+    )
+    .expect("stamp");
+    let handle = Arc::new(RankedMutex::new(config));
+    let refresher =
+        |_rt: &str, _scopes: Option<&str>| Err(RefreshError::Invalid(TokenFailure::Status(400)));
+    assert!(
+        matches!(
+            ensure_installable(&handle, name, refresher),
+            AuthGate::Broken
+        ),
+        "an expired backup must not launder a dead chain into Ready"
+    );
+    assert!(
+        dir.join("session-token.static.json").exists(),
+        "the refused backup stays on disk instead of being consumed"
+    );
+    let oauth = sidecar_oauth(name).expect("sidecar");
+    assert_eq!(
+        oauth.access_token, "at-rolled-dead",
+        "and the expired mint never reached the sidecar"
+    );
+}
+
+/// The scheduler's re-stamp leg must never park behind a held rotation lock:
+/// it runs inline on the tick thread and `rotation.lock` has no timeout, so a
+/// `clauth start` holding the lock across its recursive copy would stall
+/// every account's poll. With the lock held, the gate answers Transient
+/// promptly (the NoWait path) instead of blocking until release.
+#[test]
+fn restamp_never_parks_behind_a_held_rotation_lock() {
+    let _home = HomeSandbox::new();
+    let name = "test-noblock";
+    let config = rolling_config(name, Some("rt-live"), Some(beyond_horizon_expiry()));
+    crate::profile::save_profile(&config.profiles[0]).expect("save profile");
+    // A rolling sidecar inside the re-stamp horizon, so the gate has work
+    // that reaches the lock.
+    crate::claude::stamp_rolling_token(
+        name,
+        &OAuthToken {
+            access_token: "at-dying".to_string(),
+            refresh_token: None,
+            expires_at: Some(future_expiry()), // +1h, inside the 2h horizon
+            scopes: Some(vec![
+                "user:inference".to_string(),
+                "user:profile".to_string(),
+            ]),
+            subscription_type: None,
+        },
+    )
+    .expect("stamp");
+    let guard = crate::runtime::RotationGuard::acquire(name).expect("hold the lock");
+    let handle = Arc::new(RankedMutex::new(config));
+    let (tx, rx) = std::sync::mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        let refresher =
+            |_rt: &str, _scopes: Option<&str>| panic!("a held lock must never reach the refresher");
+        let gate = restamp_rolling_token(&handle, "test-noblock", refresher);
+        tx.send(matches!(gate, AuthGate::Transient(_)))
+            .expect("send");
+    });
+    // Generous for a loaded runner, tiny next to the block it guards against
+    // (the lock is held for the whole wait, so a parking implementation can
+    // only fail this by timeout).
+    let verdict = rx.recv_timeout(std::time::Duration::from_secs(10));
+    drop(guard);
+    worker.join().expect("worker");
+    assert!(
+        verdict.expect("the re-stamp leg parked behind a held rotation lock"),
+        "a held lock answers Transient, never Ready and never a wait"
+    );
+}

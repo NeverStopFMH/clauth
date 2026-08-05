@@ -3194,3 +3194,53 @@ fn restamp_never_parks_behind_a_held_rotation_lock() {
         "a held lock answers Transient, never Ready and never a wait"
     );
 }
+
+/// A profile whose chain grant is UNRECORDED (no scopes, no plan stamp — the
+/// shape `stamp_rolling_token` refuses) but whose sidecar holds a live,
+/// installable mint must still switch in on that mint. The GrantUnusable
+/// verdict's first cut returned Transient unconditionally and turned this
+/// profile into a hard switch refusal — losing the live-sidecar fallback the
+/// old WriteFailed path had (verification fleet, round 3).
+#[test]
+fn rolling_gate_unrecorded_grant_still_installs_a_live_mint() {
+    let _home = HomeSandbox::new();
+    let name = "test-grant-mint";
+    // A LIVE chain with no recorded grant at all.
+    let config = rolling_config(name, Some("rt-live"), Some(beyond_horizon_expiry()));
+    let mut profile = config.profiles[0].clone();
+    if let Some(oauth) = profile
+        .credentials
+        .as_mut()
+        .and_then(|c| c.claude_ai_oauth.as_mut())
+    {
+        oauth.scopes = None;
+        oauth.subscription_type = None;
+    }
+    crate::profile::save_profile(&profile).expect("save profile");
+    let config = Arc::new(RankedMutex::new(crate::profile::AppConfig {
+        state: config.state.clone(),
+        profiles: vec![profile],
+    }));
+    // The sidecar: a genuine live mint.
+    crate::claude::write_session_token(
+        name,
+        "sk-ant-oat01-live-mint",
+        crate::usage::now_ms() as i64,
+    )
+    .expect("mint");
+    let refresher = |_rt: &str, _scopes: Option<&str>| {
+        panic!("a live chain with an unusable grant must not spend a refresh")
+    };
+    assert!(
+        matches!(
+            ensure_installable(&config, name, refresher),
+            AuthGate::Ready
+        ),
+        "the live mint installs; the unusable grant only stops the ROLL"
+    );
+    let oauth = sidecar_oauth(name).expect("sidecar");
+    assert_eq!(
+        oauth.access_token, "sk-ant-oat01-live-mint",
+        "mint untouched"
+    );
+}

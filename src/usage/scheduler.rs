@@ -3570,7 +3570,12 @@ pub(super) fn claude_rolling_tick(
             .and_then(|mut p| {
                 // Same backwards-clock clamp as the scan stamp: a retry stamp
                 // further out than the longest leash can only mean the wall
-                // clock moved back under it.
+                // clock moved back under it. Clamping to the LONGEST leash is
+                // chosen, not sloppy: the stored stamp does not say which
+                // leash minted it, so a big backwards step can stretch a
+                // 15-minute retry to at most the 6h Broken leash — bounded
+                // and rare — where clamping to the short leash would let the
+                // same step ERODE every legitimate Broken leash instead.
                 let at = p.retry_after_ms.get_mut(&name)?;
                 *at = (*at).min(now + ROLLING_BROKEN_RETRY_MS);
                 Some(*at)

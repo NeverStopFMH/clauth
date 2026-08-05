@@ -975,27 +975,45 @@ fn cmd_rolling_token(name: &str) -> Result<()> {
         );
     }
     let is_active = config.is_active(&canonical);
+    let was_rolling = profile.rolling_token;
     let handle: profile::ConfigHandle =
         std::sync::Arc::new(crate::lockorder::RankedMutex::new(config));
-    oauth::arm_rolling_token(&handle, &canonical, oauth::refresh_result)?;
-    // Re-read under the handle: the gate marks a terminally dead chain
-    // `auth_broken` on its way to degrading, and that is what separates
-    // "nothing to retry" from "the daemon will get it".
-    let chain_is_broken = handle
-        .lock()
-        .ok()
-        .is_some_and(|c| c.state.auth_broken.contains(&canonical.as_str().into()));
-    report_armed_sidecar(&canonical, chain_is_broken)?;
-    // The flag persists ONLY past the report: a bail above (dead chain, a
-    // mis-fill raced back in, an unreadable sidecar) exits non-zero with
-    // NOTHING durable — a failed command that leaves `rolling_token = true`
-    // behind arms the daemon's re-stamp machinery for a profile the operator
-    // was just told is not armed.
+    // The flag persists BEFORE the arm, then rolls back to its PRIOR value on
+    // a failed report. Persist-after looked cleaner ("nothing durable on
+    // failure") and was wrong twice over: the gate's refresh leg stamps the
+    // sidecar through the rotation hook, and that hook is FLAG-GATED — arming
+    // with the flag still false made the very refresh the arm triggered stamp
+    // nothing — and a reader walking away from `clauth rolling-token | head`
+    // exits the process at the report, which would have left an armed rolling
+    // bearer with no flag and nothing ever re-stamping it. Rollback-on-bail
+    // keeps both invariants: the arm runs with the flag it needs, and a
+    // non-zero exit leaves the flag exactly as it was found.
     if let Ok(mut cfg) = handle.lock()
         && let Some(profile) = cfg.find_mut(&canonical)
     {
         profile.rolling_token = true;
         profile::save_profile(profile)?;
+    }
+    let armed =
+        oauth::arm_rolling_token(&handle, &canonical, oauth::refresh_result).and_then(|()| {
+            // Re-read under the handle: the gate marks a terminally dead chain
+            // `auth_broken` on its way to degrading, and that is what separates
+            // "nothing to retry" from "the daemon will get it".
+            let chain_is_broken = handle
+                .lock()
+                .ok()
+                .is_some_and(|c| c.state.auth_broken.contains(&canonical.as_str().into()));
+            report_armed_sidecar(&canonical, chain_is_broken)
+        });
+    if let Err(e) = armed {
+        if !was_rolling
+            && let Ok(mut cfg) = handle.lock()
+            && let Some(profile) = cfg.find_mut(&canonical)
+        {
+            profile.rolling_token = false;
+            profile::save_profile(profile)?;
+        }
+        return Err(e);
     }
     if is_active {
         claude::force_link_profile_credentials(&canonical)?;
@@ -1038,7 +1056,7 @@ fn report_armed_sidecar(canonical: &str, chain_is_broken: bool) -> Result<()> {
             anyhow::bail!(
                 "'{canonical}' usage chain is dead, so sessions stay on the static mint and \
                  nothing would re-stamp a rolling token. Run `clauth login {canonical}` to \
-                 revive the chain, then re-run. The rolling-token flag was not set."
+                 revive the chain, then re-run. The rolling-token flag was left as it was."
             );
         }
         claude::SidecarKind::Mint => {
@@ -1063,10 +1081,17 @@ fn report_armed_sidecar(canonical: &str, chain_is_broken: bool) -> Result<()> {
             // The re-stamp promise is the DAEMON's to keep, so it is only
             // made when one is actually there to keep it.
             let restamp = match crate::daemon::daemon_health() {
+                // Best-effort probe: an error reads Absent by design, so the
+                // claim is hedged rather than absolute.
                 crate::daemon::DaemonHealth::Absent => {
-                    "No daemon is running: nothing re-stamps it until `clauth daemon` starts."
+                    "No daemon appears to be running; nothing re-stamps it until \
+                     `clauth daemon` starts."
                 }
-                _ => "The daemon re-stamps it before it expires.",
+                crate::daemon::DaemonHealth::Stale => {
+                    "A daemon is present but its feed looks stale; check \
+                     `clauth daemon --status` or re-stamps may not land."
+                }
+                crate::daemon::DaemonHealth::Fresh => "The daemon re-stamps it before it expires.",
             };
             outln!(
                 "clauth: rolling token armed for '{canonical}'. Sessions now hold the usage \
@@ -1134,8 +1159,31 @@ fn cmd_static_token(name: &str) -> Result<()> {
     let backup_exists = profile::profile_dir(&canonical)?
         .join("session-token.static.json")
         .exists();
+    // A backup that exists but did not restore is an EXPIRED backup
+    // (`restore_static_mint` refuses to install a dead mint) — every verdict
+    // below names it when present, or the operator hunts for a file that is
+    // right there.
+    let backup_note = if backup_exists {
+        " An expired preserved backup is on disk and was left in place."
+    } else {
+        ""
+    };
     match claude::sidecar_summary(&canonical) {
-        Some((claude::SidecarKind::Mint, _)) => {
+        Some((claude::SidecarKind::Mint, token)) => {
+            // The clock check the no-op verdict must make: "already on its
+            // mint" is only a success while the mint is alive — an expired
+            // one signs sessions out on the next switch, which is a failed
+            // restore whatever the file layout says.
+            if token
+                .expires_at
+                .is_some_and(|exp| crate::usage::now_ms() as i64 >= exp)
+            {
+                anyhow::bail!(
+                    "'{canonical}' is off the rolling token, but the static mint in its \
+                     sidecar has EXPIRED and there is nothing to restore over it.{backup_note} \
+                     Re-mint with `clauth login {canonical} --setup-token`."
+                )
+            }
             outln!(
                 "clauth: '{canonical}' is already on its static long-lived mint; the \
                  rolling token is off. Nothing to restore."
@@ -1143,14 +1191,6 @@ fn cmd_static_token(name: &str) -> Result<()> {
             Ok(())
         }
         Some((claude::SidecarKind::Rolling, _)) => {
-            // A backup that exists but did not restore is an EXPIRED backup
-            // (`restore_static_mint` refuses to install a dead mint) — name
-            // that, or the operator hunts for a file that is right there.
-            let backup_note = if backup_exists {
-                " The preserved backup has itself expired and was left in place."
-            } else {
-                ""
-            };
             anyhow::bail!(
                 "'{canonical}' is off the rolling token, but there is no static mint to \
                  restore.{backup_note} The last rolling bearer serves until it expires and \
@@ -1161,15 +1201,15 @@ fn cmd_static_token(name: &str) -> Result<()> {
         Some((claude::SidecarKind::Misfilled, _)) => {
             anyhow::bail!(
                 "'{canonical}' sidecar holds a rotating pair (mis-filled), so the split is \
-                 disengaged and there is no static mint to restore. Re-capture with \
-                 `clauth login {canonical} --setup-token`."
+                 disengaged and there is no live static mint to restore.{backup_note} \
+                 Re-capture with `clauth login {canonical} --setup-token`."
             )
         }
         None => {
             anyhow::bail!(
-                "'{canonical}' has no session-token sidecar and no preserved mint; sessions \
-                 run on the rotating pair. Capture a long-lived login with \
-                 `clauth login {canonical} --setup-token`."
+                "'{canonical}' has no session-token sidecar and no live preserved mint; \
+                 sessions run on the rotating pair.{backup_note} Capture a long-lived login \
+                 with `clauth login {canonical} --setup-token`."
             )
         }
     }

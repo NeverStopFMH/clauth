@@ -3175,12 +3175,76 @@ fn an_unreadable_sidecar_aborts_the_roll_instead_of_forfeiting_the_mint() {
             subscription_type: Some("max".into()),
         },
     );
+    let err =
+        err.expect_err("a roll that cannot read what it is about to overwrite must not proceed");
+    // Pinned to the READ arm's context, not just "some error": a directory at
+    // the sidecar path also fails the WRITE, so an any-error assert passed
+    // against the unfixed code (verification fleet, round 3).
     assert!(
-        err.is_err(),
-        "a roll that cannot read what it is about to overwrite must not proceed"
+        format!("{err:#}").contains("before overwriting"),
+        "the failure must come from the pre-overwrite read, not the later write: {err:#}"
     );
     assert!(
         !dir.join("session-token.static.json").exists(),
         "and no half-truth backup appears"
+    );
+}
+
+/// An expired backup does not poison the slot: the next preserve REPLACES it
+/// with the fresh mint being superseded. Left in place behind the bare
+/// `exists()` idempotence guard, the dead file blocked every future mint from
+/// preservation — re-mint, re-arm, and the fresh mint was destroyed on the
+/// next roll with only the dead backup left to restore.
+#[test]
+fn a_fresh_mint_replaces_an_expired_backup_on_the_next_roll() {
+    let _home = HomeSandbox::new();
+    let name = "expired-backup-replaced";
+    let dir = crate::profile::profile_dir(name).expect("dir");
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    let now = crate::usage::now_ms() as i64;
+    let expired = ClaudeCredentials {
+        claude_ai_oauth: Some(OAuthToken {
+            access_token: "sk-ant-oat01-dead-m1".to_string(),
+            refresh_token: None,
+            expires_at: Some(now - 86_400_000),
+            scopes: Some(vec![
+                "user:inference".to_string(),
+                "user:sessions:claude_code".to_string(),
+            ]),
+            subscription_type: None,
+        }),
+    };
+    std::fs::write(
+        dir.join("session-token.static.json"),
+        serde_json::to_vec_pretty(&expired).expect("ser"),
+    )
+    .expect("write dead backup");
+    // The fresh mint the operator just captured (flag was off, so no
+    // with-backup write happened).
+    write_session_token(name, "sk-ant-oat01-fresh-m2", now).expect("mint");
+
+    stamp_rolling_token(
+        name,
+        &OAuthToken {
+            access_token: "at-rolled".to_string(),
+            refresh_token: None,
+            expires_at: Some(now + 8 * 3_600_000),
+            scopes: Some(vec![
+                "user:inference".to_string(),
+                "user:profile".to_string(),
+            ]),
+            subscription_type: Some("max".into()),
+        },
+    )
+    .expect("roll");
+
+    let backup: ClaudeCredentials = serde_json::from_slice(
+        &std::fs::read(dir.join("session-token.static.json")).expect("read backup"),
+    )
+    .expect("parse");
+    assert_eq!(
+        backup.access_token(),
+        Some("sk-ant-oat01-fresh-m2"),
+        "the fresh mint displaces the dead backup instead of dying behind it"
     );
 }

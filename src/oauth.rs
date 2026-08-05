@@ -1849,9 +1849,22 @@ fn rolling_install_gate(
             };
         }
         // Permanent until a re-login: never fall through to the refresh leg,
-        // which would spend a rotation to arrive at the same refusal.
+        // which would spend a rotation to arrive at the same refusal. But a
+        // LIVE sidecar still installs — before this verdict existed, the same
+        // chain shape reached `stamp_rolling_token`'s bail and the WriteFailed
+        // arm's `sidecar_live` fallback served the mint; losing that turned a
+        // profile with a perfectly installable mint into a hard switch refusal
+        // (verification fleet, round 3).
         RollAttempt::GrantUnusable => {
-            return AuthGate::Transient(rolling_grant_unrecorded(name));
+            return if sidecar_live(crate::claude::session_token_status(name)) {
+                logline!(
+                    "clauth: '{name}' usage chain's recorded grant cannot mint a rolling                      bearer (re-run `clauth login {name}` to record it); installing {}",
+                    serving_desc(name)
+                );
+                AuthGate::Ready
+            } else {
+                AuthGate::Transient(rolling_grant_unrecorded(name))
+            };
         }
         RollAttempt::ChainStale => {}
     }

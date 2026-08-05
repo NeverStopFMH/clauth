@@ -301,8 +301,29 @@ fn preserve_static_mint(name: &str) -> Result<()> {
     let dir = profile_dir(name)?;
     let sidecar = dir.join("session-token.json");
     let backup = dir.join("session-token.static.json");
-    if backup.exists() {
-        return Ok(());
+    // A LIVE preserved mint stands (idempotence: the first preserved mint is
+    // the real one). A backup that is EXPIRED or unparseable is REPLACED by
+    // the mint about to be superseded: leaving a dead file in the slot
+    // permanently blocked every FUTURE mint from being preserved — re-mint,
+    // re-arm, and the fresh mint was destroyed on the next roll with only the
+    // dead backup left to restore (verification fleet, round 3). Read errors
+    // other than NotFound are loud, same rule as the sidecar read below.
+    match std::fs::read(&backup) {
+        Ok(bytes) => {
+            let now = crate::usage::now_ms() as i64;
+            let live = serde_json::from_slice::<ClaudeCredentials>(&bytes)
+                .ok()
+                .and_then(|c| c.claude_ai_oauth)
+                .is_some_and(|o| {
+                    o.expires_at
+                        .is_none_or(|exp| exp > now + BACKUP_EXPIRY_GRACE_MS)
+                });
+            if live {
+                return Ok(());
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e).context("read session-token.static.json before replacing it"),
     }
     // ONE read backs both the decision and the bytes written. Reading twice
     // let a mis-fill land in between, so a rotating pair could be validated as
@@ -476,7 +497,7 @@ fn arm_rolling_from_disk_synced(name: &str, pre_guard_done: impl FnOnce()) {
             // ~/.clauth could not be read is the failure this leg exists to
             // prevent, and it deserves a trace.
             crate::logline::logline!(
-                "clauth: start-time rolling-token arming for '{name}' skipped                  (could not load the profile: {e:#}); the session runs on                  whatever the sidecar holds"
+                "clauth: start-time rolling-token arming for '{name}' skipped (could not load the profile: {e:#}); the session runs on whatever the sidecar holds"
             );
             return;
         }
@@ -524,7 +545,7 @@ fn arm_rolling_from_disk_synced(name: &str, pre_guard_done: impl FnOnce()) {
             // operator has to hear about, because every later arming attempt
             // fails the same way.
             crate::logline::logline!(
-                "clauth: start-time rolling-token arming for '{name}' skipped                  (rotation lock: {e:#})"
+                "clauth: start-time rolling-token arming for '{name}' skipped (rotation lock: {e:#})"
             );
             return;
         }
@@ -539,7 +560,7 @@ fn arm_rolling_from_disk_synced(name: &str, pre_guard_done: impl FnOnce()) {
         Ok(fresh) => fresh,
         Err(e) => {
             crate::logline::logline!(
-                "clauth: start-time rolling-token arming for '{name}' skipped                  (post-guard profile re-read failed: {e:#})"
+                "clauth: start-time rolling-token arming for '{name}' skipped (post-guard profile re-read failed: {e:#})"
             );
             return;
         }
@@ -582,10 +603,6 @@ fn arm_rolling_from_disk_synced(name: &str, pre_guard_done: impl FnOnce()) {
     }
 }
 
-/// Restore the preserved static mint over the rolling sidecar (the rolling token switched off, or
-/// the usage chain died terminally). `Ok(true)` when a backup existed and was
-/// restored; `Ok(false)` when there was nothing to restore (the sidecar is
-/// left as-is — a last rolling token keeps serving until its real expiry).
 /// The preserved backup's bytes — IF it still holds a live mint. `Ok(None)`
 /// when there is no backup, or when the one on disk has aged past its stamped
 /// `expiresAt`: restoring an expired mint installs a credential that signs
@@ -595,6 +612,12 @@ fn arm_rolling_from_disk_synced(name: &str, pre_guard_done: impl FnOnce()) {
 /// evidence — and every restore path treats it as nothing-to-restore. Read
 /// and parse failures are loud: this file is the mint's only other copy, and
 /// "could not read it" must never be reported as "it does not exist".
+/// How much life a backup must keep to be worth restoring. Aligned with the
+/// install gate's own grace: a mint restored with seconds left passes the
+/// clock test here only to fail `sidecar_live` immediately after, consuming
+/// the backup for nothing.
+const BACKUP_EXPIRY_GRACE_MS: i64 = 60_000;
+
 fn live_backup_bytes(name: &str, backup: &Path) -> Result<Option<Vec<u8>>> {
     let bytes = match std::fs::read(backup) {
         Ok(b) => b,
@@ -607,7 +630,7 @@ fn live_backup_bytes(name: &str, backup: &Path) -> Result<Option<Vec<u8>>> {
         .claude_ai_oauth
         .as_ref()
         .and_then(|o| o.expires_at)
-        .is_some_and(|exp| exp <= crate::usage::now_ms() as i64);
+        .is_some_and(|exp| exp <= crate::usage::now_ms() as i64 + BACKUP_EXPIRY_GRACE_MS);
     if expired {
         crate::logline::logline!(
             "clauth: '{name}' preserved static mint has itself expired — not restoring it; \
@@ -618,6 +641,10 @@ fn live_backup_bytes(name: &str, backup: &Path) -> Result<Option<Vec<u8>>> {
     Ok(Some(bytes))
 }
 
+/// Restore the preserved static mint over the rolling sidecar (the rolling token switched off, or
+/// the usage chain died terminally). `Ok(true)` when a backup existed and was
+/// restored; `Ok(false)` when there was nothing to restore (the sidecar is
+/// left as-is — a last rolling token keeps serving until its real expiry).
 pub(crate) fn restore_static_mint(name: &str) -> Result<bool> {
     let dir = profile_dir(name)?;
     let backup = dir.join("session-token.static.json");

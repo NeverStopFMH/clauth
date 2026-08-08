@@ -592,7 +592,7 @@ impl Daemon {
         // deep-slot stuck RateLimited). Lower rank than config, like the stores
         // above — snapshot + release before the config lock. Projected to the 429
         // axis on purpose: `stale` is contracted as a stuck THROTTLE
-        // (`wiki/daemon.md`), so a refresh-fail streak must not leak into it.
+        // (`wiki/Daemon.md`), so a refresh-fail streak must not leak into it.
         let streaks_snap: HashMap<String, u32> = self
             .poll_streaks
             .lock()

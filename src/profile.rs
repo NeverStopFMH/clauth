@@ -397,7 +397,7 @@ pub(crate) struct AppState {
     /// two are separate.
     ///
     /// The on-disk key stays `switch_off_when_spent`: it is also a `status.json` field
-    /// (schema 1, `wiki/daemon.md`), so renaming it would break a published read
+    /// (schema 1, `wiki/Daemon.md`), so renaming it would break a published read
     /// contract and every existing profiles.toml. The Rust name says what it
     /// does; the serde name is the compatibility surface. Don't "align" them.
     #[serde(rename = "wrap_off", default)]

@@ -174,7 +174,7 @@ fn build_status_hides_disabled_by_default_and_shows_with_include_disabled() {
 
 // A disabled ACTIVE must stay visible even under the default hide, or the
 // top-level `active_profile` field names an entry `profiles[]` doesn't carry —
-// a reader following wiki/daemon.md's contract (resolve `active_profile`
+// a reader following wiki/Daemon.md's contract (resolve `active_profile`
 // against `profiles[]`) would find nothing.
 #[test]
 fn build_status_keeps_a_disabled_active_visible_so_active_profile_never_dangles() {

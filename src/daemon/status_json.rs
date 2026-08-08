@@ -1,6 +1,6 @@
 //! `~/.clauth/status.json` serializer — the daemon's published feed, and the
 //! shape `clauth status --json` prints (one code path builds both, so they
-//! cannot drift). Contract: wiki/daemon.md.
+//! cannot drift). Contract: wiki/Daemon.md.
 //!
 //! Usage windows/tier come from the on-disk `usage_cache.json` (written by the
 //! scheduler), so this is process-independent: it returns the last-persisted

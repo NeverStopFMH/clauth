@@ -302,34 +302,16 @@ pub(crate) fn rolling_projection(chain: &crate::profile::OAuthToken) -> crate::p
 }
 
 /// Copy a genuine static mint aside to `session-token.static.json` before the
-/// roll first overwrites it. Idempotent: an existing backup is never replaced
-/// (the first preserved mint is the real one — later sidecar contents are rolling
-/// values), and a sidecar that is absent or holds a rolling/mis-filled value has
-/// no mint to preserve. Callers hold the state flock.
+/// roll overwrites it. Idempotent across rolls: once preserved, later sidecar
+/// contents are rolling values and touch nothing. A live backup stands unless
+/// the sidecar holds a genuinely FRESHER mint (a later stamped expiry — the
+/// shape only an explicit re-mint produces), which replaces it; a sidecar
+/// that is absent or holds a rolling/mis-filled value has no mint to
+/// preserve. Callers hold the state flock.
 fn preserve_static_mint(name: &str) -> Result<()> {
     let dir = profile_dir(name)?;
     let sidecar = dir.join("session-token.json");
     let backup = dir.join("session-token.static.json");
-    // A LIVE preserved mint stands (idempotence: the first preserved mint is
-    // the real one). Anything else in the slot — expired, unparseable, or not
-    // a mint — is REPLACED by the mint about to be superseded: leaving a dead
-    // file in the slot permanently blocked every FUTURE mint from being
-    // preserved — re-mint, re-arm, and the fresh mint was destroyed on the
-    // next roll with only the dead backup left to restore. The verdict comes
-    // from [`classify_backup_bytes`], the SAME rule every restore path reads
-    // the file with — two hand-rolled checks let a shape one side treated as
-    // live and the other as dead fall between them. Read errors other than
-    // NotFound are loud, same rule as the sidecar read below.
-    match std::fs::read(&backup) {
-        Ok(bytes) => {
-            let now = crate::usage::now_ms() as i64;
-            if matches!(classify_backup_bytes(&bytes, now), BackupVerdict::LiveMint) {
-                return Ok(());
-            }
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => return Err(e).context("read session-token.static.json before replacing it"),
-    }
     // ONE read backs both the decision and the bytes written. Reading twice
     // let a mis-fill land in between, so a rotating pair could be validated as
     // absent and then snapshotted as "the mint".
@@ -364,6 +346,48 @@ fn preserve_static_mint(name: &str) -> Result<()> {
     // never become "the mint" either.
     if sidecar_kind_of(oauth) != SidecarKind::Mint {
         return Ok(());
+    }
+    // Whether the slot's current holder stands. A LIVE backup whose stamped
+    // expiry is AT LEAST the sidecar mint's stands (idempotence: rolls after
+    // the first change nothing); anything else is REPLACED by the mint about
+    // to be superseded. Two failure shapes taught this rule its two halves:
+    // a DEAD file left in the slot permanently blocked every future mint from
+    // being preserved (re-mint, re-arm, and the fresh mint was destroyed on
+    // the next roll with only the dead backup left to restore) — and a live
+    // but OLDER backup did the same thing one notch subtler: with the flag
+    // off, `clauth login --setup-token` writes the sidecar alone, so the
+    // fresh year-scale mint sat only there, and "an existing backup is never
+    // replaced" let the next roll destroy it while preserving the stale one.
+    // Liveness comes from [`classify_backup_bytes`], the SAME rule every
+    // restore path reads the file with; the freshness comparison treats a
+    // missing expiry stamp as unbounded. Read errors other than NotFound are
+    // loud, same rule as the sidecar read above.
+    let sidecar_exp = oauth.expires_at;
+    match std::fs::read(&backup) {
+        Ok(bytes) => {
+            let now = crate::usage::now_ms() as i64;
+            let stands = matches!(classify_backup_bytes(&bytes, now), BackupVerdict::LiveMint)
+                && serde_json::from_slice::<ClaudeCredentials>(&bytes)
+                    .ok()
+                    .and_then(|c| c.claude_ai_oauth)
+                    .is_some_and(|held| match (held.expires_at, sidecar_exp) {
+                        (None, _) => true,
+                        (Some(_), None) => false,
+                        (Some(held_exp), Some(new_exp)) => held_exp >= new_exp,
+                    });
+            if stands {
+                return Ok(());
+            }
+            // A displaced holder that never was a mint is EVIDENCE (whatever
+            // wrote it, the disposal rule matches `live_backup_bytes`); a
+            // displaced dead or stale mint is just a superseded credential
+            // and is overwritten in place.
+            if matches!(classify_backup_bytes(&bytes, now), BackupVerdict::NoMint) {
+                quarantine_file_locked(name, &backup, "session-token.static.json")?;
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e).context("read session-token.static.json before replacing it"),
     }
     atomic_write_600(&backup, raw).context("write session-token.static.json")
 }
@@ -626,7 +650,7 @@ fn arm_rolling_from_disk_synced(name: &str, pre_guard_done: impl FnOnce()) {
 /// refresh-less mint cannot answer that — a backup restored with less life
 /// than CC's own threshold lands in a client already trying to refresh it,
 /// consuming the backup only to sign the session out moments later.
-const BACKUP_EXPIRY_GRACE_MS: i64 = 5 * 60 * 1000;
+pub(crate) const BACKUP_EXPIRY_GRACE_MS: i64 = 5 * 60 * 1000;
 
 /// What preserved-backup bytes hold — THE one rule every consumer of
 /// `session-token.static.json` shares. [`preserve_static_mint`]'s
@@ -728,6 +752,16 @@ pub(crate) fn restore_static_mint(name: &str) -> Result<bool> {
         let Some(bytes) = live_backup_bytes(name, &backup)? else {
             return Ok(false);
         };
+        // A mis-filled sidecar about to be overwritten is EVIDENCE, exactly
+        // as it is on the heal and CLI pre-clear paths — this was the one
+        // repair that destroyed the rotating pair silently instead of moving
+        // it aside first.
+        if matches!(
+            session_token_status(name),
+            Some(SessionTokenStatus::NotLongLived)
+        ) {
+            quarantine_file_locked(name, &sidecar, "session-token.json")?;
+        }
         atomic_write_600(&sidecar, bytes).context("restore session-token.json")?;
         std::fs::remove_file(&backup).context("remove consumed static backup")?;
         Ok(true)

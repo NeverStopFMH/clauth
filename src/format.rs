@@ -245,7 +245,10 @@ impl Transient {
     /// a mis-filled sidecar with nothing live to heal it
     /// ([`Cause::SidecarMisfilled`]). The scheduler paces these on the same
     /// long leash as a `Broken` verdict — a minutes-scale retry against a
-    /// condition no retry can clear is pure log noise.
+    /// condition no retry can clear is pure log noise. The leash never delays
+    /// the recovery it prescribes: the re-login that clears these re-arms the
+    /// rolling token and stamps the sidecar itself, CLI-side, without waiting
+    /// for any scan (the same property the `Broken` leash already leans on).
     pub(crate) fn permanent_until_relogin(&self) -> bool {
         matches!(
             self.cause,

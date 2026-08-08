@@ -1754,9 +1754,13 @@ enum LockWait {
 /// sidecar state is decided here:
 ///
 ///   * mis-filled sidecar → healed (evidence quarantined, static mint
-///     restored) when a backup exists; without one the disengaged-vanilla
-///     posture stands (loud) — but the pair is only ever installed through
-///     the SAME plain gate a non-rolling mis-fill takes, never silently;
+///     restored) when a LIVE backup exists; a repair that raced ahead of us
+///     rejoins the normal table below. With nothing live to restore the
+///     split stays disengaged (loud), and what happens next follows `wait`:
+///     the Block paths install through the SAME plain gate a non-rolling
+///     mis-fill takes — never silently — while the NoWait leg answers
+///     Transient with the mis-fill's own cause, because the plain gate's
+///     acquire blocks and a disengaged split holds no re-stamp work anyway;
 ///   * fresh rolling token (or freshly restored mint) → install as-is, no locks;
 ///   * stale or absent → serialized under the profile's RotationGuard for the
 ///     whole read-and-restamp (a concurrent rotation's newer stamp can no

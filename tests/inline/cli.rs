@@ -1566,6 +1566,55 @@ mod static_token_verdicts {
         .expect("write sidecar");
         let err = cmd_static_token("st-deadmint").expect_err("an expired mint is not a no-op");
         assert!(format!("{err:#}").contains("EXPIRED"), "{err:#}");
+
+        // Same verdict on the same grace the restore rule uses: a mint inside
+        // Claude Code's five-minute refresh window is dead-on-arrival, and
+        // identical bytes must not read as dead in the backup slot but fine
+        // in the live one.
+        seeded_profile("st-window", false);
+        let dir = crate::profile::profile_dir("st-window").expect("dir");
+        let closing = crate::profile::ClaudeCredentials {
+            claude_ai_oauth: Some(crate::profile::OAuthToken {
+                access_token: "sk-ant-oat01-two-minutes".to_string(),
+                refresh_token: None,
+                expires_at: Some(crate::usage::now_ms() as i64 + 2 * 60 * 1000),
+                scopes: Some(vec![
+                    "user:inference".to_string(),
+                    "user:sessions:claude_code".to_string(),
+                ]),
+                subscription_type: None,
+            }),
+        };
+        std::fs::write(
+            dir.join("session-token.json"),
+            serde_json::to_vec_pretty(&closing).expect("ser"),
+        )
+        .expect("write sidecar");
+        let err = cmd_static_token("st-window")
+            .expect_err("a mint inside CC's refresh window is not a no-op either");
+        assert!(format!("{err:#}").contains("EXPIRED"), "{err:#}");
+    }
+
+    /// A restore that ERRORS (backup unreadable, not merely absent) exits
+    /// after the flag flip already persisted, so the error must own that
+    /// state the way the bail verdicts do — a raw filesystem error read as
+    /// though the command had done nothing.
+    #[test]
+    fn a_failed_restore_error_owns_the_flag_it_flipped() {
+        let _home = HomeSandbox::new();
+        seeded_profile("st-eio", true);
+        rolling_sidecar("st-eio", 8 * 3_600_000);
+        let dir = crate::profile::profile_dir("st-eio").expect("dir");
+        // A directory where the backup goes: reads fail with a non-NotFound
+        // error on every platform.
+        std::fs::create_dir(dir.join("session-token.static.json")).expect("block the backup path");
+        let err = cmd_static_token("st-eio").expect_err("an unreadable backup is loud");
+        assert!(
+            format!("{err:#}").contains("is off the rolling token now"),
+            "the error owns the flag state the command already changed: {err:#}"
+        );
+        let p = crate::profile::load_profile("st-eio").expect("reload");
+        assert!(!p.rolling_token, "the flip it owns is real");
     }
 
     /// The trap a corrupt backup used to spring: `static-token` flipped the

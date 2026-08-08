@@ -1163,7 +1163,17 @@ fn cmd_static_token(name: &str) -> Result<()> {
         profile::save_profile(profile)?;
     }
     let is_active = config.is_active(&canonical);
-    if claude::restore_static_mint(&canonical)? {
+    // The flag flip above is already durable, so a restore that ERRORS (the
+    // backup unreadable, the sidecar unwritable) must own that state the same
+    // way the bail arms below do — a raw filesystem error here read as though
+    // the command had done nothing.
+    let restored = claude::restore_static_mint(&canonical).with_context(|| {
+        format!(
+            "'{canonical}' is off the rolling token now, but its preserved mint could not \
+             be restored · fix the file problem, then re-run `clauth static-token {canonical}`"
+        )
+    })?;
+    if restored {
         outln!("clauth: '{canonical}' is back on its static long-lived mint.");
         if is_active {
             claude::force_link_profile_credentials(&canonical)?;
@@ -1179,9 +1189,11 @@ fn cmd_static_token(name: &str) -> Result<()> {
         .join("session-token.static.json")
         .exists();
     // A backup that exists but did not restore is an EXPIRED backup
-    // (`restore_static_mint` refuses to install a dead mint) — every verdict
-    // below names it when present, or the operator hunts for a file that is
-    // right there.
+    // (`restore_static_mint` refuses to install a dead mint, and quarantines
+    // away anything that is not a mint at all) — every FAILING verdict below
+    // names it when present, or the operator hunts for a file that is right
+    // there. The no-op success stays quiet: nothing about a dead backup
+    // changes what that verdict reports.
     let backup_note = if backup_exists {
         " An expired preserved backup is on disk and was left in place."
     } else {
@@ -1192,14 +1204,17 @@ fn cmd_static_token(name: &str) -> Result<()> {
             // The clock check the no-op verdict must make: "already on its
             // mint" is only a success while the mint is alive — an expired
             // one signs sessions out on the next switch, which is a failed
-            // restore whatever the file layout says.
-            if token
-                .expires_at
-                .is_some_and(|exp| crate::usage::now_ms() as i64 >= exp)
-            {
+            // restore whatever the file layout says. Alive on the SAME grace
+            // the restore rule uses (`BACKUP_EXPIRY_GRACE_MS`, Claude Code's
+            // own five-minute refresh threshold): identical bytes must not
+            // read as dead in the backup slot and fine in the live one.
+            if token.expires_at.is_some_and(|exp| {
+                crate::usage::now_ms() as i64 + claude::BACKUP_EXPIRY_GRACE_MS >= exp
+            }) {
                 anyhow::bail!(
                     "'{canonical}' is off the rolling token, but the static mint in its \
-                     sidecar has EXPIRED and there is nothing to restore over it.{backup_note} \
+                     sidecar has EXPIRED (or sits inside Claude Code's own five-minute \
+                     refresh window) and there is nothing to restore over it.{backup_note} \
                      Re-mint with `clauth login {canonical} --setup-token`."
                 )
             }

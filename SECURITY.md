@@ -19,7 +19,8 @@ auto-updater below; `cargo` installs update with `cargo install clauth`.
 ## Data at rest
 
 Per-profile state lives under `~/.clauth/`. On Unix the whole tree is owner-only: every
-clauth-owned file is `0600`, every directory `0700`. No exceptions list to drift out of date.
+clauth-owned file is `0600`, every directory `0700`. No exceptions list to drift out of
+date. The one copy that lives elsewhere is the macOS Keychain item below.
 
 | Path | Contents | Unix mode |
 |------|----------|-----------|
@@ -27,9 +28,22 @@ clauth-owned file is `0600`, every directory `0700`. No exceptions list to drift
 | `~/.clauth/profiles/<name>/session-token.json` | long-lived `claude setup-token` login, if captured (sessions run on this; no refresh token) | file `0600`, dirs `0700` |
 | `~/.clauth/profiles/<name>/config.toml` | base URL, API key (endpoint profiles), env block | `0600` |
 | `~/.clauth/profiles/<name>/usage_cache.json` | last-known utilization and plan | `0600` |
-| `~/.clauth/profiles/<name>/runtime/settings.json` | per-session Claude Code settings (an endpoint profile's API key rides here as `ANTHROPIC_AUTH_TOKEN`) | `0600` |
+| `~/.clauth/profiles/<name>/runtime-<sid>/settings.json` | one live session's Claude Code settings. An endpoint profile's key is **not** in it: the file carries an `apiKeyHelper` line naming `clauth __api-key <profile>`, which Claude Code runs per request to mint the key | `0600` |
 | `~/.clauth/jobs/<id>.json` | backgrounded `delegate` prompt + result | file `0600`, dir `0700` |
-| provider stats cache, logs, lock files (`~/.clauth/`) | third-party state, event log, advisory locks | file `0600`, dir `0700` |
+| `~/.clauth/live_sessions/<sid>.json`, `~/.clauth/live_bare/<pid>` | liveness markers for running sessions: pid, profile name, working directory, flags. No credentials | file `0600`, dir `0700` |
+| usage and price caches, session history, logs, lock files (`~/.clauth/`) | last-known usage, third-party state, burn samples, event log, advisory locks | file `0600`, dir `0700` |
+
+On macOS a second copy of the active login lives outside this tree, in the login
+Keychain, because that is where Claude Code reads it from:
+
+| Item | Contents | Written by |
+|------|----------|------------|
+| generic password `Claude Code-credentials`, account `$USER` | the OAuth pair for whichever profile is linked | `/usr/bin/security`, one item per `CLAUDE_CONFIG_DIR` |
+
+clauth writes and clears that item; it never reads it back during normal
+operation. The command line goes to `security -i` over stdin rather than argv,
+so the token never appears in the process table. Access is whatever the login
+Keychain grants, not `0600`.
 
 - Writes are atomic. The temp file gets mode `0600` at creation, not a chmod
   afterward, so a loose umask never leaves a readable window; it's fsynced, then
@@ -43,10 +57,9 @@ clauth-owned file is `0600`, every directory `0700`. No exceptions list to drift
 - A switch rewrites three files: `~/.claude/.credentials.json`, parts of
   `~/.claude/settings.json` (the `env` block, the top-level `model` key, `apiKeyHelper`),
   and `~/.claude.json`, where the stale account-identity block is dropped so Claude Code
-  re-derives identity from the new token. The rest of `~/.claude/` is left alone.
-- On macOS a switch mirrors the login into the `Claude Code-credentials` Keychain item
-  too, because Claude Code reads the Keychain before the file there. clauth writes that
-  item and never reads it back.
+  re-derives identity from the new token. The rest of `~/.claude/` is left alone. On
+  macOS it writes the Keychain item above as well, because Claude Code reads the
+  Keychain before the file there.
 
 ## Network activity
 
@@ -85,6 +98,17 @@ Background, automatic:
   identity. It's the same request Claude Code makes on startup, and it exists to arm
   the 5-hour usage window. Off by default, OAuth profiles only; enable it per profile
   on the Setup tab or with `auto_start = true`.
+- **Auto-switch.** When the fallback chain is armed, clauth relinks the global
+  credentials to another account on its own once the active one runs out of
+  headroom, from the TUI or from `clauth daemon`. It sends no inference itself.
+  The chain is empty by default, and an account outside it is never switched to.
+- **Pay-as-you-go spend.** With extra usage enabled, an auto-switch can land on
+  an account that bills real money. Three things must all be true first: the
+  chain-wide `allow extra usage` toggle is on, that account carries a `max spend`
+  ceiling above $0, and billing is enabled on the account at Anthropic. All three
+  are off or zero by default, and an account with subscription quota left always
+  wins over one that costs money. Once the ceiling is spent, clauth stops using
+  that account.
 - **Token refresh.** Anthropic refresh tokens are single-use, so refreshing spends
   the stored token for a fresh pair. By default it fires ahead of expiry, early enough
   that a running `claude` never reaches its own refresh threshold. Set the Config tab's
@@ -98,8 +122,11 @@ User-invoked, only when you run the command:
   catch the redirect, then exchanges the returned code for a fresh token pair written
   into the new profile. It reproduces Claude Code's own PKCE flow, touches no other
   account, and never opens a usage window. On macOS this is why `clauth login` works at
-  all — Claude Code's own `/login` under a custom config dir writes only a per-config-dir
+  all: Claude Code's own `/login` under a custom config dir writes only a per-config-dir
   Keychain item, never the profile's credentials file.
+- **`clauth start` / `clauth resume`.** Spawns `claude` against the profile you named,
+  so everything that session sends bills to that account. clauth forwards your args and
+  sends nothing of its own.
 
 Agent-invoked, only when the Claude Code plugin is installed:
 
@@ -147,13 +174,18 @@ thing, `cargo install clauth` does the same job.
 
 ## Process execution
 
-- `clauth start <profile> [claude args...]` runs `claude` (found on `PATH`) with
-  `CLAUDE_CONFIG_DIR` pointed at the profile's isolated runtime, forwarding your extra
-  args. Args go through an argument vector, never a shell, so there's no
-  shell-injection path.
-- On Linux, opening a status-incident link runs `xdg-open <url>` with null stdio. The
-  URL comes from the Statuspage feed and is passed as a single argument.
-- clauth runs no other external commands.
+Every command below goes through an argument vector, never a shell, so there is
+no shell-injection path.
+
+| Command | When |
+|---------|------|
+| `claude` (from `PATH`) | `clauth start`, `clauth resume`, and the MCP `delegate` tool, with `CLAUDE_CONFIG_DIR` pointed at that session's runtime and your extra args forwarded |
+| `clauth mcp`, `claude --version` | Plugin-tab checks: a JSON-RPC handshake against clauth's own server, and Claude Code's version |
+| `/usr/bin/security` | macOS only: writing and clearing the Keychain item above |
+| `xdg-open` (Linux), `open` (macOS), `rundll32` (Windows) | opening a URL: the browser login page, or a status incident from the Status tab. The URL is passed as one argument |
+| `kill` / `taskkill`, plus `ps` on macOS and `tasklist` on Windows | `clauth daemon --replace` only: the pid is checked against a running clauth daemon before it is signalled (Linux reads `/proc/<pid>/cmdline` instead of shelling out) |
+
+clauth runs no other external commands.
 
 ## First-run shell completions
 
@@ -179,5 +211,8 @@ only); fish gets its own completions dir. The answer is saved to
 |--------|--------|
 | `CLAUTH_NO_UPDATE=1` | disables all background update checks and self-replacement |
 | `CLAUTH_NO_COMPLETIONS=1` | skips the first-run completion-install prompt |
+| an empty `fallback_chain` (the default) | clauth never switches accounts on its own |
+| `allow extra usage` off (the default) | no auto-switch can reach an account that bills money |
+| `auto_start = false` (the default) | clauth sends no inference of its own |
 | `install.sh --nocargo` | forces a verified binary download instead of `cargo install` |
 | `cargo install` | never self-replaces; update with `cargo install clauth` |

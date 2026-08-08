@@ -515,6 +515,12 @@ fn cmd_login(args: LoginArgs) -> Result<()> {
 /// or logged. Additive: nothing else about the profile moves, and the sidecar
 /// takes effect on the next switch — this deliberately does not touch the
 /// live slot, so capturing can never sign a running session out.
+///
+/// It deliberately seeds no identity anchor either: the capture is an offline
+/// paste (no network call), a setup token is the session bearer rather than an
+/// OAuth pair, and `try_adopt_live_rotation` short-circuits for a session-token
+/// profile, so there is nothing for the anchor to guard. A later
+/// `clauth login <name>` that adds an OAuth pair seeds it then.
 fn cmd_login_setup_token(
     config: &mut profile::AppConfig,
     target: &str,

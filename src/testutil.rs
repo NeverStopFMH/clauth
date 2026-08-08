@@ -304,6 +304,7 @@ impl<'a> EndpointSandbox<'a> {
         );
         crate::usage::reset_request_slots();
         crate::usage::reset_identity_memo();
+        crate::oauth::reset_stored_probe_suppression();
         Self(std::marker::PhantomData)
     }
 }
@@ -314,6 +315,7 @@ impl Drop for EndpointSandbox<'_> {
         crate::usage::clear_usage_endpoint_override();
         crate::usage::reset_request_slots();
         crate::usage::reset_identity_memo();
+        crate::oauth::reset_stored_probe_suppression();
     }
 }
 

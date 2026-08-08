@@ -904,8 +904,11 @@ mod adopt_live_rotation {
 
     /// Active profile persisted to disk (classify reads the file layer) with a
     /// stored pair ("at-old"), plus a DIVERGED live regular file holding the
-    /// mirror pair ("at-mirror").
+    /// mirror pair ("at-mirror"). Resets the stored-token probe suppression:
+    /// every test shares the "at-old" token, so a suppression recorded by one
+    /// would bleed into the next.
     fn setup(name: &str, stored_expiry: i64, mirror_expiry: i64) -> crate::profile::ConfigHandle {
+        crate::oauth::reset_stored_probe_suppression();
         let mut p = crate::profile::Profile::new(name.to_string(), None, None);
         p.credentials = Some(creds_with("at-old", Some(stored_expiry)));
         crate::profile::save_profile(&p).expect("save profile");
@@ -1011,6 +1014,90 @@ mod adopt_live_rotation {
         });
         assert!(adopted.is_some());
         assert_eq!(stored_access(&handle, name), "at-mirror");
+    }
+
+    /// A stored token that is CLOCK-valid but revoked upstream (its probe
+    /// returns `None`) with no cached anchor is the per-leg waste the
+    /// suppression exists for. The first leg probes and suppresses; a second
+    /// leg must not re-spend a `/profile` on the same dead stored token.
+    #[test]
+    fn a_dead_stored_token_probe_is_suppressed_for_one_window() {
+        let _home = HomeSandbox::new();
+        let name = "adopt-dead-stored";
+        // Stored token clock-valid (so the probe arm runs), mirror strictly
+        // fresher (so the gate reaches the identity block).
+        let handle = setup(name, future_expiry(), future_expiry() + 3_600_000);
+        let stored_calls = std::cell::Cell::new(0usize);
+        let mirror_calls = std::cell::Cell::new(0usize);
+        let identity = |tok: &str| {
+            if tok == "at-old" {
+                stored_calls.set(stored_calls.get() + 1);
+                None
+            } else {
+                mirror_calls.set(mirror_calls.get() + 1);
+                Some("uuid-1".into())
+            }
+        };
+
+        let first = try_adopt_live_rotation(&handle, name, &guard(name), &identity);
+        assert_eq!(first, None, "identity unprovable → refuse");
+        assert_eq!(
+            stored_calls.get(),
+            1,
+            "the first leg probes the stored token"
+        );
+        assert_eq!(
+            mirror_calls.get(),
+            0,
+            "a missing expected identity short-circuits before the mirror is probed"
+        );
+
+        let second = try_adopt_live_rotation(&handle, name, &guard(name), &identity);
+        assert_eq!(second, None);
+        assert_eq!(
+            stored_calls.get(),
+            1,
+            "a second leg must not re-spend a /profile on the same dead stored token"
+        );
+    }
+
+    /// The suppression is a TTL, never a permanent `None`. Once the window
+    /// lapses, the stored token is probed again, so a transient failure stays
+    /// retryable.
+    #[test]
+    fn a_suppressed_stored_probe_retries_after_the_ttl_lapses() {
+        let _home = HomeSandbox::new();
+        let name = "adopt-ttl-lapse";
+        let handle = setup(name, future_expiry(), future_expiry() + 3_600_000);
+        let stored_calls = std::cell::Cell::new(0usize);
+        let identity = |tok: &str| {
+            if tok == "at-old" {
+                stored_calls.set(stored_calls.get() + 1);
+                None
+            } else {
+                Some("uuid-1".into())
+            }
+        };
+
+        assert_eq!(
+            try_adopt_live_rotation(&handle, name, &guard(name), &identity),
+            None
+        );
+        assert_eq!(stored_calls.get(), 1, "first leg probes and suppresses");
+
+        set_stored_probe_not_before_for_test(
+            &crate::usage::identity_key("at-old"),
+            crate::usage::now_ms() - 1,
+        );
+        assert_eq!(
+            try_adopt_live_rotation(&handle, name, &guard(name), &identity),
+            None
+        );
+        assert_eq!(
+            stored_calls.get(),
+            2,
+            "after the TTL lapses the stored token is probed again"
+        );
     }
 
     #[test]

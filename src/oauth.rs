@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
@@ -6,6 +7,7 @@ use serde::Deserialize;
 
 use crate::claude::{LinkState, classify_credentials_link};
 use crate::lock::with_state_lock;
+use crate::lockorder::{RankedMutex, rank};
 use crate::logline::logline;
 use crate::profile::{
     AccountId, AppConfig, OAuthToken, clear_staged_credentials, save_profile,
@@ -1234,6 +1236,66 @@ pub(crate) fn apply_rotated_tokens_locked(
 /// the same [`crate::runtime::RotationGuard`], not just the state flock.
 /// Taken by reference because the flock is not reentrant — the refresh-failure
 /// call site already holds the guard when it retries the adopt.
+///
+/// The stored-token identity probe below is gated by a bounded negative cache.
+/// The STORED token is static: once it fails to prove identity (revoked
+/// upstream while still clock-valid), it will fail every leg, and re-probing
+/// it each time spends a `/profile` against an account already in trouble. So
+/// a failed stored-token probe is suppressed for a window. The suppression is
+/// a TTL, never a permanent `None` (a transient failure becomes retryable once
+/// it lapses), and it never applies to the LIVE mirror token — whose probe the
+/// fresh-pair adopt depends on re-running within a leg.
+const STORED_PROBE_SUPPRESS_TTL_MS: u64 = 15 * 60 * 1000;
+
+/// Per-stored-token-hash → the earliest epoch-ms a `/profile` identity probe
+/// may run again. Consulted only by [`try_adopt_live_rotation`]'s stored-token
+/// arm; the live-mirror probe and the `Some`-only identity memo are untouched.
+/// Keyed by the same SHA-256 [`crate::usage::identity_key`] the memo uses, so a
+/// replaced stored token (a fresh hash after a successful refresh) is never
+/// suppressed. Same leaf rank as the memo: the two maps are never held together.
+static STORED_PROBE_SUPPRESSED: LazyLock<RankedMutex<HashMap<[u8; 32], u64>, rank::IdentityMemo>> =
+    LazyLock::new(|| RankedMutex::new(HashMap::new()));
+
+/// Whether the stored token may be identity-probed again, spending a `/profile`.
+fn stored_probe_due(key: &[u8; 32]) -> bool {
+    let now = now_ms();
+    let Ok(suppressed) = STORED_PROBE_SUPPRESSED.lock() else {
+        // A poisoned lock probes rather than silently refuses a legit adopt.
+        return true;
+    };
+    !suppressed
+        .get(key)
+        .is_some_and(|not_before| now < *not_before)
+}
+
+fn suppress_stored_probe(key: &[u8; 32]) {
+    if let Ok(mut suppressed) = STORED_PROBE_SUPPRESSED.lock() {
+        suppressed.insert(*key, now_ms() + STORED_PROBE_SUPPRESS_TTL_MS);
+    }
+}
+
+/// A stored token whose probe just succeeded has its positive answer memoized,
+/// so the suppression entry is dead weight.
+fn clear_stored_probe_suppression(key: &[u8; 32]) {
+    if let Ok(mut suppressed) = STORED_PROBE_SUPPRESSED.lock() {
+        suppressed.remove(key);
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn reset_stored_probe_suppression() {
+    if let Ok(mut suppressed) = STORED_PROBE_SUPPRESSED.lock() {
+        suppressed.clear();
+    }
+}
+
+#[cfg(test)]
+fn set_stored_probe_not_before_for_test(key: &[u8; 32], not_before: u64) {
+    if let Ok(mut suppressed) = STORED_PROBE_SUPPRESSED.lock() {
+        suppressed.insert(*key, not_before);
+    }
+}
+
 pub(crate) fn try_adopt_live_rotation(
     config: &crate::profile::ConfigHandle,
     name: &str,
@@ -1291,7 +1353,19 @@ pub(crate) fn try_adopt_live_rotation(
         .or_else(|| {
             let alive = (now_ms() as i64) < stored_expires;
             match (&stored_access, alive) {
-                (Some(tok), true) => identity(tok),
+                (Some(tok), true) => {
+                    let key = crate::usage::identity_key(tok);
+                    if !stored_probe_due(&key) {
+                        return None;
+                    }
+                    let r = identity(tok);
+                    if r.is_some() {
+                        clear_stored_probe_suppression(&key);
+                    } else {
+                        suppress_stored_probe(&key);
+                    }
+                    r
+                }
                 _ => None,
             }
         });

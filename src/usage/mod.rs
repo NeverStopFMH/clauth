@@ -40,6 +40,9 @@ pub(crate) use fetch::{reserved_request_slot, reset_request_slots};
 // outlives a test. Cleared with the endpoint overrides that make it reachable.
 #[cfg(test)]
 pub(crate) use scheduler::reset_identity_memo;
+// The stored-token probe suppression in `oauth.rs` and its tests share the memo's
+// token-hash key derivation.
+pub(crate) use scheduler::identity_key;
 // Test-only: point `/usage` at a loopback listener so `fetch_with_rotation`'s
 // 401-then-rotate leg — and the refusal inside it — can run offline.
 #[cfg(test)]

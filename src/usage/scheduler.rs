@@ -509,7 +509,10 @@ static IDENTITY_MEMO: std::sync::LazyLock<
     RankedMutex<HashMap<[u8; 32], crate::profile::AccountId>, rank::IdentityMemo>,
 > = std::sync::LazyLock::new(|| RankedMutex::new(HashMap::new()));
 
-fn identity_key(access_token: &str) -> [u8; 32] {
+/// SHA-256 of an access token, the shared key for both the positive memo and
+/// the stored-token probe suppression in `oauth.rs`. The digest (never the
+/// bytes) is what the maps retain.
+pub(crate) fn identity_key(access_token: &str) -> [u8; 32] {
     use sha2::{Digest as _, Sha256};
     Sha256::digest(access_token.as_bytes()).into()
 }

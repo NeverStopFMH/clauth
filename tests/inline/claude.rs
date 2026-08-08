@@ -2430,7 +2430,7 @@ fn write_session_token_with_backup_stamps_both_from_the_same_mint() {
 
 /// A feed profile's mis-filled sidecar heals when a backup exists: evidence
 /// lands in quarantine, the mint comes back, the backup is consumed. Without
-/// a backup nothing is touched (`Ok(false)` — the disengaged-vanilla posture).
+/// a backup nothing is touched (`NoLiveBackup` — the disengaged posture).
 #[test]
 fn heal_misfilled_sidecar_quarantines_and_restores_the_mint() {
     let _home = HomeSandbox::new();
@@ -2457,7 +2457,10 @@ fn heal_misfilled_sidecar_quarantines_and_restores_the_mint() {
         serde_json::to_vec(&creds("at-misfill", Some("rt-misfill"))).expect("ser"),
     )
     .expect("misfill");
-    assert!(heal_misfilled_sidecar(name).expect("heal"));
+    assert_eq!(
+        heal_misfilled_sidecar(name).expect("heal"),
+        HealOutcome::Healed
+    );
     assert_eq!(
         std::fs::read(dir.join("session-token.json")).expect("sidecar"),
         mint_bytes,
@@ -2486,13 +2489,24 @@ fn heal_misfilled_sidecar_quarantines_and_restores_the_mint() {
         serde_json::to_vec(&creds("at-misfill-2", Some("rt-misfill-2"))).expect("ser"),
     )
     .expect("misfill 2");
-    assert!(!heal_misfilled_sidecar(name).expect("no-backup heal"));
+    assert_eq!(
+        heal_misfilled_sidecar(name).expect("no-backup heal"),
+        HealOutcome::NoLiveBackup
+    );
     assert!(
         matches!(
             session_token_status(name),
             Some(SessionTokenStatus::NotLongLived)
         ),
         "mis-fill left in place without a backup"
+    );
+    // And a sidecar that is not mis-filled at all reports itself as exactly
+    // that — the state the install gate lets fall through to the normal
+    // rolling table, never the vanilla path.
+    write_session_token(name, "sk-ant-oat01-genuine-mint-value-1234567890", now).expect("re-mint");
+    assert_eq!(
+        heal_misfilled_sidecar(name).expect("healthy heal"),
+        HealOutcome::NotMisfilled
     );
 }
 
@@ -3071,6 +3085,81 @@ fn a_rotating_pair_classifies_misfilled_never_rolling() {
     );
 }
 
+/// The backup slot's one shared rule ([`classify_backup_bytes`]): bytes that
+/// are not a genuine mint never restore, from ANY consumer. The shape that
+/// motivated it — a parseable file with no `claudeAiOauth` block — used to
+/// split the pair: `preserve_static_mint` read it as dead (replace) while the
+/// restore path read it as live, installed it, `has_session_token` went
+/// false, and sessions got the rotating pair. Not-a-mint content is
+/// quarantined (evidence, same as a mis-filled sidecar) and the slot cleared,
+/// so it also cannot trap `clauth static-token` in a loop its own recovery
+/// advice cannot exit.
+#[test]
+fn a_backup_that_is_not_a_mint_is_quarantined_never_restored() {
+    let _home = HomeSandbox::new();
+    let name = "nonmint-backup";
+    let dir = crate::profile::profile_dir(name).expect("dir");
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    let now = crate::usage::now_ms() as i64;
+    // A live rolling bearer in the sidecar — what a bad restore would destroy.
+    stamp_rolling_token(
+        name,
+        &OAuthToken {
+            access_token: "at-alive".to_string(),
+            refresh_token: None,
+            expires_at: Some(now + 8 * 3_600_000),
+            scopes: None,
+            subscription_type: Some("max".into()),
+        },
+    )
+    .expect("stamp");
+    for (label, bytes) in [
+        (
+            "blockless",
+            serde_json::to_vec(&ClaudeCredentials {
+                claude_ai_oauth: None,
+            })
+            .expect("ser"),
+        ),
+        (
+            "rotating pair",
+            serde_json::to_vec(&creds("at-pair", Some("rt-pair"))).expect("ser"),
+        ),
+    ] {
+        std::fs::write(dir.join("session-token.static.json"), &bytes).expect("write backup");
+        assert!(
+            !restore_static_mint(name).expect("restore verdict"),
+            "a {label} backup restores nothing"
+        );
+        assert!(
+            !dir.join("session-token.static.json").exists(),
+            "the {label} slot-holder is quarantined away, not left in place"
+        );
+        let sidecar: ClaudeCredentials =
+            serde_json::from_slice(&std::fs::read(dir.join("session-token.json")).expect("read"))
+                .expect("parse");
+        assert_eq!(
+            sidecar.access_token(),
+            Some("at-alive"),
+            "the live bearer is untouched by a refused {label} restore"
+        );
+    }
+    let quarantined = std::fs::read_dir(dir.join("quarantine"))
+        .expect("quarantine dir")
+        .filter(|e| {
+            e.as_ref().is_ok_and(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .ends_with(".session-token.static.json")
+            })
+        })
+        .count();
+    assert_eq!(
+        quarantined, 2,
+        "both refused slot-holders survive as evidence"
+    );
+}
+
 /// An EXPIRED backup is refused by every restore path and left on disk:
 /// installing it would sign sessions out on first use, and consuming it would
 /// also destroy whatever life the current sidecar has left.
@@ -3141,7 +3230,10 @@ fn an_expired_backup_is_never_restored() {
         serde_json::to_vec(&creds("at-misfill", Some("rt-misfill"))).expect("ser"),
     )
     .expect("misfill");
-    assert!(!heal_misfilled_sidecar(name).expect("heal"));
+    assert_eq!(
+        heal_misfilled_sidecar(name).expect("heal"),
+        HealOutcome::NoLiveBackup
+    );
     assert!(
         matches!(
             session_token_status(name),

@@ -1351,8 +1351,12 @@ mod static_token_verdicts {
         let err = cmd_static_token("st-roll")
             .expect_err("a bearer left with nothing re-stamping it is a failed restore");
         assert!(
-            format!("{err:#}").contains("no static mint to restore"),
+            format!("{err:#}").contains("no live static mint to restore"),
             "{err:#}"
+        );
+        assert!(
+            format!("{err:#}").contains("this command is what stopped its re-stamping"),
+            "the copy owns the state the flag flip created, not just describes it: {err:#}"
         );
         // The flag flip IS durable on this path — stopping the re-stamps is
         // what the operator asked for; the missing mint is the error.
@@ -1442,5 +1446,172 @@ mod static_token_verdicts {
         );
         let p = crate::profile::load_profile("rt-dead").expect("reload");
         assert!(!p.rolling_token, "nothing durable from a failed arm");
+    }
+
+    /// A mint chain shape for the arm tests: a real access token whose grant
+    /// was never recorded (setup scopes only, no plan stamp) — the shape
+    /// `roll_from_stored_chain` refuses pre-stamp, so the arm fails AFTER the
+    /// flag persist without touching the network.
+    fn unrecorded_chain_profile(name: &str, rolling_flag: bool) {
+        let mut profile = crate::profile::Profile::new(name.to_string(), None, None);
+        profile.rolling_token = rolling_flag;
+        profile.credentials = Some(crate::profile::ClaudeCredentials {
+            claude_ai_oauth: Some(crate::profile::OAuthToken {
+                access_token: "at-unrecorded".to_string(),
+                refresh_token: Some("rt-unrecorded".to_string()),
+                expires_at: Some(crate::usage::now_ms() as i64 + 8 * 3_600_000),
+                scopes: Some(vec![
+                    "user:inference".to_string(),
+                    "user:sessions:claude_code".to_string(),
+                ]),
+                subscription_type: None,
+            }),
+        });
+        crate::profile::save_profile(&profile).expect("save profile");
+        let state = crate::profile::AppState {
+            profiles: vec![profile.name.clone()],
+            ..Default::default()
+        };
+        crate::profile::save_app_state(&state).expect("save state");
+    }
+
+    /// The persist-before-arm shape's other half: a failed arm rolls the flag
+    /// back to the value it FOUND — off stays off, and a flag that was
+    /// already on is not stolen by the rollback. Reaches past the up-front
+    /// pre-checks (the dead-chain test pins those) to the persist + rollback
+    /// pair itself.
+    #[test]
+    fn a_failed_arm_rolls_the_flag_back_to_what_it_found() {
+        let _home = HomeSandbox::new();
+        unrecorded_chain_profile("rt-back", false);
+        let err = cmd_rolling_token("rt-back").expect_err("an unrecorded grant refuses the arm");
+        assert!(format!("{err:#}").contains("no recorded grant"), "{err:#}");
+        let p = crate::profile::load_profile("rt-back").expect("reload");
+        assert!(
+            !p.rolling_token,
+            "the flag persisted for the arm is rolled back when the arm fails"
+        );
+
+        unrecorded_chain_profile("rt-keep", true);
+        cmd_rolling_token("rt-keep").expect_err("same refusal");
+        let p = crate::profile::load_profile("rt-keep").expect("reload");
+        assert!(
+            p.rolling_token,
+            "a flag that was already on is left on — rollback restores the PRIOR value, \
+             never a hardcoded one"
+        );
+    }
+
+    /// The read-back report refuses to claim success it cannot verify: no
+    /// readable sidecar is an error, and a sidecar re-filled with a rotating
+    /// pair mid-arm is an error — neither may decay into an `Ok(())` print.
+    #[test]
+    fn the_arming_report_fails_on_what_it_cannot_verify() {
+        let _home = HomeSandbox::new();
+        seeded_profile("rt-report", true);
+        let err = report_armed_sidecar("rt-report", false)
+            .expect_err("no readable sidecar must not report armed");
+        assert!(
+            format!("{err:#}").contains("no readable sidecar"),
+            "{err:#}"
+        );
+
+        let dir = crate::profile::profile_dir("rt-report").expect("dir");
+        let pair = crate::profile::ClaudeCredentials {
+            claude_ai_oauth: Some(crate::profile::OAuthToken {
+                access_token: "at-raced".to_string(),
+                refresh_token: Some("rt-raced".to_string()),
+                expires_at: Some(crate::usage::now_ms() as i64 + 3_600_000),
+                scopes: None,
+                subscription_type: None,
+            }),
+        };
+        std::fs::write(
+            dir.join("session-token.json"),
+            serde_json::to_vec_pretty(&pair).expect("ser"),
+        )
+        .expect("write misfill");
+        let err = report_armed_sidecar("rt-report", false)
+            .expect_err("a raced-in rotating pair must not report armed");
+        assert!(
+            format!("{err:#}").contains("rotating pair while arming"),
+            "{err:#}"
+        );
+    }
+
+    /// "Already on its mint" is only a no-op success while the mint is ALIVE:
+    /// an expired one signs sessions out on the next switch, which is a
+    /// failed restore whatever the file layout says.
+    #[test]
+    fn an_expired_mint_in_the_sidecar_is_a_failed_restore() {
+        let _home = HomeSandbox::new();
+        seeded_profile("st-deadmint", false);
+        let dir = crate::profile::profile_dir("st-deadmint").expect("dir");
+        let dead = crate::profile::ClaudeCredentials {
+            claude_ai_oauth: Some(crate::profile::OAuthToken {
+                access_token: "sk-ant-oat01-clock-dead".to_string(),
+                refresh_token: None,
+                expires_at: Some(crate::usage::now_ms() as i64 - 1_000),
+                scopes: Some(vec![
+                    "user:inference".to_string(),
+                    "user:sessions:claude_code".to_string(),
+                ]),
+                subscription_type: None,
+            }),
+        };
+        std::fs::write(
+            dir.join("session-token.json"),
+            serde_json::to_vec_pretty(&dead).expect("ser"),
+        )
+        .expect("write sidecar");
+        let err = cmd_static_token("st-deadmint").expect_err("an expired mint is not a no-op");
+        assert!(format!("{err:#}").contains("EXPIRED"), "{err:#}");
+    }
+
+    /// The trap a corrupt backup used to spring: `static-token` flipped the
+    /// flag off, errored on the unparseable file, and the re-mint it
+    /// prescribed ran with the flag off — the no-backup write path — so the
+    /// file survived to fail the next attempt identically. The way out was
+    /// `rolling-token`, re-arming the mode being left. Now the corrupt slot
+    /// is quarantined (evidence kept under the profile) and the prescribed
+    /// recovery actually recovers.
+    #[test]
+    fn a_corrupt_backup_is_quarantined_and_the_recovery_path_stays_open() {
+        let _home = HomeSandbox::new();
+        seeded_profile("st-corrupt", true);
+        rolling_sidecar("st-corrupt", 8 * 3_600_000);
+        let dir = crate::profile::profile_dir("st-corrupt").expect("dir");
+        std::fs::write(dir.join("session-token.static.json"), b"not json at all")
+            .expect("corrupt backup");
+
+        let err = cmd_static_token("st-corrupt").expect_err("nothing restorable yet");
+        assert!(
+            format!("{err:#}").contains("no live static mint to restore"),
+            "{err:#}"
+        );
+        assert!(
+            !dir.join("session-token.static.json").exists(),
+            "the corrupt slot-holder is cleared, not left to fail the next attempt"
+        );
+        let quarantined = std::fs::read_dir(dir.join("quarantine"))
+            .expect("quarantine dir")
+            .filter_map(|e| e.ok())
+            .any(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .ends_with(".session-token.static.json")
+            });
+        assert!(quarantined, "the bytes survive as evidence");
+
+        // The prescribed recovery: re-mint (the flag is off, so this is the
+        // plain no-backup write — exactly what `clauth login --setup-token`
+        // runs), then the command reports the mint as already in front.
+        crate::claude::write_session_token(
+            "st-corrupt",
+            "sk-ant-oat01-fresh-recovery-mint",
+            crate::usage::now_ms() as i64,
+        )
+        .expect("re-mint");
+        cmd_static_token("st-corrupt").expect("the recovery path converges instead of looping");
     }
 }

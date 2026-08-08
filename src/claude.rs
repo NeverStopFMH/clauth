@@ -260,13 +260,7 @@ pub(crate) fn write_session_token(name: &str, token: &str, now_ms: i64) -> Resul
 /// switching back to the static token — or a terminally dead chain — can restore Sonnet-cap
 /// service instead of signing sessions out.
 pub(crate) fn stamp_rolling_token(name: &str, chain: &crate::profile::OAuthToken) -> Result<()> {
-    let rolled = crate::profile::OAuthToken {
-        access_token: chain.access_token.clone(),
-        refresh_token: None,
-        expires_at: chain.expires_at,
-        scopes: chain.scopes.clone(),
-        subscription_type: chain.subscription_type.clone(),
-    };
+    let rolled = rolling_projection(chain);
     // [`sidecar_kind_of`]'s totality is enforced HERE, at the only writer of
     // rolling content: a chain whose recorded grant would classify as a mint
     // (no plan stamp AND nothing beyond the setup scope pair) cannot produce a
@@ -276,7 +270,7 @@ pub(crate) fn stamp_rolling_token(name: &str, chain: &crate::profile::OAuthToken
     if sidecar_kind_of(&rolled) == SidecarKind::Mint {
         anyhow::bail!(
             "'{name}' usage chain's recorded grant is indistinguishable from a setup-token \
-             mint (no scope beyond the setup pair, no subscription type); refusing to stamp \
+             mint (no scope beyond the setup pair, no subscription type) · refusing to stamp \
              a rolling bearer that could later be preserved as the static mint. Re-run \
              `clauth login {name}` to record the chain's real grant"
         );
@@ -292,6 +286,21 @@ pub(crate) fn stamp_rolling_token(name: &str, chain: &crate::profile::OAuthToken
     })
 }
 
+/// The refresh-less projection of a usage chain — the EXACT content a rolling
+/// stamp writes: the chain's bearer, scopes, and plan stamp with the refresh
+/// token dropped. One constructor, so the pre-stamp classification
+/// (`roll_from_stored_chain`'s `GrantUnusable` verdict) and the stamp itself
+/// can never drift apart on what "rolled" means.
+pub(crate) fn rolling_projection(chain: &crate::profile::OAuthToken) -> crate::profile::OAuthToken {
+    crate::profile::OAuthToken {
+        access_token: chain.access_token.clone(),
+        refresh_token: None,
+        expires_at: chain.expires_at,
+        scopes: chain.scopes.clone(),
+        subscription_type: chain.subscription_type.clone(),
+    }
+}
+
 /// Copy a genuine static mint aside to `session-token.static.json` before the
 /// roll first overwrites it. Idempotent: an existing backup is never replaced
 /// (the first preserved mint is the real one — later sidecar contents are rolling
@@ -302,23 +311,19 @@ fn preserve_static_mint(name: &str) -> Result<()> {
     let sidecar = dir.join("session-token.json");
     let backup = dir.join("session-token.static.json");
     // A LIVE preserved mint stands (idempotence: the first preserved mint is
-    // the real one). A backup that is EXPIRED or unparseable is REPLACED by
-    // the mint about to be superseded: leaving a dead file in the slot
-    // permanently blocked every FUTURE mint from being preserved — re-mint,
-    // re-arm, and the fresh mint was destroyed on the next roll with only the
-    // dead backup left to restore (verification fleet, round 3). Read errors
-    // other than NotFound are loud, same rule as the sidecar read below.
+    // the real one). Anything else in the slot — expired, unparseable, or not
+    // a mint — is REPLACED by the mint about to be superseded: leaving a dead
+    // file in the slot permanently blocked every FUTURE mint from being
+    // preserved — re-mint, re-arm, and the fresh mint was destroyed on the
+    // next roll with only the dead backup left to restore. The verdict comes
+    // from [`classify_backup_bytes`], the SAME rule every restore path reads
+    // the file with — two hand-rolled checks let a shape one side treated as
+    // live and the other as dead fall between them. Read errors other than
+    // NotFound are loud, same rule as the sidecar read below.
     match std::fs::read(&backup) {
         Ok(bytes) => {
             let now = crate::usage::now_ms() as i64;
-            let live = serde_json::from_slice::<ClaudeCredentials>(&bytes)
-                .ok()
-                .and_then(|c| c.claude_ai_oauth)
-                .is_some_and(|o| {
-                    o.expires_at
-                        .is_none_or(|exp| exp > now + BACKUP_EXPIRY_GRACE_MS)
-                });
-            if live {
+            if matches!(classify_backup_bytes(&bytes, now), BackupVerdict::LiveMint) {
                 return Ok(());
             }
         }
@@ -392,13 +397,29 @@ pub(crate) fn write_session_token_with_backup(name: &str, token: &str, now_ms: i
     Ok(expires_at)
 }
 
-/// CLA-ROLL: heal a mis-filled sidecar on a rolling-token profile — quarantine the
-/// evidence (`~/.clauth/quarantine/…-<name>.session-token.json`), restore the
-/// preserved static mint over it. `Ok(true)` = healed; `Ok(false)` = no
-/// backup to restore (the caller keeps the disengaged-vanilla posture) OR the
-/// sidecar is not actually mis-filled (re-checked under the lock — a
-/// concurrent repair may have beaten us).
-pub(crate) fn heal_misfilled_sidecar(name: &str) -> Result<bool> {
+/// What [`heal_misfilled_sidecar`] found — distinguished because the caller
+/// acts differently on each, and one `false` folding them made the install
+/// gate send a sidecar a concurrent repair had already fixed down the vanilla
+/// path, and its log claim "no static backup exists" cover a backup that was
+/// sitting right there, expired.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HealOutcome {
+    /// Evidence quarantined, preserved mint restored over the pair.
+    Healed,
+    /// Re-checked under the lock and the sidecar is not mis-filled — a
+    /// concurrent repair (or whatever writes the sidecar) beat us. Nothing to
+    /// heal; the sidecar's current content decides what happens next.
+    NotMisfilled,
+    /// The sidecar IS mis-filled and no live mint backup exists to restore:
+    /// absent, expired, or not a mint at all ([`live_backup_bytes`] logged
+    /// which). The split stays disengaged until an operator re-captures.
+    NoLiveBackup,
+}
+
+/// CLA-ROLL: heal a mis-filled sidecar on a rolling-token profile — quarantine
+/// the evidence (the profile's own `quarantine/` dir), restore the preserved
+/// static mint over it.
+pub(crate) fn heal_misfilled_sidecar(name: &str) -> Result<HealOutcome> {
     let dir = profile_dir(name)?;
     let sidecar = dir.join("session-token.json");
     let backup = dir.join("session-token.static.json");
@@ -407,19 +428,19 @@ pub(crate) fn heal_misfilled_sidecar(name: &str) -> Result<bool> {
             session_token_status(name),
             Some(SessionTokenStatus::NotLongLived)
         ) {
-            return Ok(false);
+            return Ok(HealOutcome::NotMisfilled);
         }
         // The clock gate matters here too: healing a mis-fill by installing an
         // EXPIRED mint trades a disengaged-but-working vanilla posture for a
         // credential that signs sessions out on first use. No live backup →
         // the mis-fill stays, loudly, exactly as if there were no backup.
         let Some(bytes) = live_backup_bytes(name, &backup)? else {
-            return Ok(false);
+            return Ok(HealOutcome::NoLiveBackup);
         };
-        quarantine_sidecar_locked(name, &sidecar)?;
+        quarantine_file_locked(name, &sidecar, "session-token.json")?;
         atomic_write_600(&sidecar, bytes).context("restore session-token.json")?;
         std::fs::remove_file(&backup).context("remove consumed static backup")?;
-        Ok(true)
+        Ok(HealOutcome::Healed)
     })
 }
 
@@ -437,20 +458,20 @@ pub(crate) fn quarantine_misfilled_sidecar(name: &str) -> Result<bool> {
         ) {
             return Ok(false);
         }
-        quarantine_sidecar_locked(name, &sidecar)?;
+        quarantine_file_locked(name, &sidecar, "session-token.json")?;
         std::fs::remove_file(&sidecar).context("remove mis-filled session-token.json")?;
         Ok(true)
     })
 }
 
-/// Copy the sidecar's bytes into `~/.clauth/quarantine/` before the caller
-/// overwrites or removes it — timestamp + sequence + profile name, suffixed
-/// `.session-token.json`, so the evidence of whatever mis-filled the sidecar
-/// survives the repair. Callers hold the state flock.
-fn quarantine_sidecar_locked(name: &str, sidecar: &Path) -> Result<()> {
-    let bytes = std::fs::read(sidecar).context("read mis-filled sidecar for quarantine")?;
+/// Copy a credential file's bytes into the profile's own `quarantine/` dir
+/// before the caller overwrites or removes it — timestamp + sequence, suffixed
+/// with the quarantined file's basename, so the evidence of whatever
+/// mis-filled it survives the repair. Callers hold the state flock.
+fn quarantine_file_locked(name: &str, path: &Path, suffix: &str) -> Result<()> {
+    let bytes = std::fs::read(path).context("read credential file for quarantine")?;
     // UNDER THE PROFILE, not a global `~/.clauth/quarantine/`. What lands here
-    // is by definition a rotating pair — that is what made it a mis-fill — and
+    // can be a rotating pair — that is what makes a sidecar a mis-fill — and
     // a global dir means `clauth delete <name>` leaves that profile's refresh
     // tokens on disk after removing everything else it owns. Here
     // `delete_profile`'s existing `remove_dir_all` sweeps it with the rest, and
@@ -462,11 +483,8 @@ fn quarantine_sidecar_locked(name: &str, sidecar: &Path) -> Result<()> {
     let dir = profile_dir(name)?.join("quarantine");
     static QUARANTINE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let seq = QUARANTINE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let dest = dir.join(format!(
-        "{}-{seq:04}.session-token.json",
-        crate::usage::now_ms()
-    ));
-    atomic_write_600(&dest, bytes).context("write quarantined sidecar")
+    let dest = dir.join(format!("{}-{seq:04}.{suffix}", crate::usage::now_ms()));
+    atomic_write_600(&dest, bytes).context("write quarantined credential file")
 }
 
 /// CLA-ROLL: best-effort arming at session start (`clauth start` resolves its
@@ -603,42 +621,99 @@ fn arm_rolling_from_disk_synced(name: &str, pre_guard_done: impl FnOnce()) {
     }
 }
 
-/// The preserved backup's bytes — IF it still holds a live mint. `Ok(None)`
-/// when there is no backup, or when the one on disk has aged past its stamped
-/// `expiresAt`: restoring an expired mint installs a credential that signs
-/// every session out on first use (the Incident C shape), and CONSUMING the
-/// backup to do it also destroys whatever life the sidecar's current bearer
-/// has left. An expired backup stays on disk — worthless to restore, still
-/// evidence — and every restore path treats it as nothing-to-restore. Read
-/// and parse failures are loud: this file is the mint's only other copy, and
-/// "could not read it" must never be reported as "it does not exist".
-/// How much life a backup must keep to be worth restoring. Aligned with the
-/// install gate's own grace: a mint restored with seconds left passes the
-/// clock test here only to fail `sidecar_live` immediately after, consuming
-/// the backup for nothing.
-const BACKUP_EXPIRY_GRACE_MS: i64 = 60_000;
+/// How much life a backup must keep to be worth restoring. Claude Code starts
+/// refreshing a credential once it is inside FIVE minutes of expiry, and a
+/// refresh-less mint cannot answer that — a backup restored with less life
+/// than CC's own threshold lands in a client already trying to refresh it,
+/// consuming the backup only to sign the session out moments later.
+const BACKUP_EXPIRY_GRACE_MS: i64 = 5 * 60 * 1000;
 
+/// What preserved-backup bytes hold — THE one rule every consumer of
+/// `session-token.static.json` shares. [`preserve_static_mint`]'s
+/// keep-or-replace guard and [`live_backup_bytes`]'s restore verdict read the
+/// same file, and two hand-rolled checks let a shape one side treated as live
+/// and the other as dead fall between them: a parseable file with no
+/// `claudeAiOauth` block restored as "the mint", after which
+/// `has_session_token` went false and sessions got the rotating pair.
+enum BackupVerdict {
+    /// A genuine mint with life left. No stamped expiry reads as alive — the
+    /// writers always stamp one, but a hand-placed mint without a clock is
+    /// still a mint.
+    LiveMint,
+    /// A genuine mint whose stamped `expiresAt` is inside
+    /// [`BACKUP_EXPIRY_GRACE_MS`] of now.
+    Expired,
+    /// Not a mint: unparseable bytes, no `claudeAiOauth` block, or content
+    /// that classifies as anything but a mint ([`sidecar_kind_of`]) — a
+    /// rotating pair or a rolling bearer must never be restorable as "the
+    /// mint", whatever wrote it into the slot.
+    NoMint,
+}
+
+fn classify_backup_bytes(bytes: &[u8], now: i64) -> BackupVerdict {
+    let Ok(creds) = serde_json::from_slice::<ClaudeCredentials>(bytes) else {
+        return BackupVerdict::NoMint;
+    };
+    let Some(oauth) = creds.claude_ai_oauth else {
+        return BackupVerdict::NoMint;
+    };
+    if sidecar_kind_of(&oauth) != SidecarKind::Mint {
+        return BackupVerdict::NoMint;
+    }
+    if oauth
+        .expires_at
+        .is_some_and(|exp| exp <= now + BACKUP_EXPIRY_GRACE_MS)
+    {
+        BackupVerdict::Expired
+    } else {
+        BackupVerdict::LiveMint
+    }
+}
+
+/// The preserved backup's bytes — IF it still holds a live mint. `Ok(None)`
+/// otherwise, with the file's fate depending on what it holds:
+///
+///   * absent → nothing to do;
+///   * a mint aged past its stamped `expiresAt` → left on disk as evidence
+///     (restoring it installs a credential that signs every session out on
+///     first use — the Incident C shape — and CONSUMING the backup to do it
+///     also destroys whatever life the sidecar's current bearer has left);
+///   * not a mint at all → QUARANTINED to the profile's `quarantine/` dir and
+///     the slot cleared. A slot-holder that can never restore is worse than an
+///     empty slot: `clauth static-token` flips the flag off before it reads
+///     the file, so a permanent error here left the operator's prescribed
+///     re-mint running with the flag off — the no-backup write path — and the
+///     file survived to fail the next attempt identically.
+///
+/// Read failures are loud: this file is the mint's only other copy, and
+/// "could not read it" must never be reported as "it does not exist". Callers
+/// hold the state flock (the quarantine move needs it).
 fn live_backup_bytes(name: &str, backup: &Path) -> Result<Option<Vec<u8>>> {
     let bytes = match std::fs::read(backup) {
         Ok(b) => b,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(e).context("read session-token.static.json"),
     };
-    let creds: ClaudeCredentials =
-        serde_json::from_slice(&bytes).context("parse session-token.static.json")?;
-    let expired = creds
-        .claude_ai_oauth
-        .as_ref()
-        .and_then(|o| o.expires_at)
-        .is_some_and(|exp| exp <= crate::usage::now_ms() as i64 + BACKUP_EXPIRY_GRACE_MS);
-    if expired {
-        crate::logline::logline!(
-            "clauth: '{name}' preserved static mint has itself expired — not restoring it; \
-             re-mint with `clauth login {name} --setup-token`"
-        );
-        return Ok(None);
+    match classify_backup_bytes(&bytes, crate::usage::now_ms() as i64) {
+        BackupVerdict::LiveMint => Ok(Some(bytes)),
+        BackupVerdict::Expired => {
+            crate::logline::logline!(
+                "clauth: '{name}' preserved static mint has itself expired — not restoring it; \
+                 re-mint with `clauth login {name} --setup-token`"
+            );
+            Ok(None)
+        }
+        BackupVerdict::NoMint => {
+            quarantine_file_locked(name, backup, "session-token.static.json")?;
+            std::fs::remove_file(backup).context("remove quarantined static backup")?;
+            crate::logline::logline!(
+                "clauth: '{name}' preserved static backup does not hold a mint — quarantined \
+                 under the profile's quarantine/ dir; re-mint with \
+                 `clauth login {name} --setup-token`"
+            );
+            Ok(None)
+        }
     }
-    Ok(Some(bytes))
 }
 
 /// Restore the preserved static mint over the rolling sidecar (the rolling token switched off, or

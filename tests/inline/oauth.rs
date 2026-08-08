@@ -3180,8 +3180,11 @@ fn restamp_never_parks_behind_a_held_rotation_lock() {
         let refresher =
             |_rt: &str, _scopes: Option<&str>| panic!("a held lock must never reach the refresher");
         let gate = restamp_rolling_token(&handle, "test-noblock", refresher);
-        tx.send(matches!(gate, AuthGate::Transient(_)))
-            .expect("send");
+        let text = match gate {
+            AuthGate::Transient(e) => Some(e.text()),
+            _ => None,
+        };
+        tx.send(text).expect("send");
     });
     // Generous for a loaded runner, tiny next to the block it guards against
     // (the lock is held for the whole wait, so a parking implementation can
@@ -3189,9 +3192,105 @@ fn restamp_never_parks_behind_a_held_rotation_lock() {
     let verdict = rx.recv_timeout(std::time::Duration::from_secs(10));
     drop(guard);
     worker.join().expect("worker");
+    let text = verdict
+        .expect("the re-stamp leg parked behind a held rotation lock")
+        .expect("a held lock answers Transient, never Ready and never a wait");
+    // The HELD copy, not the UNAVAILABLE one: this is genuine contention, and
+    // the arm whose copy upstream corrected in round 1 describes a filesystem
+    // fault that is not what happened here.
     assert!(
-        verdict.expect("the re-stamp leg parked behind a held rotation lock"),
-        "a held lock answers Transient, never Ready and never a wait"
+        text.contains("an in-flight rotation holds"),
+        "a held lock renders as contention: {text}"
+    );
+}
+
+/// The mis-fill arm is the one path that leaves [`rolling_install_gate`] for
+/// the vanilla gate — whose own acquire BLOCKS — so the NoWait axis must
+/// cover it too, or the non-parking property holds everywhere except on the
+/// arm that widened last. The scenario that defeats it: a mis-filled sidecar,
+/// an EXPIRED preserved mint (so the heal has nothing live to restore), an
+/// expiring chain (so the vanilla gate would proceed to its blocking
+/// acquire), and a `clauth start` holding `rotation.lock`. The tick's leg
+/// must answer Transient with the mis-fill's own cause, promptly, touching
+/// neither the refresher nor the evidence on disk.
+#[test]
+fn restamp_on_a_misfill_with_no_live_backup_never_takes_the_vanilla_gate() {
+    let _home = HomeSandbox::new();
+    let name = "test-misfill-nowait";
+    // Chain inside the vanilla gate's own grace: the fall-through would not
+    // stop at the pre-check but go on to acquire the held lock and refresh.
+    let config = rolling_config(name, Some("rt-live"), Some(now_ms() as i64 + 10_000));
+    crate::profile::save_profile(&config.profiles[0]).expect("save profile");
+    let dir = crate::profile::profile_dir(name).expect("dir");
+    // The mis-fill: a rotating pair in the sidecar.
+    let pair = crate::profile::ClaudeCredentials {
+        claude_ai_oauth: Some(OAuthToken {
+            access_token: "at-misfill".to_string(),
+            refresh_token: Some("rt-misfill".to_string()),
+            expires_at: Some(now_ms() as i64 + 3_600_000),
+            scopes: None,
+            subscription_type: None,
+        }),
+    };
+    std::fs::write(
+        dir.join("session-token.json"),
+        serde_json::to_vec(&pair).expect("ser"),
+    )
+    .expect("misfill");
+    // The preserved mint: genuine, but past its clock — nothing live to heal
+    // with, and refused without being consumed.
+    let dead_mint = crate::profile::ClaudeCredentials {
+        claude_ai_oauth: Some(OAuthToken {
+            access_token: "sk-ant-oat01-dead-mint".to_string(),
+            refresh_token: None,
+            expires_at: Some(now_ms() as i64 - 1_000),
+            scopes: Some(vec![
+                "user:inference".to_string(),
+                "user:sessions:claude_code".to_string(),
+            ]),
+            subscription_type: None,
+        }),
+    };
+    std::fs::write(
+        dir.join("session-token.static.json"),
+        serde_json::to_vec(&dead_mint).expect("ser"),
+    )
+    .expect("expired backup");
+    let guard = crate::runtime::RotationGuard::acquire(name).expect("hold the lock");
+    let handle = Arc::new(RankedMutex::new(config));
+    let (tx, rx) = std::sync::mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        let refresher = |_rt: &str, _scopes: Option<&str>| {
+            panic!("the NoWait leg must never do the vanilla gate's refresh work")
+        };
+        let gate = restamp_rolling_token(&handle, "test-misfill-nowait", refresher);
+        let text = match gate {
+            AuthGate::Transient(e) => Some(e.text()),
+            _ => None,
+        };
+        tx.send(text).expect("send");
+    });
+    let verdict = rx.recv_timeout(std::time::Duration::from_secs(10));
+    drop(guard);
+    worker.join().expect("worker");
+    let text = verdict
+        .expect("the re-stamp leg parked behind the vanilla gate's blocking acquire")
+        .expect("a disengaged mis-fill answers Transient on the NoWait leg, never vanilla-Ready");
+    assert!(
+        text.contains("rotating pair and no live mint backup"),
+        "the mis-fill's own cause, not a lock or write flavor: {text}"
+    );
+    assert!(
+        dir.join("session-token.static.json").exists(),
+        "the expired mint stays on disk as evidence"
+    );
+    let sidecar: crate::profile::ClaudeCredentials =
+        serde_json::from_slice(&std::fs::read(dir.join("session-token.json")).expect("read"))
+            .expect("parse");
+    assert_eq!(
+        sidecar.access_token(),
+        Some("at-misfill"),
+        "the sidecar is untouched — the evidence quarantine is the CLI's explicit-intent path"
     );
 }
 

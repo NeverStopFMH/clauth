@@ -6672,3 +6672,90 @@ fn claude_rolling_tick_broken_verdict_takes_the_long_leash() {
     );
     assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
 }
+
+/// A Transient whose cause only a re-login clears takes the SAME long leash
+/// as Broken: an unrecorded grant paced on the 15-minute cadence re-logs the
+/// identical refusal ~24 times per bearer lifetime with no retry ever able to
+/// succeed. Genuinely transient causes must keep the short cadence — that
+/// asymmetry is the test.
+#[test]
+fn claude_rolling_tick_relogin_transients_take_the_long_leash() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let config = rolling_profile_config(&["cl-grant"], &[]);
+    write_rolling_sidecar("cl-grant", 60 * 60 * 1000);
+    let pacing = crate::lockorder::RankedMutex::new(super::ClaudeRollingPacing::default());
+    let now = crate::usage::now_ms();
+
+    let calls = std::sync::atomic::AtomicUsize::new(0);
+    let unrecorded = |_: &str| {
+        calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        crate::oauth::AuthGate::Transient(crate::format::Transient::new(
+            crate::format::Cause::RollingGrantUnrecorded("cl-grant".to_string()),
+            crate::format::Retry::Stated,
+        ))
+    };
+    super::claude_rolling_tick(&config, &pacing, now, &unrecorded);
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    // Where an ordinary transient would retry, the re-login refusal is still
+    // leashed…
+    pacing.lock().unwrap().next_scan_ms = 0;
+    super::claude_rolling_tick(
+        &config,
+        &pacing,
+        now + super::ROLLING_RETRY_MS + 1,
+        &unrecorded,
+    );
+    assert_eq!(
+        calls.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "an unrecorded grant is not retried on the transient cadence"
+    );
+    // …and an ordinary transient keeps the short cadence on the same code
+    // path, so the long leash demonstrably keys off the CAUSE.
+    let ordinary = |_: &str| {
+        calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        crate::oauth::AuthGate::Transient(crate::format::Transient::new(
+            crate::format::Cause::Endpoint("could not reach anthropic"),
+            crate::format::Retry::Wait,
+        ))
+    };
+    pacing.lock().unwrap().next_scan_ms = 0;
+    pacing.lock().unwrap().retry_after_ms.clear();
+    super::claude_rolling_tick(&config, &pacing, now, &ordinary);
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+    pacing.lock().unwrap().next_scan_ms = 0;
+    super::claude_rolling_tick(
+        &config,
+        &pacing,
+        now + super::ROLLING_RETRY_MS + 1,
+        &ordinary,
+    );
+    assert_eq!(
+        calls.load(std::sync::atomic::Ordering::SeqCst),
+        3,
+        "a genuinely transient cause keeps the short cadence"
+    );
+}
+
+/// Names that leave the candidate set — profile deleted, disabled, or the
+/// flag turned off — take their retry stamps with them. Without the sweep the
+/// map grows monotonically over the daemon's lifetime, and a re-created
+/// profile of the same name inherits a stale leash it never earned.
+#[test]
+fn claude_rolling_tick_drops_retry_state_for_departed_profiles() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let config = rolling_profile_config(&["cl-alive"], &[]);
+    write_rolling_sidecar("cl-alive", 60 * 60 * 1000);
+    let pacing = crate::lockorder::RankedMutex::new(super::ClaudeRollingPacing::default());
+    let now = crate::usage::now_ms();
+    pacing.lock().unwrap().retry_after_ms.insert(
+        "cl-deleted".to_string(),
+        now + super::ROLLING_BROKEN_RETRY_MS,
+    );
+    super::claude_rolling_tick(&config, &pacing, now, &|_| crate::oauth::AuthGate::Ready);
+    let p = pacing.lock().unwrap();
+    assert!(
+        !p.retry_after_ms.contains_key("cl-deleted"),
+        "a departed profile's stamp is swept on the next scan"
+    );
+}

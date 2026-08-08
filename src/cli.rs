@@ -137,6 +137,9 @@ pub(crate) enum Command {
     /// access token: full scopes and the account's `subscriptionType`, but NO
     /// refresh token. Sessions run bearers that unlock plan-gated models while
     /// the rotating chain stays clauth-private.
+    ///
+    /// Needs the clauth daemon running: the bearer dies in hours, and the
+    /// daemon's scan is what re-stamps it before then.
     #[command(name = "rolling-token")]
     RollingToken {
         /// Profile to arm.

@@ -815,6 +815,17 @@ fn rolling_grant_unrecorded(name: &str) -> crate::format::Transient {
     )
 }
 
+/// CLA-ROLL: the sidecar holds a rotating pair with nothing live to heal it,
+/// and this caller must not fall into the blocking vanilla gate. See
+/// [`crate::format::Cause::SidecarMisfilled`].
+fn sidecar_misfilled(name: &str) -> crate::format::Transient {
+    crate::format::Transient::new(
+        crate::format::Cause::SidecarMisfilled(name.to_string()),
+        // Only a re-capture fixes it, and the cause says so.
+        crate::format::Retry::Stated,
+    )
+}
+
 enum RotateOutcome {
     /// `RotationGuard::acquire` failed — the lock file could not be created or
     /// opened. NOT contention: `acquire` blocks on the flock, so a sibling
@@ -1773,17 +1784,35 @@ fn rolling_install_gate(
         Some(SessionTokenStatus::NotLongLived)
     ) {
         match crate::claude::heal_misfilled_sidecar(name) {
-            Ok(true) => logline!(
+            Ok(crate::claude::HealOutcome::Healed) => logline!(
                 "clauth: '{name}' mis-filled sidecar quarantined; static mint restored \
                  (the rolling token re-arms on the next rotation)"
             ),
-            Ok(false) => {
+            // A concurrent repair — or whatever writes the sidecar — already
+            // resolved the mis-fill. Fall through to the normal rolling table,
+            // which re-reads the sidecar as it now is. (The old bool folded
+            // this into "no backup" and sent a healthy sidecar down the
+            // vanilla path.)
+            Ok(crate::claude::HealOutcome::NotMisfilled) => {}
+            Ok(crate::claude::HealOutcome::NoLiveBackup) => {
                 logline!(
-                    "clauth: '{name}' sidecar is mis-filled and no static backup exists — \
-                     the split stays disengaged (vanilla install); re-capture with \
+                    "clauth: '{name}' sidecar is mis-filled and no live static backup exists \
+                     to restore — the split stays disengaged; re-capture with \
                      `clauth login {name} --setup-token`"
                 );
-                return vanilla_install_gate(config, name, refresher);
+                return match wait {
+                    // The switch/arm paths keep the pre-split behavior: the
+                    // profile installs through the SAME plain gate a
+                    // non-rolling mis-fill takes.
+                    LockWait::Block => vanilla_install_gate(config, name, refresher),
+                    // The vanilla gate's own acquire BLOCKS, which is exactly
+                    // what this axis exists to keep off the tick thread — and
+                    // the work it would do there (install or refresh the
+                    // ROTATING PAIR) is not re-stamp work at all. Permanent
+                    // until an operator re-captures, so the scheduler paces it
+                    // on the re-login leash.
+                    LockWait::NoWait => AuthGate::Transient(sidecar_misfilled(name)),
+                };
             }
             Err(e) => {
                 logline!("clauth: '{name}' mis-filled sidecar could not be quarantined ({e:#})");
@@ -1858,7 +1887,8 @@ fn rolling_install_gate(
         RollAttempt::GrantUnusable => {
             return if sidecar_live(crate::claude::session_token_status(name)) {
                 logline!(
-                    "clauth: '{name}' usage chain's recorded grant cannot mint a rolling                      bearer (re-run `clauth login {name}` to record it); installing {}",
+                    "clauth: '{name}' usage chain's recorded grant cannot mint a rolling \
+                     bearer (re-run `clauth login {name}` to record it); installing {}",
                     serving_desc(name)
                 );
                 AuthGate::Ready
@@ -1960,7 +1990,7 @@ pub(crate) fn arm_rolling_token(
         }
         AuthGate::Broken => {
             anyhow::bail!(
-                "'{name}' usage chain is dead; run `clauth login {name}` first, then re-run"
+                "'{name}' usage chain is dead · run `clauth login {name}` first, then re-run"
             )
         }
         // CLI surface: `text_with_status` is the flavor that names the HTTP
@@ -2126,15 +2156,10 @@ fn roll_from_stored_chain(
         return RollAttempt::ChainStale;
     }
     // Classified BEFORE the stamp, on the refresh-less projection the stamp
-    // would write, so the permanent refusal gets its own verdict instead of
-    // surfacing as a filesystem-flavored write failure.
-    let projected = crate::profile::OAuthToken {
-        access_token: String::new(),
-        refresh_token: None,
-        expires_at: oauth.expires_at,
-        scopes: oauth.scopes.clone(),
-        subscription_type: oauth.subscription_type.clone(),
-    };
+    // would write — the same constructor the stamp itself uses — so the
+    // permanent refusal gets its own verdict instead of surfacing as a
+    // filesystem-flavored write failure.
+    let projected = crate::claude::rolling_projection(&oauth);
     if crate::claude::sidecar_kind_of(&projected) != crate::claude::SidecarKind::Rolling {
         return RollAttempt::GrantUnusable;
     }

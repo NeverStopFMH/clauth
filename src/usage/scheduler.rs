@@ -3563,6 +3563,15 @@ pub(super) fn claude_rolling_tick(
             .map(|p| p.name.as_str().to_string())
             .collect()
     };
+    // Names that leave the candidate set — profile deleted, disabled, or the
+    // flag turned off — take their retry stamps with them: the map is
+    // in-memory and small, but an entry nothing can ever clear is still a
+    // leak, and a re-created profile of the same name would inherit a stale
+    // leash it never earned.
+    if let Ok(mut p) = pacing.lock() {
+        p.retry_after_ms
+            .retain(|held, _| candidates.iter().any(|c| c == held));
+    }
     for name in candidates {
         let widened = pacing
             .lock()
@@ -3627,6 +3636,15 @@ pub(super) fn claude_rolling_tick(
                     "clauth: re-stamp for '{name}' failed (will retry): {}",
                     e.text_with_status()
                 );
+                // A transient whose cause only a re-login clears is not
+                // transient for pacing purposes: the 15-minute cadence
+                // against it re-logs the same refusal ~24 times a bearer
+                // lifetime without one of them ever succeeding.
+                let retry_ms = if e.permanent_until_relogin() {
+                    ROLLING_BROKEN_RETRY_MS
+                } else {
+                    retry_ms
+                };
                 if let Ok(mut p) = pacing.lock() {
                     p.retry_after_ms.insert(name.clone(), now + retry_ms);
                 }

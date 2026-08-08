@@ -947,7 +947,7 @@ fn cmd_rolling_token(name: &str) -> Result<()> {
         .contains(&canonical.as_str().into())
     {
         anyhow::bail!(
-            "'{canonical}' usage chain is dead; run `clauth login {canonical}` first, \
+            "'{canonical}' usage chain is dead · run `clauth login {canonical}` first, \
              then re-run"
         );
     }
@@ -962,7 +962,7 @@ fn cmd_rolling_token(name: &str) -> Result<()> {
     if !plan_capable {
         outln!(
             "clauth: warning: the usage chain for '{canonical}' is missing the user:profile \
-             scope or a subscriptionType stamp; rolling tokens may not unlock plan-gated \
+             scope or a subscriptionType stamp · rolling tokens may not unlock plan-gated \
              models. A fresh `clauth login {canonical}` browser sign-in fixes that."
         );
     }
@@ -987,7 +987,9 @@ fn cmd_rolling_token(name: &str) -> Result<()> {
     // exits the process at the report, which would have left an armed rolling
     // bearer with no flag and nothing ever re-stamping it. Rollback-on-bail
     // keeps both invariants: the arm runs with the flag it needs, and a
-    // non-zero exit leaves the flag exactly as it was found.
+    // non-zero exit from the arm leaves the flag exactly as it was found.
+    // (After a SUCCESSFUL arm the set flag is the new truth — the live-install
+    // step at the bottom can still exit non-zero, correctly leaving it on.)
     if let Ok(mut cfg) = handle.lock()
         && let Some(profile) = cfg.find_mut(&canonical)
     {
@@ -1011,7 +1013,15 @@ fn cmd_rolling_token(name: &str) -> Result<()> {
             && let Some(profile) = cfg.find_mut(&canonical)
         {
             profile.rolling_token = false;
-            profile::save_profile(profile)?;
+            // The arming error is the one the operator needs; a rollback that
+            // then cannot save its own config write must not replace it.
+            if let Err(save_err) = profile::save_profile(profile) {
+                errln!(
+                    "clauth: warning: could not roll the rolling-token flag back for \
+                     '{canonical}' ({save_err:#}) · once ~/.clauth is writable, run \
+                     `clauth static-token {canonical}` to clear it"
+                );
+            }
         }
         return Err(e);
     }
@@ -1043,8 +1053,8 @@ fn report_armed_sidecar(canonical: &str, chain_is_broken: bool) -> Result<()> {
         // "armed" here would be exactly the assumed-not-read report this
         // function's contract forbids.
         anyhow::bail!(
-            "arming reported success but '{canonical}' has no readable sidecar to verify; \
-             nothing was confirmed. Check ~/.clauth and re-run"
+            "arming reported success but '{canonical}' has no readable sidecar to verify, \
+             so nothing was confirmed · check permissions on ~/.clauth and re-run"
         );
     };
     match kind {
@@ -1062,7 +1072,7 @@ fn report_armed_sidecar(canonical: &str, chain_is_broken: bool) -> Result<()> {
         claude::SidecarKind::Mint => {
             outln!(
                 "clauth: '{canonical}' usage chain could not be read just now, so sessions \
-                 stay on the static mint. The flag is set; the daemon re-stamps on its next \
+                 stay on the static mint. The flag is set · the daemon re-stamps on its next \
                  rotation."
             );
         }
@@ -1070,8 +1080,8 @@ fn report_armed_sidecar(canonical: &str, chain_is_broken: bool) -> Result<()> {
             // The CLI pre-cleared one before arming, so reaching this means a
             // writer raced a fresh rotating pair back into the sidecar.
             anyhow::bail!(
-                "'{canonical}' sidecar was re-filled with a rotating pair while arming; \
-                 the split is disengaged and nothing was armed. Re-run, and if it repeats \
+                "'{canonical}' sidecar was re-filled with a rotating pair while arming, so \
+                 the split is disengaged and nothing was armed · re-run, and if it repeats \
                  find what is writing session-token.json"
             );
         }
@@ -1084,11 +1094,11 @@ fn report_armed_sidecar(canonical: &str, chain_is_broken: bool) -> Result<()> {
                 // Best-effort probe: an error reads Absent by design, so the
                 // claim is hedged rather than absolute.
                 crate::daemon::DaemonHealth::Absent => {
-                    "No daemon appears to be running; nothing re-stamps it until \
+                    "No daemon appears to be running · nothing re-stamps it until \
                      `clauth daemon` starts."
                 }
                 crate::daemon::DaemonHealth::Stale => {
-                    "A daemon is present but its feed looks stale; check \
+                    "A daemon is present but its feed looks stale · check \
                      `clauth daemon --status` or re-stamps may not land."
                 }
                 crate::daemon::DaemonHealth::Fresh => "The daemon re-stamps it before it expires.",
@@ -1139,6 +1149,15 @@ fn cmd_static_token(name: &str) -> Result<()> {
     // original error says which, so it is kept rather than replaced.
     let _guard = runtime::RotationGuard::acquire(&canonical)
         .with_context(|| format!("could not lock '{canonical}' to restore its static token"))?;
+    // Flag OFF first, before the restore is known to land — DELIBERATE, and
+    // load-bearing for every bail arm below, none of which rolls it back. The
+    // command's primary effect is the disarm: with the flag still on, the
+    // daemon's next scan re-stamps a rolling bearer over the very mint the
+    // failure copy tells the operator to capture, so their fresh
+    // `--setup-token` login visibly "doesn't take". With it off, the
+    // prescribed re-mint lands and stays. The cost is owned where it bites:
+    // the rolling-bearer bail says in so many words that this command is what
+    // stopped the re-stamping.
     if let Some(profile) = config.find_mut(&canonical) {
         profile.rolling_token = false;
         profile::save_profile(profile)?;
@@ -1185,17 +1204,17 @@ fn cmd_static_token(name: &str) -> Result<()> {
                 )
             }
             outln!(
-                "clauth: '{canonical}' is already on its static long-lived mint; the \
+                "clauth: '{canonical}' is already on its static long-lived mint · the \
                  rolling token is off. Nothing to restore."
             );
             Ok(())
         }
         Some((claude::SidecarKind::Rolling, _)) => {
             anyhow::bail!(
-                "'{canonical}' is off the rolling token, but there is no static mint to \
-                 restore.{backup_note} The last rolling bearer serves until it expires and \
-                 nothing re-stamps it now; capture a fresh long-lived login with \
-                 `clauth login {canonical} --setup-token`."
+                "'{canonical}' is off the rolling token now, but there was no live static \
+                 mint to restore.{backup_note} The last rolling bearer serves until it \
+                 expires, and this command is what stopped its re-stamping · capture a \
+                 fresh long-lived login with `clauth login {canonical} --setup-token`."
             )
         }
         Some((claude::SidecarKind::Misfilled, _)) => {
@@ -1207,7 +1226,7 @@ fn cmd_static_token(name: &str) -> Result<()> {
         }
         None => {
             anyhow::bail!(
-                "'{canonical}' has no session-token sidecar and no live preserved mint; \
+                "'{canonical}' has no session-token sidecar and no live preserved mint · \
                  sessions run on the rotating pair.{backup_note} Capture a long-lived login \
                  with `clauth login {canonical} --setup-token`."
             )

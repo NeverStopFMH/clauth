@@ -136,10 +136,12 @@ User-invoked, only when you run the command:
   refresh token, so sessions still hold nothing rotatable. It also **widens what
   that credential can reach**. A `claude setup-token` mint carries two scopes,
   `user:inference` and `user:sessions:claude_code`. The rolling bearer carries
-  the chain's full granted set — for a standard Pro/Max browser login that is
-  `user:profile`, `user:inference`, `user:sessions:claude_code`,
-  `user:mcp_servers` and `user:file_upload` — the five every real Pro/Max
-  browser login grants. Anything that can read the sidecar, or the live
+  the chain's full granted set. The browser login requests six scopes
+  (`org:create_api_key`, `user:profile`, `user:inference`,
+  `user:sessions:claude_code`, `user:mcp_servers`, `user:file_upload`); every
+  real Pro/Max login observed so far grants the five without
+  `org:create_api_key`, and the bearer carries whatever the account's grant
+  actually was. Anything that can read the sidecar, or the live
   `~/.claude/.credentials.json` a switch installs it into, can use every one of
   those scopes until the token expires — which is hours rather than the mint's
   year. The command prints the scope list when it arms, so the widening is

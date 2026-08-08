@@ -140,6 +140,13 @@ pub(crate) enum Cause {
     /// be preserved as "the mint". Not a filesystem problem and not retryable
     /// in-process: only a fresh `clauth login` records the chain's real grant.
     RollingGrantUnrecorded(String),
+    /// CLA-ROLL: the sidecar holds a rotating pair (mis-filled) with no live
+    /// mint backup to heal it, and the caller runs on the thread that must not
+    /// fall into the blocking vanilla gate (the scheduler's re-stamp leg —
+    /// which also has no re-stamp work to do on a disengaged split). Not
+    /// retryable in-process: only a fresh `clauth login <p> --setup-token`
+    /// re-captures the mint.
+    SidecarMisfilled(String),
 }
 
 impl Cause {
@@ -166,15 +173,21 @@ impl Cause {
             }
             Self::RotationLockHeld(profile) => {
                 format!(
-                    "an in-flight rotation holds '{profile}'; the re-stamp retries on its \
+                    "an in-flight rotation holds '{profile}' · the re-stamp retries on its \
                      next scan"
                 )
             }
             Self::RollingGrantUnrecorded(profile) => {
                 format!(
                     "'{profile}' usage chain has no recorded grant beyond the setup-token \
-                     scopes, so a rolling bearer cannot be told from a mint; run \
+                     scopes, so a rolling bearer cannot be told from a mint · run \
                      `clauth login {profile}` to record the chain's real grant"
+                )
+            }
+            Self::SidecarMisfilled(profile) => {
+                format!(
+                    "'{profile}' session token holds a rotating pair and no live mint backup \
+                     exists to heal it · re-capture with `clauth login {profile} --setup-token`"
                 )
             }
             Self::PersistFailed(profile) => {
@@ -225,6 +238,19 @@ impl Transient {
     /// Cause + next step, no status. TUI toasts and the MCP `reason`.
     pub(crate) fn text(&self) -> String {
         format!("{}{}", self.cause.text(), self.suffix())
+    }
+
+    /// The causes only a fresh `clauth login` clears — no in-process retry
+    /// can: an unrecorded chain grant ([`Cause::RollingGrantUnrecorded`]) and
+    /// a mis-filled sidecar with nothing live to heal it
+    /// ([`Cause::SidecarMisfilled`]). The scheduler paces these on the same
+    /// long leash as a `Broken` verdict — a minutes-scale retry against a
+    /// condition no retry can clear is pure log noise.
+    pub(crate) fn permanent_until_relogin(&self) -> bool {
+        matches!(
+            self.cause,
+            Cause::RollingGrantUnrecorded(_) | Cause::SidecarMisfilled(_)
+        )
     }
 
     /// Cause + status + next step. CLI stderr and the daemon log, the two

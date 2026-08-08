@@ -40,8 +40,13 @@ clauth-owned file is `0600`, every directory `0700`. No exceptions list to drift
   is repaired the next time clauth runs. The repair never follows a symlink out of the
   tree, so it can't touch a file clauth doesn't own. On Windows, access falls to the
   default user-profile ACLs, which clauth does not loosen.
-- A switch rewrites two things: `~/.claude/.credentials.json` and the `env` block of
-  `~/.claude/settings.json`. The rest of `~/.claude/` is left alone.
+- A switch rewrites three files: `~/.claude/.credentials.json`, parts of
+  `~/.claude/settings.json` (the `env` block, the top-level `model` key, `apiKeyHelper`),
+  and `~/.claude.json`, where the stale account-identity block is dropped so Claude Code
+  re-derives identity from the new token. The rest of `~/.claude/` is left alone.
+- On macOS a switch mirrors the login into the `Claude Code-credentials` Keychain item
+  too, because Claude Code reads the Keychain before the file there. clauth writes that
+  item and never reads it back.
 
 ## Network activity
 
@@ -50,7 +55,7 @@ Every request clauth makes, and what rides along with it:
 | Endpoint | When | Carries |
 |----------|------|---------|
 | `api.github.com/repos/uwuclxdy/clauth/releases/latest` + release assets | background update check on launch (binary installs only) | no credentials, just a `User-Agent` |
-| `platform.claude.com/v1/oauth/token` | lazy token refresh (on a 401) and `t` force-rotate | your stored refresh token |
+| `platform.claude.com/v1/oauth/token` | token refresh ahead of expiry, on a rejected request, and on `t` force-rotate | your stored refresh token |
 | `claude.com/cai/oauth/authorize` | `clauth login` interactive sign-in, opened in your browser | no credentials; a PKCE challenge + random `state` |
 | `platform.claude.com/v1/oauth/token` | `clauth login` authorization-code exchange | the one-time auth code + PKCE verifier (mints a fresh token pair) |
 | `api.anthropic.com/api/oauth/usage` | usage poll on the refresh interval | access token (Bearer) |
@@ -59,7 +64,8 @@ Every request clauth makes, and what rides along with it:
 | `status.claude.com/api/v2/incidents.json` | Status tab and background poll | no credentials |
 | `raw.githubusercontent.com/BerriAI/litellm/...` | model price table for the Tokens tab cost lens, fetched and disk-cached | no credentials |
 | `api.deepseek.com/user/balance` | only for profiles whose base URL is DeepSeek | that provider's API key |
-| a custom base URL you set | requests against an API-endpoint profile | whatever you configured |
+| `api.z.ai/api/monitor/usage/...` | only for profiles whose base URL is Z.ai | that provider's API key |
+| a custom base URL you set | requests against an API-endpoint profile, plus a best-effort usage probe against that same origin | whatever you configured |
 
 Your stored access tokens go to `api.anthropic.com` and nowhere else. Your refresh token
 goes to `platform.claude.com`, which is the token endpoint Claude Code's own client
@@ -80,8 +86,10 @@ Background, automatic:
   the 5-hour usage window. Off by default, OAuth profiles only; enable it per profile
   on the Setup tab or with `auto_start = true`.
 - **Token refresh.** Anthropic refresh tokens are single-use, so refreshing spends
-  the stored token for a fresh pair. It's lazy: it fires only when a usage query
-  returns 401, never ahead of time, unless you press `t` to force it.
+  the stored token for a fresh pair. By default it fires ahead of expiry, early enough
+  that a running `claude` never reaches its own refresh threshold. Set the Config tab's
+  `rotation` row to `lazy` to refresh only after a request is rejected. Pressing `t`
+  forces a rotation either way.
 
 User-invoked, only when you run the command:
 

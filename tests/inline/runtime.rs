@@ -3170,6 +3170,37 @@ fn acquire_registers_a_row_and_teardown_removes_it() {
     });
 }
 
+/// The session teardown holds the state flock a FIXED number of times, and the
+/// unregister call never becomes a hold of its own. `unregister` takes the lock
+/// itself, so the drop must not call it outside the one teardown closure: a
+/// hoisted `unregister` is one extra outermost acquisition, leaving a window
+/// where the row is gone but the marker is not. Measured 2026-08-08: a real
+/// drop takes the lock in `tick` (credential reconcile), in
+/// `settings_sync::sync_members`, and once in the teardown closure itself
+/// (`src/runtime.rs` Drop); `claude_json::sync_once`'s fast path skips it in
+/// this fixture. The load-bearing number is that the closure stays ONE hold —
+/// the `tick`/sync legs are named so a change to them re-derives the count
+/// rather than misattributing it to the unregister invariant.
+#[test]
+fn session_teardown_holds_the_state_flock_once() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        fake_claude_home(tmp.path());
+        let profile = make_profile("teardown-count");
+
+        let rt = ProfileRuntime::acquire(&profile, Isolation::Shared, &[], false).expect("acquire");
+
+        crate::lock::OUTERMOST_ACQUISITIONS.with(|c| c.set(0));
+        drop(rt);
+        let held = crate::lock::OUTERMOST_ACQUISITIONS.with(|c| c.get());
+        assert_eq!(
+            held, 3,
+            "a session teardown must take the state flock exactly three times: tick reconcile, \
+             settings sync, and the teardown closure (got {held})"
+        );
+    });
+}
+
 #[test]
 fn scrub_profile_env_drops_managed_and_active_custom_keys() {
     // `clauth start <B>` from a session running profile A must not inherit A's

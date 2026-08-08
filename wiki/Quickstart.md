@@ -1,0 +1,101 @@
+# Quickstart
+
+## Capture your first profile
+
+Launch the TUI while logged into Claude Code:
+
+```bash
+clauth
+```
+
+Pick `+ new from current profile` on the Overview tab and name it, e.g. `work`. clauth snapshots the OAuth token and endpoint settings your running session is using. Log into a second account in Claude Code, run `clauth` again, and capture that one too.
+
+To add an account without touching the session you are in, use `clauth login` instead: it opens a browser, runs Claude Code's own OAuth flow, and writes the minted tokens into a fresh profile.
+
+```bash
+clauth login personal                                   # browser login
+clauth login deepseek --base-url https://api.deepseek.com --api-key sk-...
+```
+
+## Switch
+
+In the TUI: move to the account, <kbd>⏎</kbd>, confirm. From the shell:
+
+```bash
+clauth work
+# switched to 'work'
+```
+
+A switch repoints the credentials your global `claude` reads. A session already running adopts the new account on its next token refresh.
+
+## Run two accounts at once
+
+```bash
+clauth start personal                  # claude under personal's own config dir
+clauth start personal -- --model haiku # flags for claude go after --
+```
+
+`clauth start` gives the session its own `CLAUDE_CONFIG_DIR`, so identity, settings, and billing caches never mix between accounts, and the global session is untouched.
+
+For a session that keeps the account's auth while dropping your global `CLAUDE.md`, plugins, and hooks:
+
+```bash
+clauth start --isolated personal -p < prompt.txt
+```
+
+Pass the prompt on stdin when you use `-p`. A variadic `claude` flag would otherwise swallow a trailing positional prompt forwarded through clauth. Run it in an empty directory to skip project memory too.
+
+## Check what is loaded
+
+```bash
+clauth which          # profile that owns the current session's credentials
+clauth which --json   # plus plan tier and endpoint
+clauth list           # account table with cached usage, no network
+```
+
+## Commands
+
+| Command | Flags | Does |
+|---------|-------|------|
+| `clauth` | | open the TUI |
+| `clauth <profile>` | | switch to that profile and exit |
+| `clauth start <profile> [claude args…]` | `--isolated`, `--rescue`, `--no-rescue`, `--with-fallback` | run `claude` under that profile's own config dir |
+| `clauth login <profile>` | `--base-url`, `--api-key`, `--setup-token`, `--yes`, `--model` | add an account, or re-authenticate one in place |
+| `clauth delete <profile>` | `--yes`, `--force` | remove a profile and every credential it holds |
+| `clauth disable <profile>` | `--yes` | hide it from auto-switch, polling, and the status feed; files stay |
+| `clauth enable <profile>` | | put a disabled profile back |
+| `clauth which` | `--json` | print the profile owning the loaded credentials |
+| `clauth list` | `--all` (`--disabled`) | account table from the on-disk caches, never fetches |
+| `clauth sessions` | `--json`, `--tokens` | list Claude Code sessions, newest first |
+| `clauth resume <id\|latest>` | `--profile <name>` | resume a session under a chosen account |
+| `clauth info <id\|latest>` | | print a session's resume command, workspace, and storage path |
+| `clauth daemon` | `--status`, `--standby`, `--replace`, `--no-standby` | run the refresh + auto-switch loop with no TUI |
+| `clauth status --json` | `--all`, `--disabled` | print the daemon's status shape once, from disk |
+| `clauth mcp` | | stdio MCP server; Claude Code launches this, not you |
+| `clauth completions <bash\|zsh\|fish\|install> [shell]` | | print or install a completion script |
+
+`--theme <full\|compatible>` is global and forces a color depth for the TUI.
+
+### Rules worth knowing
+
+- **`start` argument order.** clauth's own flags go before the profile name. Anything clauth does not recognize is forwarded to `claude` verbatim, leading hyphens included. Use `--` for a spelling both programs own, like `--help`.
+- **`start --with-fallback`** hands the session its own fallback chain. It is refused, by name, when combined with `--isolated`, on macOS, on Windows without symlink privilege, for a non-OAuth account, for an account outside the chain, when the chain has no other member, or when no `clauth daemon` is running.
+- **`start --rescue` / `--no-rescue`** require `--isolated`. They override the profile's `auto_rescue` setting for that run, which decides whether the throwaway runtime's transcripts get lifted into your global store before teardown.
+- **`delete` and `disable` want a TTY.** Both prompt `[y/N]`; on a non-TTY stdin they refuse unless you pass `--yes`. `--force` is the only way past `delete`'s live-session guard, and `--yes` alone does not override it.
+- **`login <existing>`** re-authenticates in place. The chain slot, env block, and model settings survive; the credentials are replaced after a confirm.
+- **`login --setup-token`** captures a `claude setup-token` mint (echo-off, or piped on stdin) as the profile's long-lived login. That token never races clauth's refresher. It engages only for a genuinely long-lived token; a rotating pair pasted here is ignored and called out on the card.
+- **`resume latest`** refuses rather than silently picking the second-newest when a live isolated session holds a newer one. `clauth info` names where any transcript actually lives.
+- **`sessions --tokens`** parses every transcript in full to total tokens and cost. On a large store that takes a while, which is why it is opt-in.
+
+### Environment variables
+
+| Variable | Effect |
+|----------|--------|
+| `CLAUTH_NO_UPDATE=1` | disables the background update check and self-replacement |
+| `CLAUTH_NO_COMPLETIONS=1` | skips the first-run completions prompt |
+| `CLAUDE_CONFIG_DIR` | scopes `which` and `start` to that config dir's credentials |
+| `SHELL` | how `completions install` detects your shell when you do not name one |
+
+### Exit codes
+
+`0` success, `1` failure, `2` usage error (unknown profile, bad flags). `clauth daemon --status` exits `0` when a daemon is running and `1` when none is.

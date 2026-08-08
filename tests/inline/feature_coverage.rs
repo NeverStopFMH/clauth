@@ -9,61 +9,78 @@
 
 use std::collections::HashSet;
 
-/// (feature name in README → test fn name prefixes that cover it)
+/// (bolded lead of a README `## Features` bullet → test fn name prefixes
+/// that cover it)
 ///
-/// A feature passes if each prefix matches at least one function in the
-/// test tree (substring match on function name).  Add a new row here
-/// when you add a feature to the README's `## Features` list.
+/// One row per README bullet, so each row is a bucket covering everything
+/// that bullet claims; the exhaustive per-subsystem reference lives in
+/// `wiki/`. A row passes when EVERY prefix matches at least one function in
+/// the test tree (substring match on the function name), so a deleted or
+/// renamed test still reds here. Add a row when you add a README bullet;
+/// add a prefix when a bullet starts claiming something new.
 const FEATURE_MAP: &[(&str, &[&str])] = &[
     (
-        "One-key switching",
-        &["auto_switch", "snapshot_chain", "resolves_started_profile"],
-    ),
-    (
-        "Log in an account",
+        // switching, login, delete, the non-destructive swap, which-am-i,
+        // and the re-login divergence prompt.
+        "Switch",
         &[
+            "auto_switch",
+            "snapshot_chain",
+            "resolves_started_profile",
             "authorize_url",
             "pkce_challenge",
             "base64url_nopad",
             "login_route",
             "reauth_confirmed",
             "login_api_mode",
+            "delete_takes_yes_and_force",
+            "diverged_",
+            "classify_link_",
+            "first_login_",
+            "build_runtime_dir_writes_settings_not_symlink",
+            "session_profile_",
+            "matches_profile_by_refresh_token",
+            "token_match_",
+            "relogin_is_diverged",
+            "overwrite_confirm",
+            "overwrite_cancel",
         ],
     ),
-    ("Delete an account", &["delete_takes_yes_and_force"]),
     (
-        "Automatic token refresh",
-        &[
-            "rotate_one",
-            "live_session_included",
-            "force_true_bypasses",
-            "rotation_guard_is_independent",
-        ],
-    ),
-    (
-        "Live usage bars",
+        // usage bars, plan detection, per-row activity, stale-data cues,
+        // the token dashboard + its cost lens, the status feed.
+        "Monitor",
         &[
             "parses_",
             "retry_after",
             "cached_fallback_does_not_clobber",
             "mark_window_open",
             "window_lapsed",
+            "gap_boundary",
+            "steady_linear_drain_exact_rate",
+            "oauth_profile",
+            "api_profile",
+            "failed_profile",
+            "all_tabs_render",
+            "empty_state_renders",
+            "parses_core_fields",
+            "collects_components_with_status",
+            "component_status_",
+            "dedup_keeps_worst_status",
+            "status_selected_row_tint",
+            "base_stats_parsed",
+            "today_bucket_aggregates",
+            "top_up_adds_new_day",
+            "group_models_keeps",
+            "model_display_name",
+            "distill_keeps",
+            "rate_strips",
+            "cost_sums",
+            "total_cost_counts_unpriced",
         ],
     ),
     (
-        "Per-row activity",
-        &["gap_boundary", "steady_linear_drain_exact_rate"],
-    ),
-    (
-        "Plan detection",
-        &["oauth_profile", "api_profile", "failed_profile"],
-    ),
-    (
-        "Per-account breakdown",
-        &["all_tabs_render", "empty_state_renders"],
-    ),
-    (
-        "Auto-switch on exhaustion",
+        "Auto-switch",
         &[
             "auto_switch_",
             "wrap_off_",
@@ -72,7 +89,32 @@ const FEATURE_MAP: &[(&str, &[&str])] = &[
         ],
     ),
     (
-        "Headless daemon + status feed",
+        "Run in parallel",
+        &[
+            "acquire_creates_runtime_and_pid_file",
+            "build_runtime_dir_credentials_not_from_claude_home",
+            "acquire_isolates_credentials_from_real_home",
+        ],
+    ),
+    (
+        // the MCP server's tools, plus the Plugin tab that proves the wiring.
+        "From inside Claude",
+        &[
+            "installed_records",
+            "marketplace_known",
+            "manual_mcp_wiring",
+            "wire_mcp_server",
+            "global_entry_drifted",
+            "which_tool_reports_the_cached_tier_not_the_login_claim",
+            "valid_switch_repoints_active_through_the_blocking_task",
+            "unknown_target_is_rejected_without_stripping_live_creds",
+            "divergence_overwrite_captures_relogin_into_outgoing",
+        ],
+    ),
+    (
+        // the daemon loop and its status feed, plus the token rotation it
+        // drives on every tick.
+        "Headless",
         &[
             "build_status",
             "tick_with_empty_queues",
@@ -88,110 +130,33 @@ const FEATURE_MAP: &[(&str, &[&str])] = &[
             "no_standby_exits_rather_than",
             "tick_stands_down_when_another",
             "held_lock_with_fresh_status",
-        ],
-    ),
-    ("Stale-data cues", &["all_tabs_render"]),
-    (
-        "Account-change detection",
-        &[
-            "relogin_is_diverged",
-            "overwrite_confirm",
-            "overwrite_cancel",
+            "rotate_one",
+            "live_session_included",
+            "force_true_bypasses",
+            "rotation_guard_is_independent",
         ],
     ),
     (
-        "Multi-instance safe",
+        // session browsing + resume, model routing, completions, and the
+        // multi-instance state lock.
+        "Quality-of-life",
         &[
-            "cross_thread_with_state_lock_serializes",
-            "same_thread_reentrancy_does_not_deadlock",
-            "poison_recovery_after_panicking_closure",
-        ],
-    ),
-    (
-        "Non-destructive",
-        &[
-            "diverged_",
-            "classify_link_",
-            "first_login_",
-            "build_runtime_dir_writes_settings_not_symlink",
-        ],
-    ),
-    (
-        "Isolated launch",
-        &[
-            "acquire_creates_runtime_and_pid_file",
-            "build_runtime_dir_credentials_not_from_claude_home",
-            "acquire_isolates_credentials_from_real_home",
-        ],
-    ),
-    (
-        "Status-line aware",
-        &[
-            "resolves_started_profile",
-            "session_profile_",
-            "matches_profile_by_refresh_token",
-            "token_match_",
-        ],
-    ),
-    (
-        "Per-profile model routing",
-        &[
+            "sessions_json_has_exact_fields_newest_first_with_null_and_redaction",
+            "resume_profile_choice_explicit_flag_forces_no_prompt",
+            "info_prints_the_resume_command_workspace_and_storage",
             "profile_config_reads_models_table",
             "model_settings_round_trip",
             "build_settings_writes_model_knobs",
             "build_settings_clears_stale_model_knobs",
-        ],
-    ),
-    (
-        "Shell completions",
-        &[
             "print_script_supports",
             "print_script_rejects",
             "install_bash_writes",
             "install_bash_is_idempotent",
             "install_fish_writes",
             "install_rejects_unsupported",
-        ],
-    ),
-    ("In-app help", &["all_tabs_render"]),
-    (
-        "Claude status feed",
-        &[
-            "parses_core_fields",
-            "collects_components_with_status",
-            "component_status_",
-            "dedup_keeps_worst_status",
-            "status_selected_row_tint",
-        ],
-    ),
-    (
-        "Token usage dashboard",
-        &[
-            "base_stats_parsed",
-            "today_bucket_aggregates",
-            "top_up_adds_new_day",
-            "group_models_keeps",
-            "model_display_name",
-        ],
-    ),
-    (
-        "API-equivalent cost",
-        &[
-            "distill_keeps",
-            "rate_strips",
-            "cost_sums",
-            "total_cost_counts_unpriced",
-        ],
-    ),
-    (
-        "Plugin wiring check",
-        &[
-            "installed_records",
-            "marketplace_known",
-            "manual_mcp_wiring",
-            "wire_mcp_server",
-            "global_entry_drifted",
-            "all_tabs_render",
+            "cross_thread_with_state_lock_serializes",
+            "same_thread_reentrancy_does_not_deadlock",
+            "poison_recovery_after_panicking_closure",
         ],
     ),
 ];
@@ -271,9 +236,11 @@ fn extract_features(readme: &str) -> Vec<String> {
             if line.starts_with("## ") {
                 break;
             }
-            // `- **Feature name** — description...`
-            if let Some(content) = line.strip_prefix("- **")
-                && let Some(name) = content.split("**").next()
+            // `- 🔄 **Feature name** description...`; the emoji is optional,
+            // so match the first bold run on the bullet rather than its start.
+            if let Some(rest) = line.strip_prefix("- ")
+                && let Some(open) = rest.find("**")
+                && let Some(name) = rest[open + 2..].split("**").next()
             {
                 let name = name.trim();
                 if !name.is_empty() {

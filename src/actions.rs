@@ -794,7 +794,7 @@ pub(crate) fn capture_into_profile(
     })?;
     // Only once the credentials are committed, and only here — no caller seeds
     // its own anchor, so no caller can forget to.
-    crate::usage::seed_login_anchor(&seed_name, account_uuid.as_deref());
+    crate::usage::seed_login_anchor(&seed_name, account_uuid.as_ref());
     Ok(())
 }
 
@@ -830,7 +830,7 @@ pub(crate) fn create_profile_from_login(
     })?;
     // The draft parked the login's uuid until `create account` fixed the name;
     // this is that name, so the anchor lands here rather than at the call site.
-    crate::usage::seed_login_anchor(&seed_name, account_uuid.as_deref());
+    crate::usage::seed_login_anchor(&seed_name, account_uuid.as_ref());
     Ok(())
 }
 
@@ -930,7 +930,7 @@ pub(crate) fn overwrite_captured_profile(
     // is: the anchor would keep proving the old account against the new pair, and
     // `seed_identity_anchor`'s ride-along is write-if-missing, so nothing corrects
     // it until the next successful login.
-    crate::usage::seed_login_anchor(name, account_uuid.as_deref());
+    crate::usage::seed_login_anchor(name, account_uuid.as_ref());
     Ok(())
 }
 

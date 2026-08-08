@@ -264,11 +264,17 @@ fn a_login_anchor_overwrites_the_previous_account() {
     use crate::profile_cache::{ACCOUNT_ID_CACHE_FILE, load_profile_cache};
     let _home = crate::testutil::HomeSandbox::new();
 
-    seed_login_anchor("acme", Some("uuid-first"));
+    seed_login_anchor(
+        "acme",
+        Some(&crate::profile::AccountId::from("uuid-first".to_string())),
+    );
     // The reauth-onto-a-DIFFERENT-account case: `clauth login` is the
     // authoritative (re)seeder, so unlike the ride-along backfill it must
     // replace the anchor rather than keep proving the old identity.
-    seed_login_anchor("acme", Some("uuid-second"));
+    seed_login_anchor(
+        "acme",
+        Some(&crate::profile::AccountId::from("uuid-second".to_string())),
+    );
     assert_eq!(
         load_profile_cache::<String>("acme", ACCOUNT_ID_CACHE_FILE).as_deref(),
         Some("uuid-second"),
@@ -283,7 +289,10 @@ fn a_login_anchor_write_ignores_an_absent_or_blank_uuid() {
 
     // A failed probe (`None`) or shape drift must never mint an anchor…
     seed_login_anchor("acme", None);
-    seed_login_anchor("acme", Some("  "));
+    seed_login_anchor(
+        "acme",
+        Some(&crate::profile::AccountId::from("  ".to_string())),
+    );
     assert_eq!(
         load_profile_cache::<String>("acme", ACCOUNT_ID_CACHE_FILE),
         None,
@@ -291,7 +300,10 @@ fn a_login_anchor_write_ignores_an_absent_or_blank_uuid() {
     );
 
     // …and must never wipe a good one either.
-    seed_login_anchor("acme", Some("uuid-good"));
+    seed_login_anchor(
+        "acme",
+        Some(&crate::profile::AccountId::from("uuid-good".to_string())),
+    );
     seed_login_anchor("acme", None);
     assert_eq!(
         load_profile_cache::<String>("acme", ACCOUNT_ID_CACHE_FILE).as_deref(),

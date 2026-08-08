@@ -1290,11 +1290,15 @@ pub(crate) fn probe_login_profile(access_token: &str) -> anyhow::Result<LoginPro
 /// onto the name must replace the old anchor rather than keep proving the old
 /// identity. Best-effort and silent on an absent/blank uuid (a failed probe or
 /// shape drift) — a login is never failed over its anchor.
-pub(crate) fn seed_login_anchor(name: &str, account_uuid: Option<&str>) {
-    let Some(uuid) = account_uuid.map(str::trim).filter(|u| !u.is_empty()) else {
+pub(crate) fn seed_login_anchor(name: &str, account_uuid: Option<&AccountId>) {
+    let Some(uuid) = account_uuid.map(|u| u.trim()).filter(|u| !u.is_empty()) else {
         return;
     };
-    write_profile_cache(name, ACCOUNT_ID_CACHE_FILE, &uuid.to_string());
+    write_profile_cache(
+        name,
+        ACCOUNT_ID_CACHE_FILE,
+        &AccountId::from(uuid.to_string()),
+    );
 }
 
 /// The account uuid `access_token` authenticates as, via `/api/oauth/profile`

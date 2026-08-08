@@ -909,7 +909,12 @@ fn overwrite_captured_profile_anchors_the_account_it_committed() {
     let target = Profile::new("swap".to_string(), None, None);
     save_profile(&target).expect("save target");
     let mut config = inactive_config(target);
-    crate::usage::seed_login_anchor("swap", Some("uuid-old-account"));
+    crate::usage::seed_login_anchor(
+        "swap",
+        Some(&crate::profile::AccountId::from(
+            "uuid-old-account".to_string(),
+        )),
+    );
 
     overwrite_captured_profile(&mut config, "swap", login_snapshot("new", Some("uuid-new")))
         .expect("overwrite in place");
@@ -949,7 +954,12 @@ fn a_snapshot_with_no_proven_identity_leaves_the_anchor_alone() {
     let target = Profile::new("unproven".to_string(), None, None);
     save_profile(&target).expect("save target");
     let mut config = inactive_config(target);
-    crate::usage::seed_login_anchor("unproven", Some("uuid-existing"));
+    crate::usage::seed_login_anchor(
+        "unproven",
+        Some(&crate::profile::AccountId::from(
+            "uuid-existing".to_string(),
+        )),
+    );
 
     // `capture_snapshot()` reads live creds off disk and proves no identity; a
     // failed login probe reports none either. Neither may mint OR clear an anchor

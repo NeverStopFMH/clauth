@@ -1607,7 +1607,12 @@ fn a_committed_relogin_anchors_the_profile_it_swapped_onto() {
     });
     // A reauth that swapped a DIFFERENT account onto the name: the stale anchor
     // must be replaced, or identity would keep proving the old account.
-    crate::usage::seed_login_anchor("work", Some("uuid-old-account"));
+    crate::usage::seed_login_anchor(
+        "work",
+        Some(&crate::profile::AccountId::from(
+            "uuid-old-account".to_string(),
+        )),
+    );
 
     apply_login(
         &mut app,
@@ -1651,7 +1656,12 @@ fn a_gated_relogin_anchors_only_once_the_user_confirms() {
         profiles: vec![work],
     });
     // A reauth swapping a DIFFERENT account onto the name.
-    crate::usage::seed_login_anchor("work", Some("uuid-old-account"));
+    crate::usage::seed_login_anchor(
+        "work",
+        Some(&crate::profile::AccountId::from(
+            "uuid-old-account".to_string(),
+        )),
+    );
 
     apply_login(
         &mut app,

@@ -13,7 +13,7 @@ use ratatui::widgets::Paragraph;
 use super::super::app::App;
 use super::super::theme;
 use super::format::{
-    ResetFmt, activity_verb, is_past_reset, reset_in_secs, reset_phrase, spinner_frame,
+    ResetFmt, activity_verb, is_past_reset, reset_in_secs_at, reset_phrase, spinner_frame,
     spinner_style,
 };
 use super::panes::{
@@ -549,7 +549,7 @@ fn collect_stats(profile: &Profile, reset_fmt: ResetFmt) -> Vec<Stat> {
     let now_secs = now_epoch_secs();
     let mut stats: Vec<Stat> = Vec::new();
     for (label, w) in usage.windows() {
-        let trailing = reset_in_secs(w)
+        let trailing = reset_in_secs_at(w, now_secs)
             .map(|secs| format!("  {}", reset_phrase(secs, reset_fmt)))
             .unwrap_or_default();
         // Absolute $ figures on the eyebrow when the window carries them (null on

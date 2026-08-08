@@ -419,24 +419,28 @@ fn the_widest_column_text_still_fits_the_wide_overview_tier() {
 #[test]
 fn overview_reset_middle_dot_stays_uncolored_in_both_mode() {
     use ratatui::style::Color;
+    // One pinned clock feeds both the fixture and the render, so the span
+    // assertions below can never race a wall-clock tick (the old fixture and
+    // `reset_in_secs` each read `now_epoch_secs()` independently, and a second
+    // landing between them pushed the countdown to `39m` under load).
+    let now = crate::usage::now_epoch_secs();
     let w = UsageWindow {
         utilization: 40.0,
-        resets_at: Some(crate::usage::epoch_secs_to_iso(
-            crate::usage::now_epoch_secs() + 40 * 60,
-        )),
+        resets_at: Some(crate::usage::epoch_secs_to_iso(now + 40 * 60)),
     };
     let fmt = ResetFmt {
         display: ResetDisplay::Both,
         clock: ClockFormat::H24,
     };
     let drain = Color::Yellow;
-    let spans = window_summary_spans_bracketed(
+    let spans = window_summary_spans_bracketed_at(
         Some(&w),
         160,
         true,
         Some(Style::default().fg(drain)),
         fmt,
         false,
+        now,
     );
     let dot = spans
         .iter()

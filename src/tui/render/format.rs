@@ -113,6 +113,28 @@ pub(super) fn window_summary_spans_bracketed(
     fmt: ResetFmt,
     stale: bool,
 ) -> Vec<Span<'static>> {
+    window_summary_spans_bracketed_at(
+        window,
+        width,
+        include_bar,
+        reset_style,
+        fmt,
+        stale,
+        now_epoch_secs(),
+    )
+}
+
+/// [`window_summary_spans_bracketed`] against a caller-supplied clock so a
+/// test can pin the fixture and the render to one instant.
+pub(crate) fn window_summary_spans_bracketed_at(
+    window: Option<&UsageWindow>,
+    width: usize,
+    include_bar: bool,
+    reset_style: Option<Style>,
+    fmt: ResetFmt,
+    stale: bool,
+    now: i64,
+) -> Vec<Span<'static>> {
     let Some(window) = window else {
         return vec![Span::styled(NO_DATA.to_string(), theme::faint())];
     };
@@ -132,7 +154,7 @@ pub(super) fn window_summary_spans_bracketed(
             Span::styled("]", bracket),
             Span::styled(format!(" {:>3.0}%", pct), fill_style),
         ];
-        if let Some(secs) = reset_in_secs(window) {
+        if let Some(secs) = reset_in_secs_at(window, now) {
             let style = reset_style.unwrap_or_else(theme::faint);
             spans.extend(reset_suffix_spans(secs, fmt, width, style));
         }
@@ -168,9 +190,15 @@ pub(super) fn is_past_reset(window: &UsageWindow) -> bool {
 
 /// Seconds until the window resets (may be negative if the stamp is overdue).
 pub(super) fn reset_in_secs(window: &UsageWindow) -> Option<i64> {
+    reset_in_secs_at(window, now_epoch_secs())
+}
+
+/// [`reset_in_secs`] against a caller-supplied clock so a test can pin both
+/// reads to one instant instead of racing the wall clock.
+pub(crate) fn reset_in_secs_at(window: &UsageWindow, now: i64) -> Option<i64> {
     let resets_at = window.resets_at.as_deref()?;
     let target = iso_to_epoch_secs(resets_at)?;
-    Some(target - now_epoch_secs())
+    Some(target - now)
 }
 
 /// The operator's reset-rendering choice, snapshotted so a render pass reads the

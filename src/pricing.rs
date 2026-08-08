@@ -302,10 +302,6 @@ fn cache_path() -> Option<PathBuf> {
 /// [`spawn`] channel — the CLI sessions surface needs a `PriceTable` on the main
 /// thread without standing up the worker. `None` when the cache is absent or
 /// unparseable; never fetches, so a cold cache simply prices nothing.
-#[allow(
-    dead_code,
-    reason = "sync price path for the sessions CLI, wired by a later phase"
-)]
 pub(crate) fn load_cached() -> Option<PriceTable> {
     load_cache(&cache_path()?)
 }

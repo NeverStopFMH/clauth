@@ -12,14 +12,6 @@
 //! `tokens`/`cost` annotation, A3 the `last_ran_profile` stamp — so those fields
 //! are defined now but left `None` here.
 
-// Staged foundation: nothing in the non-test build calls this module yet. The
-// A2 annotation pass and the TUI/CLI sessions surface consume it; drop this
-// allow once the first of those wires `build_index` in.
-#![allow(
-    dead_code,
-    reason = "A1 session-index foundation, wired by a later phase"
-)]
-
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
 use std::fs::File;
@@ -101,6 +93,10 @@ pub(crate) struct SessionInfo {
     /// Last user message, redacted preview (`None` when the tail held none).
     pub(crate) last_message: Option<String>,
     /// Which store the transcript came from.
+    #[allow(
+        dead_code,
+        reason = "written at index time; read by the Sessions tab in docs/sessions-design.md §2"
+    )]
     pub(crate) source: SessionSource,
     /// Per-session token total — A2 fills this; `None` = absent from stats.
     pub(crate) tokens: Option<u64>,

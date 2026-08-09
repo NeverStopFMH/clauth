@@ -1177,7 +1177,7 @@ pub(crate) struct PluginState {
     /// missing/unparseable, `Some(Some(v))` = the version string. Re-probed only
     /// on an explicit `r` so a tab switch never re-spawns the subprocess.
     pub(crate) cc_version: Option<Option<String>>,
-    /// Cached `clauth mcp` initialize handshake: `None` = unprobed. Re-probed only
+    /// Cached `clauth mcp` discovery handshake: `None` = unprobed. Re-probed only
     /// on `r` (heavier than the others — it boots the real server), never on a tab
     /// switch or the per-tick refresh.
     pub(crate) mcp_boot: Option<crate::plugin_probe::McpProbe>,

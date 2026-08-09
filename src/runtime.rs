@@ -614,7 +614,7 @@ pub(crate) fn register_bare_session() -> Result<File> {
 /// independent in `tui::app`, and the tab stops offering the fix once either
 /// wires it), so one session can boot two servers and render as two; and any
 /// non-Claude-Code MCP client pointed at `clauth mcp` renders as a bare `claude`,
-/// since nothing here reads the client's `initialize`.
+/// since nothing here reads who the client says it is.
 pub(crate) fn live_bare_sessions() -> Option<usize> {
     live_sessions_at(&live_bare_dir().ok()?)
 }

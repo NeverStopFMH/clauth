@@ -16,10 +16,15 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use rmcp::{
-    ErrorData, ServerHandler,
+    ErrorData, RoleServer, ServerHandler,
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
-    model::{CallToolResult, ContentBlock, ServerCapabilities, ServerInfo},
-    schemars, tool, tool_handler, tool_router,
+    model::{
+        CacheScope, CallToolResult, ContentBlock, DiscoverResult, Implementation, ListToolsResult,
+        PaginatedRequestParams, ProtocolVersion, ServerCapabilities, ServerInfo,
+    },
+    schemars,
+    service::RequestContext,
+    tool, tool_handler, tool_router,
 };
 use serde::Deserialize;
 
@@ -35,7 +40,7 @@ use render::ProfileSnapshot;
 
 /// Marks the `clauth mcp` child that [`crate::plugin_probe::mcp_boots`] spawns
 /// for the Plugin tab's handshake check. clauth owns both sides of that spawn, so
-/// an env marker beats inferring it from the client's `initialize`.
+/// an env marker beats inferring it from the client identity in a request.
 pub(crate) const MCP_PROBE_ENV: &str = "CLAUTH_MCP_PROBE";
 
 /// Default wall-clock ceiling (seconds) on one delegate. A wall clock cannot see
@@ -106,9 +111,6 @@ fn with_footer(json: serde_json::Value, footer: String) -> Vec<ContentBlock> {
 
 #[derive(Clone)]
 pub(crate) struct ClauthServer {
-    // consumed by the `#[tool_handler]` macro at dispatch time; rustc's
-    // dead-code pass can't see through the macro plumbing.
-    #[allow(dead_code)]
     tool_router: ToolRouter<Self>,
 }
 
@@ -1468,17 +1470,67 @@ fn truncate(s: &str, max: usize) -> String {
     format!("{}…", &s[..end])
 }
 
-#[tool_handler]
+/// How long a client may treat `server/discover` and `tools/list` as fresh. Both
+/// are fixed for the process — the tool set is compile-time and the instructions
+/// block is built once at startup — so a cached copy is never staler than the
+/// server's own. rmcp defaults both to `0`, which makes a conforming client
+/// re-fetch on every use.
+const CACHE_TTL_MS: u64 = 5 * 60 * 1000;
+
+// `router = self.tool_router` dispatches from the stored router. Left off, the
+// macro's default rebuilds `Self::tool_router()` on every call.
+#[tool_handler(router = self.tool_router)]
 impl ServerHandler for ClauthServer {
     fn get_info(&self) -> ServerInfo {
-        // ServerInfo is #[non_exhaustive]; build from default then set fields.
-        // Tools capability must be advertised explicitly: ServerInfo::default() leaves
-        // capabilities empty, so a spec-compliant client (Claude Code) exposes no tools
-        // at all even though the server can answer tools/list.
-        let mut info = ServerInfo::default();
-        info.capabilities = ServerCapabilities::builder().enable_tools().build();
-        info.instructions = Some(build_instructions());
-        info
+        // Both of these are wrong by default. Empty capabilities make a
+        // spec-compliant client (Claude Code) expose no tools at all, even
+        // though the server still answers a forced `tools/list`; and rmcp's
+        // default `Implementation` reads its OWN build env, so the server
+        // introduces itself to every client as "rmcp".
+        //
+        // The protocol version stays at rmcp's default. It is only the fallback
+        // for an `initialize` caller asking for a revision this SDK does not
+        // know — a legacy client, which a 2026-07-28 answer would break —
+        // while `server/discover` advertises the full supported set instead.
+        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+            .with_server_info(Implementation::new(
+                env!("CARGO_PKG_NAME"),
+                env!("CARGO_PKG_VERSION"),
+            ))
+            .with_instructions(build_instructions())
+    }
+
+    async fn discover(
+        &self,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<DiscoverResult, ErrorData> {
+        Ok(DiscoverResult::from_server_info(
+            self.supported_protocol_versions().into_owned(),
+            self.get_info(),
+        )
+        .with_ttl_ms(CACHE_TTL_MS)
+        // The instructions block names the operator's profiles, so a cached
+        // copy must not cross an authorization context.
+        .with_cache_scope(CacheScope::Private))
+    }
+
+    async fn list_tools(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<ListToolsResult, ErrorData> {
+        let result = ListToolsResult::with_all_items(self.tool_router.list_all());
+        // Cache hints arrived with 2026-07-28; a legacy peer gets the old shape.
+        let hinted = context
+            .protocol_version()
+            .is_some_and(|v| v >= ProtocolVersion::V_2026_07_28);
+        Ok(if hinted {
+            result
+                .with_ttl_ms(CACHE_TTL_MS)
+                .with_cache_scope(CacheScope::Public)
+        } else {
+            result
+        })
     }
 }
 
@@ -1546,7 +1598,7 @@ pub(crate) fn serve() -> Result<()> {
     // — a bare `claude` runs no clauth teardown, SIGKILL least of all.
     let _bare_marker = hold_bare_session_marker();
     // rmcp's service loop arms a Tokio timer (needs `enable_time`), so a bare
-    // current-thread runtime panics right after the initialize reply. `enable_all`
+    // current-thread runtime panics right after the first reply. `enable_all`
     // also turns on the I/O driver, covering a future transport that polls a real
     // fd or any added tokio net/process path.
     let rt = tokio::runtime::Builder::new_current_thread()

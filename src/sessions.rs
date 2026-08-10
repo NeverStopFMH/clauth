@@ -283,21 +283,7 @@ fn preview_of(raw: &str) -> Option<String> {
     if trimmed.is_empty() {
         return None;
     }
-    Some(truncate_chars(trimmed, PREVIEW_MAX_CHARS))
-}
-
-/// Truncate to at most `max` characters, appending an ellipsis when cut.
-/// `char_indices().nth(max)` yields a valid UTF-8 boundary, so a multi-byte
-/// character is never split.
-fn truncate_chars(s: &str, max: usize) -> String {
-    match s.char_indices().nth(max) {
-        Some((idx, _)) => {
-            let mut out = s[..idx].to_string();
-            out.push('…');
-            out
-        }
-        None => s.to_string(),
-    }
+    Some(crate::format::truncate(trimmed, PREVIEW_MAX_CHARS))
 }
 
 /// Head metadata recovered from a transcript's first lines. The session id is

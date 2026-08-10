@@ -3917,6 +3917,98 @@ fn tick_fetches_the_third_party_leg_under_its_own_lease() {
     );
 }
 
+/// Pins two tick legs the existing armed-tick test does not cover: the
+/// history-prune leg and the cadence-window throttle.
+///
+///   * **prune** — `last_history_prune` is seeded stale, so the tick's
+///     `prune_histories_if_due` fires and advances the stamp; deleting the
+///     call from `tick` leaves the stamp stale and reds this test.
+///   * **throttle** — a second tick immediately after the first must NOT
+///     re-fetch, because `partition_due` sees `last_fetched + interval` is
+///     still in the future; removing that gate makes the second tick fire a
+///     second HTTP request and `seen.len()` reads 2.
+///
+/// The OAuth/session-token leg is NOT pinned here: `tick` hardcodes the real
+/// fetcher against a constant `api.anthropic.com` URL with no injection seam,
+/// so an OAuth work-list would fire a live request. The `tokens` list is empty
+/// for the same reason as the test above.
+#[test]
+fn tick_prunes_histories_and_throttles_a_second_tick_inside_the_cadence_window() {
+    use super::HISTORY_PRUNE_INTERVAL_MS;
+    use crate::profile::{AppConfig, AppState};
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    let home = crate::testutil::HomeSandbox::new();
+
+    let name = "gen";
+    // Allow 2 requests so a broken throttle RECORDS the second hit rather than
+    // timing out; assert below that only 1 arrives.
+    let (base, server) = crate::testutil::serve_endpoints(2, |_, _| {
+        (200, r#"{"session":{"percent":42.5}}"#.to_string())
+    });
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    let mut profile = crate::testutil::blank_profile(name);
+    profile.base_url = Some(base.clone());
+    profile.api_key = Some("key".to_string());
+    let config: crate::profile::ConfigHandle = Arc::new(RankedMutex::new(AppConfig {
+        state: AppState::default(),
+        profiles: vec![profile],
+    }));
+    let entry = ThirdPartyEntry {
+        name: name.to_string(),
+        target: crate::providers::ThirdPartyTarget::Generic {
+            base_url: base.clone(),
+        },
+        api_key: "key".to_string(),
+    };
+    let stale_prune = crate::usage::now_ms().saturating_sub(HISTORY_PRUNE_INTERVAL_MS + 1);
+    let state = super::SchedulerState {
+        config,
+        tokens: Arc::new(RankedMutex::new(vec![])),
+        store: Arc::new(RankedMutex::new(HashMap::new())),
+        status: Arc::new(RankedMutex::new(HashMap::new())),
+        refresh_interval: Arc::new(AtomicU64::new(REFRESH_INTERVAL_MS)),
+        next_refresh_per_profile: Arc::new(RankedMutex::new(HashMap::new())),
+        activity: Arc::new(RankedMutex::new(HashMap::new())),
+        last_fetched: Arc::new(RankedMutex::new(HashMap::new())),
+        poll_streaks: Arc::new(RankedMutex::new(HashMap::new())),
+        kick_blocks: Arc::new(RankedMutex::new(HashMap::new())),
+        pending_switch: Arc::new(RankedMutex::new(HashSet::new())),
+        pending_switch_off: Arc::new(RankedMutex::new(false)),
+        refetch_queue: Arc::new(RankedMutex::new(HashSet::new())),
+        third_party_tokens: Arc::new(RankedMutex::new(vec![entry])),
+        third_party_usage_store: Arc::new(RankedMutex::new(HashMap::new())),
+        third_party_status: Arc::new(RankedMutex::new(HashMap::new())),
+        suppressed_generic: Arc::new(RankedMutex::new(HashSet::new())),
+        shutting_down: Arc::new(AtomicBool::new(false)),
+        fetch_lease: Arc::new(crate::daemon::FetchLease::new()),
+        standdown_active: AtomicBool::new(false),
+        last_history_prune: AtomicU64::new(stale_prune),
+    };
+
+    // First tick: wins the lease, prunes histories, fetches.
+    super::tick(&state);
+
+    assert!(
+        state.last_history_prune.load(Ordering::Relaxed) > stale_prune,
+        "the history prune leg advanced the stale stamp"
+    );
+    assert!(
+        state.last_fetched.lock().unwrap().contains_key(name),
+        "the first tick stamped last_fetched"
+    );
+
+    // Second tick inside the cadence window: partition_due sees
+    // last_fetched + interval > now, so no fetch fires.
+    super::tick(&state);
+
+    let seen = server.join().expect("listener");
+    assert_eq!(
+        seen.len(),
+        1,
+        "a second tick inside the cadence window must not re-fetch: {seen:?}"
+    );
+}
+
 // ── active-profile 429 ladder cap ────────────────────────────────────────────
 //
 // A deep back-off slot on the active row mostly buys staleness on the exact

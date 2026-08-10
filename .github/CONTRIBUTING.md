@@ -1,9 +1,7 @@
 # Contributing
 
 Issues and PRs are welcome. File an issue through the
-[chooser](https://github.com/uwuclxdy/clauth/issues/new/choose), or open a PR against the
-default branch (`mommy`). PR titles follow
-[Conventional Commits](https://www.conventionalcommits.org): `type(scope): summary`.
+[chooser](https://github.com/uwuclxdy/clauth/issues/new/choose), or open a PR against the default branch.
 
 Found a security issue? Report it privately through the
 [security policy](https://github.com/uwuclxdy/clauth/security/policy). Don't file a public issue.

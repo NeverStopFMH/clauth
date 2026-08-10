@@ -496,26 +496,20 @@ fn broken_login_outranks_token_danger_marker() {
     assert!(!text.contains('⊘'), "token marker yields to ×: {text}");
 }
 
-/// A live long-lived token tags the type column (·token) and raises no marker;
-/// an expired one raises the ⊘ danger marker.
+/// A live long-lived token raises no marker; an expired one raises the ⊘ danger marker.
 #[test]
-fn long_lived_token_tags_type_column_and_expired_marks() {
+fn long_lived_token_expired_marks() {
     let _home = crate::testutil::HomeSandbox::new();
     use crate::claude::SessionTokenStatus as S;
     let day = 86_400_000_i64;
     let a = profile("a", 95.0, 10.0, 3600);
     let config = config_with(vec![a], None, vec![]);
     let mut app = App::new(config);
-    // Wide terminal so the type column isn't clamped narrow enough to drop the tag.
     let widths = OverviewWidths::new(120, &app);
 
     app.session_tokens
         .insert("a".into(), S::LongLived(Some(now_ms() as i64 + 340 * day)));
     let live = line_text(&render_overview_row(&app, 0, &widths, false, true));
-    assert!(
-        live.contains("·token"),
-        "type column tags token mode: {live}"
-    );
     assert!(
         !live.contains('⊘'),
         "a live token raises no danger marker: {live}"
@@ -1026,9 +1020,9 @@ fn no_tier_type_cell_does_not_pulse() {
 }
 
 /// The dash joins the other no-data cells at `faint`, but only when it is the
-/// whole cell: a `·token` tag beside it is real data, a disabled row still
-/// flattens to `dim` the way it outranks every other cell state, and a row whose
-/// label is a REAL one keeps `dim` however it reached the un-pulsed branch.
+/// whole cell: a disabled row flattens to `dim` the way it outranks every other
+/// cell state, and a row whose label is a REAL one keeps `dim` however it
+/// reached the un-pulsed branch.
 ///
 /// That last leg is the one the `no_tier &&` conjunct exists for. An api-key row
 /// has a genuine `API` label AND no credentials, so it lands in the same branch
@@ -1042,7 +1036,6 @@ fn no_tier_type_cell_reads_faint_unless_something_real_shares_the_cell() {
     let config = config_with(
         vec![
             credentialed_profile("a", "something_new"),
-            credentialed_profile("b", "something_new"),
             disabled,
             Profile::new(
                 "d".to_string(),
@@ -1055,20 +1048,15 @@ fn no_tier_type_cell_reads_faint_unless_something_real_shares_the_cell() {
         vec![],
     );
 
-    let cell = |idx: usize, token_mode: bool| -> (String, Option<ratatui::style::Color>) {
+    let cell = |idx: usize| -> (String, Option<ratatui::style::Color>) {
         let mut app = App::new(config.clone());
         app.anim_phase_ms = Some(0);
-        if token_mode {
-            let name = app.config().profiles[idx].name.to_string();
-            app.session_tokens
-                .insert(name, crate::claude::SessionTokenStatus::LongLived(None));
-        }
         let widths = OverviewWidths::new(110, &app);
         let span = render_overview_row(&app, idx, &widths, false, true).spans[KIND_SPAN].clone();
         (span.content.to_string(), span.style.fg)
     };
 
-    let (bare, bare_fg) = cell(0, false);
+    let (bare, bare_fg) = cell(0);
     assert_eq!(
         bare.trim_end(),
         "—",
@@ -1076,26 +1064,14 @@ fn no_tier_type_cell_reads_faint_unless_something_real_shares_the_cell() {
     );
     assert_eq!(bare_fg, theme::faint().fg, "a bare dash is a no-data cell");
 
-    let (tagged, tagged_fg) = cell(1, true);
-    assert_eq!(
-        tagged.trim_end(),
-        "— ·token",
-        "fixture control: the tag shares the cell"
-    );
-    assert_eq!(
-        tagged_fg,
-        theme::dim().fg,
-        "`·token` is real data, so fading the cell would claim otherwise"
-    );
-
-    let (_, disabled_fg) = cell(2, false);
+    let (_, disabled_fg) = cell(1);
     assert_eq!(
         disabled_fg,
         theme::dim().fg,
         "a disabled row flattens to dim, outranking no-data as it does stale"
     );
 
-    let (api, api_fg) = cell(3, false);
+    let (api, api_fg) = cell(2);
     assert_eq!(
         api.trim_end(),
         "API",
@@ -1111,7 +1087,7 @@ fn no_tier_type_cell_reads_faint_unless_something_real_shares_the_cell() {
     // (no credentials rather than no tier), and it fades too — the cell is empty
     // for the same reason, so it reads the same way. This one changed with the
     // no-data dash and had no leg of its own.
-    let (uncredentialed, uncredentialed_fg) = cell(4, false);
+    let (uncredentialed, uncredentialed_fg) = cell(3);
     assert_eq!(
         uncredentialed.trim_end(),
         "—",

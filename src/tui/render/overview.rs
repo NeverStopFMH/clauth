@@ -374,11 +374,9 @@ fn render_overview_row(
     };
 
     // Long-lived-token state from the per-frame-free cache (App::session_tokens).
-    // `token_danger` (expired or mis-filled) drives the `⊘` marker; `token_mode`
-    // (running on a genuine long-lived token) drives the type tag below.
+    // `token_danger` (expired or mis-filled) drives the `⊘` marker.
     let token_status = app.session_tokens.get(&name_str);
     let token_danger = token_status.is_some_and(|s| s.is_danger(now_ms() as i64));
-    let token_mode = token_status.is_some_and(|s| s.is_long_lived_mode());
 
     let mut spans = vec![cursor];
     // A disabled row flattens every semantic hue to dim — the whole row reads as
@@ -427,17 +425,11 @@ fn render_overview_row(
     spans.push(Span::styled(nt, ns));
     spans.push(Span::raw(np));
     spans.push(gap(widths));
-    // Type tag: a session-token profile appends ` ·token` so its mode reads on
-    // the list without drilling into Setup. The tag trails the tier, so
-    // `fixed_split` drops it first under width pressure (tier stays legible).
-    let mut label = account_type_label(profile);
+    let label = account_type_label(profile);
     // Read before the tag: a no-data dash is not a tier, and the row must not
     // animate one. A lone glyph color-cycling beside the static faint dashes in
     // the same row reads as live data, which is the opposite of what it means.
     let no_tier = label == super::format::NO_DATA;
-    if token_mode {
-        label.push_str(" ·token");
-    }
     // The credentialed identity-wave is ambient MOTION, which reads as "this
     // thing is live". A disabled account is not, so it renders the same flat dim
     // cell an uncredentialed row gets — dimming the pulse's crest would still
@@ -449,9 +441,9 @@ fn render_overview_row(
         spans.extend(pulse);
     } else {
         // The dash joins the other no-data cells at `faint` only when it is the
-        // whole cell: a `·token` tag beside it is real data. A disabled row still
-        // flattens to dim, outranking no-data the way it outranks stale.
-        let style = if no_tier && !token_mode && !disabled {
+        // whole cell. A disabled row still flattens to dim, outranking no-data
+        // the way it outranks stale.
+        let style = if no_tier && !disabled {
             theme::faint()
         } else {
             theme::dim()

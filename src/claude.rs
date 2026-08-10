@@ -51,13 +51,6 @@ pub(crate) enum SessionTokenStatus {
 }
 
 impl SessionTokenStatus {
-    /// Whether this profile actually runs its sessions on a long-lived token —
-    /// the "token mode" the overview type tag marks. A `NotLongLived` sidecar is
-    /// disengaged (sessions run on `credentials.json`), so it is NOT token mode.
-    pub(crate) fn is_long_lived_mode(&self) -> bool {
-        matches!(self, SessionTokenStatus::LongLived(_))
-    }
-
     /// Whether the sidecar is in a state a switch would install to sessions'
     /// harm: an expired long-lived token (every switch signs sessions out) or a
     /// mis-fill the operator believes is armed. Drives the overview `⊘` marker.

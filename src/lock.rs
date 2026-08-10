@@ -204,9 +204,7 @@ impl Drop for StateLock {
         DEPTH.set(new_depth);
 
         if new_depth == 0 {
-            // Outermost unwind. Close the flock file so other processes can
-            // acquire it, then release the thread mutex so other threads of
-            // this process can enter. Both happen when _thread_guard drops.
+            // Outermost unwind. Clearing the File from the guard closes the fd (releasing the flock for other processes); the thread mutex releases when _thread_guard drops at the end of this fn.
             if let Some(ref mut g) = self._thread_guard {
                 **g = None; // close the File → flock released
             }

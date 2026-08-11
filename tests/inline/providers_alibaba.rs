@@ -113,6 +113,13 @@ fn a_weekly_only_body_yields_no_5h_bar() {
     );
 }
 
+/// No live account produces a 5h pair right now: Alibaba has temporarily lifted
+/// the 5h limit and intends to restore it (user-attested 2026-08-11), so
+/// `/usage` carries the weekly pair alone while `quota-config` still publishes a
+/// `five_hour` allowance per tier. This test is therefore the only thing
+/// standing between the 5h path and a dead-code sweep, and the field returning
+/// would be a silent regression without it. Do not delete it as coverage of an
+/// impossible case.
 #[test]
 fn a_body_carrying_both_windows_orders_the_5h_first() {
     let s = stats(&usage(USAGE_WITH_5H), None, None);

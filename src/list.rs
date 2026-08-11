@@ -52,11 +52,17 @@ struct Row {
     endpoint: String,
     disabled: bool,
     canceled: bool,
-    /// The profile's usage credential is dead and will not self-heal
-    /// (`fetch_status: "AuthExpired"`). This table has no freshness column, so
-    /// without the suffix the stale window percentages above read as ordinary
-    /// live numbers.
-    login_expired: bool,
+    /// Label for a usage credential that is dead and will not self-heal
+    /// (`fetch_status: "AuthExpired"`), or `None` when it is fine. This table
+    /// has no freshness column, so without the suffix the stale window
+    /// percentages above read as ordinary live numbers.
+    ///
+    /// Two labels, because the state has two causes and they want opposite
+    /// actions: a stored session lapsed (`login expired`), or none was ever
+    /// stored (`login needed`). An api-key account reaches the second the moment
+    /// it gets a typed provider whose quota rides a separate credential, and
+    /// "expired" would tell that operator to renew something they never had.
+    usage_login: Option<&'static str>,
 }
 
 impl Row {
@@ -77,25 +83,29 @@ impl Row {
             endpoint: entry["base_url"].as_str().unwrap_or("-").to_string(),
             disabled: config.find(name).is_some_and(|p| p.is_disabled()),
             canceled: crate::profile_json::is_canceled_cached(name),
-            login_expired: entry["fetch_status"].as_str() == Some("AuthExpired"),
+            usage_login: (entry["fetch_status"].as_str() == Some("AuthExpired")).then(|| {
+                if config.find(name).is_some_and(|p| p.console.is_some()) {
+                    "login expired"
+                } else {
+                    "login needed"
+                }
+            }),
         }
     }
 
-    /// Trailing state marker: `(disabled)`, `(canceled)`, `(login expired)`, or
+    /// Trailing state marker: `(disabled)`, `(canceled)`, `(login expired)` /
+    /// `(login needed)`, or
     /// any combination. All render rather than one winning — an operator usually
     /// disables an account BECAUSE it died, so letting `disabled` mask
     /// `canceled` is the erasure the Fallback tab's stacked pills already exist
     /// to prevent. This table has no status column, so the suffix is the only
     /// place any of these facts can appear.
     fn state_suffix(&self) -> String {
-        let states: Vec<&str> = [
-            (self.disabled, "disabled"),
-            (self.canceled, "canceled"),
-            (self.login_expired, "login expired"),
-        ]
-        .into_iter()
-        .filter_map(|(on, label)| on.then_some(label))
-        .collect();
+        let states: Vec<&str> = [(self.disabled, "disabled"), (self.canceled, "canceled")]
+            .into_iter()
+            .filter_map(|(on, label)| on.then_some(label))
+            .chain(self.usage_login)
+            .collect();
         if states.is_empty() {
             return String::new();
         }

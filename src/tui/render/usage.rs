@@ -985,12 +985,21 @@ fn status_lines(profile: &Profile, header: &HeaderState, inner_w: u16) -> Vec<Li
             // No countdown: the profile is session-suppressed, so there is no
             // next attempt to count down to. Only a re-login (or a manual
             // refresh, which retries once) moves this.
+            //
+            // "expired" only when a session actually lapsed. An account that
+            // never stored one reaches this state too — a working api key does
+            // not authenticate the usage gateway — and telling that operator
+            // something expired sends them hunting for what to renew instead of
+            // to the login they have not run. Same split the terminal message
+            // below makes.
+            let label = if profile.console.is_some() {
+                "login expired"
+            } else {
+                "login needed"
+            };
             spans.extend([
                 Span::styled("[ ", theme::dim()),
-                Span::styled(
-                    "login expired",
-                    theme::danger().add_modifier(Modifier::BOLD),
-                ),
+                Span::styled(label, theme::danger().add_modifier(Modifier::BOLD)),
                 Span::styled(" ]", theme::dim()),
             ]);
         }

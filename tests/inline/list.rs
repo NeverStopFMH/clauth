@@ -287,3 +287,41 @@ fn a_dead_credential_is_named_in_the_state_suffix() {
         "the table must name a credential that will never self-heal, got:\n{table}"
     );
 }
+
+/// The same dead-credential state has two causes wanting opposite actions, and
+/// the api-key-only account is the common one: its key works for inference and
+/// authenticates nothing on the usage gateway, so it lands here having never
+/// stored a session. "expired" would send that operator looking for something to
+/// renew.
+#[test]
+fn a_profile_that_never_stored_a_session_is_told_it_needs_one() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let base = "https://token-plan.ap-southeast-1.maas.aliyuncs.com/apps/anthropic";
+    let mut p = crate::profile::Profile::new(
+        "qwen".to_string(),
+        Some(base.to_string()),
+        Some("sk-sp-a-perfectly-good-inference-key".to_string()),
+    );
+    p.provider = crate::providers::Provider::from_base_url(base);
+    assert!(p.console.is_none(), "the account has only its api key");
+    let config = AppConfig {
+        state: crate::profile::AppState {
+            profiles: vec!["qwen".into()],
+            ..crate::profile::AppState::default()
+        },
+        profiles: vec![p],
+    };
+    let fp = crate::usage::profile_credential_fingerprint(&config.profiles[0]).unwrap();
+    crate::profile_cache::write_auth_expired("qwen", fp);
+
+    let body = crate::daemon::build_status(&config, 300_000, None, false);
+    let table = render_table(&config, &body);
+    assert!(
+        table.contains("login needed"),
+        "an account that never had a session is not expired, got:\n{table}"
+    );
+    assert!(
+        !table.contains("login expired"),
+        "nothing lapsed here, so nothing may say it did, got:\n{table}"
+    );
+}

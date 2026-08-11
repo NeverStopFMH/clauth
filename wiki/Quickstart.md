@@ -17,6 +17,8 @@ clauth login personal                                   # browser login
 clauth login deepseek --base-url https://api.deepseek.com --api-key sk-...
 ```
 
+For a third-party endpoint clauth recognises, `open provider console` in the TUI action menu opens the page that key is minted on ([Configuration](Configuration#where-the-keys-come-from)).
+
 ## Switch
 
 In the TUI: move to the account, <kbd>⏎</kbd>, confirm. From the shell:

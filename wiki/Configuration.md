@@ -31,6 +31,23 @@ Three providers get typed usage panels:
 
 Any other endpoint is scanned best-effort: clauth probes a short list of usage paths on the origin your key already authorizes, and renders whatever percentage or balance shapes come back. Those panels carry a "looks wrong? report it" line, since the shape is guessed. An endpoint that returns nothing usable stops being polled until you press <kbd>r</kbd>.
 
+#### Where the keys come from
+
+For those three, `open provider console` in the TUI action menu ([Interface and keys](Interface-And-Keys#action-menus)) opens the page the account's key is minted on. The pages, if you would rather go directly:
+
+| Endpoint | Page |
+|----------|------|
+| DeepSeek | <https://platform.deepseek.com/api_keys> |
+| Z.ai | <https://z.ai/manage-apikey/apikey-list> |
+| Alibaba Token Plan, international | <https://modelstudio.console.alibabacloud.com/ap-southeast-1?tab=plan#/efm/subscription/overview> |
+| Alibaba Token Plan, mainland China | <https://bailian.console.aliyun.com/cn-beijing?tab=plan#/efm/subscription/overview> |
+| Alibaba Coding Plan, international | <https://modelstudio.console.alibabacloud.com/ap-southeast-1/?tab=globalset#/efm/coding_plan> |
+| Alibaba Coding Plan, mainland China | <https://bailian.console.aliyun.com/cn-beijing/?tab=plan#/efm/subscription/coding-plan> |
+
+Alibaba gets four rows because Token Plan and Coding Plan are separate products with separate quotas, sold on two consoles that do not share accounts. Take the key from the page matching the endpoint you configured, or your calls bill against a plan you did not mean. The key is the `sk-sp-…` one on your plan's own page, not a workspace key from the general api-key page, which is billed pay-as-you-go instead of drawing your plan's quota.
+
+An AccessKey pair from the RAM console is a different thing again and clauth has no use for one. It cannot read a Solo plan's quota (measured, on the signed OpenAPI), so nothing here asks for one.
+
 #### The Alibaba console session
 
 Alibaba is the one provider whose api key cannot read its own quota: every quota endpoint ignores the key outright. Those panels run on a separate console session instead. `clauth login <account>` on a Model Studio account opens the Alibaba console in your browser and stores the session it hands back as a `[console]` table in that account's `config.toml`. Nothing else on the account changes. The console returns an api key and an endpoint alongside the session, both scoped to a workspace rather than to your plan and billed separately from it, so clauth discards them.
@@ -68,7 +85,7 @@ A preset is a named `base_url` + `[models]` pair you can stamp onto any account 
 | `Qwen-CodingPlan-Intl` | `https://coding-intl.dashscope.aliyuncs.com/apps/anthropic` |
 | `Qwen-CodingPlan-CN` | `https://coding.dashscope.aliyuncs.com/apps/anthropic` |
 
-`DeepSeek` and `Z.ai` set the endpoint plus a base model, leaving the tier rows yours to pin afterwards. The four Alibaba ones fill every row instead, because those endpoints reject a Claude model id outright rather than serving something for it, so any alias left unpinned fails on use. All six leave the api key alone; pick the region your plan was bought in, since a key issued for one is not accepted by the other.
+`DeepSeek` and `Z.ai` set the endpoint plus a base model, leaving the tier rows yours to pin afterwards. The four Alibaba ones fill every row instead, because those endpoints reject a Claude model id outright rather than serving something for it, so any alias left unpinned fails on use. All six leave the api key alone; pick the region your plan was bought in, since a key issued for one is not accepted by the other. Once a preset is stamped on, `open provider console` in the same menu opens that endpoint's own key page ([above](Configuration#where-the-keys-come-from)).
 
 `save as preset` stores the focused account's own endpoint and models under a name you type, in `~/.clauth/presets/<name>.json`:
 

@@ -60,21 +60,22 @@ Entries above the rule act on the account named in the menu's title bar; entries
 
 | Tab | Account | Tab-wide |
 |-----|---------|----------|
-| Overview | `refresh usage`, `rotate access token`, `disable account` / `enable account` | `refresh all accounts`, `new account` |
-| Usage | `refresh usage`, `rotate access token`, `disable account` / `enable account` | `refresh all accounts`, `toggle estimates`, `toggle pace marker` |
+| Overview | `refresh usage`, `rotate access token`, `disable account` / `enable account`, `open provider console` | `refresh all accounts`, `new account` |
+| Usage | `refresh usage`, `rotate access token`, `disable account` / `enable account`, `open provider console` | `refresh all accounts`, `toggle estimates`, `toggle pace marker` |
 | Tokens | none | `period: lifetime` / `daily` / `weekly` / `monthly`, `show all models` / `show claude models` / `show other models`, `toggle cache counting`, `reload stats` |
-| Setup | `duplicate account`, `save as preset`, `apply preset` | none |
+| Setup | `duplicate account`, `save as preset`, `apply preset`, `open provider console` | none |
 | Status | none | `refresh status`, `open in browser` |
 
-The active period or model filter is omitted from the Tokens menu, so the entries you see are the ones that would change something.
+The active period or model filter is omitted from the Tokens menu, so the entries you see are the ones that would change something. `open provider console` follows the same idea from the other direction: it appears only on an account whose endpoint clauth knows a key page for, so an OAuth account's menu is one entry shorter.
 
-The Setup detail pane is itself a list of actions, so <kbd>⏎</kbd> on a row is the action. What the menu adds is the three that work on the account as a whole, from either the account list or a settings row. On the `+ new` form there is no account yet, so nothing opens.
+The Setup detail pane is itself a list of actions, so <kbd>⏎</kbd> on a row is the action. What the menu adds is what works on the account as a whole, from either the account list or a settings row. On the `+ new` form there is no account yet, so nothing opens.
 
 | Entry | Does |
 |-------|------|
 | `duplicate account` | asks for a name, then copies every setting onto a new account: endpoint, api key, env, models, thresholds. The stored login stays behind, as do the chain's `preferred` and `last resort` marks, which only one account may hold |
 | `save as preset` | stores this account's base url and models under a name you type ([Configuration](Configuration#presets)). An existing preset asks first; a built-in's name is refused |
 | `apply preset` | opens the picker, built-ins first. Applying replaces the endpoint and the whole model block, naming the fields first when any are set. <kbd>d</kbd> deletes a saved preset |
+| `open provider console` | opens the page this account's api key is minted on, in your browser. Only for DeepSeek, Z.ai and Alibaba Model Studio endpoints, so it is absent on an OAuth account and on any endpoint clauth does not recognise. An Alibaba account gets its own plan's page: Token Plan and Coding Plan are separate products, on separate pages, per console |
 
 There is no `remove field`: an env row's <kbd>⏎</kbd> edits its value, and an empty value saves as empty, so the key stays. Drop one by editing the account's `config.toml`.
 

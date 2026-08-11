@@ -1661,11 +1661,17 @@ fn maybe_rewrite_config_toml(config_path: &Path, raw_config: &str, profile: &Pro
     }
 }
 
-/// Serialize `creds` for the profile store, preserving any non-login top-level
-/// blocks (notably `mcpOAuth`, the per-MCP-server logins) already present in the
-/// store file at `cred_path`. [`ClaudeCredentials`] models only the Claude login,
-/// so a plain re-serialize on a token refresh would drop those blocks; this
-/// re-attaches them. Keys serialized from `creds` win; existing extras are kept.
+/// Serialize `creds` for the profile store at `cred_path`, re-attaching every
+/// non-login top-level block the store already holds. [`ClaudeCredentials`]
+/// models the Claude login alone, so a plain re-serialize drops those blocks on
+/// every token write, `mcpOAuth` (the per-MCP-server logins) among them.
+///
+/// Everything already in the file is kept, unlike `claude.rs`'s carry, which
+/// takes an allowlist. The two run in opposite directions: the carry IMPORTS
+/// from another account's live file, where an unrecognised key is a key nobody
+/// decided should cross, while this only rewrites a store over itself, where an
+/// unrecognised key belongs to the account whose file it already is. Dropping it
+/// here would lose data no other writer holds.
 fn serialize_credentials_preserving_extra(
     creds: &ClaudeCredentials,
     cred_path: &Path,
@@ -1680,9 +1686,7 @@ fn serialize_credentials_preserving_extra(
             if key == "claudeAiOauth" {
                 continue;
             }
-            value_obj
-                .entry(key.clone())
-                .or_insert_with(|| extra.clone());
+            value_obj.insert(key.clone(), extra.clone());
         }
     }
     serde_json::to_string_pretty(&value).context("failed to serialize credentials")
@@ -1772,7 +1776,14 @@ fn recover_pending_credentials(
         if !adopt {
             return None;
         }
-        let _ = with_state_lock(|| atomic_write_600(&cred_path, &bytes).map_err(Into::into));
+        // Through the preserving serializer, not the staged bytes: staging holds
+        // the rotated login alone, so writing it raw would drop every non-login
+        // block the store carries. The recovery leg is the one write that reaches
+        // the store without going through `save_profile`.
+        let _ = with_state_lock(|| {
+            let body = serialize_credentials_preserving_extra(&pending, &cred_path)?;
+            atomic_write_600(&cred_path, body).map_err(Into::into)
+        });
         Some(pending)
     })();
     let _ = std::fs::remove_file(&pending_path);

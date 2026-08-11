@@ -2008,3 +2008,44 @@ fn save_profile_preserves_mcp_oauth_across_a_login_refresh() {
         "the MCP-server login survived the login refresh"
     );
 }
+
+/// The crash-recovery leg is the one write that reaches `credentials.json`
+/// without going through `save_profile`, so it owes the same preservation. The
+/// staged sidecar holds the rotated login alone; writing those bytes raw drops
+/// the MCP-server logins the store carries, and the sidecar is consumed right
+/// after, so nothing can recover them.
+#[test]
+fn pending_recovery_preserves_the_stores_mcp_oauth() {
+    let _home = HomeSandbox::new();
+    let name = "pending-preserve-mcp";
+    let committed = pair("old-access", "old-refresh");
+    seed_committed(name, &committed);
+
+    // Claude Code authenticated an MCP server through the store.
+    let cred_path = profile_subpath(name, "credentials.json").expect("cred path");
+    let mut stored: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&cred_path).expect("read store")).expect("parse");
+    stored["mcpOAuth"] = serde_json::json!({ "linear": { "accessToken": "mock-linear" } });
+    std::fs::write(&cred_path, serde_json::to_vec(&stored).unwrap()).expect("write mcp block");
+
+    // A rotation stages, then the commit never lands.
+    let staged = pair("new-access", "new-refresh");
+    stage_rotated_credentials(name, &staged).expect("stage_rotated_credentials");
+    let pending_path = profile_subpath(name, "credentials.json.pending").expect("pending path");
+    let now = std::time::SystemTime::now();
+    crate::testutil::set_mtime(&cred_path, now - std::time::Duration::from_secs(60));
+    crate::testutil::set_mtime(&pending_path, now);
+
+    recover_pending_credentials(name, Some(committed));
+
+    let after: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&cred_path).expect("re-read")).expect("parse");
+    assert_eq!(
+        after["claudeAiOauth"]["refreshToken"], "new-refresh",
+        "the adopted rotation still lands"
+    );
+    assert_eq!(
+        after["mcpOAuth"]["linear"]["accessToken"], "mock-linear",
+        "the MCP-server login survives an interrupted rotation"
+    );
+}

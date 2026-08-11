@@ -6,7 +6,7 @@ This page covers where your logins sit and how they move between accounts. The t
 
 | Path | Holds |
 |------|-------|
-| `~/.clauth/profiles/<name>/credentials.json` | that account's OAuth token pair |
+| `~/.clauth/profiles/<name>/credentials.json` | that account's OAuth token pair, plus the MCP-server logins described below |
 | `~/.clauth/profiles/<name>/session-token.json` | a long-lived `claude setup-token` login, when captured |
 | `~/.clauth/profiles/<name>/config.toml` | the endpoint API key, for endpoint accounts |
 
@@ -21,8 +21,20 @@ An endpoint account's API key reaches Claude Code through `apiKeyHelper`, so it 
 | `~/.claude/.credentials.json` | repointed at the target profile's stored login |
 | `~/.claude/settings.json` | the `env` block, the top-level `model` key, `apiKeyHelper` |
 | `~/.claude.json` | the stale account-identity block is dropped, so Claude Code re-derives identity from the new token |
+| `~/.clauth/profiles/<target>/credentials.json` | gains the live file's MCP-server logins, so a switch stops signing you out of them |
 
-Nothing else moves. Hooks, permissions, status line, projects, plugins, MCP servers, and token stats are all left where they are.
+Nothing else moves. Hooks, permissions, status line, projects, plugins and token stats are all left where they are.
+
+## MCP-server logins
+
+Claude Code keeps each MCP server's OAuth login in the same file as your Claude login, keyed by the server and its endpoint. Those logins are minted against the server itself, so they belong to no Claude account, and a switch carries them onto the account you switch to. Without that, every switch signed you out of every MCP server.
+
+Two consequences worth knowing:
+
+- The same MCP-server token ends up stored under more than one account. Every copy is `0600` like the rest, and your Claude logins are still never duplicated.
+- Signing out of an MCP server in Claude Code propagates on your next switch. A profile you have not switched into since then keeps its old copy until you do.
+
+On macOS none of this applies: Claude Code already keeps MCP tokens in their own Keychain item that clauth never touches, so they always survived a switch there.
 
 ## Per-platform behavior
 

@@ -701,18 +701,34 @@ pub(crate) enum ActionMenuAction {
 /// State for the action-menu modal.
 #[derive(Debug, Clone)]
 pub(crate) struct ActionMenuState {
+    /// Account-scoped items first, then the tab-global ones. One flat list so
+    /// the cursor and the hotkey scan stay index-free of the split; the render
+    /// draws the group rule at `scoped_len`.
     pub(crate) items: Vec<ActionItem>,
+    /// How many leading `items` act on [`ActionMenuState::context`].
+    pub(crate) scoped_len: usize,
+    /// The focused account, named in the title bar so the scoped items don't
+    /// each need a suffix. `None` whenever the scoped group is empty — a name
+    /// on a menu of tab-global actions would claim a scope that isn't there.
+    pub(crate) context: Option<String>,
     pub(crate) cursor: usize,
 }
 
 impl ActionMenuState {
     /// Build and assign hotkeys in source order per the SKILL.md algorithm.
     /// Reserved keys: `a` `x` `?` `q`.
-    pub(crate) fn new(actions: Vec<ActionMenuAction>) -> Self {
+    pub(crate) fn new(
+        scoped: Vec<ActionMenuAction>,
+        global: Vec<ActionMenuAction>,
+        context: Option<String>,
+    ) -> Self {
         const RESERVED: &[char] = &['a', 'x', '?', 'q'];
+        let scoped_len = scoped.len();
+        let context = (scoped_len > 0).then_some(context).flatten();
         let mut claimed: Vec<char> = Vec::new();
-        let items = actions
+        let items = scoped
             .into_iter()
+            .chain(global)
             .map(|action| {
                 let label = action.label();
                 // An explicit override wins when free; else scan the first 3 alpha
@@ -736,7 +752,12 @@ impl ActionMenuState {
                 }
             })
             .collect();
-        Self { items, cursor: 0 }
+        Self {
+            items,
+            scoped_len,
+            context,
+            cursor: 0,
+        }
     }
 }
 
@@ -5020,27 +5041,22 @@ fn handle_modal_key(app: &mut App, key: KeyEvent) {
     }
 }
 
-/// Build the action menu for the current screen/focus context.
+/// Build the action menu for the current screen/focus context: what acts on the
+/// focused account, then what acts on the tab.
 pub(crate) fn build_action_menu(app: &App) -> ActionMenuState {
     use ActionMenuAction::*;
+    let mut scoped: Vec<ActionMenuAction> = Vec::new();
     let mut actions: Vec<ActionMenuAction> = Vec::new();
+    let mut context: Option<String> = None;
 
     match app.tab {
         Tab::Overview => {
-            if focused_account(app).is_some() {
-                actions.push(RefreshUsage);
-                actions.push(RotateTokens);
-                actions.push(disabled_toggle_action(app));
-            }
+            context = push_account_scope(app, &mut scoped);
             actions.push(RefreshAll);
             actions.push(NewAccount);
         }
         Tab::Usage => {
-            if focused_account(app).is_some() {
-                actions.push(RefreshUsage);
-                actions.push(RotateTokens);
-                actions.push(disabled_toggle_action(app));
-            }
+            context = push_account_scope(app, &mut scoped);
             actions.push(RefreshAll);
             actions.push(ToggleEstimates);
             actions.push(TogglePace);
@@ -5073,21 +5089,27 @@ pub(crate) fn build_action_menu(app: &App) -> ActionMenuState {
         }
         Tab::Setup => match app.config_focus {
             ConfigFocus::Profiles => actions.push(NewAccount),
+            // The detail pane's rows all act on the account it is configuring,
+            // so the whole menu is scoped and nothing sits below the rule.
             ConfigFocus::Actions => {
+                context = app
+                    .config_draft
+                    .as_ref()
+                    .and_then(|d| d.editing_name.clone());
                 let rows = config_rows(app);
                 if let Some(&row) = rows.get(app.config_action_cursor) {
                     match row {
-                        ConfigRow::Disabled => actions.push(disabled_toggle_action(app)),
-                        ConfigRow::AutoStart => actions.push(ActionMenuAction::ToggleAutoStart),
-                        ConfigRow::Login => actions.push(ActionMenuAction::LoginAccount),
-                        ConfigRow::DeleteCreds => actions.push(ActionMenuAction::ClearCredentials),
+                        ConfigRow::Disabled => scoped.push(disabled_toggle_action(app)),
+                        ConfigRow::AutoStart => scoped.push(ActionMenuAction::ToggleAutoStart),
+                        ConfigRow::Login => scoped.push(ActionMenuAction::LoginAccount),
+                        ConfigRow::DeleteCreds => scoped.push(ActionMenuAction::ClearCredentials),
                         ConfigRow::ClearSessionToken => {
-                            actions.push(ActionMenuAction::ClearSessionToken);
+                            scoped.push(ActionMenuAction::ClearSessionToken);
                         }
-                        ConfigRow::Delete => actions.push(ActionMenuAction::DeleteProfile),
-                        ConfigRow::Create => actions.push(ActionMenuAction::CreateProfile),
+                        ConfigRow::Delete => scoped.push(ActionMenuAction::DeleteProfile),
+                        ConfigRow::Create => scoped.push(ActionMenuAction::CreateProfile),
                         ConfigRow::EnvEntry(_) => {
-                            actions.push(ActionMenuAction::RemoveEnvField);
+                            scoped.push(ActionMenuAction::RemoveEnvField);
                         }
                         // Text rows and the reveal chip carry nothing ⏎ on the
                         // row doesn't already do — `a` offers nothing there.
@@ -5110,7 +5132,18 @@ pub(crate) fn build_action_menu(app: &App) -> ActionMenuState {
         Tab::Plugin => {}
     }
 
-    ActionMenuState::new(actions)
+    ActionMenuState::new(scoped, actions, context)
+}
+
+/// Push what the account under the cursor can be told to do, returning the name
+/// the menu titles that group with. Nothing to push when the cursor sits past
+/// the accounts (an empty Overview), which is also what leaves the title bare.
+fn push_account_scope(app: &App, scoped: &mut Vec<ActionMenuAction>) -> Option<String> {
+    let (name, _, _) = focused_account(app)?;
+    scoped.push(ActionMenuAction::RefreshUsage);
+    scoped.push(ActionMenuAction::RotateTokens);
+    scoped.push(disabled_toggle_action(app));
+    Some(name)
 }
 
 /// The focused account's disable-row action, labeled by the state it would

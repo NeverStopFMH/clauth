@@ -225,6 +225,20 @@ fn modal_block(title: impl Into<String>) -> Block<'static> {
         .padding(Padding::new(2, 2, 1, 1))
 }
 
+/// [`modal_block`] plus the contract's title-right meta slot, for a modal whose
+/// contents are scoped to one named thing. The name keeps its own case (it is a
+/// proper noun, not a structural label) and stays `TEXT_DIM` — it is data about
+/// the modal, so it takes neither the title's italic nor any bold.
+fn modal_block_with_meta(title: &str, meta: Option<&str>) -> Block<'static> {
+    let block = modal_block(title);
+    match meta {
+        Some(meta) => block.title(
+            Line::from(Span::styled(format!(" {meta} "), theme::dim())).alignment(Alignment::Right),
+        ),
+        None => block,
+    }
+}
+
 fn draw_confirm(frame: &mut Frame<'_>, area: Rect, state: &ConfirmState) {
     let title = match state.on_confirm {
         // The one non-confirm modal: an in-use account can't be acted on.
@@ -784,6 +798,11 @@ fn draw_action_menu(frame: &mut Frame<'_>, area: Rect, state: &ActionMenuState) 
     const HOTKEY_W: u16 = 1; // 1 char for hotkey letter, or 1 space if none
     const GUTTER: u16 = 2; // "❯ " or "  "
 
+    // The rule between the account-scoped items and the tab-global ones. Only
+    // when both groups exist — a one-group menu needs nothing separated.
+    let rule_at = (state.scoped_len > 0 && state.scoped_len < state.items.len())
+        .then_some(state.scoped_len as u16);
+
     // Render rows with right-aligned hotkeys — can't use draw_modal because that
     // wraps all lines in one Paragraph, preventing per-row background tinting.
     // Custom draw: measure → size → clear → border → per-row widgets.
@@ -795,22 +814,51 @@ fn draw_action_menu(frame: &mut Frame<'_>, area: Rect, state: &ActionMenuState) 
         .unwrap_or(0) as u16;
     let content_w = GUTTER + max_label_w + 3 + HOTKEY_W;
     let title = "actions";
+    // Both border breaks have to fit: ` ACTIONS ` on the left, ` <account> ` on
+    // the right, 2 corners and at least one dash of chrome between them.
+    let title_w = title.chars().count() as u16
+        + 2
+        + state
+            .context
+            .as_ref()
+            .map_or(0, |c| c.chars().count() as u16 + 2);
     let w = (content_w + 6)
-        .max(title.chars().count() as u16 + 4)
+        .max(title_w + 3)
         .min(area.width.saturating_sub(4));
-    // items rows + 4 chrome (border + padding)
-    let h = (state.items.len() as u16 + 4).min(area.height.saturating_sub(4));
+    // items rows + the rule + 4 chrome (border + padding)
+    let h = (state.items.len() as u16 + u16::from(rule_at.is_some()) + 4)
+        .min(area.height.saturating_sub(4));
 
     let rect = centered(area, w, h);
     frame.render_widget(Clear, rect);
-    let block = modal_block(title);
+    let block = modal_block_with_meta(title, state.context.as_deref());
     let inner = block.inner(rect);
     frame.render_widget(block, rect);
+
+    if let Some(at) = rule_at {
+        let y = inner.y + at;
+        if y < inner.y + inner.height {
+            frame.render_widget(
+                Paragraph::new(Line::from(Span::styled(
+                    "─".repeat(inner.width as usize),
+                    theme::line(),
+                )))
+                .style(theme::base()),
+                Rect {
+                    y,
+                    height: 1,
+                    ..inner
+                },
+            );
+        }
+    }
 
     let inner_w = inner.width;
     for (i, item) in state.items.iter().enumerate() {
         let focused = i == state.cursor;
-        let y = inner.y + i as u16;
+        // Rows below the rule sit one further down; the cursor never lands on
+        // it, so `items` stays the only index anything else needs.
+        let y = inner.y + i as u16 + u16::from(rule_at.is_some_and(|at| i as u16 >= at));
         if y >= inner.y + inner.height {
             break;
         }

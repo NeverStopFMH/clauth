@@ -6163,13 +6163,14 @@ fn construct_probes_the_daemon_dot_instead_of_seeding_a_constant() {
 
 // ── Setup menu: duplicate + presets ───────────────────────────────────────────
 //
-// The Setup pane's menu is now three whole-account actions, none of which any
-// key reaches: every per-row action is already the row's own ⏎.
+// The Setup pane's menu is three whole-account actions, none of which any key
+// reaches: every per-row action is already the row's own ⏎.
 
 /// Both halves of the Setup tab configure the same focused account, so both
 /// carry the same scoped trio under the account's name. Past the roster (`+
-/// new`) there is no account to scope to, so the menu is empty and the footer
-/// stops advertising `a`.
+/// new`) only `apply preset` is offered — there is no source account to
+/// duplicate or save, but stamping a template onto the draft is the primary
+/// reason a preset exists.
 #[test]
 fn the_setup_tab_offers_the_focused_accounts_whole_account_actions() {
     use super::{ConfigFocus, Tab, build_action_menu};
@@ -6199,11 +6200,49 @@ fn the_setup_tab_offers_the_focused_accounts_whole_account_actions() {
         assert_eq!(menu.context.as_deref(), Some("acct"));
     }
 
-    // `+ new` sits past the roster: nothing to scope to, so nothing opens.
+    // `+ new` sits past the roster: only `apply preset` is offered, scoped to
+    // the draft (no context name until the user types one).
     app.profile_cursor = app.profile_count();
+    let menu = build_action_menu(&app);
+    assert_eq!(
+        menu.items
+            .iter()
+            .map(|i| (i.label, i.hotkey))
+            .collect::<Vec<_>>(),
+        [("apply preset", Some('p'))],
+        "`+ new` offers apply preset only",
+    );
+    assert_eq!(menu.scoped_len, 1);
+    assert_eq!(menu.context, None, "the draft has no name yet");
+}
+
+/// Applying a preset on `+ new` stamps the draft's input buffers (base_url +
+/// model), not a saved profile — nothing hits disk until the create form fires.
+#[test]
+fn apply_preset_on_new_row_stamps_the_draft_buffers() {
+    use super::{ActionMenuAction, Tab, dispatch_action_menu_action, handle_key};
+    use crate::profile::Profile;
+    use ratatui::crossterm::event::KeyCode;
+    let _home = crate::testutil::HomeSandbox::new();
+
+    let mut app = app_with(vec![Profile::new("acct".to_string(), None, None)]);
+    app.tab = Tab::Setup;
+    app.profile_cursor = app.profile_count();
+    app.config_draft = Some(super::build_draft_new());
+
+    // Open the picker (cursor 0 = DeepSeek built-in), press Enter to pick it.
+    // No confirm fires: the draft has no saved fields to clobber.
+    dispatch_action_menu_action(&mut app, ActionMenuAction::ApplyPreset);
+    handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+
+    let draft = app.config_draft.as_ref().expect("draft still mounted");
+    assert_eq!(draft.base_url.value, "https://api.deepseek.com/anthropic");
+    assert_eq!(draft.model.value, "deepseek-chat");
     assert!(
-        build_action_menu(&app).items.is_empty(),
-        "the create form has no account for these to act on",
+        app.config()
+            .find("acct")
+            .is_some_and(|p| p.base_url.is_none()),
+        "the saved profile is untouched"
     );
 }
 
@@ -6503,4 +6542,54 @@ fn saving_a_preset_guards_both_an_existing_name_and_a_builtin() {
         !crate::presets::preset_exists("DeepSeek"),
         "and nothing was written into the built-in's slot",
     );
+}
+
+/// Pressing `d` on a built-in preset toasts "always available" with the picker
+/// still mounted — the user can pick another or back out. Pressing `d` on a
+/// custom preset pops the picker and raises the delete confirm.
+#[test]
+fn d_on_a_builtin_keeps_the_picker_on_a_custom_pops_it() {
+    use super::{
+        ActionMenuAction, ConfirmAction, Modal, Tab, dispatch_action_menu_action, handle_key,
+    };
+    use crate::profile::{ModelSettings, Profile};
+    use crate::testutil::key;
+    use ratatui::crossterm::event::KeyCode;
+    let _home = crate::testutil::HomeSandbox::new();
+
+    // Seed a custom preset so there's something to delete.
+    crate::presets::save_preset(
+        "mine",
+        &Some("https://custom.test".to_string()),
+        &ModelSettings::default(),
+    )
+    .expect("save custom preset");
+
+    let mut app = app_with(vec![Profile::new("acct".to_string(), None, None)]);
+    app.tab = Tab::Setup;
+    app.profile_cursor = 0;
+
+    // Cursor 0 = DeepSeek built-in. `d` toasts and keeps the picker mounted.
+    dispatch_action_menu_action(&mut app, ActionMenuAction::ApplyPreset);
+    handle_key(&mut app, key(KeyCode::Char('d')));
+    assert!(
+        matches!(app.modals.last(), Some(Modal::PresetPicker(_))),
+        "the picker stays mounted on a built-in `d`"
+    );
+    // Back out, then move cursor to the custom preset (index 2: DeepSeek, Z.ai, mine).
+    handle_key(&mut app, key(KeyCode::Esc));
+    dispatch_action_menu_action(&mut app, ActionMenuAction::ApplyPreset);
+    handle_key(&mut app, key(KeyCode::Down));
+    handle_key(&mut app, key(KeyCode::Down));
+    handle_key(&mut app, key(KeyCode::Char('d')));
+    assert!(
+        matches!(app.modals.last(), Some(Modal::Confirm(_))),
+        "the picker pops and the confirm takes over on a custom `d`"
+    );
+    if let Some(Modal::Confirm(state)) = app.modals.last() {
+        assert!(matches!(
+            state.on_confirm,
+            ConfirmAction::DeletePreset(ref n) if n == "mine"
+        ));
+    }
 }

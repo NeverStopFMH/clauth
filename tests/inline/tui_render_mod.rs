@@ -761,8 +761,8 @@ fn narrow_overview_chain_row_keeps_its_figures_on_one_line() {
 
 /// The footer advertises `a` only where the menu has something in it. Both
 /// directions on one screen: the Setup tab's three actions all work on the
-/// focused account, and the `+ new` form has no account yet — so the hint has
-/// to come and go with the cursor.
+/// focused account, and the `+ new` form carries only `apply preset` (no source
+/// account to duplicate or save) — so the hint stays up in both positions.
 #[test]
 fn the_actions_hint_tracks_whether_the_menu_has_anything_in_it() {
     use crate::tui::app::handle_key;
@@ -791,18 +791,21 @@ fn the_actions_hint_tracks_whether_the_menu_has_anything_in_it() {
         "an account carries three whole-account actions no key reaches:\n{out}"
     );
 
-    // The create form sits past the roster: nothing to duplicate or stamp yet.
+    // The create form sits past the roster: only `apply preset` is offered
+    // (no source account to duplicate or save), but that still means the menu
+    // has an item, so the footer keeps advertising `a`.
     app.profile_cursor = app.profile_count();
+    app.config_draft = None;
     let menu = crate::tui::app::build_action_menu(&app);
-    assert!(menu.items.is_empty());
+    assert_eq!(menu.items.len(), 1);
     assert_eq!(
         menu.context, None,
-        "an empty scoped group names no account to scope it to"
+        "no draft is mounted yet, so the group title is bare"
     );
     let out = dump(&app, 120, 30);
     assert!(
-        !out.contains("a actions"),
-        "the create form's menu is empty, so the key must not be advertised:\n{out}"
+        out.contains("a actions"),
+        "the create form's menu carries apply preset, so the key stays advertised:\n{out}"
     );
 }
 

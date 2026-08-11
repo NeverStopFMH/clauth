@@ -618,6 +618,50 @@ fn set_profile_default_model_blank_clears_default() {
 }
 
 #[test]
+fn edit_profile_preset_writes_endpoint_and_models_in_one_shot() {
+    let _home = HomeSandbox::new();
+    let mut config = acct_config();
+
+    // Seed an api key + an old model block so we can prove both are preserved
+    // (the key entirely, and the model block replaced — not merged).
+    config.profiles[0].api_key = Some("sk-secret".to_string());
+    config.profiles[0].models.opus = Some("old-opus".to_string());
+    config.profiles[0].models.default = Some("old-default".to_string());
+
+    edit_profile_preset(
+        &mut config,
+        "acct",
+        Some("https://api.deepseek.com/anthropic".to_string()),
+        ModelSettings {
+            default: Some("deepseek-chat".to_string()),
+            ..ModelSettings::default()
+        },
+    )
+    .expect("preset applied");
+
+    let profile = config.find("acct").unwrap();
+    assert_eq!(
+        profile.base_url.as_deref(),
+        Some("https://api.deepseek.com/anthropic"),
+        "endpoint landed"
+    );
+    assert_eq!(
+        profile.models.default.as_deref(),
+        Some("deepseek-chat"),
+        "default model landed"
+    );
+    assert_eq!(
+        profile.models.opus, None,
+        "the model block is replaced wholesale, not merged"
+    );
+    assert_eq!(
+        profile.api_key.as_deref(),
+        Some("sk-secret"),
+        "the account's own key survives a preset stamp"
+    );
+}
+
+#[test]
 fn validate_profile_name_accepts_email_rejects_path_chars() {
     for name in [
         "claude@domain.com",

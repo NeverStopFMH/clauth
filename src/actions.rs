@@ -429,6 +429,46 @@ pub(crate) fn edit_profile_model(
     })
 }
 
+/// Apply a preset (`base_url` + `models`) in a single locked transaction. A
+/// preset never carries the api key, so the account's own credential is
+/// preserved. Building the full profile state and writing it once — one lock
+/// acquisition, one disk write, one live-settings re-apply — means a failure
+/// leaves the account on its prior state rather than half-stamped (new endpoint,
+/// old models) the way chaining [`edit_profile_endpoint`] +
+/// [`edit_profile_model`] would.
+pub(crate) fn edit_profile_preset(
+    config: &mut AppConfig,
+    name: &str,
+    base_url: Option<String>,
+    models: ModelSettings,
+) -> Result<()> {
+    with_state_lock(|| {
+        let profile = config.find_mut(name).context("profile not found")?;
+        profile.base_url = base_url;
+        profile.models = models;
+        // Re-derive the provider exactly like `edit_profile_endpoint`: a stale
+        // value here keeps (or blocks) third-party fetches against the wrong
+        // endpoint. The api_key is unchanged, so only a moved endpoint can flip
+        // the provider — no need to clear `third_party_usage` on a key rotation.
+        let provider = profile
+            .base_url
+            .as_deref()
+            .and_then(Provider::from_base_url);
+        if provider != profile.provider {
+            profile.third_party_usage = None;
+        }
+        profile.provider = provider;
+        save_profile(profile)?;
+
+        if config.is_active(name) {
+            let profile = config.find(name).context("profile not found")?;
+            let prev_env_keys: Vec<String> = profile.env.keys().cloned().collect();
+            apply_profile_to_claude_settings(profile, &prev_env_keys)?;
+        }
+        Ok(())
+    })
+}
+
 /// Persist a profile's custom env map (the Setup-tab field editor). Captures the
 /// OLD env keys first so a re-apply to the live `~/.claude/settings.json` strips
 /// any key the new map dropped — passing the new keys instead would leak a removed

@@ -24,8 +24,9 @@ use crate::actions::{
     CaptureSnapshot, EnvKeyCollision, capture_into_profile, capture_snapshot, classify_env_key,
     clear_profile_api_key, clear_profile_credentials, create_blank_profile,
     create_profile_from_login, delete_profile, duplicate_profile, edit_profile_endpoint,
-    edit_profile_env, edit_profile_model, find_matching_oauth_profile, overwrite_captured_profile,
-    rename_profile, reorder_profile, switch_off, switch_profile, validate_profile_name,
+    edit_profile_env, edit_profile_model, edit_profile_preset, find_matching_oauth_profile,
+    overwrite_captured_profile, rename_profile, reorder_profile, switch_off, switch_profile,
+    validate_profile_name,
 };
 use crate::claude::{
     LinkState, adopt_first_login, classify_credentials_link, claude_settings_env_keys,
@@ -5162,12 +5163,20 @@ pub(crate) fn build_action_menu(app: &App) -> ActionMenuState {
         // they carry the same three items. Every per-row action already has a
         // key (the detail pane is a list of actions and ⏎ runs the row); what
         // is left is the whole-account work no row states: copy it, save its
-        // endpoint + models as a template, stamp one back onto it.
+        // endpoint + models as a template, stamp one back onto it. On `+ new`
+        // there is no source account to duplicate or save, but a preset can
+        // still stamp the draft's endpoint + model fields.
         Tab::Setup => {
             if let Some((name, _, _)) = focused_account(app) {
                 context = Some(name);
                 scoped.push(Duplicate);
                 scoped.push(SaveAsPreset);
+                scoped.push(ApplyPreset);
+            } else if app.profile_cursor >= app.profile_count() {
+                context = app
+                    .config_draft
+                    .as_ref()
+                    .and_then(|d| d.name.trimmed_some());
                 scoped.push(ApplyPreset);
             }
         }
@@ -6698,13 +6707,25 @@ fn prompt_save_preset(app: &mut App) {
 }
 
 /// `apply preset`: open the picker. The list always holds the two built-ins, so
-/// it is never empty and needs no empty state.
+/// it is never empty and needs no empty state. On `+ new` the target is the
+/// draft's name buffer (empty until the user types one); the preset's fields
+/// are stamped into the draft, not a saved profile.
 fn open_preset_picker(app: &mut App) {
-    let Some((name, _, _)) = focused_account(app) else {
+    let target = if let Some((name, _, _)) = focused_account(app) {
+        name
+    } else if app.profile_cursor >= app.profile_count() {
+        if app.config_draft.is_none() {
+            app.config_draft = Some(build_draft_new());
+        }
+        app.config_draft
+            .as_ref()
+            .map(|d| d.name.trimmed().to_string())
+            .unwrap_or_default()
+    } else {
         return;
     };
     app.modals.push(Modal::PresetPicker(PresetPickerForm {
-        target: name,
+        target,
         presets: crate::presets::list_presets(),
         cursor: 0,
     }));
@@ -6799,12 +6820,12 @@ fn handle_preset_picker_key(app: &mut App, key: KeyEvent) {
             };
         }
         // Drop a custom preset. Built-ins have no file to drop, so the pick says
-        // so rather than no-opping: a list carries no dimmed row here.
+        // so rather than no-opping: a list carries no dimmed row here. The toast
+        // fires with the picker still mounted so the user can pick another.
         KeyCode::Char('d') => {
             let Some(preset) = state.presets.get(state.cursor.min(last)).cloned() else {
                 return;
             };
-            app.modals.pop();
             if preset.builtin {
                 app.toast(
                     ToastKind::Info,
@@ -6812,6 +6833,7 @@ fn handle_preset_picker_key(app: &mut App, key: KeyEvent) {
                 );
                 return;
             }
+            app.modals.pop();
             app.modals.push(Modal::Confirm(ConfirmState {
                 message: format!("delete preset '{}'?", preset.name),
                 detail: Some("accounts already stamped from it are untouched.".to_string()),
@@ -6873,10 +6895,13 @@ fn preset_clobbers(profile: &Profile) -> Vec<&'static str> {
     out
 }
 
-/// Stamp `preset` onto `target`: the endpoint first, then the models, each
-/// through the same `edit_profile_*` helper the detail rows commit with, so an
-/// active account's live `settings.json` is re-applied exactly as a hand edit
-/// would. Rebuilds the draft afterwards, since every buffer it holds is stale.
+/// Stamp `preset` onto `target`. A saved account is written in a single locked
+/// transaction ([`edit_profile_preset`]) so a failure leaves the whole profile on
+/// its prior state. On `+ new` (cursor past the roster) the target names the
+/// unsaved draft, not a profile on disk — the preset's fields are written into
+/// the draft's input buffers directly and committed when the create form fires.
+/// Rebuilds the draft afterwards for a saved account, since every buffer it
+/// holds is stale.
 ///
 /// The preset is re-read here rather than carried from the picker: a confirm can
 /// sit open across an edit to the store, and what the user confirmed was a NAME.
@@ -6887,11 +6912,20 @@ fn apply_preset_to(app: &mut App, target: &str, preset: &str) {
         app.toast(ToastKind::Danger, format!("preset '{preset}' is gone"));
         return;
     };
+    // `+ new`: target names the draft. Stamp the input buffers and return —
+    // nothing is on disk until the create form commits.
+    if app.profile_cursor >= app.profile_count() {
+        stamp_draft_from_preset(app, &preset);
+        return;
+    }
     let result = {
         let mut cfg = app.config();
-        let api_key = cfg.find(target).and_then(|p| p.api_key.clone());
-        edit_profile_endpoint(&mut cfg, target, preset.base_url.clone(), api_key)
-            .and_then(|()| edit_profile_model(&mut cfg, target, preset.models.clone()))
+        edit_profile_preset(
+            &mut cfg,
+            target,
+            preset.base_url.clone(),
+            preset.models.clone(),
+        )
     };
     match result {
         Ok(()) => {
@@ -6907,6 +6941,39 @@ fn apply_preset_to(app: &mut App, target: &str, preset: &str) {
         }
         Err(e) => app.toast(ToastKind::Danger, format!("apply preset failed\n{e}")),
     }
+}
+
+/// Write `preset`'s fields into the `+ new` draft's input buffers. Only fields
+/// the preset carries are touched — a draft is a work in progress, so clearing
+/// a buffer the user had typed (because the preset left that field unset) would
+/// lose their work for no reason. The model-override fields the preset does
+/// carry land in the corresponding tier row.
+fn stamp_draft_from_preset(app: &mut App, preset: &crate::presets::Preset) {
+    let Some(draft) = app.config_draft.as_mut() else {
+        return;
+    };
+    if let Some(url) = preset.base_url.as_deref() {
+        draft.base_url = InputState::new(url);
+    }
+    if let Some(m) = preset.models.default.as_deref() {
+        draft.model = InputState::new(m);
+    }
+    for (value, field) in [
+        (preset.models.opus.as_deref(), &mut draft.opus_model),
+        (preset.models.sonnet.as_deref(), &mut draft.sonnet_model),
+        (preset.models.haiku.as_deref(), &mut draft.haiku_model),
+        (preset.models.fable.as_deref(), &mut draft.fable_model),
+        (preset.models.subagent.as_deref(), &mut draft.subagent_model),
+    ] {
+        if let Some(m) = value {
+            *field = InputState::new(m);
+        }
+    }
+    let name = preset.name.clone();
+    app.toast(
+        ToastKind::Success,
+        format!("stamped '{name}' onto the new account"),
+    );
 }
 
 /// Save `source`'s base url + models under `preset`.

@@ -23,9 +23,9 @@ use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use crate::actions::{
     CaptureSnapshot, EnvKeyCollision, capture_into_profile, capture_snapshot, classify_env_key,
     clear_profile_api_key, clear_profile_credentials, create_blank_profile,
-    create_profile_from_login, delete_profile, edit_profile_endpoint, edit_profile_env,
-    edit_profile_model, find_matching_oauth_profile, overwrite_captured_profile, rename_profile,
-    reorder_profile, switch_off, switch_profile, validate_profile_name,
+    create_profile_from_login, delete_profile, duplicate_profile, edit_profile_endpoint,
+    edit_profile_env, edit_profile_model, find_matching_oauth_profile, overwrite_captured_profile,
+    rename_profile, reorder_profile, switch_off, switch_profile, validate_profile_name,
 };
 use crate::claude::{
     LinkState, adopt_first_login, classify_credentials_link, claude_settings_env_keys,
@@ -218,13 +218,17 @@ pub(crate) enum ConfigRow {
     SonnetModel,
     /// `ANTHROPIC_DEFAULT_HAIKU_MODEL` — full id, free text.
     HaikuModel,
+    /// `ANTHROPIC_DEFAULT_FABLE_MODEL` — full id, free text.
+    FableModel,
     /// `CLAUDE_CODE_SUBAGENT_MODEL` — full id, free text.
     SubagentModel,
     /// The `+ model override` reveal row. Shown only while the unset alias
-    /// overrides are collapsed; ⏎ expands opus/sonnet/haiku/subagent inline.
+    /// overrides are collapsed; ⏎ expands opus/sonnet/haiku/fable/subagent inline.
     ModelOverrideAdd,
     /// A custom `key = value` env entry, indexed into the profile's sorted env
-    /// snapshot. ⏎ edits the value inline; `a` → `remove field` deletes it.
+    /// snapshot. ⏎ edits its VALUE. There is no removal action: an emptied value
+    /// saves as an empty string, so the key stays in `settings.json` until the
+    /// account's `config.toml` is edited by hand.
     EnvEntry(usize),
     /// The `+ add env` row — ⏎ opens a key editor that runs the collision check.
     EnvAdd,
@@ -268,6 +272,7 @@ impl ConfigRow {
                 | ConfigRow::OpusModel
                 | ConfigRow::SonnetModel
                 | ConfigRow::HaikuModel
+                | ConfigRow::FableModel
                 | ConfigRow::SubagentModel
         )
     }
@@ -368,6 +373,7 @@ pub(crate) struct ConfigDraft {
     pub(crate) opus_model: InputState,
     pub(crate) sonnet_model: InputState,
     pub(crate) haiku_model: InputState,
+    pub(crate) fable_model: InputState,
     pub(crate) subagent_model: InputState,
     /// Value buffer for the env entry currently being edited (seeded on entry).
     /// Shared across `EnvEntry` rows since only one is active at a time.
@@ -409,6 +415,7 @@ impl ConfigDraft {
             ConfigRow::OpusModel => &self.opus_model,
             ConfigRow::SonnetModel => &self.sonnet_model,
             ConfigRow::HaikuModel => &self.haiku_model,
+            ConfigRow::FableModel => &self.fable_model,
             ConfigRow::SubagentModel => &self.subagent_model,
             ConfigRow::EnvEntry(_) if self.active == Some(row) => &self.env_value,
             ConfigRow::EnvAdd if self.active == Some(ConfigRow::EnvAdd) => &self.env_new_key,
@@ -434,6 +441,7 @@ impl ConfigDraft {
             ConfigRow::OpusModel => &mut self.opus_model,
             ConfigRow::SonnetModel => &mut self.sonnet_model,
             ConfigRow::HaikuModel => &mut self.haiku_model,
+            ConfigRow::FableModel => &mut self.fable_model,
             ConfigRow::SubagentModel => &mut self.subagent_model,
             ConfigRow::EnvEntry(_) if self.active == Some(row) => &mut self.env_value,
             ConfigRow::EnvAdd if self.active == Some(ConfigRow::EnvAdd) => &mut self.env_new_key,
@@ -507,11 +515,70 @@ pub(crate) enum ConfirmAction {
     /// in the chain. Confirm carries the add through; cancel returns to the
     /// picker. Non-destructive — the member can be removed after adding.
     AddChainCandidate(String),
+    /// Setup menu `save as preset`: a custom preset already holds the typed
+    /// name. `(preset name, source account)` — confirming re-saves over it.
+    OverwritePreset(String, String),
+    /// Setup menu `apply preset`: the target account already carries a base url
+    /// or model settings the preset would replace. `(account, preset name)` —
+    /// the preset is re-read at apply, so what lands is what is on disk now.
+    ApplyPresetOver(String, String),
+    /// Preset picker `d`: drop a custom preset from disk.
+    DeletePreset(String),
     /// Info-only modal: an action the user asked for is refused for a reason
     /// they should read (rotating a macOS profile whose running session holds
     /// its login in a Keychain entry clauth cannot write). Confirming just
     /// dismisses; `run_confirm_action` does nothing.
     Acknowledge,
+}
+
+/// One-field name prompt shared by the Setup menu's two naming actions. The
+/// variant carries what the typed name is FOR, so the modal itself stays a plain
+/// input and every validation rule lives in the handler that consumes it.
+#[derive(Debug, Clone)]
+pub(crate) struct NamePromptForm {
+    pub(crate) input: InputState,
+    pub(crate) action: NamePromptAction,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum NamePromptAction {
+    /// Copy this account onto a new one under the typed name.
+    DuplicateProfile(String),
+    /// Save this account's base url + models as a preset under the typed name.
+    SavePreset(String),
+}
+
+impl NamePromptAction {
+    /// Modal title, and the blurb under it — both read off the same variant so a
+    /// new action can't ship with the other one's copy.
+    pub(crate) fn title(&self) -> &'static str {
+        match self {
+            Self::DuplicateProfile(_) => "DUPLICATE",
+            Self::SavePreset(_) => "SAVE PRESET",
+        }
+    }
+
+    pub(crate) fn blurb(&self) -> String {
+        match self {
+            Self::DuplicateProfile(source) => {
+                format!("copies every setting of '{source}' except its login.")
+            }
+            Self::SavePreset(source) => {
+                format!("stores '{source}'s base url and model settings under this name.")
+            }
+        }
+    }
+}
+
+/// Preset picker for `apply preset`. Built-ins lead the list (see
+/// [`crate::presets::list_presets`]), so the cursor's index is the list's index
+/// and nothing has to track the split.
+#[derive(Debug, Clone)]
+pub(crate) struct PresetPickerForm {
+    /// The account the pick is stamped onto.
+    pub(crate) target: String,
+    pub(crate) presets: Vec<crate::presets::Preset>,
+    pub(crate) cursor: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -671,11 +738,16 @@ pub(crate) enum ActionMenuAction {
     /// Usage, which carry no row for it).
     DisableProfile,
     EnableProfile,
-    /// Remove the focused custom env entry from the account. The only Setup-pane
-    /// action the menu carries, because it is the only one no key reaches: ⏎ on
-    /// the row edits its VALUE, and an empty value saves as an empty string
-    /// rather than removing the key.
-    RemoveEnvField,
+    // Setup tab — all three act on the focused account and none has a key.
+    /// Copy every setting of the focused account onto a new one, credentials
+    /// excluded. Prompts for the new name.
+    Duplicate,
+    /// Store the focused account's base url + model settings as a named
+    /// [`crate::presets::Preset`]. Prompts for the name.
+    SaveAsPreset,
+    /// Stamp a preset's base url + model settings onto the focused account.
+    /// Opens the picker.
+    ApplyPreset,
     // Status tab
     RefreshStatus,
     OpenIncidentLink,
@@ -795,7 +867,9 @@ impl ActionMenuAction {
             Self::RotateTokens => "rotate access token",
             Self::DisableProfile => "disable account",
             Self::EnableProfile => "enable account",
-            Self::RemoveEnvField => "remove field",
+            Self::Duplicate => "duplicate account",
+            Self::SaveAsPreset => "save as preset",
+            Self::ApplyPreset => "apply preset",
             Self::RefreshStatus => "refresh status",
             Self::OpenIncidentLink => "open in browser",
             Self::ToggleEstimates => "toggle estimates",
@@ -819,6 +893,11 @@ pub(crate) enum Modal {
     /// Credential divergence prompt.
     Divergence(DivergenceForm),
     CaptureName(CaptureNameForm),
+    /// One-field name prompt behind the Setup menu's `duplicate account` and
+    /// `save as preset`.
+    NamePrompt(NamePromptForm),
+    /// Setup menu `apply preset`: pick which preset stamps the account.
+    PresetPicker(PresetPickerForm),
     /// Divergence "save elsewhere": pick which profile the live login lands in.
     DivergenceTarget(DivergenceTargetForm),
     Help,
@@ -5006,6 +5085,8 @@ fn handle_modal_key(app: &mut App, key: KeyEvent) {
         Modal::Confirm(_) => handle_confirm_key(app, key),
         Modal::Divergence(_) => handle_divergence_key(app, key),
         Modal::CaptureName(_) => handle_capture_name_key(app, key),
+        Modal::NamePrompt(_) => handle_name_prompt_key(app, key),
+        Modal::PresetPicker(_) => handle_preset_picker_key(app, key),
         Modal::DivergenceTarget(_) => handle_divergence_target_key(app, key),
         Modal::ActionMenu(_) => handle_action_menu_key(app, key),
         Modal::EnvCollision(_) => handle_env_collision_key(app, key),
@@ -5077,24 +5158,19 @@ pub(crate) fn build_action_menu(app: &App) -> ActionMenuState {
             actions.push(ToggleCountCache);
             actions.push(ReloadTokenStats);
         }
-        Tab::Setup => match app.config_focus {
-            ConfigFocus::Profiles => actions.push(NewAccount),
-            // The detail pane is a list of actions: every row states its own,
-            // and ⏎ / space both run it. Dropping a custom env entry is the one
-            // thing no key there does, so it is the only item, and it acts on
-            // the account being configured (all scoped, nothing below the rule).
-            ConfigFocus::Actions => {
-                if let Some(&ConfigRow::EnvEntry(_)) =
-                    config_rows(app).get(app.config_action_cursor)
-                {
-                    context = app
-                        .config_draft
-                        .as_ref()
-                        .and_then(|d| d.editing_name.clone());
-                    scoped.push(RemoveEnvField);
-                }
+        // Both halves of the Setup tab configure the SAME focused account, so
+        // they carry the same three items. Every per-row action already has a
+        // key (the detail pane is a list of actions and ⏎ runs the row); what
+        // is left is the whole-account work no row states: copy it, save its
+        // endpoint + models as a template, stamp one back onto it.
+        Tab::Setup => {
+            if let Some((name, _, _)) = focused_account(app) {
+                context = Some(name);
+                scoped.push(Duplicate);
+                scoped.push(SaveAsPreset);
+                scoped.push(ApplyPreset);
             }
-        },
+        }
         // Fallback: every action the chain and its detail rows carry is bound to
         // a key of its own (⏎, ⇧↑↓, space, +/-), so `a` offers nothing.
         Tab::Fallback => {}
@@ -5256,7 +5332,9 @@ fn dispatch_action_menu_action(app: &mut App, action: ActionMenuAction) {
         ActionMenuAction::DisableProfile | ActionMenuAction::EnableProfile => {
             toggle_focused_account_disabled(app);
         }
-        ActionMenuAction::RemoveEnvField => remove_env_field(app),
+        ActionMenuAction::Duplicate => prompt_duplicate_profile(app),
+        ActionMenuAction::SaveAsPreset => prompt_save_preset(app),
+        ActionMenuAction::ApplyPreset => open_preset_picker(app),
         ActionMenuAction::RefreshStatus => trigger_status_refresh(app),
         ActionMenuAction::OpenIncidentLink => open_incident_link(app),
         ActionMenuAction::ToggleEstimates => toggle_show_estimates(app),
@@ -5398,6 +5476,7 @@ pub(crate) fn config_rows(app: &App) -> Vec<ConfigRow> {
                 ConfigRow::OpusModel => profile.and_then(|p| p.models.opus.as_deref()),
                 ConfigRow::SonnetModel => profile.and_then(|p| p.models.sonnet.as_deref()),
                 ConfigRow::HaikuModel => profile.and_then(|p| p.models.haiku.as_deref()),
+                ConfigRow::FableModel => profile.and_then(|p| p.models.fable.as_deref()),
                 ConfigRow::SubagentModel => profile.and_then(|p| p.models.subagent.as_deref()),
                 _ => None,
             };
@@ -5409,6 +5488,7 @@ pub(crate) fn config_rows(app: &App) -> Vec<ConfigRow> {
         ConfigRow::OpusModel,
         ConfigRow::SonnetModel,
         ConfigRow::HaikuModel,
+        ConfigRow::FableModel,
         ConfigRow::SubagentModel,
     ] {
         if expanded || override_set(row) {
@@ -5491,6 +5571,7 @@ fn build_draft_new() -> ConfigDraft {
         opus_model: InputState::new(""),
         sonnet_model: InputState::new(""),
         haiku_model: InputState::new(""),
+        fable_model: InputState::new(""),
         subagent_model: InputState::new(""),
         env_value: InputState::new(""),
         env_new_key: InputState::new(""),
@@ -5515,6 +5596,7 @@ fn build_draft_existing(app: &App, name: &str) -> ConfigDraft {
         opus_model: InputState::new(m.opus.as_deref().unwrap_or("")),
         sonnet_model: InputState::new(m.sonnet.as_deref().unwrap_or("")),
         haiku_model: InputState::new(m.haiku.as_deref().unwrap_or("")),
+        fable_model: InputState::new(m.fable.as_deref().unwrap_or("")),
         subagent_model: InputState::new(m.subagent.as_deref().unwrap_or("")),
         env_value: InputState::new(""),
         env_new_key: InputState::new(""),
@@ -5929,6 +6011,9 @@ fn row_committed_value(profile: Option<&Profile>, name: &str, row: ConfigRow) ->
         ConfigRow::HaikuModel => profile
             .and_then(|p| p.models.haiku.clone())
             .unwrap_or_default(),
+        ConfigRow::FableModel => profile
+            .and_then(|p| p.models.fable.clone())
+            .unwrap_or_default(),
         ConfigRow::SubagentModel => profile
             .and_then(|p| p.models.subagent.clone())
             .unwrap_or_default(),
@@ -5968,6 +6053,7 @@ fn commit_config_field(app: &mut App, field: ConfigRow) {
         | ConfigRow::OpusModel
         | ConfigRow::SonnetModel
         | ConfigRow::HaikuModel
+        | ConfigRow::FableModel
         | ConfigRow::SubagentModel => commit_model_field(app, field),
         ConfigRow::EnvEntry(i) => commit_env_value(app, i),
         ConfigRow::EnvAdd => commit_env_new_key(app),
@@ -6032,6 +6118,7 @@ fn apply_model_field(models: &mut ModelSettings, field: ConfigRow, raw: &str) {
         ConfigRow::OpusModel => models.opus = scalar,
         ConfigRow::SonnetModel => models.sonnet = scalar,
         ConfigRow::HaikuModel => models.haiku = scalar,
+        ConfigRow::FableModel => models.fable = scalar,
         ConfigRow::SubagentModel => models.subagent = scalar,
         _ => {}
     }
@@ -6263,50 +6350,6 @@ fn env_add_commit(app: &mut App, name: &str, key: &str) {
         app.config_action_cursor = row_pos;
     }
     enter_env_value_edit(app, idx);
-}
-
-/// Remove the focused custom env entry and persist; clamps the cursor afterwards.
-fn remove_env_field(app: &mut App) {
-    let rows = config_rows(app);
-    let Some(ConfigRow::EnvEntry(i)) = rows.get(app.config_action_cursor).copied() else {
-        return;
-    };
-    let Some(name) = app
-        .config_draft
-        .as_ref()
-        .and_then(|d| d.editing_name.clone())
-    else {
-        return;
-    };
-    let (removed, new_env) = {
-        let cfg = app.config();
-        match cfg.find(&name) {
-            Some(p) => {
-                let Some(removed) = p.env.keys().nth(i).cloned() else {
-                    return;
-                };
-                let mut env = p.env.clone();
-                env.remove(&removed);
-                (removed, env)
-            }
-            None => return,
-        }
-    };
-    let result = {
-        let mut cfg = app.config();
-        edit_profile_env(&mut cfg, &name, new_env)
-    };
-    match result {
-        Ok(()) => {
-            if let Some(d) = app.config_draft.as_mut() {
-                d.active = None;
-            }
-            let last = config_rows(app).len().saturating_sub(1);
-            app.config_action_cursor = app.config_action_cursor.min(last);
-            app.toast(ToastKind::Success, format!("removed env '{removed}'"));
-        }
-        Err(e) => app.toast(ToastKind::Danger, format!("env remove failed\n{e}")),
-    }
 }
 
 /// Position of `EnvEntry(sorted_idx)` in the current detail-row list, if present.
@@ -6629,6 +6672,290 @@ fn toggle_focused_account_disabled(app: &mut App) {
     }));
 }
 
+// ── Setup menu: duplicate + presets ───────────────────────────────────────────
+
+/// `duplicate account`: ask for the new name. The copy itself runs on ⏎, so
+/// esc costs nothing.
+fn prompt_duplicate_profile(app: &mut App) {
+    let Some((name, _, _)) = focused_account(app) else {
+        return;
+    };
+    app.modals.push(Modal::NamePrompt(NamePromptForm {
+        input: InputState::new(""),
+        action: NamePromptAction::DuplicateProfile(name),
+    }));
+}
+
+/// `save as preset`: ask for the preset name.
+fn prompt_save_preset(app: &mut App) {
+    let Some((name, _, _)) = focused_account(app) else {
+        return;
+    };
+    app.modals.push(Modal::NamePrompt(NamePromptForm {
+        input: InputState::new(""),
+        action: NamePromptAction::SavePreset(name),
+    }));
+}
+
+/// `apply preset`: open the picker. The list always holds the two built-ins, so
+/// it is never empty and needs no empty state.
+fn open_preset_picker(app: &mut App) {
+    let Some((name, _, _)) = focused_account(app) else {
+        return;
+    };
+    app.modals.push(Modal::PresetPicker(PresetPickerForm {
+        target: name,
+        presets: crate::presets::list_presets(),
+        cursor: 0,
+    }));
+}
+
+/// ⏎ on the name prompt. The name is validated for the action it carries —
+/// a duplicate against the profile roster, a preset against the preset store —
+/// and a failure toasts with the modal still open so the name can be fixed.
+fn handle_name_prompt_key(app: &mut App, key: KeyEvent) {
+    let Some(Modal::NamePrompt(form)) = app.modals.last_mut() else {
+        return;
+    };
+    match key.code {
+        // Esc closes; `q` is a valid name character and falls through to the
+        // input editor. (The other modals' `q` shortcut doesn't apply to a
+        // text field.)
+        KeyCode::Esc => {
+            app.modals.pop();
+        }
+        KeyCode::Enter => {
+            let name = form.input.trimmed().to_string();
+            let action = form.action.clone();
+            match action {
+                NamePromptAction::DuplicateProfile(source) => {
+                    let validation = {
+                        let cfg = app.config();
+                        validate_profile_name(&name, &cfg.names(), None)
+                    };
+                    if let Err(e) = validation {
+                        app.toast(ToastKind::Danger, format!("{e}"));
+                        return;
+                    }
+                    app.modals.pop();
+                    duplicate_profile_into(app, &source, &name);
+                }
+                NamePromptAction::SavePreset(source) => {
+                    // The preset store is its own namespace, so the roster is
+                    // empty here; only the charset + built-in rules apply.
+                    if let Err(e) = validate_profile_name(&name, &[], None) {
+                        app.toast(ToastKind::Danger, format!("{e}"));
+                        return;
+                    }
+                    if crate::presets::is_builtin(&name) {
+                        app.toast(
+                            ToastKind::Danger,
+                            format!("'{name}' is a built-in preset\npick another name"),
+                        );
+                        return;
+                    }
+                    app.modals.pop();
+                    if crate::presets::preset_exists(&name) {
+                        app.modals.push(Modal::Confirm(ConfirmState {
+                            message: format!("preset '{name}' already exists."),
+                            detail: Some(
+                                "overwrite it with this account's base url and model settings?"
+                                    .to_string(),
+                            ),
+                            choice: false,
+                            on_confirm: ConfirmAction::OverwritePreset(name, source),
+                        }));
+                        return;
+                    }
+                    save_preset_from(app, &source, &name);
+                }
+            }
+        }
+        _ => apply_input_edit(&mut form.input, key),
+    }
+}
+
+fn handle_preset_picker_key(app: &mut App, key: KeyEvent) {
+    let Some(Modal::PresetPicker(state)) = app.modals.last_mut() else {
+        return;
+    };
+    let last = state.presets.len().saturating_sub(1);
+    match key.code {
+        KeyCode::Esc | KeyCode::Char('q') => {
+            app.modals.pop();
+        }
+        KeyCode::Up => {
+            state.cursor = if state.cursor == 0 {
+                last
+            } else {
+                state.cursor - 1
+            };
+        }
+        KeyCode::Down => {
+            state.cursor = if state.cursor >= last {
+                0
+            } else {
+                state.cursor + 1
+            };
+        }
+        // Drop a custom preset. Built-ins have no file to drop, so the pick says
+        // so rather than no-opping: a list carries no dimmed row here.
+        KeyCode::Char('d') => {
+            let Some(preset) = state.presets.get(state.cursor.min(last)).cloned() else {
+                return;
+            };
+            app.modals.pop();
+            if preset.builtin {
+                app.toast(
+                    ToastKind::Info,
+                    format!("'{}' is built in and always available", preset.name),
+                );
+                return;
+            }
+            app.modals.push(Modal::Confirm(ConfirmState {
+                message: format!("delete preset '{}'?", preset.name),
+                detail: Some("accounts already stamped from it are untouched.".to_string()),
+                choice: false,
+                on_confirm: ConfirmAction::DeletePreset(preset.name),
+            }));
+        }
+        KeyCode::Enter => {
+            let picked = state.presets.get(state.cursor.min(last)).cloned();
+            let target = state.target.clone();
+            app.modals.pop();
+            let Some(preset) = picked else {
+                return;
+            };
+            // Naming the fields that would change is the whole point of the
+            // warning: "this overwrites settings" says nothing a user can act on.
+            let clobbered = {
+                let cfg = app.config();
+                cfg.find(&target).map(preset_clobbers).unwrap_or_default()
+            };
+            if clobbered.is_empty() {
+                apply_preset_to(app, &target, &preset.name);
+                return;
+            }
+            app.modals.push(Modal::Confirm(ConfirmState {
+                message: format!("apply '{}' over '{target}'?", preset.name),
+                detail: Some(format!("replaces {}.", clobbered.join(", "))),
+                choice: false,
+                on_confirm: ConfirmAction::ApplyPresetOver(target, preset.name),
+            }));
+        }
+        _ => {}
+    }
+}
+
+/// Which of the target's own fields an apply would land on, in row order and
+/// spelled the way the Setup rows are. Empty means the preset writes into a
+/// blank endpoint + model block and can go straight through. Every set field
+/// counts: the apply REPLACES both blocks wholesale, so a field the preset
+/// leaves unset is cleared rather than kept.
+fn preset_clobbers(profile: &Profile) -> Vec<&'static str> {
+    let mut out = Vec::new();
+    if profile.base_url.is_some() {
+        out.push("base url");
+    }
+    let m = &profile.models;
+    for (label, set) in [
+        ("model", m.default.is_some()),
+        ("opus", m.opus.is_some()),
+        ("sonnet", m.sonnet.is_some()),
+        ("haiku", m.haiku.is_some()),
+        ("fable", m.fable.is_some()),
+        ("subagent", m.subagent.is_some()),
+    ] {
+        if set {
+            out.push(label);
+        }
+    }
+    out
+}
+
+/// Stamp `preset` onto `target`: the endpoint first, then the models, each
+/// through the same `edit_profile_*` helper the detail rows commit with, so an
+/// active account's live `settings.json` is re-applied exactly as a hand edit
+/// would. Rebuilds the draft afterwards, since every buffer it holds is stale.
+///
+/// The preset is re-read here rather than carried from the picker: a confirm can
+/// sit open across an edit to the store, and what the user confirmed was a NAME.
+/// The account's own api key is preserved — a template names an endpoint, never
+/// the credential for one.
+fn apply_preset_to(app: &mut App, target: &str, preset: &str) {
+    let Some(preset) = crate::presets::load_preset(preset) else {
+        app.toast(ToastKind::Danger, format!("preset '{preset}' is gone"));
+        return;
+    };
+    let result = {
+        let mut cfg = app.config();
+        let api_key = cfg.find(target).and_then(|p| p.api_key.clone());
+        edit_profile_endpoint(&mut cfg, target, preset.base_url.clone(), api_key)
+            .and_then(|()| edit_profile_model(&mut cfg, target, preset.models.clone()))
+    };
+    match result {
+        Ok(()) => {
+            app.refresh_tokens();
+            app.last_reload_fp = reload_fingerprint();
+            if app.config_draft.is_some() {
+                app.config_draft = Some(build_draft_existing(app, target));
+            }
+            app.toast(
+                ToastKind::Success,
+                format!("applied '{}' to '{target}'", preset.name),
+            );
+        }
+        Err(e) => app.toast(ToastKind::Danger, format!("apply preset failed\n{e}")),
+    }
+}
+
+/// Save `source`'s base url + models under `preset`.
+fn save_preset_from(app: &mut App, source: &str, preset: &str) {
+    let fields = {
+        let cfg = app.config();
+        cfg.find(source)
+            .map(|p| (p.base_url.clone(), p.models.clone()))
+    };
+    let Some((base_url, models)) = fields else {
+        app.toast(ToastKind::Danger, format!("'{source}' is gone"));
+        return;
+    };
+    match crate::presets::save_preset(preset, &base_url, &models) {
+        Ok(()) => app.toast(ToastKind::Success, format!("saved preset '{preset}'")),
+        Err(e) => app.toast(ToastKind::Danger, format!("save preset failed\n{e}")),
+    }
+}
+
+/// Copy `source` onto a new account named `new_name` and select it.
+fn duplicate_profile_into(app: &mut App, source: &str, new_name: &str) {
+    let result = {
+        let mut cfg = app.config();
+        duplicate_profile(&mut cfg, source, new_name.to_string())
+    };
+    match result {
+        Ok(()) => {
+            app.refresh_tokens();
+            app.last_reload_fp = reload_fingerprint();
+            let idx = app
+                .config()
+                .profiles
+                .iter()
+                .position(|p| p.name == new_name)
+                .unwrap_or(0);
+            app.profile_cursor = idx;
+            app.config_action_cursor = 0;
+            if app.config_focus == ConfigFocus::Actions {
+                app.config_draft = Some(build_draft_existing(app, new_name));
+            }
+            app.toast(
+                ToastKind::Success,
+                format!("duplicated '{source}' as '{new_name}'"),
+            );
+        }
+        Err(e) => app.toast(ToastKind::Danger, format!("duplicate failed\n{e}")),
+    }
+}
+
 /// Flip `name`'s `Profile::disabled` flag (Setup `disabled` row). Inert while
 /// `name` is the active profile or holds a live `clauth start` session — the
 /// same gate `actions::disable_profile` itself enforces, checked here TOO so
@@ -6916,6 +7243,12 @@ fn run_confirm_action(app: &mut App, action: ConfirmAction) {
         ConfirmAction::RestartLogin(name, is_new) => start_login(app, name, is_new),
         ConfirmAction::DeleteLiveSession(name) => finish_delete(app, &name, true),
         ConfirmAction::AddChainCandidate(name) => commit_chain_add(app, &name),
+        ConfirmAction::OverwritePreset(preset, source) => save_preset_from(app, &source, &preset),
+        ConfirmAction::ApplyPresetOver(target, preset) => apply_preset_to(app, &target, &preset),
+        ConfirmAction::DeletePreset(preset) => match crate::presets::delete_preset(&preset) {
+            Ok(()) => app.toast(ToastKind::Success, format!("deleted preset '{preset}'")),
+            Err(e) => app.toast(ToastKind::Danger, format!("delete preset failed\n{e}")),
+        },
         ConfirmAction::Acknowledge => {}
     }
 }

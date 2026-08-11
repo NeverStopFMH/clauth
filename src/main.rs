@@ -23,6 +23,7 @@ mod out;
 mod platform;
 mod plugin_probe;
 mod poll;
+mod presets;
 mod pricing;
 mod profile;
 mod profile_cache;

@@ -760,30 +760,39 @@ fn narrow_overview_chain_row_keeps_its_figures_on_one_line() {
 }
 
 /// The footer advertises `a` only where the menu has something in it. Both
-/// directions on one screen: the Setup detail pane's env row can drop its key,
-/// which no key on that pane does, while every other row there is already its
-/// own ⏎ — so the hint has to come and go with the cursor.
+/// directions on one screen: the Setup tab's three actions all work on the
+/// focused account, and the `+ new` form has no account yet — so the hint has
+/// to come and go with the cursor.
 #[test]
 fn the_actions_hint_tracks_whether_the_menu_has_anything_in_it() {
-    use crate::tui::app::{ConfigRow, config_rows, handle_key};
+    use crate::tui::app::handle_key;
     use ratatui::crossterm::event::KeyCode;
     let _home = crate::testutil::HomeSandbox::new();
 
-    let mut profile = crate::testutil::blank_profile("acct");
-    profile.env.insert("FOO".to_string(), "bar".to_string());
     let mut app = App::new(AppConfig {
         state: AppState {
             profiles: vec![ProfileName::from("acct")],
             ..AppState::default()
         },
-        profiles: vec![profile],
+        profiles: vec![crate::testutil::blank_profile("acct")],
     });
     app.tab = Tab::Setup;
     handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
-    app.config_action_cursor = config_rows(&app)
-        .iter()
-        .position(|r| *r == ConfigRow::Name)
-        .expect("the name row is always present");
+    let menu = crate::tui::app::build_action_menu(&app);
+    assert_eq!(menu.items.len(), 3);
+    assert_eq!(
+        menu.context.as_deref(),
+        Some("acct"),
+        "a scoped group names the account it scopes to"
+    );
+    let out = dump(&app, 120, 30);
+    assert!(
+        out.contains("a actions"),
+        "an account carries three whole-account actions no key reaches:\n{out}"
+    );
+
+    // The create form sits past the roster: nothing to duplicate or stamp yet.
+    app.profile_cursor = app.profile_count();
     let menu = crate::tui::app::build_action_menu(&app);
     assert!(menu.items.is_empty());
     assert_eq!(
@@ -793,17 +802,7 @@ fn the_actions_hint_tracks_whether_the_menu_has_anything_in_it() {
     let out = dump(&app, 120, 30);
     assert!(
         !out.contains("a actions"),
-        "a text row's menu is empty, so the key must not be advertised:\n{out}"
-    );
-
-    app.config_action_cursor = config_rows(&app)
-        .iter()
-        .position(|r| matches!(r, ConfigRow::EnvEntry(_)))
-        .expect("the profile carries one custom env entry");
-    let out = dump(&app, 120, 30);
-    assert!(
-        out.contains("a actions"),
-        "the env row can drop its key, which no key on the pane does:\n{out}"
+        "the create form's menu is empty, so the key must not be advertised:\n{out}"
     );
 }
 

@@ -607,6 +607,7 @@ pub(crate) fn managed_env_key_label(key: &str) -> Option<&'static str> {
         "ANTHROPIC_DEFAULT_OPUS_MODEL" => "the opus model field",
         "ANTHROPIC_DEFAULT_SONNET_MODEL" => "the sonnet model field",
         "ANTHROPIC_DEFAULT_HAIKU_MODEL" => "the haiku model field",
+        "ANTHROPIC_DEFAULT_FABLE_MODEL" => "the fable model field",
         "CLAUDE_CODE_SUBAGENT_MODEL" => "the subagent model field",
         _ => return None,
     })
@@ -805,6 +806,7 @@ pub(crate) fn build_claude_settings_json(
         ("ANTHROPIC_DEFAULT_OPUS_MODEL", &profile.models.opus),
         ("ANTHROPIC_DEFAULT_SONNET_MODEL", &profile.models.sonnet),
         ("ANTHROPIC_DEFAULT_HAIKU_MODEL", &profile.models.haiku),
+        ("ANTHROPIC_DEFAULT_FABLE_MODEL", &profile.models.fable),
         ("CLAUDE_CODE_SUBAGENT_MODEL", &profile.models.subagent),
     ];
     for (key, value) in model_env {

@@ -3529,6 +3529,7 @@ mod env_editor {
             ConfigRow::OpusModel,
             ConfigRow::SonnetModel,
             ConfigRow::HaikuModel,
+            ConfigRow::FableModel,
             ConfigRow::SubagentModel,
         ] {
             assert!(
@@ -3580,6 +3581,7 @@ mod env_editor {
             ConfigRow::OpusModel,
             ConfigRow::SonnetModel,
             ConfigRow::HaikuModel,
+            ConfigRow::FableModel,
             ConfigRow::SubagentModel,
         ] {
             assert!(rows.contains(&row), "every override shows once expanded");
@@ -6156,5 +6158,349 @@ fn construct_probes_the_daemon_dot_instead_of_seeding_a_constant() {
         app_with(Vec::new()).daemon_health,
         DaemonHealth::Absent,
         "no holder → the seed hides the dot, proving the probe reads the lock"
+    );
+}
+
+// ── Setup menu: duplicate + presets ───────────────────────────────────────────
+//
+// The Setup pane's menu is now three whole-account actions, none of which any
+// key reaches: every per-row action is already the row's own ⏎.
+
+/// Both halves of the Setup tab configure the same focused account, so both
+/// carry the same scoped trio under the account's name. Past the roster (`+
+/// new`) there is no account to scope to, so the menu is empty and the footer
+/// stops advertising `a`.
+#[test]
+fn the_setup_tab_offers_the_focused_accounts_whole_account_actions() {
+    use super::{ConfigFocus, Tab, build_action_menu};
+    use crate::profile::Profile;
+    let _home = crate::testutil::HomeSandbox::new();
+
+    let mut app = app_with(vec![Profile::new("acct".to_string(), None, None)]);
+    app.tab = Tab::Setup;
+    app.profile_cursor = 0;
+
+    for focus in [ConfigFocus::Profiles, ConfigFocus::Actions] {
+        app.config_focus = focus;
+        let menu = build_action_menu(&app);
+        assert_eq!(
+            menu.items
+                .iter()
+                .map(|i| (i.label, i.hotkey))
+                .collect::<Vec<_>>(),
+            [
+                ("duplicate account", Some('d')),
+                ("save as preset", Some('s')),
+                ("apply preset", Some('p')),
+            ],
+            "{focus:?} carries the account-scoped trio",
+        );
+        assert_eq!(menu.scoped_len, 3, "all three act on the account");
+        assert_eq!(menu.context.as_deref(), Some("acct"));
+    }
+
+    // `+ new` sits past the roster: nothing to scope to, so nothing opens.
+    app.profile_cursor = app.profile_count();
+    assert!(
+        build_action_menu(&app).items.is_empty(),
+        "the create form has no account for these to act on",
+    );
+}
+
+/// `duplicate account` copies every configured field. The stored login does NOT
+/// come along, and neither do the two chain radios — `preferred` is exclusive
+/// across the whole roster (`toggle_preferred` clears every sibling), so a copy
+/// would put two profiles in a slot only one may hold.
+#[test]
+fn duplicate_copies_the_settings_and_leaves_the_login_and_the_radios_behind() {
+    use super::{ActionMenuAction, Modal, Tab, dispatch_action_menu_action, handle_key};
+    use crate::profile::{ClaudeCredentials, OAuthToken, Profile};
+    use ratatui::crossterm::event::KeyCode;
+    let _home = crate::testutil::HomeSandbox::new();
+
+    let mut src = Profile::new(
+        "src".to_string(),
+        Some("https://api.test/anthropic".to_string()),
+        Some("sk-secret".to_string()),
+    );
+    src.env.insert("FOO".to_string(), "bar".to_string());
+    src.models.default = Some("deepseek-chat".to_string());
+    src.models.fable = Some("claude-fable-5".to_string());
+    src.auto_start = true;
+    src.fallback_threshold = Some(80.0);
+    src.bell_threshold = Some(95.0);
+    src.check_weekly = false;
+    src.preferred = true;
+    src.last_resort = true;
+    src.credentials = Some(ClaudeCredentials {
+        claude_ai_oauth: Some(OAuthToken {
+            access_token: "at".to_string(),
+            refresh_token: Some("rt".to_string()),
+            expires_at: None,
+            scopes: None,
+            subscription_type: None,
+        }),
+    });
+    crate::profile::save_profile(&src).expect("save source");
+
+    let mut app = app_with(vec![src]);
+    app.tab = Tab::Setup;
+    app.profile_cursor = 0;
+
+    dispatch_action_menu_action(&mut app, ActionMenuAction::Duplicate);
+    assert!(
+        matches!(app.modals.last(), Some(Modal::NamePrompt(_))),
+        "the copy waits on a name",
+    );
+    for ch in "copy".chars() {
+        handle_key(&mut app, crate::testutil::key(KeyCode::Char(ch)));
+    }
+    handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    assert!(app.modals.is_empty(), "the prompt closes on commit");
+
+    let cfg = app.config();
+    let copy = cfg.find("copy").expect("the duplicate exists");
+    assert_eq!(copy.base_url.as_deref(), Some("https://api.test/anthropic"));
+    assert_eq!(copy.api_key.as_deref(), Some("sk-secret"));
+    assert_eq!(copy.env.get("FOO").map(String::as_str), Some("bar"));
+    assert_eq!(copy.models, cfg.find("src").expect("source").models);
+    assert!(copy.auto_start);
+    assert_eq!(copy.fallback_threshold, Some(80.0));
+    assert_eq!(copy.bell_threshold, Some(95.0));
+    assert!(!copy.check_weekly, "an off-by-default gate copies as off");
+
+    assert!(copy.credentials.is_none(), "the stored login stays behind");
+    assert!(!copy.preferred, "preferred is a roster-wide radio");
+    assert!(!copy.last_resort, "so is last-resort");
+    assert!(
+        cfg.find("src").expect("source").preferred,
+        "the source keeps its own radio",
+    );
+}
+
+/// A duplicate named after an existing account is refused by the same validator
+/// the create form uses, with the prompt left open so the name can be fixed.
+#[test]
+fn duplicate_refuses_a_name_already_on_the_roster() {
+    use super::{ActionMenuAction, Modal, Tab, dispatch_action_menu_action, handle_key};
+    use crate::profile::Profile;
+    use ratatui::crossterm::event::KeyCode;
+    let _home = crate::testutil::HomeSandbox::new();
+
+    let src = Profile::new("src".to_string(), None, None);
+    crate::profile::save_profile(&src).expect("save source");
+    let mut app = app_with(vec![src, Profile::new("taken".to_string(), None, None)]);
+    app.tab = Tab::Setup;
+    app.profile_cursor = 0;
+
+    dispatch_action_menu_action(&mut app, ActionMenuAction::Duplicate);
+    for ch in "taken".chars() {
+        handle_key(&mut app, crate::testutil::key(KeyCode::Char(ch)));
+    }
+    handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+
+    assert!(
+        matches!(app.modals.last(), Some(Modal::NamePrompt(_))),
+        "the prompt stays open on a bad name",
+    );
+    assert_eq!(
+        app.config().profiles.len(),
+        2,
+        "nothing was created under the taken name",
+    );
+}
+
+/// `save as preset` stores the account's endpoint + models, and `apply preset`
+/// stamps them onto another account. The picked preset is re-read from disk at
+/// apply, so what lands is what the store holds.
+#[test]
+fn a_saved_preset_applies_onto_another_account() {
+    use super::{ActionMenuAction, Modal, Tab, dispatch_action_menu_action, handle_key};
+    use crate::profile::Profile;
+    use ratatui::crossterm::event::KeyCode;
+    let _home = crate::testutil::HomeSandbox::new();
+
+    let mut src = Profile::new(
+        "src".to_string(),
+        Some("https://api.test/anthropic".to_string()),
+        None,
+    );
+    src.models.default = Some("deepseek-chat".to_string());
+    src.models.fable = Some("claude-fable-5".to_string());
+    crate::profile::save_profile(&src).expect("save source");
+    // The target holds a key of its own: a template names an endpoint, never
+    // the credential for one, so the apply must leave it standing.
+    let mut target = Profile::new("target".to_string(), None, Some("sk-target".to_string()));
+    target.api_key = Some("sk-target".to_string());
+    crate::profile::save_profile(&target).expect("save target");
+
+    let mut app = app_with(vec![src, target]);
+    app.tab = Tab::Setup;
+    app.profile_cursor = 0;
+
+    dispatch_action_menu_action(&mut app, ActionMenuAction::SaveAsPreset);
+    for ch in "mine".chars() {
+        handle_key(&mut app, crate::testutil::key(KeyCode::Char(ch)));
+    }
+    handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    let saved = crate::presets::load_preset("mine").expect("the preset landed");
+    assert_eq!(
+        saved.base_url.as_deref(),
+        Some("https://api.test/anthropic")
+    );
+    assert_eq!(saved.models.fable.as_deref(), Some("claude-fable-5"));
+
+    // Apply it onto the blank second account: nothing is set there, so no
+    // warning stands between the pick and the write.
+    app.profile_cursor = 1;
+    dispatch_action_menu_action(&mut app, ActionMenuAction::ApplyPreset);
+    let Some(Modal::PresetPicker(picker)) = app.modals.last() else {
+        panic!("apply opens the picker");
+    };
+    let at = picker
+        .presets
+        .iter()
+        .position(|p| p.name == "mine")
+        .expect("the saved preset is listed");
+    let Some(Modal::PresetPicker(picker)) = app.modals.last_mut() else {
+        unreachable!()
+    };
+    picker.cursor = at;
+    handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+
+    assert!(
+        app.modals.is_empty(),
+        "a blank target applies straight away"
+    );
+    let cfg = app.config();
+    let applied = cfg.find("target").expect("target");
+    assert_eq!(
+        applied.base_url.as_deref(),
+        Some("https://api.test/anthropic")
+    );
+    assert_eq!(applied.models.default.as_deref(), Some("deepseek-chat"));
+    assert_eq!(applied.models.fable.as_deref(), Some("claude-fable-5"));
+    assert_eq!(
+        applied.api_key.as_deref(),
+        Some("sk-target"),
+        "the account's own key survives an endpoint swap",
+    );
+}
+
+/// Applying over an account that already carries an endpoint or model settings
+/// names the fields it would replace, and cancelling leaves them alone.
+#[test]
+fn applying_over_set_fields_names_them_before_replacing_anything() {
+    use super::{
+        ActionMenuAction, Modal, Tab, dispatch_action_menu_action, handle_key, run_confirm_action,
+    };
+    use crate::profile::Profile;
+    use ratatui::crossterm::event::KeyCode;
+    let _home = crate::testutil::HomeSandbox::new();
+
+    let mut target = Profile::new(
+        "target".to_string(),
+        Some("https://old.test".to_string()),
+        None,
+    );
+    target.models.default = Some("keep-me".to_string());
+    target.models.opus = Some("old-opus".to_string());
+    crate::profile::save_profile(&target).expect("save target");
+
+    let mut app = app_with(vec![target]);
+    app.tab = Tab::Setup;
+    app.profile_cursor = 0;
+
+    dispatch_action_menu_action(&mut app, ActionMenuAction::ApplyPreset);
+    handle_key(&mut app, crate::testutil::key(KeyCode::Enter)); // cursor 0 = DeepSeek
+
+    let Some(Modal::Confirm(state)) = app.modals.pop() else {
+        panic!("a set field raises the overwrite warning");
+    };
+    assert_eq!(state.message, "apply 'DeepSeek' over 'target'?");
+    assert_eq!(
+        state.detail.as_deref(),
+        Some("replaces base url, model, opus."),
+        "the warning names the fields, not just that there are some",
+    );
+    assert!(!state.choice, "the warning defaults to cancel");
+
+    // Cancelling is the pop above — nothing ran.
+    assert_eq!(
+        app.config()
+            .find("target")
+            .expect("target")
+            .base_url
+            .as_deref(),
+        Some("https://old.test"),
+        "the cancelled apply wrote nothing",
+    );
+
+    run_confirm_action(&mut app, state.on_confirm);
+    let cfg = app.config();
+    let applied = cfg.find("target").expect("target");
+    assert_eq!(
+        applied.base_url.as_deref(),
+        Some("https://api.deepseek.com/anthropic")
+    );
+    assert_eq!(applied.models.default.as_deref(), Some("deepseek-chat"));
+    assert_eq!(
+        applied.models.opus, None,
+        "the apply replaces the model block whole, it does not merge into it",
+    );
+}
+
+/// `save as preset` onto a name a custom preset already holds asks first, and
+/// a built-in's name is refused outright with the prompt still open.
+#[test]
+fn saving_a_preset_guards_both_an_existing_name_and_a_builtin() {
+    use super::{
+        ActionMenuAction, ConfirmAction, Modal, Tab, dispatch_action_menu_action, handle_key,
+    };
+    use crate::profile::Profile;
+    use ratatui::crossterm::event::KeyCode;
+    let _home = crate::testutil::HomeSandbox::new();
+
+    let src = Profile::new(
+        "src".to_string(),
+        Some("https://api.test".to_string()),
+        None,
+    );
+    crate::profile::save_profile(&src).expect("save source");
+    let mut app = app_with(vec![src]);
+    app.tab = Tab::Setup;
+    app.profile_cursor = 0;
+
+    let type_name = |app: &mut super::App, name: &str| {
+        dispatch_action_menu_action(app, ActionMenuAction::SaveAsPreset);
+        for ch in name.chars() {
+            handle_key(app, crate::testutil::key(KeyCode::Char(ch)));
+        }
+        handle_key(app, crate::testutil::key(KeyCode::Enter));
+    };
+
+    type_name(&mut app, "mine");
+    assert!(
+        crate::presets::preset_exists("mine"),
+        "the first save lands"
+    );
+
+    type_name(&mut app, "mine");
+    let Some(Modal::Confirm(state)) = app.modals.pop() else {
+        panic!("a second save over the same name asks first");
+    };
+    assert!(matches!(
+        state.on_confirm,
+        ConfirmAction::OverwritePreset(ref p, ref s) if p == "mine" && s == "src"
+    ));
+
+    type_name(&mut app, "DeepSeek");
+    assert!(
+        matches!(app.modals.last(), Some(Modal::NamePrompt(_))),
+        "a built-in name is refused with the prompt open so it can be retyped",
+    );
+    assert!(
+        !crate::presets::preset_exists("DeepSeek"),
+        "and nothing was written into the built-in's slot",
     );
 }

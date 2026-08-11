@@ -1299,10 +1299,12 @@ fn load_config_repairs_a_loose_clauth_tree() {
 fn profile_config_reads_models_table() {
     let toml = "[models]\n\
         default = \"opusplan\"\n\
-        haiku = \"claude-haiku-4-5\"\n";
+        haiku = \"claude-haiku-4-5\"\n\
+        fable = \"claude-fable-5\"\n";
     let cfg: ProfileConfig = toml::from_str(toml).expect("parse models table");
     assert_eq!(cfg.models.default.as_deref(), Some("opusplan"));
     assert_eq!(cfg.models.haiku.as_deref(), Some("claude-haiku-4-5"));
+    assert_eq!(cfg.models.fable.as_deref(), Some("claude-fable-5"));
     assert_eq!(cfg.models.sonnet, None);
 }
 
@@ -1317,6 +1319,7 @@ fn model_settings_round_trip_through_config_toml() {
         opus: Some("claude-opus-4-8[1m]".to_string()),
         sonnet: None,
         haiku: None,
+        fable: Some("claude-fable-5".to_string()),
         subagent: Some("claude-haiku-4-5".to_string()),
     };
     let rendered = render_config_toml(&profile);

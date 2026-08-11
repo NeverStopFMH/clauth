@@ -11,7 +11,8 @@ use crate::profile::DivergenceChoice;
 
 use super::super::app::{
     ActionMenuState, App, ConfirmAction, ConfirmState, DivergenceAction, DivergenceForm,
-    DivergenceTargetForm, EnvCollisionChoice, EnvCollisionForm, InputState, LoginStage, Modal, Tab,
+    DivergenceTargetForm, EnvCollisionChoice, EnvCollisionForm, InputState, LoginStage, Modal,
+    NamePromptForm, PresetPickerForm, Tab,
 };
 use super::super::theme;
 use super::chain::reason_marker;
@@ -27,6 +28,8 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App, modal: &Modal) 
         Modal::Confirm(state) => draw_confirm(frame, area, state),
         Modal::Divergence(form) => draw_divergence(frame, area, form),
         Modal::CaptureName(form) => draw_capture_name(frame, area, &form.input),
+        Modal::NamePrompt(form) => draw_name_prompt(frame, area, form),
+        Modal::PresetPicker(form) => draw_preset_picker(frame, area, form),
         Modal::DivergenceTarget(form) => draw_divergence_target(frame, area, form),
         Modal::Help => draw_help(frame, area, app),
         Modal::ActionMenu(state) => draw_action_menu(frame, area, state),
@@ -500,6 +503,64 @@ fn draw_capture_name(frame: &mut Frame<'_>, area: Rect, input: &InputState) {
     frame.set_cursor_position((cx, cy));
 }
 
+/// The Setup menu's shared name prompt. Same geometry trick as
+/// [`draw_capture_name`] — the input is line index 2, so the native cursor can
+/// be placed without re-measuring what `draw_modal` already sized.
+fn draw_name_prompt(frame: &mut Frame<'_>, area: Rect, form: &NamePromptForm) {
+    let lines = vec![
+        Line::from(Span::styled(form.action.blurb(), theme::dim())),
+        Line::from(""),
+        labelled_input("name", &form.input, true),
+    ];
+
+    let title = form.action.title();
+    let content_w = lines.iter().map(Line::width).max().unwrap_or(0) as u16;
+    let w = (content_w + 6)
+        .max(title.chars().count() as u16 + 4)
+        .min(area.width.saturating_sub(4));
+    let h = (lines.len() as u16 + 4).min(area.height.saturating_sub(4));
+    let rect = centered(area, w, h);
+    let inner_x = rect.x.saturating_add(3);
+    let inner_y = rect.y.saturating_add(2);
+
+    draw_modal(frame, area, title, lines);
+
+    // x = edit gutter "✎ " (2) + label "name" (4) + " " (1) + cols before caret
+    let cx = inner_x.saturating_add(2 + 4 + 1 + head_cols(&form.input) as u16);
+    let cy = inner_y.saturating_add(2);
+    frame.set_cursor_position((cx, cy));
+}
+
+/// `apply preset` picker. Built-ins lead the list and carry a dim `built-in`
+/// tail so the two groups read apart without a second rule.
+fn draw_preset_picker(frame: &mut Frame<'_>, area: Rect, form: &PresetPickerForm) {
+    let last = form.presets.len().saturating_sub(1);
+    let cursor = form.cursor.min(last);
+
+    let mut lines: Vec<Line<'_>> = vec![
+        Line::from(Span::styled(
+            format!("sets the base url and models on '{}'.", form.target),
+            theme::dim(),
+        )),
+        Line::from(""),
+    ];
+    for (i, preset) in form.presets.iter().enumerate() {
+        let mut line = option_line(i == cursor, preset.name.clone());
+        if preset.builtin {
+            line.push_span(Span::styled("  built-in", theme::dim()));
+        }
+        lines.push(line);
+    }
+    // `d` reaches nothing else from here, so the picker has to teach it.
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "d deletes a saved preset",
+        theme::dim(),
+    )));
+
+    draw_modal(frame, area, "PRESET", lines);
+}
+
 /// Per-tab rows for the KEYS help modal, beneath the shared `tabs`/`global`
 /// sections. A standalone builder (not inlined into `draw_help`) so tests can
 /// enumerate every tab's real content without rendering a frame — see
@@ -544,7 +605,11 @@ fn tab_specific_rows(tab: Tab) -> Vec<(&'static str, &'static [(&'static str, &'
                 ("\u{21b5}", "open settings · edit field · flip toggle"),
                 ("\u{21b5} on a field", "edit inline; \u{21b5} again saves"),
                 ("space", "cycle the model preset (model row)"),
-                ("env", "+ add env · \u{21b5} edits a value · a removes"),
+                ("env", "+ add env · \u{21b5} edits a value"),
+                (
+                    "a",
+                    "duplicate the account \u{b7} save it as a preset \u{b7} apply one",
+                ),
                 (
                     "disable / enable",
                     "\u{21b5} arms disable, again confirms \u{b7} enable is one press \u{b7} inert while active or a live session is open",

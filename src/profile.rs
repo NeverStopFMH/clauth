@@ -806,7 +806,7 @@ impl AppConfig {
 }
 
 /// Per-account model knobs written into the profile's Claude Code `settings.json`.
-/// `default` is the `model` setting; `opus`/`sonnet`/`haiku` are the
+/// `default` is the `model` setting; `opus`/`sonnet`/`haiku`/`fable` are the
 /// `ANTHROPIC_DEFAULT_*_MODEL` env overrides; `subagent` is
 /// `CLAUDE_CODE_SUBAGENT_MODEL`.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -820,6 +820,8 @@ pub(crate) struct ModelSettings {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) haiku: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) fable: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) subagent: Option<String>,
 }
 
@@ -829,6 +831,7 @@ impl ModelSettings {
             && self.opus.is_none()
             && self.sonnet.is_none()
             && self.haiku.is_none()
+            && self.fable.is_none()
             && self.subagent.is_none()
     }
 }
@@ -1735,15 +1738,16 @@ fn render_config_toml(profile: &Profile) -> String {
 
     out.push_str("# Per-account Claude Code model configuration, written into this profile's\n");
     out.push_str("# settings.json. `default` is the `model` setting (an alias like `opusplan`\n");
-    out.push_str("# or a full id like `claude-opus-4-8[1m]`); `opus`/`sonnet`/`haiku` pin what\n");
-    out.push_str("# those aliases resolve to (ANTHROPIC_DEFAULT_*_MODEL); `subagent` forces the\n");
-    out.push_str("# subagent model (CLAUDE_CODE_SUBAGENT_MODEL).\n");
+    out.push_str("# or a full id like `claude-opus-4-8[1m]`); `opus`/`sonnet`/`haiku`/`fable`\n");
+    out.push_str("# pin what those aliases resolve to (ANTHROPIC_DEFAULT_*_MODEL); `subagent`\n");
+    out.push_str("# forces the subagent model (CLAUDE_CODE_SUBAGENT_MODEL).\n");
     let m = &profile.models;
     let scalars = [
         ("default", &m.default),
         ("opus", &m.opus),
         ("sonnet", &m.sonnet),
         ("haiku", &m.haiku),
+        ("fable", &m.fable),
         ("subagent", &m.subagent),
     ];
     if scalars.iter().all(|(_, v)| v.is_none()) {

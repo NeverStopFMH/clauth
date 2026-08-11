@@ -463,6 +463,7 @@ fn build_settings_writes_model_knobs() {
         opus: Some("claude-opus-4-8[1m]".to_string()),
         sonnet: None,
         haiku: None,
+        fable: Some("claude-fable-5".to_string()),
         subagent: Some("claude-haiku-4-5".to_string()),
     };
     let json = build_claude_settings_json(Some(&base), &profile, &[]).expect("build settings");
@@ -472,11 +473,32 @@ fn build_settings_writes_model_knobs() {
         v["env"]["ANTHROPIC_DEFAULT_OPUS_MODEL"],
         "claude-opus-4-8[1m]"
     );
+    assert_eq!(v["env"]["ANTHROPIC_DEFAULT_FABLE_MODEL"], "claude-fable-5");
     assert_eq!(v["env"]["CLAUDE_CODE_SUBAGENT_MODEL"], "claude-haiku-4-5");
     assert!(
         v["env"].get("ANTHROPIC_DEFAULT_SONNET_MODEL").is_none(),
         "an unset tier override writes no env key",
     );
+}
+
+/// `ModelSettings::is_empty` is the gate that decides whether a profile with no
+/// endpoint and no env is worth writing settings for at all, so a tier missing
+/// from it makes that tier's ONLY-set case a silent no-write.
+#[test]
+fn a_tier_override_alone_is_enough_to_write_settings() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let base = tmp.path().join("settings.json"); // absent → nothing to merge onto
+    let mut profile = crate::profile::Profile::new("p".to_string(), None, None);
+    profile.models.fable = Some("claude-fable-5".to_string());
+    assert!(
+        !profile.models.is_empty(),
+        "a lone tier override is not an empty model block",
+    );
+
+    crate::profile::save_profile(&profile).expect("save profile");
+    let json = build_claude_settings_json(Some(&base), &profile, &[]).expect("build settings");
+    let v: serde_json::Value = serde_json::from_str(&json).expect("parse settings");
+    assert_eq!(v["env"]["ANTHROPIC_DEFAULT_FABLE_MODEL"], "claude-fable-5");
 }
 
 // A profile with no model config must strip a previous profile's model knobs
@@ -487,7 +509,7 @@ fn build_settings_clears_stale_model_knobs() {
     let base = tmp.path().join("settings.json");
     fs::write(
         &base,
-        r#"{"model":"opus","env":{"ANTHROPIC_DEFAULT_OPUS_MODEL":"old","CLAUDE_CODE_SUBAGENT_MODEL":"old","KEEP":"1"}}"#,
+        r#"{"model":"opus","env":{"ANTHROPIC_DEFAULT_OPUS_MODEL":"old","ANTHROPIC_DEFAULT_FABLE_MODEL":"old","CLAUDE_CODE_SUBAGENT_MODEL":"old","KEEP":"1"}}"#,
     )
     .expect("seed base settings");
     let profile = crate::profile::Profile::new("p".to_string(), None, None); // empty models
@@ -495,6 +517,7 @@ fn build_settings_clears_stale_model_knobs() {
     let v: serde_json::Value = serde_json::from_str(&json).expect("parse settings");
     assert!(v.get("model").is_none(), "top-level `model` cleared");
     assert!(v["env"].get("ANTHROPIC_DEFAULT_OPUS_MODEL").is_none());
+    assert!(v["env"].get("ANTHROPIC_DEFAULT_FABLE_MODEL").is_none());
     assert!(v["env"].get("CLAUDE_CODE_SUBAGENT_MODEL").is_none());
     assert_eq!(v["env"]["KEEP"], "1", "unrelated env keys are preserved");
 }

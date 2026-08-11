@@ -75,6 +75,7 @@ struct Snap {
     opus: String,
     sonnet: String,
     haiku: String,
+    fable: String,
     subagent: String,
     /// Sorted `(key, value)` custom env entries — one `EnvEntry` row each.
     env: Vec<(String, String)>,
@@ -124,6 +125,7 @@ impl Snap {
             opus: String::new(),
             sonnet: String::new(),
             haiku: String::new(),
+            fable: String::new(),
             subagent: String::new(),
             env: Vec::new(),
             auto_start: false,
@@ -173,6 +175,7 @@ fn build_snap(app: &App, with_text: bool) -> Snap {
             opus: text(&p.models.opus),
             sonnet: text(&p.models.sonnet),
             haiku: text(&p.models.haiku),
+            fable: text(&p.models.fable),
             subagent: text(&p.models.subagent),
             // Env rows render from the snapshot (no per-entry draft buffer), so
             // they're always populated — even while a draft owns the text fields.
@@ -434,6 +437,7 @@ fn snap_value(snap: &Snap, row: ConfigRow) -> &str {
         ConfigRow::OpusModel => &snap.opus,
         ConfigRow::SonnetModel => &snap.sonnet,
         ConfigRow::HaikuModel => &snap.haiku,
+        ConfigRow::FableModel => &snap.fable,
         ConfigRow::SubagentModel => &snap.subagent,
         ConfigRow::EnvEntry(i) => snap.env.get(i).map(|(_, v)| v.as_str()).unwrap_or(""),
         ConfigRow::AutoStart
@@ -466,8 +470,11 @@ fn row_hint(row: ConfigRow, snap: &Snap) -> Option<String> {
         ConfigRow::OpusModel => "what the opus alias resolves to (full model id)",
         ConfigRow::SonnetModel => "what the sonnet alias resolves to (full model id)",
         ConfigRow::HaikuModel => "what the haiku alias resolves to (full model id)",
+        ConfigRow::FableModel => "what the fable alias resolves to (full model id)",
         ConfigRow::SubagentModel => "model forced for every subagent in this account",
-        ConfigRow::EnvEntry(_) => "env var set for claude code while this account is active",
+        // No row or key drops the key itself — an emptied value saves as an
+        // empty string — so the hint has to say where the entry actually goes.
+        ConfigRow::EnvEntry(_) => "set while this account is active · an empty value keeps the key",
         ConfigRow::EnvAdd => "add an env var for this account",
         // Gate reasons name the same blockers as the CLI's own refusal copy
         // (`actions::disable_profile`), then the on/off state — checked in that
@@ -543,6 +550,7 @@ fn detail_row(
         ConfigRow::OpusModel => kv_field(arrow, "opus", input, editing, selected, false),
         ConfigRow::SonnetModel => kv_field(arrow, "sonnet", input, editing, selected, false),
         ConfigRow::HaikuModel => kv_field(arrow, "haiku", input, editing, selected, false),
+        ConfigRow::FableModel => kv_field(arrow, "fable", input, editing, selected, false),
         ConfigRow::SubagentModel => kv_field(arrow, "subagent", input, editing, selected, false),
         // A custom env entry: its key is the label; mask the value when the key
         // looks like a credential (mirrors the api-key row).

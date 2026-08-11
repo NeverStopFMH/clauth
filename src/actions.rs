@@ -646,6 +646,39 @@ pub(crate) fn create_blank_profile(
     })
 }
 
+/// Copy every configured setting of `source` onto a new profile named `name`.
+///
+/// What is DELIBERATELY not copied:
+/// - the stored OAuth pair, the usage cache and the fetch/third-party state —
+///   all per-login, and a duplicate holds no login yet;
+/// - `preferred` and `last_resort`, which are radios across the whole profile
+///   list (`toggle_preferred` clears every sibling): copying either would put
+///   two profiles in a slot only one may hold, and `fallback.rs` picks the
+///   first it finds, so the loser would just vanish silently.
+///
+/// The api key IS copied: it is a per-endpoint setting the Setup tab edits like
+/// any other field, and a duplicate of an api account with no key cannot talk
+/// to anything.
+pub(crate) fn duplicate_profile(config: &mut AppConfig, source: &str, name: String) -> Result<()> {
+    with_state_lock(|| {
+        let src = config.find(source).context("profile not found")?;
+        let mut profile = Profile::new(name, src.base_url.clone(), src.api_key.clone());
+        profile.auto_start = src.auto_start;
+        profile.env = src.env.clone();
+        profile.models = src.models.clone();
+        profile.fallback_threshold = src.fallback_threshold;
+        profile.weekly_threshold = src.weekly_threshold;
+        profile.max_auto_spend = src.max_auto_spend;
+        profile.check_weekly = src.check_weekly;
+        profile.check_scoped = src.check_scoped;
+        profile.bell_threshold = src.bell_threshold;
+        profile.disabled = src.disabled;
+        save_profile(&profile)?;
+        config.add(profile);
+        save_app_state(&config.state)
+    })
+}
+
 /// Set a profile's default `model` (the Setup tab's base model row / the
 /// `clauth login --model` flag), preserving any alias overrides already on it.
 /// An empty (post-trim) value clears the default, matching the Setup tab's ⏎

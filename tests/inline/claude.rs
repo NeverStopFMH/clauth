@@ -1576,26 +1576,102 @@ fn carry_copies_mcp_oauth_and_leaves_the_target_login_untouched() {
     );
 }
 
+/// The accepted ceiling, pinned end-to-end rather than at the helper: the carry
+/// can add and overwrite, never delete, so a block the live file lacks survives
+/// onto the live slot when that store becomes live. Pruning instead would wipe
+/// real logins the first time a freshly-logged-in account went live. Anyone who
+/// adds pruning fails here and has to go read why it is deliberate.
+#[cfg(unix)]
 #[test]
-fn carry_leaves_target_blocks_the_live_file_lacks() {
+fn a_block_the_live_file_lacks_survives_onto_the_live_slot() {
+    let _home = HomeSandbox::new();
+    let mut a = crate::profile::Profile::new("a".to_string(), None, None);
+    a.credentials = Some(creds("login-a", Some("refresh-a")));
+    crate::profile::save_profile(&a).expect("save a");
+    let mut b = crate::profile::Profile::new("b".to_string(), None, None);
+    b.credentials = Some(creds("login-b", Some("refresh-b")));
+    crate::profile::save_profile(&b).expect("save b");
+
+    // B's store already holds an MCP login from an earlier era; the live file
+    // (A, freshly logged in through the browser) carries none.
+    let b_store = crate::profile::profile_dir("b")
+        .expect("dir")
+        .join("credentials.json");
+    let mut stored: serde_json::Value =
+        serde_json::from_slice(&fs::read(&b_store).expect("read b")).expect("parse");
+    stored["mcpOAuth"] = serde_json::json!({ "sentry": { "accessToken": "mock-sentry" } });
+    fs::write(&b_store, serde_json::to_vec(&stored).unwrap()).expect("seed b");
+    force_link_profile_credentials("a").expect("link a");
+
+    force_link_profile_credentials("b").expect("link b");
+
+    let live_path = claude_credentials_path().expect("creds path");
+    let after: serde_json::Value =
+        serde_json::from_slice(&fs::read(&live_path).expect("read after")).expect("parse");
+    assert_eq!(
+        after["mcpOAuth"]["sentry"]["accessToken"], "mock-sentry",
+        "a login-only live file must not prune the incoming store's own blocks"
+    );
+}
+
+/// The static-token sidecar is built by [`write_session_token`] from the mint
+/// alone, so anything carried into it is dropped at the next re-mint. Driven
+/// through the production writer on purpose: the sidecar DOES carry a
+/// `claudeAiOauth` block, so a content-shaped guard reads it as an OAuth store
+/// and writes MCP secrets into it.
+#[test]
+fn carry_skips_the_static_token_sidecar() {
+    let _home = HomeSandbox::new();
+    let mut split = crate::profile::Profile::new("split".to_string(), None, None);
+    split.credentials = Some(creds("usage-access", Some("usage-refresh")));
+    crate::profile::save_profile(&split).expect("save split");
+    let target = crate::profile::profile_dir("split")
+        .expect("dir")
+        .join("session-token.json");
+    crate::claude::write_session_token("split", &format!("sk-ant-{}", "m".repeat(40)), 0)
+        .expect("mint");
+    let before = fs::read(&target).expect("read sidecar");
+
+    let live = crate::profile::profile_dir("split")
+        .expect("dir")
+        .join("live.json");
+    fs::write(
+        &live,
+        serde_json::to_vec(&live_with_mcp("live-login", "mock-linear")).unwrap(),
+    )
+    .expect("write live");
+
+    carry_live_extra_into(&live, &target).expect("carry");
+
+    assert_eq!(
+        fs::read(&target).expect("read sidecar"),
+        before,
+        "the sidecar is rebuilt from the mint on every re-mint, so nothing may be carried into it"
+    );
+}
+
+/// The carry is an allowlist: only `mcpOAuth` moves. Any other non-login key
+/// Claude Code parks in that store stays with the account that minted it.
+#[test]
+fn carry_moves_only_the_allowlisted_key() {
     let dir = tempfile::tempdir().expect("tempdir");
     let live = dir.path().join("live.json");
     let target = dir.path().join("credentials.json");
-    // Live carries no mcpOAuth at all.
     fs::write(
         &live,
-        serde_json::to_vec(
-            &serde_json::json!({ "claudeAiOauth": { "accessToken": "live-login" } }),
-        )
+        serde_json::to_vec(&serde_json::json!({
+            "claudeAiOauth": { "accessToken": "live-login" },
+            "mcpOAuth": { "linear": { "accessToken": "mock-linear" } },
+            "trustedDeviceToken": "mock-device-token"
+        }))
         .unwrap(),
     )
     .expect("write live");
     fs::write(
         &target,
-        serde_json::to_vec(&serde_json::json!({
-            "claudeAiOauth": { "accessToken": "target-login" },
-            "mcpOAuth": { "sentry": { "accessToken": "mock-sentry" } }
-        }))
+        serde_json::to_vec(
+            &serde_json::json!({ "claudeAiOauth": { "accessToken": "target-login" } }),
+        )
         .unwrap(),
     )
     .expect("write target");
@@ -1605,32 +1681,43 @@ fn carry_leaves_target_blocks_the_live_file_lacks() {
     let got: serde_json::Value =
         serde_json::from_slice(&fs::read(&target).expect("read target")).expect("parse");
     assert_eq!(
-        got["mcpOAuth"]["sentry"]["accessToken"], "mock-sentry",
-        "a block the live file lacks is left as the target had it"
+        got["mcpOAuth"]["linear"]["accessToken"], "mock-linear",
+        "the allowlisted key is carried"
+    );
+    assert!(
+        got.get("trustedDeviceToken").is_none(),
+        "an unrecognised key must not cross accounts on a switch"
     );
 }
 
+/// The carry is a new writer of a file under `~/.clauth`, so it owes the tree's
+/// 0600 invariant like every other one.
+#[cfg(unix)]
 #[test]
-fn carry_skips_a_non_oauth_store() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let live = dir.path().join("live.json");
-    let target = dir.path().join("session-token.json");
+fn carry_keeps_the_store_at_0600() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let _home = HomeSandbox::new();
+    let mut a = crate::profile::Profile::new("a".to_string(), None, None);
+    a.credentials = Some(creds("login-a", Some("refresh-a")));
+    crate::profile::save_profile(&a).expect("save a");
+    let target = crate::profile::profile_dir("a")
+        .expect("dir")
+        .join("credentials.json");
+
+    let live = crate::profile::profile_dir("a")
+        .expect("dir")
+        .join("live.json");
     fs::write(
         &live,
         serde_json::to_vec(&live_with_mcp("live-login", "mock-linear")).unwrap(),
     )
     .expect("write live");
-    let sidecar = serde_json::json!({ "sessionToken": "mock-static-token" });
-    fs::write(&target, serde_json::to_vec(&sidecar).unwrap()).expect("write sidecar");
 
     carry_live_extra_into(&live, &target).expect("carry");
 
-    let got: serde_json::Value =
-        serde_json::from_slice(&fs::read(&target).expect("read target")).expect("parse");
-    assert_eq!(
-        got, sidecar,
-        "a session-token store has no claudeAiOauth and is left untouched"
-    );
+    let mode = fs::metadata(&target).expect("stat").permissions().mode() & 0o777;
+    assert_eq!(mode, 0o600, "the carry must not widen the store's mode");
 }
 
 #[cfg(unix)]
@@ -1832,5 +1919,49 @@ fn link_refuses_two_differing_logged_out_shells() {
     assert!(
         err.to_string().contains("refusing to replace"),
         "a blank token must never match another blank token: {err}"
+    );
+}
+
+/// A carry failure must not strand the operator on the outgoing account.
+/// Preserving MCP logins is a convenience; completing the switch is not, so an
+/// unwritable profile directory reports and continues.
+#[cfg(unix)]
+#[test]
+fn a_failed_carry_still_completes_the_switch() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let _home = HomeSandbox::new();
+    let mut a = crate::profile::Profile::new("a".to_string(), None, None);
+    a.credentials = Some(creds("login-a", Some("refresh-a")));
+    crate::profile::save_profile(&a).expect("save a");
+    let mut b = crate::profile::Profile::new("b".to_string(), None, None);
+    b.credentials = Some(creds("login-b", Some("refresh-b")));
+    crate::profile::save_profile(&b).expect("save b");
+
+    force_link_profile_credentials("a").expect("link a");
+    let live_path = claude_credentials_path().expect("creds path");
+    let mut live: serde_json::Value =
+        serde_json::from_slice(&fs::read(&live_path).expect("read live")).expect("parse live");
+    live["mcpOAuth"] = serde_json::json!({ "linear": { "accessToken": "mock-linear" } });
+    fs::write(&live_path, serde_json::to_vec(&live).unwrap()).expect("write live mcp");
+
+    // Lock B's directory so the carry's atomic write cannot land its temp file.
+    let b_dir = crate::profile::profile_dir("b").expect("dir");
+    fs::set_permissions(&b_dir, fs::Permissions::from_mode(0o500)).expect("lock b");
+    if fs::write(b_dir.join(".probe"), b"x").is_ok() {
+        // Running as root: mode bits do not deny, so there is no failure to drive.
+        fs::set_permissions(&b_dir, fs::Permissions::from_mode(0o700)).expect("unlock b");
+        return;
+    }
+
+    let result = force_link_profile_credentials("b");
+    fs::set_permissions(&b_dir, fs::Permissions::from_mode(0o700)).expect("unlock b");
+    result.expect("an unwritable store must not fail the switch");
+
+    let after: serde_json::Value =
+        serde_json::from_slice(&fs::read(&live_path).expect("read after")).expect("parse after");
+    assert_eq!(
+        after["claudeAiOauth"]["accessToken"], "login-b",
+        "the switch installed account B even though its MCP carry could not land"
     );
 }

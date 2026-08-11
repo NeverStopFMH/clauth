@@ -64,12 +64,14 @@ Entries above the rule act on the account named in the menu's title bar; entries
 | Usage | `refresh usage`, `rotate access token`, `disable account` / `enable account` | `refresh all accounts`, `toggle estimates`, `toggle pace marker` |
 | Tokens | none | `period: lifetime` / `daily` / `weekly` / `monthly`, `show all models` / `show claude models` / `show other models`, `toggle cache counting`, `reload stats` |
 | Setup (account list) | none | `new account` |
-| Setup (a settings row) | the row's own action: `toggle auto-start`, `log in`, `log out`, `clear long-lived token`, `remove field`, `disable account` / `enable account`, `delete account`, `create account` | none |
+| Setup (a settings row) | `remove field`, on an env row only | none |
 | Status | none | `refresh status`, `open in browser` |
 
 The active period or model filter is omitted from the Tokens menu, so the entries you see are the ones that would change something.
 
-`disable account` off the Setup tab asks first, since disabling drops the account from auto-switch, usage polling and status mid-flight; re-enabling is immediate. Neither runs for the active account or for one holding a live `clauth start` session; the pick names whichever is in the way.
+The Setup detail pane is itself a list of actions, so <kbd>⏎</kbd> on a row is the action and the menu adds only `remove field`: dropping a custom env var is the one thing no key there does, since <kbd>⏎</kbd> on an env row edits its value and an empty value saves as empty.
+
+`disable account` from Overview or Usage asks first, since disabling drops the account from auto-switch, usage polling and status mid-flight; re-enabling is immediate. Neither runs for the active account or for one holding a live `clauth start` session; the pick names whichever is in the way.
 
 ## Setup tab rows
 

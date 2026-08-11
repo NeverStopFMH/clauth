@@ -1716,6 +1716,15 @@ fn carry_keeps_the_store_at_0600() {
 
     carry_live_extra_into(&live, &target).expect("carry");
 
+    // Assert the write HAPPENED before asserting its mode: a carry that never
+    // runs leaves the mode `save_profile` set, so a mode check alone passes
+    // against a no-op and the posture it claims to pin goes uncovered.
+    let got: serde_json::Value =
+        serde_json::from_slice(&fs::read(&target).expect("read target")).expect("parse");
+    assert_eq!(
+        got["mcpOAuth"]["linear"]["accessToken"], "mock-linear",
+        "the carry must have rewritten the store for its mode to mean anything"
+    );
     let mode = fs::metadata(&target).expect("stat").permissions().mode() & 0o777;
     assert_eq!(mode, 0o600, "the carry must not widen the store's mode");
 }

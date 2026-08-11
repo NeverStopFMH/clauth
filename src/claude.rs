@@ -131,6 +131,14 @@ pub(crate) fn clear_static_backup(name: &str) -> Result<bool> {
     })
 }
 
+/// Whether `name` holds a preserved mint backup (`session-token.static.json`).
+/// A single stat: the Setup tab's clear row uses it to DISCLOSE that the
+/// backup goes with a clear, and to stay reachable while the backup is the
+/// only long-lived piece left.
+pub(crate) fn has_static_backup(name: &str) -> bool {
+    profile_dir(name).is_ok_and(|d| d.join("session-token.static.json").exists())
+}
+
 /// A cheap identity of `name`'s on-disk credential state: (mtime, length) of
 /// `credentials.json`, `session-token.json`, and `session-token.static.json`,
 /// `None` per absent file. Every recovery the re-login-shaped scheduler

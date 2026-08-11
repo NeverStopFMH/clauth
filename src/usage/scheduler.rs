@@ -3505,14 +3505,20 @@ const ROLLING_RETRY_MS: u64 = 15 * 60 * 1000;
 /// so a hold only the clock releases would sit on the operator's fix for up to
 /// six hours. Every hold this long therefore records a
 /// [`crate::claude::credential_fingerprint`] of the profile, and a change to
-/// any of the three files releases the hold on the next scan — the gate runs
-/// right after the fix, not six hours later.
+/// any of the three files — the operator's fix, or clauth's own successful
+/// rotation of the chain, either of which is exactly a reason to re-judge —
+/// releases the hold on the next scan: the gate runs right after the write,
+/// not six hours later. A self-release re-runs one gate and, if the verdict
+/// stands, re-inserts the hold — bounded by the writes themselves.
 const ROLLING_BROKEN_RETRY_MS: u64 = 6 * 60 * 60 * 1000;
 
 /// One paced re-stamp hold. `watched` is `Some` exactly on the
 /// [`ROLLING_BROKEN_RETRY_MS`]-length holds — the re-login-shaped ones, whose
-/// real exit is the operator changing a credential file, not the clock. The
-/// short transient cadence stays purely time-based.
+/// real exit is a credential file changing (the operator's fix, or clauth's
+/// own successful rotation — either one is reason to re-judge), not the
+/// clock. The short transient cadence stays purely time-based, and the
+/// backwards-clock clamp reads the kind off `watched`, so the coupling holds
+/// under a clock step too.
 pub(super) struct RetryHold {
     not_before: u64,
     watched: Option<[Option<(std::time::SystemTime, u64)>; 3]>,
@@ -3593,15 +3599,19 @@ pub(super) fn claude_rolling_tick(
     for name in candidates {
         let held = pacing.lock().ok().and_then(|mut p| {
             // Same backwards-clock clamp as the scan stamp: a retry stamp
-            // further out than the longest leash can only mean the wall
-            // clock moved back under it. Clamping to the LONGEST leash is
-            // chosen, not sloppy: the stored stamp does not say which
-            // leash minted it, so a big backwards step can stretch a
-            // 15-minute retry to at most the 6h Broken leash — bounded
-            // and rare — where clamping to the short leash would let the
-            // same step ERODE every legitimate Broken leash instead.
+            // further out than its own leash can only mean the wall clock
+            // moved back under it. The hold KNOWS its leash now — `watched`
+            // rides exactly the long one — so each kind clamps to its own
+            // bound, and a backwards step can no longer stretch a 15-minute
+            // retry into an unwatched six-hour stall (the one combination
+            // with no exit but the clock, which the watch exists to remove).
             let hold = p.retry_after_ms.get_mut(&name)?;
-            hold.not_before = hold.not_before.min(now + ROLLING_BROKEN_RETRY_MS);
+            let bound = if hold.watched.is_some() {
+                ROLLING_BROKEN_RETRY_MS
+            } else {
+                ROLLING_RETRY_MS
+            };
+            hold.not_before = hold.not_before.min(now + bound);
             Some((hold.not_before, hold.watched))
         });
         if let Some((not_before, watched)) = held

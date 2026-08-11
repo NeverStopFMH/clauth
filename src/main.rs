@@ -721,7 +721,7 @@ fn cmd_static_token_clear(name: &str, yes: bool) -> Result<()> {
     use std::io::IsTerminal as _;
     platform::init();
 
-    let mut config = load_config()?;
+    let config = load_config()?;
     let canonical = resolve_or_bail(&config, name)?;
     let target = canonical.as_str();
     let profile = config
@@ -780,16 +780,10 @@ fn cmd_static_token_clear(name: &str, yes: bool) -> Result<()> {
             }
         }
         if rolling_armed {
-            outln!(
-                "clauth: '{target}' is on the rolling token — clearing also turns its \
-                 re-stamping off."
-            );
+            outln!("{}", clear_disarm_note(target));
         }
         if backup_present {
-            outln!(
-                "clauth: the preserved mint at session-token.static.json goes with it — \
-                 `clauth static-token {target}` will have nothing to restore."
-            );
+            outln!("{}", clear_backup_note(target));
         }
         out!("Clear the long-lived token for '{target}'? [y/N] ");
         let mut answer = String::new();
@@ -806,12 +800,29 @@ fn cmd_static_token_clear(name: &str, yes: bool) -> Result<()> {
     // just reported cleared.
     let _guard = runtime::RotationGuard::acquire(target)
         .with_context(|| format!("could not lock '{target}' to clear its long-lived token"))?;
-    if rolling_armed && let Some(p) = config.find_mut(target) {
-        p.rolling_token = false;
-        profile::save_profile(p)?;
+    // Everything the ACTIONS key off is re-read under the guard; the snapshot
+    // above fed the prompt's copy and nothing else. The prompt is an unbounded
+    // wait, and a rotation, a switch, or a re-login can all land during it —
+    // `save_profile` persists the WHOLE profile, so writing the pre-prompt
+    // snapshot back would rewind `credentials.json` to a spent refresh token
+    // (the exact hazard `adopt_disk_rotation` names, one layer up), and acting
+    // on the pre-prompt `active` relinks the wrong world in both directions.
+    let mut on_disk = profile::load_profile(target)?;
+    let rolling_armed = on_disk.rolling_token;
+    if rolling_armed {
+        on_disk.rolling_token = false;
+        profile::save_profile(&on_disk)?;
     }
+    // A mis-filled sidecar is EVIDENCE — the anomaly the split exists to
+    // detect, and one the operator did not name: the prompt says "the
+    // long-lived token", and a rotating pair is precisely not that. Every
+    // other removal of a mis-fill moves it aside first; this one does too,
+    // and the plain-delete argument on `clear_static_backup` stays scoped to
+    // the operator's own mint.
+    claude::quarantine_misfilled_sidecar(target)?;
     claude::clear_session_token(target)?;
     claude::clear_static_backup(target)?;
+    let active = load_config()?.is_active(target);
     // Re-read AFTER the clear: `install_source_path` only falls back to
     // `credentials.json` once the sidecar is gone, so this is the store the
     // relink below actually finds.
@@ -841,9 +852,35 @@ fn cmd_static_token_clear(name: &str, yes: bool) -> Result<()> {
         );
     }
     if rolling_armed {
-        outln!("clauth: rolling-token is off · nothing re-stamps a sidecar for '{target}' now.");
+        outln!("{}", clear_disarmed_postscript(target));
     }
     Ok(())
+}
+
+/// The pre-prompt warning that a rolling profile's re-stamping stops with the
+/// clear. Single-caller fns, like the arm-report copy and for the same reason:
+/// there is no stdout capture, so the unit pin is on content and a deleted
+/// print orphans the fn into a dead-code error under `-D warnings`.
+fn clear_disarm_note(target: &str) -> String {
+    format!("clauth: '{target}' is on the rolling token — clearing also turns its re-stamping off.")
+}
+
+/// The pre-prompt warning that the preserved mint goes with the clear — the
+/// only line telling the operator a SECOND, restorable credential is about to
+/// be destroyed, which makes it a posture line by the same argument as
+/// [`scope_widening_disclosure`].
+fn clear_backup_note(target: &str) -> String {
+    format!(
+        "clauth: the preserved mint at session-token.static.json goes with it — \
+         `clauth static-token {target}` will have nothing to restore."
+    )
+}
+
+/// The post-clear statement that nothing re-stamps a sidecar anymore — the
+/// disarm half of the report, and the only confirmation the flag actually
+/// moved.
+fn clear_disarmed_postscript(target: &str) -> String {
+    format!("clauth: rolling-token is off · nothing re-stamps a sidecar for '{target}' now.")
 }
 
 /// `clauth delete <name> [--yes] [--force]` — remove a profile and all its
@@ -1222,7 +1259,7 @@ fn report_armed_sidecar(canonical: &str, chain_is_broken: bool) -> Result<()> {
 /// gated on the profile being enabled — walking a disabled profile back to a
 /// mint that needs no re-stamping is always allowed.
 fn cmd_static_token(name: &str) -> Result<()> {
-    let mut config = load_config()?;
+    let config = load_config()?;
     let canonical = resolve_or_bail(&config, name)?;
     // The whole restore (flag flip + mint restore) serializes on the profile's
     // rotation guard: without it, a concurrent rotation that still sees the
@@ -1244,11 +1281,18 @@ fn cmd_static_token(name: &str) -> Result<()> {
     // prescribed re-mint lands and stays. The cost is owned where it bites:
     // the rolling-bearer bail says in so many words that this command is what
     // stopped the re-stamping.
-    if let Some(profile) = config.find_mut(&canonical) {
-        profile.rolling_token = false;
-        profile::save_profile(profile)?;
+    //
+    // Written from a fresh DISK read, never the pre-acquire config snapshot:
+    // the blocking acquire above can WAIT out an in-flight rotation, and
+    // `save_profile` persists the whole profile — writing the snapshot back
+    // would rewind the very rotation it just waited for to a spent refresh
+    // token.
+    let mut on_disk = profile::load_profile(&canonical)?;
+    if on_disk.rolling_token {
+        on_disk.rolling_token = false;
+        profile::save_profile(&on_disk)?;
     }
-    let is_active = config.is_active(&canonical);
+    let is_active = load_config()?.is_active(&canonical);
     // The flag flip above is already durable, so a restore that ERRORS (the
     // backup unreadable, the sidecar unwritable) must own that state the same
     // way the bail arms below do — a raw filesystem error here read as though

@@ -133,6 +133,15 @@ struct Snap {
     /// re-stamp — which is the same class of comfortable-looking lie the
     /// honest hours-scale countdown exists to prevent.
     rolling_token: bool,
+    /// The CONFIG flag, for the clear row's disclosure alone: "re-stamping
+    /// stops" must fire whenever the daemon would re-stamp — flag truth — even
+    /// while the sidecar holds a mint (degraded) or nothing (not yet stamped).
+    /// Every RENDERING surface keys off `rolling_token` above; this one names
+    /// what the clear is about to turn off.
+    rolling_armed: bool,
+    /// Whether a preserved mint backup sits beside the sidecar — the clear
+    /// row's disclosure that a second, restorable credential goes with it.
+    has_static_backup: bool,
 }
 
 impl Snap {
@@ -163,6 +172,8 @@ impl Snap {
             console_login: false,
             session_token: None,
             rolling_token: false,
+            rolling_armed: false,
+            has_static_backup: false,
         }
     }
 }
@@ -247,6 +258,8 @@ fn build_snap(app: &App, with_text: bool) -> Snap {
                     _ => crate::claude::SessionTokenStatus::LongLived(oauth.expires_at),
                 }),
                 rolling_token: matches!(&sidecar, Some((crate::claude::SidecarKind::Rolling, _))),
+                rolling_armed: p.rolling_token,
+                has_static_backup: crate::claude::has_static_backup(p.name.as_str()),
             }
         }
         None => Snap::blank("settings"),
@@ -593,20 +606,30 @@ fn row_hint(row: ConfigRow, snap: &Snap) -> Option<String> {
         // active account's wording names the relink, since that is the half a
         // running session feels. Both halves then split again on what the clear
         // falls back TO: an api-key account has no login to install, so it is
-        // signed out rather than relinked.
+        // signed out rather than relinked — and the FULL scope of the clear is
+        // spelled out below, because this hint is the TUI's entire disclosure
+        // that re-stamping stops and the preserved mint goes too (the CLI
+        // prints two explicit lines for the same act, and a two-press arm is
+        // not a disclosure).
         ConfigRow::ClearSessionToken if !snap.has_other_login => {
             "no other login stored, log in first"
         }
-        ConfigRow::ClearSessionToken if snap.is_active && snap.clear_falls_back_to_oauth => {
-            "relinks this account's own login now · running sessions follow"
+        ConfigRow::ClearSessionToken => {
+            let base = match (snap.is_active, snap.clear_falls_back_to_oauth) {
+                (true, true) => "relinks this account's own login now · running sessions follow",
+                (true, false) => "signs Claude Code out now · this account runs on its api key",
+                (false, true) => "the next switch installs this account's own login again",
+                (false, false) => "the next switch runs this account on its api key",
+            };
+            let mut hint = base.to_string();
+            if snap.rolling_armed || snap.rolling_token {
+                hint.push_str(" · re-stamping stops");
+            }
+            if snap.has_static_backup {
+                hint.push_str(" · the preserved mint goes too");
+            }
+            return Some(hint);
         }
-        ConfigRow::ClearSessionToken if snap.is_active => {
-            "signs Claude Code out now · this account runs on its api key"
-        }
-        ConfigRow::ClearSessionToken if snap.clear_falls_back_to_oauth => {
-            "the next switch installs this account's own login again"
-        }
-        ConfigRow::ClearSessionToken => "the next switch runs this account on its api key",
         ConfigRow::Delete => {
             "deletes the account and everything stored for it, usage history included"
         }

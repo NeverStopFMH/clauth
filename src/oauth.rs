@@ -1699,10 +1699,19 @@ fn vanilla_install_gate(
     // otherwise install as-is and sign every session out (Incident C shape).
     match crate::claude::session_token_status(name) {
         Some(crate::claude::SessionTokenStatus::LongLived(expires_at)) => {
-            let clock_dead = expires_at.is_some_and(|exp| (now_ms() as i64) >= exp);
+            // The SAME grace as every other verdict on these bytes
+            // (`AUTH_GATE_GRACE_MS` = CC's five-minute refresh threshold =
+            // the backup-restore rule): a mint inside that window installs
+            // into a client already trying to refresh a refresh-less
+            // credential, which signs the session out moments later — so
+            // "identical bytes, identical verdict" has to include the one arm
+            // that INSTALLS a mint, or `clauth static-token` calls a file
+            // EXPIRED that the very next switch serves happily.
+            let clock_dead = expiring(expires_at, false);
             if clock_dead {
                 logline!(
-                    "clauth: '{name}' long-lived token has expired — re-mint with \
+                    "clauth: '{name}' long-lived token has expired (or sits inside Claude \
+                     Code's own five-minute refresh window) — re-mint with \
                      `claude setup-token` (clauth login {name} --setup-token)"
                 );
                 return AuthGate::Broken;
@@ -2065,7 +2074,7 @@ pub(crate) fn rolling_sidecar_restamp_due(name: &str, now: i64) -> bool {
 /// same complete decision table as the switch-in gate (no-spend re-stamp from
 /// a comfortable chain / guarded refresh / mint degrade), but judged against
 /// the generous [`ROLLING_RESTAMP_HORIZON_MS`] instead of the switch gate's
-/// seconds-tight grace. For the ACTIVE profile a no-spend re-stamp must also
+/// minutes-tight grace. For the ACTIVE profile a no-spend re-stamp must also
 /// reach the macOS Keychain (a `Refreshed` outcome already mirrored through
 /// the rotation hook; the running `claude` re-reads the Keychain per
 /// request) — same refresh-less content belt as the hook: nothing carrying a

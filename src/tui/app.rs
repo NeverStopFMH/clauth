@@ -1636,17 +1636,12 @@ pub(crate) struct App {
 
     /// Cached long-lived-token status per profile, keyed by name (absent when a
     /// profile has no sidecar). Read by the Overview render for the `⊘` danger
-    /// marker, so it needn't stat each `session-token.json` per frame. Seeded at construct and refreshed on config reload; the expiry
-    /// stamp it carries is compared to live `now_ms` at render time, so the
-    /// clock ticking past expiry never needs a re-read — only an add / delete /
+    /// marker, so it needn't stat each `session-token.json` per frame. Seeded
+    /// at construct and refreshed on config reload; the expiry stamp it
+    /// carries is compared to live `now_ms` at render time, so the clock
+    /// ticking past expiry never needs a re-read — only an add / delete /
     /// re-mint does, which `reload_fingerprint` now catches.
-    pub(crate) session_tokens: HashMap<
-        String,
-        (
-            crate::claude::SessionTokenStatus,
-            crate::claude::SidecarKind,
-        ),
-    >,
+    pub(crate) session_tokens: HashMap<String, crate::claude::SessionTokenStatus>,
     /// Live `clauth start` sessions per account, for the Overview `active`
     /// column and the Fallback tab's compact equivalent. Cached because
     /// collecting it is a readdir plus an `open` + `try_lock` per row per marker
@@ -1665,21 +1660,15 @@ pub(crate) struct App {
 /// Reads each `session-token.json` off disk, so callers gather the names under a
 /// brief config guard and call this with the guard already dropped — the read
 /// never happens while the config lock is held.
-fn collect_session_tokens(
-    names: &[String],
-) -> HashMap<
-    String,
-    (
-        crate::claude::SessionTokenStatus,
-        crate::claude::SidecarKind,
-    ),
-> {
+fn collect_session_tokens(names: &[String]) -> HashMap<String, crate::claude::SessionTokenStatus> {
     names
         .iter()
         .filter_map(|n| {
-            // ONE sidecar read per profile yields both the status and the
-            // kind, the same derivation `build_snap` uses: Misfilled ⇔
-            // NotLongLived, everything readable else is LongLived.
+            // ONE sidecar read per profile, the same derivation `build_snap`
+            // uses: Misfilled ⇔ NotLongLived, everything readable else is
+            // LongLived. (The cache held the `SidecarKind` too while the
+            // Overview wore a type tag; upstream 5dde024 removed the tag, and
+            // the kind went with it.)
             let (kind, oauth) = crate::claude::sidecar_summary(n)?;
             let status = match kind {
                 crate::claude::SidecarKind::Misfilled => {
@@ -1687,7 +1676,7 @@ fn collect_session_tokens(
                 }
                 _ => crate::claude::SessionTokenStatus::LongLived(oauth.expires_at),
             };
-            Some((n.clone(), (status, kind)))
+            Some((n.clone(), status))
         })
         .collect()
 }
@@ -5603,12 +5592,19 @@ pub(crate) fn config_rows(app: &App) -> Vec<ConfigRow> {
         rows.push(ConfigRow::DeleteCreds);
     }
     // CLA-SPLIT escape hatch, beside the log-out row because it drops the OTHER
-    // credential a split profile holds. Gated on the sidecar EXISTING
-    // (`session_token_status`), not on the split being engaged
-    // (`has_session_token`): a mis-filled sidecar needs the same exit, and until
-    // this row there was none from either state short of deleting the file by
-    // hand. The no-other-login refusal is a dim, not a hide — see `run_config_row`.
-    if profile.is_some_and(|p| crate::claude::session_token_status(p.name.as_str()).is_some()) {
+    // credential a split profile holds. Gated on ANY long-lived piece existing
+    // — the sidecar (`session_token_status`, so a mis-fill gets the same
+    // exit), the preserved mint backup, or a set `rolling_token` flag — never
+    // on the split being ENGAGED: a flag with no sidecar is exactly the state
+    // where hiding the row leaves the daemon to re-create what the operator
+    // has no surface left to remove (the CLI's widened nothing-to-clear gate,
+    // rendered). The no-other-login refusal is a dim, not a hide — see
+    // `run_config_row`.
+    if profile.is_some_and(|p| {
+        crate::claude::session_token_status(p.name.as_str()).is_some()
+            || p.rolling_token
+            || crate::claude::has_static_backup(p.name.as_str())
+    }) {
         rows.push(ConfigRow::ClearSessionToken);
     }
     // The account-actions group's tail: disable/enable (reversible) one severity
@@ -5913,8 +5909,17 @@ fn run_config_row(app: &mut App, row: ConfigRow) {
 /// Same full-exit contract as the CLI's `static-token --clear`, or the two
 /// surfaces fight the daemon differently: the `rolling_token` flag goes FIRST
 /// (a set flag re-stamps a fresh bearer over the removal on the daemon's next
-/// scan), and the preserved mint backup goes too (a "cleared" long-lived token
-/// with a year-scale mint still in `session-token.static.json` is not cleared).
+/// scan), the preserved mint backup goes too (a "cleared" long-lived token
+/// with a year-scale mint still in `session-token.static.json` is not
+/// cleared), and a mis-filled sidecar is quarantined as evidence before the
+/// removal, exactly as every other repair path does.
+///
+/// The rotation guard is the same load-bearing piece it is on the CLI path —
+/// a rotation in flight that still saw the flag set would re-stamp the
+/// sidecar AFTER the removal — but a UI thread must never park behind a
+/// timeout-less flock, so this takes `try_acquire` and fails LOUDLY into a
+/// toast when a rotation holds the profile, instead of silently losing the
+/// race.
 ///
 /// The relink has TWO outcomes and the toast names which one happened. The row
 /// is refused only when an account stores neither a login nor an api key, so an
@@ -5927,25 +5932,46 @@ fn run_config_row(app: &mut App, row: ConfigRow) {
 /// reload and rebuild `session_tokens` (the Overview `⊘` marker's cache). The
 /// local `remove` below only spares that marker one tick of staleness.
 fn perform_clear_session_token(app: &mut App, name: &str) {
+    let _guard = match crate::runtime::RotationGuard::try_acquire(name) {
+        Ok(Some(guard)) => guard,
+        Ok(None) => {
+            app.toast(
+                ToastKind::Danger,
+                format!("a rotation is in flight for '{name}' · try again in a moment"),
+            );
+            return;
+        }
+        Err(e) => {
+            app.toast(ToastKind::Danger, format!("clear failed\n{e}"));
+            return;
+        }
+    };
     let active = app.config().is_active(name);
     let rolling_armed = app.config().find(name).is_some_and(|p| p.rolling_token);
-    let save_err = if rolling_armed {
-        let mut cfg = app.config();
-        match cfg.find_mut(name) {
-            Some(p) => {
+    if rolling_armed {
+        // The in-memory flag flips for the renderer; the PERSIST is written
+        // from a fresh disk read under the guard, never from the in-memory
+        // snapshot — an external daemon's rotation may have landed since the
+        // last reload, and `save_profile` writes the whole profile back.
+        {
+            let mut cfg = app.config();
+            if let Some(p) = cfg.find_mut(name) {
                 p.rolling_token = false;
-                save_profile(p).err()
             }
-            None => None,
         }
-    } else {
-        None
-    };
-    if let Some(e) = save_err {
-        app.toast(ToastKind::Danger, format!("clear failed\n{e}"));
-        return;
+        let save_err = crate::profile::load_profile(name)
+            .and_then(|mut p| {
+                p.rolling_token = false;
+                save_profile(&p)
+            })
+            .err();
+        if let Some(e) = save_err {
+            app.toast(ToastKind::Danger, format!("clear failed\n{e}"));
+            return;
+        }
     }
-    if let Err(e) = crate::claude::clear_session_token(name)
+    if let Err(e) = crate::claude::quarantine_misfilled_sidecar(name)
+        .and_then(|_| crate::claude::clear_session_token(name))
         .and_then(|_| crate::claude::clear_static_backup(name))
     {
         app.toast(ToastKind::Danger, format!("clear failed\n{e}"));

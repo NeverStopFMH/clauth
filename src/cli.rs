@@ -109,15 +109,18 @@ pub(crate) enum Command {
     /// back to a year-scale bearer carrying two scopes, which nothing has to
     /// re-stamp.
     ///
-    /// `--clear` removes the long-lived token instead, so the profile's stored
-    /// OAuth login is what switches install again. The live credentials are
+    /// `--clear` is the FULL exit instead: it removes the long-lived token,
+    /// the preserved mint backup, and the rolling-token flag together, so the
+    /// profile's stored OAuth login is what switches install again and
+    /// nothing re-creates a sidecar afterwards. The live credentials are
     /// relinked when the profile is active, and the clear is refused when the
     /// profile stores no other login.
     #[command(name = "static-token")]
     StaticToken {
         /// Profile whose long-lived token to operate on.
         profile: String,
-        /// Remove the long-lived token instead of restoring the preserved mint.
+        /// Remove the long-lived token, its preserved mint backup, and the
+        /// rolling-token flag, instead of restoring the mint.
         #[arg(long)]
         clear: bool,
         /// Skip `--clear`'s confirm prompt. Required on a non-TTY stdin.

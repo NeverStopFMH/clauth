@@ -728,6 +728,35 @@ fn clear_session_token_hint_names_the_gate_then_what_the_clear_falls_back_to() {
         row_hint(ConfigRow::ClearSessionToken, &snap).as_deref(),
         Some("the next switch installs this account's own login again"),
     );
+
+    snap.is_active = true;
+    // The full-scope disclosure: this hint is the TUI's ONLY statement that a
+    // clear on a rolling profile stops the re-stamping and destroys the
+    // preserved mint — the CLI prints two explicit lines for the same act,
+    // and a two-press arm is not a disclosure.
+    snap.rolling_armed = true;
+    assert_eq!(
+        row_hint(ConfigRow::ClearSessionToken, &snap).as_deref(),
+        Some("relinks this account's own login now · running sessions follow · re-stamping stops"),
+    );
+    snap.has_static_backup = true;
+    assert_eq!(
+        row_hint(ConfigRow::ClearSessionToken, &snap).as_deref(),
+        Some(
+            "relinks this account's own login now · running sessions follow · re-stamping \
+             stops · the preserved mint goes too"
+        ),
+    );
+    // The disarm half also fires off the sidecar CONTENT alone (a rolling
+    // bearer with the flag raced off), so neither signal can silently stop
+    // carrying the disclosure.
+    snap.rolling_armed = false;
+    snap.rolling_token = true;
+    snap.has_static_backup = false;
+    assert_eq!(
+        row_hint(ConfigRow::ClearSessionToken, &snap).as_deref(),
+        Some("relinks this account's own login now · running sessions follow · re-stamping stops"),
+    );
 }
 
 /// `build_snap` derives the token row from what the sidecar HOLDS, never from

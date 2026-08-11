@@ -375,8 +375,8 @@ fn render_overview_row(
 
     // Long-lived-token state from the per-frame-free cache (App::session_tokens).
     // `token_danger` (expired or mis-filled) drives the `⊘` marker.
-    let token_entry = app.session_tokens.get(&name_str);
-    let token_danger = token_entry.is_some_and(|(s, _)| s.is_danger(now_ms() as i64));
+    let token_status = app.session_tokens.get(&name_str);
+    let token_danger = token_status.is_some_and(|s| s.is_danger(now_ms() as i64));
 
     let mut spans = vec![cursor];
     // A disabled row flattens every semantic hue to dim — the whole row reads as

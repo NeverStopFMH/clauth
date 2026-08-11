@@ -1858,11 +1858,61 @@ mod static_token_clear {
     }
 
     /// With all three pieces absent the clear is a quiet no-op success, not an
-    /// error — the requested end state already holds.
+    /// error — the requested end state already holds. The early return is
+    /// pinned by a side-effect the fall-through path cannot avoid: the full
+    /// path acquires the rotation guard, which materializes
+    /// `rotation.lock` in the profile dir, so the lock file's absence is what
+    /// proves the no-op branch ran rather than a false "cleared" printing
+    /// through the whole body.
     #[test]
     fn nothing_to_clear_is_a_noop_success() {
         let _home = HomeSandbox::new();
         cleared_profile("cl-none", false, true);
         cmd_static_token_clear("cl-none", true).expect("nothing to clear is success");
+        let dir = crate::profile::profile_dir("cl-none").expect("dir");
+        assert!(
+            !dir.join("rotation.lock").exists(),
+            "the no-op branch returns before the rotation guard — a lock file \
+             here means the full clear body ran against nothing"
+        );
+    }
+
+    /// A mis-filled sidecar is EVIDENCE — the anomaly the split exists to
+    /// detect, and one the operator did not name (the prompt says "the
+    /// long-lived token"; a rotating pair is precisely not that). The clear
+    /// quarantines it before removal, like every other path that disposes of
+    /// one.
+    #[test]
+    fn clear_quarantines_a_misfilled_sidecar_instead_of_plain_deleting_it() {
+        let _home = HomeSandbox::new();
+        cleared_profile("cl-mf", false, true);
+        let dir = crate::profile::profile_dir("cl-mf").expect("dir");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        std::fs::write(
+            dir.join("session-token.json"),
+            serde_json::to_vec(&crate::profile::ClaudeCredentials {
+                claude_ai_oauth: Some(crate::profile::OAuthToken {
+                    access_token: "at-misfill".to_string(),
+                    refresh_token: Some("rt-misfill".to_string()),
+                    expires_at: Some(crate::usage::now_ms() as i64 + 8 * 3_600_000),
+                    scopes: None,
+                    subscription_type: None,
+                }),
+            })
+            .expect("ser"),
+        )
+        .expect("write misfill");
+
+        cmd_static_token_clear("cl-mf", true).expect("the clear succeeds");
+
+        assert!(!dir.join("session-token.json").exists(), "sidecar removed");
+        let quarantined: Vec<_> = std::fs::read_dir(dir.join("quarantine"))
+            .expect("quarantine dir exists")
+            .collect();
+        assert_eq!(
+            quarantined.len(),
+            1,
+            "the rotating pair is moved aside as evidence, never plain-deleted"
+        );
     }
 }

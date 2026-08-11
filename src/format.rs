@@ -266,8 +266,10 @@ impl Transient {
     /// stamps NOTHING scheduler-side (a browser login writes only
     /// `credentials.json`, and a `--setup-token` re-mint writes a mint, which
     /// disarms rather than re-arms), which is why these holds carry a
-    /// credential-file watch in the scheduler: the fix releases the leash on
-    /// the next scan instead of waiting out the clock.
+    /// credential-file watch in the scheduler: a write to any watched file —
+    /// the fix, or clauth's own successful rotation, either of which is
+    /// reason to re-judge — releases the leash on the next scan instead of
+    /// waiting out the clock.
     pub(crate) fn permanent_until_relogin(&self) -> bool {
         matches!(
             self.cause,

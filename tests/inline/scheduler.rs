@@ -6855,6 +6855,52 @@ fn claude_rolling_tick_reaches_the_gate_for_a_misfilled_sidecar() {
     );
 }
 
+/// The backwards-clock clamp reads the hold's KIND off `watched`: a stretched
+/// SHORT hold clamps back to the 15-minute cadence, never to the six-hour
+/// leash — an unwatched six-hour hold would have no exit but the clock, the
+/// exact stall the watch exists to remove, handed to a profile that never
+/// earned the long leash.
+#[test]
+fn claude_rolling_tick_clamps_a_short_hold_to_its_own_leash() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let config = rolling_profile_config(&["cl-clk"], &[]);
+    write_rolling_sidecar("cl-clk", 60 * 60 * 1000);
+    let pacing = crate::lockorder::RankedMutex::new(super::ClaudeRollingPacing::default());
+    let now = crate::usage::now_ms();
+    // What a backwards step leaves behind on a SHORT (unwatched) hold.
+    pacing.lock().unwrap().retry_after_ms.insert(
+        "cl-clk".to_string(),
+        super::RetryHold {
+            not_before: now + 10 * super::ROLLING_BROKEN_RETRY_MS,
+            watched: None,
+        },
+    );
+
+    let calls = std::sync::atomic::AtomicUsize::new(0);
+    let counting = |_: &str| {
+        calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        crate::oauth::AuthGate::Refreshed
+    };
+    // Tick 1: the clamp pulls the stamp back to the SHORT cadence; still held.
+    super::claude_rolling_tick(&config, &pacing, now, &counting);
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    // Tick 2, one short cadence later: the profile runs. Clamped to the long
+    // leash instead, this unwatched hold would sit for six hours with no
+    // credential-change exit.
+    pacing.lock().unwrap().next_scan_ms = 0;
+    super::claude_rolling_tick(
+        &config,
+        &pacing,
+        now + super::ROLLING_RETRY_MS + 1,
+        &counting,
+    );
+    assert_eq!(
+        calls.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "a short hold clamps to its own leash, not the long one"
+    );
+}
+
 /// Names that leave the candidate set — profile deleted, disabled, or the
 /// flag turned off — take their retry stamps with them. Without the sweep the
 /// map grows monotonically over the daemon's lifetime, and a re-created

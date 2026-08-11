@@ -1381,6 +1381,11 @@ fn clear_session_token_on_a_rolling_profile_disarms_and_takes_the_backup() {
 /// the clear loudly into a toast, and nothing on disk or in config moves. A UI
 /// thread must never park behind a timeout-less flock, so `try_acquire` is the
 /// only correct spelling of the CLI's load-bearing guard here.
+/// The TUI clear takes the rotation guard NON-BLOCKING: a rotation in flight —
+/// the exact writer that could re-stamp the sidecar after the removal — fails
+/// the clear loudly into a toast, and nothing on disk or in config moves. A UI
+/// thread must never park behind a timeout-less flock, so `try_acquire` is the
+/// only correct spelling of the CLI's load-bearing guard here.
 #[test]
 fn clear_session_token_refuses_while_a_rotation_holds_the_profile() {
     use super::{ConfigRow, build_draft_existing, run_config_row};

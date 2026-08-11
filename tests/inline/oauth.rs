@@ -1901,6 +1901,58 @@ fn gate_session_token_ready_even_when_auth_broken() {
     ));
 }
 
+/// CLA-SPLIT: the install arm reads a mint with the SAME grace every other
+/// verdict on these bytes uses (`AUTH_GATE_GRACE_MS` = CC's five-minute
+/// refresh threshold = the backup-restore rule). Three minutes of life is
+/// inside CC's own refresh window — a refresh-less credential the client
+/// immediately tries to refresh, signing the session out — so the switch must
+/// refuse it exactly where `clauth static-token` calls the identical bytes
+/// EXPIRED; ten minutes clears the window and installs. Zero grace here was
+/// the one arm that INSTALLS a mint while every other slot called it dead.
+#[test]
+fn gate_refuses_a_mint_inside_ccs_refresh_window() {
+    let _home = HomeSandbox::new();
+    let name = "test-gate-mint-window";
+    let config = oauth_config(name, Some("rt-good"), Some(future_expiry()));
+    crate::profile::save_profile(&config.profiles[0]).expect("save profile");
+    let dir = crate::profile::profile_dir(name).expect("dir");
+    let mint = |exp_in_ms: i64| {
+        std::fs::write(
+            dir.join("session-token.json"),
+            serde_json::to_vec(&ClaudeCredentials {
+                claude_ai_oauth: Some(OAuthToken {
+                    access_token: "oat-static".to_string(),
+                    refresh_token: None,
+                    expires_at: Some(crate::usage::now_ms() as i64 + exp_in_ms),
+                    scopes: None,
+                    subscription_type: None,
+                }),
+            })
+            .expect("ser"),
+        )
+        .expect("write session token");
+    };
+    let handle = Arc::new(RankedMutex::new(config));
+
+    mint(3 * 60 * 1000);
+    assert!(
+        matches!(
+            ensure_installable(&handle, name, never_refresh),
+            AuthGate::Broken
+        ),
+        "three minutes of life is inside CC's refresh window — refused"
+    );
+
+    mint(10 * 60 * 1000);
+    assert!(
+        matches!(
+            ensure_installable(&handle, name, never_refresh),
+            AuthGate::Ready
+        ),
+        "ten minutes clears the window — installs as-is"
+    );
+}
+
 // ── rotate_one_inner, driven offline ─────────────────────────────────────────
 //
 // This leg feeds both the action-menu single rotate and every `refresh_all`
@@ -3004,10 +3056,12 @@ fn beyond_horizon_expiry() -> i64 {
     crate::usage::now_ms() as i64 + 6 * 3_600_000
 }
 
-/// The due predicate fires only for an armed, exp-carrying sidecar inside the
-/// horizon — absent sidecars and mis-fills belong to the switch-time gate.
+/// The due predicate fires for an armed, exp-carrying sidecar inside the
+/// horizon — and for a MIS-FILL at any clock, because the content is the
+/// defect and this leg is the only one a running daemon has that can repair
+/// it. Absent sidecars stay the switch-time gate's job.
 #[test]
-fn restamp_due_fires_inside_the_horizon_only() {
+fn restamp_due_fires_inside_the_horizon_or_on_a_misfill() {
     let _home = HomeSandbox::new();
     let now = crate::usage::now_ms() as i64;
     let name = "test-restamp-due";
@@ -3015,6 +3069,30 @@ fn restamp_due_fires_inside_the_horizon_only() {
         !rolling_sidecar_restamp_due(name, now),
         "absent sidecar is not the timer's job"
     );
+    // A rotating pair with 8h of clock — comfortably OUTSIDE the horizon, so
+    // only the content classification can make it due. This is the arm whose
+    // deletion turns the daemon-side heal back into dead code.
+    let dir = crate::profile::profile_dir(name).expect("dir");
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    std::fs::write(
+        dir.join("session-token.json"),
+        serde_json::to_vec(&crate::profile::ClaudeCredentials {
+            claude_ai_oauth: Some(OAuthToken {
+                access_token: "at-misfill".to_string(),
+                refresh_token: Some("rt-misfill".to_string()),
+                expires_at: Some(beyond_horizon_expiry()),
+                scopes: None,
+                subscription_type: None,
+            }),
+        })
+        .expect("ser"),
+    )
+    .expect("write misfill");
+    assert!(
+        rolling_sidecar_restamp_due(name, now),
+        "a mis-fill is due NOW, whatever its clock says"
+    );
+    std::fs::remove_file(dir.join("session-token.json")).expect("clean the misfill fixture");
     crate::claude::stamp_rolling_token(
         name,
         &OAuthToken {
@@ -3054,7 +3132,7 @@ fn restamp_due_fires_inside_the_horizon_only() {
 }
 
 /// A dying fed bearer + a chain clear of the horizon → no-spend re-stamp,
-/// exactly where the switch gate (seconds-tight grace) would have no-opped —
+/// exactly where the switch gate (minutes-tight grace) would have no-opped —
 /// the contrast that pins the horizon semantics.
 #[test]
 fn restamp_restamps_a_dying_bearer_the_switch_gate_calls_fresh() {
@@ -3074,7 +3152,7 @@ fn restamp_restamps_a_dying_bearer_the_switch_gate_calls_fresh() {
     )
     .expect("feed");
     let handle = Arc::new(RankedMutex::new(config));
-    // Switch gate: +1h clears the 60s grace → install as-is, no re-stamp.
+    // Switch gate: +1h clears the five-minute grace → install as-is, no re-stamp.
     assert!(matches!(
         ensure_installable(&handle, name, never_refresh),
         AuthGate::Ready

@@ -483,6 +483,9 @@ pub(crate) enum ConfirmAction {
     /// Force-rotate one account's refresh token (action-menu "rotate access
     /// token" on the focused account).
     RotateOne(String),
+    /// Disable one account (action-menu "disable account" off the Setup pane,
+    /// standing in for the row's arm-then-confirm).
+    DisableOne(String),
     /// Plugin tab: write the `mcpServers.clauth` entry into `~/.claude.json`.
     /// Reversible local write — non-destructive, so it keeps the plain button.
     WireMcpServers,
@@ -659,6 +662,10 @@ pub(crate) enum ActionMenuAction {
     // Global
     NewAccount,
     RefreshUsage,
+    /// Force-refresh every account — what the global `r` does off the Usage and
+    /// Tokens tabs, and the only way to reach it from Usage (where `r` is the
+    /// focused account's own refresh).
+    RefreshAll,
     RotateTokens,
     // Config detail actions (proxied through run_config_row)
     DisableProfile,
@@ -742,6 +749,14 @@ impl ActionMenuAction {
             Self::RotateTokens => Some('t'),
             Self::ToggleEstimates => Some('e'),
             Self::TogglePace => Some('p'),
+            // `r` belongs to the focused account's own refresh, and `e`/`p` to
+            // the Usage page keys above, so refresh-all takes the third letter
+            // of its label — pinned rather than scanned so it doesn't move with
+            // the tab. (Uppercase `R` is out: hotkeys are case-insensitive.)
+            Self::RefreshAll => Some('f'),
+            // One letter across both halves of the disable/enable pair, so the
+            // key doesn't move when the account's state flips.
+            Self::DisableProfile | Self::EnableProfile => Some('d'),
             // Mirror the Tokens tab's page keys so the menu teaches them.
             Self::ToggleCountCache => Some('c'),
             Self::ReloadTokenStats => Some('r'),
@@ -759,6 +774,7 @@ impl ActionMenuAction {
         match self {
             Self::NewAccount => "new account",
             Self::RefreshUsage => "refresh usage",
+            Self::RefreshAll => "refresh all accounts",
             Self::RotateTokens => "rotate access token",
             Self::DisableProfile => "disable account",
             Self::EnableProfile => "enable account",
@@ -840,6 +856,11 @@ const ROTATE_LIVE_SESSION_MSG: &str = "has a live clauth start session";
 const ROTATE_LIVE_SESSION_DETAIL: &str = "macos keeps its login in a keychain entry clauth can't write, so rotating would sign the \
      session out.";
 const ROTATE_LIVE_SESSION_TOAST: &str = "macos keeps its login where clauth can't rotate it";
+
+/// What disabling costs, for the action menu's confirm. The Setup row states the
+/// same thing in its own hint (`config::row_hint`) before arming.
+const DISABLE_DETAIL: &str =
+    "it drops out of auto-switch, usage polling, and status until re-enabled.";
 const TOAST_CAPACITY: usize = 3;
 const TOAST_TTL_NORMAL: Duration = Duration::from_secs(3);
 const TOAST_TTL_DANGER: Duration = Duration::from_secs(6);
@@ -5006,12 +5027,21 @@ pub(crate) fn build_action_menu(app: &App) -> ActionMenuState {
 
     match app.tab {
         Tab::Overview => {
+            if focused_account(app).is_some() {
+                actions.push(RefreshUsage);
+                actions.push(RotateTokens);
+                actions.push(disabled_toggle_action(app));
+            }
+            actions.push(RefreshAll);
             actions.push(NewAccount);
-            actions.push(RefreshUsage);
-            actions.push(RotateTokens);
         }
         Tab::Usage => {
-            actions.push(RefreshUsage);
+            if focused_account(app).is_some() {
+                actions.push(RefreshUsage);
+                actions.push(RotateTokens);
+                actions.push(disabled_toggle_action(app));
+            }
+            actions.push(RefreshAll);
             actions.push(ToggleEstimates);
             actions.push(TogglePace);
         }
@@ -5047,18 +5077,7 @@ pub(crate) fn build_action_menu(app: &App) -> ActionMenuState {
                 let rows = config_rows(app);
                 if let Some(&row) = rows.get(app.config_action_cursor) {
                     match row {
-                        ConfigRow::Disabled => {
-                            let currently_disabled = app
-                                .config()
-                                .profiles
-                                .get(app.profile_cursor)
-                                .is_some_and(Profile::is_disabled);
-                            actions.push(if currently_disabled {
-                                ActionMenuAction::EnableProfile
-                            } else {
-                                ActionMenuAction::DisableProfile
-                            });
-                        }
+                        ConfigRow::Disabled => actions.push(disabled_toggle_action(app)),
                         ConfigRow::AutoStart => actions.push(ActionMenuAction::ToggleAutoStart),
                         ConfigRow::Login => actions.push(ActionMenuAction::LoginAccount),
                         ConfigRow::DeleteCreds => actions.push(ActionMenuAction::ClearCredentials),
@@ -5092,6 +5111,21 @@ pub(crate) fn build_action_menu(app: &App) -> ActionMenuState {
     }
 
     ActionMenuState::new(actions)
+}
+
+/// The focused account's disable-row action, labeled by the state it would
+/// leave behind — the same flip the Setup row's own label carries.
+fn disabled_toggle_action(app: &App) -> ActionMenuAction {
+    let currently_disabled = app
+        .config()
+        .profiles
+        .get(app.profile_cursor)
+        .is_some_and(Profile::is_disabled);
+    if currently_disabled {
+        ActionMenuAction::EnableProfile
+    } else {
+        ActionMenuAction::DisableProfile
+    }
 }
 
 fn handle_action_menu_key(app: &mut App, key: KeyEvent) {
@@ -5205,11 +5239,22 @@ fn dispatch_action_menu_action(app: &mut App, action: ActionMenuAction) {
             }
             None => {}
         },
-        ActionMenuAction::DisableProfile | ActionMenuAction::EnableProfile => {
+        ActionMenuAction::RefreshAll => {
+            app.manual_refresh();
+            app.toast(ToastKind::Info, "refreshing every account");
+        }
+        // On Setup the flip belongs to the `disabled` row, arm-and-confirm
+        // included; every other tab has no such row to drive.
+        ActionMenuAction::DisableProfile | ActionMenuAction::EnableProfile
+            if app.tab == Tab::Setup && app.config_focus == ConfigFocus::Actions =>
+        {
             let rows = config_rows(app);
             if let Some(&row) = rows.get(app.config_action_cursor) {
                 run_config_row(app, row);
             }
+        }
+        ActionMenuAction::DisableProfile | ActionMenuAction::EnableProfile => {
+            toggle_focused_account_disabled(app);
         }
         ActionMenuAction::ToggleAutoStart => {
             let rows = config_rows(app);
@@ -6583,6 +6628,43 @@ fn finish_delete(app: &mut App, name: &str, force: bool) {
     }
 }
 
+/// The action menu's `disable account` / `enable account` off the Setup pane,
+/// where there is no row to arm. Disabling routes through the confirm modal
+/// instead (the row's own arm-then-confirm, in the shape a modal can carry);
+/// enabling is harmless, so it fires straight away, exactly as the row does.
+///
+/// The two gates the row renders inert speak up here: a menu carries no dimmed
+/// item, so a silent no-op would read as a broken pick.
+fn toggle_focused_account_disabled(app: &mut App) {
+    let Some((name, _, _)) = focused_account(app) else {
+        return;
+    };
+    if app.config().is_active(&name) {
+        app.toast(
+            ToastKind::Warning,
+            format!("'{name}' is the active account\nswitch away before disabling it"),
+        );
+        return;
+    }
+    if crate::runtime::has_live_session(&name) {
+        app.toast(
+            ToastKind::Warning,
+            format!("'{name}' has a live session\nclose it before disabling"),
+        );
+        return;
+    }
+    if app.config().find(&name).is_some_and(Profile::is_disabled) {
+        toggle_profile_disabled(app, &name);
+        return;
+    }
+    app.modals.push(Modal::Confirm(ConfirmState {
+        message: format!("disable '{name}'?"),
+        detail: Some(DISABLE_DETAIL.to_string()),
+        choice: false,
+        on_confirm: ConfirmAction::DisableOne(name),
+    }));
+}
+
 /// Flip `name`'s `Profile::disabled` flag (Setup `disabled` row). Inert while
 /// `name` is the active profile or holds a live `clauth start` session — the
 /// same gate `actions::disable_profile` itself enforces, checked here TOO so
@@ -6822,6 +6904,9 @@ fn run_confirm_action(app: &mut App, action: ConfirmAction) {
             });
             app.toast(ToastKind::Info, format!("rotating '{name}'"));
         }
+        // Re-checked inside `toggle_profile_disabled`: an account can go active
+        // or open a session between arming this confirm and running it.
+        ConfirmAction::DisableOne(name) => toggle_profile_disabled(app, &name),
         ConfirmAction::WireMcpServers => {
             match crate::plugin_probe::wire_mcp_server() {
                 Ok(()) => {

@@ -240,6 +240,7 @@ fn draw_confirm(frame: &mut Frame<'_>, area: Rect, state: &ConfirmState) {
         ConfirmAction::Switch(_)
             | ConfirmAction::RotateAll
             | ConfirmAction::RotateOne(_)
+            | ConfirmAction::DisableOne(_)
             | ConfirmAction::CaptureOverwrite(..)
             | ConfirmAction::AdoptDivergence(..)
             | ConfirmAction::BlankCredentials(_)

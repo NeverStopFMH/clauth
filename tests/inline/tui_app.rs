@@ -1335,6 +1335,134 @@ fn action_menu_labels_the_disabled_row_by_current_state() {
     );
 }
 
+/// Overview and Usage carry the focused account's own actions plus the
+/// tab-global ones. The hotkeys are pinned, not scanned: `d` survives the
+/// disable↔enable label flip, and `f` keeps refresh-all off `e`/`p`, which the
+/// Usage page keys own.
+#[test]
+fn the_account_tabs_offer_the_focused_account_plus_the_global_actions() {
+    use super::{Tab, build_action_menu};
+    use crate::profile::Profile;
+    let _home = crate::testutil::HomeSandbox::new();
+
+    let entries = |app: &super::App| -> Vec<(&'static str, Option<char>)> {
+        build_action_menu(app)
+            .items
+            .iter()
+            .map(|i| (i.label, i.hotkey))
+            .collect()
+    };
+
+    let mut app = app_with(vec![Profile::new("acct".to_string(), None, None)]);
+    app.profile_cursor = 0;
+
+    app.tab = Tab::Overview;
+    assert_eq!(
+        entries(&app),
+        [
+            ("refresh usage", Some('r')),
+            ("rotate access token", Some('t')),
+            ("disable account", Some('d')),
+            ("refresh all accounts", Some('f')),
+            ("new account", Some('n')),
+        ]
+    );
+
+    app.tab = Tab::Usage;
+    assert_eq!(
+        entries(&app),
+        [
+            ("refresh usage", Some('r')),
+            ("rotate access token", Some('t')),
+            ("disable account", Some('d')),
+            ("refresh all accounts", Some('f')),
+            ("toggle estimates", Some('e')),
+            ("toggle pace marker", Some('p')),
+        ]
+    );
+
+    // With no account under the cursor only the tab-global half is left, and
+    // refresh-all keeps its letter rather than sliding onto the freed `r`.
+    let mut empty = bare_app();
+    empty.tab = Tab::Overview;
+    assert_eq!(
+        entries(&empty),
+        [
+            ("refresh all accounts", Some('f')),
+            ("new account", Some('n'))
+        ]
+    );
+}
+
+/// Off the Setup pane there is no `disabled` row to arm, so the menu pick routes
+/// disabling through the confirm modal instead of flipping on one press —
+/// enabling stays immediate, exactly as the row behaves.
+#[test]
+fn disabling_from_an_account_tab_confirms_first_while_enabling_is_immediate() {
+    use super::{
+        ActionMenuAction, ConfirmAction, Modal, Tab, build_action_menu,
+        dispatch_action_menu_action, run_confirm_action,
+    };
+    use crate::profile::Profile;
+    let _home = crate::testutil::HomeSandbox::new();
+
+    let acct = Profile::new("acct".to_string(), None, None);
+    crate::profile::save_profile(&acct).expect("save profile");
+    let mut app = app_with(vec![acct]);
+    app.tab = Tab::Overview;
+    app.profile_cursor = 0;
+
+    dispatch_action_menu_action(&mut app, ActionMenuAction::DisableProfile);
+    assert!(
+        !app.config().find("acct").unwrap().is_disabled(),
+        "the pick asks first, it does not flip"
+    );
+    let Some(Modal::Confirm(state)) = app.modals.pop() else {
+        panic!("disabling raises a confirm");
+    };
+    assert!(matches!(state.on_confirm, ConfirmAction::DisableOne(ref n) if n == "acct"));
+
+    run_confirm_action(&mut app, state.on_confirm);
+    assert!(app.config().find("acct").unwrap().is_disabled());
+
+    // Re-enabling is harmless: the menu flips its label and fires on the pick.
+    assert_eq!(build_action_menu(&app).items[2].label, "enable account");
+    dispatch_action_menu_action(&mut app, ActionMenuAction::EnableProfile);
+    assert!(!app.config().find("acct").unwrap().is_disabled());
+    assert!(app.modals.is_empty(), "enabling asks nothing");
+}
+
+/// The active account can't be disabled. The Setup row says so by rendering
+/// inert, which a menu item can't do — so the pick names the blocker instead of
+/// silently doing nothing.
+#[test]
+fn disabling_the_active_account_from_a_menu_says_why_instead_of_no_opping() {
+    use super::{ActionMenuAction, Tab, dispatch_action_menu_action};
+    use crate::profile::{AppConfig, AppState, Profile};
+    let _home = crate::testutil::HomeSandbox::new();
+
+    let acct = Profile::new("acct".to_string(), None, None);
+    crate::profile::save_profile(&acct).expect("save profile");
+    let mut app = super::App::new(AppConfig {
+        state: AppState {
+            active_profile: Some("acct".into()),
+            profiles: vec!["acct".into()],
+            ..AppState::default()
+        },
+        profiles: vec![acct],
+    });
+    app.tab = Tab::Overview;
+    app.profile_cursor = 0;
+
+    dispatch_action_menu_action(&mut app, ActionMenuAction::DisableProfile);
+    assert!(app.modals.is_empty(), "a gated pick arms no confirm");
+    assert!(!app.config().find("acct").unwrap().is_disabled());
+    assert!(
+        app.toasts.iter().any(|t| t.body.contains("switch away")),
+        "the refusal names the way out"
+    );
+}
+
 /// The Fallback tab's add-picker (`chain_candidates`) never offers a disabled
 /// account — this is the "excluded from any fallback-chain editing UI" half
 /// of the spec that isn't a render concern (the selector's dim + chip is

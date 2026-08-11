@@ -54,20 +54,22 @@ On macOS, <kbd>t</kbd> skips any account holding a live `clauth start` session: 
 
 ## Action menus
 
-<kbd>a</kbd> opens the actions available for whatever is selected. Config and Plugin have none.
+<kbd>a</kbd> opens the actions available for whatever is selected. It lists what no key already does, so a row whose <kbd>⏎</kbd> is the whole story carries no menu: Config, Fallback and Plugin have none, nor do the Setup tab's text rows. The footer only advertises <kbd>a</kbd> where something would open.
 
-| Tab | Entries |
-|-----|---------|
-| Overview | `switch to selected`, `new account`, `refresh usage`, `rotate access token` |
-| Usage | `refresh usage`, `toggle estimates`, `toggle pace marker` |
-| Tokens | `period: lifetime` / `daily` / `weekly` / `monthly`, `show all models` / `show claude models` / `show other models`, `toggle cache counting`, `reload stats` |
-| Setup (account list) | `configure`, `new account` |
-| Setup (a settings row) | the row's own action: `edit field`, `remove field`, `toggle auto-start`, `log in`, `log out`, `disable account` / `enable account`, `delete account`, `create account` |
-| Fallback (chain) | `open`, `reorder up`, `reorder down` |
-| Fallback (member detail) | `edit threshold`, `edit weekly at`, `toggle weekly gate`, `toggle scoped gate`, `toggle last resort`, `toggle preferred`, `edit max auto-spend`, `remove member` |
-| Status | `refresh status`, `open in browser` |
+Entries above the rule act on the account named in the menu's title bar; entries below it act on the tab.
+
+| Tab | Account | Tab-wide |
+|-----|---------|----------|
+| Overview | `refresh usage`, `rotate access token`, `disable account` / `enable account` | `refresh all accounts`, `new account` |
+| Usage | `refresh usage`, `rotate access token`, `disable account` / `enable account` | `refresh all accounts`, `toggle estimates`, `toggle pace marker` |
+| Tokens | none | `period: lifetime` / `daily` / `weekly` / `monthly`, `show all models` / `show claude models` / `show other models`, `toggle cache counting`, `reload stats` |
+| Setup (account list) | none | `new account` |
+| Setup (a settings row) | the row's own action: `toggle auto-start`, `log in`, `log out`, `clear long-lived token`, `remove field`, `disable account` / `enable account`, `delete account`, `create account` | none |
+| Status | none | `refresh status`, `open in browser` |
 
 The active period or model filter is omitted from the Tokens menu, so the entries you see are the ones that would change something.
+
+`disable account` off the Setup tab asks first, since disabling drops the account from auto-switch, usage polling and status mid-flight; re-enabling is immediate. Neither runs for the active account or for one holding a live `clauth start` session; the pick names whichever is in the way.
 
 ## Setup tab rows
 

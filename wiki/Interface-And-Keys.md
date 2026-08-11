@@ -54,7 +54,7 @@ On macOS, <kbd>t</kbd> skips any account holding a live `clauth start` session: 
 
 ## Action menus
 
-<kbd>a</kbd> opens the actions available for whatever is selected. It lists what no key already does, so a row whose <kbd>⏎</kbd> is the whole story carries no menu: Config, Fallback and Plugin have none, nor do the Setup tab's text rows. The footer only advertises <kbd>a</kbd> where something would open.
+<kbd>a</kbd> opens the actions available for whatever is selected. It lists what no key already does, so a screen whose <kbd>⏎</kbd> is the whole story carries no menu: Config, Fallback and Plugin have none. The footer only advertises <kbd>a</kbd> where something would open.
 
 Entries above the rule act on the account named in the menu's title bar; entries below it act on the tab.
 
@@ -63,13 +63,20 @@ Entries above the rule act on the account named in the menu's title bar; entries
 | Overview | `refresh usage`, `rotate access token`, `disable account` / `enable account` | `refresh all accounts`, `new account` |
 | Usage | `refresh usage`, `rotate access token`, `disable account` / `enable account` | `refresh all accounts`, `toggle estimates`, `toggle pace marker` |
 | Tokens | none | `period: lifetime` / `daily` / `weekly` / `monthly`, `show all models` / `show claude models` / `show other models`, `toggle cache counting`, `reload stats` |
-| Setup (account list) | none | `new account` |
-| Setup (a settings row) | `remove field`, on an env row only | none |
+| Setup | `duplicate account`, `save as preset`, `apply preset` | none |
 | Status | none | `refresh status`, `open in browser` |
 
 The active period or model filter is omitted from the Tokens menu, so the entries you see are the ones that would change something.
 
-The Setup detail pane is itself a list of actions, so <kbd>⏎</kbd> on a row is the action and the menu adds only `remove field`: dropping a custom env var is the one thing no key there does, since <kbd>⏎</kbd> on an env row edits its value and an empty value saves as empty.
+The Setup detail pane is itself a list of actions, so <kbd>⏎</kbd> on a row is the action. What the menu adds is the three that work on the account as a whole, from either the account list or a settings row. On the `+ new` form there is no account yet, so nothing opens.
+
+| Entry | Does |
+|-------|------|
+| `duplicate account` | asks for a name, then copies every setting onto a new account: endpoint, api key, env, models, thresholds. The stored login stays behind, as do the chain's `preferred` and `last resort` marks, which only one account may hold |
+| `save as preset` | stores this account's base url and models under a name you type ([Configuration](Configuration#presets)). An existing preset asks first; a built-in's name is refused |
+| `apply preset` | opens the picker, built-ins first. Applying replaces the endpoint and the whole model block, naming the fields first when any are set. <kbd>d</kbd> deletes a saved preset |
+
+There is no `remove field`: an env row's <kbd>⏎</kbd> edits its value, and an empty value saves as empty, so the key stays. Drop one by editing the account's `config.toml`.
 
 `disable account` from Overview or Usage asks first, since disabling drops the account from auto-switch, usage polling and status mid-flight; re-enabling is immediate. Neither runs for the active account or for one holding a live `clauth start` session; the pick names whichever is in the way.
 
@@ -82,8 +89,8 @@ The Setup detail pane is itself a list of actions, so <kbd>⏎</kbd> on a row is
 | `base url` | the API endpoint; blank means an OAuth account |
 | `api key` | the key for that endpoint |
 | `model` | the account's default model; <kbd>space</kbd> cycles presets, <kbd>⏎</kbd> types a full id |
-| `+ model override` | expands to `opus`, `sonnet`, `haiku`, `subagent` id overrides |
-| env entries | extra environment variables merged into `settings.json` while this account is active |
+| `+ model override` | expands to `opus`, `sonnet`, `haiku`, `fable`, `subagent` id overrides |
+| env entries | extra environment variables merged into `settings.json` while this account is active; <kbd>⏎</kbd> edits a value, and an empty one keeps the key |
 | `disable account` / `enable account` | hides the account from auto-switch and polling, keeping its files |
 | `+ login` / `re-login` | browser OAuth login for this profile |
 | `log out` | drops the stored credentials, keeps the profile |

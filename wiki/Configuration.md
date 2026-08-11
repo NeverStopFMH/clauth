@@ -40,10 +40,23 @@ default  = "opusplan"                     # preset alias or a full model id
 opus     = "claude-opus-4-5-20251101"     # ANTHROPIC_DEFAULT_OPUS_MODEL
 sonnet   = "claude-sonnet-4-5-20250929"   # ANTHROPIC_DEFAULT_SONNET_MODEL
 haiku    = "claude-haiku-4-5-20251001"    # ANTHROPIC_DEFAULT_HAIKU_MODEL
+fable    = "claude-fable-5"               # ANTHROPIC_DEFAULT_FABLE_MODEL
 subagent = "claude-sonnet-4-5-20250929"   # CLAUDE_CODE_SUBAGENT_MODEL
 ```
 
 `default` lands as the top-level `model` key in `settings.json`; the rest ride in its `env` block. A switch or a `clauth start` applies whichever account you land on.
+
+## Presets
+
+A preset is a named `base_url` + `[models]` pair you can stamp onto any account from the Setup tab's <kbd>a</kbd> menu. Two ship built in, `DeepSeek` and `Z.ai`, each setting the endpoint and a base model; the tier rows stay yours to pin afterwards.
+
+`save as preset` stores the focused account's own endpoint and models under a name you type, in `~/.clauth/presets/<name>.json`:
+
+```json
+{ "base_url": "https://api.example/anthropic", "models": { "default": "my-model" } }
+```
+
+`apply preset` opens the picker, built-ins first. Applying replaces the account's endpoint and its whole `[models]` block, so a tier the preset leaves unset is cleared rather than kept; the picker warns and names the fields first when the account already carries any. The account's own api key is never touched, and a preset never carries one. <kbd>d</kbd> in the picker deletes a saved preset; the built-ins have no file and stay.
 
 ## Auto-start the 5-hour window
 
@@ -101,7 +114,7 @@ If the messages limiter is blocking Claude Code, a live 5h window will not clear
 | `max_auto_spend` | float | `0.0` | dollar ceiling on pay-as-you-go fallback |
 | `bell_threshold` | float | none | 5h % that fires a bell toast |
 | `[env]` | table | `{}` | extra environment variables merged into `settings.json` while active |
-| `[models]` | table | `{}` | `default`, `opus`, `sonnet`, `haiku`, `subagent` |
+| `[models]` | table | `{}` | `default`, `opus`, `sonnet`, `haiku`, `fable`, `subagent` |
 
 `last_resort` and `preferred` are radio toggles across the chain: marking one clears it everywhere else, and no account can be both.
 

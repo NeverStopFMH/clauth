@@ -327,6 +327,21 @@ impl Profile {
         self.provider?.console_url(self.base_url.as_deref()?)
     }
 
+    /// The console front this account's usage session is captured from, or
+    /// `None` when its usage needs no console. `Some` is what makes a login on
+    /// this account the CONSOLE login rather than an api-key or OAuth one.
+    ///
+    /// One predicate for every surface that asks: the CLI's login gate, the TUI
+    /// row that runs it, and that row's own hint and label. They disagreed once
+    /// already — the row ran the console flow while its hint still described the
+    /// api-key re-entry.
+    pub(crate) fn console_login_target(&self) -> Option<(ConsoleSite, &'static str)> {
+        if self.provider != Some(Provider::Alibaba) {
+            return None;
+        }
+        crate::providers::alibaba::site_and_region(self.base_url.as_deref()?)
+    }
+
     /// User-disabled (see [`Profile::disabled`]) — never `auth_broken`'s
     /// auto-quarantine, always an operator's own choice.
     pub(crate) fn is_disabled(&self) -> bool {

@@ -1780,7 +1780,13 @@ fn drain_login_events_discards_a_superseded_result() {
     app.login_generation = 2;
     app.login = Some(login_session("ghost", true, 2));
     app.login_result_tx
-        .send((1, Ok(login_outcome("ref", Some("uuid-live")))))
+        .send((
+            1,
+            Ok(super::LoginResult::Oauth(Box::new(login_outcome(
+                "ref",
+                Some("uuid-live"),
+            )))),
+        ))
         .unwrap();
 
     drain_login_events(&mut app);
@@ -1813,7 +1819,13 @@ fn login_result_on_the_new_form_stashes_into_the_draft() {
     app.login = Some(login_session("fresh", true, 1));
     app.modals.push(Modal::Login);
     app.login_result_tx
-        .send((1, Ok(login_outcome("ref", Some("uuid-live")))))
+        .send((
+            1,
+            Ok(super::LoginResult::Oauth(Box::new(login_outcome(
+                "ref",
+                Some("uuid-live"),
+            )))),
+        ))
         .unwrap();
 
     drain_login_events(&mut app);
@@ -1888,7 +1900,13 @@ fn login_result_with_the_form_closed_is_dropped_with_a_warning() {
     app.login_generation = 1;
     app.login = Some(login_session("fresh", true, 1));
     app.login_result_tx
-        .send((1, Ok(login_outcome("ref", Some("uuid-live")))))
+        .send((
+            1,
+            Ok(super::LoginResult::Oauth(Box::new(login_outcome(
+                "ref",
+                Some("uuid-live"),
+            )))),
+        ))
         .unwrap();
 
     drain_login_events(&mut app);
@@ -6681,4 +6699,308 @@ fn d_on_a_builtin_keeps_the_picker_on_a_custom_pops_it() {
             ConfirmAction::DeletePreset(ref n) if n == "mine"
         ));
     }
+}
+
+// ── Alibaba console login from the Setup `log in` row ─────────────────────────
+
+fn console_outcome(token: &str) -> crate::alibaba_login::ConsoleLoginOutcome {
+    crate::alibaba_login::ConsoleLoginOutcome {
+        console: crate::profile::ConsoleCredential {
+            token: token.to_string(),
+            site: crate::profile::ConsoleSite::International,
+            region: "ap-southeast-1".to_string(),
+        },
+    }
+}
+
+/// `log in` means a different flow per account, and the row cannot show which.
+/// An Alibaba account's usage rides a console session its api key cannot stand
+/// in for, so that row captures the session — matching a bare `clauth login`.
+/// Every other account keeps the flow it had.
+#[test]
+fn the_login_row_targets_a_console_only_for_a_model_studio_account() {
+    use crate::profile::{ConsoleSite, Profile};
+    let _home = crate::testutil::HomeSandbox::new();
+
+    let app = app_with(vec![
+        Profile::new("oauth".to_string(), None, None),
+        Profile::new(
+            "qwen-intl".to_string(),
+            Some("https://token-plan.ap-southeast-1.maas.aliyuncs.com/apps/anthropic".to_string()),
+            Some("sk-sp-test".to_string()),
+        ),
+        Profile::new(
+            "qwen-cn".to_string(),
+            Some("https://coding.dashscope.aliyuncs.com/apps/anthropic".to_string()),
+            Some("sk-sp-test".to_string()),
+        ),
+        Profile::new(
+            "deepseek".to_string(),
+            Some("https://api.deepseek.com".to_string()),
+            Some("sk-test".to_string()),
+        ),
+        Profile::new(
+            "proxy".to_string(),
+            Some("https://proxy.example/v1".to_string()),
+            Some("sk-test".to_string()),
+        ),
+    ]);
+
+    // Exact values: the site decides which console front is opened, and a token
+    // minted on one front is meaningless on the other.
+    assert_eq!(
+        super::console_login_target(&app, "qwen-intl"),
+        Some((ConsoleSite::International, "ap-southeast-1"))
+    );
+    assert_eq!(
+        super::console_login_target(&app, "qwen-cn"),
+        Some((ConsoleSite::Domestic, "cn-beijing"))
+    );
+
+    for other in ["oauth", "deepseek", "proxy", "missing"] {
+        assert_eq!(
+            super::console_login_target(&app, other),
+            None,
+            "'{other}' keeps its own login flow"
+        );
+    }
+}
+
+/// The captured session lands on the profile and nothing else moves: the api
+/// key stays, because the console hands back a workspace key billed against a
+/// different product than the plan this account runs on.
+#[test]
+fn a_captured_console_session_replaces_only_the_session() {
+    use super::drain_login_events;
+    use crate::profile::Profile;
+    let _home = crate::testutil::HomeSandbox::new();
+
+    let acct = Profile::new(
+        "qwen".to_string(),
+        Some("https://token-plan.ap-southeast-1.maas.aliyuncs.com/apps/anthropic".to_string()),
+        Some("sk-sp-original".to_string()),
+    );
+    crate::profile::save_profile(&acct).expect("save profile");
+    let mut app = app_with(vec![acct]);
+
+    app.login_generation = 1;
+    app.login = Some(login_session("qwen", false, 1));
+    app.login_result_tx
+        .send((
+            1,
+            Ok(super::LoginResult::Console(Box::new(console_outcome(
+                "console-token-1",
+            )))),
+        ))
+        .unwrap();
+
+    drain_login_events(&mut app);
+
+    let cfg = app.config();
+    let profile = cfg.find("qwen").expect("profile survives the login");
+    let console = profile.console.as_ref().expect("session stored");
+    assert_eq!(console.token, "console-token-1");
+    assert_eq!(console.region, "ap-southeast-1");
+    assert_eq!(
+        profile.api_key.as_deref(),
+        Some("sk-sp-original"),
+        "the console's own workspace key must never reach the profile"
+    );
+    assert_eq!(
+        profile.base_url.as_deref(),
+        Some("https://token-plan.ap-southeast-1.maas.aliyuncs.com/apps/anthropic"),
+        "the endpoint is untouched"
+    );
+    drop(cfg);
+    // Storing it is half the job: `store_console_login` drops the cache the old
+    // session filled, so without the re-fetch the tab shows nothing until the
+    // next cadence tick.
+    assert!(
+        app.refetch_queue.lock().unwrap().contains("qwen"),
+        "a fresh session asks for the figures it can now read"
+    );
+}
+
+/// A browser round-trip is long enough for the account to be repointed at
+/// another endpoint underneath it. A session is only meaningful on the console
+/// its endpoint is administered from, so the apply re-checks instead of storing
+/// it against whatever the profile has become.
+#[test]
+fn a_console_session_is_discarded_when_the_account_stopped_being_alibaba() {
+    use super::drain_login_events;
+    use crate::profile::Profile;
+    let _home = crate::testutil::HomeSandbox::new();
+
+    let acct = Profile::new(
+        "moved".to_string(),
+        Some("https://api.deepseek.com".to_string()),
+        Some("sk-test".to_string()),
+    );
+    crate::profile::save_profile(&acct).expect("save profile");
+    let mut app = app_with(vec![acct]);
+
+    app.login_generation = 1;
+    app.login = Some(login_session("moved", false, 1));
+    app.login_result_tx
+        .send((
+            1,
+            Ok(super::LoginResult::Console(Box::new(console_outcome(
+                "console-token-2",
+            )))),
+        ))
+        .unwrap();
+
+    drain_login_events(&mut app);
+
+    assert!(
+        app.config().find("moved").unwrap().console.is_none(),
+        "the session must not be stored against a non-Alibaba endpoint"
+    );
+    let toast = app.toasts.back().expect("the discard is reported");
+    assert!(
+        toast.body.contains("no longer points at the console"),
+        "the toast names the reason, got {:?}",
+        toast.body
+    );
+}
+
+/// The dangerous half of the same race, and the reason the re-check is on the
+/// SITE rather than on "still Alibaba": both Model Studio fronts pass a
+/// provider check, and the usage fetch keys on the credential's own site rather
+/// than on `base_url`. Storing an international session against a mainland
+/// endpoint would not read as a dead session, it would report the other plan's
+/// quota under this account's name.
+#[test]
+fn a_console_session_from_the_other_front_is_discarded_rather_than_stored() {
+    use super::drain_login_events;
+    use crate::profile::Profile;
+    let _home = crate::testutil::HomeSandbox::new();
+
+    let acct = Profile::new(
+        "swapped".to_string(),
+        // Mainland endpoint; the captured session below is international.
+        Some("https://token-plan.cn-beijing.maas.aliyuncs.com/apps/anthropic".to_string()),
+        Some("sk-sp-test".to_string()),
+    );
+    crate::profile::save_profile(&acct).expect("save profile");
+    let mut app = app_with(vec![acct]);
+
+    assert_eq!(
+        super::console_login_target(&app, "swapped").map(|(site, _)| site),
+        Some(crate::profile::ConsoleSite::Domestic),
+        "the fixture is the mainland front, so the intl session below mismatches"
+    );
+
+    app.login_generation = 1;
+    app.login = Some(login_session("swapped", false, 1));
+    app.login_result_tx
+        .send((
+            1,
+            Ok(super::LoginResult::Console(Box::new(console_outcome(
+                "intl-token",
+            )))),
+        ))
+        .unwrap();
+
+    drain_login_events(&mut app);
+
+    assert!(
+        app.config().find("swapped").unwrap().console.is_none(),
+        "a session from the other console front must not be stored"
+    );
+}
+
+/// A profile deleted during the browser round-trip is a different failure from
+/// one that moved, and the operator is told which. They shared one message
+/// until 2026-08-11, so a delete reported the account had changed type.
+#[test]
+fn a_console_session_for_a_deleted_account_says_it_is_gone() {
+    use super::drain_login_events;
+    let _home = crate::testutil::HomeSandbox::new();
+
+    let mut app = app_with(vec![]);
+    app.login_generation = 1;
+    app.login = Some(login_session("vanished", false, 1));
+    app.login_result_tx
+        .send((
+            1,
+            Ok(super::LoginResult::Console(Box::new(console_outcome(
+                "orphan-token",
+            )))),
+        ))
+        .unwrap();
+
+    drain_login_events(&mut app);
+
+    let toast = app.toasts.back().expect("the discard is reported");
+    assert!(
+        toast.body.contains("no longer exists"),
+        "a deleted account is reported as gone, got {:?}",
+        toast.body
+    );
+}
+
+/// The branch ORDER is the whole change: an Alibaba account satisfies the
+/// api-key predicate too, so putting the console branch second routes every one
+/// of them back to the api-key re-entry with nothing else failing. Testing the
+/// two predicates in isolation cannot see that, so pin the overlap.
+#[test]
+fn a_model_studio_account_satisfies_both_login_predicates() {
+    use crate::profile::Profile;
+    let _home = crate::testutil::HomeSandbox::new();
+
+    let app = app_with(vec![Profile::new(
+        "qwen".to_string(),
+        Some("https://token-plan.ap-southeast-1.maas.aliyuncs.com/apps/anthropic".to_string()),
+        Some("sk-sp-test".to_string()),
+    )]);
+
+    assert!(
+        !app.config().find("qwen").unwrap().login_is_oauth(),
+        "the api-key arm's predicate is TRUE for it, which is why order decides"
+    );
+    assert_eq!(
+        super::login_row_flow(&app, Some("qwen")),
+        super::LoginRowFlow::Console {
+            site: crate::profile::ConsoleSite::International,
+            region: "ap-southeast-1",
+        },
+        "and the console arm is the one that wins"
+    );
+}
+
+/// The other two arms of the same resolver, so the console arm cannot be
+/// widened into them unnoticed.
+#[test]
+fn the_login_row_keeps_its_other_two_flows() {
+    use crate::profile::Profile;
+    let _home = crate::testutil::HomeSandbox::new();
+
+    let app = app_with(vec![
+        Profile::new("oauth".to_string(), None, None),
+        Profile::new(
+            "deepseek".to_string(),
+            Some("https://api.deepseek.com".to_string()),
+            Some("sk-test".to_string()),
+        ),
+    ]);
+
+    assert_eq!(
+        super::login_row_flow(&app, Some("deepseek")),
+        super::LoginRowFlow::ApiKey
+    );
+    assert_eq!(
+        super::login_row_flow(&app, Some("oauth")),
+        super::LoginRowFlow::OauthMint
+    );
+    assert_eq!(
+        super::login_row_flow(&app, Some("missing")),
+        super::LoginRowFlow::OauthMint,
+        "an unknown name cannot re-enter a key it has no account for"
+    );
+    assert_eq!(
+        super::login_row_flow(&app, None),
+        super::LoginRowFlow::OauthMint,
+        "the `+ new` form has no account to read a type off"
+    );
 }

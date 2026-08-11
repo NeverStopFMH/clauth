@@ -40,7 +40,7 @@ use crate::lock::with_state_lock;
 use crate::lockorder::{RankedGuard, RankedMutex};
 use crate::oauth;
 use crate::profile::{
-    AppConfig, ClockFormat, ConfigHandle, DivergenceChoice, MAX_REFRESH_INTERVAL_MS,
+    AppConfig, ClockFormat, ConfigHandle, ConsoleSite, DivergenceChoice, MAX_REFRESH_INTERVAL_MS,
     MAX_WEEKLY_SWITCH_PCT, MIN_REFRESH_INTERVAL_MS, MIN_WEEKLY_SWITCH_PCT, ModelSettings, Profile,
     ReloadFingerprint, ResetDisplay, ThemeName, load_config, reload_fingerprint, save_app_state,
     save_profile,
@@ -1391,6 +1391,20 @@ pub(crate) enum LoginEvent {
     Stage(LoginStage),
 }
 
+/// What a finished login worker produced. Both flows are a browser round-trip
+/// announced through the same [`LoginEvent`] channel and drawn by the same
+/// modal, and they diverge only at apply time: an Anthropic login replaces the
+/// profile's credentials, an Alibaba console login replaces its usage session
+/// and touches nothing else.
+///
+/// The drain routes on this payload rather than on anything recorded in
+/// [`LoginSession`], so a session and its result cannot disagree about which
+/// flow ran.
+pub(crate) enum LoginResult {
+    Oauth(Box<crate::oauth_login::LoginOutcome>),
+    Console(Box<crate::alibaba_login::ConsoleLoginOutcome>),
+}
+
 // ── App ───────────────────────────────────────────────────────────────────────
 
 pub(crate) struct App {
@@ -1496,14 +1510,10 @@ pub(crate) struct App {
     pub(crate) login_generation: u64,
     pub(crate) login_event_rx: std::sync::mpsc::Receiver<(u64, LoginEvent)>,
     pub(crate) login_event_tx: std::sync::mpsc::Sender<(u64, LoginEvent)>,
-    pub(crate) login_result_rx: std::sync::mpsc::Receiver<(
-        u64,
-        std::result::Result<crate::oauth_login::LoginOutcome, String>,
-    )>,
-    pub(crate) login_result_tx: std::sync::mpsc::Sender<(
-        u64,
-        std::result::Result<crate::oauth_login::LoginOutcome, String>,
-    )>,
+    pub(crate) login_result_rx:
+        std::sync::mpsc::Receiver<(u64, std::result::Result<LoginResult, String>)>,
+    pub(crate) login_result_tx:
+        std::sync::mpsc::Sender<(u64, std::result::Result<LoginResult, String>)>,
 
     /// Claude status feed state; UI-thread-only (no shared lock).
     pub(crate) status: StatusState,
@@ -5763,15 +5773,17 @@ fn run_config_row(app: &mut App, row: ConfigRow) {
                 .config_draft
                 .as_ref()
                 .and_then(|d| d.editing_name.clone());
-            // An existing API account re-enters its base url + api key inline (no
-            // browser); only OAuth accounts run the token-minting flow below.
-            let is_api_account = editing.as_deref().is_some_and(|n| {
-                let cfg = app.config();
-                cfg.find(n).map(|p| !p.login_is_oauth()).unwrap_or(false)
-            });
-            if is_api_account {
-                start_api_relogin(app);
-                return;
+            match login_row_flow(app, editing.as_deref()) {
+                LoginRowFlow::Console { site, region } => {
+                    let name = editing.unwrap_or_default();
+                    start_console_login(app, name, site, region);
+                    return;
+                }
+                LoginRowFlow::ApiKey => {
+                    start_api_relogin(app);
+                    return;
+                }
+                LoginRowFlow::OauthMint => {}
             }
             let target = match editing {
                 Some(name) => Some((name, false)),
@@ -5967,7 +5979,115 @@ fn start_login(app: &mut App, name: String, is_new: bool) {
         });
         // A toast, not stderr: the canned line without the HTTP status. The
         // status is in `~/.clauth/clauth.log` via the exchange's `logline!`.
-        let _ = result_tx.send((generation, res.map_err(|e| e.user_message())));
+        let _ = result_tx.send((
+            generation,
+            res.map(|o| LoginResult::Oauth(Box::new(o)))
+                .map_err(|e| e.user_message()),
+        ));
+    });
+    open_login_modal(app);
+}
+
+/// Which of the three flows the `log in` row runs. An account can satisfy more
+/// than one of these predicates, so the ORDER is the behaviour: a Model Studio
+/// account is api-typed by `login_is_oauth`, and reading the api-key arm first
+/// would route every one of them to the api-key re-entry with nothing else
+/// failing. Encoded here rather than as a chain of early returns in the row so
+/// the order is a thing a test can pin — driving the row itself binds a
+/// loopback listener and opens a browser.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LoginRowFlow {
+    /// Capture this account's Alibaba console session.
+    Console {
+        site: ConsoleSite,
+        region: &'static str,
+    },
+    /// Re-enter an existing api-key account's base url + key inline.
+    ApiKey,
+    /// Mint an Anthropic login in the browser. Also the `+ new` form's flow,
+    /// which has no account to read a type off yet.
+    OauthMint,
+}
+
+/// Resolve the `log in` row's flow for the draft's account (`None` on the
+/// `+ new` form, which can only mint).
+fn login_row_flow(app: &App, editing: Option<&str>) -> LoginRowFlow {
+    let Some(name) = editing else {
+        return LoginRowFlow::OauthMint;
+    };
+    if let Some((site, region)) = console_login_target(app, name) {
+        return LoginRowFlow::Console { site, region };
+    }
+    let cfg = app.config();
+    match cfg.find(name) {
+        Some(p) if !p.login_is_oauth() => LoginRowFlow::ApiKey,
+        _ => LoginRowFlow::OauthMint,
+    }
+}
+
+/// Which console the `log in` row would capture a session from for `name`, or
+/// `None` when that row runs one of its other two flows (an api-key re-entry or
+/// an Anthropic browser mint).
+///
+/// Split out of the row so the decision is readable without starting a browser
+/// round-trip: driving the row itself binds a loopback listener and opens a
+/// browser, which is not something a test may do.
+///
+/// The verdict itself is [`Profile::console_login_target`], shared with the row's
+/// hint and label so the copy cannot describe a different flow than the one ⏎
+/// runs.
+fn console_login_target(app: &App, name: &str) -> Option<(ConsoleSite, &'static str)> {
+    let cfg = app.config();
+    cfg.find(name)?.console_login_target()
+}
+
+/// Kick the Alibaba console login on a worker — the same browser round-trip and
+/// the same progress modal as [`start_login`], capturing that account's usage
+/// session instead of an Anthropic credential.
+///
+/// Never `is_new`: the console site and region are read off the profile's
+/// endpoint, so an account without one has no console to open, and the create
+/// form has no endpoint yet. That is why the CLI's own route is
+/// create-with-preset, then log in.
+fn start_console_login(app: &mut App, name: String, site: ConsoleSite, region: &'static str) {
+    if let Some(session) = app.login.as_ref() {
+        // Same shape as `start_login`'s guard, `is_new` included: a `+ new`
+        // draft's login is a different session even when the typed name matches,
+        // so re-showing its modal without a word would read as this row's own
+        // login having started.
+        if session.name != name || session.is_new {
+            app.toast(
+                ToastKind::Warning,
+                format!("a login for '{}' is already in progress", session.name),
+            );
+        }
+        open_login_modal(app);
+        return;
+    }
+    app.login_generation += 1;
+    let generation = app.login_generation;
+    app.login = Some(LoginSession {
+        name,
+        is_new: false,
+        generation,
+        url: None,
+        stage: LoginStage::WaitingBrowser,
+    });
+    let event_tx = app.login_event_tx.clone();
+    let result_tx = app.login_result_tx.clone();
+    spawn_worker(move || {
+        let res = crate::alibaba_login::login_with(site, region, |url| {
+            let _ = event_tx.send((generation, LoginEvent::Url(url.to_string())));
+        });
+        let _ = result_tx.send((
+            generation,
+            res.map(|o| LoginResult::Console(Box::new(o)))
+                // `{e:#}` keeps the whole `anyhow` chain: the outermost context
+                // here is a bare "loopback accept failed" whose io cause is the
+                // only part that says what to do about it. No constructor in
+                // `alibaba_login` embeds the token or an upstream body.
+                .map_err(|e| format!("{e:#}")),
+        ));
     });
     open_login_modal(app);
 }
@@ -7810,7 +7930,8 @@ fn drain_login_events(app: &mut App) {
         };
         close_login_modal(app);
         match result {
-            Ok(creds) => apply_login(app, session, creds),
+            Ok(LoginResult::Oauth(creds)) => apply_login(app, session, *creds),
+            Ok(LoginResult::Console(outcome)) => apply_console_login(app, session, *outcome),
             Err(e) => app.toast(
                 ToastKind::Danger,
                 format!("login for '{}' failed\n{e}", session.name),
@@ -7913,6 +8034,77 @@ fn apply_login(app: &mut App, session: LoginSession, outcome: crate::oauth_login
             app.toast(ToastKind::Success, format!("logged in '{}'", session.name));
         }
         Err(e) => app.toast(ToastKind::Danger, format!("login failed\n{e}")),
+    }
+}
+
+/// Fold a captured Alibaba console session into its profile. Replaces the usage
+/// session and NOTHING else — not the api key, which the callback also returns
+/// scoped to a workspace rather than to this plan (`alibaba_login`'s module doc
+/// has the reason it is dropped).
+///
+/// Re-checks the account at apply time the way [`apply_login`] does, and on the
+/// same reasoning: a browser round-trip is long enough for the profile to be
+/// deleted or repointed at a different endpoint underneath it, and a session is
+/// only meaningful on the console its endpoint is administered from. There is no
+/// divergence gate, because a lapsed session cannot be refreshed and re-running
+/// this login is the routine repair rather than an overwrite to guard.
+fn apply_console_login(
+    app: &mut App,
+    session: LoginSession,
+    outcome: crate::alibaba_login::ConsoleLoginOutcome,
+) {
+    let name = session.name;
+    let (exists, target) = {
+        let cfg = app.config();
+        let profile = cfg.find(&name);
+        (
+            profile.is_some(),
+            profile.and_then(Profile::console_login_target),
+        )
+    };
+    if !exists {
+        app.toast(
+            ToastKind::Danger,
+            format!("console login failed\nprofile '{name}' no longer exists"),
+        );
+        return;
+    }
+    // The SITE, not just "still Alibaba". A session is minted on one console
+    // front and is meaningless on the other, and the usage fetch keys on the
+    // credential's OWN site rather than on `base_url` — so an endpoint moved
+    // between two Model Studio hosts mid-round-trip would not degrade to a dead
+    // session, it would quietly report the other plan's quota under this name.
+    // Compared against what the console ANSWERED with, which is what got
+    // stored, rather than against what the login opened.
+    if target.map(|(site, _)| site) != Some(outcome.console.site) {
+        app.toast(
+            ToastKind::Danger,
+            format!("console login failed\n'{name}' no longer points at the console this session came from"),
+        );
+        return;
+    }
+    let result = {
+        let mut cfg = app.config();
+        crate::actions::store_console_login(&mut cfg, &name, outcome.console)
+    };
+    match result {
+        Ok(()) => {
+            // The stored session is what the usage leg fetches with, and
+            // `store_console_login` drops the cache the old one filled, so ask
+            // for the figures the new one can actually read.
+            app.refresh_tokens();
+            app.manual_refresh_one(&name);
+            // The window is the surprising part and the CLI's own summary leads
+            // with it: the 48h runs from the aliyun browser sign-in, so a login
+            // inherits what is left of it and can be worth minutes.
+            app.toast(
+                ToastKind::Success,
+                format!(
+                    "console session captured for '{name}'\nit expires 48h after your aliyun sign-in, not after this login"
+                ),
+            );
+        }
+        Err(e) => app.toast(ToastKind::Danger, format!("console login failed\n{e}")),
     }
 }
 

@@ -106,6 +106,12 @@ struct Snap {
     captured: bool,
     /// Recognised third-party provider display name, if any.
     provider: Option<&'static str>,
+    /// This account's login IS the Alibaba console login
+    /// ([`crate::profile::Profile::console_login_target`]). Read here so the
+    /// `Login` row's hint and label describe the flow ⏎ actually runs: the
+    /// account is api-typed by `login_is_oauth`, so both would otherwise
+    /// announce the api-key re-entry.
+    console_login: bool,
     /// CLA-SPLIT sidecar state (`claude::session_token_status`): `None` = no
     /// sidecar; long-lived with its stamped horizon, or the mis-filled
     /// not-long-lived shape the split disengages for. Read per frame for the
@@ -137,6 +143,7 @@ impl Snap {
             has_other_login: false,
             captured: false,
             provider: None,
+            console_login: false,
             session_token: None,
         }
     }
@@ -189,7 +196,14 @@ fn build_snap(app: &App, with_text: bool) -> Snap {
             has_live_session: crate::runtime::has_live_session(p.name.as_str()),
             // OAuth accounts carry a token; API accounts carry an api key. Either
             // one flips the Login row to "re-login" and shows the log-out row.
-            logged_in: if p.login_is_oauth() {
+            // A console account's `log in` row captures the SESSION, so that
+            // is the credential its done-state names. Its api key is a
+            // different credential on a different row and cannot stand in:
+            // a keyless account with a live session is logged in for this
+            // row's purposes, and a keyed one with no session is not.
+            logged_in: if p.console_login_target().is_some() {
+                p.console.is_some()
+            } else if p.login_is_oauth() {
                 p.credentials.is_some()
             } else {
                 p.api_key.as_deref().is_some_and(|k| !k.trim().is_empty())
@@ -198,6 +212,7 @@ fn build_snap(app: &App, with_text: bool) -> Snap {
             has_other_login: p.credentials.is_some() || p.api_key.is_some(),
             captured: false,
             provider: p.provider.map(|p| p.display_name()),
+            console_login: p.console_login_target().is_some(),
             session_token: crate::claude::session_token_status(p.name.as_str()),
         },
         None => Snap::blank("settings"),
@@ -498,6 +513,9 @@ fn row_hint(row: ConfigRow, snap: &Snap) -> Option<String> {
         }
         ConfigRow::AutoStart => "never starts a session on its own",
         ConfigRow::ModelOverrideAdd => "pin what an alias resolves to, or force the subagent model",
+        ConfigRow::Login if snap.console_login => {
+            "opens the alibaba console to capture this account's usage session"
+        }
         ConfigRow::Login if api_login => "re-enter the base url + api key for this account",
         ConfigRow::Login => "browser OAuth login; mints fresh tokens for this account",
         ConfigRow::DeleteCreds if api_login => {

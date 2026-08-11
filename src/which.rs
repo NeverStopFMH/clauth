@@ -6,8 +6,9 @@
 //! and the matching profile's file byte-identical across rotations. (1b) When
 //! the loaded file carries NO refresh token, match its `accessToken` against
 //! each profile's long-lived session-token sidecar (CLA-SPLIT): that is what a
-//! switch installs for such a profile, and a mint carries no refresh token by
-//! construction, so tier 1 can never see it. (2) Inside
+//! switch installs for such a profile, and both things a sidecar can hold — a
+//! `claude setup-token` mint, or a rolling stamp (CLA-ROLL) — carry no refresh
+//! token by construction, so tier 1 can never see either. (2) Inside
 //! a `clauth start` runtime, fall back to the profile named by
 //! `CLAUDE_CONFIG_DIR` (`profiles/<name>/runtime-<sid>`, or a bare
 //! `profiles/<name>/runtime` where the tree is shared): a runtime tree belongs
@@ -211,10 +212,12 @@ fn resolve_profile_candidate<'a>(
         return Some((name, Source::RefreshMatch));
     }
     // CLA-SPLIT tier. Gated on the loaded file carrying NO refresh token, which
-    // is both the correctness condition (a `claude setup-token` mint has none by
-    // construction, so a rotating login can never be attributed to a sidecar)
-    // and the cost one: the common case runs zero extra disk reads, and this
-    // resolves once per second behind a statusline.
+    // is both the correctness condition (a `claude setup-token` mint and a
+    // rolling stamp are refresh-less by construction, so a rotating login can
+    // never be attributed to a sidecar) and the cost one: the common case runs
+    // zero extra disk reads, and this resolves once per second behind a
+    // statusline. The sidecar read behind `installed_session_token` is itself
+    // content-gated, so a rolling bearer attributes here exactly like a mint.
     if creds.is_some_and(|c| c.refresh_token().is_none())
         && let Some(at) = creds.and_then(ClaudeCredentials::access_token)
         && let Some(name) = match_by_session_token(config, at, installed_session_token)

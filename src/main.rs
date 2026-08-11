@@ -679,14 +679,27 @@ fn cmd_login_setup_token(
     Ok(())
 }
 
-/// `clauth static-token <name> --clear [--yes]` — the exit from CLA-SPLIT, and
-/// the mirror of the capture above: it drops `session-token.json` so
-/// `install_source_path` points back at the profile's stored OAuth pair.
+/// `clauth static-token <name> --clear [--yes]` — the exit from the long-lived
+/// token entirely: it removes every piece of that state, so the profile's
+/// stored OAuth pair is what switches install again and nothing re-creates a
+/// sidecar behind the operator's back. Three pieces, each cleared when present:
+///
+/// - `session-token.json` — flips `install_source_path` back to
+///   `credentials.json`.
+/// - the `rolling_token` flag — FIRST, and load-bearing: with the flag still
+///   set, the daemon's next scan re-stamps a fresh rolling bearer over the
+///   removal, and the clear visibly "doesn't take" — the same daemon-fights-
+///   operator failure the bare restore's flag-off-first ordering exists for.
+/// - `session-token.static.json` — the preserved mint IS a long-lived
+///   credential; "cleared" with a year-scale token still on disk would be
+///   false. On a rolling profile it is the only long-lived piece, the
+///   hours-scale bearer in the sidecar being the decoy.
 ///
 /// A verb rather than a flag on `login`, matching how `enable`/`disable` toggle
 /// per-profile state: this removes a credential, so hanging it off the command
-/// that ADDS one reads as a login that does not log in. `--clear` is required
-/// (see the clap definition) because the bare verb is reserved.
+/// that ADDS one reads as a login that does not log in. The bare verb is the
+/// RESTORE (the inverse of `rolling-token`), which is why `--yes` requires
+/// `--clear`.
 ///
 /// Unlike the capture it CANNOT leave the live slot alone. The slot is a symlink
 /// into the profile store, so removing its target under it leaves a dangling
@@ -708,17 +721,33 @@ fn cmd_static_token_clear(name: &str, yes: bool) -> Result<()> {
     use std::io::IsTerminal as _;
     platform::init();
 
-    let config = load_config()?;
+    let mut config = load_config()?;
     let canonical = resolve_or_bail(&config, name)?;
     let target = canonical.as_str();
-    if claude::session_token_status(target).is_none() {
-        outln!("clauth: '{target}' holds no long-lived token, so nothing to clear.");
-        return Ok(());
-    }
     let profile = config
         .find(target)
         .ok_or_else(|| anyhow::anyhow!("no profile named '{target}'"))?;
-    if profile.credentials.is_none() && profile.api_key.is_none() {
+    let sidecar_present = claude::session_token_status(target).is_some();
+    let backup_present = profile::profile_dir(target)?
+        .join("session-token.static.json")
+        .exists();
+    let rolling_armed = profile.rolling_token;
+    // "Nothing to clear" only when ALL THREE pieces are absent. A set flag with
+    // no sidecar (the daemon just hasn't stamped yet, or someone removed the
+    // file by hand) is exactly the state where an early "nothing to clear"
+    // would leave the daemon to re-create what the operator was told is gone.
+    if !sidecar_present && !backup_present && !rolling_armed {
+        outln!("clauth: '{target}' holds no long-lived token, so nothing to clear.");
+        return Ok(());
+    }
+    // The other-login guard covers the backup slot too: a preserved mint is
+    // restorable by the bare verb, so destroying it when it is the profile's
+    // only credential strips the profile the same way removing the sidecar
+    // would.
+    if (sidecar_present || backup_present)
+        && profile.credentials.is_none()
+        && profile.api_key.is_none()
+    {
         anyhow::bail!(
             "'{target}' stores no other login, so clearing its long-lived token would leave it \
              with no credentials at all. Run `clauth login {target}` first, then clear."
@@ -750,6 +779,18 @@ fn cmd_static_token_clear(name: &str, yes: bool) -> Result<()> {
                 );
             }
         }
+        if rolling_armed {
+            outln!(
+                "clauth: '{target}' is on the rolling token — clearing also turns its \
+                 re-stamping off."
+            );
+        }
+        if backup_present {
+            outln!(
+                "clauth: the preserved mint at session-token.static.json goes with it — \
+                 `clauth static-token {target}` will have nothing to restore."
+            );
+        }
         out!("Clear the long-lived token for '{target}'? [y/N] ");
         let mut answer = String::new();
         std::io::stdin().read_line(&mut answer)?;
@@ -759,7 +800,18 @@ fn cmd_static_token_clear(name: &str, yes: bool) -> Result<()> {
         }
     }
 
+    // Serialized on the rotation guard for the same reason the bare restore is:
+    // a rotation in flight that still sees the flag set would re-stamp the
+    // sidecar AFTER the removal below, resurrecting the very state this command
+    // just reported cleared.
+    let _guard = runtime::RotationGuard::acquire(target)
+        .with_context(|| format!("could not lock '{target}' to clear its long-lived token"))?;
+    if rolling_armed && let Some(p) = config.find_mut(target) {
+        p.rolling_token = false;
+        profile::save_profile(p)?;
+    }
     claude::clear_session_token(target)?;
+    claude::clear_static_backup(target)?;
     // Re-read AFTER the clear: `install_source_path` only falls back to
     // `credentials.json` once the sidecar is gone, so this is the store the
     // relink below actually finds.
@@ -787,6 +839,9 @@ fn cmd_static_token_clear(name: &str, yes: bool) -> Result<()> {
             "clauth: cleared the long-lived token for '{target}'. It stores no OAuth login, \
              so switching to it authenticates by api key:  clauth {target}"
         );
+    }
+    if rolling_armed {
+        outln!("clauth: rolling-token is off · nothing re-stamps a sidecar for '{target}' now.");
     }
     Ok(())
 }

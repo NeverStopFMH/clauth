@@ -1369,9 +1369,9 @@ fn stored_probe_due(key: &[u8; 32]) -> bool {
         // A poisoned lock probes rather than silently refuses a legit adopt.
         return true;
     };
-    !suppressed
+    suppressed
         .get(key)
-        .is_some_and(|not_before| now < *not_before)
+        .is_none_or(|not_before| now >= *not_before)
 }
 
 fn suppress_stored_probe(key: &[u8; 32]) {

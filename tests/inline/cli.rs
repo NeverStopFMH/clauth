@@ -395,8 +395,8 @@ fn static_token_bare_restores_and_clear_takes_an_unprompted_yes() {
         "-y is the short spelling"
     );
 
-    let err =
-        parse(&["static-token", "acme", "--yes"]).expect_err("--yes without --clear must be refused");
+    let err = parse(&["static-token", "acme", "--yes"])
+        .expect_err("--yes without --clear must be refused");
     assert!(
         err.to_string().contains("--clear"),
         "the error must name what --yes requires, got: {err}"
@@ -1662,5 +1662,143 @@ mod static_token_verdicts {
         )
         .expect("re-mint");
         cmd_static_token("st-corrupt").expect("the recovery path converges instead of looping");
+    }
+}
+
+/// `static-token --clear` as the FULL exit from the long-lived token: all three
+/// pieces of that state go together (sidecar, preserved mint, `rolling_token`
+/// flag), because each one left behind resurrects what the operator was told is
+/// gone — a lingering flag has the daemon re-stamp a fresh sidecar, and a
+/// lingering backup keeps the actual year-scale credential on disk under a
+/// command that just printed "cleared".
+mod static_token_clear {
+    use super::*;
+    use crate::testutil::HomeSandbox;
+
+    /// A profile with a stored OAuth pair (so the other-login guard passes),
+    /// the rolling flag as given, saved into app state.
+    fn cleared_profile(name: &str, rolling_flag: bool, with_login: bool) {
+        let mut profile = crate::profile::Profile::new(name.to_string(), None, None);
+        profile.rolling_token = rolling_flag;
+        if with_login {
+            profile.credentials = Some(crate::profile::ClaudeCredentials {
+                claude_ai_oauth: Some(crate::profile::OAuthToken {
+                    access_token: "at-usage".to_string(),
+                    refresh_token: Some("rt-usage".to_string()),
+                    expires_at: Some(crate::usage::now_ms() as i64 + 8 * 3_600_000),
+                    scopes: None,
+                    subscription_type: None,
+                }),
+            });
+        }
+        crate::profile::save_profile(&profile).expect("save profile");
+        let state = crate::profile::AppState {
+            profiles: vec![profile.name.clone()],
+            ..Default::default()
+        };
+        crate::profile::save_app_state(&state).expect("save state");
+    }
+
+    #[test]
+    fn clear_takes_the_sidecar_the_backup_and_the_flag_together() {
+        let _home = HomeSandbox::new();
+        cleared_profile("cl-roll", true, true);
+        // A mint first, then the rolling stamp: the first stamp preserves the
+        // mint into `session-token.static.json`, which is exactly the two-file
+        // state a rolling profile carries in production.
+        crate::claude::write_session_token(
+            "cl-roll",
+            "sk-ant-oat01-clear-full-exit-mint",
+            crate::usage::now_ms() as i64,
+        )
+        .expect("mint");
+        crate::claude::stamp_rolling_token(
+            "cl-roll",
+            &crate::profile::OAuthToken {
+                access_token: "at-rolled".to_string(),
+                refresh_token: None,
+                expires_at: Some(crate::usage::now_ms() as i64 + 8 * 3_600_000),
+                scopes: Some(vec![
+                    "user:inference".to_string(),
+                    "user:profile".to_string(),
+                ]),
+                subscription_type: Some("max".into()),
+            },
+        )
+        .expect("stamp");
+        let dir = crate::profile::profile_dir("cl-roll").expect("dir");
+        assert!(dir.join("session-token.static.json").exists(), "fixture");
+
+        cmd_static_token_clear("cl-roll", true).expect("the clear succeeds");
+
+        assert!(
+            !dir.join("session-token.json").exists(),
+            "the sidecar is gone"
+        );
+        assert!(
+            !dir.join("session-token.static.json").exists(),
+            "the preserved mint is a long-lived credential and goes with the clear"
+        );
+        let p = crate::profile::load_profile("cl-roll").expect("reload");
+        assert!(
+            !p.rolling_token,
+            "the flag goes too, or the daemon re-stamps a sidecar over the clear"
+        );
+    }
+
+    /// The widened nothing-to-clear gate: a set flag with NO files is exactly
+    /// the state where an early "nothing to clear" would leave the daemon to
+    /// re-create what the operator was told is gone.
+    #[test]
+    fn a_set_flag_with_no_files_is_still_something_to_clear() {
+        let _home = HomeSandbox::new();
+        cleared_profile("cl-flag", true, true);
+        cmd_static_token_clear("cl-flag", true).expect("the disarm succeeds");
+        let p = crate::profile::load_profile("cl-flag").expect("reload");
+        assert!(!p.rolling_token, "the clear turned re-stamping off");
+    }
+
+    /// The other-login guard covers the backup slot: a preserved mint is
+    /// restorable by the bare verb, so destroying it when it is the profile's
+    /// only credential strips the profile the same way removing the sidecar
+    /// would.
+    #[test]
+    fn the_backup_slot_counts_as_the_last_credential() {
+        let _home = HomeSandbox::new();
+        cleared_profile("cl-last", false, false);
+        let dir = crate::profile::profile_dir("cl-last").expect("dir");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        // A live mint in the backup slot and nothing else: the one credential.
+        crate::claude::write_session_token(
+            "cl-last",
+            "sk-ant-oat01-last-credential-mint",
+            crate::usage::now_ms() as i64,
+        )
+        .expect("mint");
+        std::fs::rename(
+            dir.join("session-token.json"),
+            dir.join("session-token.static.json"),
+        )
+        .expect("move into the backup slot");
+
+        let err = cmd_static_token_clear("cl-last", true)
+            .expect_err("clearing the only credential is refused");
+        assert!(
+            format!("{err:#}").contains("stores no other login"),
+            "{err:#}"
+        );
+        assert!(
+            dir.join("session-token.static.json").exists(),
+            "a refused clear removes nothing"
+        );
+    }
+
+    /// With all three pieces absent the clear is a quiet no-op success, not an
+    /// error — the requested end state already holds.
+    #[test]
+    fn nothing_to_clear_is_a_noop_success() {
+        let _home = HomeSandbox::new();
+        cleared_profile("cl-none", false, true);
+        cmd_static_token_clear("cl-none", true).expect("nothing to clear is success");
     }
 }

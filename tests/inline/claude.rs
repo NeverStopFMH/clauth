@@ -1090,6 +1090,28 @@ fn installed_session_token_tracks_what_a_switch_installs() {
         Some("oat-access")
     );
 
+    // CLA-ROLL: a rolling stamp is refresh-less by construction, exactly like
+    // the mint, so it attributes the same way — `clauth which` must keep
+    // naming a session when the daemon swaps the mint for a rolling bearer.
+    // Re-gating this on a mint-only predicate is what would silently turn
+    // every rolling session's statusline to `unknown`.
+    stamp_rolling_token(
+        "split",
+        &OAuthToken {
+            access_token: "at-rolling".to_string(),
+            refresh_token: Some("rt-chain".to_string()),
+            expires_at: Some(crate::usage::now_ms() as i64 + 8 * 3_600_000),
+            scopes: Some(vec!["user:profile".into(), "user:inference".into()]),
+            subscription_type: Some("max".into()),
+        },
+    )
+    .expect("stamp rolling");
+    assert_eq!(
+        installed_session_token("split").as_deref(),
+        Some("at-rolling"),
+        "a rolling stamp attributes like the mint"
+    );
+
     // Mis-fill: a rotating pair in the sidecar leaves the split disengaged, so
     // the install source is the OAuth pair and there is nothing to attribute by.
     let dir = crate::profile::profile_dir("split").expect("profile dir");

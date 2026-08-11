@@ -1302,6 +1302,121 @@ fn clear_session_token_on_an_idle_account_leaves_the_live_link_alone() {
     );
 }
 
+/// The TUI clear is the same FULL exit as `clauth static-token --clear`, or the
+/// two surfaces fight the daemon differently: on a rolling profile the
+/// `rolling_token` flag goes FIRST (a set flag has the daemon re-stamp a fresh
+/// bearer over the removal on its next scan) and the preserved mint goes too
+/// (a "cleared" long-lived token with a year-scale mint still in
+/// `session-token.static.json` is not cleared).
+#[test]
+fn clear_session_token_on_a_rolling_profile_disarms_and_takes_the_backup() {
+    use super::{ConfigRow, build_draft_existing, run_config_row};
+    use crate::profile::Profile;
+    let _home = crate::testutil::HomeSandbox::new();
+
+    let mut acct = Profile::new("roll".to_string(), None, None);
+    acct.credentials = Some(split_creds("stored-oauth", Some("stored-refresh")));
+    acct.rolling_token = true;
+    crate::profile::save_profile(&acct).expect("save profile");
+    // A mint first, then the rolling stamp: the first stamp preserves the mint
+    // into the backup slot — the exact two-file state a rolling profile
+    // carries in production.
+    crate::claude::write_session_token(
+        "roll",
+        "sk-ant-oat01-tui-clear-rolling-mint0",
+        crate::usage::now_ms() as i64,
+    )
+    .expect("mint");
+    crate::claude::stamp_rolling_token(
+        "roll",
+        &crate::profile::OAuthToken {
+            access_token: "at-rolled".to_string(),
+            refresh_token: None,
+            expires_at: Some(crate::usage::now_ms() as i64 + 8 * 3_600_000),
+            scopes: Some(vec![
+                "user:inference".to_string(),
+                "user:profile".to_string(),
+            ]),
+            subscription_type: Some("max".into()),
+        },
+    )
+    .expect("stamp");
+    let dir = crate::profile::profile_dir("roll").expect("profile dir");
+    assert!(
+        dir.join("session-token.static.json").exists(),
+        "fixture: the stamp preserved the mint"
+    );
+
+    let mut app = app_with(vec![acct]);
+    app.profile_cursor = 0;
+    app.config_draft = Some(build_draft_existing(&app, "roll"));
+
+    run_config_row(&mut app, ConfigRow::ClearSessionToken);
+    run_config_row(&mut app, ConfigRow::ClearSessionToken);
+
+    assert!(
+        !dir.join("session-token.json").exists(),
+        "the sidecar is gone"
+    );
+    assert!(
+        !dir.join("session-token.static.json").exists(),
+        "the preserved mint is a long-lived credential and goes with the clear"
+    );
+    let p = crate::profile::load_profile("roll").expect("reload");
+    assert!(
+        !p.rolling_token,
+        "the flag goes too, or the daemon re-stamps a sidecar over the clear"
+    );
+    assert!(
+        app.toasts
+            .iter()
+            .any(|t| t.body.contains("re-stamping off")),
+        "the toast names the disarm, got {:?}",
+        app.toasts
+    );
+}
+
+/// The TUI clear takes the rotation guard NON-BLOCKING: a rotation in flight —
+/// the exact writer that could re-stamp the sidecar after the removal — fails
+/// the clear loudly into a toast, and nothing on disk or in config moves. A UI
+/// thread must never park behind a timeout-less flock, so `try_acquire` is the
+/// only correct spelling of the CLI's load-bearing guard here.
+#[test]
+fn clear_session_token_refuses_while_a_rotation_holds_the_profile() {
+    use super::{ConfigRow, build_draft_existing, run_config_row};
+    use crate::profile::Profile;
+    let _home = crate::testutil::HomeSandbox::new();
+
+    let mut acct = Profile::new("held".to_string(), None, None);
+    acct.credentials = Some(split_creds("stored-oauth", Some("stored-refresh")));
+    acct.rolling_token = true;
+    crate::profile::save_profile(&acct).expect("save profile");
+    seed_session_token("held", None);
+    let dir = crate::profile::profile_dir("held").expect("profile dir");
+
+    let _outside = crate::runtime::RotationGuard::acquire("held").expect("hold the lock");
+
+    let mut app = app_with(vec![acct]);
+    app.profile_cursor = 0;
+    app.config_draft = Some(build_draft_existing(&app, "held"));
+    run_config_row(&mut app, ConfigRow::ClearSessionToken);
+    run_config_row(&mut app, ConfigRow::ClearSessionToken);
+
+    assert!(
+        dir.join("session-token.json").exists(),
+        "a refused clear removes nothing"
+    );
+    let p = crate::profile::load_profile("held").expect("reload");
+    assert!(p.rolling_token, "a refused clear disarms nothing");
+    assert!(
+        app.toasts
+            .iter()
+            .any(|t| t.body.contains("rotation is in flight")),
+        "the refusal is loud, got {:?}",
+        app.toasts
+    );
+}
+
 /// Overview and Usage carry the focused account's own actions plus the
 /// tab-global ones. The hotkeys are pinned, not scanned: `d` survives the
 /// disable↔enable label flip, and `f` keeps refresh-all off `e`/`p`, which the

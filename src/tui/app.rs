@@ -1636,8 +1636,7 @@ pub(crate) struct App {
 
     /// Cached long-lived-token status per profile, keyed by name (absent when a
     /// profile has no sidecar). Read by the Overview render for the `⊘` danger
-    /// marker + the type tag, so it needn't stat each `session-token.json` per
-    /// frame. Seeded at construct and refreshed on config reload; the expiry
+    /// marker, so it needn't stat each `session-token.json` per frame. Seeded at construct and refreshed on config reload; the expiry
     /// stamp it carries is compared to live `now_ms` at render time, so the
     /// clock ticking past expiry never needs a re-read — only an add / delete /
     /// re-mint does, which `reload_fingerprint` now catches.
@@ -5911,6 +5910,12 @@ fn run_config_row(app: &mut App, row: ConfigRow) {
 /// and Claude Code reads no credentials at all. An idle account is left alone:
 /// force-linking it would repoint the live slot at a profile nobody switched to.
 ///
+/// Same full-exit contract as the CLI's `static-token --clear`, or the two
+/// surfaces fight the daemon differently: the `rolling_token` flag goes FIRST
+/// (a set flag re-stamps a fresh bearer over the removal on the daemon's next
+/// scan), and the preserved mint backup goes too (a "cleared" long-lived token
+/// with a year-scale mint still in `session-token.static.json` is not cleared).
+///
 /// The relink has TWO outcomes and the toast names which one happened. The row
 /// is refused only when an account stores neither a login nor an api key, so an
 /// api-key account clears fine onto an ABSENT install source: the forcing relink
@@ -5923,7 +5928,26 @@ fn run_config_row(app: &mut App, row: ConfigRow) {
 /// local `remove` below only spares that marker one tick of staleness.
 fn perform_clear_session_token(app: &mut App, name: &str) {
     let active = app.config().is_active(name);
-    if let Err(e) = crate::claude::clear_session_token(name) {
+    let rolling_armed = app.config().find(name).is_some_and(|p| p.rolling_token);
+    let save_err = if rolling_armed {
+        let mut cfg = app.config();
+        match cfg.find_mut(name) {
+            Some(p) => {
+                p.rolling_token = false;
+                save_profile(p).err()
+            }
+            None => None,
+        }
+    } else {
+        None
+    };
+    if let Some(e) = save_err {
+        app.toast(ToastKind::Danger, format!("clear failed\n{e}"));
+        return;
+    }
+    if let Err(e) = crate::claude::clear_session_token(name)
+        .and_then(|_| crate::claude::clear_static_backup(name))
+    {
         app.toast(ToastKind::Danger, format!("clear failed\n{e}"));
         return;
     }
@@ -5945,9 +5969,14 @@ fn perform_clear_session_token(app: &mut App, name: &str) {
         (false, true) => "; the next switch installs its own login",
         (false, false) => "; it stores no login, so it runs on its api key",
     };
+    let rolled = if rolling_armed {
+        " · re-stamping off"
+    } else {
+        ""
+    };
     app.toast(
         ToastKind::Success,
-        format!("cleared the long-lived token for '{name}'{tail}"),
+        format!("cleared the long-lived token for '{name}'{tail}{rolled}"),
     );
 }
 

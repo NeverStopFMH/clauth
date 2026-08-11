@@ -84,7 +84,10 @@ pub(crate) fn session_token_status(name: &str) -> Option<SessionTokenStatus> {
 /// `None` when the split is disengaged (no sidecar, unparseable, or a
 /// [`SessionTokenStatus::NotLongLived`] mis-fill that switches ignore). Gated on
 /// the same predicate as [`has_session_token`], so a profile can never be
-/// attributed by a token no switch would ever install.
+/// attributed by a token no switch would ever install — and that predicate is
+/// content-classified, so a ROLLING stamp (refresh-less by construction, like
+/// the mint) attributes here too: `clauth which` names a session running on a
+/// rolling bearer the same way it names one on a static mint.
 pub(crate) fn installed_session_token(name: &str) -> Option<String> {
     if !has_session_token(name) {
         return None;
@@ -107,6 +110,24 @@ pub(crate) fn clear_session_token(name: &str) -> Result<bool> {
         Ok(()) => Ok(true),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
         Err(e) => Err(anyhow::Error::new(e).context("remove session-token.json")),
+    })
+}
+
+/// Remove `name`'s preserved mint backup (`session-token.static.json`), the
+/// clear's second file: "cleared the long-lived token" with a year-scale mint
+/// still sitting in the backup slot would be false — on a rolling profile the
+/// sidecar holds an hours-scale bearer and the backup holds the actual
+/// long-lived credential the operator asked to remove. Same contract as
+/// [`clear_session_token`]: returns whether a file was removed, absent is
+/// success. A plain delete, not a quarantine — quarantine preserves EVIDENCE of
+/// an anomaly, and an operator-confirmed removal of their own credential is the
+/// one path where keeping the bytes on disk would defeat the command.
+pub(crate) fn clear_static_backup(name: &str) -> Result<bool> {
+    let path = profile_dir(name)?.join("session-token.static.json");
+    with_state_lock(|| match std::fs::remove_file(&path) {
+        Ok(()) => Ok(true),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(anyhow::Error::new(e).context("remove session-token.static.json")),
     })
 }
 

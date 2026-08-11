@@ -660,23 +660,6 @@ pub(crate) enum ActionMenuAction {
     NewAccount,
     RefreshUsage,
     RotateTokens,
-    // Overview
-    SwitchToSelected,
-    // Config
-    ConfigureSelected,
-    // Fallback chain
-    OpenChainMember,
-    ReorderUp,
-    ReorderDown,
-    // Fallback detail
-    EditThreshold,
-    EditWeeklyAt,
-    ToggleCheckWeekly,
-    ToggleCheckScoped,
-    ToggleLastResort,
-    TogglePreferred,
-    EditMaxSpend,
-    RemoveMember,
     // Config detail actions (proxied through run_config_row)
     DisableProfile,
     EnableProfile,
@@ -686,8 +669,9 @@ pub(crate) enum ActionMenuAction {
     LoginAccount,
     ClearCredentials,
     ClearSessionToken,
-    EditField,
-    /// Remove the focused custom env entry from the account.
+    /// Remove the focused custom env entry from the account. The only way to
+    /// drop one: ⏎ on the row edits its VALUE, and an empty value saves as an
+    /// empty string rather than removing the key.
     RemoveEnvField,
     // Status tab
     RefreshStatus,
@@ -776,19 +760,6 @@ impl ActionMenuAction {
             Self::NewAccount => "new account",
             Self::RefreshUsage => "refresh usage",
             Self::RotateTokens => "rotate access token",
-            Self::SwitchToSelected => "switch to selected",
-            Self::ConfigureSelected => "configure",
-            Self::OpenChainMember => "open",
-            Self::ReorderUp => "reorder up",
-            Self::ReorderDown => "reorder down",
-            Self::EditThreshold => "edit threshold",
-            Self::EditWeeklyAt => "edit weekly at",
-            Self::ToggleCheckWeekly => "toggle weekly gate",
-            Self::ToggleCheckScoped => "toggle scoped gate",
-            Self::ToggleLastResort => "toggle last resort",
-            Self::TogglePreferred => "toggle preferred",
-            Self::EditMaxSpend => "edit max auto-spend",
-            Self::RemoveMember => "remove member",
             Self::DisableProfile => "disable account",
             Self::EnableProfile => "enable account",
             Self::ToggleAutoStart => "toggle auto-start",
@@ -797,7 +768,6 @@ impl ActionMenuAction {
             Self::LoginAccount => "log in",
             Self::ClearCredentials => "log out",
             Self::ClearSessionToken => "clear long-lived token",
-            Self::EditField => "edit field",
             Self::RemoveEnvField => "remove field",
             Self::RefreshStatus => "refresh status",
             Self::OpenIncidentLink => "open in browser",
@@ -5030,27 +5000,12 @@ fn handle_modal_key(app: &mut App, key: KeyEvent) {
 }
 
 /// Build the action menu for the current screen/focus context.
-fn build_action_menu(app: &App) -> ActionMenuState {
+pub(crate) fn build_action_menu(app: &App) -> ActionMenuState {
     use ActionMenuAction::*;
     let mut actions: Vec<ActionMenuAction> = Vec::new();
 
     match app.tab {
         Tab::Overview => {
-            let can_switch = app
-                .current_main_item()
-                .map(|item| match item {
-                    MainItemKind::Profile(idx) => {
-                        let cfg = app.config();
-                        cfg.profiles
-                            .get(idx)
-                            .map(|p| !cfg.is_active(&p.name) && !p.is_disabled())
-                            .unwrap_or(false)
-                    }
-                })
-                .unwrap_or(false);
-            if can_switch {
-                actions.push(SwitchToSelected);
-            }
             actions.push(NewAccount);
             actions.push(RefreshUsage);
             actions.push(RotateTokens);
@@ -5087,12 +5042,7 @@ fn build_action_menu(app: &App) -> ActionMenuState {
             actions.push(ReloadTokenStats);
         }
         Tab::Setup => match app.config_focus {
-            ConfigFocus::Profiles => {
-                if app.profile_cursor < app.profile_count() {
-                    actions.push(ConfigureSelected);
-                }
-                actions.push(NewAccount);
-            }
+            ConfigFocus::Profiles => actions.push(NewAccount),
             ConfigFocus::Actions => {
                 let rows = config_rows(app);
                 if let Some(&row) = rows.get(app.config_action_cursor) {
@@ -5118,45 +5068,18 @@ fn build_action_menu(app: &App) -> ActionMenuState {
                         ConfigRow::Delete => actions.push(ActionMenuAction::DeleteProfile),
                         ConfigRow::Create => actions.push(ActionMenuAction::CreateProfile),
                         ConfigRow::EnvEntry(_) => {
-                            actions.push(ActionMenuAction::EditField);
                             actions.push(ActionMenuAction::RemoveEnvField);
                         }
-                        // The reveal chip has no field to edit — `a` offers nothing.
-                        ConfigRow::ModelOverrideAdd => {}
-                        _ => actions.push(ActionMenuAction::EditField),
+                        // Text rows and the reveal chip carry nothing ⏎ on the
+                        // row doesn't already do — `a` offers nothing there.
+                        _ => {}
                     }
                 }
             }
         },
-        Tab::Fallback => match app.fallback_focus {
-            FallbackFocus::Chain => {
-                let items = chain_items(app);
-                if let Some(item) = items.get(app.chain_cursor) {
-                    match item {
-                        ChainItemKind::Member(_) => {
-                            actions.push(OpenChainMember);
-                            actions.push(ReorderUp);
-                            actions.push(ReorderDown);
-                        }
-                        ChainItemKind::Add => {}
-                    }
-                }
-            }
-            FallbackFocus::Detail => {
-                if let Some(&row) = FALLBACK_ROWS.get(app.fallback_detail_cursor) {
-                    match row {
-                        FallbackRow::Threshold => actions.push(EditThreshold),
-                        FallbackRow::WeeklyAt => actions.push(EditWeeklyAt),
-                        FallbackRow::CheckWeekly => actions.push(ToggleCheckWeekly),
-                        FallbackRow::CheckScoped => actions.push(ToggleCheckScoped),
-                        FallbackRow::LastResort => actions.push(ToggleLastResort),
-                        FallbackRow::Preferred => actions.push(TogglePreferred),
-                        FallbackRow::MaxSpend => actions.push(EditMaxSpend),
-                        FallbackRow::Remove => actions.push(RemoveMember),
-                    }
-                }
-            }
-        },
+        // Fallback: every action the chain and its detail rows carry is bound to
+        // a key of its own (⏎, ⇧↑↓, space, +/-), so `a` offers nothing.
+        Tab::Fallback => {}
         Tab::Config => {}
         Tab::Status => {
             actions.push(RefreshStatus);
@@ -5282,35 +5205,6 @@ fn dispatch_action_menu_action(app: &mut App, action: ActionMenuAction) {
             }
             None => {}
         },
-        ActionMenuAction::SwitchToSelected => activate_main_item(app),
-        ActionMenuAction::ConfigureSelected => enter_config_detail(app),
-        ActionMenuAction::OpenChainMember => enter_fallback_detail(app),
-        ActionMenuAction::ReorderUp => reorder_chain_member(app, -1),
-        ActionMenuAction::ReorderDown => reorder_chain_member(app, 1),
-        ActionMenuAction::EditThreshold => {
-            run_fallback_row(app, FallbackRow::Threshold);
-        }
-        ActionMenuAction::EditWeeklyAt => {
-            run_fallback_row(app, FallbackRow::WeeklyAt);
-        }
-        ActionMenuAction::ToggleCheckWeekly => {
-            run_fallback_row(app, FallbackRow::CheckWeekly);
-        }
-        ActionMenuAction::ToggleCheckScoped => {
-            run_fallback_row(app, FallbackRow::CheckScoped);
-        }
-        ActionMenuAction::ToggleLastResort => {
-            run_fallback_row(app, FallbackRow::LastResort);
-        }
-        ActionMenuAction::TogglePreferred => {
-            run_fallback_row(app, FallbackRow::Preferred);
-        }
-        ActionMenuAction::EditMaxSpend => {
-            run_fallback_row(app, FallbackRow::MaxSpend);
-        }
-        ActionMenuAction::RemoveMember => {
-            run_fallback_row(app, FallbackRow::Remove);
-        }
         ActionMenuAction::DisableProfile | ActionMenuAction::EnableProfile => {
             let rows = config_rows(app);
             if let Some(&row) = rows.get(app.config_action_cursor) {
@@ -5348,12 +5242,6 @@ fn dispatch_action_menu_action(app: &mut App, action: ActionMenuAction) {
             }
         }
         ActionMenuAction::ClearSessionToken => {
-            let rows = config_rows(app);
-            if let Some(&row) = rows.get(app.config_action_cursor) {
-                run_config_row(app, row);
-            }
-        }
-        ActionMenuAction::EditField => {
             let rows = config_rows(app);
             if let Some(&row) = rows.get(app.config_action_cursor) {
                 run_config_row(app, row);

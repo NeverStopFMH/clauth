@@ -8,8 +8,8 @@ use ratatui::widgets::Paragraph;
 
 use super::super::app::{
     App, ConfigFocus, ConfigRow, FallbackHint, FooterAlert, GLOBAL_CONFIG_ROWS, GlobalConfigRow,
-    LoginSession, PluginFocus, StatusFocus, Tab, TokenView, config_rows, fallback_hint,
-    has_sub_focus,
+    LoginSession, PluginFocus, StatusFocus, Tab, TokenView, build_action_menu, config_rows,
+    fallback_hint, has_sub_focus,
 };
 use super::super::theme;
 use super::format::spinner_frame;
@@ -253,6 +253,13 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
 
     if show_q {
         hints.push(("q", q_label));
+    }
+
+    // `a` opens nothing where the context carries no action of its own (the
+    // whole Fallback tab, a Setup text row). Reading the real menu keeps the
+    // hint honest per row instead of leaving each arm's literal to drift.
+    if build_action_menu(app).items.is_empty() {
+        hints.retain(|(key, _)| *key != "a");
     }
 
     // Measured degradation for narrow terminals: while the row overflows, drop

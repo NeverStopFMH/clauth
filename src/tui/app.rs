@@ -667,18 +667,14 @@ pub(crate) enum ActionMenuAction {
     /// focused account's own refresh).
     RefreshAll,
     RotateTokens,
-    // Config detail actions (proxied through run_config_row)
+    /// The focused account's disabled flag, off the Setup pane (Overview and
+    /// Usage, which carry no row for it).
     DisableProfile,
     EnableProfile,
-    ToggleAutoStart,
-    DeleteProfile,
-    CreateProfile,
-    LoginAccount,
-    ClearCredentials,
-    ClearSessionToken,
-    /// Remove the focused custom env entry from the account. The only way to
-    /// drop one: ⏎ on the row edits its VALUE, and an empty value saves as an
-    /// empty string rather than removing the key.
+    /// Remove the focused custom env entry from the account. The only Setup-pane
+    /// action the menu carries, because it is the only one no key reaches: ⏎ on
+    /// the row edits its VALUE, and an empty value saves as an empty string
+    /// rather than removing the key.
     RemoveEnvField,
     // Status tab
     RefreshStatus,
@@ -799,12 +795,6 @@ impl ActionMenuAction {
             Self::RotateTokens => "rotate access token",
             Self::DisableProfile => "disable account",
             Self::EnableProfile => "enable account",
-            Self::ToggleAutoStart => "toggle auto-start",
-            Self::DeleteProfile => "delete account",
-            Self::CreateProfile => "create account",
-            Self::LoginAccount => "log in",
-            Self::ClearCredentials => "log out",
-            Self::ClearSessionToken => "clear long-lived token",
             Self::RemoveEnvField => "remove field",
             Self::RefreshStatus => "refresh status",
             Self::OpenIncidentLink => "open in browser",
@@ -2559,7 +2549,7 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) {
                 }
             } else {
                 app.manual_refresh();
-                app.toast(ToastKind::Info, "refreshing usage");
+                app.toast(ToastKind::Info, "refreshing every account");
             }
             return;
         }
@@ -5089,32 +5079,19 @@ pub(crate) fn build_action_menu(app: &App) -> ActionMenuState {
         }
         Tab::Setup => match app.config_focus {
             ConfigFocus::Profiles => actions.push(NewAccount),
-            // The detail pane's rows all act on the account it is configuring,
-            // so the whole menu is scoped and nothing sits below the rule.
+            // The detail pane is a list of actions: every row states its own,
+            // and ⏎ / space both run it. Dropping a custom env entry is the one
+            // thing no key there does, so it is the only item, and it acts on
+            // the account being configured (all scoped, nothing below the rule).
             ConfigFocus::Actions => {
-                context = app
-                    .config_draft
-                    .as_ref()
-                    .and_then(|d| d.editing_name.clone());
-                let rows = config_rows(app);
-                if let Some(&row) = rows.get(app.config_action_cursor) {
-                    match row {
-                        ConfigRow::Disabled => scoped.push(disabled_toggle_action(app)),
-                        ConfigRow::AutoStart => scoped.push(ActionMenuAction::ToggleAutoStart),
-                        ConfigRow::Login => scoped.push(ActionMenuAction::LoginAccount),
-                        ConfigRow::DeleteCreds => scoped.push(ActionMenuAction::ClearCredentials),
-                        ConfigRow::ClearSessionToken => {
-                            scoped.push(ActionMenuAction::ClearSessionToken);
-                        }
-                        ConfigRow::Delete => scoped.push(ActionMenuAction::DeleteProfile),
-                        ConfigRow::Create => scoped.push(ActionMenuAction::CreateProfile),
-                        ConfigRow::EnvEntry(_) => {
-                            scoped.push(ActionMenuAction::RemoveEnvField);
-                        }
-                        // Text rows and the reveal chip carry nothing ⏎ on the
-                        // row doesn't already do — `a` offers nothing there.
-                        _ => {}
-                    }
+                if let Some(&ConfigRow::EnvEntry(_)) =
+                    config_rows(app).get(app.config_action_cursor)
+                {
+                    context = app
+                        .config_draft
+                        .as_ref()
+                        .and_then(|d| d.editing_name.clone());
+                    scoped.push(RemoveEnvField);
                 }
             }
         },
@@ -5276,54 +5253,8 @@ fn dispatch_action_menu_action(app: &mut App, action: ActionMenuAction) {
             app.manual_refresh();
             app.toast(ToastKind::Info, "refreshing every account");
         }
-        // On Setup the flip belongs to the `disabled` row, arm-and-confirm
-        // included; every other tab has no such row to drive.
-        ActionMenuAction::DisableProfile | ActionMenuAction::EnableProfile
-            if app.tab == Tab::Setup && app.config_focus == ConfigFocus::Actions =>
-        {
-            let rows = config_rows(app);
-            if let Some(&row) = rows.get(app.config_action_cursor) {
-                run_config_row(app, row);
-            }
-        }
         ActionMenuAction::DisableProfile | ActionMenuAction::EnableProfile => {
             toggle_focused_account_disabled(app);
-        }
-        ActionMenuAction::ToggleAutoStart => {
-            let rows = config_rows(app);
-            if let Some(&row) = rows.get(app.config_action_cursor) {
-                run_config_row(app, row);
-            }
-        }
-        ActionMenuAction::DeleteProfile => {
-            let rows = config_rows(app);
-            if let Some(&row) = rows.get(app.config_action_cursor) {
-                run_config_row(app, row);
-            }
-        }
-        ActionMenuAction::CreateProfile => {
-            let rows = config_rows(app);
-            if let Some(&row) = rows.get(app.config_action_cursor) {
-                run_config_row(app, row);
-            }
-        }
-        ActionMenuAction::LoginAccount => {
-            let rows = config_rows(app);
-            if let Some(&row) = rows.get(app.config_action_cursor) {
-                run_config_row(app, row);
-            }
-        }
-        ActionMenuAction::ClearCredentials => {
-            let rows = config_rows(app);
-            if let Some(&row) = rows.get(app.config_action_cursor) {
-                run_config_row(app, row);
-            }
-        }
-        ActionMenuAction::ClearSessionToken => {
-            let rows = config_rows(app);
-            if let Some(&row) = rows.get(app.config_action_cursor) {
-                run_config_row(app, row);
-            }
         }
         ActionMenuAction::RemoveEnvField => remove_env_field(app),
         ActionMenuAction::RefreshStatus => trigger_status_refresh(app),

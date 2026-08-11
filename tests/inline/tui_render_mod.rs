@@ -760,32 +760,30 @@ fn narrow_overview_chain_row_keeps_its_figures_on_one_line() {
 }
 
 /// The footer advertises `a` only where the menu has something in it. Both
-/// directions on one screen: the Setup detail pane's `disabled` row carries an
-/// action of its own, a text row above it carries none (⏎ on the row IS the
-/// edit), so the hint has to come and go with the cursor.
+/// directions on one screen: the Setup detail pane's env row can drop its key,
+/// which no key on that pane does, while every other row there is already its
+/// own ⏎ — so the hint has to come and go with the cursor.
 #[test]
 fn the_actions_hint_tracks_whether_the_menu_has_anything_in_it() {
     use crate::tui::app::{ConfigRow, config_rows, handle_key};
     use ratatui::crossterm::event::KeyCode;
     let _home = crate::testutil::HomeSandbox::new();
 
+    let mut profile = crate::testutil::blank_profile("acct");
+    profile.env.insert("FOO".to_string(), "bar".to_string());
     let mut app = App::new(AppConfig {
         state: AppState {
             profiles: vec![ProfileName::from("acct")],
             ..AppState::default()
         },
-        profiles: vec![crate::testutil::blank_profile("acct")],
+        profiles: vec![profile],
     });
     app.tab = Tab::Setup;
     handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
-    let row_at = |app: &App, want: ConfigRow| -> usize {
-        config_rows(app)
-            .iter()
-            .position(|r| *r == want)
-            .unwrap_or_else(|| panic!("{want:?} is present"))
-    };
-
-    app.config_action_cursor = row_at(&app, ConfigRow::Name);
+    app.config_action_cursor = config_rows(&app)
+        .iter()
+        .position(|r| *r == ConfigRow::Name)
+        .expect("the name row is always present");
     let menu = crate::tui::app::build_action_menu(&app);
     assert!(menu.items.is_empty());
     assert_eq!(
@@ -798,11 +796,14 @@ fn the_actions_hint_tracks_whether_the_menu_has_anything_in_it() {
         "a text row's menu is empty, so the key must not be advertised:\n{out}"
     );
 
-    app.config_action_cursor = row_at(&app, ConfigRow::Disabled);
+    app.config_action_cursor = config_rows(&app)
+        .iter()
+        .position(|r| matches!(r, ConfigRow::EnvEntry(_)))
+        .expect("the profile carries one custom env entry");
     let out = dump(&app, 120, 30);
     assert!(
         out.contains("a actions"),
-        "the disable row has an action of its own:\n{out}"
+        "the env row can drop its key, which no key on the pane does:\n{out}"
     );
 }
 

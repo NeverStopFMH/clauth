@@ -488,9 +488,9 @@ fn a_single_group_action_menu_draws_no_rule_and_names_no_account() {
     );
 }
 
-/// A menu that is scoped end to end (the Setup detail pane, whose every row
-/// acts on the account it is configuring) still names that account, and still
-/// draws no rule — there is no second group for one to hold off.
+/// A menu that is scoped end to end (the Setup detail pane's env row, whose one
+/// action drops a key off the account it is configuring) still names that
+/// account, and still draws no rule — there is no second group to hold off.
 #[test]
 fn an_all_scoped_action_menu_names_its_account_without_a_rule() {
     use crate::tui::app::{ConfigFocus, ConfigRow, config_rows, handle_key};
@@ -498,15 +498,17 @@ fn an_all_scoped_action_menu_names_its_account_without_a_rule() {
     let _home = crate::testutil::HomeSandbox::new();
     let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
 
-    let mut app = app_on(Tab::Setup, vec![crate::testutil::blank_profile("acct")]);
+    let mut profile = crate::testutil::blank_profile("acct");
+    profile.env.insert("FOO".to_string(), "bar".to_string());
+    let mut app = app_on(Tab::Setup, vec![profile]);
     app.profile_cursor = 0;
     // ⏎ on the account list is what seeds the draft the menu titles itself with.
     handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
     assert_eq!(app.config_focus, ConfigFocus::Actions);
     app.config_action_cursor = config_rows(&app)
         .iter()
-        .position(|r| *r == ConfigRow::Disabled)
-        .expect("the disable row is always present");
+        .position(|r| matches!(r, ConfigRow::EnvEntry(_)))
+        .expect("the profile carries one custom env entry");
 
     let (rows, left, right) = render_action_menu(&app, 60, 20);
     let slice =
@@ -519,11 +521,11 @@ fn an_all_scoped_action_menu_names_its_account_without_a_rule() {
     assert_eq!(
         rows[top..top + 5].iter().map(slice).collect::<Vec<_>>(),
         vec![
-            "╭ ACTIONS ────────── acct ╮".to_string(),
-            "│                         │".to_string(),
-            "│  ❯ disable account   d  │".to_string(),
-            "│                         │".to_string(),
-            "╰─────────────────────────╯".to_string(),
+            "╭ ACTIONS ─────── acct ╮".to_string(),
+            "│                      │".to_string(),
+            "│  ❯ remove field   r  │".to_string(),
+            "│                      │".to_string(),
+            "╰──────────────────────╯".to_string(),
         ],
     );
 }

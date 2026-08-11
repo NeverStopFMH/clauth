@@ -58,7 +58,7 @@ Runs a headless `claude -p` under another profile and returns what it produced.
 | `background` | bool | `false` |
 | `monitor` | bool | `false` |
 
-**Cost.** A delegate to a subscription account opens a real 5-hour window there. To an API-key account it bills real money. Call `list_profiles` first to pick the account with headroom.
+**Cost.** A delegate to a subscription account opens a real 5-hour window there. To a pay-as-you-go API-key account it bills real money. To a prepaid plan account it draws down quota you already bought, so it costs nothing extra. Call `list_profiles` first to pick the account with headroom.
 
 **What it sees.** Only the prompt you pass. It has no view of the calling conversation, so the prompt has to carry the whole task.
 

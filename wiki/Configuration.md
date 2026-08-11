@@ -21,14 +21,23 @@ A mint is a narrower credential than a `/login` session: it carries `user:infere
 
 ### Third-party usage data
 
-Two providers get typed usage panels:
+Three providers get typed usage panels:
 
 | Provider | Base URL | Shows |
 |----------|----------|-------|
 | DeepSeek | `https://api.deepseek.com` | balance rows per currency: total, granted, topped up |
 | Z.ai | `https://api.z.ai` | percentage bars per limit window (5h / 7d / 30d), per-tool rows, plan level, 7-day per-model token totals |
+| Alibaba Model Studio | the four Qwen preset endpoints below | a 7d bar carrying your tier's absolute allowance, a 5h bar when the API reports one, plan tier, subscription status and days left |
 
 Any other endpoint is scanned best-effort: clauth probes a short list of usage paths on the origin your key already authorizes, and renders whatever percentage or balance shapes come back. Those panels carry a "looks wrong? report it" line, since the shape is guessed. An endpoint that returns nothing usable stops being polled until you press <kbd>r</kbd>.
+
+#### The Alibaba console session
+
+Alibaba is the one provider whose api key cannot read its own quota: every quota endpoint ignores the key outright. Those panels run on a separate console session instead. `clauth login <account>` on a Model Studio account opens the Alibaba console in your browser and stores the session it hands back as a `[console]` table in that account's `config.toml`. Nothing else on the account changes. The console returns an api key and an endpoint alongside the session, both scoped to a workspace rather than to your plan and billed separately from it, so clauth discards them.
+
+The 48-hour clock runs from your aliyun console sign-in, so it is already ticking by the time `clauth login` captures the session. Running the login again inherits whatever is left of that window, which can be minutes; sign in to the Alibaba console afresh first if you want a full one. Once it lapses, clauth stops polling that account: the Usage tab reads `console login expired, run clauth login` and `clauth list` marks it `(login expired)`. Polling resumes the moment a new session lands on disk, with no restart.
+
+An account with no api key at all still gets its usage panel, since the quota rides the console session. It just cannot run Claude Code until you add a key.
 
 ## Model routing
 
@@ -126,6 +135,7 @@ If the messages limiter is blocking Claude Code, a live 5h window will not clear
 | `bell_threshold` | float | none | 5h % that fires a bell toast |
 | `[env]` | table | `{}` | extra environment variables merged into `settings.json` while active |
 | `[models]` | table | `{}` | `default`, `opus`, `sonnet`, `haiku`, `fable`, `subagent` |
+| `[console]` | table | `{}` | Alibaba Model Studio usage session: `token`, `site` (`international` / `domestic`), `region` (`ap-southeast-1` / `cn-beijing`). `clauth login` writes it ([above](Configuration#the-alibaba-console-session)) |
 
 `last_resort` and `preferred` are radio toggles across the chain: marking one clears it everywhere else, and no account can be both.
 
@@ -149,6 +159,7 @@ If the messages limiter is blocking Claude Code, a live 5h window will not clear
       usage_cache.json     # last-known utilization and plan
       usage_history.jsonl  # 2 days of samples, feeding burn-aware switching
       third_party_cache.json
+      third_party_auth.json# set while the usage login is expired; a hash, never the credential
       account_id.json      # which account this is, so a re-login can be told apart
       profile_fetched.json # when the plan tier was last read
       kick_block.json      # messages-limiter block state
@@ -160,6 +171,6 @@ If the messages limiter is blocking Claude Code, a live 5h window will not clear
 
 Lock files (`.lock`, `clauthd.lock`, `usage-fetch.lock`) sit alongside. Everything clauth owns is `0600`, every directory `0700`, re-tightened on each launch.
 
-Deleting any `*_cache.json`, `usage_history.jsonl`, or `status.json` costs you history and nothing else. Deleting `credentials.json` or `session-token.json` signs that profile out.
+Deleting any `*_cache.json`, `usage_history.jsonl`, `third_party_auth.json`, or `status.json` costs you history and nothing else. Deleting `credentials.json` or `session-token.json` signs that profile out.
 
 The `-<sid>` suffix appears only where the OS grants symlinks. Windows without symlink privilege builds the runtime tree by copying `~/.claude/`, so every session of one profile shares a single unsuffixed `runtime/` instead of paying for a copy each.

@@ -92,6 +92,28 @@ pub(crate) enum Command {
         yes: bool,
     },
 
+    /// Operate on a profile's long-lived session token
+    ///
+    /// Today the only operation is `--clear`, which drops the profile's
+    /// `session-token.json` so its stored OAuth login is what switches install
+    /// again. The live credentials are relinked when the profile is active, and
+    /// the clear is refused when the profile stores no other login.
+    ///
+    /// The bare form is reserved: `--clear` is required rather than defaulted,
+    /// so adding an operation later cannot silently change what a bare
+    /// `clauth static-token <profile>` already did for somebody.
+    #[command(name = "static-token")]
+    StaticToken {
+        /// Profile whose long-lived token to operate on.
+        profile: String,
+        /// Remove the long-lived token.
+        #[arg(long, required = true)]
+        clear: bool,
+        /// Skip the confirm prompt. Required on a non-TTY stdin.
+        #[arg(long, short = 'y')]
+        yes: bool,
+    },
+
     /// Restore a disabled profile to every operational surface
     Enable {
         /// Profile to re-enable.
@@ -302,11 +324,10 @@ impl StartArgs {
 
 /// `clauth login`'s profile plus its auth-method flags.
 ///
-/// `--setup-token` and `--clear-setup-token` are the two halves of the
-/// long-lived sidecar and are mutually exclusive; `--yes` skips the confirm on
-/// whichever of them is present, which is what the `token_op` group names.
+/// Capturing a long-lived token lives here as `--setup-token` because it IS a
+/// login; removing one is `clauth static-token <profile> --clear`, a verb rather
+/// than a flag, matching how `enable`/`disable` toggle per-profile state.
 #[derive(Args, Debug)]
-#[command(group(clap::ArgGroup::new("token_op").args(["setup_token", "clear_setup_token"])))]
 pub(crate) struct LoginArgs {
     /// Profile to log in as. An existing name re-authenticates it in place.
     pub(crate) profile: String,
@@ -322,13 +343,8 @@ pub(crate) struct LoginArgs {
     /// on the next switch and touches nothing else about the profile.
     #[arg(long, conflicts_with_all = ["base_url", "api_key"])]
     pub(crate) setup_token: bool,
-    /// Drop the profile's long-lived session-token sidecar, so its stored OAuth
-    /// login is what switches install again. Relinks the live slot when the
-    /// profile is active. Nothing else about the profile moves.
-    #[arg(long, conflicts_with_all = ["base_url", "api_key", "model"])]
-    pub(crate) clear_setup_token: bool,
-    /// Replace or drop an existing long-lived token unprompted.
-    #[arg(long, short = 'y', requires = "token_op")]
+    /// Replace an existing long-lived token unprompted.
+    #[arg(long, short = 'y', requires = "setup_token")]
     pub(crate) yes: bool,
     /// Default model for the profile: opus, sonnet, haiku, opusplan, or a full
     /// model id.

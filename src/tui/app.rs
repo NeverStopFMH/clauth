@@ -5814,7 +5814,7 @@ fn run_config_row(app: &mut App, row: ConfigRow) {
         }
         ConfigRow::ClearSessionToken => {
             if let Some(name) = name {
-                // Same refusal the CLI makes (`cmd_login_clear_setup_token`):
+                // Same refusal the CLI makes (`cmd_static_token_clear`):
                 // with no other login stored, clearing the sidecar leaves the
                 // account with no credentials at all.
                 let stores_other_login = {

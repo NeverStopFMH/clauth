@@ -362,38 +362,53 @@ fn login_setup_token_excludes_api_mode_and_bare_yes() {
     );
 }
 
-/// The clear half of the sidecar. `--yes` covers it too: it is the destructive
-/// direction, and a non-interactive caller needs some way to say yes.
-#[test]
-fn login_clear_setup_token_flag_and_its_unprompted_drop() {
-    let a = login(&["login", "acme", "--clear-setup-token"]);
-    assert!(a.clear_setup_token);
-    assert!(!a.setup_token);
-    assert!(!a.yes);
-    assert!(login(&["login", "acme", "--clear-setup-token", "--yes"]).yes);
-    assert!(login(&["login", "acme", "--clear-setup-token", "-y"]).yes);
+fn static_token(args: &[&str]) -> (String, bool, bool) {
+    match command(args) {
+        Command::StaticToken {
+            profile,
+            clear,
+            yes,
+        } => (profile, clear, yes),
+        other => panic!("{args:?} must reach static-token, got {other:?}"),
+    }
 }
 
-/// Capturing and clearing are opposite operations on one file, so asking for
-/// both is a contradiction rather than an ordering question. Clearing also takes
-/// no `--model`: it writes nothing to the profile.
+/// The clear half of the sidecar is a VERB, not a flag on `login`: it removes a
+/// credential, and `login` is the command that adds one. `--clear` is required,
+/// so the bare verb stays reserved rather than silently meaning "clear".
 #[test]
-fn login_clear_setup_token_excludes_its_opposite_api_mode_and_model() {
-    for extra in [
-        vec!["--setup-token"],
-        vec!["--base-url", "https://x"],
-        vec!["--api-key", "sk-x"],
-        vec!["--model", "opus"],
-    ] {
-        let mut argv = vec!["login", "acme", "--clear-setup-token"];
-        argv.extend(extra.iter().copied());
-        let err = parse(&argv).expect_err(&format!("{extra:?} must be refused"));
-        assert!(
-            err.to_string().contains("cannot be used with"),
-            "must read as a conflict for {extra:?}, got: {err}"
-        );
-        assert_eq!(err.exit_code(), 2);
-    }
+fn static_token_needs_clear_and_takes_an_unprompted_yes() {
+    let (profile, clear, yes) = static_token(&["static-token", "acme", "--clear"]);
+    assert_eq!(profile, "acme");
+    assert!(clear);
+    assert!(!yes);
+    assert!(static_token(&["static-token", "acme", "--clear", "--yes"]).2);
+    assert!(
+        static_token(&["static-token", "acme", "--clear", "-y"]).2,
+        "-y is the short spelling"
+    );
+
+    let err = parse(&["static-token", "acme"]).expect_err("the bare verb must be refused");
+    assert!(
+        err.to_string().contains("--clear"),
+        "the error must name what is missing, got: {err}"
+    );
+    assert_eq!(err.exit_code(), 2);
+}
+
+/// `login` no longer carries a clear flag, and its `--yes` means only "replace
+/// the stored token unprompted" again.
+#[test]
+fn login_has_no_clear_flag_and_bare_yes_still_needs_setup_token() {
+    let err = parse(&["login", "acme", "--clear-setup-token"])
+        .expect_err("the retired flag must not parse");
+    assert_eq!(err.exit_code(), 2);
+
+    let err = parse(&["login", "acme", "--yes"]).expect_err("bare --yes must be refused");
+    assert!(
+        err.to_string().contains("--setup-token"),
+        "the error must name what --yes requires, got: {err}"
+    );
 }
 
 #[test]

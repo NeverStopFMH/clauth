@@ -1089,7 +1089,7 @@ fn config_rows_clear_session_token_row_tracks_the_sidecar() {
 }
 
 /// The row refuses on a profile storing no OTHER login — the same refusal
-/// `cmd_login_clear_setup_token` makes on the CLI, since clearing there would
+/// `cmd_static_token_clear` makes on the CLI, since clearing there would
 /// strip the profile's only credential. Inert means inert: pressing twice
 /// neither arms nor clears nor toasts.
 #[test]

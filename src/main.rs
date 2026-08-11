@@ -144,6 +144,11 @@ fn dispatch(cli: Cli) -> Result<()> {
             force,
         } => cmd_delete(&profile, yes, force),
         Command::Disable { profile, yes } => cmd_disable(&profile, yes),
+        Command::StaticToken {
+            profile,
+            clear: _,
+            yes,
+        } => cmd_static_token_clear(&profile, yes),
         Command::Enable { profile } => cmd_enable(&profile),
         Command::Which { json } => which::run(json),
         Command::List { all, disabled } => list::run(all || disabled),
@@ -445,9 +450,6 @@ fn cmd_login(args: LoginArgs) -> Result<()> {
             args.yes,
         );
     }
-    if args.clear_setup_token {
-        return cmd_login_clear_setup_token(&config, &target, reauth, args.yes);
-    }
 
     // Confirm a reauth BEFORE collecting anything (browser or key prompt): a
     // declined overwrite must not open a browser or read a secret.
@@ -515,8 +517,8 @@ fn cmd_login(args: LoginArgs) -> Result<()> {
     if !is_api && claude::has_session_token(&target) {
         outln!(
             "clauth: NOTE '{target}' still holds a long-lived token, and that is what switches \
-             install — this login only feeds usage polling. Drop it with:  clauth login {target} \
-             --clear-setup-token"
+             install. This login only feeds usage polling. Drop it with:  clauth static-token \
+             {target} --clear"
         );
     }
     Ok(())
@@ -610,9 +612,14 @@ fn cmd_login_setup_token(
     Ok(())
 }
 
-/// `clauth login <name> --clear-setup-token [--yes]` — the exit from CLA-SPLIT,
-/// and the mirror of the capture above: it drops `session-token.json` so
+/// `clauth static-token <name> --clear [--yes]` — the exit from CLA-SPLIT, and
+/// the mirror of the capture above: it drops `session-token.json` so
 /// `install_source_path` points back at the profile's stored OAuth pair.
+///
+/// A verb rather than a flag on `login`, matching how `enable`/`disable` toggle
+/// per-profile state: this removes a credential, so hanging it off the command
+/// that ADDS one reads as a login that does not log in. `--clear` is required
+/// (see the clap definition) because the bare verb is reserved.
 ///
 /// Unlike the capture it CANNOT leave the live slot alone. The slot is a symlink
 /// into the profile store, so removing its target under it leaves a dangling
@@ -623,17 +630,13 @@ fn cmd_login_setup_token(
 /// Refuses when the profile has no other login to fall back to (a name created
 /// by `--setup-token` alone stores no OAuth pair): clearing there would strip its
 /// only credential. `--yes` skips the confirm, never that guard.
-fn cmd_login_clear_setup_token(
-    config: &profile::AppConfig,
-    target: &str,
-    exists: bool,
-    yes: bool,
-) -> Result<()> {
+fn cmd_static_token_clear(name: &str, yes: bool) -> Result<()> {
     use std::io::IsTerminal as _;
+    platform::init();
 
-    if !exists {
-        anyhow::bail!("no profile named '{target}'");
-    }
+    let config = load_config()?;
+    let canonical = resolve_or_bail(&config, name)?;
+    let target = canonical.as_str();
     if claude::session_token_status(target).is_none() {
         outln!("clauth: '{target}' holds no long-lived token, so nothing to clear.");
         return Ok(());

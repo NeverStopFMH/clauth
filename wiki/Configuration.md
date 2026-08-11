@@ -15,6 +15,10 @@ Every key below has a TUI equivalent on the Setup, Fallback, or Config tab ([Int
 
 **Long-lived setup token.** `clauth login <name> --setup-token` stores a `claude setup-token` mint as `session-token.json`. Sessions run on that static login, which never races clauth's token refresher. The Setup tab then shows a `token` row counting down to the re-mint.
 
+The token outranks the profile's OAuth pair at every switch for as long as it exists, so a later `clauth login <name>` updates only what clauth polls usage with. `clauth login <name> --clear-setup-token` drops it and puts the OAuth login back in front of sessions.
+
+A mint is a narrower credential than a `/login` session: it carries `user:inference` and `user:sessions:claude_code` and no refresh token, against the five scopes a browser login stores. Claude Code turns off anything gated on the wider set, Claude in Chrome by name. Clear the token if you want those features back.
+
 ### Third-party usage data
 
 Two providers get typed usage panels:

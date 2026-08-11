@@ -83,6 +83,8 @@ The active period or model filter is omitted from the Tokens menu, so the entrie
 | `disable account` / `enable account` | hides the account from auto-switch and polling, keeping its files |
 | `+ login` / `re-login` | browser OAuth login for this profile |
 | `log out` | drops the stored credentials, keeps the profile |
+| `token` | read-only state of a stored long-lived setup token: its remaining life, or `expired` / `mis-filled` with the fix beneath it ([Configuration](Configuration#account-types)) |
+| `clear long-lived token` | drops that token so the account's own OAuth login installs again; appears only when one is stored, arms on the first press, clears on the second. Faint and inert when the account has no other login to fall back to |
 | `delete account` | removes the profile; arms on the first press, deletes on the second |
 
 ## Config tab rows

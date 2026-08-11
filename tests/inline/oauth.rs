@@ -1244,6 +1244,47 @@ mod adopt_live_rotation {
             crate::claude::LinkState::LinkedTo,
         );
     }
+
+    /// The adopt's relink is what closed `docs/todo.md`'s "post-adopt relink
+    /// drops unrelated keys" entry, so it gets the verify line that entry asked
+    /// for: a live file carrying `mcpOAuth` survives the adopt with that key
+    /// intact. Before the carry the relink pointed the live slot at a store
+    /// holding the login alone, and Claude Code lost every MCP-server session on
+    /// a leg that runs unattended roughly every 8 hours.
+    #[cfg(all(unix, not(target_os = "macos")))]
+    #[test]
+    fn an_adopt_keeps_the_live_files_mcp_oauth() {
+        let _home = HomeSandbox::new();
+        let name = "adopt-mcp";
+        let handle = setup(name, future_expiry(), future_expiry() + 3_600_000);
+
+        // Claude Code authenticated an MCP server before it rotated its login.
+        let live = crate::profile::claude_dir()
+            .unwrap()
+            .join(".credentials.json");
+        let mut body: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&live).unwrap()).unwrap();
+        body["mcpOAuth"] = serde_json::json!({ "linear": { "accessToken": "mock-linear" } });
+        std::fs::write(&live, serde_json::to_vec(&body).unwrap()).unwrap();
+
+        let adopted =
+            try_adopt_live_rotation(&handle, name, &guard(name), &|_| Some("uuid-1".into()));
+        assert!(
+            adopted.is_some(),
+            "the same-account fresher pair is adopted"
+        );
+
+        let after: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&live).unwrap()).unwrap();
+        assert_eq!(
+            after["claudeAiOauth"]["accessToken"], "at-mirror",
+            "the adopted login is what the live slot serves"
+        );
+        assert_eq!(
+            after["mcpOAuth"]["linear"]["accessToken"], "mock-linear",
+            "the MCP-server login survives the post-adopt relink"
+        );
+    }
 }
 
 // ── post-guard re-read (the pre-RotationGuard token-snapshot race) ────────────

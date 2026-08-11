@@ -1973,3 +1973,38 @@ fn the_auth_expired_record_is_owner_only() {
         0x0123_4567_89ab_cdef
     ));
 }
+
+/// `save_profile` must not drop non-login blocks (e.g. `mcpOAuth`) that a Claude
+/// login-token refresh rewrites over — those are per-MCP-server logins
+/// independent of the account. Synthetic tokens only.
+#[test]
+fn save_profile_preserves_mcp_oauth_across_a_login_refresh() {
+    let _home = HomeSandbox::new();
+
+    let mut profile = Profile::new("acct".to_string(), None, None);
+    profile.credentials = Some(pair("login-v1", "refresh-v1"));
+    save_profile(&profile).expect("save v1");
+
+    // Claude Code authenticates an MCP server, writing an mcpOAuth block into the
+    // store file alongside the login.
+    let cred_path = profile_credentials_path("acct").expect("cred path");
+    let mut stored: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&cred_path).expect("read store")).expect("parse");
+    stored["mcpOAuth"] = serde_json::json!({ "linear": { "accessToken": "mock-linear" } });
+    std::fs::write(&cred_path, serde_json::to_vec(&stored).unwrap()).expect("write mcp block");
+
+    // A Claude login-token rotation re-saves the profile with a new login.
+    profile.credentials = Some(pair("login-v2", "refresh-v2"));
+    save_profile(&profile).expect("save v2");
+
+    let after: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&cred_path).expect("read after")).expect("parse");
+    assert_eq!(
+        after["claudeAiOauth"]["accessToken"], "login-v2",
+        "the Claude login rotated to v2"
+    );
+    assert_eq!(
+        after["mcpOAuth"]["linear"]["accessToken"], "mock-linear",
+        "the MCP-server login survived the login refresh"
+    );
+}

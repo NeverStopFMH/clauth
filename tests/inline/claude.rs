@@ -1527,3 +1527,209 @@ fn a_clauth_symlink_under_a_flipped_install_source_is_not_unsaved() {
         "a dangling clauth symlink is a store slot, not an unsaved login"
     );
 }
+
+// ---------------------------------------------------------------------------
+// mcpOAuth preservation. `~/.claude/.credentials.json` also holds each MCP
+// server's OAuth login (`mcpOAuth`), which is independent of the Claude account;
+// an account switch must not drop them. Every token below is synthetic.
+// ---------------------------------------------------------------------------
+
+/// A synthetic live-credentials body: a Claude login plus one MCP-server login.
+fn live_with_mcp(login: &str, mcp_token: &str) -> serde_json::Value {
+    serde_json::json!({
+        "claudeAiOauth": { "accessToken": login },
+        "mcpOAuth": { "linear": { "accessToken": mcp_token } }
+    })
+}
+
+#[test]
+fn carry_copies_mcp_oauth_and_leaves_the_target_login_untouched() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let live = dir.path().join("live.json");
+    let target = dir.path().join("credentials.json");
+    fs::write(
+        &live,
+        serde_json::to_vec(&live_with_mcp("live-login", "mock-linear")).unwrap(),
+    )
+    .expect("write live");
+    // Target store is a fresh browser login: a Claude login, no mcpOAuth.
+    fs::write(
+        &target,
+        serde_json::to_vec(
+            &serde_json::json!({ "claudeAiOauth": { "accessToken": "target-login" } }),
+        )
+        .unwrap(),
+    )
+    .expect("write target");
+
+    carry_live_extra_into(&live, &target).expect("carry");
+
+    let got: serde_json::Value =
+        serde_json::from_slice(&fs::read(&target).expect("read target")).expect("parse");
+    assert_eq!(
+        got["mcpOAuth"]["linear"]["accessToken"], "mock-linear",
+        "mcpOAuth carried onto the incoming profile"
+    );
+    assert_eq!(
+        got["claudeAiOauth"]["accessToken"], "target-login",
+        "the incoming account's own login is never overwritten by the live one"
+    );
+}
+
+#[test]
+fn carry_leaves_target_blocks_the_live_file_lacks() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let live = dir.path().join("live.json");
+    let target = dir.path().join("credentials.json");
+    // Live carries no mcpOAuth at all.
+    fs::write(
+        &live,
+        serde_json::to_vec(
+            &serde_json::json!({ "claudeAiOauth": { "accessToken": "live-login" } }),
+        )
+        .unwrap(),
+    )
+    .expect("write live");
+    fs::write(
+        &target,
+        serde_json::to_vec(&serde_json::json!({
+            "claudeAiOauth": { "accessToken": "target-login" },
+            "mcpOAuth": { "sentry": { "accessToken": "mock-sentry" } }
+        }))
+        .unwrap(),
+    )
+    .expect("write target");
+
+    carry_live_extra_into(&live, &target).expect("carry");
+
+    let got: serde_json::Value =
+        serde_json::from_slice(&fs::read(&target).expect("read target")).expect("parse");
+    assert_eq!(
+        got["mcpOAuth"]["sentry"]["accessToken"], "mock-sentry",
+        "a block the live file lacks is left as the target had it"
+    );
+}
+
+#[test]
+fn carry_skips_a_non_oauth_store() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let live = dir.path().join("live.json");
+    let target = dir.path().join("session-token.json");
+    fs::write(
+        &live,
+        serde_json::to_vec(&live_with_mcp("live-login", "mock-linear")).unwrap(),
+    )
+    .expect("write live");
+    let sidecar = serde_json::json!({ "sessionToken": "mock-static-token" });
+    fs::write(&target, serde_json::to_vec(&sidecar).unwrap()).expect("write sidecar");
+
+    carry_live_extra_into(&live, &target).expect("carry");
+
+    let got: serde_json::Value =
+        serde_json::from_slice(&fs::read(&target).expect("read target")).expect("parse");
+    assert_eq!(
+        got, sidecar,
+        "a session-token store has no claudeAiOauth and is left untouched"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn switching_accounts_preserves_mcp_oauth_end_to_end() {
+    let _home = HomeSandbox::new();
+
+    // Two OAuth profiles, each login-only in its store (as a browser login lands).
+    let mut a = crate::profile::Profile::new("a".to_string(), None, None);
+    a.credentials = Some(creds("login-a", Some("refresh-a")));
+    crate::profile::save_profile(&a).expect("save a");
+    let mut b = crate::profile::Profile::new("b".to_string(), None, None);
+    b.credentials = Some(creds("login-b", Some("refresh-b")));
+    crate::profile::save_profile(&b).expect("save b");
+
+    // Make A live, then simulate Claude Code authenticating an MCP server: it
+    // writes an mcpOAuth block through clauth's symlink into A's store.
+    force_link_profile_credentials("a").expect("link a");
+    let live_path = claude_credentials_path().expect("creds path");
+    let mut live: serde_json::Value =
+        serde_json::from_slice(&fs::read(&live_path).expect("read live")).expect("parse live");
+    live["mcpOAuth"] = serde_json::json!({ "linear": { "accessToken": "mock-linear" } });
+    fs::write(&live_path, serde_json::to_vec(&live).unwrap()).expect("write live mcp");
+
+    // Switch to B.
+    force_link_profile_credentials("b").expect("link b");
+
+    // The live credential now resolves to B's login AND still carries mcpOAuth.
+    let after: serde_json::Value =
+        serde_json::from_slice(&fs::read(&live_path).expect("read after")).expect("parse after");
+    assert_eq!(
+        after["claudeAiOauth"]["accessToken"], "login-b",
+        "the switch installed account B's login"
+    );
+    assert_eq!(
+        after["mcpOAuth"]["linear"]["accessToken"], "mock-linear",
+        "the MCP-server login survived the account switch"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn link_adopts_a_matching_login_and_preserves_mcp_oauth() {
+    let _home = HomeSandbox::new();
+    // Profile "main" holds a login-only store — exactly how a snapshot of the live
+    // account records it, since the typed model drops mcpOAuth.
+    let mut main = crate::profile::Profile::new("main".to_string(), None, None);
+    main.credentials = Some(creds("acct-login", Some("acct-refresh")));
+    crate::profile::save_profile(&main).expect("save main");
+
+    // The live file is the SAME account (an untracked regular file) carrying an
+    // mcpOAuth block — the state that made the byte-compare guard falsely refuse.
+    let live_path = claude_credentials_path().expect("creds path");
+    std::fs::create_dir_all(live_path.parent().expect("parent")).expect("mkdir");
+    std::fs::write(
+        &live_path,
+        serde_json::to_vec(&serde_json::json!({
+            "claudeAiOauth": { "accessToken": "acct-login" },
+            "mcpOAuth": { "linear": { "accessToken": "mock-linear" } }
+        }))
+        .unwrap(),
+    )
+    .expect("write live");
+
+    // Must NOT refuse (same login), and must carry mcpOAuth onto the store.
+    link_profile_credentials("main").expect("link adopts a matching login");
+
+    let after: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&live_path).expect("read after")).expect("parse");
+    assert_eq!(after["claudeAiOauth"]["accessToken"], "acct-login");
+    assert_eq!(
+        after["mcpOAuth"]["linear"]["accessToken"], "mock-linear",
+        "mcpOAuth survived the adoption link"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn link_still_refuses_a_different_live_login() {
+    let _home = HomeSandbox::new();
+    let mut other = crate::profile::Profile::new("other".to_string(), None, None);
+    other.credentials = Some(creds("other-login", Some("other-refresh")));
+    crate::profile::save_profile(&other).expect("save other");
+
+    // Live is an unresolved DIFFERENT account — a CC re-login the user hasn't saved.
+    let live_path = claude_credentials_path().expect("creds path");
+    std::fs::create_dir_all(live_path.parent().expect("parent")).expect("mkdir");
+    std::fs::write(
+        &live_path,
+        serde_json::to_vec(
+            &serde_json::json!({ "claudeAiOauth": { "accessToken": "unsaved-live-login" } }),
+        )
+        .unwrap(),
+    )
+    .expect("write live");
+
+    let err = link_profile_credentials("other").expect_err("must refuse a different login");
+    assert!(
+        err.to_string().contains("refusing to replace"),
+        "the guard still protects an unresolved different login: {err}"
+    );
+}

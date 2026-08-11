@@ -462,6 +462,48 @@ pub(crate) fn create_symlink(target: &Path, link: &Path) -> Result<()> {
         .context("failed to copy credentials")
 }
 
+/// Carry the live credential's non-login blocks — notably `mcpOAuth`, the
+/// per-MCP-server logins Claude Code keeps alongside the Claude account — onto
+/// `target` before it becomes the live credential. These blocks are independent
+/// of which Claude account is active, so an account switch must preserve them:
+/// without this, switching to a profile whose store lacks them (e.g. a fresh
+/// browser login) drops every MCP-server auth. Each non-login top-level block
+/// present in the live file is copied onto the target (its prior copy of that
+/// block overwritten); a block the live file lacks is left as the target has it.
+/// The target's `claudeAiOauth` login is never touched. A no-op when the live
+/// file is unreadable, carries no such blocks, or `target` is not an OAuth store
+/// (a session-token sidecar has no `claudeAiOauth`).
+fn carry_live_extra_into(link: &Path, target: &Path) -> Result<()> {
+    let Ok(live) = read_json_file::<serde_json::Value>(link) else {
+        return Ok(());
+    };
+    let Ok(mut stored) = read_json_file::<serde_json::Value>(target) else {
+        return Ok(());
+    };
+    let (Some(live_obj), Some(stored_obj)) = (live.as_object(), stored.as_object_mut()) else {
+        return Ok(());
+    };
+    // Only an OAuth store carries these blocks; never touch a session-token sidecar.
+    if !stored_obj.contains_key("claudeAiOauth") {
+        return Ok(());
+    }
+    let mut changed = false;
+    for (key, value) in live_obj {
+        if key == "claudeAiOauth" {
+            continue;
+        }
+        if stored_obj.get(key) != Some(value) {
+            stored_obj.insert(key.clone(), value.clone());
+            changed = true;
+        }
+    }
+    if changed {
+        atomic_write_600(target, serde_json::to_string_pretty(&stored)?)
+            .context("failed to carry mcpOAuth into profile credentials")?;
+    }
+    Ok(())
+}
+
 /// Symlink `~/.claude/.credentials.json` → profile's `credentials.json` (copy on
 /// Windows). Refuses to overwrite a non-matching regular file — that would silently
 /// drop a CC re-login the user hasn't resolved yet.
@@ -472,15 +514,30 @@ pub(crate) fn link_profile_credentials(name: &str) -> Result<()> {
 
         if let Ok(meta) = link.symlink_metadata() {
             if !meta.file_type().is_symlink() {
-                let live_bytes = std::fs::read(&link).ok();
-                let target_bytes = std::fs::read(&target).ok();
-                if live_bytes != target_bytes {
+                // Compare the LOGIN only, not the whole file: mcpOAuth and other
+                // non-login blocks are carried across below (`carry_live_extra_into`),
+                // so a live file that differs from the profile only in those must
+                // not read as an unresolved re-login. A differing login is genuinely
+                // unresolved — refuse rather than silently drop it. Mirrors the
+                // access-token comparison `classify_credentials_link` already uses;
+                // an unreadable side compares as `None`, preserving the prior
+                // "bail unless they match" conservatism.
+                let live_login = read_json_file::<ClaudeCredentials>(&link)
+                    .ok()
+                    .and_then(|c| c.access_token().map(str::to_string));
+                let target_login = read_json_file::<ClaudeCredentials>(&target)
+                    .ok()
+                    .and_then(|c| c.access_token().map(str::to_string));
+                if live_login != target_login {
                     anyhow::bail!(
                         "refusing to replace .credentials.json: live file differs from profile '{name}'; {} first",
                         crate::format::RESOLVE_IN_TUI
                     );
                 }
             }
+            // Preserve the live mcpOAuth blocks onto the incoming profile before
+            // the swap, so switching accounts keeps MCP-server auth intact.
+            carry_live_extra_into(&link, &target)?;
             std::fs::remove_file(&link).context("failed to remove old .credentials.json")?;
         }
 
@@ -945,10 +1002,13 @@ pub(crate) fn force_snapshot_active_credentials(config: &mut AppConfig) -> Resul
 pub(crate) fn force_link_profile_credentials(name: &str) -> Result<()> {
     with_state_lock(|| {
         let link = claude_credentials_path()?;
+        let target = install_source_path(name)?;
         if link.symlink_metadata().is_ok() {
+            // Preserve the live mcpOAuth blocks onto the incoming profile before
+            // the swap, so switching accounts keeps MCP-server auth intact.
+            carry_live_extra_into(&link, &target)?;
             std::fs::remove_file(&link).context("failed to remove .credentials.json")?;
         }
-        let target = install_source_path(name)?;
         if target.exists() {
             if let Some(parent) = link.parent() {
                 std::fs::create_dir_all(parent)?;

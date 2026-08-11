@@ -68,6 +68,12 @@ pub(crate) enum Command {
     /// session expires 48 hours after the aliyun sign-in behind it rather than
     /// after this login, so it can arrive with minutes left. That profile's
     /// endpoint and api key are left untouched.
+    ///
+    /// Starting an Alibaba account from nothing therefore takes two steps: give
+    /// it a Model Studio endpoint first (a Qwen preset on the Setup tab, or
+    /// --base-url here), then run a bare login on that name. Which console a
+    /// session is captured from is read off the endpoint, so a name with no
+    /// endpoint yet has no console to open.
     Login(LoginArgs),
 
     /// Remove a profile and all its credentials

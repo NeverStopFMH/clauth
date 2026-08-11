@@ -1500,6 +1500,33 @@ fn maybe_rewrite_config_toml(config_path: &Path, raw_config: &str, profile: &Pro
     }
 }
 
+/// Serialize `creds` for the profile store, preserving any non-login top-level
+/// blocks (notably `mcpOAuth`, the per-MCP-server logins) already present in the
+/// store file at `cred_path`. [`ClaudeCredentials`] models only the Claude login,
+/// so a plain re-serialize on a token refresh would drop those blocks; this
+/// re-attaches them. Keys serialized from `creds` win; existing extras are kept.
+fn serialize_credentials_preserving_extra(
+    creds: &ClaudeCredentials,
+    cred_path: &Path,
+) -> Result<String> {
+    let mut value = serde_json::to_value(creds).context("failed to serialize credentials")?;
+    let existing = read_json_file::<serde_json::Value>(cred_path).ok();
+    if let (Some(value_obj), Some(existing_obj)) = (
+        value.as_object_mut(),
+        existing.as_ref().and_then(serde_json::Value::as_object),
+    ) {
+        for (key, extra) in existing_obj {
+            if key == "claudeAiOauth" {
+                continue;
+            }
+            value_obj
+                .entry(key.clone())
+                .or_insert_with(|| extra.clone());
+        }
+    }
+    serde_json::to_string_pretty(&value).context("failed to serialize credentials")
+}
+
 pub(crate) fn save_profile(profile: &Profile) -> Result<()> {
     with_state_lock(|| {
         mkdir_700(&profile_dir(&profile.name)?)?;
@@ -1508,8 +1535,10 @@ pub(crate) fn save_profile(profile: &Profile) -> Result<()> {
         // not be lost to a config.toml write failure.
         let cred_path = profile_credentials_path(&profile.name)?;
         match &profile.credentials {
-            Some(creds) => atomic_write_600(&cred_path, serde_json::to_string_pretty(creds)?)
-                .context("failed to write credentials.json")?,
+            Some(creds) => {
+                let bytes = serialize_credentials_preserving_extra(creds, &cred_path)?;
+                atomic_write_600(&cred_path, bytes).context("failed to write credentials.json")?
+            }
             None if cred_path.exists() => {
                 std::fs::remove_file(&cred_path).context("failed to remove credentials.json")?
             }

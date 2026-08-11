@@ -131,6 +131,14 @@ impl ThirdPartyTarget {
 /// (`https://api.deepseek.com.evil.tld`) — a bare `starts_with` would claim
 /// those and send the profile's API key to the real provider endpoint.
 ///
+/// A `:` is only a port when what follows it is digits: per RFC 3986 everything
+/// before an `@` is USERINFO, so `https://api.deepseek.com:443@evil.tld` has
+/// host `evil.tld` and belongs to no provider here. Accepting it labelled that
+/// profile DeepSeek and pointed the typed usage fetch at the real
+/// `api.deepseek.com`, handing the account's api key to a host its own config
+/// never named. An empty port (`https://api.deepseek.com:/v1`) is valid and
+/// still the provider, so it matches.
+///
 /// The scheme + host are compared case-insensitively (hosts are
 /// case-insensitive per RFC 3986). `url` is lowercased; `base` is lowercased
 /// defensively so a future caller passing mixed-case still matches.
@@ -139,7 +147,13 @@ fn url_matches_host(url: &str, base: &str) -> bool {
     let base = base.to_ascii_lowercase();
     match url.strip_prefix(&base) {
         Some("") => true,
-        Some(rest) => rest.starts_with(['/', ':', '?', '#']),
+        Some(rest) => match rest.strip_prefix(':') {
+            Some(after) => {
+                let port_end = after.find(['/', '?', '#']).unwrap_or(after.len());
+                after[..port_end].bytes().all(|b| b.is_ascii_digit())
+            }
+            None => rest.starts_with(['/', '?', '#']),
+        },
         None => false,
     }
 }

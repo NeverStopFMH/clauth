@@ -37,6 +37,39 @@ fn deepseek_rejects_host_extension() {
 }
 
 #[test]
+fn a_userinfo_authority_is_not_the_provider_it_is_prefixed_with() {
+    // `https://api.deepseek.com:443@evil.tld` has host `evil.tld` — everything
+    // before the `@` is userinfo. Claiming it as DeepSeek pointed the typed
+    // usage fetch at the real `api.deepseek.com` with this account's key, which
+    // is the same leak the host-extension case above exists to stop, reached
+    // through the port delimiter instead of the dot.
+    for url in [
+        "https://api.deepseek.com:443@evil.tld/v1",
+        "https://api.deepseek.com:x@evil.tld",
+        "https://api.deepseek.com:@evil.tld",
+        "https://api.z.ai:8443@evil.tld",
+        "https://token-plan.ap-southeast-1.maas.aliyuncs.com:1@evil.tld/apps/anthropic",
+    ] {
+        assert_eq!(Provider::from_base_url(url), None, "{url}");
+    }
+
+    // The positive leg: a real port, an empty port, and a port with a path all
+    // still resolve, so the guard rejects userinfo rather than rejecting `:`.
+    for url in [
+        "https://api.deepseek.com:443",
+        "https://api.deepseek.com:443/v1",
+        "https://api.deepseek.com:/v1",
+        "https://api.deepseek.com:?k=v",
+    ] {
+        assert_eq!(
+            Provider::from_base_url(url),
+            Some(Provider::DeepSeek),
+            "{url}"
+        );
+    }
+}
+
+#[test]
 fn deepseek_rejects_plain_http_and_unrelated_hosts() {
     assert_eq!(Provider::from_base_url("http://api.deepseek.com"), None);
     assert_eq!(Provider::from_base_url("https://api.anthropic.com"), None);

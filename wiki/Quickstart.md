@@ -60,7 +60,8 @@ clauth list           # account table with cached usage, no network
 | `clauth` | | open the TUI |
 | `clauth <profile>` | | switch to that profile and exit |
 | `clauth start <profile> [claude args…]` | `--isolated`, `--rescue`, `--no-rescue`, `--with-fallback` | run `claude` under that profile's own config dir |
-| `clauth login <profile>` | `--base-url`, `--api-key`, `--setup-token`, `--clear-setup-token`, `--yes`, `--model` | add an account, or re-authenticate one in place |
+| `clauth login <profile>` | `--base-url`, `--api-key`, `--setup-token`, `--yes`, `--model` | add an account, or re-authenticate one in place |
+| `clauth static-token <profile>` | `--clear`, `--yes` | operate on a stored long-lived token; `--clear` removes it |
 | `clauth delete <profile>` | `--yes`, `--force` | remove a profile and every credential it holds |
 | `clauth disable <profile>` | `--yes` | hide it from auto-switch, polling, and the status feed; files stay |
 | `clauth enable <profile>` | | put a disabled profile back |
@@ -84,7 +85,7 @@ clauth list           # account table with cached usage, no network
 - **`delete` and `disable` want a TTY.** Both prompt `[y/N]`; on a non-TTY stdin they refuse unless you pass `--yes`. `--force` is the only way past `delete`'s live-session guard, and `--yes` alone does not override it.
 - **`login <existing>`** re-authenticates in place. The chain slot, env block, and model settings survive; the credentials are replaced after a confirm.
 - **`login --setup-token`** captures a `claude setup-token` mint (echo-off, or piped on stdin) as the profile's long-lived login. That token never races clauth's refresher. It engages only for a genuinely long-lived token; a rotating pair pasted here is ignored and called out on the card.
-- **`login --clear-setup-token`** is the way back out. A stored long-lived token is what every switch installs, so a plain `clauth login <profile>` refreshes only the OAuth pair clauth polls usage with, and never reaches a session. The login prints a note saying so. Clearing drops the token and relinks the live credentials when the profile is active. It is refused when the profile stores no other login, since that would leave it with no credentials at all.
+- **`static-token --clear`** is the way back out. A stored long-lived token is what every switch installs, so a plain `clauth login <profile>` refreshes only the OAuth pair clauth polls usage with, and never reaches a session. The login prints a note saying so. Clearing drops the token and relinks the live credentials when the profile is active. It is refused when the profile stores no other login, since that would leave it with no credentials at all.
 - **`resume latest`** refuses rather than silently picking the second-newest when a live isolated session holds a newer one. `clauth info` names where any transcript actually lives.
 - **`sessions --tokens`** parses every transcript in full to total tokens and cost. On a large store that takes a while, which is why it is opt-in.
 

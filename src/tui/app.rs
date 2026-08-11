@@ -6706,7 +6706,7 @@ fn prompt_save_preset(app: &mut App) {
     }));
 }
 
-/// `apply preset`: open the picker. The list always holds the two built-ins, so
+/// `apply preset`: open the picker. The list always holds the built-ins, so
 /// it is never empty and needs no empty state. On `+ new` the target is the
 /// draft's name buffer (empty until the user types one); the preset's fields
 /// are stamped into the draft, not a saved profile.

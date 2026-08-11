@@ -1,4 +1,4 @@
-//! Preset store: the built-in pair, the on-disk round-trip, and the two
+//! Preset store: the shipped table, the on-disk round-trip, and the two
 //! refusals that keep a built-in's slot the binary's alone.
 
 use super::{
@@ -13,17 +13,28 @@ fn models(default: &str) -> ModelSettings {
     }
 }
 
-/// With nothing on disk the list is exactly the two built-ins, in menu order,
-/// each carrying the endpoint + base model that makes it worth picking.
+/// The shipped names in menu order, so a table change lands in one place.
+const BUILTIN_NAMES: [&str; 6] = [
+    "DeepSeek",
+    "Z.ai",
+    "Qwen-TokenPlan-Intl",
+    "Qwen-TokenPlan-CN",
+    "Qwen-CodingPlan-Intl",
+    "Qwen-CodingPlan-CN",
+];
+
+fn names(presets: &[super::Preset]) -> Vec<&str> {
+    presets.iter().map(|p| p.name.as_str()).collect()
+}
+
+/// With nothing on disk the list is exactly the built-ins, in menu order, each
+/// carrying the endpoint + base model that makes it worth picking.
 #[test]
 fn the_builtins_ship_with_their_endpoint_and_base_model() {
     let _home = crate::testutil::HomeSandbox::new();
 
     let listed = list_presets();
-    assert_eq!(
-        listed.iter().map(|p| p.name.as_str()).collect::<Vec<_>>(),
-        ["DeepSeek", "Z.ai"],
-    );
+    assert_eq!(names(&listed), BUILTIN_NAMES);
     assert!(listed.iter().all(|p| p.builtin));
 
     let deepseek = &listed[0];
@@ -44,6 +55,57 @@ fn the_builtins_ship_with_their_endpoint_and_base_model() {
         Some("https://api.z.ai/api/anthropic")
     );
     assert_eq!(zai.models.default.as_deref(), Some("glm-5.2"));
+}
+
+/// Alibaba's endpoints answer `400 "Model not exist."` for any Claude model id,
+/// so the alias an uncovered tier resolves to is a hard failure there rather
+/// than a degraded route. Every alibaba preset therefore pins each alias AND the
+/// subagent row, not just `models.default` — the deliberate deviation from the
+/// two presets above.
+#[test]
+fn an_alibaba_preset_pins_every_alias_and_the_subagent_row() {
+    let _home = crate::testutil::HomeSandbox::new();
+
+    for (name, base_url, model) in [
+        (
+            "Qwen-TokenPlan-Intl",
+            "https://token-plan.ap-southeast-1.maas.aliyuncs.com/apps/anthropic",
+            "qwen3.8-max",
+        ),
+        (
+            "Qwen-TokenPlan-CN",
+            "https://token-plan.cn-beijing.maas.aliyuncs.com/apps/anthropic",
+            "qwen3.8-max",
+        ),
+        (
+            "Qwen-CodingPlan-Intl",
+            "https://coding-intl.dashscope.aliyuncs.com/apps/anthropic",
+            "qwen3-coder-plus",
+        ),
+        (
+            "Qwen-CodingPlan-CN",
+            "https://coding.dashscope.aliyuncs.com/apps/anthropic",
+            "qwen3-coder-plus",
+        ),
+    ] {
+        let p = load_preset(name).unwrap_or_else(|| panic!("{name} ships in the binary"));
+        assert_eq!(p.base_url.as_deref(), Some(base_url), "{name} endpoint");
+        let m = &p.models;
+        for (field, got) in [
+            ("default", &m.default),
+            ("opus", &m.opus),
+            ("sonnet", &m.sonnet),
+            ("haiku", &m.haiku),
+            ("fable", &m.fable),
+            ("subagent", &m.subagent),
+        ] {
+            assert_eq!(
+                got.as_deref(),
+                Some(model),
+                "{name} leaves `{field}` free to resolve to a Claude id the endpoint rejects",
+            );
+        }
+    }
 }
 
 #[test]
@@ -69,11 +131,8 @@ fn a_saved_preset_round_trips_and_joins_the_list_after_the_builtins() {
     assert!(!loaded.builtin);
 
     assert_eq!(
-        list_presets()
-            .iter()
-            .map(|p| p.name.as_str())
-            .collect::<Vec<_>>(),
-        ["DeepSeek", "Z.ai", "mine"],
+        names(&list_presets()),
+        [BUILTIN_NAMES.as_slice(), ["mine"].as_slice()].concat(),
         "built-ins keep the head of the list",
     );
 }
@@ -163,11 +222,8 @@ fn an_unparseable_preset_is_skipped_not_fatal() {
     std::fs::write(dir.join("broken.json"), "{ not json").expect("write broken preset");
 
     assert_eq!(
-        list_presets()
-            .iter()
-            .map(|p| p.name.as_str())
-            .collect::<Vec<_>>(),
-        ["DeepSeek", "Z.ai", "good"],
+        names(&list_presets()),
+        [BUILTIN_NAMES.as_slice(), ["good"].as_slice()].concat(),
     );
 }
 

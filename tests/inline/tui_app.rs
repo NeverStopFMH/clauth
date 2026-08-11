@@ -6576,11 +6576,19 @@ fn d_on_a_builtin_keeps_the_picker_on_a_custom_pops_it() {
         matches!(app.modals.last(), Some(Modal::PresetPicker(_))),
         "the picker stays mounted on a built-in `d`"
     );
-    // Back out, then move cursor to the custom preset (index 2: DeepSeek, Z.ai, mine).
+    // Back out, then walk down to the custom preset. Its index is read off the
+    // same list the picker renders rather than hard-coded, so growing the
+    // built-in table moves the cursor instead of silently retargeting this
+    // assertion at a built-in.
     handle_key(&mut app, key(KeyCode::Esc));
     dispatch_action_menu_action(&mut app, ActionMenuAction::ApplyPreset);
-    handle_key(&mut app, key(KeyCode::Down));
-    handle_key(&mut app, key(KeyCode::Down));
+    let mine = crate::presets::list_presets()
+        .iter()
+        .position(|p| p.name == "mine")
+        .expect("the saved preset is in the picker's list");
+    for _ in 0..mine {
+        handle_key(&mut app, key(KeyCode::Down));
+    }
     handle_key(&mut app, key(KeyCode::Char('d')));
     assert!(
         matches!(app.modals.last(), Some(Modal::Confirm(_))),

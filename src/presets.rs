@@ -5,7 +5,7 @@
 //! every fallback knob stay out — those are per-account, and a template that
 //! carried them would silently move an api key between accounts.
 //!
-//! Two built-ins ship in the binary; the rest live one JSON file per preset
+//! The built-ins ship in the binary; the rest live one JSON file per preset
 //! under `~/.clauth/presets/`. The file NAME is the preset name, so it goes
 //! through [`crate::actions::validate_profile_name`] (the same charset that
 //! bounds a profile directory) before it ever reaches a path — see
@@ -37,30 +37,86 @@ struct PresetFile {
     models: ModelSettings,
 }
 
-/// The built-ins, in menu order. Each sets only `models.default` — CC's
-/// top-level `model` setting, the fallback every alias resolves through when no
-/// per-tier override covers it — so applying one leaves the tier rows free for
-/// the operator to pin afterwards.
-const BUILTINS: [(&str, &str, &str); 2] = [
-    (
-        "DeepSeek",
-        "https://api.deepseek.com/anthropic",
-        "deepseek-chat",
-    ),
-    ("Z.ai", "https://api.z.ai/api/anthropic", "glm-5.2"),
+/// One entry of the shipped table.
+struct Builtin {
+    name: &'static str,
+    base_url: &'static str,
+    model: &'static str,
+    /// Whether `model` is written to every alias and the subagent row, or to
+    /// `models.default` alone.
+    ///
+    /// `default` alone is the lighter template: it is CC's top-level `model`
+    /// setting, the fallback every alias resolves through when no per-tier
+    /// override covers it, so it leaves the tier rows free for the operator.
+    /// That only holds while the endpoint tolerates whatever an uncovered alias
+    /// resolves to. Alibaba's does not: `POST /apps/anthropic/v1/messages` with
+    /// `claude-sonnet-4-5` or `claude-haiku-4-5-20251001` answers
+    /// `400 InvalidParameter "Model not exist."` (measured 2026-08-11 against
+    /// `token-plan.ap-southeast-1`), so an alias left unpinned is a hard failure
+    /// rather than a degraded route. Alibaba's own `bl config agent --agent
+    /// claude-code` writes all of them for the same reason.
+    pin_every_tier: bool,
+}
+
+/// The built-ins, in menu order.
+const BUILTINS: &[Builtin] = &[
+    Builtin {
+        name: "DeepSeek",
+        base_url: "https://api.deepseek.com/anthropic",
+        model: "deepseek-chat",
+        pin_every_tier: false,
+    },
+    Builtin {
+        name: "Z.ai",
+        base_url: "https://api.z.ai/api/anthropic",
+        model: "glm-5.2",
+        pin_every_tier: false,
+    },
+    Builtin {
+        name: "Qwen-TokenPlan-Intl",
+        base_url: "https://token-plan.ap-southeast-1.maas.aliyuncs.com/apps/anthropic",
+        model: "qwen3.8-max",
+        pin_every_tier: true,
+    },
+    Builtin {
+        name: "Qwen-TokenPlan-CN",
+        base_url: "https://token-plan.cn-beijing.maas.aliyuncs.com/apps/anthropic",
+        model: "qwen3.8-max",
+        pin_every_tier: true,
+    },
+    Builtin {
+        name: "Qwen-CodingPlan-Intl",
+        base_url: "https://coding-intl.dashscope.aliyuncs.com/apps/anthropic",
+        model: "qwen3-coder-plus",
+        pin_every_tier: true,
+    },
+    Builtin {
+        name: "Qwen-CodingPlan-CN",
+        base_url: "https://coding.dashscope.aliyuncs.com/apps/anthropic",
+        model: "qwen3-coder-plus",
+        pin_every_tier: true,
+    },
 ];
 
 fn builtins() -> Vec<Preset> {
     BUILTINS
         .iter()
-        .map(|(name, base_url, model)| Preset {
-            name: (*name).to_string(),
-            base_url: Some((*base_url).to_string()),
-            models: ModelSettings {
-                default: Some((*model).to_string()),
-                ..ModelSettings::default()
-            },
-            builtin: true,
+        .map(|b| {
+            let model = || Some(b.model.to_string());
+            let tier = || b.pin_every_tier.then(model).flatten();
+            Preset {
+                name: b.name.to_string(),
+                base_url: Some(b.base_url.to_string()),
+                models: ModelSettings {
+                    default: model(),
+                    opus: tier(),
+                    sonnet: tier(),
+                    haiku: tier(),
+                    fable: tier(),
+                    subagent: tier(),
+                },
+                builtin: true,
+            }
         })
         .collect()
 }
@@ -71,7 +127,7 @@ fn builtins() -> Vec<Preset> {
 pub(crate) fn is_builtin(name: &str) -> bool {
     BUILTINS
         .iter()
-        .any(|(builtin, _, _)| builtin.eq_ignore_ascii_case(name.trim()))
+        .any(|b| b.name.eq_ignore_ascii_case(name.trim()))
 }
 
 fn presets_dir() -> Result<std::path::PathBuf> {

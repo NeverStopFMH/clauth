@@ -56,6 +56,8 @@ The 48-hour clock runs from your aliyun console sign-in, so it is already tickin
 
 An account with no api key at all still gets its usage panel, since the quota rides the console session. It just cannot run Claude Code until you add a key.
 
+The Setup tab's `re-login` row runs this same console flow on a Model Studio account, so the shell is no longer the only route to it. Starting one from nothing is still two steps, because the console a session comes from is read off the endpoint: give the account a Qwen preset first, then log in.
+
 ## Model routing
 
 Per account, on the Setup tab or in `config.toml`:

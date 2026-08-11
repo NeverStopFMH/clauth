@@ -93,7 +93,7 @@ There is no `remove field`: an env row's <kbd>⏎</kbd> edits its value, and an 
 | `+ model override` | expands to `opus`, `sonnet`, `haiku`, `fable`, `subagent` id overrides |
 | env entries | extra environment variables merged into `settings.json` while this account is active; <kbd>⏎</kbd> edits a value, and an empty one keeps the key |
 | `disable account` / `enable account` | hides the account from auto-switch and polling, keeping its files |
-| `+ login` / `re-login` | browser OAuth login for this profile |
+| `+ login` / `re-login` | what it runs depends on the account, the same three-way split `clauth login` has: an OAuth account mints a browser login, an api-key account re-enters its base url and key inline, and a Model Studio account opens the Alibaba console to capture the usage session its api key cannot stand in for ([Configuration](Configuration#the-alibaba-console-session)). That last one replaces the session and nothing else, since the endpoint and api key keep their own rows |
 | `log out` | drops the stored credentials, keeps the profile |
 | `token` | read-only state of a stored long-lived setup token: its remaining life, or `expired` / `mis-filled` with the fix beneath it ([Configuration](Configuration#account-types)) |
 | `clear long-lived token` | drops that token so the account's own OAuth login installs again; appears only when one is stored, arms on the first press, clears on the second. Faint and inert when the account has no other login to fall back to |

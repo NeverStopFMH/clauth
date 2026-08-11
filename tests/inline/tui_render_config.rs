@@ -574,3 +574,137 @@ fn long_lived_token_row_counts_down_and_escalates() {
         "a disengaged sidecar is DANGER"
     );
 }
+
+/// The action next to that status row. Same button class as `Delete` /
+/// `Disabled`: one label span, DANGER + bold whether or not the row is focused,
+/// flipping to the `press again to <verb>` copy once `armed_action` names it —
+/// clearing changes what EVERY future switch installs and can move a running
+/// session's credentials, so it is never a one-press action.
+#[test]
+fn clear_session_token_button_is_delete_class_and_arms_on_second_press() {
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let mut snap = Snap::blank("a");
+    snap.has_other_login = true; // ungated: the profile has an OAuth login too
+    let input = InputState::new("");
+
+    for selected in [false, true] {
+        let arrow = if selected { "❯ " } else { "  " };
+        let unarmed = detail_row(
+            ConfigRow::ClearSessionToken,
+            selected,
+            false,
+            None,
+            &snap,
+            &input,
+        );
+        assert_eq!(
+            line_text(&unarmed),
+            format!("{arrow}clear long-lived token"),
+            "unarmed label is fixed regardless of focus (selected={selected})"
+        );
+        assert_eq!(unarmed.spans[1].style.fg, theme::danger().fg);
+        assert!(
+            unarmed.spans[1].style.add_modifier.contains(Modifier::BOLD),
+            "always bold, like `delete account` (selected={selected})"
+        );
+
+        let armed = detail_row(
+            ConfigRow::ClearSessionToken,
+            selected,
+            false,
+            Some(ConfigRow::ClearSessionToken),
+            &snap,
+            &input,
+        );
+        assert_eq!(
+            line_text(&armed),
+            format!("{arrow}press again to clear"),
+            "arming swaps to the confirm copy"
+        );
+        assert_eq!(armed.spans[1].style.fg, theme::danger().fg);
+        assert!(armed.spans[1].style.add_modifier.contains(Modifier::BOLD));
+    }
+
+    // Another row's arm must not bleed into this row's confirm copy.
+    let cross_armed = detail_row(
+        ConfigRow::ClearSessionToken,
+        true,
+        false,
+        Some(ConfigRow::Delete),
+        &snap,
+        &input,
+    );
+    assert_eq!(line_text(&cross_armed), "❯ clear long-lived token");
+}
+
+/// Dimmed + inert when the profile stores no other login — clearing there
+/// would strip its only credential, so the row takes the same faint treatment
+/// as a gated `disabled` row (arrow included) and ignores a stale arm. The
+/// differential leg proves the faint is a real style branch rather than a
+/// coincidence with an ungated row's color.
+#[test]
+fn clear_session_token_button_dims_without_another_stored_login() {
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let snap = Snap::blank("a"); // has_other_login: false
+    let input = InputState::new("");
+
+    let gated = detail_row(
+        ConfigRow::ClearSessionToken,
+        true,
+        false,
+        Some(ConfigRow::ClearSessionToken),
+        &snap,
+        &input,
+    );
+    assert_eq!(
+        line_text(&gated),
+        "❯ clear long-lived token",
+        "gated ignores the stale arm, showing the plain label"
+    );
+    assert_eq!(gated.spans[1].style.fg, theme::faint().fg);
+    assert_eq!(
+        gated.spans[0].style.fg,
+        theme::faint().fg,
+        "the arrow dims too while gated and selected"
+    );
+
+    let mut ungated_snap = Snap::blank("a");
+    ungated_snap.has_other_login = true;
+    let ungated = detail_row(
+        ConfigRow::ClearSessionToken,
+        true,
+        false,
+        None,
+        &ungated_snap,
+        &input,
+    );
+    assert_ne!(
+        gated.spans[1].style.fg, ungated.spans[1].style.fg,
+        "a gated row must render distinctly from the same row ungated"
+    );
+}
+
+/// The `└` hint is value-aware like every other Setup hint: the gate's reason
+/// first, then what the clear actually does — and the ACTIVE account's wording
+/// names the relink, since that is the half a running session feels.
+#[test]
+fn clear_session_token_hint_names_the_gate_then_the_relink() {
+    let mut snap = Snap::blank("a");
+
+    assert_eq!(
+        row_hint(ConfigRow::ClearSessionToken, &snap).as_deref(),
+        Some("no other login stored, log in first"),
+    );
+
+    snap.has_other_login = true;
+    assert_eq!(
+        row_hint(ConfigRow::ClearSessionToken, &snap).as_deref(),
+        Some("the next switch installs this account's own login again"),
+    );
+
+    snap.is_active = true;
+    assert_eq!(
+        row_hint(ConfigRow::ClearSessionToken, &snap).as_deref(),
+        Some("relinks this account's own login now · running sessions follow"),
+    );
+}

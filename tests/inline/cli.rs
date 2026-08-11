@@ -362,6 +362,40 @@ fn login_setup_token_excludes_api_mode_and_bare_yes() {
     );
 }
 
+/// The clear half of the sidecar. `--yes` covers it too: it is the destructive
+/// direction, and a non-interactive caller needs some way to say yes.
+#[test]
+fn login_clear_setup_token_flag_and_its_unprompted_drop() {
+    let a = login(&["login", "acme", "--clear-setup-token"]);
+    assert!(a.clear_setup_token);
+    assert!(!a.setup_token);
+    assert!(!a.yes);
+    assert!(login(&["login", "acme", "--clear-setup-token", "--yes"]).yes);
+    assert!(login(&["login", "acme", "--clear-setup-token", "-y"]).yes);
+}
+
+/// Capturing and clearing are opposite operations on one file, so asking for
+/// both is a contradiction rather than an ordering question. Clearing also takes
+/// no `--model`: it writes nothing to the profile.
+#[test]
+fn login_clear_setup_token_excludes_its_opposite_api_mode_and_model() {
+    for extra in [
+        vec!["--setup-token"],
+        vec!["--base-url", "https://x"],
+        vec!["--api-key", "sk-x"],
+        vec!["--model", "opus"],
+    ] {
+        let mut argv = vec!["login", "acme", "--clear-setup-token"];
+        argv.extend(extra.iter().copied());
+        let err = parse(&argv).expect_err(&format!("{extra:?} must be refused"));
+        assert!(
+            err.to_string().contains("cannot be used with"),
+            "must read as a conflict for {extra:?}, got: {err}"
+        );
+        assert_eq!(err.exit_code(), 2);
+    }
+}
+
 #[test]
 fn login_api_mode_takes_both_endpoint_flags_in_any_order_with_model() {
     let a = login(&[

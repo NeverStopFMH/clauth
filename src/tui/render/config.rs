@@ -94,6 +94,12 @@ struct Snap {
     /// so a hybrid's stored pair wins over its base url). Endpoint-shaped rows
     /// keep tracking the base-url buffer instead.
     login_is_oauth: bool,
+    /// Whether the account stores a login BESIDES its long-lived sidecar —
+    /// either credential, regardless of typing, mirroring the CLI's own
+    /// refusal. Deliberately not `logged_in`, which picks one credential by
+    /// `login_is_oauth` and so reads false for a hybrid whose OAuth pair is
+    /// exactly what the clear would fall back to. Gates `ClearSessionToken`.
+    has_other_login: bool,
     /// `+ new` form only: the draft holds a minted login awaiting `create
     /// account` — flips the `Login` row to its `✓ logged in` state.
     captured: bool,
@@ -126,6 +132,7 @@ impl Snap {
             has_live_session: false,
             logged_in: false,
             login_is_oauth: true,
+            has_other_login: false,
             captured: false,
             provider: None,
             session_token: None,
@@ -185,6 +192,7 @@ fn build_snap(app: &App, with_text: bool) -> Snap {
                 p.api_key.as_deref().is_some_and(|k| !k.trim().is_empty())
             },
             login_is_oauth: p.login_is_oauth(),
+            has_other_login: p.credentials.is_some() || p.api_key.is_some(),
             captured: false,
             provider: p.provider.map(|p| p.display_name()),
             session_token: crate::claude::session_token_status(p.name.as_str()),
@@ -433,6 +441,7 @@ fn snap_value(snap: &Snap, row: ConfigRow) -> &str {
         | ConfigRow::EnvAdd
         | ConfigRow::Login
         | ConfigRow::DeleteCreds
+        | ConfigRow::ClearSessionToken
         | ConfigRow::Disabled
         | ConfigRow::Delete
         | ConfigRow::Create => "",
@@ -490,6 +499,17 @@ fn row_hint(row: ConfigRow, snap: &Snap) -> Option<String> {
         ConfigRow::DeleteCreds => {
             "clears the stored OAuth login; keeps the account and its settings"
         }
+        // Gate reason first (same order as `Disabled` above — a gate only ever
+        // bites the clearable state), then what the clear does from here. The
+        // active account's wording names the relink, since that is the half a
+        // running session feels.
+        ConfigRow::ClearSessionToken if !snap.has_other_login => {
+            "no other login stored, log in first"
+        }
+        ConfigRow::ClearSessionToken if snap.is_active => {
+            "relinks this account's own login now · running sessions follow"
+        }
+        ConfigRow::ClearSessionToken => "the next switch installs this account's own login again",
         ConfigRow::Delete => {
             "deletes the account and everything stored for it, usage history included"
         }
@@ -619,6 +639,27 @@ fn detail_row(
         }
         ConfigRow::DeleteCreds => {
             Line::from(vec![arrow, Span::styled("log out", theme::danger().bold())])
+        }
+        // `Delete`'s button class — always-bold DANGER, `press again to <verb>`
+        // once armed — because a clear retargets every future switch and moves
+        // the active account's live credentials. Dimmed/inert (arrow included,
+        // matching the gated `disabled` row) when the account stores no other
+        // login: `run_config_row`'s own gate no-ops there.
+        ConfigRow::ClearSessionToken => {
+            let gated = !snap.has_other_login;
+            let row_arrow = if gated && selected {
+                Span::styled("❯ ", theme::faint())
+            } else {
+                arrow
+            };
+            let (label, style) = if gated {
+                ("clear long-lived token", theme::faint())
+            } else if armed_action == Some(ConfigRow::ClearSessionToken) {
+                ("press again to clear", theme::danger().bold())
+            } else {
+                ("clear long-lived token", theme::danger().bold())
+            };
+            Line::from(vec![row_arrow, Span::styled(label, style)])
         }
     }
 }

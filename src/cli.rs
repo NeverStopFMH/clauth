@@ -301,7 +301,12 @@ impl StartArgs {
 }
 
 /// `clauth login`'s profile plus its auth-method flags.
+///
+/// `--setup-token` and `--clear-setup-token` are the two halves of the
+/// long-lived sidecar and are mutually exclusive; `--yes` skips the confirm on
+/// whichever of them is present, which is what the `token_op` group names.
 #[derive(Args, Debug)]
+#[command(group(clap::ArgGroup::new("token_op").args(["setup_token", "clear_setup_token"])))]
 pub(crate) struct LoginArgs {
     /// Profile to log in as. An existing name re-authenticates it in place.
     pub(crate) profile: String,
@@ -317,8 +322,13 @@ pub(crate) struct LoginArgs {
     /// on the next switch and touches nothing else about the profile.
     #[arg(long, conflicts_with_all = ["base_url", "api_key"])]
     pub(crate) setup_token: bool,
-    /// Replace an existing long-lived token unprompted.
-    #[arg(long, short = 'y', requires = "setup_token")]
+    /// Drop the profile's long-lived session-token sidecar, so its stored OAuth
+    /// login is what switches install again. Relinks the live slot when the
+    /// profile is active. Nothing else about the profile moves.
+    #[arg(long, conflicts_with_all = ["base_url", "api_key", "model"])]
+    pub(crate) clear_setup_token: bool,
+    /// Replace or drop an existing long-lived token unprompted.
+    #[arg(long, short = 'y', requires = "token_op")]
     pub(crate) yes: bool,
     /// Default model for the profile: opus, sonnet, haiku, opusplan, or a full
     /// model id.

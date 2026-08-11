@@ -79,6 +79,36 @@ pub(crate) fn session_token_status(name: &str) -> Option<SessionTokenStatus> {
     Some(SessionTokenStatus::LongLived(oauth.expires_at))
 }
 
+/// The access token a switch would INSTALL for `name` from its sidecar, or
+/// `None` when the split is disengaged (no sidecar, unparseable, or a
+/// [`SessionTokenStatus::NotLongLived`] mis-fill that switches ignore). Gated on
+/// the same predicate as [`has_session_token`], so a profile can never be
+/// attributed by a token no switch would ever install.
+pub(crate) fn installed_session_token(name: &str) -> Option<String> {
+    if !has_session_token(name) {
+        return None;
+    }
+    let path = profile_dir(name).ok()?.join("session-token.json");
+    let creds = read_json_file::<ClaudeCredentials>(&path).ok()?;
+    creds
+        .access_token()
+        .filter(|t| !t.is_empty())
+        .map(str::to_string)
+}
+
+/// Remove `name`'s long-lived sidecar, flipping [`install_source_path`] back to
+/// `credentials.json`. Returns whether a file was actually removed, so a caller
+/// can tell "cleared" from "there was nothing to clear". An absent sidecar is
+/// success, not an error: the requested end state already holds.
+pub(crate) fn clear_session_token(name: &str) -> Result<bool> {
+    let path = profile_dir(name)?.join("session-token.json");
+    with_state_lock(|| match std::fs::remove_file(&path) {
+        Ok(()) => Ok(true),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(anyhow::Error::new(e).context("remove session-token.json")),
+    })
+}
+
 /// Documented lifetime of a `claude setup-token` mint (~1 year). The minted
 /// string carries no expiry of its own, so the capture flow stamps this
 /// assumed horizon into the sidecar — the Setup-tab countdown and
@@ -300,7 +330,7 @@ fn is_first_login_at(link: &Path, expected: &Path) -> bool {
 /// The `Diverged`-but-saved state this clears arises when a profile's INSTALL
 /// SOURCE changes under the live slot: capturing a `setup-token` sidecar for
 /// the ACTIVE profile flips [`install_source_path`] from `credentials.json` to
-/// `session-token.json` (removing it flips back) while the live slot still
+/// `session-token.json` ([`clear_session_token`] flips it back) while the live slot still
 /// holds the previous source's content — a stale slot the next switch
 /// re-installs, not an unsaved login. Both stores are checked because the flip
 /// can leave the slot holding either the OAuth login or the static mint.

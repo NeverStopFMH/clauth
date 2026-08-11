@@ -16,7 +16,7 @@ const BASH: &str = r#"_clauth() {
     elif [ "$prev" = "--theme" ]; then
         COMPREPLY=( $(compgen -W "full compatible" -- "${cur}") )
     elif [ "${COMP_WORDS[1]}" = "login" ] && [ "${cur:0:2}" = "--" ]; then
-        COMPREPLY=( $(compgen -W "--base-url --api-key --setup-token --yes -y --model" -- "${cur}") )
+        COMPREPLY=( $(compgen -W "--base-url --api-key --setup-token --clear-setup-token --yes -y --model" -- "${cur}") )
     elif [ "${COMP_WORDS[1]}" = "start" ] && [ "${cur:0:2}" = "--" ]; then
         COMPREPLY=( $(compgen -W "--isolated --rescue --no-rescue --with-fallback" -- "${cur}") )
     elif [ "${COMP_WORDS[1]}" = "daemon" ] && [ "${cur:0:2}" = "--" ]; then
@@ -97,7 +97,7 @@ _clauth() {
     elif (( CURRENT >= 3 )) && [[ "${words[2]}" == resume ]]; then
         _values 'flag' '--profile[resume under this profile instead of prompting]'
     elif (( CURRENT >= 4 )) && [[ "${words[2]}" == login ]]; then
-        _values 'flag' '--base-url[API base url]' '--api-key[API key (prompted echo-off if omitted)]' '--setup-token[capture a claude setup-token mint as a long-lived login]' '--yes[replace an existing long-lived token unprompted]' '-y[replace an existing long-lived token unprompted]' '--model[set the default model before signing in]'
+        _values 'flag' '--base-url[API base url]' '--api-key[API key (prompted echo-off if omitted)]' '--setup-token[capture a claude setup-token mint as a long-lived login]' '--clear-setup-token[drop the long-lived login, restoring the stored OAuth one]' '--yes[replace or drop an existing long-lived token unprompted]' '-y[replace or drop an existing long-lived token unprompted]' '--model[set the default model before signing in]'
     elif (( CURRENT >= 4 )) && [[ "${words[2]}" == delete ]]; then
         _values 'flag' '--yes[skip the confirm prompt]' '-y[skip the confirm prompt]' '--force[override the live-session guard]'
     elif (( CURRENT >= 4 )) && [[ "${words[2]}" == disable ]]; then
@@ -150,6 +150,7 @@ complete -c clauth -f -n "__fish_seen_subcommand_from resume" -a --profile -d "R
 complete -c clauth -f -n "__fish_seen_subcommand_from login" -a --base-url -d "API base url"
 complete -c clauth -f -n "__fish_seen_subcommand_from login" -a --api-key -d "API key (prompted echo-off if omitted)"
 complete -c clauth -f -n "__fish_seen_subcommand_from login" -a --setup-token -d "Capture a claude setup-token mint as a long-lived login"
+complete -c clauth -f -n "__fish_seen_subcommand_from login" -a --clear-setup-token -d "Drop the long-lived login, restoring the stored OAuth one"
 complete -c clauth -f -n "__fish_seen_subcommand_from login" -a --yes -d "Replace an existing long-lived token unprompted"
 complete -c clauth -f -n "__fish_seen_subcommand_from login" -a -y -d "Replace an existing long-lived token unprompted"
 complete -c clauth -f -n "__fish_seen_subcommand_from login" -a --model -d "Set default model before signing in"

@@ -233,6 +233,16 @@ pub(crate) enum ConfigRow {
     Login,
     /// Drop this account's stored OAuth credentials, keeping the profile shell.
     DeleteCreds,
+    /// CLA-SPLIT escape hatch: delete this account's `session-token.json`, so
+    /// switches go back to installing its own `credentials.json`. Shown only
+    /// while a sidecar exists (`claude::session_token_status`, so a MIS-FILLED
+    /// one gets the row too — that state needs an exit as much as a live mint),
+    /// and dimmed + inert when the account stores no other login, since
+    /// clearing would leave it with no credentials at all. Arms on the first
+    /// Space/⏎ and confirms on the second, like `Disabled`'s disable direction:
+    /// it changes what every future switch installs and, on the active account,
+    /// moves a running session's credentials.
+    ClearSessionToken,
     /// User-disabled account-action row (`Profile::disabled`, see
     /// `docs/fallback.md`), same class as `Delete`: enabling fires the shared
     /// `actions::enable_profile` immediately (harmless), disabling arms on the
@@ -366,10 +376,10 @@ pub(crate) struct ConfigDraft {
     pub(crate) env_new_key: InputState,
     /// `Some(row)` while a text row (or the `model` custom field) owns the keyboard.
     pub(crate) active: Option<ConfigRow>,
-    /// The account-action row (`Delete`, or `Disabled` in the disable
-    /// direction only — enabling is immediate, never armed) currently armed by
-    /// a first ⏎; a second ⏎ on that same row confirms. Any cursor move, or
-    /// the confirm itself, disarms back to `None`.
+    /// The account-action row (`Delete`, `ClearSessionToken`, or `Disabled` in
+    /// the disable direction only — enabling is immediate, never armed)
+    /// currently armed by a first ⏎; a second ⏎ on that same row confirms. Any
+    /// cursor move, or the confirm itself, disarms back to `None`.
     pub(crate) armed_action: Option<ConfigRow>,
     /// API-account re-login is in flight: committing the base-url field advances
     /// to the api-key field (re-enter both, mirroring `login --base-url --api-key`)
@@ -408,6 +418,7 @@ impl ConfigDraft {
             | ConfigRow::EnvAdd
             | ConfigRow::Login
             | ConfigRow::DeleteCreds
+            | ConfigRow::ClearSessionToken
             | ConfigRow::Disabled
             | ConfigRow::Delete
             | ConfigRow::Create => return None,
@@ -432,6 +443,7 @@ impl ConfigDraft {
             | ConfigRow::EnvAdd
             | ConfigRow::Login
             | ConfigRow::DeleteCreds
+            | ConfigRow::ClearSessionToken
             | ConfigRow::Disabled
             | ConfigRow::Delete
             | ConfigRow::Create => return None,
@@ -673,6 +685,7 @@ pub(crate) enum ActionMenuAction {
     CreateProfile,
     LoginAccount,
     ClearCredentials,
+    ClearSessionToken,
     EditField,
     /// Remove the focused custom env entry from the account.
     RemoveEnvField,
@@ -783,6 +796,7 @@ impl ActionMenuAction {
             Self::CreateProfile => "create account",
             Self::LoginAccount => "log in",
             Self::ClearCredentials => "log out",
+            Self::ClearSessionToken => "clear long-lived token",
             Self::EditField => "edit field",
             Self::RemoveEnvField => "remove field",
             Self::RefreshStatus => "refresh status",
@@ -5098,6 +5112,9 @@ fn build_action_menu(app: &App) -> ActionMenuState {
                         ConfigRow::AutoStart => actions.push(ActionMenuAction::ToggleAutoStart),
                         ConfigRow::Login => actions.push(ActionMenuAction::LoginAccount),
                         ConfigRow::DeleteCreds => actions.push(ActionMenuAction::ClearCredentials),
+                        ConfigRow::ClearSessionToken => {
+                            actions.push(ActionMenuAction::ClearSessionToken);
+                        }
                         ConfigRow::Delete => actions.push(ActionMenuAction::DeleteProfile),
                         ConfigRow::Create => actions.push(ActionMenuAction::CreateProfile),
                         ConfigRow::EnvEntry(_) => {
@@ -5330,6 +5347,12 @@ fn dispatch_action_menu_action(app: &mut App, action: ActionMenuAction) {
                 run_config_row(app, row);
             }
         }
+        ActionMenuAction::ClearSessionToken => {
+            let rows = config_rows(app);
+            if let Some(&row) = rows.get(app.config_action_cursor) {
+                run_config_row(app, row);
+            }
+        }
         ActionMenuAction::EditField => {
             let rows = config_rows(app);
             if let Some(&row) = rows.get(app.config_action_cursor) {
@@ -5522,6 +5545,15 @@ pub(crate) fn config_rows(app: &App) -> Vec<ConfigRow> {
     };
     if has_creds {
         rows.push(ConfigRow::DeleteCreds);
+    }
+    // CLA-SPLIT escape hatch, beside the log-out row because it drops the OTHER
+    // credential a split profile holds. Gated on the sidecar EXISTING
+    // (`session_token_status`), not on the split being engaged
+    // (`has_session_token`): a mis-filled sidecar needs the same exit, and until
+    // this row there was none from either state short of deleting the file by
+    // hand. The no-other-login refusal is a dim, not a hide — see `run_config_row`.
+    if profile.is_some_and(|p| crate::claude::session_token_status(p.name.as_str()).is_some()) {
+        rows.push(ConfigRow::ClearSessionToken);
     }
     // The account-actions group's tail: disable/enable (reversible) one severity
     // notch below delete (irreversible), which always stays the very last row.
@@ -5780,8 +5812,70 @@ fn run_config_row(app: &mut App, row: ConfigRow) {
                 }));
             }
         }
+        ConfigRow::ClearSessionToken => {
+            if let Some(name) = name {
+                // Same refusal the CLI makes (`cmd_login_clear_setup_token`):
+                // with no other login stored, clearing the sidecar leaves the
+                // account with no credentials at all.
+                let stores_other_login = {
+                    let cfg = app.config();
+                    cfg.find(&name)
+                        .is_some_and(|p| p.credentials.is_some() || p.api_key.is_some())
+                };
+                if !stores_other_login {
+                    return;
+                }
+                let armed = app
+                    .config_draft
+                    .as_ref()
+                    .is_some_and(|d| d.armed_action == Some(ConfigRow::ClearSessionToken));
+                // Arm/confirm rather than a modal: this is a row-level
+                // destructive action, and it retargets every future switch.
+                if armed {
+                    perform_clear_session_token(app, &name);
+                    disarm_armed_action(app);
+                } else {
+                    arm_action(app, ConfigRow::ClearSessionToken);
+                }
+            }
+        }
         _ => {}
     }
+}
+
+/// Confirmed `clear long-lived token`: drop the sidecar, then relink when the
+/// account is ACTIVE. The relink is not optional there — the live
+/// `~/.claude/.credentials.json` is a symlink INTO the profile store aimed at
+/// `session-token.json`, so removing the target alone leaves a dangling link
+/// and Claude Code reads no credentials at all. An idle account is left alone:
+/// force-linking it would repoint the live slot at a profile nobody switched to.
+///
+/// Deliberately does NOT stamp `last_reload_fp`: `reload_fingerprint` folds each
+/// sidecar's write time in, so leaving it stale is what makes the next tick
+/// reload and rebuild `session_tokens` (the Overview `⊘` marker's cache). The
+/// local `remove` below only spares that marker one tick of staleness.
+fn perform_clear_session_token(app: &mut App, name: &str) {
+    let active = app.config().is_active(name);
+    if let Err(e) = crate::claude::clear_session_token(name) {
+        app.toast(ToastKind::Danger, format!("clear failed\n{e}"));
+        return;
+    }
+    app.session_tokens.remove(name);
+    if active && let Err(e) = force_link_profile_credentials(name) {
+        app.toast(ToastKind::Danger, format!("relink failed\n{e}"));
+        return;
+    }
+    // No `refresh_tokens()`: `collect_tokens` reads `Profile::credentials`, which
+    // a sidecar clear never touches.
+    let tail = if active {
+        ", relinked its own login"
+    } else {
+        "; the next switch installs its own login"
+    };
+    app.toast(
+        ToastKind::Success,
+        format!("cleared the long-lived token for '{name}'{tail}"),
+    );
 }
 
 /// API-account "re-login": re-enter the base url + api key inline, mirroring the
@@ -5867,8 +5961,8 @@ fn close_login_modal(app: &mut App) {
     app.modals.retain(|m| !matches!(m, Modal::Login));
 }
 
-/// Arm an account-action row (`Delete`, or `Disabled` in the disable
-/// direction) on its first ⏎.
+/// Arm an account-action row (`Delete`, `ClearSessionToken`, or `Disabled` in
+/// the disable direction) on its first ⏎.
 fn arm_action(app: &mut App, row: ConfigRow) {
     if let Some(d) = app.config_draft.as_mut() {
         d.armed_action = Some(row);
@@ -5950,6 +6044,7 @@ fn row_committed_value(profile: Option<&Profile>, name: &str, row: ConfigRow) ->
         | ConfigRow::EnvAdd
         | ConfigRow::Login
         | ConfigRow::DeleteCreds
+        | ConfigRow::ClearSessionToken
         | ConfigRow::Disabled
         | ConfigRow::Delete
         | ConfigRow::Create => String::new(),

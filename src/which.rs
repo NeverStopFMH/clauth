@@ -3,7 +3,11 @@
 //!
 //! Resolution: (1) match the loaded file's `refreshToken` against each stored
 //! profile's `refreshToken` — the clauth symlink layout keeps the live file
-//! and the matching profile's file byte-identical across rotations. (2) Inside
+//! and the matching profile's file byte-identical across rotations. (1b) When
+//! the loaded file carries NO refresh token, match its `accessToken` against
+//! each profile's long-lived session-token sidecar (CLA-SPLIT): that is what a
+//! switch installs for such a profile, and a mint carries no refresh token by
+//! construction, so tier 1 can never see it. (2) Inside
 //! a `clauth start` runtime, fall back to the profile named by
 //! `CLAUDE_CONFIG_DIR` (`profiles/<name>/runtime-<sid>`, or a bare
 //! `profiles/<name>/runtime` where the tree is shared): a runtime tree belongs
@@ -28,6 +32,9 @@ use crate::profile_json::tier_label;
 pub(crate) enum Source {
     /// Exact `refreshToken` match against a stored profile.
     RefreshMatch,
+    /// Exact `accessToken` match against a profile's long-lived session-token
+    /// sidecar — the credential a switch installs for a CLA-SPLIT profile.
+    SessionTokenMatch,
     /// Profile named by a `clauth start` runtime `CLAUDE_CONFIG_DIR`.
     SessionDir,
     /// Fresh first-login attributed to the credential-less active profile.
@@ -38,6 +45,7 @@ impl Source {
     pub(crate) fn as_str(self) -> &'static str {
         match self {
             Source::RefreshMatch => "refresh_match",
+            Source::SessionTokenMatch => "session_token_match",
             Source::SessionDir => "session_dir",
             Source::CredentialLessActive => "credential_less_active",
         }
@@ -88,6 +96,7 @@ fn resolve_at(config: &AppConfig, config_dir: Option<&Path>) -> Option<(String, 
         creds.as_ref(),
         config_dir.is_some(),
         session_profile.as_deref(),
+        &crate::claude::installed_session_token,
     )
     .map(|(name, source)| (name.to_string(), source))
 }
@@ -130,7 +139,8 @@ fn credentials_path(config_dir: Option<&Path>) -> Result<PathBuf> {
 /// (`~/.clauth/profiles/<name>/runtime-<sid>`, or a legacy bare `runtime`).
 /// Returns `None` for any other shape, an isolated runtime included: that tier
 /// has never covered the isolated flavor, and an isolated session's stored creds
-/// are already reached by the `refreshToken` match above.
+/// are already reached by the credential matches above (`refreshToken`, or the
+/// session-token match when the install is a refresh-less mint).
 fn session_profile_from_config_dir(dir: &Path) -> Option<String> {
     if !dir
         .file_name()?
@@ -162,8 +172,15 @@ fn resolve_profile<'a>(
     creds: Option<&ClaudeCredentials>,
     in_session: bool,
     session_profile: Option<&str>,
+    installed_session_token: &dyn Fn(&str) -> Option<String>,
 ) -> Option<(&'a str, Source)> {
-    let (name, source) = resolve_profile_candidate(config, creds, in_session, session_profile)?;
+    let (name, source) = resolve_profile_candidate(
+        config,
+        creds,
+        in_session,
+        session_profile,
+        installed_session_token,
+    )?;
     if config.find(name).is_some_and(Profile::is_disabled) {
         return None;
     }
@@ -172,24 +189,37 @@ fn resolve_profile<'a>(
 
 /// Resolve loaded credentials to a stored profile.
 ///
-/// Order: (1) exact refresh-token match; (2) inside a `clauth start` runtime,
+/// Order: (1) exact refresh-token match; (1b) exact session-token match for a
+/// refresh-token-less login; (2) inside a `clauth start` runtime,
 /// the profile named by `CLAUDE_CONFIG_DIR` owns the session even before its
 /// first login is stored; (3) for a non-runtime caller, the credential-less
 /// active profile (API-key/endpoint, or a fresh login not yet snapshotted).
 ///
-/// A `CLAUDE_CONFIG_DIR` that isn't a clauth runtime gets step 1 only — its
+/// A `CLAUDE_CONFIG_DIR` that isn't a clauth runtime gets steps 1/1b only — its
 /// credentials don't belong to the global active profile.
 fn resolve_profile_candidate<'a>(
     config: &'a AppConfig,
     creds: Option<&ClaudeCredentials>,
     in_session: bool,
     session_profile: Option<&str>,
+    installed_session_token: &dyn Fn(&str) -> Option<String>,
 ) -> Option<(&'a str, Source)> {
     if let Some(name) = creds
         .and_then(ClaudeCredentials::refresh_token)
         .and_then(|rt| match_by_refresh_token(config, rt))
     {
         return Some((name, Source::RefreshMatch));
+    }
+    // CLA-SPLIT tier. Gated on the loaded file carrying NO refresh token, which
+    // is both the correctness condition (a `claude setup-token` mint has none by
+    // construction, so a rotating login can never be attributed to a sidecar)
+    // and the cost one: the common case runs zero extra disk reads, and this
+    // resolves once per second behind a statusline.
+    if creds.is_some_and(|c| c.refresh_token().is_none())
+        && let Some(at) = creds.and_then(ClaudeCredentials::access_token)
+        && let Some(name) = match_by_session_token(config, at, installed_session_token)
+    {
+        return Some((name, Source::SessionTokenMatch));
     }
     if let Some(profile) = session_profile.and_then(|n| config.find(n)) {
         return Some((profile.name.as_str(), Source::SessionDir));
@@ -216,6 +246,31 @@ fn match_by_refresh_token<'a>(config: &'a AppConfig, refresh_token: &str) -> Opt
     let mut fallback = None;
     for p in &config.profiles {
         if p.refresh_token() != Some(refresh_token) {
+            continue;
+        }
+        if Some(p.name.as_str()) == active {
+            return Some(p.name.as_str());
+        }
+        fallback.get_or_insert(p.name.as_str());
+    }
+    fallback
+}
+
+/// Active-first tie-break, same as [`match_by_refresh_token`]: two profiles can
+/// legitimately hold the same mint (a duplicated account), and the active one is
+/// the honest answer for the live slot.
+fn match_by_session_token<'a>(
+    config: &'a AppConfig,
+    access_token: &str,
+    installed_session_token: &dyn Fn(&str) -> Option<String>,
+) -> Option<&'a str> {
+    if access_token.is_empty() {
+        return None;
+    }
+    let active = config.state.active_profile.as_deref();
+    let mut fallback = None;
+    for p in &config.profiles {
+        if installed_session_token(p.name.as_str()).as_deref() != Some(access_token) {
             continue;
         }
         if Some(p.name.as_str()) == active {

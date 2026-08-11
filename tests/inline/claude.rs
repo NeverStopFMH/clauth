@@ -1047,6 +1047,100 @@ fn install_source_prefers_session_token() {
     );
 }
 
+/// `installed_session_token` answers with exactly the token a switch installs,
+/// which is what `clauth which` attributes the live slot by. It has to track
+/// `has_session_token`: a mis-filled sidecar (one carrying a refresh token) is
+/// never installed, so attributing a profile by it would name an account no
+/// session is running as.
+#[test]
+fn installed_session_token_tracks_what_a_switch_installs() {
+    let _home = HomeSandbox::new();
+    let mut profile = crate::profile::Profile::new("split".to_string(), None, None);
+    profile.credentials = Some(creds("usage-access", Some("usage-refresh")));
+    crate::profile::save_profile(&profile).expect("save profile");
+
+    assert_eq!(installed_session_token("split"), None, "no sidecar yet");
+
+    fill_session_token_by_hand("split", "oat-access");
+    assert_eq!(
+        installed_session_token("split").as_deref(),
+        Some("oat-access")
+    );
+
+    // Mis-fill: a rotating pair in the sidecar leaves the split disengaged, so
+    // the install source is the OAuth pair and there is nothing to attribute by.
+    let dir = crate::profile::profile_dir("split").expect("profile dir");
+    fs::write(
+        dir.join("session-token.json"),
+        serde_json::to_vec(&creds("oat-access", Some("rt-misfill"))).expect("ser sidecar"),
+    )
+    .expect("write sidecar");
+    assert_eq!(
+        session_token_status("split"),
+        Some(SessionTokenStatus::NotLongLived)
+    );
+    assert_eq!(
+        installed_session_token("split"),
+        None,
+        "mis-fill installs nothing"
+    );
+
+    // A blank access token is Claude Code's logged-out shell, not a login. It
+    // must not become an attribution key, or every profile holding a blanked
+    // sidecar would answer to the same empty string.
+    fill_session_token_by_hand("split", "");
+    assert!(
+        has_session_token("split"),
+        "a blank mint is still long-lived"
+    );
+    assert_eq!(
+        installed_session_token("split"),
+        None,
+        "blank is not a token"
+    );
+}
+
+/// Clearing the sidecar is the only exit from the split. It flips the install
+/// source back to the OAuth pair, and it is idempotent: the second call reports
+/// "nothing to clear" rather than failing, so a repeated `--clear` is harmless.
+#[test]
+fn clear_session_token_flips_the_install_source_back() {
+    let _home = HomeSandbox::new();
+    let mut profile = crate::profile::Profile::new("split".to_string(), None, None);
+    profile.credentials = Some(creds("usage-access", Some("usage-refresh")));
+    crate::profile::save_profile(&profile).expect("save profile");
+    fill_session_token_by_hand("split", "oat-access");
+    assert!(
+        install_source_path("split")
+            .expect("source")
+            .ends_with("session-token.json")
+    );
+
+    assert!(clear_session_token("split").expect("clear"), "removed one");
+    assert!(!has_session_token("split"));
+    assert_eq!(session_token_status("split"), None);
+    assert!(
+        install_source_path("split")
+            .expect("source")
+            .ends_with("credentials.json"),
+        "install source flips back to the usage pair"
+    );
+    // The usage OAuth pair is untouched — clearing drops the sidecar only.
+    assert_eq!(
+        crate::profile::load_profile("split")
+            .expect("reload")
+            .credentials
+            .and_then(|c| c.access_token().map(str::to_string))
+            .as_deref(),
+        Some("usage-access")
+    );
+
+    assert!(
+        !clear_session_token("split").expect("second clear"),
+        "idempotent: nothing left to remove"
+    );
+}
+
 /// A live slot holding the profile's static session token is the designed
 /// steady state: LinkedTo (the divergence machinery stays dormant), and a
 /// snapshot leaves the clauth-private usage OAuth pair untouched instead of

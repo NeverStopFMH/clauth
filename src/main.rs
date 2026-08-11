@@ -445,6 +445,9 @@ fn cmd_login(args: LoginArgs) -> Result<()> {
             args.yes,
         );
     }
+    if args.clear_setup_token {
+        return cmd_login_clear_setup_token(&config, &target, reauth, args.yes);
+    }
 
     // Confirm a reauth BEFORE collecting anything (browser or key prompt): a
     // declined overwrite must not open a browser or read a secret.
@@ -503,6 +506,18 @@ fn cmd_login(args: LoginArgs) -> Result<()> {
             actions::set_profile_default_model(&mut config, &target, model)?;
         }
         outln!("clauth: captured into profile '{target}'. Switch to it with:  clauth {target}");
+    }
+    // CLA-SPLIT: the sidecar outranks `credentials.json` at every switch, so a
+    // fresh OAuth login reaches usage polling and NOTHING ELSE while it exists.
+    // Silence here reads as "the re-login took", which is what sent an operator
+    // round the loop of re-authenticating an account that kept running on its
+    // year-old mint.
+    if !is_api && claude::has_session_token(&target) {
+        outln!(
+            "clauth: NOTE '{target}' still holds a long-lived token, and that is what switches \
+             install — this login only feeds usage polling. Drop it with:  clauth login {target} \
+             --clear-setup-token"
+        );
     }
     Ok(())
 }
@@ -592,6 +607,82 @@ fn cmd_login_setup_token(
             "\nclauth: for usage polling, also add an OAuth pair later:  clauth login <name>"
         }
     );
+    Ok(())
+}
+
+/// `clauth login <name> --clear-setup-token [--yes]` — the exit from CLA-SPLIT,
+/// and the mirror of the capture above: it drops `session-token.json` so
+/// `install_source_path` points back at the profile's stored OAuth pair.
+///
+/// Unlike the capture it CANNOT leave the live slot alone. The slot is a symlink
+/// into the profile store, so removing its target under it leaves a dangling
+/// link and Claude Code reads no credentials at all. An active profile is
+/// therefore relinked in the same operation, which on Linux a live session picks
+/// up on the next mtime move.
+///
+/// Refuses when the profile has no other login to fall back to (a name created
+/// by `--setup-token` alone stores no OAuth pair): clearing there would strip its
+/// only credential. `--yes` skips the confirm, never that guard.
+fn cmd_login_clear_setup_token(
+    config: &profile::AppConfig,
+    target: &str,
+    exists: bool,
+    yes: bool,
+) -> Result<()> {
+    use std::io::IsTerminal as _;
+
+    if !exists {
+        anyhow::bail!("no profile named '{target}'");
+    }
+    if claude::session_token_status(target).is_none() {
+        outln!("clauth: '{target}' holds no long-lived token, so nothing to clear.");
+        return Ok(());
+    }
+    let profile = config
+        .find(target)
+        .ok_or_else(|| anyhow::anyhow!("no profile named '{target}'"))?;
+    if profile.credentials.is_none() && profile.api_key.is_none() {
+        anyhow::bail!(
+            "'{target}' stores no other login, so clearing its long-lived token would leave it \
+             with no credentials at all. Run `clauth login {target}` first, then clear."
+        );
+    }
+
+    let active = config.is_active(target);
+    if !yes {
+        if !std::io::stdin().is_terminal() {
+            anyhow::bail!(
+                "pass --yes to clear the long-lived token for '{target}' non-interactively"
+            );
+        }
+        if active {
+            outln!(
+                "clauth: '{target}' is active — clearing relinks the live credentials onto its \
+                 stored OAuth login, and running sessions follow."
+            );
+        }
+        out!("Clear the long-lived token for '{target}'? [y/N] ");
+        let mut answer = String::new();
+        std::io::stdin().read_line(&mut answer)?;
+        if !reauth_confirmed(&answer) {
+            outln!("clauth: aborted. '{target}' left unchanged.");
+            return Ok(());
+        }
+    }
+
+    claude::clear_session_token(target)?;
+    if active {
+        claude::force_link_profile_credentials(target)?;
+        outln!(
+            "clauth: cleared the long-lived token for '{target}' and relinked the live \
+             credentials onto its stored OAuth login."
+        );
+    } else {
+        outln!(
+            "clauth: cleared the long-lived token for '{target}'. Its stored OAuth login \
+             installs on the next switch:  clauth {target}"
+        );
+    }
     Ok(())
 }
 

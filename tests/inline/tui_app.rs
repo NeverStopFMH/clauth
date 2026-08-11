@@ -1024,6 +1024,267 @@ fn enable_row_fires_immediately_no_arm() {
     );
 }
 
+// ── `clear long-lived token` row (CLA-SPLIT escape hatch) ──────────────────
+
+/// A credential blob for the CLA-SPLIT fixtures below.
+fn split_creds(access: &str, refresh: Option<&str>) -> crate::profile::ClaudeCredentials {
+    crate::profile::ClaudeCredentials {
+        claude_ai_oauth: Some(crate::profile::OAuthToken {
+            access_token: access.to_string(),
+            refresh_token: refresh.map(str::to_string),
+            expires_at: None,
+            scopes: None,
+            subscription_type: None,
+        }),
+    }
+}
+
+/// Write `name`'s `session-token.json` by hand, the way the CLA-SPLIT fill
+/// does. `refresh: None` is a genuine long-lived mint; `Some(..)` is the
+/// mis-filled shape (a rotating pair) the split disengages for.
+fn seed_session_token(name: &str, refresh: Option<&str>) {
+    let dir = crate::profile::profile_dir(name).expect("profile dir");
+    std::fs::create_dir_all(&dir).expect("mkdir profile");
+    std::fs::write(
+        dir.join("session-token.json"),
+        serde_json::to_vec(&split_creds("mint-access", refresh)).expect("serialize sidecar"),
+    )
+    .expect("write sidecar");
+}
+
+/// The escape hatch exists only while there is something to escape from: no
+/// `session-token.json`, no row. A MIS-FILLED sidecar gets the row too — the
+/// split is disengaged there, but the operator still believes it is armed and
+/// deleting the file by hand was the only exit. Gating on `has_session_token`
+/// (long-lived only) would hide the row in exactly that state.
+#[test]
+fn config_rows_clear_session_token_row_tracks_the_sidecar() {
+    use super::{ConfigRow, config_rows};
+    use crate::profile::Profile;
+    let _home = crate::testutil::HomeSandbox::new();
+
+    let mut acct = Profile::new("acct".to_string(), None, None);
+    acct.credentials = Some(split_creds("stored-oauth", Some("stored-refresh")));
+    crate::profile::save_profile(&acct).expect("save profile");
+    let mut app = app_with(vec![acct]);
+    app.profile_cursor = 0;
+    app.config_draft = None;
+
+    assert!(
+        !config_rows(&app).contains(&ConfigRow::ClearSessionToken),
+        "no sidecar → nothing to clear, so no row"
+    );
+
+    seed_session_token("acct", None);
+    assert!(
+        config_rows(&app).contains(&ConfigRow::ClearSessionToken),
+        "a long-lived sidecar shows the row"
+    );
+
+    seed_session_token("acct", Some("rotating"));
+    assert!(
+        config_rows(&app).contains(&ConfigRow::ClearSessionToken),
+        "a mis-filled sidecar needs the same exit"
+    );
+}
+
+/// The row refuses on a profile storing no OTHER login — the same refusal
+/// `cmd_login_clear_setup_token` makes on the CLI, since clearing there would
+/// strip the profile's only credential. Inert means inert: pressing twice
+/// neither arms nor clears nor toasts.
+#[test]
+fn clear_session_token_row_is_inert_without_another_stored_login() {
+    use super::{ConfigRow, build_draft_existing, run_config_row};
+    use crate::profile::Profile;
+    let _home = crate::testutil::HomeSandbox::new();
+
+    let acct = Profile::new("acct".to_string(), None, None);
+    crate::profile::save_profile(&acct).expect("save profile");
+    seed_session_token("acct", None);
+    let sidecar = crate::profile::profile_dir("acct")
+        .expect("profile dir")
+        .join("session-token.json");
+
+    let mut app = app_with(vec![acct]);
+    app.profile_cursor = 0;
+    app.config_draft = Some(build_draft_existing(&app, "acct"));
+
+    run_config_row(&mut app, ConfigRow::ClearSessionToken);
+    run_config_row(&mut app, ConfigRow::ClearSessionToken);
+
+    assert!(
+        sidecar.exists(),
+        "a gated row must not clear the profile's only credential"
+    );
+    assert_eq!(
+        app.config_draft.as_ref().and_then(|d| d.armed_action),
+        None,
+        "a gated row must not even arm"
+    );
+    assert!(
+        app.toasts.is_empty(),
+        "a gated row stays silent, like the `disabled` row's own gate"
+    );
+}
+
+/// Arm-then-confirm, and the relink that makes the confirm safe. On the ACTIVE
+/// profile the live `~/.claude/.credentials.json` is a symlink INTO the store
+/// pointed at `session-token.json`, so removing that target without relinking
+/// leaves a dangling link and Claude Code reads no credentials at all — the
+/// `read_link` assertion is what pins the relink, not the toast.
+#[cfg(unix)]
+#[test]
+fn clear_session_token_arms_then_clears_and_relinks_the_active_account() {
+    use super::{ConfigRow, build_draft_existing, run_config_row};
+    use crate::profile::Profile;
+    let home = crate::testutil::HomeSandbox::new();
+
+    let mut acct = Profile::new("acct".to_string(), None, None);
+    acct.credentials = Some(split_creds("stored-oauth", Some("stored-refresh")));
+    crate::profile::save_profile(&acct).expect("save profile");
+    seed_session_token("acct", None);
+    let dir = crate::profile::profile_dir("acct").expect("profile dir");
+    let sidecar = dir.join("session-token.json");
+    // Where a switch on a split profile leaves the live slot: symlinked AT the
+    // sidecar, which is precisely what makes a bare delete dangle.
+    crate::claude::force_link_profile_credentials("acct").expect("link");
+    let live = home.home().join(".claude").join(".credentials.json");
+    assert_eq!(
+        std::fs::read_link(&live).expect("live is a symlink"),
+        sidecar,
+        "fixture: the live slot starts on the sidecar"
+    );
+
+    let mut app = app_with(vec![acct]);
+    app.config().state.active_profile = Some("acct".into());
+    app.profile_cursor = 0;
+    app.config_draft = Some(build_draft_existing(&app, "acct"));
+
+    run_config_row(&mut app, ConfigRow::ClearSessionToken);
+    assert!(sidecar.exists(), "the first press must only arm the row");
+    assert_eq!(
+        app.config_draft.as_ref().and_then(|d| d.armed_action),
+        Some(ConfigRow::ClearSessionToken),
+        "the first press arms this row"
+    );
+    assert!(app.toasts.is_empty(), "arming alone must not toast");
+
+    run_config_row(&mut app, ConfigRow::ClearSessionToken);
+    assert!(
+        !sidecar.exists(),
+        "the second press, while armed, clears the sidecar"
+    );
+    assert_eq!(
+        std::fs::read_link(&live).expect("live is still a symlink"),
+        dir.join("credentials.json"),
+        "the active account's live link must land on its stored OAuth login, not dangle"
+    );
+    assert!(
+        app.toasts.iter().any(|t| t.body.contains("cleared")),
+        "the confirmed clear toasts, got {:?}",
+        app.toasts
+    );
+    assert_eq!(
+        app.config_draft.as_ref().and_then(|d| d.armed_action),
+        None,
+        "the arm must clear after firing — this row disappears with the sidecar, \
+         but a stale arm would still leak onto whichever row takes its index"
+    );
+}
+
+/// The relink is scoped to the ACTIVE profile. Clearing an idle profile's
+/// sidecar must leave the live slot pointing where it already pointed —
+/// relinking unconditionally would repoint `~/.claude/.credentials.json` at a
+/// profile the user never switched to.
+#[cfg(unix)]
+#[test]
+fn clear_session_token_on_an_idle_account_leaves_the_live_link_alone() {
+    use super::{ConfigRow, build_draft_existing, run_config_row};
+    use crate::profile::Profile;
+    let home = crate::testutil::HomeSandbox::new();
+
+    let mut live_acct = Profile::new("live".to_string(), None, None);
+    live_acct.credentials = Some(split_creds("live-oauth", Some("live-refresh")));
+    crate::profile::save_profile(&live_acct).expect("save live");
+    let mut idle = Profile::new("idle".to_string(), None, None);
+    idle.credentials = Some(split_creds("idle-oauth", Some("idle-refresh")));
+    crate::profile::save_profile(&idle).expect("save idle");
+    seed_session_token("idle", None);
+    crate::claude::force_link_profile_credentials("live").expect("link live");
+
+    let mut app = app_with(vec![live_acct, idle]);
+    app.config().state.active_profile = Some("live".into());
+    app.profile_cursor = 1;
+    app.config_draft = Some(build_draft_existing(&app, "idle"));
+
+    run_config_row(&mut app, ConfigRow::ClearSessionToken);
+    run_config_row(&mut app, ConfigRow::ClearSessionToken);
+
+    assert!(
+        !crate::profile::profile_dir("idle")
+            .expect("profile dir")
+            .join("session-token.json")
+            .exists(),
+        "the idle account's sidecar still clears"
+    );
+    let live_link = home.home().join(".claude").join(".credentials.json");
+    assert_eq!(
+        std::fs::read_link(&live_link).expect("live is a symlink"),
+        crate::profile::profile_dir("live")
+            .expect("profile dir")
+            .join("credentials.json"),
+        "clearing an idle account must not repoint the live slot at it"
+    );
+}
+
+/// The `a` menu reaches the escape hatch too, and dispatches through
+/// `run_config_row` so it obeys the same arm-then-confirm rule as ⏎ on the row
+/// — a menu pick that cleared on one press would bypass the confirm entirely.
+#[test]
+fn action_menu_offers_clear_session_token_and_still_arms_first() {
+    use super::{
+        ActionMenuAction, ConfigFocus, ConfigRow, Tab, build_action_menu, build_draft_existing,
+        config_rows, dispatch_action_menu_action,
+    };
+    use crate::profile::Profile;
+    let _home = crate::testutil::HomeSandbox::new();
+
+    let mut acct = Profile::new("acct".to_string(), None, None);
+    acct.credentials = Some(split_creds("stored-oauth", Some("stored-refresh")));
+    crate::profile::save_profile(&acct).expect("save profile");
+    seed_session_token("acct", None);
+    let sidecar = crate::profile::profile_dir("acct")
+        .expect("profile dir")
+        .join("session-token.json");
+
+    let mut app = app_with(vec![acct]);
+    app.tab = Tab::Setup;
+    app.profile_cursor = 0;
+    app.config_focus = ConfigFocus::Actions;
+    app.config_draft = Some(build_draft_existing(&app, "acct"));
+    app.config_action_cursor = config_rows(&app)
+        .iter()
+        .position(|r| *r == ConfigRow::ClearSessionToken)
+        .expect("the sidecar row is present");
+
+    let menu = build_action_menu(&app);
+    assert_eq!(
+        menu.items.iter().map(|i| i.label).collect::<Vec<_>>(),
+        ["clear long-lived token"],
+        "the focused row's only action is its own"
+    );
+
+    dispatch_action_menu_action(&mut app, ActionMenuAction::ClearSessionToken);
+    assert!(sidecar.exists(), "the menu pick arms, it does not clear");
+    assert_eq!(
+        app.config_draft.as_ref().and_then(|d| d.armed_action),
+        Some(ConfigRow::ClearSessionToken)
+    );
+
+    dispatch_action_menu_action(&mut app, ActionMenuAction::ClearSessionToken);
+    assert!(!sidecar.exists(), "the second pick confirms");
+}
+
 /// The `a` action-menu entry for the `disabled` row flips with the account's
 /// state — "disable account" while enabled, "enable account" while disabled
 /// — mirroring the row's own label, and still dispatches through

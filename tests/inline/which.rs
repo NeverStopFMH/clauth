@@ -104,6 +104,38 @@ fn live_oauth(refresh: Option<&str>) -> ClaudeCredentials {
     }
 }
 
+/// The CLA-SPLIT lookup for a tree where no profile carries a sidecar — the
+/// shape every pre-split test resolves under.
+fn no_sidecars(_name: &str) -> Option<String> {
+    None
+}
+
+/// A stub CLA-SPLIT lookup over `(profile, installed access token)` pairs,
+/// standing in for `claude::installed_session_token`'s disk read. The real one
+/// already filters mis-filled sidecars out, so anything listed here is a token a
+/// switch would genuinely install.
+fn sidecars(pairs: &'static [(&'static str, &'static str)]) -> impl Fn(&str) -> Option<String> {
+    move |name| {
+        pairs
+            .iter()
+            .find(|(p, _)| *p == name)
+            .map(|(_, token)| (*token).to_string())
+    }
+}
+
+/// A login with no refresh token — what a `claude setup-token` mint installs.
+fn live_session_token(access: &str) -> ClaudeCredentials {
+    ClaudeCredentials {
+        claude_ai_oauth: Some(OAuthToken {
+            access_token: access.to_string(),
+            refresh_token: None,
+            expires_at: None,
+            scopes: None,
+            subscription_type: None,
+        }),
+    }
+}
+
 fn config_with(profiles: Vec<Profile>, active: Option<&str>) -> AppConfig {
     let names: Vec<ProfileName> = profiles.iter().map(|p| p.name.clone()).collect();
     AppConfig {
@@ -167,7 +199,7 @@ fn attributes_unmatched_login_to_credential_less_active() {
     );
     let live = live_oauth(Some("rt-fresh"));
     assert_eq!(
-        resolve_profile(&config, Some(&live), false, None),
+        resolve_profile(&config, Some(&live), false, None, &no_sidecars),
         Some(("new", Source::CredentialLessActive))
     );
 }
@@ -183,7 +215,7 @@ fn token_match_wins_over_credential_less_active() {
     );
     let live = live_oauth(Some("rt-personal"));
     assert_eq!(
-        resolve_profile(&config, Some(&live), false, None),
+        resolve_profile(&config, Some(&live), false, None, &no_sidecars),
         Some(("personal", Source::RefreshMatch))
     );
 }
@@ -192,14 +224,20 @@ fn token_match_wins_over_credential_less_active() {
 fn no_attribution_when_active_profile_has_creds() {
     let config = config_with(vec![oauth_profile("work", "rt-work")], Some("work"));
     let live = live_oauth(Some("rt-fresh"));
-    assert_eq!(resolve_profile(&config, Some(&live), false, None), None);
+    assert_eq!(
+        resolve_profile(&config, Some(&live), false, None, &no_sidecars),
+        None
+    );
 }
 
 #[test]
 fn no_attribution_when_no_active_profile() {
     let config = config_with(vec![blank_profile("new")], None);
     let live = live_oauth(Some("rt-fresh"));
-    assert_eq!(resolve_profile(&config, Some(&live), false, None), None);
+    assert_eq!(
+        resolve_profile(&config, Some(&live), false, None, &no_sidecars),
+        None
+    );
 }
 
 #[test]
@@ -209,7 +247,7 @@ fn attributes_credential_less_active_without_loaded_refresh_token() {
     let config = config_with(vec![blank_profile("new")], Some("new"));
     let live = live_oauth(None);
     assert_eq!(
-        resolve_profile(&config, Some(&live), false, None),
+        resolve_profile(&config, Some(&live), false, None, &no_sidecars),
         Some(("new", Source::CredentialLessActive))
     );
 }
@@ -220,7 +258,7 @@ fn attributes_api_key_active_when_credentials_file_absent() {
     // the loaded creds are `None`. the active profile still owns the session.
     let config = config_with(vec![endpoint_profile("api")], Some("api"));
     assert_eq!(
-        resolve_profile(&config, None, false, None),
+        resolve_profile(&config, None, false, None, &no_sidecars),
         Some(("api", Source::CredentialLessActive))
     );
 }
@@ -234,7 +272,10 @@ fn no_credential_less_attribution_inside_session() {
         Some("active"),
     );
     let live = live_oauth(Some("rt-from-runtime"));
-    assert_eq!(resolve_profile(&config, Some(&live), true, None), None);
+    assert_eq!(
+        resolve_profile(&config, Some(&live), true, None, &no_sidecars),
+        None
+    );
 }
 
 #[test]
@@ -246,7 +287,7 @@ fn token_match_still_works_inside_session() {
     );
     let live = live_oauth(Some("rt-work"));
     assert_eq!(
-        resolve_profile(&config, Some(&live), true, None),
+        resolve_profile(&config, Some(&live), true, None, &no_sidecars),
         Some(("work", Source::RefreshMatch))
     );
 }
@@ -260,7 +301,7 @@ fn resolves_started_profile_in_runtime_session() {
     );
     let live = live_oauth(Some("rt-fresh"));
     assert_eq!(
-        resolve_profile(&config, Some(&live), true, Some("new")),
+        resolve_profile(&config, Some(&live), true, Some("new"), &no_sidecars),
         Some(("new", Source::SessionDir))
     );
 }
@@ -270,7 +311,7 @@ fn started_profile_resolves_with_no_loaded_creds() {
     // no creds yet (pre-first-login) — started profile still owns the session
     let config = config_with(vec![blank_profile("new")], Some("work"));
     assert_eq!(
-        resolve_profile(&config, None, true, Some("new")),
+        resolve_profile(&config, None, true, Some("new"), &no_sidecars),
         Some(("new", Source::SessionDir))
     );
 }
@@ -287,7 +328,7 @@ fn token_match_wins_over_started_profile() {
     );
     let live = live_oauth(Some("rt-personal"));
     assert_eq!(
-        resolve_profile(&config, Some(&live), true, Some("new")),
+        resolve_profile(&config, Some(&live), true, Some("new"), &no_sidecars),
         Some(("personal", Source::RefreshMatch))
     );
 }
@@ -298,7 +339,7 @@ fn unknown_started_profile_is_not_resolved() {
     let config = config_with(vec![oauth_profile("work", "rt-work")], Some("work"));
     let live = live_oauth(Some("rt-fresh"));
     assert_eq!(
-        resolve_profile(&config, Some(&live), true, Some("ghost")),
+        resolve_profile(&config, Some(&live), true, Some("ghost"), &no_sidecars),
         None
     );
 }
@@ -313,7 +354,10 @@ fn disabled_profile_is_never_resolved_even_on_a_stale_token_match() {
     disabled.disabled = true;
     let config = config_with(vec![disabled], None);
     let live = live_oauth(Some("rt-acme"));
-    assert_eq!(resolve_profile(&config, Some(&live), false, None), None);
+    assert_eq!(
+        resolve_profile(&config, Some(&live), false, None, &no_sidecars),
+        None
+    );
 }
 
 #[test]
@@ -325,7 +369,156 @@ fn disabled_profile_is_never_resolved_as_credential_less_active() {
     disabled.disabled = true;
     let config = config_with(vec![disabled], Some("acme"));
     let live = live_oauth(None);
-    assert_eq!(resolve_profile(&config, Some(&live), false, None), None);
+    assert_eq!(
+        resolve_profile(&config, Some(&live), false, None, &no_sidecars),
+        None
+    );
+}
+
+#[test]
+fn session_token_install_is_attributed_to_its_profile() {
+    // The regression: a switch installs `session-token.json` for a CLA-SPLIT
+    // profile, and that mint carries no refresh token, so tier 1 cannot see it.
+    // Before the sidecar tier the whole resolution fell through to `unknown`
+    // and every statusline reading `clauth which` lost its account.
+    let config = config_with(vec![oauth_profile("work", "rt-work")], Some("work"));
+    let live = live_session_token("oat-work");
+    assert_eq!(
+        resolve_profile(
+            &config,
+            Some(&live),
+            false,
+            None,
+            &sidecars(&[("work", "oat-work")])
+        ),
+        Some(("work", Source::SessionTokenMatch))
+    );
+}
+
+#[test]
+fn a_rotating_login_is_never_attributed_to_a_sidecar() {
+    // The tier is gated on the loaded file carrying NO refresh token. A rotating
+    // login whose refresh token matches nothing must stay unresolved even when a
+    // sidecar happens to hold the same access token, or a stale live slot mid-
+    // rotation would name a profile it is not running as.
+    let config = config_with(vec![oauth_profile("work", "rt-work")], Some("work"));
+    let live = ClaudeCredentials {
+        claude_ai_oauth: Some(OAuthToken {
+            access_token: "oat-work".to_string(),
+            refresh_token: Some("rt-elsewhere".to_string()),
+            expires_at: None,
+            scopes: None,
+            subscription_type: None,
+        }),
+    };
+    assert_eq!(
+        resolve_profile(
+            &config,
+            Some(&live),
+            false,
+            None,
+            &sidecars(&[("work", "oat-work")])
+        ),
+        None
+    );
+}
+
+#[test]
+fn session_token_match_wins_over_credential_less_active() {
+    // Same precedence the refresh tier already has: an exact credential match is
+    // more precise than "the active profile stores nothing".
+    let config = config_with(
+        vec![oauth_profile("work", "rt-work"), blank_profile("new")],
+        Some("new"),
+    );
+    let live = live_session_token("oat-work");
+    assert_eq!(
+        resolve_profile(
+            &config,
+            Some(&live),
+            false,
+            None,
+            &sidecars(&[("work", "oat-work")])
+        ),
+        Some(("work", Source::SessionTokenMatch))
+    );
+}
+
+#[test]
+fn session_token_ties_break_on_the_active_profile() {
+    // One mint captured into two profiles (a duplicated account). The active one
+    // is the honest answer for the live slot.
+    let config = config_with(
+        vec![oauth_profile("work", "rt-work"), blank_profile("copy")],
+        Some("copy"),
+    );
+    let live = live_session_token("oat-shared");
+    assert_eq!(
+        resolve_profile(
+            &config,
+            Some(&live),
+            false,
+            None,
+            &sidecars(&[("work", "oat-shared"), ("copy", "oat-shared")])
+        ),
+        Some(("copy", Source::SessionTokenMatch))
+    );
+}
+
+#[test]
+fn session_token_match_still_works_inside_a_session() {
+    // An exact credential match is valid wherever it is asked from, so a session
+    // on a custom `CLAUDE_CONFIG_DIR` resolves the same as a bare one.
+    let config = config_with(vec![oauth_profile("work", "rt-work")], Some("work"));
+    let live = live_session_token("oat-work");
+    assert_eq!(
+        resolve_profile(
+            &config,
+            Some(&live),
+            true,
+            None,
+            &sidecars(&[("work", "oat-work")])
+        ),
+        Some(("work", Source::SessionTokenMatch))
+    );
+}
+
+#[test]
+fn disabled_profile_is_never_resolved_on_a_session_token_match() {
+    // Disabling leaves the sidecar on disk, so the new tier needs the same gate
+    // every other tier passes through.
+    let mut disabled = oauth_profile("acme", "rt-acme");
+    disabled.disabled = true;
+    let config = config_with(vec![disabled], None);
+    let live = live_session_token("oat-acme");
+    assert_eq!(
+        resolve_profile(
+            &config,
+            Some(&live),
+            false,
+            None,
+            &sidecars(&[("acme", "oat-acme")])
+        ),
+        None
+    );
+}
+
+#[test]
+fn a_blank_access_token_never_matches_a_sidecar() {
+    // Claude Code's logged-out shell blanks the tokens in place. A stub sidecar
+    // that also read back blank would otherwise attribute the shell to it.
+    let config = config_with(vec![oauth_profile("work", "rt-work")], Some("work"));
+    let live = live_session_token("");
+    assert_eq!(
+        resolve_profile(
+            &config,
+            Some(&live),
+            false,
+            None,
+            &sidecars(&[("work", "")])
+        ),
+        None
+    );
 }
 
 /// An OAuth profile whose login token claims `sub`, the tier this field reported
@@ -567,6 +760,7 @@ fn json_tier_is_null_for_a_recognised_third_party_holding_oauth_creds() {
 #[test]
 fn source_maps_to_wire_strings() {
     assert_eq!(Source::RefreshMatch.as_str(), "refresh_match");
+    assert_eq!(Source::SessionTokenMatch.as_str(), "session_token_match");
     assert_eq!(Source::SessionDir.as_str(), "session_dir");
     assert_eq!(
         Source::CredentialLessActive.as_str(),

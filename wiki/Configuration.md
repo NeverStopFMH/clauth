@@ -48,7 +48,18 @@ subagent = "claude-sonnet-4-5-20250929"   # CLAUDE_CODE_SUBAGENT_MODEL
 
 ## Presets
 
-A preset is a named `base_url` + `[models]` pair you can stamp onto any account from the Setup tab's <kbd>a</kbd> menu. Two ship built in, `DeepSeek` and `Z.ai`, each setting the endpoint and a base model; the tier rows stay yours to pin afterwards.
+A preset is a named `base_url` + `[models]` pair you can stamp onto any account from the Setup tab's <kbd>a</kbd> menu. Six ship built in:
+
+| Preset | Endpoint |
+|---|---|
+| `DeepSeek` | `https://api.deepseek.com/anthropic` |
+| `Z.ai` | `https://api.z.ai/api/anthropic` |
+| `Qwen-TokenPlan-Intl` | `https://token-plan.ap-southeast-1.maas.aliyuncs.com/apps/anthropic` |
+| `Qwen-TokenPlan-CN` | `https://token-plan.cn-beijing.maas.aliyuncs.com/apps/anthropic` |
+| `Qwen-CodingPlan-Intl` | `https://coding-intl.dashscope.aliyuncs.com/apps/anthropic` |
+| `Qwen-CodingPlan-CN` | `https://coding.dashscope.aliyuncs.com/apps/anthropic` |
+
+`DeepSeek` and `Z.ai` set the endpoint plus a base model, leaving the tier rows yours to pin afterwards. The four Alibaba ones fill every row instead, because those endpoints reject a Claude model id outright rather than serving something for it, so any alias left unpinned fails on use. All six leave the api key alone; pick the region your plan was bought in, since a key issued for one is not accepted by the other.
 
 `save as preset` stores the focused account's own endpoint and models under a name you type, in `~/.clauth/presets/<name>.json`:
 

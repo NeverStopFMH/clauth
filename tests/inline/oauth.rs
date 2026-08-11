@@ -1347,6 +1347,61 @@ fn gate_under_guard_installs_a_sibling_refreshed_pair_as_is() {
     ));
 }
 
+/// A sidecar repair that failed on the bounded state-flock wait is CONTENTION
+/// — another clauth process is busy under ~/.clauth, on macOS possibly across
+/// a 20-second Keychain shell-out — and must never render as
+/// `SidecarWriteFailed`'s "check permissions", which sends the operator
+/// hunting a fault that does not exist. Any other error keeps the fault copy.
+#[test]
+fn a_state_lock_timeout_reads_as_contention_not_permissions() {
+    let busy = anyhow::Error::new(crate::lock::StateLockTimeout::stub())
+        .context("quarantine session-token.json");
+    let t = sidecar_repair_transient("busy", &busy);
+    assert!(
+        t.text().contains("another clauth process holds"),
+        "contention names the holder, got: {}",
+        t.text()
+    );
+    assert!(
+        !t.text().contains("check permissions"),
+        "contention must not prescribe a permissions hunt, got: {}",
+        t.text()
+    );
+
+    let fault = anyhow::anyhow!("read-only file system").context("write session-token.json");
+    let t = sidecar_repair_transient("busy", &fault);
+    assert!(
+        t.text().contains("check permissions on ~/.clauth"),
+        "a genuine filesystem fault keeps the fault copy, got: {}",
+        t.text()
+    );
+}
+
+/// The install-gate grace IS Claude Code's refresh threshold, shared with the
+/// backup-restore verdicts: identical bytes must never read as dead in the
+/// backup slot ([`crate::claude::BACKUP_EXPIRY_GRACE_MS`]) and installable in
+/// the live one. A mint with three minutes of life sits inside CC's own
+/// five-minute refresh window — a refresh-less credential the client is
+/// already trying to refresh — so every gate this constant feeds must treat
+/// it as expiring.
+#[test]
+fn the_install_grace_is_ccs_refresh_window_shared_with_the_backup_verdicts() {
+    assert_eq!(
+        AUTH_GATE_GRACE_MS,
+        crate::claude::BACKUP_EXPIRY_GRACE_MS,
+        "one number, one home — the two slots must agree on what dead means"
+    );
+    let now = crate::usage::now_ms() as i64;
+    assert!(
+        expiring(Some(now + 3 * 60 * 1000), false),
+        "three minutes of life is inside CC's five-minute refresh window"
+    );
+    assert!(
+        !expiring(Some(now + 10 * 60 * 1000), false),
+        "ten minutes clears the window"
+    );
+}
+
 /// Still expiring under the guard → the refresher is fed the CURRENTLY stored
 /// refresh token, never a caller-supplied snapshot.
 #[test]

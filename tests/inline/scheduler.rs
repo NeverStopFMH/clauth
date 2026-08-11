@@ -6605,7 +6605,13 @@ fn claude_rolling_tick_survives_a_backwards_clock_step() {
     pacing.lock().unwrap().next_scan_ms = now + 40 * super::ROLLING_SCAN_GAP_MS;
     pacing.lock().unwrap().retry_after_ms.insert(
         "cl-ntp".to_string(),
-        now + 10 * super::ROLLING_BROKEN_RETRY_MS,
+        super::RetryHold {
+            not_before: now + 10 * super::ROLLING_BROKEN_RETRY_MS,
+            // The real fingerprint: the fixture's files do not change during
+            // the test, so the CLOCK clamp must be what releases this hold —
+            // a watch that released it early would fail the tick-2 assert.
+            watched: Some(crate::claude::credential_fingerprint("cl-ntp")),
+        },
     );
 
     let calls = std::sync::atomic::AtomicUsize::new(0);
@@ -6737,6 +6743,118 @@ fn claude_rolling_tick_relogin_transients_take_the_long_leash() {
     );
 }
 
+/// The long leash's exit is the OPERATOR'S FIX, not the clock: a re-login
+/// writes `credentials.json` and stamps nothing scheduler-side, so a hold that
+/// only time releases would sit on the prescribed recovery for up to six
+/// hours. The hold watches the profile's credential files; a change releases
+/// it on the next scan — and unchanged files demonstrably do NOT release it,
+/// or the leash would be no leash at all.
+#[test]
+fn claude_rolling_tick_relogin_hold_releases_on_a_credential_write() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let config = rolling_profile_config(&["cl-fix"], &[]);
+    write_rolling_sidecar("cl-fix", 60 * 60 * 1000);
+    let pacing = crate::lockorder::RankedMutex::new(super::ClaudeRollingPacing::default());
+    let now = crate::usage::now_ms();
+
+    let calls = std::sync::atomic::AtomicUsize::new(0);
+    let unrecorded = |_: &str| {
+        calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        crate::oauth::AuthGate::Transient(crate::format::Transient::new(
+            crate::format::Cause::RollingGrantUnrecorded("cl-fix".to_string()),
+            crate::format::Retry::Stated,
+        ))
+    };
+    super::claude_rolling_tick(&config, &pacing, now, &unrecorded);
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+    // Inside the leash with NOTHING changed on disk: still held.
+    pacing.lock().unwrap().next_scan_ms = 0;
+    super::claude_rolling_tick(
+        &config,
+        &pacing,
+        now + super::ROLLING_RETRY_MS + 1,
+        &unrecorded,
+    );
+    assert_eq!(
+        calls.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "unchanged credentials do not release the hold"
+    );
+
+    // The operator does exactly what the cause prescribed: a re-login, which
+    // lands as a `credentials.json` write and nothing else.
+    let dir = crate::profile::profile_dir("cl-fix").expect("dir");
+    std::fs::write(
+        dir.join("credentials.json"),
+        serde_json::to_vec(&crate::profile::ClaudeCredentials {
+            claude_ai_oauth: Some(crate::profile::OAuthToken {
+                access_token: "at-fresh-login".to_string(),
+                refresh_token: Some("rt-fresh-login".to_string()),
+                expires_at: Some(crate::usage::now_ms() as i64 + 8 * 3_600_000),
+                scopes: None,
+                subscription_type: None,
+            }),
+        })
+        .expect("ser"),
+    )
+    .expect("write fresh login");
+
+    pacing.lock().unwrap().next_scan_ms = 0;
+    super::claude_rolling_tick(
+        &config,
+        &pacing,
+        now + super::ROLLING_RETRY_MS + 2,
+        &unrecorded,
+    );
+    assert_eq!(
+        calls.load(std::sync::atomic::Ordering::SeqCst),
+        2,
+        "the credential write releases the hold on the next scan, hours early"
+    );
+}
+
+/// The due predicate reads a MIS-FILL as due now: the content is the defect
+/// (its clock is irrelevant), switches refuse to install it, and this leg is
+/// the only one a running daemon has that can repair it. Without this, a
+/// mis-filled sidecar beside a healthy preserved mint sat unrepaired forever
+/// on any profile nobody switched to.
+#[test]
+fn claude_rolling_tick_reaches_the_gate_for_a_misfilled_sidecar() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let config = rolling_profile_config(&["cl-mf"], &[]);
+    let dir = crate::profile::profile_dir("cl-mf").expect("dir");
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    // A rotating pair in the sidecar, expiry comfortably OUTSIDE the re-stamp
+    // horizon: only the content classification can make this due.
+    std::fs::write(
+        dir.join("session-token.json"),
+        serde_json::to_vec(&crate::profile::ClaudeCredentials {
+            claude_ai_oauth: Some(crate::profile::OAuthToken {
+                access_token: "at-misfill".to_string(),
+                refresh_token: Some("rt-misfill".to_string()),
+                expires_at: Some(crate::usage::now_ms() as i64 + 8 * 3_600_000),
+                scopes: None,
+                subscription_type: None,
+            }),
+        })
+        .expect("ser"),
+    )
+    .expect("write misfill");
+
+    let calls = std::sync::atomic::AtomicUsize::new(0);
+    let pacing = crate::lockorder::RankedMutex::new(super::ClaudeRollingPacing::default());
+    super::claude_rolling_tick(&config, &pacing, crate::usage::now_ms(), &|_| {
+        calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        crate::oauth::AuthGate::Ready
+    });
+    assert_eq!(
+        calls.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "a mis-filled sidecar reaches the gate — the repair leg actually fires"
+    );
+}
+
 /// Names that leave the candidate set — profile deleted, disabled, or the
 /// flag turned off — take their retry stamps with them. Without the sweep the
 /// map grows monotonically over the daemon's lifetime, and a re-created
@@ -6750,7 +6868,10 @@ fn claude_rolling_tick_drops_retry_state_for_departed_profiles() {
     let now = crate::usage::now_ms();
     pacing.lock().unwrap().retry_after_ms.insert(
         "cl-deleted".to_string(),
-        now + super::ROLLING_BROKEN_RETRY_MS,
+        super::RetryHold {
+            not_before: now + super::ROLLING_BROKEN_RETRY_MS,
+            watched: None,
+        },
     );
     super::claude_rolling_tick(&config, &pacing, now, &|_| crate::oauth::AuthGate::Ready);
     let p = pacing.lock().unwrap();

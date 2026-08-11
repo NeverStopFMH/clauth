@@ -1145,6 +1145,45 @@ fn installed_session_token_tracks_what_a_switch_installs() {
     );
 }
 
+/// The scheduler's re-login leash watches this fingerprint, and every recovery
+/// it prescribes lands as a write to ONE of the three files — so each file
+/// must move the fingerprint independently, or the recovery that touches the
+/// untracked one waits out the full six-hour leash the watch exists to cut
+/// short.
+#[test]
+fn the_credential_fingerprint_tracks_each_of_the_three_files() {
+    let _home = HomeSandbox::new();
+    let dir = crate::profile::profile_dir("fp").expect("dir");
+    fs::create_dir_all(&dir).expect("mkdir");
+    let f0 = credential_fingerprint("fp");
+    assert_eq!(
+        f0,
+        [None, None, None],
+        "an empty profile has no fingerprint"
+    );
+
+    fs::write(dir.join("credentials.json"), b"{\"a\":1}").expect("write");
+    let f1 = credential_fingerprint("fp");
+    assert_ne!(
+        f1, f0,
+        "a re-login (credentials.json) moves the fingerprint"
+    );
+
+    fs::write(dir.join("session-token.json"), b"{\"b\":22}").expect("write");
+    let f2 = credential_fingerprint("fp");
+    assert_ne!(
+        f2, f1,
+        "a re-mint (session-token.json) moves the fingerprint"
+    );
+
+    fs::write(dir.join("session-token.static.json"), b"{\"c\":333}").expect("write");
+    let f3 = credential_fingerprint("fp");
+    assert_ne!(
+        f3, f2,
+        "a hand-restored backup (session-token.static.json) moves the fingerprint"
+    );
+}
+
 /// Clearing the sidecar is the only exit from the split. It flips the install
 /// source back to the OAuth pair, and it is idempotent: the second call reports
 /// "nothing to clear" rather than failing, so a repeated `--clear` is harmless.

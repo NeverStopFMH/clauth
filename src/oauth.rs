@@ -785,6 +785,28 @@ fn sidecar_write_failed(name: &str) -> crate::format::Transient {
     )
 }
 
+/// CLA-ROLL: map a failed sidecar repair to its Transient — contention and
+/// fault are different verdicts. The repair bodies run under
+/// `with_state_lock`, which fails on a bounded cross-process flock timeout
+/// ([`crate::lock::StateLockTimeout`]), and on macOS that flock is held
+/// across the `/usr/bin/security` shell-out for up to 20 seconds — so a slow
+/// Keychain in a SIBLING process surfaces here as a timeout, and rendering it
+/// through [`sidecar_write_failed`]'s "check permissions" copy sends the
+/// operator hunting a fault that does not exist. Same contention-vs-fault
+/// split as `RotationLockUnavailable` (round 1) and `RotationLockHeld`
+/// (round 3), one lock further down.
+fn sidecar_repair_transient(name: &str, e: &anyhow::Error) -> crate::format::Transient {
+    if e.chain()
+        .any(|c| c.downcast_ref::<crate::lock::StateLockTimeout>().is_some())
+    {
+        return crate::format::Transient::new(
+            crate::format::Cause::StateLockBusy(name.to_string()),
+            crate::format::Retry::Wait,
+        );
+    }
+    sidecar_write_failed(name)
+}
+
 /// CLA-ROLL: a live `clauth start` session is holding the ROTATING pair,
 /// because it started before the sidecar was armed. See
 /// [`crate::format::Cause::LiveSessionOnRotatingChain`].
@@ -1603,8 +1625,14 @@ fn active_link_diverged(config: &AppConfig) -> bool {
 
 /// Grace window (ms): a token with less than this much life left is treated as
 /// expiring, so the AUTH-1 gate refreshes it *before* install rather than
-/// letting the freshly-switched session hit a 401.
-const AUTH_GATE_GRACE_MS: i64 = 60_000;
+/// letting the freshly-switched session hit a 401. The bound is Claude Code's
+/// own refresh threshold — CC starts refreshing a credential inside five
+/// minutes of expiry, so anything installed with less life lands in a client
+/// already trying to refresh it — and it is the SAME number the
+/// backup-restore verdicts read ([`crate::claude::BACKUP_EXPIRY_GRACE_MS`],
+/// the one home), so identical bytes can never read as dead in the backup
+/// slot and installable in the live one.
+const AUTH_GATE_GRACE_MS: i64 = crate::claude::BACKUP_EXPIRY_GRACE_MS;
 
 /// Outcome of the pre-install auth gate ([`ensure_installable`]).
 pub(crate) enum AuthGate {
@@ -1720,12 +1748,13 @@ fn vanilla_install_gate(
     // clauth can't write (`runtime::rotation_blocked_by_live_session`).
     //
     // This RELOCATES the spend, it does not avoid it. Reaching this line means
-    // the token is inside the 60s grace or `auth_broken`, so installing as-is
-    // starts a Claude Code that is already past its own 5-minute threshold: it
-    // refreshes on its first request and spends the very chain the other session
-    // holds. What the refusal buys is that the spend happens in a process that
-    // CAN write the item its reader consults, so the loser is a token rather
-    // than a signed-out session. Keep it for that, not for a spend that isn't
+    // the token is inside the grace — which IS Claude Code's own 5-minute
+    // refresh threshold — or `auth_broken`, so installing as-is starts a
+    // Claude Code already inside its refresh window: it refreshes on its first
+    // request and spends the very chain the other session holds. What the
+    // refusal buys is that the spend happens in a process that CAN write the
+    // item its reader consults, so the loser is a token rather than a
+    // signed-out session. Keep it for that, not for a spend that isn't
     // happening.
     if crate::runtime::rotation_blocked_for(name) {
         return AuthGate::Ready;
@@ -1820,7 +1849,7 @@ fn rolling_install_gate(
             }
             Err(e) => {
                 logline!("clauth: '{name}' mis-filled sidecar could not be quarantined ({e:#})");
-                return AuthGate::Transient(sidecar_write_failed(name));
+                return AuthGate::Transient(sidecar_repair_transient(name, &e));
             }
         }
     }
@@ -1878,7 +1907,7 @@ fn rolling_install_gate(
                 AuthGate::Ready
             } else {
                 logline!("clauth: '{name}' rolling-token write failed ({e:#})");
-                AuthGate::Transient(sidecar_write_failed(name))
+                AuthGate::Transient(sidecar_repair_transient(name, &e))
             };
         }
         // Permanent until a re-login: never fall through to the refresh leg,
@@ -2012,16 +2041,24 @@ pub(crate) fn arm_rolling_token(
 pub(crate) const ROLLING_RESTAMP_HORIZON_MS: i64 = 2 * 60 * 60 * 1000;
 
 /// CLA-ROLL due predicate for the scheduler's re-stamp leg: an armed,
-/// exp-carrying sidecar inside [`ROLLING_RESTAMP_HORIZON_MS`] of death. Absent
-/// sidecars (arming is switch/rotation work), exp-less claims, and
-/// NotLongLived mis-fills (switch-time healing owns those) are all not-due —
-/// the timer's single job is clock freshness of what the roll installed.
+/// exp-carrying sidecar inside [`ROLLING_RESTAMP_HORIZON_MS`] of death — or a
+/// mis-fill, which is due NOW: its clock is irrelevant because the CONTENT is
+/// the defect, switches refuse to install it, and the gate behind this
+/// predicate is the only leg a running daemon has that can repair it (heal
+/// from the preserved mint, or report the no-backup state on its own cause —
+/// on which the scheduler's credential-file watch then makes the operator's
+/// re-mint the release). Without this arm a mis-filled sidecar beside a
+/// healthy backup sat unrepaired forever on any profile nobody switched to.
+/// Absent sidecars (arming is switch/rotation work) and exp-less claims stay
+/// not-due.
 pub(crate) fn rolling_sidecar_restamp_due(name: &str, now: i64) -> bool {
-    matches!(
-        crate::claude::session_token_status(name),
-        Some(crate::claude::SessionTokenStatus::LongLived(Some(exp)))
-            if exp <= now + ROLLING_RESTAMP_HORIZON_MS
-    )
+    match crate::claude::session_token_status(name) {
+        Some(crate::claude::SessionTokenStatus::LongLived(Some(exp))) => {
+            exp <= now + ROLLING_RESTAMP_HORIZON_MS
+        }
+        Some(crate::claude::SessionTokenStatus::NotLongLived) => true,
+        _ => false,
+    }
 }
 
 /// CLA-ROLL: the scheduler-leg re-stamp for one rolling-token profile — the
@@ -2225,7 +2262,7 @@ fn expiring(expires_at: Option<i64>, flagged: bool) -> bool {
 /// [`expiring`] with a caller-chosen margin. The switch gates keep the tight
 /// [`AUTH_GATE_GRACE_MS`]; the CLA-ROLL re-stamp leg passes
 /// [`ROLLING_RESTAMP_HORIZON_MS`] so a rolling bearer is renewed HOURS before its
-/// clock death, not seconds — the margin that keeps a running session alive
+/// clock death, not minutes — the margin that keeps a running session alive
 /// across daemon idle gaps and machine sleep.
 fn horizon_expiring(expires_at: Option<i64>, flagged: bool, horizon_ms: i64) -> bool {
     flagged || expires_at.is_some_and(|exp| (now_ms() as i64) + horizon_ms >= exp)

@@ -831,6 +831,24 @@ fn rolling_token_row_counts_to_the_restamp_and_escalates() {
         text(&due)
     );
 
+    // 2.5h of life = 30 minutes until the re-stamp: STRICTLY inside the
+    // sub-hour band, not on its zero boundary. The boundary cases alone let
+    // the band predicate collapse to `== 0` unnoticed — measured — and this
+    // fixture is what a collapsed predicate renders as a stopped-looking
+    // "~0h" countdown.
+    let inside = session_token_lines(
+        &S::LongLived(Some(now + 2 * hour + hour / 2)),
+        true,
+        "acct",
+        now,
+        w,
+    );
+    assert!(
+        text(&inside).contains("rolling · re-stamp due"),
+        "{}",
+        text(&inside)
+    );
+
     // Expired: the stalled DANGER state, with the fix line naming the live
     // profile and the re-arm verb.
     let stalled = session_token_lines(&S::LongLived(Some(now - hour)), true, "acct", now, w);
@@ -852,5 +870,42 @@ fn rolling_token_row_counts_to_the_restamp_and_escalates() {
         text(&unstamped).contains("rolling · no recorded expiry"),
         "{}",
         text(&unstamped)
+    );
+}
+
+/// The stalled-rolling fix line interpolates `snap.title`, never `snap.name`:
+/// `build_snap(app, draft.is_none())` blanks `name` whenever a draft is open,
+/// so a name-fed line renders `clauth rolling-token  re-arms` — a fix command
+/// with a hole where the profile belongs — exactly while the operator is
+/// editing the profile it names. Driven through `draw_settings_rows` with the
+/// draft-open Snap shape (`title` carries the profile, `name` blank), which is
+/// the shape the direct `session_token_lines` tests above never exercise.
+#[test]
+fn stalled_rolling_fix_line_uses_the_title_that_survives_a_draft() {
+    let _home = crate::testutil::HomeSandbox::new();
+    use crate::profile::{AppConfig, AppState};
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    let mut snap = Snap::blank("acct");
+    snap.rolling_token = true;
+    snap.session_token = Some(crate::claude::SessionTokenStatus::LongLived(Some(
+        crate::usage::now_ms() as i64 - 3_600_000,
+    )));
+    let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+    let app = App::new(AppConfig {
+        state: AppState::default(),
+        profiles: Vec::new(),
+    });
+    term.draw(|f| draw_settings_rows(f, f.area(), &app, &[], 0, &snap, false))
+        .unwrap();
+    let joined = crate::testutil::buffer_rows(term.backend().buffer())
+        .join(" ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert!(
+        joined.contains("clauth rolling-token acct re-arms"),
+        "the fix line reads the title, which a draft never blanks: {joined}"
     );
 }

@@ -182,6 +182,11 @@ fn every_transient_cause_renders_its_own_copy() {
             "'work' session token holds a rotating pair and no live mint backup exists to \
              heal it · re-capture with `clauth login work --setup-token`",
         ),
+        (
+            Cause::StateLockBusy("work".to_string()),
+            "another clauth process holds ~/.clauth's state lock · 'work' session token left \
+             untouched",
+        ),
     ] {
         assert_eq!(Transient::new(cause, Retry::Stated).text(), want);
     }
@@ -203,6 +208,7 @@ fn only_the_relogin_causes_read_as_permanent() {
         (Cause::LiveSessionOnRotatingChain("work".to_string()), false),
         (Cause::InternalLock, false),
         (Cause::PersistFailed("work".to_string()), false),
+        (Cause::StateLockBusy("work".to_string()), false),
     ] {
         let t = Transient::new(cause, Retry::Stated);
         assert_eq!(t.permanent_until_relogin(), want, "{}", t.text());

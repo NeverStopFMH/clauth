@@ -147,6 +147,17 @@ pub(crate) enum Cause {
     /// retryable in-process: only a fresh `clauth login <p> --setup-token`
     /// re-captures the mint.
     SidecarMisfilled(String),
+    /// CLA-ROLL: a sidecar repair could not take the cross-process state flock
+    /// inside its bounded wait — another clauth process is busy under
+    /// `~/.clauth` (on macOS that flock is even held across a
+    /// `/usr/bin/security` shell-out for up to 20 seconds). Genuine
+    /// contention, not a fault: the holder finishes and a retry goes through.
+    /// Distinct from [`Self::SidecarWriteFailed`] on purpose — that copy
+    /// prescribes a permissions check, which a busy sibling would send the
+    /// operator on for nothing. Same contention-vs-fault split as
+    /// [`Self::RotationLockUnavailable`] (fault) vs
+    /// [`Self::RotationLockHeld`] (contention).
+    StateLockBusy(String),
 }
 
 impl Cause {
@@ -188,6 +199,12 @@ impl Cause {
                 format!(
                     "'{profile}' session token holds a rotating pair and no live mint backup \
                      exists to heal it · re-capture with `clauth login {profile} --setup-token`"
+                )
+            }
+            Self::StateLockBusy(profile) => {
+                format!(
+                    "another clauth process holds ~/.clauth's state lock · '{profile}' session \
+                     token left untouched"
                 )
             }
             Self::PersistFailed(profile) => {
@@ -245,10 +262,12 @@ impl Transient {
     /// a mis-filled sidecar with nothing live to heal it
     /// ([`Cause::SidecarMisfilled`]). The scheduler paces these on the same
     /// long leash as a `Broken` verdict — a minutes-scale retry against a
-    /// condition no retry can clear is pure log noise. The leash never delays
-    /// the recovery it prescribes: the re-login that clears these re-arms the
-    /// rolling token and stamps the sidecar itself, CLI-side, without waiting
-    /// for any scan (the same property the `Broken` leash already leans on).
+    /// condition no retry can clear is pure log noise. The re-login itself
+    /// stamps NOTHING scheduler-side (a browser login writes only
+    /// `credentials.json`, and a `--setup-token` re-mint writes a mint, which
+    /// disarms rather than re-arms), which is why these holds carry a
+    /// credential-file watch in the scheduler: the fix releases the leash on
+    /// the next scan instead of waiting out the clock.
     pub(crate) fn permanent_until_relogin(&self) -> bool {
         matches!(
             self.cause,

@@ -1665,6 +1665,70 @@ mod static_token_verdicts {
     }
 }
 
+/// The arm-report copy surfaces the round-6 review measured as silently
+/// deletable or interchangeable, pinned as CONTENT (the print sites can no
+/// longer lose them silently either — each fn has exactly one caller, so a
+/// deleted print is a dead-code error under `-D warnings`).
+mod armed_report_copy {
+    use super::*;
+
+    /// The disclosure is the feature's entire security posture in user-facing
+    /// copy — there is no confirm prompt by design — so the widening, its
+    /// consequence, and the way back must each survive verbatim.
+    #[test]
+    fn the_scope_widening_disclosure_names_the_widening_and_the_way_back() {
+        let line = scope_widening_disclosure("acme");
+        assert!(
+            line.contains("wider than the setup-token mint it supersedes"),
+            "{line}"
+        );
+        assert!(
+            line.contains("Anything that can read this profile's session credential"),
+            "{line}"
+        );
+        assert!(
+            line.contains("`clauth static-token acme` puts the mint back"),
+            "{line}"
+        );
+    }
+
+    /// Each health state makes its OWN claim: `Fresh` promising while no
+    /// daemon runs reads the arm as durable when nothing will re-stamp it.
+    #[test]
+    fn each_daemon_health_state_makes_its_own_restamp_claim() {
+        let absent = restamp_promise(crate::daemon::DaemonHealth::Absent);
+        let stale = restamp_promise(crate::daemon::DaemonHealth::Stale);
+        let fresh = restamp_promise(crate::daemon::DaemonHealth::Fresh);
+        assert!(
+            absent.contains("No daemon appears to be running"),
+            "{absent}"
+        );
+        assert!(absent.contains("`clauth daemon` starts"), "{absent}");
+        assert!(stale.contains("looks stale"), "{stale}");
+        assert!(stale.contains("`clauth daemon --status`"), "{stale}");
+        assert!(fresh.contains("re-stamps it before it expires"), "{fresh}");
+        assert!(
+            !fresh.contains("No daemon") && !fresh.contains("stale"),
+            "the healthy claim carries no warning language: {fresh}"
+        );
+    }
+
+    /// The warning for a failed arm whose rollback also failed to save: the
+    /// only line telling the operator a durable flag-on-with-nothing-armed
+    /// state exists. It owns the state, carries the save error, and names the
+    /// exit.
+    #[test]
+    fn the_stranded_rollback_warning_owns_the_flag_and_the_exit() {
+        let w = rollback_stranded_warning("acme", &anyhow::anyhow!("read-only file system"));
+        assert!(
+            w.contains("could not roll the rolling-token flag back for 'acme'"),
+            "{w}"
+        );
+        assert!(w.contains("read-only file system"), "{w}");
+        assert!(w.contains("`clauth static-token acme` to clear it"), "{w}");
+    }
+}
+
 /// `static-token --clear` as the FULL exit from the long-lived token: all three
 /// pieces of that state go together (sidecar, preserved mint, `rolling_token`
 /// flag), because each one left behind resurrects what the operator was told is

@@ -1071,11 +1071,7 @@ fn cmd_rolling_token(name: &str) -> Result<()> {
             // The arming error is the one the operator needs; a rollback that
             // then cannot save its own config write must not replace it.
             if let Err(save_err) = profile::save_profile(profile) {
-                errln!(
-                    "clauth: warning: could not roll the rolling-token flag back for \
-                     '{canonical}' ({save_err:#}) · once ~/.clauth is writable, run \
-                     `clauth static-token {canonical}` to clear it"
-                );
+                errln!("{}", rollback_stranded_warning(&canonical, &save_err));
             }
         }
         return Err(e);
@@ -1087,6 +1083,58 @@ fn cmd_rolling_token(name: &str) -> Result<()> {
         outln!("clauth: it installs on the next switch:  clauth {canonical}");
     }
     Ok(())
+}
+
+/// The warning for a failed arm whose ROLLBACK also failed to save: the flag
+/// is durably on with nothing armed, and this line is the only thing telling
+/// the operator that state exists and how to leave it. A separate fn so the
+/// copy is unit-pinned and a deleted print orphans it into a dead-code error —
+/// the warning is best-effort by design (the arming error still propagates),
+/// which is exactly what made it silently deletable.
+fn rollback_stranded_warning(canonical: &str, save_err: &anyhow::Error) -> String {
+    format!(
+        "clauth: warning: could not roll the rolling-token flag back for \
+         '{canonical}' ({save_err:#}) · once ~/.clauth is writable, run \
+         `clauth static-token {canonical}` to clear it"
+    )
+}
+
+/// The re-stamp promise `report_armed_sidecar` closes on — the DAEMON's to
+/// keep, so each health state gets its own claim and none may stand in for
+/// another: `Fresh` promising while no daemon runs is the arm reading as
+/// durable when nothing will re-stamp it, and `Absent`'s warning on a healthy
+/// daemon buries the one real signal in noise. A separate fn so the three
+/// arms are unit-pinned as DISTINCT — measured interchangeable before.
+fn restamp_promise(health: crate::daemon::DaemonHealth) -> &'static str {
+    match health {
+        // Best-effort probe: an error reads Absent by design, so the
+        // claim is hedged rather than absolute.
+        crate::daemon::DaemonHealth::Absent => {
+            "No daemon appears to be running · nothing re-stamps it until \
+             `clauth daemon` starts."
+        }
+        crate::daemon::DaemonHealth::Stale => {
+            "A daemon is present but its feed looks stale · check \
+             `clauth daemon --status` or re-stamps may not land."
+        }
+        crate::daemon::DaemonHealth::Fresh => "The daemon re-stamps it before it expires.",
+    }
+}
+
+/// The security disclosure printed after a confirmed arm — the ENTIRE
+/// user-facing statement that the session credential just got wider, and the
+/// way back. There is deliberately no confirm prompt (a security prompt on a
+/// repeatable command gets clicked through), so this line plus the SECURITY.md
+/// row IS the feature's disclosure posture: a separate fn so the copy is
+/// unit-pinned and a deleted print orphans it into a dead-code error, making
+/// the one copy hole that would be a posture change a compile failure instead.
+fn scope_widening_disclosure(canonical: &str) -> String {
+    format!(
+        "clauth: that is wider than the setup-token mint it supersedes, which carried \
+         two. Anything that can read this profile's session credential can now use \
+         every one of those scopes. `clauth static-token {canonical}` puts the mint \
+         back."
+    )
 }
 
 /// Say what sessions now hold, read back off disk rather than assumed.
@@ -1145,19 +1193,7 @@ fn report_armed_sidecar(canonical: &str, chain_is_broken: bool) -> Result<()> {
             let plan = token.subscription_type.clone().unwrap_or_default();
             // The re-stamp promise is the DAEMON's to keep, so it is only
             // made when one is actually there to keep it.
-            let restamp = match crate::daemon::daemon_health() {
-                // Best-effort probe: an error reads Absent by design, so the
-                // claim is hedged rather than absolute.
-                crate::daemon::DaemonHealth::Absent => {
-                    "No daemon appears to be running · nothing re-stamps it until \
-                     `clauth daemon` starts."
-                }
-                crate::daemon::DaemonHealth::Stale => {
-                    "A daemon is present but its feed looks stale · check \
-                     `clauth daemon --status` or re-stamps may not land."
-                }
-                crate::daemon::DaemonHealth::Fresh => "The daemon re-stamps it before it expires.",
-            };
+            let restamp = restamp_promise(crate::daemon::daemon_health());
             outln!(
                 "clauth: rolling token armed for '{canonical}'. Sessions now hold the usage \
                  chain's access token: {} scope(s){}{}, and no refresh token. {restamp}",
@@ -1173,12 +1209,7 @@ fn report_armed_sidecar(canonical: &str, chain_is_broken: bool) -> Result<()> {
                     format!(", plan {plan}")
                 },
             );
-            outln!(
-                "clauth: that is wider than the setup-token mint it supersedes, which carried \
-                 two. Anything that can read this profile's session credential can now use \
-                 every one of those scopes. `clauth static-token {canonical}` puts the mint \
-                 back."
-            );
+            outln!("{}", scope_widening_disclosure(canonical));
         }
     }
     Ok(())

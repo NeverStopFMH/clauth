@@ -3496,16 +3496,34 @@ const ROLLING_SCAN_GAP_MS: u64 = 5 * 60 * 1000;
 /// rotation lock) — the horizon is hours wide, so minutes-scale retries lose
 /// nothing while avoiding per-scan log spam.
 const ROLLING_RETRY_MS: u64 = 15 * 60 * 1000;
-/// A Broken verdict (dead chain, no mint to degrade to) only changes via
-/// re-login — which re-arms the rolling token anyway — so retry on a long leash.
+/// A Broken verdict (dead chain, no mint to degrade to) and the re-login-shaped
+/// transients change only when the operator acts, so retrying them on the
+/// minutes cadence is pure log noise — they pace on this long leash instead.
+/// The leash is a NOISE gate, not the exit: a browser re-login writes
+/// `credentials.json` and never touches the sidecar or the flag (and a
+/// `--setup-token` re-mint writes a MINT, which disarms rather than re-arms),
+/// so a hold only the clock releases would sit on the operator's fix for up to
+/// six hours. Every hold this long therefore records a
+/// [`crate::claude::credential_fingerprint`] of the profile, and a change to
+/// any of the three files releases the hold on the next scan — the gate runs
+/// right after the fix, not six hours later.
 const ROLLING_BROKEN_RETRY_MS: u64 = 6 * 60 * 60 * 1000;
+
+/// One paced re-stamp hold. `watched` is `Some` exactly on the
+/// [`ROLLING_BROKEN_RETRY_MS`]-length holds — the re-login-shaped ones, whose
+/// real exit is the operator changing a credential file, not the clock. The
+/// short transient cadence stays purely time-based.
+pub(super) struct RetryHold {
+    not_before: u64,
+    watched: Option<[Option<(std::time::SystemTime, u64)>; 3]>,
+}
 
 /// Pacing for the re-stamp scan: an in-memory throttle only — the durable
 /// truth is the sidecar's own expiry, which every leg re-reads.
 #[derive(Default)]
 pub(super) struct ClaudeRollingPacing {
     next_scan_ms: u64,
-    retry_after_ms: HashMap<String, u64>,
+    retry_after_ms: HashMap<String, RetryHold>,
 }
 
 /// CLA-ROLL: rolling-sidecar freshness scan. For every rolling-token claude
@@ -3573,25 +3591,40 @@ pub(super) fn claude_rolling_tick(
             .retain(|held, _| candidates.iter().any(|c| c == held));
     }
     for name in candidates {
-        let widened = pacing
-            .lock()
-            .ok()
-            .and_then(|mut p| {
-                // Same backwards-clock clamp as the scan stamp: a retry stamp
-                // further out than the longest leash can only mean the wall
-                // clock moved back under it. Clamping to the LONGEST leash is
-                // chosen, not sloppy: the stored stamp does not say which
-                // leash minted it, so a big backwards step can stretch a
-                // 15-minute retry to at most the 6h Broken leash — bounded
-                // and rare — where clamping to the short leash would let the
-                // same step ERODE every legitimate Broken leash instead.
-                let at = p.retry_after_ms.get_mut(&name)?;
-                *at = (*at).min(now + ROLLING_BROKEN_RETRY_MS);
-                Some(*at)
-            })
-            .is_some_and(|at| now < at);
-        if widened {
-            continue;
+        let held = pacing.lock().ok().and_then(|mut p| {
+            // Same backwards-clock clamp as the scan stamp: a retry stamp
+            // further out than the longest leash can only mean the wall
+            // clock moved back under it. Clamping to the LONGEST leash is
+            // chosen, not sloppy: the stored stamp does not say which
+            // leash minted it, so a big backwards step can stretch a
+            // 15-minute retry to at most the 6h Broken leash — bounded
+            // and rare — where clamping to the short leash would let the
+            // same step ERODE every legitimate Broken leash instead.
+            let hold = p.retry_after_ms.get_mut(&name)?;
+            hold.not_before = hold.not_before.min(now + ROLLING_BROKEN_RETRY_MS);
+            Some((hold.not_before, hold.watched))
+        });
+        if let Some((not_before, watched)) = held
+            && now < not_before
+        {
+            // A watched (re-login-shaped) hold releases the moment the
+            // profile's credential files change: the operator just did the
+            // thing the cause prescribed, and holding the gate shut for the
+            // rest of the leash would delay the very recovery it named. The
+            // fingerprint read is metadata-only IO, done OUTSIDE the pacing
+            // lock — that rank is a leaf precisely because nothing else
+            // happens under it.
+            let released =
+                watched.is_some_and(|w| w != crate::claude::credential_fingerprint(&name));
+            if !released {
+                continue;
+            }
+            if let Ok(mut p) = pacing.lock() {
+                p.retry_after_ms.remove(&name);
+            }
+            logline!(
+                "clauth: '{name}' credentials changed under a re-stamp hold — re-checking now"
+            );
         }
         if !crate::oauth::rolling_sidecar_restamp_due(&name, now as i64) {
             continue;
@@ -3623,11 +3656,15 @@ pub(super) fn claude_rolling_tick(
                 // taken — the rank is a leaf precisely because nothing else,
                 // locks or IO, ever happens under it.
                 let still_due = crate::oauth::rolling_sidecar_restamp_due(&name, now as i64);
+                let hold = still_due.then(|| retry_hold(&name, now, retry_ms));
                 if let Ok(mut p) = pacing.lock() {
-                    if still_due {
-                        p.retry_after_ms.insert(name.clone(), now + retry_ms);
-                    } else {
-                        p.retry_after_ms.remove(&name);
+                    match hold {
+                        Some(hold) => {
+                            p.retry_after_ms.insert(name.clone(), hold);
+                        }
+                        None => {
+                            p.retry_after_ms.remove(&name);
+                        }
                     }
                 }
             }
@@ -3645,16 +3682,31 @@ pub(super) fn claude_rolling_tick(
                 } else {
                     retry_ms
                 };
+                let hold = retry_hold(&name, now, retry_ms);
                 if let Ok(mut p) = pacing.lock() {
-                    p.retry_after_ms.insert(name.clone(), now + retry_ms);
+                    p.retry_after_ms.insert(name.clone(), hold);
                 }
             }
             crate::oauth::AuthGate::Broken => {
+                let hold = retry_hold(&name, now, ROLLING_BROKEN_RETRY_MS);
                 if let Ok(mut p) = pacing.lock() {
-                    p.retry_after_ms
-                        .insert(name.clone(), now + ROLLING_BROKEN_RETRY_MS);
+                    p.retry_after_ms.insert(name.clone(), hold);
                 }
             }
         }
+    }
+}
+
+/// Build the paced hold for one verdict. The watch rides the DURATION: every
+/// [`ROLLING_BROKEN_RETRY_MS`]-length hold is by construction a re-login-shaped
+/// one (permanent transient, quarantined chain, Broken verdict), and those are
+/// exactly the holds whose real exit is the operator changing a credential
+/// file. Computed before the pacing lock is taken — the fingerprint is
+/// metadata IO, and that rank is a leaf.
+fn retry_hold(name: &str, now: u64, retry_ms: u64) -> RetryHold {
+    RetryHold {
+        not_before: now + retry_ms,
+        watched: (retry_ms == ROLLING_BROKEN_RETRY_MS)
+            .then(|| crate::claude::credential_fingerprint(name)),
     }
 }

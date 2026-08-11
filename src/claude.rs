@@ -131,6 +131,31 @@ pub(crate) fn clear_static_backup(name: &str) -> Result<bool> {
     })
 }
 
+/// A cheap identity of `name`'s on-disk credential state: (mtime, length) of
+/// `credentials.json`, `session-token.json`, and `session-token.static.json`,
+/// `None` per absent file. Every recovery the re-login-shaped scheduler
+/// leashes prescribe lands as a write to one of these three (a browser
+/// re-login replaces `credentials.json`, a `--setup-token` re-mint or a
+/// hand-restore replaces the sidecar or the backup), and every writer in this
+/// codebase goes through an atomic tempfile + rename, so a change is always a
+/// fresh mtime. Metadata only — no locks, no reads: a mid-write observation
+/// just changes again on the next look, which is the correct answer anyway.
+pub(crate) fn credential_fingerprint(name: &str) -> [Option<(std::time::SystemTime, u64)>; 3] {
+    let Ok(dir) = profile_dir(name) else {
+        return [None, None, None];
+    };
+    [
+        "credentials.json",
+        "session-token.json",
+        "session-token.static.json",
+    ]
+    .map(|f| {
+        std::fs::metadata(dir.join(f))
+            .ok()
+            .and_then(|m| Some((m.modified().ok()?, m.len())))
+    })
+}
+
 /// Documented lifetime of a `claude setup-token` mint (~1 year). The minted
 /// string carries no expiry of its own, so the capture flow stamps this
 /// assumed horizon into the sidecar — the Setup-tab countdown and

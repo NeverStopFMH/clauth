@@ -142,10 +142,17 @@ pub(crate) fn enabled() -> bool {
     false
 }
 
-/// The Keychain `account` Claude Code stores the login under: the OS login name.
-/// Empirically the login item is at `account = $USER`; a *separate* item at
-/// `account = "unknown"` holds MCP tokens (`mcpOAuth`), not the login — so the
-/// account must be pinned. A bare service-only lookup can return the wrong item.
+/// The Keychain `account` Claude Code stores its credential blob under: the OS
+/// login name. Every `*-generic-password` call site in CC passes this same
+/// `$USER`-derived value (its own fallback for an unusable `$USER` is the literal
+/// `claude-code-user`, which clauth does not reproduce), so pinning the account
+/// keeps clauth writing where CC reads.
+///
+/// A previous note here claimed a *separate* item at `account = "unknown"` held
+/// `mcpOAuth`. That is wrong and was load-bearing for the wrong conclusion: CC
+/// keeps ONE item holding one JSON blob, and `mcpOAuth` is a sibling key of
+/// `claudeAiOauth` inside it (`docs/domain-knowledge.md`, traced on 2.1.210 and
+/// 2.1.227). See [`write_at`] for the consequence, which is not yet fixed.
 fn account() -> Result<String> {
     std::env::var("USER")
         .or_else(|_| std::env::var("LOGNAME"))
@@ -211,6 +218,16 @@ fn security_quote(s: &str) -> Result<String> {
 /// (verified: 0 on success, 44 for `errSecItemNotFound`, 2 on usage error).
 /// The no-value `-w` prompt form is still unusable here — it reads from the
 /// controlling *tty* (`readpassphrase`), not stdin, so a pipe can't feed it.
+/// KNOWN DEFECT, macOS only, pre-dating the file-side MCP carry and not fixed by
+/// it (`docs/todo.md`). `add-generic-password -U` replaces the item's whole
+/// password, and `creds` serializes to `{"claudeAiOauth": …}` alone, so every
+/// switch that mirrors here drops the sibling keys CC keeps in that same blob:
+/// `mcpOAuth`, `organizationUuid`, `trustedDeviceToken`, `enterpriseGateway`,
+/// `designOauth`. This is the same loss `carry_live_extra_into` fixes on the file
+/// path, still live on the Keychain path, and the file-side carry cannot reach it.
+/// Fixing it needs a Keychain READ before the write, which the module avoids on
+/// purpose (reading CC's item raises an access prompt on every call), so the fix
+/// is a design decision rather than a patch.
 fn write_at(service: &str, account: &str, creds: &ClaudeCredentials) -> Result<()> {
     let json = serde_json::to_string(creds).context("failed to serialize Claude credentials")?;
     let line = format!(

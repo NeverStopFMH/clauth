@@ -1767,7 +1767,6 @@ fn switching_accounts_preserves_mcp_oauth_end_to_end() {
     );
 }
 
-#[cfg(unix)]
 #[test]
 fn link_adopts_a_matching_login_and_preserves_mcp_oauth() {
     let _home = HomeSandbox::new();
@@ -1803,7 +1802,6 @@ fn link_adopts_a_matching_login_and_preserves_mcp_oauth() {
     );
 }
 
-#[cfg(unix)]
 #[test]
 fn link_still_refuses_a_different_live_login() {
     let _home = HomeSandbox::new();
@@ -1836,7 +1834,6 @@ fn link_still_refuses_a_different_live_login() {
 /// storing no `credentials.json`. Left to the login test alone the two compare
 /// equal, the guard clears, and the live file is removed with nothing to relink.
 /// The byte-compare fallback is what keeps refusing here.
-#[cfg(unix)]
 #[test]
 fn link_refuses_a_torn_live_file_over_a_profile_storing_no_login() {
     let _home = HomeSandbox::new();
@@ -1867,7 +1864,6 @@ fn link_refuses_a_torn_live_file_over_a_profile_storing_no_login() {
 
 /// Same hole, reached by the other route: a live file carrying MCP-server logins
 /// and no Claude login block parses fine and still names no login.
-#[cfg(unix)]
 #[test]
 fn link_refuses_a_login_less_live_file_over_a_profile_storing_no_login() {
     let _home = HomeSandbox::new();
@@ -1904,7 +1900,6 @@ fn link_refuses_a_login_less_live_file_over_a_profile_storing_no_login() {
 /// Two logged-out shells are two blank tokens, and blank equals blank. The login
 /// test carries `classify_link_at`'s non-empty clause so it never clears on them;
 /// differing shells then fall to the byte compare and refuse.
-#[cfg(unix)]
 #[test]
 fn link_refuses_two_differing_logged_out_shells() {
     let _home = HomeSandbox::new();

@@ -2155,3 +2155,146 @@ mod identify_live_login_owner {
         );
     }
 }
+
+// ── a console login never touches the profile's api key ──────────────────────
+
+/// The console callback hands back a WORKSPACE key (`sk-ws-…`) against the
+/// workspace endpoint — a different product, billed pay-as-you-go, from the
+/// prepaid Token Plan the profile runs on (`sk-sp-…` against
+/// `token-plan.<region>.maas.aliyuncs.com`). Persisting it would silently move
+/// that account's spend onto the other product, so `store_console_login` writes
+/// the session and NOTHING else: not over a stored key, and not into an empty
+/// slot either, where it would leave the profile pointed at an endpoint its plan
+/// does not cover.
+#[test]
+fn a_console_login_stores_the_session_and_leaves_the_api_key_alone() {
+    let _home = HomeSandbox::new();
+    let base = "https://token-plan.ap-southeast-1.maas.aliyuncs.com/apps/anthropic";
+    let session = || crate::profile::ConsoleCredential {
+        token: "3f2b1c4d-5e6f-4708-9a1b-2c3d4e5f6071".to_string(),
+        site: crate::profile::ConsoleSite::International,
+        region: "ap-southeast-1".to_string(),
+    };
+
+    // A profile already holding its plan key keeps it byte for byte.
+    let with_key = Profile::new(
+        "qwen-keyed".to_string(),
+        Some(base.to_string()),
+        Some("sk-sp-the-plan-key".to_string()),
+    );
+    let mut config = inactive_config(with_key);
+    store_console_login(&mut config, "qwen-keyed", session()).expect("store_console_login");
+    let loaded = crate::profile::load_profile("qwen-keyed").expect("load_profile");
+    assert_eq!(
+        loaded.api_key.as_deref(),
+        Some("sk-sp-the-plan-key"),
+        "the plan key survives a console login",
+    );
+    assert_eq!(
+        loaded.base_url.as_deref(),
+        Some(base),
+        "and so does the endpoint"
+    );
+    assert_eq!(
+        loaded.console.expect("the session landed").token,
+        "3f2b1c4d-5e6f-4708-9a1b-2c3d4e5f6071"
+    );
+
+    // An EMPTY slot is not an invitation: the callback's key belongs to another
+    // product, so filling it would point this profile at the wrong endpoint.
+    let no_key = Profile::new("qwen-bare".to_string(), Some(base.to_string()), None);
+    let mut config = inactive_config(no_key);
+    store_console_login(&mut config, "qwen-bare", session()).expect("store_console_login");
+    let loaded = crate::profile::load_profile("qwen-bare").expect("load_profile");
+    assert_eq!(loaded.api_key, None, "no key is written into an empty slot");
+    assert!(loaded.console.is_some(), "the session still landed");
+}
+
+/// `main.rs`'s reauth contract is that the snapshot clears the old type's
+/// leftovers. The console session is a FOURTH credential, and it is meaningless
+/// off Alibaba: left behind, an endpoint move parks a live Model Studio session
+/// on a profile that no longer talks to Model Studio, where it survives every
+/// later reload.
+#[test]
+fn moving_the_endpoint_off_alibaba_clears_the_console_session() {
+    let _home = HomeSandbox::new();
+    let alibaba = "https://token-plan.ap-southeast-1.maas.aliyuncs.com/apps/anthropic";
+    let session = || crate::profile::ConsoleCredential {
+        token: "console-token".to_string(),
+        site: crate::profile::ConsoleSite::International,
+        region: "ap-southeast-1".to_string(),
+    };
+
+    // edit_profile_endpoint: Alibaba → z.ai.
+    let mut p = Profile::new(
+        "moved".to_string(),
+        Some(alibaba.to_string()),
+        Some("sk-sp-k".to_string()),
+    );
+    p.console = Some(session());
+    let mut config = inactive_config(p);
+    edit_profile_endpoint(
+        &mut config,
+        "moved",
+        Some("https://api.z.ai/api/anthropic".to_string()),
+        Some("zai-key".to_string()),
+    )
+    .expect("edit_profile_endpoint");
+    assert!(
+        crate::profile::load_profile("moved")
+            .expect("load_profile")
+            .console
+            .is_none(),
+        "the console session does not survive the endpoint moving off Alibaba",
+    );
+
+    // …and it DOES survive an edit that stays on Alibaba (a rotated api key).
+    let mut p = Profile::new(
+        "stayed".to_string(),
+        Some(alibaba.to_string()),
+        Some("sk-sp-k".to_string()),
+    );
+    p.console = Some(session());
+    let mut config = inactive_config(p);
+    edit_profile_endpoint(
+        &mut config,
+        "stayed",
+        Some(alibaba.to_string()),
+        Some("sk-sp-rotated".to_string()),
+    )
+    .expect("edit_profile_endpoint");
+    assert!(
+        crate::profile::load_profile("stayed")
+            .expect("load_profile")
+            .console
+            .is_some(),
+        "a same-provider edit keeps the session the operator just captured",
+    );
+
+    // overwrite_captured_profile: the reauth path, Alibaba → a fresh OAuth login.
+    let mut p = Profile::new(
+        "reauthed".to_string(),
+        Some(alibaba.to_string()),
+        Some("sk-sp-k".to_string()),
+    );
+    p.console = Some(session());
+    let mut config = inactive_config(p);
+    overwrite_captured_profile(
+        &mut config,
+        "reauthed",
+        CaptureSnapshot {
+            credentials: None,
+            base_url: None,
+            api_key: None,
+            account_uuid: None,
+        },
+    )
+    .expect("overwrite_captured_profile");
+    assert!(
+        crate::profile::load_profile("reauthed")
+            .expect("load_profile")
+            .console
+            .is_none(),
+        "a reauth that clears the endpoint clears the session with it",
+    );
+}

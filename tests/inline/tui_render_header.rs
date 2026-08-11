@@ -23,6 +23,7 @@ fn oauth_profile(name: &str, five_hour_pct: f64) -> Profile {
         check_scoped: true,
         bell_threshold: None,
         disabled: false,
+        console: None,
         credentials: None,
         usage: Some(UsageInfo {
             five_hour: Some(UsageWindow {
@@ -54,6 +55,7 @@ fn provider_profile(name: &str) -> Profile {
         check_scoped: true,
         bell_threshold: None,
         disabled: false,
+        console: None,
         credentials: None,
         usage: None,
         fetch_status: None,

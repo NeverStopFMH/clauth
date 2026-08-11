@@ -19,8 +19,8 @@ use crate::lockorder::RankedMutex;
 use crate::oauth;
 use crate::out::{out, outln};
 use crate::profile::{
-    AccountId, AppConfig, ClaudeCredentials, DivergenceChoice, ModelSettings, Profile, profile_dir,
-    save_app_state, save_profile,
+    AccountId, AppConfig, ClaudeCredentials, ConsoleCredential, DivergenceChoice, ModelSettings,
+    Profile, profile_dir, save_app_state, save_profile,
 };
 use crate::providers::Provider;
 use crate::spinner::Spinner;
@@ -390,6 +390,16 @@ pub(crate) fn edit_profile_endpoint(
         if provider != profile.provider || (provider.is_some() && profile.api_key != old_api_key) {
             profile.third_party_usage = None;
         }
+        // The console session is a FOURTH credential and it means nothing off
+        // Alibaba: left behind, an endpoint move parks a live Model Studio
+        // session on a profile that no longer talks to Model Studio, and every
+        // later reload carries it forward. A move BETWEEN Alibaba endpoints
+        // keeps it — the session the operator just captured is still the right
+        // one, and a genuinely wrong site answers `AuthExpired`, which is
+        // visible and one re-login from fixed.
+        if provider != Some(crate::providers::Provider::Alibaba) {
+            profile.console = None;
+        }
         profile.provider = provider;
         save_profile(profile)?;
 
@@ -398,6 +408,38 @@ pub(crate) fn edit_profile_endpoint(
             let prev_env_keys: Vec<String> = profile.env.keys().cloned().collect();
             apply_profile_to_claude_settings(profile, &prev_env_keys)?;
         }
+        Ok(())
+    })
+}
+
+/// Persist a captured Alibaba console session onto a profile — the session and
+/// NOTHING else.
+///
+/// **The api key and base_url are deliberately not written, not even into an
+/// empty slot.** The console callback returns a WORKSPACE key (`sk-ws-…`) and
+/// the workspace endpoint (`ws-<id>.<region>.maas.aliyuncs.com`), which are a
+/// different product from the Token Plan the profile runs on (`sk-sp-…` against
+/// `token-plan.<region>.maas.aliyuncs.com`) and are billed differently — prepaid
+/// plan vs pay-as-you-go. Writing either would silently move that account's
+/// spend onto the other product. `ConsoleLoginOutcome` carries neither, so this
+/// signature is the second place that has to change before one could.
+///
+/// The stale third-party cache is dropped: it was fetched under the previous
+/// session, and a new login can be a different account entirely.
+pub(crate) fn store_console_login(
+    config: &mut AppConfig,
+    name: &str,
+    console: ConsoleCredential,
+) -> Result<()> {
+    with_state_lock(|| {
+        let profile = config.find_mut(name).context("profile not found")?;
+        profile.console = Some(console);
+        profile.third_party_usage = None;
+        save_profile(profile)?;
+        crate::profile_cache::remove_profile_cache(
+            name,
+            crate::profile_cache::THIRD_PARTY_CACHE_FILE,
+        );
         Ok(())
     })
 }
@@ -944,6 +986,11 @@ pub(crate) fn overwrite_captured_profile(
         profile.api_key = api_key;
         profile.credentials = credentials;
         profile.provider = provider;
+        // Same rule as `edit_profile_endpoint`: a reauth replaces the credential
+        // set, and the console session is one of them.
+        if provider != Some(Provider::Alibaba) {
+            profile.console = None;
+        }
         profile.usage = None;
         profile.fetch_status = None;
         profile.third_party_usage = None;
@@ -952,6 +999,9 @@ pub(crate) fn overwrite_captured_profile(
         for file in [
             crate::profile_cache::USAGE_CACHE_FILE,
             crate::profile_cache::THIRD_PARTY_CACHE_FILE,
+            // Inert once the credential changes, but this profile may now be a
+            // different account entirely — drop it with the rest.
+            crate::profile_cache::THIRD_PARTY_AUTH_FILE,
             crate::throughput::THROUGHPUT_CACHE_FILE,
         ] {
             crate::profile_cache::remove_profile_cache(name, file);
@@ -1031,6 +1081,9 @@ pub(crate) fn clear_profile_credentials(config: &mut AppConfig, name: &str) -> R
         for file in [
             crate::profile_cache::USAGE_CACHE_FILE,
             crate::profile_cache::THIRD_PARTY_CACHE_FILE,
+            // Inert once the credential changes, but this profile may now be a
+            // different account entirely — drop it with the rest.
+            crate::profile_cache::THIRD_PARTY_AUTH_FILE,
             crate::throughput::THROUGHPUT_CACHE_FILE,
         ] {
             crate::profile_cache::remove_profile_cache(name, file);

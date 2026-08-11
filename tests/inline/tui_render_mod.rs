@@ -24,6 +24,7 @@ fn oauth(name: &str, five: f64, seven: f64, auto: bool) -> Profile {
         check_scoped: true,
         bell_threshold: None,
         disabled: false,
+        console: None,
         credentials: None,
         usage: Some(UsageInfo {
             plan: None,
@@ -1003,6 +1004,7 @@ fn bare(name: &str) -> Profile {
         check_scoped: true,
         bell_threshold: None,
         disabled: false,
+        console: None,
         credentials: None,
         usage: None,
         fetch_status: None,

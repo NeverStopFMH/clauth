@@ -257,6 +257,10 @@ pub(crate) struct Profile {
     /// credentials stay on disk untouched. It still sits in `fallback_chain`
     /// on disk; only the walk skips it. Default off. See `Profile::is_disabled`.
     pub(crate) disabled: bool,
+    /// Alibaba Model Studio console session, when one has been captured. The
+    /// api key can't read quota, so this is what the Alibaba usage fetch runs
+    /// on; `None` means the account renders no usage until a console login.
+    pub(crate) console: Option<ConsoleCredential>,
     pub(crate) credentials: Option<ClaudeCredentials>,
     pub(crate) usage: Option<UsageInfo>,
     pub(crate) fetch_status: Option<FetchStatus>,
@@ -285,6 +289,7 @@ impl Profile {
             check_scoped: true,
             bell_threshold: None,
             disabled: false,
+            console: None,
             credentials: None,
             usage: None,
             fetch_status: None,
@@ -836,6 +841,86 @@ impl ModelSettings {
     }
 }
 
+/// Which Alibaba Model Studio front the console session belongs to. The two
+/// sites are separate deployments with separate console hosts and separate
+/// gateway actions, so a token minted on one is meaningless on the other.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum ConsoleSite {
+    /// `bailian.console.aliyun.com` — the mainland-China front.
+    #[default]
+    Domestic,
+    /// `modelstudio.console.alibabacloud.com` — the international front.
+    International,
+}
+
+impl ConsoleSite {
+    /// The canonical spelling written to `config.toml`.
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Domestic => "domestic",
+            Self::International => "international",
+        }
+    }
+
+    /// Parse a stored or callback-supplied site. `None` for anything outside
+    /// the known spellings, so a caller can fall back to the site it already
+    /// knows rather than silently routing to the other deployment. `intl` is
+    /// accepted because that is how the international hosts spell themselves.
+    pub(crate) fn parse(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "domestic" | "cn" | "china" => Some(Self::Domestic),
+            "international" | "intl" => Some(Self::International),
+            _ => None,
+        }
+    }
+}
+
+/// A profile's Alibaba Model Studio **console** session: the only credential
+/// that can read Token Plan quota. The api key authenticates inference and is
+/// never read by the quota surface, so this is a second, independent secret.
+///
+/// It expires 48 hours after the operator's aliyun BROWSER sign-in — not after
+/// the login that captured it, which merely inherits the rest of that window
+/// (two tokens minted ~4h apart carry the same create/expire stamps). There is
+/// no refresh path, so its death is an ordinary state rather than an error, and
+/// a re-login is not guaranteed to buy much — see
+/// [`crate::usage::FetchStatus::AuthExpired`] and `docs/domain-knowledge.md`.
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct ConsoleCredential {
+    /// Bearer token for the OneConsole gateway. Redacted from [`fmt::Debug`]
+    /// because `Profile` derives `Debug` and a stray `{:?}` would otherwise put
+    /// a live session on a log line.
+    pub(crate) token: String,
+    pub(crate) site: ConsoleSite,
+    /// Console region id (`cn-beijing`, `ap-southeast-1`). Sent verbatim as the
+    /// gateway's `region` form field, so it stays a string rather than an enum:
+    /// an unknown region still reaches the endpoint that can answer for it.
+    pub(crate) region: String,
+}
+
+impl std::fmt::Debug for ConsoleCredential {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ConsoleCredential")
+            .field("token", &"<redacted>")
+            .field("site", &self.site)
+            .field("region", &self.region)
+            .finish()
+    }
+}
+
+/// On-disk `[console]` table. Every field is optional so an absent table, a
+/// half-filled one, and a hand-edited one all parse; [`load_profile`]
+/// normalizes it into an `Option<ConsoleCredential>` at the load boundary.
+#[derive(Debug, Default, Serialize, Deserialize, PartialEq)]
+struct ConsoleConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    token: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    site: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    region: Option<String>,
+}
+
 #[derive(Debug, Serialize, Deserialize, Default, PartialEq)]
 struct ProfileConfig {
     base_url: Option<String>,
@@ -867,6 +952,10 @@ struct ProfileConfig {
     bell_threshold: Option<f64>,
     #[serde(default)]
     disabled: bool,
+    /// `[console]` — the Alibaba Model Studio console session. A TABLE, so it
+    /// must render after every scalar key in `render_config_toml`.
+    #[serde(default)]
+    console: ConsoleConfig,
 }
 
 /// Test-only home-dir override. Redirects all reads/writes away from real `~/.clauth`.
@@ -1366,6 +1455,48 @@ fn finite_pct(raw: Option<f64>) -> Option<f64> {
     raw.filter(|v| v.is_finite()).map(|v| v.clamp(0.0, 100.0))
 }
 
+/// `[console]` → a usable credential, normalized at the LOAD boundary so no
+/// reader below ever meets a half-filled table. A blank or absent token means
+/// no session at all (the two are the same state to every consumer); an unset
+/// or unrecognised `site`/`region` takes the vendor default rather than failing
+/// the profile load, because a hand-edit there costs one re-login and not a
+/// bricked account.
+fn console_credential(raw: &ConsoleConfig) -> Option<ConsoleCredential> {
+    let token = raw
+        .token
+        .as_deref()
+        .map(str::trim)
+        .filter(|t| !t.is_empty())?;
+    let region = raw
+        .region
+        .as_deref()
+        .map(str::trim)
+        .filter(|r| !r.is_empty())
+        .unwrap_or(crate::providers::alibaba::DEFAULT_REGION);
+    Some(ConsoleCredential {
+        token: token.to_string(),
+        site: raw
+            .site
+            .as_deref()
+            .and_then(ConsoleSite::parse)
+            .unwrap_or_default(),
+        region: region.to_string(),
+    })
+}
+
+/// Inverse of [`console_credential`] for the rewrite-drift comparison: the
+/// table `render_config_toml` emits for this credential.
+fn console_config(cred: Option<&ConsoleCredential>) -> ConsoleConfig {
+    match cred {
+        Some(c) => ConsoleConfig {
+            token: Some(c.token.clone()),
+            site: Some(c.site.as_str().to_string()),
+            region: Some(c.region.clone()),
+        },
+        None => ConsoleConfig::default(),
+    }
+}
+
 pub(crate) fn load_profile(name: &str) -> Result<Profile> {
     let config_path = profile_config_path(name)?;
     let raw_config = match std::fs::read_to_string(&config_path) {
@@ -1451,6 +1582,7 @@ pub(crate) fn load_profile(name: &str) -> Result<Profile> {
         check_scoped: config.check_scoped.unwrap_or(true),
         bell_threshold: finite_pct(config.bell_threshold),
         disabled: config.disabled,
+        console: console_credential(&config.console),
         credentials,
         usage: None,
         fetch_status: None,
@@ -1489,6 +1621,7 @@ fn maybe_rewrite_config_toml(config_path: &Path, raw_config: &str, profile: &Pro
                 check_scoped: (!profile.check_scoped).then_some(false),
                 bell_threshold: profile.bell_threshold,
                 disabled: profile.disabled,
+                console: console_config(profile.console.as_ref()),
             };
             canonical != on_disk
         }
@@ -1733,6 +1866,31 @@ fn render_config_toml(profile: &Profile) -> String {
         out.push_str("disabled = true\n");
     } else {
         out.push_str("# disabled = true\n");
+    }
+    out.push('\n');
+
+    // Tables last: every key after a `[table]` header belongs to that table, so
+    // this block and the two below must follow every scalar key above.
+    out.push_str("# Alibaba Model Studio console session. The ONLY credential that can read\n");
+    out.push_str("# Token Plan quota — the api key authenticates inference and is never read\n");
+    out.push_str("# by the quota surface. Captured by `clauth login <name>` on an Alibaba\n");
+    out.push_str("# profile. It expires 48h after your aliyun browser sign-in, NOT after the\n");
+    out.push_str("# login: re-running the login inherits whatever is left of that window,\n");
+    out.push_str("# which can be minutes. A full window needs a fresh console sign-in first.\n");
+    out.push_str("# site: domestic | international.\n");
+    match profile.console.as_ref() {
+        Some(c) => {
+            out.push_str("[console]\n");
+            out.push_str(&format!("token = {}\n", toml_str(&c.token)));
+            out.push_str(&format!("site = {}\n", toml_str(c.site.as_str())));
+            out.push_str(&format!("region = {}\n", toml_str(&c.region)));
+        }
+        None => {
+            out.push_str("# [console]\n");
+            out.push_str("# token = \"...\"\n");
+            out.push_str("# site = \"international\"\n");
+            out.push_str("# region = \"ap-southeast-1\"\n");
+        }
     }
     out.push('\n');
 

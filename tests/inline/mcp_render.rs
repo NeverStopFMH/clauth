@@ -126,9 +126,16 @@ fn instructions_block_emits_stable_roster_cost_model_and_safety_prose() {
     assert!(out.contains("Profiles (at session start"));
     assert!(out.contains("call `list_profiles`"));
 
-    // cost model is spelled out so delegate routing can account for money.
+    // cost model is spelled out so delegate routing can account for money. All
+    // three paid shapes are named: collapsing "api key" to one billing story
+    // told the model an Alibaba plan profile costs per token, when its quota is
+    // bought up front and a delegate there spends nothing extra.
     assert!(out.contains("Cost:"));
     assert!(out.contains("bills real USD"));
+    assert!(
+        out.contains("prepaid plan profile"),
+        "a prepaid plan must not read as pay-as-you-go: {out}",
+    );
 
     // cheapest-target pointer + delegate-framing nudge must survive a prose edit.
     assert!(

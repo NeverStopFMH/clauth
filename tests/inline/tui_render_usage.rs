@@ -281,6 +281,55 @@ fn tp_rows_disabled_profile_is_terminal() {
     );
 }
 
+/// A recognised-provider profile with NO credential its provider can use is
+/// never scheduled either, so it has the same hole. Reachable from the shipped
+/// TUI: a blank Setup key field stores `None`.
+#[test]
+fn tp_rows_uncredentialed_profile_is_terminal() {
+    let mut profile = crate::testutil::blank_profile("ds");
+    profile.base_url = Some("https://api.deepseek.com/anthropic".to_string());
+    profile.provider =
+        crate::providers::Provider::from_base_url("https://api.deepseek.com/anthropic");
+    profile.api_key = None;
+    let rendered: Vec<String> = build_tp_rows(&profile, 52, false, false, ResetFmt::default())
+        .iter()
+        .map(|l| l.spans.iter().map(|s| s.content.clone()).collect())
+        .collect();
+    assert!(
+        !rendered.iter().any(|l| l.contains("loading")),
+        "a profile no leg will fetch must not spin loading, got {rendered:?}"
+    );
+    assert!(
+        rendered.iter().any(|l| l.contains("no api key")),
+        "and it must name the fix, got {rendered:?}"
+    );
+}
+
+/// An Alibaba profile with a console session but NO api key is the inverse: it
+/// IS scheduled (its quota runs on the console session), so it must keep
+/// loading rather than claim a missing key.
+#[test]
+fn tp_rows_console_only_alibaba_still_loads() {
+    let mut profile = crate::testutil::blank_profile("qwen");
+    let base = "https://token-plan.ap-southeast-1.maas.aliyuncs.com/apps/anthropic";
+    profile.base_url = Some(base.to_string());
+    profile.provider = crate::providers::Provider::from_base_url(base);
+    profile.api_key = None;
+    profile.console = Some(crate::profile::ConsoleCredential {
+        token: "t".to_string(),
+        site: crate::profile::ConsoleSite::International,
+        region: "ap-southeast-1".to_string(),
+    });
+    let rendered: Vec<String> = build_tp_rows(&profile, 52, false, false, ResetFmt::default())
+        .iter()
+        .map(|l| l.spans.iter().map(|s| s.content.clone()).collect())
+        .collect();
+    assert!(
+        rendered.iter().any(|l| l.contains("loading")),
+        "a scheduled profile is still loading, got {rendered:?}"
+    );
+}
+
 /// With no fetched plan, the Usage `plan` row must match the Overview's tier
 /// label (`account_tier`) instead of a bare "oauth"/"api", so the two surfaces
 /// never disagree. A `subscription_type` claim renders as its tier.

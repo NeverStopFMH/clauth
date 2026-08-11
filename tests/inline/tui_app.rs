@@ -5471,11 +5471,12 @@ fn toast_bodies(app: &App) -> Vec<String> {
 /// compile-enforced — an array length can't be tied to a variant count without a
 /// derive crate — but the match below fails to compile first, which lands
 /// whoever adds a variant here.
-const ALL_STATUSES: [FetchStatus; 4] = [
+const ALL_STATUSES: [FetchStatus; 5] = [
     FetchStatus::Fresh,
     FetchStatus::Cached,
     FetchStatus::RateLimited,
     FetchStatus::Failed,
+    FetchStatus::AuthExpired,
 ];
 
 /// Exhaustiveness tripwire over `FetchStatus`. The gate keys on `== Fresh`, so
@@ -5485,7 +5486,10 @@ const ALL_STATUSES: [FetchStatus; 4] = [
 fn skips_the_one_shot(status: FetchStatus) -> bool {
     match status {
         FetchStatus::Fresh => false,
-        FetchStatus::Cached | FetchStatus::RateLimited | FetchStatus::Failed => true,
+        FetchStatus::Cached
+        | FetchStatus::RateLimited
+        | FetchStatus::Failed
+        | FetchStatus::AuthExpired => true,
     }
 }
 
@@ -5921,6 +5925,7 @@ fn mini_profile(name: &str, api_key: Option<&str>) -> Profile {
         check_scoped: true,
         bell_threshold: None,
         disabled: false,
+        console: None,
         credentials: None,
         usage: None,
         fetch_status: None,

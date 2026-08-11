@@ -981,6 +981,19 @@ fn status_lines(profile: &Profile, header: &HeaderState, inner_w: u16) -> Vec<Li
                 UsageDiag::Stale
             });
         }
+        Some(FetchStatus::AuthExpired) => {
+            // No countdown: the profile is session-suppressed, so there is no
+            // next attempt to count down to. Only a re-login (or a manual
+            // refresh, which retries once) moves this.
+            spans.extend([
+                Span::styled("[ ", theme::dim()),
+                Span::styled(
+                    "login expired",
+                    theme::danger().add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(" ]", theme::dim()),
+            ]);
+        }
         _ => match countdown {
             // A scheduled refresh is work lined up — the cloudy-tui `queued`
             // dot (`◌` in ACCENT), not a spinner: nothing is running yet.
@@ -1194,6 +1207,20 @@ fn build_tp_rows(
             match profile.fetch_status {
                 Some(FetchStatus::Failed) => "no usage available",
                 Some(FetchStatus::RateLimited) => "rate limited, retrying",
+                // The two ways a provider's usage credential can be unusable
+                // read differently to the operator, and the profile itself says
+                // which one this is.
+                Some(FetchStatus::AuthExpired) if profile.console.is_some() => {
+                    "console login expired, run clauth login"
+                }
+                Some(FetchStatus::AuthExpired) => "console login needed, run clauth login",
+                // A profile no leg will ever fetch must not claim to be
+                // loading — the same rule `oauth_empty_msg` applies. An Alibaba
+                // profile is never in here: its quota runs on the console
+                // session, so it is scheduled with or without an api key.
+                _ if !crate::usage::third_party_credentialed(profile) => {
+                    "no api key set, add one on the setup tab"
+                }
                 _ => "loading",
             }
         };

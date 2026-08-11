@@ -1,4 +1,5 @@
 mod actions;
+mod alibaba_login;
 mod claude;
 mod claude_json;
 mod cli;
@@ -452,6 +453,23 @@ fn cmd_login(args: LoginArgs) -> Result<()> {
         );
     }
 
+    // An Alibaba Model Studio profile's usage credential is a console session,
+    // not an OAuth pair: the api key can't read quota and an Anthropic login
+    // would mint tokens that endpoint has no use for. So a bare `clauth login`
+    // on one runs the console flow instead. Deliberately ahead of
+    // `confirm_reauth`: the session cannot be refreshed and lapses on a clock
+    // clauth does not own, so re-running this login is the routine repair
+    // rather than an overwrite to guard — and it replaces the console session
+    // and NOTHING else. Not the api key: the callback returns a workspace key
+    // for a different product, and `actions::store_console_login` exists to
+    // keep it off the profile.
+    if !is_api
+        && reauth
+        && config.find(&target).and_then(|p| p.provider) == Some(providers::Provider::Alibaba)
+    {
+        return cmd_login_console(&mut config, &target, args.model.as_deref());
+    }
+
     // Confirm a reauth BEFORE collecting anything (browser or key prompt): a
     // declined overwrite must not open a browser or read a secret.
     if reauth && !confirm_reauth(&target, is_api)? {
@@ -522,6 +540,35 @@ fn cmd_login(args: LoginArgs) -> Result<()> {
              {target} --clear"
         );
     }
+    Ok(())
+}
+
+/// The Alibaba arm of [`cmd_login`]: open the Model Studio console, catch the
+/// loopback callback, and store the session on the profile. The console front
+/// and region come from the profile's own `base_url`, so nothing is prompted
+/// for. The profile's api key is left alone — the callback's is workspace-scoped
+/// and belongs to a different product (see `actions::store_console_login`).
+fn cmd_login_console(config: &mut AppConfig, target: &str, model: Option<&str>) -> Result<()> {
+    let base_url = config
+        .find(target)
+        .and_then(|p| p.base_url.clone())
+        .unwrap_or_default();
+    let (site, region) = providers::alibaba::site_and_region(&base_url)
+        .context("this profile's endpoint is not an Alibaba Model Studio one")?;
+    outln!(
+        "clauth: opening the Alibaba Model Studio console to capture a usage session for '{target}'…"
+    );
+    let outcome = alibaba_login::login_with(site, region, |url| {
+        outln!("\nIf the browser didn't open, visit this URL to sign in:\n{url}\n");
+    })?;
+    actions::store_console_login(config, target, outcome.console.clone())?;
+    if let Some(model) = model {
+        actions::set_profile_default_model(config, target, model)?;
+    }
+    outln!(
+        "clauth: console session captured for '{target}'.\n{}",
+        alibaba_login::login_summary(&outcome)
+    );
     Ok(())
 }
 

@@ -2972,23 +2972,69 @@ fn deadline_spread_is_bounded_per_profile_and_per_cycle() {
     assert_eq!(deadline_spread("alpha", now, 0).0, 0);
 }
 
-/// `filter_suppressed` drops third-party entries whose name is in the session
-/// suppressed set and passes the rest through in order; an empty set (the steady
-/// state for healthy profiles) is a no-op fast path.
+/// `filter_suppressed` drops third-party entries suppressed under the SAME
+/// credential they still carry, and passes the rest through in order; an empty
+/// map (the steady state for healthy profiles) is a no-op fast path.
 #[test]
 fn filter_suppressed_drops_only_named_entries() {
-    let suppressed: SuppressedGenericStore = Arc::new(RankedMutex::new(HashSet::new()));
-    suppressed.lock().unwrap().insert("no-data".to_string());
+    let suppressed: SuppressedGenericStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let victim = tp_entry("no-data");
+    suppressed
+        .lock()
+        .unwrap()
+        .insert("no-data".to_string(), victim.credential_fingerprint());
 
     let snap = vec![tp_entry("ok"), tp_entry("no-data"), tp_entry("also-ok")];
     let out = filter_suppressed(&suppressed, snap);
     let names: Vec<&str> = out.iter().map(|e| e.name.as_str()).collect();
     assert_eq!(names, vec!["ok", "also-ok"]);
 
-    // Empty set → identity (the fast path).
-    let empty: SuppressedGenericStore = Arc::new(RankedMutex::new(HashSet::new()));
+    // Empty map → identity (the fast path).
+    let empty: SuppressedGenericStore = Arc::new(RankedMutex::new(HashMap::new()));
     let snap2 = vec![tp_entry("ok"), tp_entry("no-data")];
     assert_eq!(filter_suppressed(&empty, snap2).len(), 2);
+}
+
+/// A re-login is the ONLY thing that can clear an `AuthExpired`, and a headless
+/// daemon has no `refetch_queue` writer — nothing in `src/daemon/` ever inserts
+/// one, so a name-keyed suppression outlived every re-login until the process
+/// restarted. The daemon DOES rebuild these entries from the reloaded config
+/// (`daemon::tick::rebuild_tokens`), so the changed credential is the signal.
+#[test]
+fn filter_suppressed_re_admits_an_entry_whose_credential_changed() {
+    let suppressed: SuppressedGenericStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let expired = alibaba_entry("qwen", "dead-console-token");
+    suppressed
+        .lock()
+        .unwrap()
+        .insert("qwen".to_string(), expired.credential_fingerprint());
+
+    // Same credential → still suppressed, no cadence retry.
+    assert!(filter_suppressed(&suppressed, vec![expired]).is_empty());
+
+    // Re-login wrote a new console session; the rebuilt entry carries it.
+    let relogged = alibaba_entry("qwen", "fresh-console-token");
+    let out = filter_suppressed(&suppressed, vec![relogged]);
+    assert_eq!(
+        out.len(),
+        1,
+        "a re-login must re-admit the profile without a restart or a timer",
+    );
+}
+
+/// The api key is part of the fingerprint too, so the generic no-data
+/// suppression clears on a rotated key by the same mechanism.
+#[test]
+fn filter_suppressed_re_admits_a_generic_entry_on_a_rotated_key() {
+    let suppressed: SuppressedGenericStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let old = tp_entry("proxy");
+    suppressed
+        .lock()
+        .unwrap()
+        .insert("proxy".to_string(), old.credential_fingerprint());
+    let mut rotated = tp_entry("proxy");
+    rotated.api_key = "a-different-key".to_string();
+    assert_eq!(filter_suppressed(&suppressed, vec![rotated]).len(), 1);
 }
 
 fn tp_entry(name: &str) -> ThirdPartyEntry {
@@ -2999,6 +3045,50 @@ fn tp_entry(name: &str) -> ThirdPartyEntry {
         },
         api_key: "key".to_string(),
     }
+}
+
+fn alibaba_entry(name: &str, token: &str) -> ThirdPartyEntry {
+    ThirdPartyEntry {
+        name: name.to_string(),
+        target: crate::providers::ThirdPartyTarget::Known {
+            provider: crate::providers::Provider::Alibaba,
+            console: Some(crate::profile::ConsoleCredential {
+                token: token.to_string(),
+                site: crate::profile::ConsoleSite::International,
+                region: "ap-southeast-1".to_string(),
+            }),
+        },
+        api_key: String::new(),
+    }
+}
+
+/// Alibaba's quota surface cannot read the api key at all, so a console-only
+/// profile is still fetchable. Dropped from the work list it would never get a
+/// `fetch_status`, and the Usage tab would spin "loading" forever.
+#[test]
+fn collect_third_party_entries_keeps_a_keyless_alibaba_profile() {
+    let mut p = crate::testutil::blank_profile("qwen");
+    p.base_url =
+        Some("https://token-plan.ap-southeast-1.maas.aliyuncs.com/apps/anthropic".to_string());
+    p.provider =
+        crate::providers::Provider::from_base_url(p.base_url.as_deref().unwrap_or_default());
+    p.api_key = None;
+
+    let entries = collect_third_party_entries(std::slice::from_ref(&p));
+    assert_eq!(
+        entries.len(),
+        1,
+        "a console-only Alibaba profile still belongs on the third-party leg",
+    );
+    assert!(crate::usage::third_party_credentialed(&p));
+
+    // A keyless DeepSeek profile has no credential at all and stays out — the
+    // render layer says so instead of loading forever.
+    let mut ds = crate::testutil::blank_profile("ds");
+    ds.base_url = Some("https://api.deepseek.com/anthropic".to_string());
+    ds.provider = crate::providers::Provider::from_base_url("https://api.deepseek.com/anthropic");
+    assert!(!crate::usage::third_party_credentialed(&ds));
+    assert!(collect_third_party_entries(std::slice::from_ref(&ds)).is_empty());
 }
 
 /// Third-party startup seed mirrors the OAuth one: any cached profile is seeded
@@ -3609,7 +3699,7 @@ fn standdown_tick_drains_forced_and_publishes_countdowns() {
         third_party_tokens: Arc::new(RankedMutex::new(vec![])),
         third_party_usage_store: Arc::new(RankedMutex::new(HashMap::new())),
         third_party_status: Arc::new(RankedMutex::new(HashMap::new())),
-        suppressed_generic: Arc::new(RankedMutex::new(HashSet::new())),
+        suppressed_generic: Arc::new(RankedMutex::new(HashMap::new())),
         shutting_down: Arc::new(AtomicBool::new(false)),
         fetch_lease: Arc::new(crate::daemon::FetchLease::new()),
         standdown_active: AtomicBool::new(true),
@@ -3690,7 +3780,7 @@ fn standdown_sweeps_bootstrap_queued_marks() {
         third_party_tokens: Arc::new(RankedMutex::new(vec![])),
         third_party_usage_store: Arc::new(RankedMutex::new(HashMap::new())),
         third_party_status: Arc::new(RankedMutex::new(HashMap::new())),
-        suppressed_generic: Arc::new(RankedMutex::new(HashSet::new())),
+        suppressed_generic: Arc::new(RankedMutex::new(HashMap::new())),
         shutting_down: Arc::new(AtomicBool::new(false)),
         fetch_lease: Arc::new(crate::daemon::FetchLease::new()),
         standdown_active: AtomicBool::new(true),
@@ -3769,7 +3859,7 @@ fn tick_stands_down_when_another_instance_holds_the_fetch_lease() {
         third_party_tokens: Arc::new(RankedMutex::new(vec![])),
         third_party_usage_store: Arc::new(RankedMutex::new(HashMap::new())),
         third_party_status: Arc::new(RankedMutex::new(HashMap::new())),
-        suppressed_generic: Arc::new(RankedMutex::new(HashSet::new())),
+        suppressed_generic: Arc::new(RankedMutex::new(HashMap::new())),
         shutting_down: Arc::new(AtomicBool::new(false)),
         // A DIFFERENT lease over the same file → its acquire() is denied while
         // `other` holds the flock.
@@ -3865,7 +3955,7 @@ fn tick_fetches_the_third_party_leg_under_its_own_lease() {
         third_party_tokens: Arc::new(RankedMutex::new(vec![entry])),
         third_party_usage_store: Arc::new(RankedMutex::new(HashMap::new())),
         third_party_status: Arc::new(RankedMutex::new(HashMap::new())),
-        suppressed_generic: Arc::new(RankedMutex::new(HashSet::new())),
+        suppressed_generic: Arc::new(RankedMutex::new(HashMap::new())),
         shutting_down: Arc::new(AtomicBool::new(false)),
         // Nothing else holds the flock, so this tick is the fetcher.
         fetch_lease: Arc::new(crate::daemon::FetchLease::new()),
@@ -3978,7 +4068,7 @@ fn tick_prunes_histories_and_throttles_a_second_tick_inside_the_cadence_window()
         third_party_tokens: Arc::new(RankedMutex::new(vec![entry])),
         third_party_usage_store: Arc::new(RankedMutex::new(HashMap::new())),
         third_party_status: Arc::new(RankedMutex::new(HashMap::new())),
-        suppressed_generic: Arc::new(RankedMutex::new(HashSet::new())),
+        suppressed_generic: Arc::new(RankedMutex::new(HashMap::new())),
         shutting_down: Arc::new(AtomicBool::new(false)),
         fetch_lease: Arc::new(crate::daemon::FetchLease::new()),
         standdown_active: AtomicBool::new(false),
@@ -4215,7 +4305,7 @@ fn completion_order_state() -> super::SchedulerState {
         third_party_tokens: Arc::new(RankedMutex::new(vec![])),
         third_party_usage_store: Arc::new(RankedMutex::new(HashMap::new())),
         third_party_status: Arc::new(RankedMutex::new(HashMap::new())),
-        suppressed_generic: Arc::new(RankedMutex::new(HashSet::new())),
+        suppressed_generic: Arc::new(RankedMutex::new(HashMap::new())),
         shutting_down: Arc::new(AtomicBool::new(false)),
         fetch_lease: Arc::new(crate::daemon::FetchLease::new()),
         standdown_active: AtomicBool::new(false),
@@ -4885,7 +4975,7 @@ fn spawn_refresher_seeds_kick_blocks_before_returning() {
         Arc::new(RankedMutex::new(vec![])),
         Arc::new(RankedMutex::new(HashMap::new())),
         Arc::new(RankedMutex::new(HashMap::new())),
-        Arc::new(RankedMutex::new(HashSet::new())),
+        Arc::new(RankedMutex::new(HashMap::new())),
         // Pre-armed shutdown: if the `cfg!(test)` spawn-skip is ever removed
         // while the seed hoist stays, the tick thread this would spawn breaks
         // at its loop-top check instead of looping past this sandbox teardown.
@@ -5230,7 +5320,7 @@ fn spawn_refresher_prunes_stale_history_before_returning() {
         Arc::new(RankedMutex::new(vec![])),
         Arc::new(RankedMutex::new(HashMap::new())),
         Arc::new(RankedMutex::new(HashMap::new())),
-        Arc::new(RankedMutex::new(HashSet::new())),
+        Arc::new(RankedMutex::new(HashMap::new())),
         // Same pre-armed shutdown as the kick-block seed test: if the
         // `cfg!(test)` spawn-skip ever goes while this hoist stays, the tick
         // thread breaks at its loop top instead of outliving the sandbox.

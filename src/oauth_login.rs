@@ -59,7 +59,11 @@ fn base64url_nopad(input: &[u8]) -> String {
 
 /// Percent-encode a query-parameter value (encode everything but RFC 3986
 /// unreserved chars) so scope spaces/colons and the redirect URI survive.
-fn percent_encode(s: &str) -> String {
+///
+/// Shared with the Alibaba console login and its gateway calls, which encode
+/// query values and form bodies against the same rule — a second copy would be
+/// a second thing to get wrong.
+pub(crate) fn percent_encode(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for &b in s.as_bytes() {
         match b {
@@ -73,7 +77,7 @@ fn percent_encode(s: &str) -> String {
 }
 
 /// Inverse of [`percent_encode`] for the callback query values. `+` → space.
-fn percent_decode(s: &str) -> String {
+pub(crate) fn percent_decode(s: &str) -> String {
     let bytes = s.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
@@ -105,8 +109,9 @@ fn percent_decode(s: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
-/// Percent-decoded value of `key` in an `a=1&b=2` query string.
-fn query_param(query: &str, key: &str) -> Option<String> {
+/// Percent-decoded value of `key` in an `a=1&b=2` query string. Also serves the
+/// Alibaba console callback, whose params arrive in a body of the same shape.
+pub(crate) fn query_param(query: &str, key: &str) -> Option<String> {
     query.split('&').find_map(|pair| {
         let (k, v) = pair.split_once('=')?;
         (k == key).then(|| percent_decode(v))

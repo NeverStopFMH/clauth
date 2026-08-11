@@ -140,11 +140,19 @@ fn api_origin_none_without_scheme_delimiter() {
 fn throttle_key_known_provider_uses_canonical_origin() {
     // Distinct providers key distinct hosts so they pace independently.
     assert_eq!(
-        ThirdPartyTarget::Known(Provider::DeepSeek).throttle_key(),
+        ThirdPartyTarget::Known {
+            provider: Provider::DeepSeek,
+            console: None,
+        }
+        .throttle_key(),
         "https://api.deepseek.com"
     );
     assert_eq!(
-        ThirdPartyTarget::Known(Provider::Zai).throttle_key(),
+        ThirdPartyTarget::Known {
+            provider: Provider::Zai,
+            console: None,
+        }
+        .throttle_key(),
         "https://api.z.ai"
     );
 }

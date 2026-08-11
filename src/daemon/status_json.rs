@@ -37,6 +37,10 @@ pub(crate) const SCHEMA_VERSION: u64 = 1;
 /// user for the duration.
 pub(crate) struct LiveSignals<'a> {
     pub(crate) status: &'a HashMap<String, FetchStatus>,
+    /// The THIRD-PARTY leg's outcomes, kept as a separate map rather than merged
+    /// into `status`: `stale` below is contracted as a stuck 429 read off the
+    /// OAuth store, and folding the two would silently retarget it.
+    pub(crate) third_party_status: &'a HashMap<String, FetchStatus>,
     pub(crate) next_refresh: &'a HashMap<String, u64>,
     /// Consecutive-429 streaks, so a profile whose live `status` is `RateLimited`
     /// AND whose streak has passed the active cap can be published as `stale` (a
@@ -56,6 +60,7 @@ fn fetch_status_str(s: FetchStatus) -> &'static str {
         FetchStatus::Cached => "Cached",
         FetchStatus::Failed => "Failed",
         FetchStatus::RateLimited => "RateLimited",
+        FetchStatus::AuthExpired => "AuthExpired",
     }
 }
 
@@ -135,12 +140,21 @@ pub(crate) fn build_status(
             };
             let mtime_ms = profile_cache_mtime_ms(name, cache_file);
 
-            // fetch_status: the live store when a daemon is running, else
+            // fetch_status: the live stores when a daemon is running, else
             // derive from cache freshness (Fresh within one interval, else
-            // Cached). The live store only carries the OAuth leg's outcomes,
-            // so a name missing from it (api-key profiles, a just-started
-            // daemon) falls back to the same derivation rather than reading
-            // as never-fetched; null = no cache at all.
+            // Cached). A name in NEITHER live store (a just-started daemon, the
+            // single-shot `status --json`) falls back to that derivation rather
+            // than reading as never-fetched; null = no cache at all.
+            //
+            // Both stores are consulted, OAuth first — the same precedence the
+            // TUI's own merge applies, so the two surfaces can't disagree about
+            // a hybrid. Reading `status` alone left every third-party outcome to
+            // the mtime derivation, which can only ever say Fresh/Cached/null:
+            // an `AuthExpired` session writes no cache and published `null`
+            // (indistinguishable from never fetched), a 429 published a
+            // freshness claim about a rejected poll, and an `AuthExpired` over a
+            // stale cache published `Fresh` — a dead session reading as live,
+            // which is the outcome this status exists to prevent.
             let derived_status = || {
                 mtime_ms.map(|mt| {
                     if now.saturating_sub(mt) < interval_ms {
@@ -150,14 +164,28 @@ pub(crate) fn build_status(
                     }
                 })
             };
+            // Durable dead-credential verdict, consulted when no live store has
+            // an answer. It outranks the mtime derivation because that
+            // derivation can only ever say Fresh/Cached: without this, a warm
+            // cache behind a session that will NEVER self-heal published
+            // "Fresh" — a live measurement over a dead credential, on every
+            // daemonless surface. Bound to the credential that produced it, so
+            // a re-login retires it and a profile nothing ever fetched has none.
+            let recorded_expired = || {
+                crate::usage::profile_credential_fingerprint(p)
+                    .is_some_and(|fp| crate::profile_cache::auth_expired_matches(name, fp))
+                    .then_some(fetch_status_str(FetchStatus::AuthExpired))
+            };
             let fetch_status: Option<&'static str> = match live {
                 Some(sig) => sig
                     .status
                     .get(name)
+                    .or_else(|| sig.third_party_status.get(name))
                     .copied()
                     .map(fetch_status_str)
+                    .or_else(recorded_expired)
                     .or_else(derived_status),
-                None => derived_status(),
+                None => recorded_expired().or_else(derived_status),
             };
 
             // next_refresh_at: the live countdown store, else mtime + interval
@@ -182,10 +210,12 @@ pub(crate) fn build_status(
 
             // `stale` = the daemon distrusts this reading — a deep-slot stuck
             // RateLimited (live status RateLimited AND the 429 streak past the
-            // active cap). Read from the LIVE store, not the mtime-derived
-            // fetch_status string (which never yields RateLimited), so it is only
-            // ever true under a real daemon. The single-shot has no streaks →
-            // always false. Same predicate `scan_auto_switch` distrusts, so the
+            // active cap). Read from the OAuth `status` store ALONE, deliberately
+            // narrower than the `fetch_status` above: the streak counter it pairs
+            // with is written only by `apply_outcome`, the OAuth leg's own
+            // handler, so a third-party 429 has no streak to judge and would
+            // always read as a shallow one. Never true for the single-shot (no
+            // streaks). Same predicate `scan_auto_switch` distrusts, so the
             // published flag and the switch decision cannot drift.
             let stale = match live {
                 Some(sig) => sig.status.get(name).copied().is_some_and(|s| {

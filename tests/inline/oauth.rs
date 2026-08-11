@@ -67,6 +67,7 @@ fn single_profile_config(name: &str, refresh_token: &str) -> AppConfig {
         check_scoped: true,
         bell_threshold: None,
         disabled: false,
+        console: None,
         credentials: Some(ClaudeCredentials {
             claude_ai_oauth: Some(OAuthToken {
                 access_token: "at".to_string(),
@@ -192,6 +193,7 @@ fn rotate_one_no_stamp_when_no_refresh_token() {
         check_scoped: true,
         bell_threshold: None,
         disabled: false,
+        console: None,
         credentials: Some(ClaudeCredentials {
             claude_ai_oauth: Some(OAuthToken {
                 access_token: "at".to_string(),
@@ -247,6 +249,7 @@ fn profile_without_refresh_token_excluded() {
         check_scoped: true,
         bell_threshold: None,
         disabled: false,
+        console: None,
         credentials: Some(ClaudeCredentials {
             claude_ai_oauth: Some(OAuthToken {
                 access_token: "at".to_string(),
@@ -338,6 +341,7 @@ fn oauth_config(name: &str, refresh_token: Option<&str>, expires_at: Option<i64>
         check_scoped: true,
         bell_threshold: None,
         disabled: false,
+        console: None,
         credentials: Some(ClaudeCredentials {
             claude_ai_oauth: Some(OAuthToken {
                 access_token: "at-old".to_string(),
@@ -378,6 +382,7 @@ fn third_party_config(name: &str) -> AppConfig {
         check_scoped: true,
         bell_threshold: None,
         disabled: false,
+        console: None,
         credentials: None,
         usage: None,
         fetch_status: None,

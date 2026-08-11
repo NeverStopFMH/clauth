@@ -188,7 +188,76 @@ pub(crate) struct TokenEntry {
 pub(crate) struct ThirdPartyEntry {
     pub(crate) name: String,
     pub(crate) target: crate::providers::ThirdPartyTarget,
+    /// Empty for a provider whose usage surface doesn't read one (Alibaba,
+    /// whose quota runs on the console session in `target`).
     pub(crate) api_key: String,
+}
+
+impl ThirdPartyEntry {
+    /// Fingerprint of the credential this entry would fetch with.
+    ///
+    /// Session suppression is keyed on it, which is what makes a re-login
+    /// observable to a HEADLESS daemon: the daemon inserts nothing into
+    /// `refetch_queue` (only the TUI's manual refresh does), so a suppressed
+    /// name recorded by name alone stayed suppressed until the process
+    /// restarted — even after `daemon::tick::rebuild_tokens` had already
+    /// rebuilt this entry from the reloaded config with the new credential.
+    /// Comparing fingerprints re-admits it the moment the credential on disk
+    /// differs from the one the suppression was recorded under, and never on a
+    /// schedule.
+    ///
+    /// A hash rather than the value, so no second copy of a live secret exists —
+    /// which matters because this value is also PERSISTED, as the key of the
+    /// dead-credential record the daemonless surfaces read
+    /// (`profile_cache::THIRD_PARTY_AUTH_FILE`). Persistence is why it is
+    /// SHA-256 over an explicit encoding rather than `DefaultHasher` over
+    /// `Hash`: neither of those is stable across toolchain versions, and a
+    /// fingerprint that silently changed under a rebuild would retire every
+    /// record on disk. Changing this encoding has the same effect, so treat it
+    /// as a format. A collision costs one profile one extra suppressed cadence.
+    pub(crate) fn credential_fingerprint(&self) -> u64 {
+        use sha2::{Digest as _, Sha256};
+        /// Length-delimited so no two field splits can collide (`ab|c` vs `a|bc`).
+        fn field(hasher: &mut Sha256, bytes: &[u8]) {
+            hasher.update((bytes.len() as u64).to_le_bytes());
+            hasher.update(bytes);
+        }
+        let mut hasher = Sha256::new();
+        field(&mut hasher, self.api_key.as_bytes());
+        match &self.target {
+            crate::providers::ThirdPartyTarget::Known { provider, console } => {
+                field(&mut hasher, b"known");
+                // A literal per variant, NOT `display_name`: that is user-facing
+                // copy and may be reworded, which would silently reset every
+                // recorded fingerprint.
+                field(
+                    &mut hasher,
+                    match provider {
+                        crate::providers::Provider::DeepSeek => b"deepseek".as_slice(),
+                        crate::providers::Provider::Zai => b"zai".as_slice(),
+                        crate::providers::Provider::Alibaba => b"alibaba".as_slice(),
+                    },
+                );
+                match console {
+                    Some(c) => {
+                        field(&mut hasher, b"console");
+                        field(&mut hasher, c.token.as_bytes());
+                        field(&mut hasher, c.site.as_str().as_bytes());
+                        field(&mut hasher, c.region.as_bytes());
+                    }
+                    None => field(&mut hasher, b"no-console"),
+                }
+            }
+            crate::providers::ThirdPartyTarget::Generic { base_url } => {
+                field(&mut hasher, b"generic");
+                field(&mut hasher, base_url.as_bytes());
+            }
+        }
+        let digest = hasher.finalize();
+        let mut head = [0u8; 8];
+        head.copy_from_slice(&digest[..8]);
+        u64::from_le_bytes(head)
+    }
 }
 
 /// Profile-name accessor shared by the OAuth and third-party entry types so
@@ -235,11 +304,22 @@ pub(crate) type ThirdPartyUsageStore =
     Arc<RankedMutex<HashMap<String, ThirdPartyStats>, rank::ThirdPartyUsageStore>>;
 pub(crate) type ThirdPartyStatusStore =
     Arc<RankedMutex<HashMap<String, FetchStatus>, rank::ThirdPartyStatus>>;
-/// Session-scoped (in-memory) set of generic profiles whose last fetch yielded
-/// no data, suppressed from the timer until a manual refresh clears them. Never
-/// persisted — clears when the TUI process exits. Known providers and 429s are
-/// never added (429 keeps the server-directed deferral).
-pub(crate) type SuppressedGenericStore = Arc<RankedMutex<HashSet<String>, rank::SuppressedGeneric>>;
+/// Session-scoped (in-memory) map of third-party profiles suppressed from the
+/// timer, each recorded against the credential fingerprint it failed under
+/// ([`ThirdPartyEntry::credential_fingerprint`]). Never persisted — clears when
+/// the process exits.
+///
+/// Two admissions, and the type name records only the first: a GENERIC profile
+/// whose last fetch yielded no data, and ANY profile whose usage credential is
+/// dead ([`FetchStatus::AuthExpired`] — a known provider can hit that one).
+/// 429s are never added; they keep the server-directed deferral instead.
+///
+/// Cleared by a manual refresh (the TUI's `refetch_queue`) OR by the credential
+/// changing on disk, which is the only clearing path a headless daemon has.
+/// A leftover row whose fingerprint no longer matches anything is inert: it
+/// filters nothing and the next suppression for that name overwrites it.
+pub(crate) type SuppressedGenericStore =
+    Arc<RankedMutex<HashMap<String, u64>, rank::SuppressedGeneric>>;
 
 /// Per-profile next-fetch epoch-ms. Written after each `partition_due` run for
 /// overview countdown display without re-running the partition math on the render thread.
@@ -354,6 +434,14 @@ pub(crate) enum FetchStatus {
     Failed,
     /// API returned 429 (endpoint-level rate limit); numbers come from on-disk cache.
     RateLimited,
+    /// The provider's usage credential is dead or absent and no refresh path
+    /// exists — only an operator re-login clears it, so the profile is
+    /// session-suppressed rather than re-polled, and re-admitted when the
+    /// credential on disk changes. Third-party only (Alibaba's console session,
+    /// whose window is set by the operator's browser sign-in and cannot be
+    /// extended from here); the OAuth leg has its own `auth_broken` quarantine
+    /// for the analogous state.
+    AuthExpired,
 }
 
 /// Rotated (access, refresh) pair from an in-fetch rotation. Propagated back into
@@ -1683,21 +1771,63 @@ pub(crate) fn collect_third_party_entries(
     profiles
         .iter()
         .filter(|p| !p.is_disabled())
-        .filter_map(|p| {
-            let api_key = p.api_key.clone()?;
-            let target = if let Some(provider) = p.provider {
-                crate::providers::ThirdPartyTarget::Known(provider)
-            } else {
-                let base_url = p.base_url.clone()?;
-                crate::providers::ThirdPartyTarget::Generic { base_url }
-            };
-            Some(ThirdPartyEntry {
-                name: p.name.to_string(),
-                target,
-                api_key,
-            })
-        })
+        .filter_map(third_party_entry_for)
         .collect()
+}
+
+/// One profile's third-party entry, or `None` when its provider has no usable
+/// credential. The single construction site: the work list above filters it by
+/// disabled-ness, and [`profile_credential_fingerprint`] takes its fingerprint,
+/// so the identity the scheduler suppresses on and the identity a persisted
+/// record is keyed by can never be two different things.
+fn third_party_entry_for(p: &crate::profile::Profile) -> Option<ThirdPartyEntry> {
+    if !third_party_credentialed(p) {
+        return None;
+    }
+    let target = if let Some(provider) = p.provider {
+        // The console credential rides the target because one provider's usage
+        // surface can't read the api key at all (Alibaba); the others carry
+        // `None` and never look.
+        crate::providers::ThirdPartyTarget::Known {
+            provider,
+            console: p.console.clone(),
+        }
+    } else {
+        crate::providers::ThirdPartyTarget::Generic {
+            base_url: p.base_url.clone()?,
+        }
+    };
+    Some(ThirdPartyEntry {
+        name: p.name.to_string(),
+        target,
+        api_key: p.api_key.clone().unwrap_or_default(),
+    })
+}
+
+/// Fingerprint of the credential `p` would fetch with. Deliberately NOT gated on
+/// disabled-ness: credential identity is a property of the credential, not of
+/// whether the profile is currently scheduled.
+pub(crate) fn profile_credential_fingerprint(p: &crate::profile::Profile) -> Option<u64> {
+    third_party_entry_for(p).map(|e| e.credential_fingerprint())
+}
+
+/// Whether the third-party leg can fetch this profile at all — the credential
+/// test [`collect_third_party_entries`] applies, hoisted so the RENDER layer
+/// reads the same rule instead of restating it. A profile this returns `false`
+/// for never gets a `fetch_status`, so the Usage tab must say so rather than
+/// spin on "loading" forever (`docs/providers.md`, issue #2).
+///
+/// Disabled-ness is deliberately not part of it: that is a separate axis, and
+/// both callers already handle it themselves.
+pub(crate) fn third_party_credentialed(p: &crate::profile::Profile) -> bool {
+    match p.provider {
+        // Alibaba's quota surface cannot read the api key (`providers::alibaba`),
+        // so a console-only profile is fetchable and a keyless one must still be
+        // scheduled — its fetch reports the missing session as `AuthExpired`,
+        // which is an answer, where being dropped is a permanent "loading".
+        Some(crate::providers::Provider::Alibaba) => true,
+        _ => p.api_key.is_some(),
+    }
 }
 
 /// Collect the OAuth profiles' token snapshots for the refresher's `TokenList`.
@@ -1749,14 +1879,24 @@ pub(crate) fn collect_oauth_seed_names(config: &crate::profile::AppConfig) -> Ve
         .collect()
 }
 
-/// Remove session-suppressed generic profiles from the third-party snapshot so
-/// they aren't re-fetched on the timer. The set is cloned once (it is small) so
-/// no lock is held across the filter; a poisoned lock passes the snapshot through.
+/// Remove session-suppressed profiles from the third-party snapshot so they
+/// aren't re-fetched on the timer. A poisoned lock passes the snapshot through.
+///
+/// An entry stays suppressed only while it still carries the credential it was
+/// suppressed under. That comparison is the whole clearing path for a headless
+/// daemon: nothing in `src/daemon/` writes `refetch_queue` (the TUI's manual
+/// refresh is its only producer), so keying on the bare name pinned an
+/// `AuthExpired` profile until the process restarted, even though the daemon
+/// had already rebuilt the entry from the reloaded config with the new session.
+///
+/// The guard is held across the filter deliberately: the closure takes no other
+/// lock, so there is no ordering hazard for `lockorder` to police, and cloning
+/// the map to avoid it would copy state this loop is the only reader of.
 fn filter_suppressed(
     suppressed: &SuppressedGenericStore,
     snapshot: Vec<ThirdPartyEntry>,
 ) -> Vec<ThirdPartyEntry> {
-    let Some(sup) = suppressed.lock().ok() else {
+    let Ok(sup) = suppressed.lock() else {
         return snapshot;
     };
     if sup.is_empty() {
@@ -1764,7 +1904,10 @@ fn filter_suppressed(
     }
     snapshot
         .into_iter()
-        .filter(|e| !sup.contains(&e.name))
+        .filter(|e| {
+            sup.get(&e.name)
+                .is_none_or(|recorded| *recorded != e.credential_fingerprint())
+        })
         .collect()
 }
 
@@ -1898,12 +2041,17 @@ fn fetch_third_party_due(state: &SchedulerState, due: Vec<ThirdPartyEntry>) {
         .into_iter()
         .map(|entry| {
             let name = entry.name.clone();
-            // Only generic no-data outcomes get session-suppressed; known
-            // providers keep retrying on their normal cadence.
+            // Generic-ness is only HALF the suppression gate (see the outcome
+            // handler below): a generic profile suppresses on a no-data result,
+            // while a dead usage credential suppresses whatever the provider.
+            // On everything else a known provider keeps its normal cadence.
             let is_generic = matches!(
                 entry.target,
                 crate::providers::ThirdPartyTarget::Generic { .. }
             );
+            // Captured before the entry moves into the worker: suppression is
+            // recorded against the credential that failed, never the bare name.
+            let fingerprint = entry.credential_fingerprint();
             // Reuse the endpoint that last worked so steady state is one request.
             let hint = state
                 .third_party_usage_store
@@ -1924,14 +2072,17 @@ fn fetch_third_party_due(state: &SchedulerState, due: Vec<ThirdPartyEntry>) {
                     hint.as_deref(),
                 )
             });
-            (name, is_generic, h)
+            (name, is_generic, fingerprint, h)
         })
         .collect();
 
-    for (name, is_generic, h) in handles {
+    for (name, is_generic, fingerprint, h) in handles {
         match h.join() {
             Ok(Ok(stats)) => {
                 clear_activity(&state.activity, &name);
+                // A live body retires any dead-credential record: the surfaces
+                // that read it have no other way to learn the session came back.
+                crate::profile_cache::clear_auth_expired(&name);
                 write_profile_cache(&name, THIRD_PARTY_CACHE_FILE, &stats);
                 if let Ok(mut store) = state.third_party_usage_store.lock() {
                     store.insert(name.clone(), stats);
@@ -1960,6 +2111,13 @@ fn fetch_third_party_due(state: &SchedulerState, due: Vec<ThirdPartyEntry>) {
                     crate::providers::ThirdPartyError::RateLimited { retry_after } => {
                         (FetchStatus::RateLimited, *retry_after)
                     }
+                    // Ahead of the cache arm on purpose: a cached copy still
+                    // renders (the cold-fill below is unchanged), but the STATUS
+                    // has to name the dead credential — `Cached` would read as a
+                    // transient blip on a state only a re-login clears.
+                    crate::providers::ThirdPartyError::AuthExpired => {
+                        (FetchStatus::AuthExpired, None)
+                    }
                     _ if cached.is_some() => (FetchStatus::Cached, None),
                     _ => (FetchStatus::Failed, None),
                 };
@@ -1971,15 +2129,31 @@ fn fetch_third_party_due(state: &SchedulerState, due: Vec<ThirdPartyEntry>) {
                 if let Ok(mut st) = state.third_party_status.lock() {
                     st.insert(name.clone(), status);
                 }
-                // A generic profile that tried and found nothing (no cache, not a
-                // 429) suppresses for the rest of the session — no timer retry,
-                // only a manual refresh re-admits it for one retry. 429 keeps the
-                // server-directed deferral; cached/known-provider legs are unaffected.
-                if is_generic
-                    && matches!(status, FetchStatus::Failed)
+                // Two outcomes suppress for the rest of the session — no timer
+                // retry, only a manual refresh re-admits one for a single try. A
+                // generic profile that tried and found nothing (no cache, not a
+                // 429), and ANY profile whose usage credential is dead: the
+                // cadence can't fix either, and only the second can happen to a
+                // known provider. 429 keeps the server-directed deferral;
+                // cached legs are unaffected.
+                if (matches!(status, FetchStatus::AuthExpired)
+                    || (is_generic && matches!(status, FetchStatus::Failed)))
                     && let Ok(mut sup) = state.suppressed_generic.lock()
                 {
-                    sup.insert(name.clone());
+                    sup.insert(name.clone(), fingerprint);
+                }
+                // Durable twin of that suppression, for the surfaces with no
+                // scheduler in the process (`clauth list`, `clauth status
+                // --json`): without it they derive freshness from the usage
+                // cache's mtime and publish a warm cache behind a dead session
+                // as `Fresh`. Keyed by the same fingerprint, so a re-login
+                // retires it. Cleared on every other outcome — the verdict is
+                // "the last fetch under THIS credential was AuthExpired", so
+                // one that isn't must not leave it standing.
+                if matches!(status, FetchStatus::AuthExpired) {
+                    crate::profile_cache::write_auth_expired(&name, fingerprint);
+                } else {
+                    crate::profile_cache::clear_auth_expired(&name);
                 }
                 stamp_last_fetched(
                     &state.last_fetched,

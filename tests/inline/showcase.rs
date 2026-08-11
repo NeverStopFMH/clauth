@@ -298,6 +298,7 @@ fn oauth_profile(
         check_scoped: true,
         bell_threshold: None,
         disabled: false,
+        console: None,
         credentials: None,
         usage: Some(UsageInfo {
             plan: Some(PlanInfo {
@@ -336,6 +337,7 @@ fn api_profile(name: &str) -> Profile {
         check_scoped: true,
         bell_threshold: None,
         disabled: false,
+        console: None,
         credentials: None,
         usage: None,
         fetch_status: None,
@@ -361,6 +363,7 @@ fn failed_profile(name: &str) -> Profile {
         check_scoped: true,
         bell_threshold: None,
         disabled: false,
+        console: None,
         credentials: None,
         usage: None,
         fetch_status: Some(FetchStatus::Failed),

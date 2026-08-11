@@ -23,7 +23,8 @@ pub(crate) use scheduler::{
     ThirdPartyUsageStore, TokenList, UsageStore, any_busy, bootstrap_fetch, bootstrap_third_party,
     clear_activity, collect_oauth_seed_names, collect_third_party_entries, collect_tokens, is_idle,
     is_stuck_rate_limited, is_stuck_streak, kick_block_switch_grade, mark_activity,
-    spawn_refresher, switch_gate_in_flight, switch_grade_kick_lifts,
+    profile_credential_fingerprint, spawn_refresher, switch_gate_in_flight,
+    switch_grade_kick_lifts, third_party_credentialed,
 };
 // The active-cap boundary is only referenced by tests (production code reaches it
 // through `is_stuck_rate_limited`); gate the re-export behind `cfg(test)` so it

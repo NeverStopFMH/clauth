@@ -1045,6 +1045,7 @@ fn credential_and_cache_files_have_restricted_permissions() {
         check_scoped: true,
         bell_threshold: None,
         disabled: false,
+        console: None,
         credentials: Some(creds.clone()),
         usage: None,
         fetch_status: None,
@@ -1847,4 +1848,128 @@ check_scoped = false
     let loaded = load_profile(name).expect("load_profile");
     assert!(!loaded.check_weekly, "an explicit false survives the load");
     assert!(!loaded.check_scoped, "an explicit false survives the load");
+}
+
+/// The Alibaba console session survives a save/load round trip through
+/// `config.toml`'s `[console]` table, and its file keeps the 0600 posture every
+/// credential under `~/.clauth` carries.
+#[test]
+fn a_console_session_round_trips_through_config_toml() {
+    let _home = HomeSandbox::new();
+    let name = "console-round-trip";
+    let mut profile = crate::testutil::blank_profile(name);
+    profile.base_url =
+        Some("https://token-plan.ap-southeast-1.maas.aliyuncs.com/apps/anthropic".to_string());
+    profile.console = Some(crate::profile::ConsoleCredential {
+        token: "console-token-value".to_string(),
+        site: crate::profile::ConsoleSite::International,
+        region: "ap-southeast-1".to_string(),
+    });
+    save_profile(&profile).expect("save_profile");
+
+    let loaded = load_profile(name).expect("load_profile");
+    let console = loaded
+        .console
+        .expect("console session survives the round trip");
+    assert_eq!(console.token, "console-token-value");
+    assert_eq!(console.site, crate::profile::ConsoleSite::International);
+    assert_eq!(console.region, "ap-southeast-1");
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let path = profile_subpath(name, "config.toml").expect("config path");
+        let mode = std::fs::metadata(&path)
+            .expect("metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600, "the console token is a credential");
+    }
+}
+
+/// A `[console]` table with no token is no session at all — a half-filled table
+/// (a hand-edit, or a login that never completed) must not reach the fetch layer
+/// as a credential. An unset site/region takes the vendor default instead of
+/// failing the whole profile load.
+#[test]
+fn a_console_table_without_a_token_reads_as_no_session() {
+    let _home = HomeSandbox::new();
+    let name = "console-partial";
+    save_profile(&crate::testutil::blank_profile(name)).expect("save_profile");
+    let config_path = profile_subpath(name, "config.toml").expect("config path");
+
+    std::fs::write(&config_path, "[console]\nsite = \"international\"\n").expect("write");
+    assert!(load_profile(name).expect("load_profile").console.is_none());
+
+    std::fs::write(&config_path, "[console]\ntoken = \"   \"\n").expect("write");
+    assert!(
+        load_profile(name).expect("load_profile").console.is_none(),
+        "a blank token is the same state as an absent one"
+    );
+
+    std::fs::write(&config_path, "[console]\ntoken = \"t\"\n").expect("write");
+    let console = load_profile(name)
+        .expect("load_profile")
+        .console
+        .expect("a token alone is a usable session");
+    assert_eq!(console.region, "cn-beijing", "the default region");
+    assert_eq!(console.site, crate::profile::ConsoleSite::Domestic);
+}
+
+/// The `[console]` block ships into every `config.toml`, so its copy is the one
+/// place this claim reaches users unprompted — and "the session lasts 48 hours"
+/// is false. The 48h runs from the operator's aliyun BROWSER sign-in, not from
+/// the `clauth login`: two tokens minted ~4h apart report the same
+/// `sessionCreateTimeStamp`/`sessionExpireTimeStamp`, so a fresh login inherits
+/// whatever is left and can be worth minutes.
+#[test]
+fn the_console_template_does_not_promise_a_fresh_48_hours() {
+    let rendered = render_config_toml(&Profile::new("p".to_string(), None, None));
+    assert!(
+        !rendered.contains("lasts 48 hours"),
+        "a login does not restart the clock, so the template must not say it does",
+    );
+    assert!(
+        rendered.contains("browser sign-in"),
+        "the template has to name what the clock actually runs from",
+    );
+}
+
+/// The dead-credential record is a new writer under `~/.clauth`, so the
+/// tree-wide 0600/0700 invariant covers it — the rule is the TREE, not the
+/// secrets in it, and this file holds a hash of a live credential.
+#[cfg(unix)]
+#[test]
+fn the_auth_expired_record_is_owner_only() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let _home = HomeSandbox::new();
+    crate::profile_cache::write_auth_expired("perm-auth-record", 0x0123_4567_89ab_cdef);
+    assert!(crate::profile_cache::auth_expired_matches(
+        "perm-auth-record",
+        0x0123_4567_89ab_cdef
+    ));
+    assert!(
+        !crate::profile_cache::auth_expired_matches("perm-auth-record", 1),
+        "a record for another credential is inert"
+    );
+
+    let path = crate::profile_cache::profile_cache_path(
+        "perm-auth-record",
+        crate::profile_cache::THIRD_PARTY_AUTH_FILE,
+    )
+    .expect("cache path");
+    let mode = std::fs::metadata(&path)
+        .expect("metadata")
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(mode, 0o600, "got {mode:#o}");
+
+    crate::profile_cache::clear_auth_expired("perm-auth-record");
+    assert!(!crate::profile_cache::auth_expired_matches(
+        "perm-auth-record",
+        0x0123_4567_89ab_cdef
+    ));
 }

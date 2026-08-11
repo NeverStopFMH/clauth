@@ -9,7 +9,17 @@
 //!    and `fetch` (mirror [`deepseek`] for balances, [`zai`] for limit bars +
 //!    per-model token rows).
 //! 2. Add a variant to [`Provider`] and wire it into `from_base_url`,
-//!    `display_name`, and [`fetch_third_party_usage`]'s match arms.
+//!    `display_name`, [`ThirdPartyTarget::throttle_key`], and
+//!    [`fetch_third_party_usage`]'s match arms.
+//! 3. Decide what the fetch AUTHENTICATES with before writing it. The api key is
+//!    not a given: Alibaba's reads inference only and every quota surface
+//!    ignores it, so [`alibaba`] runs on a separate per-profile console session
+//!    and its entries are collected even when the api key is absent
+//!    ([`crate::usage::third_party_credentialed`] is the shared test, and the
+//!    render layer reads the same one). A provider whose usage credential can
+//!    die with no refresh path returns [`ThirdPartyError::AuthExpired`] rather
+//!    than a generic failure, which is what stops the cadence and tells the
+//!    operator to re-authenticate instead of waiting.
 //!
 //! No render-layer changes needed — [`ThirdPartyStats`] carries provider-agnostic
 //! [`UsageBar`]s (percentage windows) and [`StatRow`]s (text), which
@@ -17,11 +27,14 @@
 //! through [`generic`]'s best-effort scanner, which sets `best_effort` so the UI
 //! invites a bug report.
 
+pub(crate) mod alibaba;
 mod deepseek;
 mod generic;
 mod zai;
 
 use serde::{Deserialize, Serialize};
+
+use crate::profile::ConsoleCredential;
 
 // ── Provider ────────────────────────────────────────────────────────────────────
 
@@ -30,6 +43,7 @@ use serde::{Deserialize, Serialize};
 pub(crate) enum Provider {
     DeepSeek,
     Zai,
+    Alibaba,
 }
 
 impl Provider {
@@ -39,6 +53,8 @@ impl Provider {
             Some(Self::DeepSeek)
         } else if zai::matches_base_url(url) {
             Some(Self::Zai)
+        } else if alibaba::matches_base_url(url) {
+            Some(Self::Alibaba)
         } else {
             None
         }
@@ -48,29 +64,28 @@ impl Provider {
         match self {
             Self::DeepSeek => deepseek::DISPLAY_NAME,
             Self::Zai => zai::DISPLAY_NAME,
-        }
-    }
-
-    /// Canonical `scheme://host` this provider's requests target — the per-host
-    /// request-pacing key (see [`ThirdPartyTarget::throttle_key`]).
-    fn origin(self) -> &'static str {
-        match self {
-            Self::DeepSeek => deepseek::ORIGIN,
-            Self::Zai => zai::ORIGIN,
+            Self::Alibaba => alibaba::DISPLAY_NAME,
         }
     }
 }
 
 /// What a third-party scheduler entry fetches against: a recognised provider
 /// (typed fetch) or an unrecognised api-key endpoint (generic discovery + scan).
+///
+/// `Known` carries the profile's console credential because one provider's usage
+/// surface doesn't run on the api key at all: Alibaba's quota lives behind a
+/// console session, and its gateway host is picked from that session's
+/// region + site rather than being a constant. Every other provider leaves it
+/// `None` and is unaffected.
 #[derive(Debug, Clone)]
 pub(crate) enum ThirdPartyTarget {
-    Known(Provider),
+    Known {
+        provider: Provider,
+        console: Option<ConsoleCredential>,
+    },
     /// Generic api-key endpoint: usage is discovered + scanned at this base_url's
     /// API origin (same host the key already authorises for completions).
-    Generic {
-        base_url: String,
-    },
+    Generic { base_url: String },
 }
 
 impl ThirdPartyTarget {
@@ -80,7 +95,12 @@ impl ThirdPartyTarget {
     /// stable per-account key.
     pub(crate) fn throttle_key(&self) -> String {
         match self {
-            Self::Known(provider) => provider.origin().to_string(),
+            Self::Known { provider, console } => match provider {
+                Provider::DeepSeek => deepseek::ORIGIN.to_string(),
+                Provider::Zai => zai::ORIGIN.to_string(),
+                // One of four console gateways, chosen by region + site.
+                Provider::Alibaba => alibaba::gateway_origin(console.as_ref()).to_string(),
+            },
             Self::Generic { base_url } => api_origin(base_url).unwrap_or_else(|| base_url.clone()),
         }
     }
@@ -129,9 +149,11 @@ pub(crate) fn fetch_third_party_usage(
     hint: Option<&str>,
 ) -> Result<ThirdPartyStats, ThirdPartyError> {
     match target {
-        ThirdPartyTarget::Known(provider) => match provider {
+        ThirdPartyTarget::Known { provider, console } => match provider {
             Provider::DeepSeek => deepseek::fetch(api_key),
             Provider::Zai => zai::fetch(api_key),
+            // The api key is not a quota credential here — the console session is.
+            Provider::Alibaba => alibaba::fetch(console.as_ref()),
         },
         ThirdPartyTarget::Generic { base_url } => generic::fetch(base_url, api_key, hint),
     }
@@ -254,6 +276,13 @@ pub(crate) enum ThirdPartyError {
     },
     Network,
     Parse,
+    /// The provider's usage credential is dead or was never captured, and no
+    /// refresh path exists — only an operator re-login clears it. Distinct from
+    /// `Status` because retrying on the cadence can never succeed: the scheduler
+    /// session-suppresses this profile and the UI names the login instead of a
+    /// network fault. Alibaba's 48-hour console session is the case that needs
+    /// it (the verdict rides an HTTP 200 body).
+    AuthExpired,
 }
 
 // ── HTTP ────────────────────────────────────────────────────────────────────────

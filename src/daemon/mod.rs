@@ -460,7 +460,7 @@ impl Daemon {
     /// Bundle scheduler `Arc`s and launch the background refresher (same call the
     /// TUI's `start_scheduler` makes). The suppressed-generic set is daemon-local.
     fn spawn_scheduler(&self) {
-        let suppressed: SuppressedGenericStore = Arc::new(RankedMutex::new(HashSet::new()));
+        let suppressed: SuppressedGenericStore = Arc::new(RankedMutex::new(HashMap::new()));
         // Daemon-local like `suppressed`: the daemon never renders pills, so the
         // block map only backs the scheduler's own gate + its write-through
         // cache files (which a standdown TUI mirrors).
@@ -583,6 +583,16 @@ impl Daemon {
             .lock()
             .map(|m| m.clone())
             .unwrap_or_default();
+        // The third-party leg writes its outcomes to a store of its own, so
+        // without this snapshot every api-key/provider profile fell through to
+        // the mtime derivation — and an `AuthExpired` session, which writes no
+        // cache, published `fetch_status: null`, indistinguishable from a cold
+        // start.
+        let tp_status_snap: HashMap<String, FetchStatus> = self
+            .third_party_status
+            .lock()
+            .map(|m| m.clone())
+            .unwrap_or_default();
         let next_snap: HashMap<String, u64> = self
             .next_refresh_per_profile
             .lock()
@@ -610,6 +620,7 @@ impl Daemon {
             .and_then(|q| q.iter().min().cloned());
         let live = LiveSignals {
             status: &status_snap,
+            third_party_status: &tp_status_snap,
             next_refresh: &next_snap,
             streaks: &streaks_snap,
             pending_switch: pending_snap.as_deref(),

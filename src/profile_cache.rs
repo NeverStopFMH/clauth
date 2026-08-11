@@ -33,6 +33,50 @@ pub(crate) const PROFILE_FETCHED_CACHE_FILE: &str = "profile_fetched.json";
 /// doesn't forget a live block mid-outage; removed the moment a kick lands.
 pub(crate) const KICK_BLOCK_CACHE_FILE: &str = "kick_block.json";
 
+/// The last third-party fetch for this profile died on a credential that can
+/// never self-heal ([`crate::usage::FetchStatus::AuthExpired`]), recorded
+/// against the fingerprint of the credential that produced it.
+///
+/// It exists for the surfaces with no scheduler in the process — `clauth list`
+/// and `clauth status --json` — which otherwise derive freshness from the usage
+/// cache's mtime alone and so report a warm cache behind a dead session as
+/// `Fresh`: a live measurement, over a credential that will never come back.
+///
+/// This is NOT a freshness claim and cannot go stale in the dangerous
+/// direction: it is a terminal verdict BOUND to one credential, so a re-login
+/// changes the fingerprint and the record stops applying on its own — the same
+/// invalidation rule the scheduler's in-memory suppression uses.
+pub(crate) const THIRD_PARTY_AUTH_FILE: &str = "third_party_auth.json";
+
+/// Body of [`THIRD_PARTY_AUTH_FILE`]. A struct rather than a bare number so a
+/// second field can join without a format break.
+#[derive(Debug, Serialize, Deserialize)]
+struct AuthVerdict {
+    /// `ThirdPartyEntry::credential_fingerprint` of the credential that failed.
+    credential: u64,
+}
+
+/// Record that `name`'s usage credential is dead. Best-effort like every other
+/// per-profile cache: a record that never lands leaves the reader on the
+/// mtime derivation, which is the pre-record answer rather than a worse one.
+pub(crate) fn write_auth_expired(name: &str, credential: u64) {
+    write_profile_cache(name, THIRD_PARTY_AUTH_FILE, &AuthVerdict { credential });
+}
+
+/// Drop the record — any outcome other than `AuthExpired` proves the verdict no
+/// longer holds. Cheap and unconditional: the file is usually absent.
+pub(crate) fn clear_auth_expired(name: &str) {
+    remove_profile_cache(name, THIRD_PARTY_AUTH_FILE);
+}
+
+/// Whether `name` carries a dead-credential verdict for the credential it holds
+/// RIGHT NOW. A record for any other fingerprint is inert — that is what makes
+/// this safe to persist.
+pub(crate) fn auth_expired_matches(name: &str, credential: u64) -> bool {
+    load_profile_cache::<AuthVerdict>(name, THIRD_PARTY_AUTH_FILE)
+        .is_some_and(|v| v.credential == credential)
+}
+
 /// The one credential-store mtime bump clauth makes with NO bytes behind it
 /// ([`TouchReceipt`]). Sits beside the store it describes, so
 /// [`effective_write_time`] resolves it from the store's own path.

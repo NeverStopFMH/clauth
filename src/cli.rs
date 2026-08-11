@@ -63,7 +63,11 @@ pub(crate) enum Command {
     ///
     /// An existing name re-authenticates in place: the fresh credential set
     /// replaces the old one while the profile's chain slot, env, and model
-    /// settings survive.
+    /// settings survive. On an Alibaba Model Studio profile a bare login opens
+    /// that console instead, capturing the session its usage figures need; that
+    /// session expires 48 hours after the aliyun sign-in behind it rather than
+    /// after this login, so it can arrive with minutes left. That profile's
+    /// endpoint and api key are left untouched.
     Login(LoginArgs),
 
     /// Remove a profile and all its credentials

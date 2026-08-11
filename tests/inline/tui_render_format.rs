@@ -75,6 +75,7 @@ fn cue_profile(status: Option<FetchStatus>) -> Profile {
         check_scoped: true,
         bell_threshold: None,
         disabled: false,
+        console: None,
         credentials: None,
         usage: None,
         fetch_status: status,

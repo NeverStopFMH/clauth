@@ -26,6 +26,7 @@ fn oauth_profile(name: &str, refresh: &str) -> Profile {
         check_scoped: true,
         bell_threshold: None,
         disabled: false,
+        console: None,
         credentials: Some(ClaudeCredentials {
             claude_ai_oauth: Some(OAuthToken {
                 access_token: format!("at-{name}"),
@@ -59,6 +60,7 @@ fn endpoint_profile(name: &str) -> Profile {
         check_scoped: true,
         bell_threshold: None,
         disabled: false,
+        console: None,
         credentials: None,
         usage: None,
         fetch_status: None,
@@ -84,6 +86,7 @@ fn blank_profile(name: &str) -> Profile {
         check_scoped: true,
         bell_threshold: None,
         disabled: false,
+        console: None,
         credentials: None,
         usage: None,
         fetch_status: None,

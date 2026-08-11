@@ -416,6 +416,7 @@ pub(crate) fn blank_profile(name: &str) -> crate::profile::Profile {
         check_scoped: true,
         bell_threshold: None,
         disabled: false,
+        console: None,
         credentials: None,
         usage: None,
         fetch_status: None,

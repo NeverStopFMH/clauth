@@ -306,6 +306,7 @@ fn build_status_pending_switch_reflects_live_signal() {
 
     let live = LiveSignals {
         status: &empty_status,
+        third_party_status: &Default::default(),
         next_refresh: &empty_next,
         streaks: &empty_streaks,
         pending_switch: Some("home"),
@@ -365,6 +366,7 @@ fn build_status_third_party_freshness_from_its_own_cache() {
     let empty_streaks = std::collections::HashMap::new();
     let live = LiveSignals {
         status: &empty_status,
+        third_party_status: &Default::default(),
         next_refresh: &empty_next,
         streaks: &empty_streaks,
         pending_switch: None,
@@ -476,6 +478,7 @@ fn build_status_stale_flags_a_deep_slot_stuck_rate_limited_profile() {
     let streaks = HashMap::from([("work".to_string(), deep), ("home".to_string(), deep)]);
     let live = LiveSignals {
         status: &status,
+        third_party_status: &Default::default(),
         next_refresh: &next,
         streaks: &streaks,
         pending_switch: None,
@@ -498,6 +501,7 @@ fn build_status_stale_flags_a_deep_slot_stuck_rate_limited_profile() {
     let streaks = HashMap::from([("work".to_string(), crate::usage::ACTIVE_CAP_MAX_STREAK)]);
     let live = LiveSignals {
         status: &status,
+        third_party_status: &Default::default(),
         next_refresh: &next,
         streaks: &streaks,
         pending_switch: None,
@@ -507,5 +511,180 @@ fn build_status_stale_flags_a_deep_slot_stuck_rate_limited_profile() {
         stale_of("work", &v),
         false,
         "a shallow RateLimited reading is not stale"
+    );
+}
+
+/// The third-party leg writes its outcomes to `third_party_status`, not the
+/// OAuth `status` store the feed used to read alone. A name missing from that
+/// one fell through to the mtime derivation — and an `AuthExpired` fetch writes
+/// no cache, so the field came out `null`: a dead console session was
+/// indistinguishable from a profile that had never been fetched. That is the
+/// exact dishonesty "detect it, stop fetching, say why" was chosen to avoid.
+#[test]
+fn build_status_publishes_the_third_party_legs_own_status() {
+    let _home = HomeSandbox::new();
+    let base = "https://token-plan.ap-southeast-1.maas.aliyuncs.com/apps/anthropic";
+    let mut qwen = Profile::new("qwen".to_string(), Some(base.to_string()), None);
+    qwen.provider = crate::providers::Provider::from_base_url(base);
+    let config = AppConfig {
+        state: AppState {
+            profiles: vec!["qwen".into()],
+            ..AppState::default()
+        },
+        profiles: vec![qwen],
+    };
+    let empty: HashMap<String, FetchStatus> = HashMap::new();
+    let next = HashMap::new();
+    let streaks = HashMap::new();
+
+    // No cache on disk (an AuthExpired fetch writes none), so the mtime
+    // derivation has nothing — the live third-party store is the only source.
+    let tp = HashMap::from([("qwen".to_string(), FetchStatus::AuthExpired)]);
+    let live = LiveSignals {
+        status: &empty,
+        third_party_status: &tp,
+        next_refresh: &next,
+        streaks: &streaks,
+        pending_switch: None,
+    };
+    let v = build_status(&config, 300_000, Some(&live), false);
+    assert_eq!(
+        v["profiles"][0]["fetch_status"], "AuthExpired",
+        "a dead console session must not read as never-fetched",
+    );
+    // `stale` is contracted as a stuck 429 off the OAuth store and must not
+    // start following the third-party leg.
+    assert_eq!(v["profiles"][0]["stale"], false);
+
+    // A third-party 429 reaches the feed too — pre-fix it published whatever the
+    // cache mtime said, which is a freshness claim about a rejected poll.
+    let tp = HashMap::from([("qwen".to_string(), FetchStatus::RateLimited)]);
+    let live = LiveSignals {
+        status: &empty,
+        third_party_status: &tp,
+        next_refresh: &next,
+        streaks: &streaks,
+        pending_switch: None,
+    };
+    let v = build_status(&config, 300_000, Some(&live), false);
+    assert_eq!(v["profiles"][0]["fetch_status"], "RateLimited");
+}
+
+/// The OAuth leg keeps precedence, exactly as the TUI's own merge does: a
+/// hybrid profile carrying both must not have its OAuth verdict overwritten.
+#[test]
+fn build_status_prefers_the_oauth_leg_when_both_stores_carry_a_name() {
+    let _home = HomeSandbox::new();
+    let config = AppConfig {
+        state: AppState {
+            profiles: vec!["both".into()],
+            ..AppState::default()
+        },
+        profiles: vec![Profile::new("both".to_string(), None, None)],
+    };
+    let status = HashMap::from([("both".to_string(), FetchStatus::Fresh)]);
+    let tp = HashMap::from([("both".to_string(), FetchStatus::AuthExpired)]);
+    let next = HashMap::new();
+    let streaks = HashMap::new();
+    let live = LiveSignals {
+        status: &status,
+        third_party_status: &tp,
+        next_refresh: &next,
+        streaks: &streaks,
+        pending_switch: None,
+    };
+    let v = build_status(&config, 300_000, Some(&live), false);
+    assert_eq!(v["profiles"][0]["fetch_status"], "Fresh");
+}
+
+/// The daemonless surfaces (`clauth status --json`, `clauth list`) derive
+/// freshness from the usage cache's mtime, so a warm cache behind a DEAD
+/// console session published `fetch_status: "Fresh"` — a live measurement over
+/// a credential that can never self-heal, which is the exact failure this
+/// design was chosen over "keep last-known values" to avoid. The durable
+/// verdict is keyed by credential fingerprint, so it can only ever say
+/// "the last fetch under the credential you still hold died".
+#[test]
+fn build_status_reports_a_recorded_dead_credential_without_a_daemon() {
+    let _home = HomeSandbox::new();
+    let base = "https://token-plan.ap-southeast-1.maas.aliyuncs.com/apps/anthropic";
+    let session = |token: &str| crate::profile::ConsoleCredential {
+        token: token.to_string(),
+        site: crate::profile::ConsoleSite::International,
+        region: "ap-southeast-1".to_string(),
+    };
+    let profile = |token: &str| {
+        let mut p = Profile::new("qwen".to_string(), Some(base.to_string()), None);
+        p.provider = crate::providers::Provider::from_base_url(base);
+        p.console = Some(session(token));
+        p
+    };
+    let config_of = |p: Profile| AppConfig {
+        state: AppState {
+            profiles: vec!["qwen".into()],
+            ..AppState::default()
+        },
+        profiles: vec![p],
+    };
+
+    // A cache written just now: the mtime derivation calls this "Fresh".
+    crate::profile_cache::write_profile_cache(
+        "qwen",
+        crate::profile_cache::THIRD_PARTY_CACHE_FILE,
+        &crate::providers::ThirdPartyStats {
+            is_available: true,
+            rows: Vec::new(),
+            bars: Vec::new(),
+            plan: Some("lite".to_string()),
+            endpoint: None,
+            best_effort: false,
+        },
+    );
+    let dead = config_of(profile("dead-token"));
+    let v = build_status(&dead, 300_000, None, false);
+    assert_eq!(
+        v["profiles"][0]["fetch_status"], "Fresh",
+        "precondition: the mtime derivation alone calls a warm cache Fresh",
+    );
+
+    // Record the verdict against the credential the profile holds.
+    let fp = crate::usage::profile_credential_fingerprint(&dead.profiles[0])
+        .expect("a console-credentialed profile has a fingerprint");
+    crate::profile_cache::write_auth_expired("qwen", fp);
+
+    let v = build_status(&dead, 300_000, None, false);
+    assert_eq!(
+        v["profiles"][0]["fetch_status"], "AuthExpired",
+        "no daemon, warm cache, dead session — must not read as a live measurement",
+    );
+
+    // A re-login changes the credential, so the record stops applying on its
+    // own. THIS is what makes persisting it safe.
+    let relogged = config_of(profile("fresh-token"));
+    let v = build_status(&relogged, 300_000, None, false);
+    assert_eq!(
+        v["profiles"][0]["fetch_status"], "Fresh",
+        "a record for a credential the profile no longer holds is inert",
+    );
+}
+
+/// The record must never invent a reading for a profile nothing has fetched.
+#[test]
+fn build_status_leaves_a_never_fetched_profile_unknown() {
+    let _home = HomeSandbox::new();
+    let base = "https://token-plan.ap-southeast-1.maas.aliyuncs.com/apps/anthropic";
+    let mut p = Profile::new("cold".to_string(), Some(base.to_string()), None);
+    p.provider = crate::providers::Provider::from_base_url(base);
+    let config = AppConfig {
+        state: AppState {
+            profiles: vec!["cold".into()],
+            ..AppState::default()
+        },
+        profiles: vec![p],
+    };
+    let v = build_status(&config, 300_000, None, false);
+    assert!(
+        v["profiles"][0]["fetch_status"].is_null(),
+        "no cache and no verdict is unknown, not a status",
     );
 }

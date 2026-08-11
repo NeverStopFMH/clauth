@@ -254,3 +254,36 @@ fn list_table_reports_no_accounts_when_empty() {
         "no accounts yet. add one with `clauth login <name>`.\n"
     );
 }
+
+/// The table shows window percentages with no freshness column, so a dead
+/// console session behind a warm cache rendered as ordinary live numbers. The
+/// state suffix — already the place for facts the columns can't hold — is where
+/// that has to surface.
+#[test]
+fn a_dead_credential_is_named_in_the_state_suffix() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let base = "https://token-plan.ap-southeast-1.maas.aliyuncs.com/apps/anthropic";
+    let mut p = crate::profile::Profile::new("qwen".to_string(), Some(base.to_string()), None);
+    p.provider = crate::providers::Provider::from_base_url(base);
+    p.console = Some(crate::profile::ConsoleCredential {
+        token: "dead".to_string(),
+        site: crate::profile::ConsoleSite::International,
+        region: "ap-southeast-1".to_string(),
+    });
+    let config = AppConfig {
+        state: crate::profile::AppState {
+            profiles: vec!["qwen".into()],
+            ..crate::profile::AppState::default()
+        },
+        profiles: vec![p],
+    };
+    let fp = crate::usage::profile_credential_fingerprint(&config.profiles[0]).unwrap();
+    crate::profile_cache::write_auth_expired("qwen", fp);
+
+    let body = crate::daemon::build_status(&config, 300_000, None, false);
+    let table = render_table(&config, &body);
+    assert!(
+        table.contains("login expired"),
+        "the table must name a credential that will never self-heal, got:\n{table}"
+    );
+}

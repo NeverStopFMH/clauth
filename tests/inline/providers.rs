@@ -181,3 +181,36 @@ fn throttle_key_generic_falls_back_to_raw_when_schemeless() {
         "localhost:1234"
     );
 }
+
+// ── Provider::console_url ─────────────────────────────────────────────────────
+
+#[test]
+fn console_url_is_the_vendor_page_per_provider() {
+    // Exact values: a typo here sends an operator to the wrong product's console.
+    assert_eq!(
+        Provider::DeepSeek.console_url("https://api.deepseek.com"),
+        Some("https://platform.deepseek.com/api_keys")
+    );
+    assert_eq!(
+        Provider::Zai.console_url("https://api.z.ai/api/anthropic"),
+        Some("https://z.ai/manage-apikey/apikey-list")
+    );
+}
+
+#[test]
+fn console_url_answers_none_for_a_base_url_the_provider_does_not_own() {
+    // The mismatched pair a caller could build by hand. Opening some other
+    // account's console would be worse than offering nothing, and the
+    // single-page providers are exactly where a wrong page reads as harmless —
+    // so every arm re-checks, not just Alibaba's.
+    assert_eq!(
+        Provider::Alibaba.console_url("https://api.deepseek.com"),
+        None
+    );
+    assert_eq!(Provider::DeepSeek.console_url("https://api.z.ai"), None);
+    assert_eq!(
+        Provider::Zai.console_url("https://token-plan.ap-southeast-1.maas.aliyuncs.com"),
+        None
+    );
+    assert_eq!(Provider::DeepSeek.console_url(""), None);
+}

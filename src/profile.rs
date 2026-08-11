@@ -317,6 +317,16 @@ impl Profile {
         self.provider.is_some()
     }
 
+    /// The vendor console page where this account's api key is minted, for a
+    /// surface offering to open it. `None` for an OAuth account and for an
+    /// endpoint no provider claims, neither of which clauth knows a page for.
+    ///
+    /// Reads the two fields that were derived together, so the page always
+    /// belongs to the endpoint the account actually calls.
+    pub(crate) fn console_url(&self) -> Option<&'static str> {
+        self.provider?.console_url(self.base_url.as_deref()?)
+    }
+
     /// User-disabled (see [`Profile::disabled`]) — never `auth_broken`'s
     /// auto-quarantine, always an operator's own choice.
     pub(crate) fn is_disabled(&self) -> bool {

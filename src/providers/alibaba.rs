@@ -43,29 +43,40 @@ pub(crate) const DEFAULT_REGION: &str = "cn-beijing";
 const INTL_REGION: &str = "ap-southeast-1";
 
 /// The inference hosts clauth recognises as Alibaba Model Studio, each with the
-/// console site + region its plan is administered from. These are the four the
-/// shipped presets point at; matching is host-boundary (`url_matches_host`), so
+/// console site + region its plan is administered from, and the console page
+/// where that plan's api key and quota live. These are the four the shipped
+/// presets point at; matching is host-boundary (`url_matches_host`), so
 /// `…aliyuncs.com.evil.tld` never claims one.
-const HOSTS: &[(&str, ConsoleSite, &str)] = &[
+///
+/// The page is per HOST, not per site: Token Plan and Coding Plan are separate
+/// products administered from separate console routes, and each front spells the
+/// route differently. Every one is the vendor's own published deep link (three
+/// off Alibaba's docs, the domestic Token Plan one off the `bl` CLI's bundle),
+/// never a guess extrapolated from a sibling.
+const HOSTS: &[(&str, ConsoleSite, &str, &str)] = &[
     (
         "https://token-plan.ap-southeast-1.maas.aliyuncs.com",
         ConsoleSite::International,
         INTL_REGION,
+        "https://modelstudio.console.alibabacloud.com/ap-southeast-1?tab=plan#/efm/subscription/overview",
     ),
     (
         "https://token-plan.cn-beijing.maas.aliyuncs.com",
         ConsoleSite::Domestic,
         DEFAULT_REGION,
+        "https://bailian.console.aliyun.com/cn-beijing?tab=plan#/efm/subscription/overview",
     ),
     (
         "https://coding-intl.dashscope.aliyuncs.com",
         ConsoleSite::International,
         INTL_REGION,
+        "https://modelstudio.console.alibabacloud.com/ap-southeast-1/?tab=globalset#/efm/coding_plan",
     ),
     (
         "https://coding.dashscope.aliyuncs.com",
         ConsoleSite::Domestic,
         DEFAULT_REGION,
+        "https://bailian.console.aliyun.com/cn-beijing/?tab=plan#/efm/subscription/coding-plan",
     ),
 ];
 
@@ -81,7 +92,7 @@ const LOGIN_ERROR_CODES: &[&str] = &["BailianGateway.Login.NotLogined", "Console
 pub(super) fn matches_base_url(url: &str) -> bool {
     HOSTS
         .iter()
-        .any(|(host, _, _)| super::url_matches_host(url, host))
+        .any(|(host, _, _, _)| super::url_matches_host(url, host))
 }
 
 /// The console site + region an Alibaba `base_url` is administered from, so a
@@ -90,8 +101,20 @@ pub(super) fn matches_base_url(url: &str) -> bool {
 pub(crate) fn site_and_region(base_url: &str) -> Option<(ConsoleSite, &'static str)> {
     HOSTS
         .iter()
-        .find(|(host, _, _)| super::url_matches_host(base_url, host))
-        .map(|(_, site, region)| (*site, *region))
+        .find(|(host, _, _, _)| super::url_matches_host(base_url, host))
+        .map(|(_, site, region, _)| (*site, *region))
+}
+
+/// The console page this endpoint's plan is administered from — where its api
+/// key is minted and its quota is shown. `None` for a URL this module doesn't
+/// recognise, which is the same input [`matches_base_url`] rejects, so a caller
+/// that reached here through [`super::Provider::from_base_url`] always gets a
+/// page rather than relying on a fallback to be right.
+pub(super) fn console_url(base_url: &str) -> Option<&'static str> {
+    HOSTS
+        .iter()
+        .find(|(host, _, _, _)| super::url_matches_host(base_url, host))
+        .map(|(_, _, _, page)| *page)
 }
 
 /// One console gateway: the host that answers, and the RPC action it answers

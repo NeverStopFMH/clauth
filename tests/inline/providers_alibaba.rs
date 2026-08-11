@@ -361,3 +361,55 @@ fn a_tier_the_quota_config_omits_keeps_its_bars() {
     assert_eq!(s.bars[0].total, None, "no ceiling is invented for it");
     assert_eq!(s.bars[0].used, None);
 }
+
+// ── console_url ───────────────────────────────────────────────────────────────
+
+/// Each of the four preset endpoints resolves to its OWN console page. Token
+/// Plan and Coding Plan are separate products and the two fronts spell their
+/// routes differently, so a page borrowed from a sibling row lands an operator
+/// on a plan they do not hold. Exact values: every one is a vendor-published
+/// deep link, and nothing here may be extrapolated from its neighbour.
+#[test]
+fn each_endpoint_resolves_to_its_own_console_page() {
+    let cases = [
+        (
+            "https://token-plan.ap-southeast-1.maas.aliyuncs.com",
+            "https://modelstudio.console.alibabacloud.com/ap-southeast-1?tab=plan#/efm/subscription/overview",
+        ),
+        (
+            "https://token-plan.cn-beijing.maas.aliyuncs.com",
+            "https://bailian.console.aliyun.com/cn-beijing?tab=plan#/efm/subscription/overview",
+        ),
+        (
+            "https://coding-intl.dashscope.aliyuncs.com",
+            "https://modelstudio.console.alibabacloud.com/ap-southeast-1/?tab=globalset#/efm/coding_plan",
+        ),
+        (
+            "https://coding.dashscope.aliyuncs.com",
+            "https://bailian.console.aliyun.com/cn-beijing/?tab=plan#/efm/subscription/coding-plan",
+        ),
+    ];
+    for (base_url, page) in cases {
+        assert_eq!(console_url(base_url), Some(page), "for {base_url}");
+    }
+    let pages: std::collections::BTreeSet<_> = cases.iter().map(|(_, page)| *page).collect();
+    assert_eq!(pages.len(), cases.len(), "no two endpoints share a page");
+}
+
+/// The console page is reachable for exactly the URLs the provider claims, so
+/// the offer and the fetch never disagree about which endpoints are Alibaba.
+#[test]
+fn console_url_tracks_matches_base_url_in_both_directions() {
+    let path = "https://token-plan.ap-southeast-1.maas.aliyuncs.com/apps/anthropic";
+    assert!(matches_base_url(path));
+    assert!(console_url(path).is_some(), "a path suffix still matches");
+
+    for rejected in [
+        "https://token-plan.ap-southeast-1.maas.aliyuncs.com.evil.tld",
+        "https://api.deepseek.com",
+        "",
+    ] {
+        assert!(!matches_base_url(rejected), "{rejected} is not Alibaba");
+        assert_eq!(console_url(rejected), None, "so it has no page: {rejected}");
+    }
+}

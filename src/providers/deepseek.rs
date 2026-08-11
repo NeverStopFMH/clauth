@@ -11,6 +11,10 @@ pub(super) const DISPLAY_NAME: &str = "DeepSeek";
 pub(super) const ORIGIN: &str = "https://api.deepseek.com";
 const BALANCE_URL: &str = "https://api.deepseek.com/user/balance";
 
+/// Where an operator mints the api key this provider authenticates with, as
+/// published by <https://api-docs.deepseek.com/> ("Your First API Call").
+pub(super) const CONSOLE_URL: &str = "https://platform.deepseek.com/api_keys";
+
 pub(super) fn matches_base_url(url: &str) -> bool {
     url_matches_host(url, ORIGIN)
 }

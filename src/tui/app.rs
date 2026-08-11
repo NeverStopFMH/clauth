@@ -739,6 +739,10 @@ pub(crate) enum ActionMenuAction {
     /// Usage, which carry no row for it).
     DisableProfile,
     EnableProfile,
+    /// Open the focused account's provider console — where its api key is
+    /// minted. Offered only for a recognised third-party endpoint, since that
+    /// is the only case clauth knows a page for.
+    OpenProviderConsole,
     // Setup tab — all three act on the focused account and none has a key.
     /// Copy every setting of the focused account onto a new one, credentials
     /// excluded. Prompts for the new name.
@@ -868,6 +872,7 @@ impl ActionMenuAction {
             Self::RotateTokens => "rotate access token",
             Self::DisableProfile => "disable account",
             Self::EnableProfile => "enable account",
+            Self::OpenProviderConsole => "open provider console",
             Self::Duplicate => "duplicate account",
             Self::SaveAsPreset => "save as preset",
             Self::ApplyPreset => "apply preset",
@@ -5172,6 +5177,11 @@ pub(crate) fn build_action_menu(app: &App) -> ActionMenuState {
                 scoped.push(Duplicate);
                 scoped.push(SaveAsPreset);
                 scoped.push(ApplyPreset);
+                // The api-key row is on this tab, so the page that key comes
+                // from belongs next to it.
+                if focused_provider_console(app).is_some() {
+                    scoped.push(OpenProviderConsole);
+                }
             } else if app.profile_cursor >= app.profile_count() {
                 context = app
                     .config_draft
@@ -5205,7 +5215,31 @@ fn push_account_scope(app: &App, scoped: &mut Vec<ActionMenuAction>) -> Option<S
     scoped.push(ActionMenuAction::RefreshUsage);
     scoped.push(ActionMenuAction::RotateTokens);
     scoped.push(disabled_toggle_action(app));
+    if focused_provider_console(app).is_some() {
+        scoped.push(ActionMenuAction::OpenProviderConsole);
+    }
     Some(name)
+}
+
+/// The console page the focused account's endpoint mints its api key on.
+/// `None` past the accounts, on an OAuth account, and on an endpoint no
+/// provider claims. Both the menu's gate and the handler resolve through this
+/// one function, so what is offered and what opens cannot drift apart.
+fn focused_provider_console(app: &App) -> Option<&'static str> {
+    app.config().profiles.get(app.profile_cursor)?.console_url()
+}
+
+/// Open the focused account's provider console in the default browser
+/// (detached), mirroring [`open_incident_link`].
+fn open_provider_console(app: &mut App) {
+    let Some(url) = focused_provider_console(app) else {
+        app.toast(ToastKind::Info, "no console page for this endpoint");
+        return;
+    };
+    match crate::platform::open_url(url) {
+        Ok(()) => app.toast(ToastKind::Info, "opening in browser"),
+        Err(_) => app.toast(ToastKind::Danger, "failed to open browser"),
+    }
 }
 
 /// The focused account's disable-row action, labeled by the state it would
@@ -5341,6 +5375,7 @@ fn dispatch_action_menu_action(app: &mut App, action: ActionMenuAction) {
         ActionMenuAction::DisableProfile | ActionMenuAction::EnableProfile => {
             toggle_focused_account_disabled(app);
         }
+        ActionMenuAction::OpenProviderConsole => open_provider_console(app),
         ActionMenuAction::Duplicate => prompt_duplicate_profile(app),
         ActionMenuAction::SaveAsPreset => prompt_save_preset(app),
         ActionMenuAction::ApplyPreset => open_preset_picker(app),

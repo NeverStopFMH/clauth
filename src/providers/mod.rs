@@ -9,7 +9,9 @@
 //!    and `fetch` (mirror [`deepseek`] for balances, [`zai`] for limit bars +
 //!    per-model token rows).
 //! 2. Add a variant to [`Provider`] and wire it into `from_base_url`,
-//!    `display_name`, [`ThirdPartyTarget::throttle_key`], and
+//!    `display_name`, `console_url` (the page an operator mints the key on —
+//!    cite where the vendor publishes it, since a wrong one sends someone to
+//!    another product), [`ThirdPartyTarget::throttle_key`], and
 //!    [`fetch_third_party_usage`]'s match arms.
 //! 3. Decide what the fetch AUTHENTICATES with before writing it. The api key is
 //!    not a given: Alibaba's reads inference only and every quota surface
@@ -65,6 +67,23 @@ impl Provider {
             Self::DeepSeek => deepseek::DISPLAY_NAME,
             Self::Zai => zai::DISPLAY_NAME,
             Self::Alibaba => alibaba::DISPLAY_NAME,
+        }
+    }
+
+    /// The vendor page where this endpoint's api key is minted, for a surface
+    /// that offers to open it. [`alibaba`] answers with four different pages,
+    /// since its four endpoints are two products across two consoles; the other
+    /// two have one page each.
+    ///
+    /// `None` means the `base_url` doesn't belong to `self`, which is why every
+    /// arm re-checks it rather than only the arm that has to. Returning a page
+    /// for a mismatched pair would open some other account's console, and a
+    /// single-page provider is exactly where that reads as harmless.
+    pub(crate) fn console_url(self, base_url: &str) -> Option<&'static str> {
+        match self {
+            Self::DeepSeek => deepseek::matches_base_url(base_url).then_some(deepseek::CONSOLE_URL),
+            Self::Zai => zai::matches_base_url(base_url).then_some(zai::CONSOLE_URL),
+            Self::Alibaba => alibaba::console_url(base_url),
         }
     }
 }

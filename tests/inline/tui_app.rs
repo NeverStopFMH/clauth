@@ -1296,6 +1296,82 @@ fn the_account_tabs_offer_the_focused_account_plus_the_global_actions() {
     );
 }
 
+/// The console link is offered for exactly the accounts clauth knows a page
+/// for. An OAuth account has none, so the entry is absent above rather than
+/// present-and-inert — the assertions there are the other direction of this one.
+#[test]
+fn the_provider_console_entry_follows_the_recognised_endpoints() {
+    use super::{Tab, build_action_menu};
+    use crate::profile::Profile;
+    let _home = crate::testutil::HomeSandbox::new();
+
+    let has_entry = |app: &super::App| {
+        build_action_menu(app)
+            .items
+            .iter()
+            .any(|i| i.label == "open provider console")
+    };
+
+    let mut app = app_with(vec![
+        Profile::new("oauth".to_string(), None, None),
+        Profile::new(
+            "qwen".to_string(),
+            Some("https://token-plan.ap-southeast-1.maas.aliyuncs.com".to_string()),
+            Some("sk-sp-test".to_string()),
+        ),
+        Profile::new(
+            "proxy".to_string(),
+            Some("https://proxy.example/v1".to_string()),
+            Some("sk-test".to_string()),
+        ),
+    ]);
+
+    // What the entry would OPEN, not just that it is offered: the label alone
+    // cannot tell a correct page from a neighbouring plan's.
+    app.profile_cursor = 1;
+    assert_eq!(
+        super::focused_provider_console(&app),
+        Some(
+            "https://modelstudio.console.alibabacloud.com/ap-southeast-1?tab=plan#/efm/subscription/overview"
+        )
+    );
+
+    // Every tab that carries an account scope offers it, including Setup, where
+    // the api-key row it feeds lives.
+    for tab in [Tab::Overview, Tab::Usage, Tab::Setup] {
+        app.tab = tab;
+        app.profile_cursor = 1;
+        assert!(
+            has_entry(&app),
+            "a recognised provider offers it on {tab:?}"
+        );
+        app.profile_cursor = 0;
+        assert!(!has_entry(&app), "an oauth account has no page on {tab:?}");
+        app.profile_cursor = 2;
+        assert!(
+            !has_entry(&app),
+            "an unrecognised endpoint has no page on {tab:?}"
+        );
+    }
+}
+
+/// The handler resolves the page itself instead of trusting that it was only
+/// offered where one exists, so a pick that somehow lands on an account with no
+/// console says so rather than opening a browser on nothing.
+#[test]
+fn picking_the_console_entry_without_a_page_says_so_and_opens_nothing() {
+    use super::{ActionMenuAction, dispatch_action_menu_action};
+    use crate::profile::Profile;
+    let _home = crate::testutil::HomeSandbox::new();
+
+    let mut app = app_with(vec![Profile::new("oauth".to_string(), None, None)]);
+    app.profile_cursor = 0;
+    dispatch_action_menu_action(&mut app, ActionMenuAction::OpenProviderConsole);
+
+    let toast = app.toasts.back().expect("the pick answers");
+    assert_eq!(toast.body, "no console page for this endpoint");
+}
+
 /// Off the Setup pane there is no `disabled` row to arm, so the menu pick routes
 /// disabling through the confirm modal instead of flipping on one press —
 /// enabling stays immediate, exactly as the row behaves.

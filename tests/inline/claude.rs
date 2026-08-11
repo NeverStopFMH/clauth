@@ -1733,3 +1733,104 @@ fn link_still_refuses_a_different_live_login() {
         "the guard still protects an unresolved different login: {err}"
     );
 }
+
+/// The refuse-guard compares logins, so it must not read "neither side names a
+/// login" as "the logins match". A live file too torn to parse yields no login,
+/// and so does an install source that does not exist — which is every profile
+/// storing no `credentials.json`. Left to the login test alone the two compare
+/// equal, the guard clears, and the live file is removed with nothing to relink.
+/// The byte-compare fallback is what keeps refusing here.
+#[cfg(unix)]
+#[test]
+fn link_refuses_a_torn_live_file_over_a_profile_storing_no_login() {
+    let _home = HomeSandbox::new();
+    // An api-key profile: saved, and storing no credentials.json at all.
+    let mut endpoint = crate::profile::Profile::new(
+        "endpoint".to_string(),
+        Some("https://api.example.invalid".to_string()),
+        Some("mock-key".to_string()),
+    );
+    endpoint.credentials = None;
+    crate::profile::save_profile(&endpoint).expect("save endpoint");
+
+    let live_path = claude_credentials_path().expect("creds path");
+    std::fs::create_dir_all(live_path.parent().expect("parent")).expect("mkdir");
+    // Caught mid-write by CC: valid prefix, no closing brace.
+    std::fs::write(&live_path, br#"{"claudeAiOauth":{"accessToken":"live"#).expect("write torn");
+
+    let err = link_profile_credentials("endpoint").expect_err("must refuse a torn live file");
+    assert!(
+        err.to_string().contains("refusing to replace"),
+        "a file too torn to parse is a possible mid-write login, not a match: {err}"
+    );
+    assert!(
+        live_path.exists(),
+        "the torn live file must survive the refusal, not be deleted with nothing to relink"
+    );
+}
+
+/// Same hole, reached by the other route: a live file carrying MCP-server logins
+/// and no Claude login block parses fine and still names no login.
+#[cfg(unix)]
+#[test]
+fn link_refuses_a_login_less_live_file_over_a_profile_storing_no_login() {
+    let _home = HomeSandbox::new();
+    let mut endpoint = crate::profile::Profile::new(
+        "endpoint".to_string(),
+        Some("https://api.example.invalid".to_string()),
+        Some("mock-key".to_string()),
+    );
+    endpoint.credentials = None;
+    crate::profile::save_profile(&endpoint).expect("save endpoint");
+
+    let live_path = claude_credentials_path().expect("creds path");
+    std::fs::create_dir_all(live_path.parent().expect("parent")).expect("mkdir");
+    std::fs::write(
+        &live_path,
+        serde_json::to_vec(&serde_json::json!({
+            "mcpOAuth": { "linear": { "accessToken": "mock-linear" } }
+        }))
+        .unwrap(),
+    )
+    .expect("write login-less live");
+
+    let err = link_profile_credentials("endpoint").expect_err("must refuse a login-less live file");
+    assert!(
+        err.to_string().contains("refusing to replace"),
+        "no login on either side is not a matching login: {err}"
+    );
+    assert!(
+        live_path.exists(),
+        "the MCP blocks must survive the refusal — deleting them is the loss this feature exists to stop"
+    );
+}
+
+/// Two logged-out shells are two blank tokens, and blank equals blank. The login
+/// test carries `classify_link_at`'s non-empty clause so it never clears on them;
+/// differing shells then fall to the byte compare and refuse.
+#[cfg(unix)]
+#[test]
+fn link_refuses_two_differing_logged_out_shells() {
+    let _home = HomeSandbox::new();
+    let mut acct = crate::profile::Profile::new("acct".to_string(), None, None);
+    acct.credentials = Some(creds("", Some("")));
+    crate::profile::save_profile(&acct).expect("save acct");
+
+    let live_path = claude_credentials_path().expect("creds path");
+    std::fs::create_dir_all(live_path.parent().expect("parent")).expect("mkdir");
+    std::fs::write(
+        &live_path,
+        serde_json::to_vec(&serde_json::json!({
+            "claudeAiOauth": { "accessToken": "", "refreshToken": "", "expiresAt": 0 },
+            "mcpOAuth": { "linear": { "accessToken": "mock-linear" } }
+        }))
+        .unwrap(),
+    )
+    .expect("write shell");
+
+    let err = link_profile_credentials("acct").expect_err("must refuse two blank logins");
+    assert!(
+        err.to_string().contains("refusing to replace"),
+        "a blank token must never match another blank token: {err}"
+    );
+}

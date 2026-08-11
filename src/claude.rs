@@ -514,21 +514,28 @@ pub(crate) fn link_profile_credentials(name: &str) -> Result<()> {
 
         if let Ok(meta) = link.symlink_metadata() {
             if !meta.file_type().is_symlink() {
-                // Compare the LOGIN only, not the whole file: mcpOAuth and other
-                // non-login blocks are carried across below (`carry_live_extra_into`),
-                // so a live file that differs from the profile only in those must
-                // not read as an unresolved re-login. A differing login is genuinely
-                // unresolved — refuse rather than silently drop it. Mirrors the
-                // access-token comparison `classify_credentials_link` already uses;
-                // an unreadable side compares as `None`, preserving the prior
-                // "bail unless they match" conservatism.
-                let live_login = read_json_file::<ClaudeCredentials>(&link)
-                    .ok()
-                    .and_then(|c| c.access_token().map(str::to_string));
-                let target_login = read_json_file::<ClaudeCredentials>(&target)
-                    .ok()
-                    .and_then(|c| c.access_token().map(str::to_string));
-                if live_login != target_login {
+                // A matching LOGIN clears the file, whatever else differs: the
+                // non-login blocks are carried across below
+                // (`carry_live_extra_into`), so a live file differing from the
+                // profile only in those is not an unresolved re-login. Non-empty
+                // and equal is the same test `classify_link_at` applies, blank
+                // clause included: two blanks are two logged-out shells, never a
+                // match. Anything the login test cannot clear falls back to the
+                // byte compare this replaced, so a file too torn to parse and one
+                // holding no login block at all keep refusing exactly as before.
+                // Without that fallback both sides read `None`, compare equal, and
+                // the live file is removed with nothing to relink.
+                let login_of = |p: &Path| {
+                    read_json_file::<ClaudeCredentials>(p)
+                        .ok()
+                        .and_then(|c| c.access_token().map(str::to_string))
+                        .filter(|t| !t.is_empty())
+                };
+                let logins_match = match (login_of(&link), login_of(&target)) {
+                    (Some(live), Some(stored)) => live == stored,
+                    _ => false,
+                };
+                if !logins_match && std::fs::read(&link).ok() != std::fs::read(&target).ok() {
                     anyhow::bail!(
                         "refusing to replace .credentials.json: live file differs from profile '{name}'; {} first",
                         crate::format::RESOLVE_IN_TUI

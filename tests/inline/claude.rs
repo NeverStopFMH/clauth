@@ -1562,7 +1562,7 @@ fn carry_copies_mcp_oauth_and_leaves_the_target_login_untouched() {
     )
     .expect("write target");
 
-    carry_live_extra_into(&live, &target).expect("carry");
+    carry_live_extra_into(&live, &target, "carrytest").expect("carry");
 
     let got: serde_json::Value =
         serde_json::from_slice(&fs::read(&target).expect("read target")).expect("parse");
@@ -1641,7 +1641,7 @@ fn carry_skips_the_static_token_sidecar() {
     )
     .expect("write live");
 
-    carry_live_extra_into(&live, &target).expect("carry");
+    carry_live_extra_into(&live, &target, "carrytest").expect("carry");
 
     assert_eq!(
         fs::read(&target).expect("read sidecar"),
@@ -1676,7 +1676,7 @@ fn carry_moves_only_the_allowlisted_key() {
     )
     .expect("write target");
 
-    carry_live_extra_into(&live, &target).expect("carry");
+    carry_live_extra_into(&live, &target, "carrytest").expect("carry");
 
     let got: serde_json::Value =
         serde_json::from_slice(&fs::read(&target).expect("read target")).expect("parse");
@@ -1714,7 +1714,7 @@ fn carry_keeps_the_store_at_0600() {
     )
     .expect("write live");
 
-    carry_live_extra_into(&live, &target).expect("carry");
+    carry_live_extra_into(&live, &target, "carrytest").expect("carry");
 
     // Assert the write HAPPENED before asserting its mode: a carry that never
     // runs leaves the mode `save_profile` set, so a mode check alone passes
@@ -1727,6 +1727,168 @@ fn carry_keeps_the_store_at_0600() {
     );
     let mode = fs::metadata(&target).expect("stat").permissions().mode() & 0o777;
     assert_eq!(mode, 0o600, "the carry must not widen the store's mode");
+}
+
+/// Seed `name` with a store carrying a login AND an `mcpOAuth` block, the shape
+/// a profile holds once it has been live with an authenticated MCP server.
+/// Returns the store path. Built through `save_profile` rather than hand-written
+/// so the file this parks out of is the one production writes.
+fn seed_store_with_mcp_logins(name: &str) -> std::path::PathBuf {
+    let mut profile = crate::profile::Profile::new(name.to_string(), None, None);
+    profile.credentials = Some(creds("stored-access", Some("stored-refresh")));
+    crate::profile::save_profile(&profile).expect("save profile");
+    let store = crate::profile::profile_dir(name)
+        .expect("profile dir")
+        .join("credentials.json");
+    let mut value: serde_json::Value =
+        serde_json::from_slice(&fs::read(&store).expect("read store")).expect("parse store");
+    value["mcpOAuth"] = serde_json::json!({ "linear": { "accessToken": "mock-linear" } });
+    fs::write(&store, serde_json::to_vec(&value).expect("ser")).expect("seed mcpOAuth");
+    store
+}
+
+/// A profile that stops storing a login has `credentials.json` removed under it,
+/// and where the live slot is clauth's symlink that file IS what the slot
+/// resolves to. So its MCP-server logins are unreachable at the removal, before
+/// any relink runs, and the switch-time carry never sees them. They belong to no
+/// Claude account, so dropping them signs the operator out of every MCP server
+/// with nothing on the box naming the cause.
+#[test]
+fn a_store_removal_parks_the_mcp_logins_it_was_holding() {
+    let _home = HomeSandbox::new();
+    let store = seed_store_with_mcp_logins("crossed");
+    let mut profile = crate::profile::Profile::new("crossed".to_string(), None, None);
+
+    profile.credentials = None;
+    crate::profile::save_profile(&profile).expect("save without a login");
+
+    assert!(!store.exists(), "the store is still removed");
+    let parked: serde_json::Value =
+        crate::profile_cache::load_profile_cache("crossed", crate::profile_cache::MCP_LOGINS_FILE)
+            .expect("the MCP logins must be parked, not dropped with the store");
+    assert_eq!(parked["mcpOAuth"]["linear"]["accessToken"], "mock-linear");
+    assert!(
+        parked.get("claudeAiOauth").is_none(),
+        "the account's own login is not parked with them"
+    );
+}
+
+/// The other half: a later `clauth login <name>` writes a store again, and the
+/// parked block goes back into it, because that store is where every reader of
+/// `mcpOAuth` looks. The parked copy is dropped once the merged write lands, so
+/// nothing keeps re-attaching a block the carry now maintains normally.
+#[test]
+fn a_regained_store_takes_its_parked_mcp_logins_back() {
+    let _home = HomeSandbox::new();
+    let store = seed_store_with_mcp_logins("crossed");
+    let mut profile = crate::profile::Profile::new("crossed".to_string(), None, None);
+    profile.credentials = None;
+    crate::profile::save_profile(&profile).expect("save without a login");
+
+    profile.credentials = Some(creds("fresh-access", Some("fresh-refresh")));
+    crate::profile::save_profile(&profile).expect("save the recapture");
+
+    let got: serde_json::Value =
+        serde_json::from_slice(&fs::read(&store).expect("read store")).expect("parse");
+    assert_eq!(
+        got["mcpOAuth"]["linear"]["accessToken"], "mock-linear",
+        "the parked MCP logins belong in the store the profile just regained"
+    );
+    assert_eq!(
+        got["claudeAiOauth"]["accessToken"], "fresh-access",
+        "and the restore must not overwrite the login the capture just wrote"
+    );
+    assert!(
+        crate::profile_cache::load_profile_cache::<serde_json::Value>(
+            "crossed",
+            crate::profile_cache::MCP_LOGINS_FILE,
+        )
+        .is_none(),
+        "the parked copy goes once the store holds them again"
+    );
+}
+
+/// The second way the block goes unreachable, and the reason the park is not
+/// scoped to the removal alone: switching onto a profile that stores no login at
+/// all (an api-key or third-party account) leaves the carry no store to land in,
+/// and the relink then drops the live slot.
+#[test]
+fn a_carry_with_no_store_to_land_in_parks_instead() {
+    let _home = HomeSandbox::new();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let live = dir.path().join("live.json");
+    fs::write(
+        &live,
+        serde_json::to_vec(&serde_json::json!({
+            "claudeAiOauth": { "accessToken": "live-login" },
+            "mcpOAuth": { "linear": { "accessToken": "mock-linear" } },
+            "trustedDeviceToken": "mock-device-token"
+        }))
+        .expect("ser"),
+    )
+    .expect("write live");
+    let absent = dir.path().join("credentials.json");
+
+    carry_live_extra_into(&live, &absent, "apikey").expect("carry");
+
+    let parked: serde_json::Value =
+        crate::profile_cache::load_profile_cache("apikey", crate::profile_cache::MCP_LOGINS_FILE)
+            .expect("a carry with nowhere to land must park rather than drop");
+    assert_eq!(parked["mcpOAuth"]["linear"]["accessToken"], "mock-linear");
+    assert!(
+        parked.get("trustedDeviceToken").is_none(),
+        "the allowlist bounds what is parked exactly as it bounds what is carried"
+    );
+}
+
+/// An absent parked file and an empty one must not both mean "parked, and there
+/// was nothing": the restore re-attaches whatever the parked file holds, so an
+/// empty one written on every login-less save would be a standing no-op file
+/// under every api-key profile.
+#[test]
+fn a_store_with_no_mcp_logins_parks_nothing() {
+    let _home = HomeSandbox::new();
+    let mut profile = crate::profile::Profile::new("plain".to_string(), None, None);
+    profile.credentials = Some(creds("stored-access", Some("stored-refresh")));
+    crate::profile::save_profile(&profile).expect("save profile");
+
+    profile.credentials = None;
+    crate::profile::save_profile(&profile).expect("save without a login");
+
+    assert!(
+        crate::profile_cache::profile_cache_path("plain", crate::profile_cache::MCP_LOGINS_FILE)
+            .is_some_and(|p| !p.exists()),
+        "a store carrying no MCP logins parks no file at all"
+    );
+}
+
+/// `~/.clauth` is 0600 files / 0700 dirs whole-tree, and a new writer that
+/// reverts to the umask is the way that has been broken before. Asserts the park
+/// HAPPENED first: a park that never runs leaves no file, and a mode check over
+/// an absent file cannot fail for the reason this test is named for.
+#[cfg(unix)]
+#[test]
+fn the_parked_mcp_logins_file_is_owner_only() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let _home = HomeSandbox::new();
+    seed_store_with_mcp_logins("crossed");
+    let mut profile = crate::profile::Profile::new("crossed".to_string(), None, None);
+    profile.credentials = None;
+    crate::profile::save_profile(&profile).expect("save without a login");
+
+    let parked =
+        crate::profile_cache::profile_cache_path("crossed", crate::profile_cache::MCP_LOGINS_FILE)
+            .expect("parked path");
+    assert!(
+        parked.exists(),
+        "the park must have written for its mode to mean anything"
+    );
+    let mode = fs::metadata(&parked).expect("stat").permissions().mode() & 0o777;
+    assert_eq!(
+        mode, 0o600,
+        "a parked file is owner-only like every ~/.clauth file"
+    );
 }
 
 #[cfg(unix)]

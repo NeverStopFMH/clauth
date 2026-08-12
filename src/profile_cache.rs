@@ -80,6 +80,13 @@ pub(crate) fn auth_expired_matches(name: &str, credential: u64) -> bool {
 /// The one credential-store mtime bump clauth makes with NO bytes behind it
 /// ([`TouchReceipt`]). Sits beside the store it describes, so
 /// [`effective_write_time`] resolves it from the store's own path.
+/// Per-profile parked MCP-server logins (`claude::park_mcp_logins_from_store`),
+/// written only while a profile stores no credentials file of its own to hold
+/// them. Carries none of the account's own credential material: the blocks
+/// inside are minted per (MCP server, endpoint) and belong to no Claude account,
+/// which is why a profile that stops storing a login still has to keep them.
+pub(crate) const MCP_LOGINS_FILE: &str = "mcp-logins.json";
+
 pub(crate) const TOUCH_RECEIPT_FILE: &str = "touch-receipt.json";
 
 /// A store mtime clauth moved without writing the store.

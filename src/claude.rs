@@ -496,7 +496,7 @@ const CARRIED_CREDENTIAL_KEYS: [&str; 1] = ["mcpOAuth"];
 /// sidecar: [`write_session_token`] rebuilds that file from the mint alone, so a
 /// block carried there is dropped at the next re-mint and sits on disk for
 /// nothing until then.
-fn carry_live_extra_into(link: &Path, target: &Path) -> Result<()> {
+fn carry_live_extra_into(link: &Path, target: &Path, name: &str) -> Result<()> {
     if target
         .file_name()
         .is_some_and(|n| n == "session-token.json")
@@ -507,6 +507,11 @@ fn carry_live_extra_into(link: &Path, target: &Path) -> Result<()> {
         return Ok(());
     };
     let Ok(mut stored) = read_json_file::<serde_json::Value>(target) else {
+        // No store to carry into. An api-key or third-party profile keeps no
+        // credentials file, so the relink below removes the live slot and
+        // nothing recreates what it held. Park it against the day this profile
+        // has a store again, rather than returning and dropping it.
+        park_mcp_logins(name, &live);
         return Ok(());
     };
     let (Some(live_obj), Some(stored_obj)) = (live.as_object(), stored.as_object_mut()) else {
@@ -533,8 +538,86 @@ fn carry_live_extra_into(link: &Path, target: &Path) -> Result<()> {
 /// instead of raising it. Preserving MCP logins is a convenience; completing the
 /// switch is not, so an unwritable profile directory must not strand the
 /// operator on the outgoing account.
+/// Copy [`CARRIED_CREDENTIAL_KEYS`] out of `source` into `name`'s parked store.
+///
+/// Nothing is written when `source` carries none of them, so an absent parked
+/// file and an empty one never both mean "parked, and there was nothing" —
+/// [`restore_parked_mcp_logins`] would re-attach the empty one as if it were a
+/// login set. Best-effort like the carry itself: `write_profile_cache` swallows
+/// its own failures, and keeping MCP logins is a convenience where completing
+/// the capture or switch that triggered this is not.
+fn park_mcp_logins(name: &str, source: &serde_json::Value) {
+    let Some(obj) = source.as_object() else {
+        return;
+    };
+    let parked: serde_json::Map<String, serde_json::Value> = CARRIED_CREDENTIAL_KEYS
+        .iter()
+        .filter_map(|key| obj.get(*key).map(|v| ((*key).to_string(), v.clone())))
+        .collect();
+    if parked.is_empty() {
+        return;
+    }
+    crate::profile_cache::write_profile_cache(
+        name,
+        crate::profile_cache::MCP_LOGINS_FILE,
+        &serde_json::Value::Object(parked),
+    );
+}
+
+/// Park `name`'s MCP-server logins out of a credential store about to be
+/// removed. `save_profile` deletes that file whenever a profile stops storing a
+/// login (a recapture onto a third-party endpoint, a blanked OAuth login), and
+/// where the live slot is clauth's symlink that file IS what the slot resolves
+/// to — so the logins are already unreachable by the time any relink runs, and
+/// the carry above never sees them. Reading the STORE rather than the live slot
+/// is what makes this behave the same on a host that copies the slot instead.
+pub(crate) fn park_mcp_logins_from_store(name: &str, store: &Path) {
+    if let Ok(existing) = read_json_file::<serde_json::Value>(store) {
+        park_mcp_logins(name, &existing);
+    }
+}
+
+/// Merge `name`'s parked MCP-server logins back into a credential store it has
+/// just regained, then drop the parked copy. The parked block wins outright
+/// over the store's: a capture writes the login alone and carries no `mcpOAuth`
+/// at all, so there is nothing newer for it to lose to. The parked copy is
+/// dropped only once the merged write has landed, so a failure here costs a
+/// retry rather than the logins.
+///
+/// Re-filtered through [`CARRIED_CREDENTIAL_KEYS`] on the way back in: the park
+/// already filtered, so this only bounds what a hand-edited parked file can put
+/// into a credential store.
+pub(crate) fn restore_parked_mcp_logins(name: &str, store: &Path) {
+    let Some(parked) = crate::profile_cache::load_profile_cache::<serde_json::Value>(
+        name,
+        crate::profile_cache::MCP_LOGINS_FILE,
+    ) else {
+        return;
+    };
+    let (Some(parked_obj), Ok(mut stored)) = (
+        parked.as_object(),
+        read_json_file::<serde_json::Value>(store),
+    ) else {
+        return;
+    };
+    let Some(stored_obj) = stored.as_object_mut() else {
+        return;
+    };
+    for key in CARRIED_CREDENTIAL_KEYS {
+        if let Some(value) = parked_obj.get(key) {
+            stored_obj.insert(key.to_string(), value.clone());
+        }
+    }
+    let landed = serde_json::to_string_pretty(&stored)
+        .ok()
+        .is_some_and(|bytes| atomic_write_600(store, bytes).is_ok());
+    if landed {
+        crate::profile_cache::remove_profile_cache(name, crate::profile_cache::MCP_LOGINS_FILE);
+    }
+}
+
 fn carry_live_extra_best_effort(link: &Path, target: &Path, name: &str) {
-    if let Err(e) = carry_live_extra_into(link, target) {
+    if let Err(e) = carry_live_extra_into(link, target, name) {
         logline!(
             "clauth: switched to '{name}' but could not carry its MCP server logins: {e:#}. \
              Re-authenticate any MCP server that reports a signed-out session"

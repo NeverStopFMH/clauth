@@ -1702,10 +1702,19 @@ pub(crate) fn save_profile(profile: &Profile) -> Result<()> {
         match &profile.credentials {
             Some(creds) => {
                 let bytes = serialize_credentials_preserving_extra(creds, &cred_path)?;
-                atomic_write_600(&cred_path, bytes).context("failed to write credentials.json")?
+                atomic_write_600(&cred_path, bytes).context("failed to write credentials.json")?;
+                // This profile has a store again, so whatever it parked when it
+                // last lost one goes back where every reader looks for it.
+                crate::claude::restore_parked_mcp_logins(&profile.name, &cred_path);
             }
             None if cred_path.exists() => {
-                std::fs::remove_file(&cred_path).context("failed to remove credentials.json")?
+                // Read the MCP-server logins out before the only file carrying
+                // them goes. This is the chokepoint rather than each caller
+                // because every path that stops a profile storing a login lands
+                // here: a recapture onto a third-party endpoint, and blanking an
+                // OAuth login both do.
+                crate::claude::park_mcp_logins_from_store(&profile.name, &cred_path);
+                std::fs::remove_file(&cred_path).context("failed to remove credentials.json")?;
             }
             None => {}
         }

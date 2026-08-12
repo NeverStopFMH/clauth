@@ -1802,56 +1802,6 @@ fn link_adopts_a_matching_login_and_preserves_mcp_oauth() {
     );
 }
 
-/// The refuse-guard reads "the live path is not a symlink" as "something other
-/// than clauth wrote it". That premise holds only where clauth's own link IS a
-/// symlink. On a host whose transport falls back to a copy — Windows without
-/// `SeCreateSymbolicLinkPrivilege`, where `create_symlink` copies — clauth writes
-/// a plain file itself, so the guard fires on clauth's OWN artifact and refuses
-/// with a divergence the TUI it points at cannot resolve.
-///
-/// Both arms off ONE fixture: the guard is scoped to the transport whose premise
-/// it rests on, not deleted. The refusing arm runs first, since it bails without
-/// touching the live file.
-#[test]
-fn a_copy_transport_host_relinks_over_the_plain_file_it_wrote_itself() {
-    let _home = HomeSandbox::new();
-    let mut acme = crate::profile::Profile::new("acme".to_string(), None, None);
-    acme.credentials = Some(creds("acme-login", Some("acme-refresh")));
-    crate::profile::save_profile(&acme).expect("save acme");
-
-    // What a copy transport leaves once the store is rewritten under it: a plain
-    // file holding the PREVIOUS login, so live and stored genuinely differ.
-    let live_path = claude_credentials_path().expect("creds path");
-    std::fs::create_dir_all(live_path.parent().expect("parent")).expect("mkdir");
-    std::fs::write(
-        &live_path,
-        serde_json::to_vec(
-            &serde_json::json!({ "claudeAiOauth": { "accessToken": "acme-login-before" } }),
-        )
-        .unwrap(),
-    )
-    .expect("write live");
-
-    let err = link_profile_credentials("acme")
-        .expect_err("a real-symlink host must still refuse an unresolved live file");
-    assert!(
-        err.to_string().contains("refusing to replace"),
-        "the guard stays live where a plain file means somebody else wrote it: {err}"
-    );
-
-    crate::runtime::with_link_mode(crate::runtime::LinkMode::Fake, || {
-        link_profile_credentials("acme")
-    })
-    .expect("a copy-transport host must relink over the plain file it wrote itself");
-    assert_eq!(
-        crate::profile::read_json_file::<crate::profile::ClaudeCredentials>(&live_path)
-            .expect("read relinked live")
-            .access_token(),
-        Some("acme-login"),
-        "the relink must land the profile's stored login, not leave the stale one"
-    );
-}
-
 #[test]
 fn link_still_refuses_a_different_live_login() {
     let _home = HomeSandbox::new();

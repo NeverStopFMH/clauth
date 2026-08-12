@@ -867,6 +867,23 @@ fn with_fake_home<T>(root: &Path, f: impl FnOnce() -> T) -> T {
     f()
 }
 
+/// Force [`detect_link_mode`] to report `mode` for the duration of `f`.
+/// `try_real_symlink` always succeeds on unix, so the fake-symlink transport —
+/// and the shared bare-stem tree it selects — is otherwise unreachable from a
+/// Linux/macOS run. Call INSIDE [`with_fake_home`]: its `HOME_TEST_LOCK` hold is
+/// what serializes this process-global override.
+fn with_link_mode<T>(mode: LinkMode, f: impl FnOnce() -> T) -> T {
+    struct ClearOnDrop;
+    impl Drop for ClearOnDrop {
+        fn drop(&mut self) {
+            clear_link_mode_override();
+        }
+    }
+    set_link_mode_override(mode);
+    let _clear = ClearOnDrop;
+    f()
+}
+
 /// Whether this host can pose `subject`, for a fixture that needs
 /// [`LinkMode::Real`] to exist at all. Three shapes need it: a compat marker
 /// SEPARATE from the session's own, a runtime tree PER session, and the real

@@ -1187,8 +1187,19 @@ fn the_tree_build_skips_a_publish_in_flight() {
         // The same walk feeds real mode, where the entry becomes a symlink that
         // dangles the moment the rename lands. Pinned so the skip cannot be
         // moved down into the copy and read as covered.
+        //
+        // Gated on the host actually posing a symlink, because forcing
+        // `LinkMode::Real` where the OS denies one fails the build outright
+        // (os error 1314) instead of exercising the walk. A runtime probe, not
+        // `cfg(unix)`: an elevated Windows box poses this leg fine, and the
+        // neighbours' compile-time gate would sweep it out there too. Not
+        // `host_poses` either — the fake half above runs on every host, so that
+        // helper's SKIP line would report a running test as skipped.
         let linked = tmp.path().join("runtime-real");
         fs::create_dir_all(&linked).expect("mkdir runtime");
+        if detect_link_mode(&linked).expect("probe link mode") != LinkMode::Real {
+            return;
+        }
         build_runtime_dir(
             &linked,
             &claude_home,

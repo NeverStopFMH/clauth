@@ -201,7 +201,8 @@ impl PriceTable {
     /// pick the lowest `input_cost_per_token` — a floor for models the official
     /// provider has not yet listed under its own namespace. Ties on input price
     /// break to the lexicographically smaller key, keeping the pick deterministic
-    /// across HashMap iteration orders.
+    /// across HashMap iteration orders. Keys with no recorded provider are
+    /// skipped, so the reseller filter fails closed on an empty provider map.
     fn org_branded_fallback(&self, model: &str) -> Option<ModelRate> {
         const ORG_MARKERS: &[(&str, &str)] = &[("glm", "zai-org")];
         const RESELLERS: &[&str] = &["openrouter", "together_ai", "fireworks_ai"];
@@ -222,7 +223,9 @@ impl PriceTable {
             if !key.contains(org) {
                 continue;
             }
-            let provider = self.providers.get(key).map(String::as_str).unwrap_or("");
+            let Some(provider) = self.providers.get(key).map(String::as_str) else {
+                continue;
+            };
             if RESELLERS.contains(&provider) {
                 continue;
             }

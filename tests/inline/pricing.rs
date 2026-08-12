@@ -204,6 +204,25 @@ fn rate_org_branded_excludes_reseller_even_when_cheaper() {
 }
 
 #[test]
+fn rate_org_branded_tie_breaks_lexicographically() {
+    // Two non-reseller zai-org-branded entries at the SAME input price. HashMap
+    // iteration order is random, so without the deterministic tie-break the pick
+    // is a coin flip; the lexicographically smaller key must always win.
+    let t = table_pv(
+        &[
+            ("cloudflare/@cf/zai-org/glm-5.2", 1.4e-6, 5.6e-6, 0.0, 0.0),
+            ("novita/zai-org/glm-5.2", 1.4e-6, 2.0e-6, 0.0, 0.0),
+        ],
+        &[
+            ("cloudflare/@cf/zai-org/glm-5.2", "cloudflare"),
+            ("novita/zai-org/glm-5.2", "novita"),
+        ],
+    );
+    // "cloudflare/..." sorts before "novita/...", so its output rate must win.
+    assert_eq!(t.rate("glm-5.2").map(|r| r.output), Some(5.6e-6));
+}
+
+#[test]
 fn rate_prefers_official_over_cheaper_reseller() {
     // openrouter lists glm-4.7 cheaper, but step (e) hits 'zai/glm-4.7' first.
     let t = table_pv(

@@ -551,7 +551,20 @@ pub(crate) fn link_profile_credentials(name: &str) -> Result<()> {
         let target = install_source_path(name)?;
 
         if let Ok(meta) = link.symlink_metadata() {
-            if !meta.file_type().is_symlink() {
+            // "Not a symlink" means "clauth did not write this" only on a host
+            // where clauth writes symlinks at all. `create_symlink` degrades to a
+            // plain copy wherever the OS refuses one (Windows without
+            // `SeCreateSymbolicLinkPrivilege`), so there a regular file IS
+            // clauth's own artifact, and the guard below would refuse every
+            // relink over one — naming a divergence the TUI it points at cannot
+            // resolve, because there is none. Short-circuits, so the probe costs
+            // nothing on the symlink path.
+            let wrote_by_someone_else = !meta.file_type().is_symlink()
+                && match link.parent() {
+                    Some(dir) => crate::runtime::real_symlinks_supported_in(dir)?,
+                    None => true,
+                };
+            if wrote_by_someone_else {
                 // A matching LOGIN clears the file, whatever else differs: the
                 // non-login blocks are carried across below
                 // (`carry_live_extra_into`), so a live file differing from the

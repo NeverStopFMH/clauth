@@ -68,7 +68,7 @@ use crate::profile::{
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum LinkMode {
+pub(crate) enum LinkMode {
     /// OS-level symlinks. Used on Unix unconditionally and on Windows when
     /// the process can create symlinks (developer mode or admin).
     Real,
@@ -2131,6 +2131,42 @@ fn clear_link_mode_override() {
     if let Ok(mut guard) = LINK_MODE_OVERRIDE.lock() {
         *guard = None;
     }
+}
+
+/// Force [`detect_link_mode`] to report `mode` for the duration of `f`.
+/// `try_real_symlink` always succeeds on unix, so the fake-symlink transport —
+/// the shared bare-stem tree it selects, and the copy `create_symlink` degrades
+/// to — is otherwise unreachable from a Linux/macOS run. Lives here rather than
+/// beside one test module because the transport reaches `claude.rs` too.
+///
+/// Call it INSIDE a home sandbox: that `HOME_TEST_LOCK` hold is what serializes
+/// this process-global override.
+#[cfg(test)]
+pub(crate) fn with_link_mode<T>(mode: LinkMode, f: impl FnOnce() -> T) -> T {
+    struct ClearOnDrop;
+    impl Drop for ClearOnDrop {
+        fn drop(&mut self) {
+            clear_link_mode_override();
+        }
+    }
+    set_link_mode_override(mode);
+    let _clear = ClearOnDrop;
+    f()
+}
+
+/// Whether a link clauth creates in `dir` would be a REAL symlink on this host.
+///
+/// [`crate::claude::create_symlink`] falls back to a plain copy wherever the OS
+/// refuses one (Windows without `SeCreateSymbolicLinkPrivilege`), so on such a
+/// host clauth's own live credential file is a regular file. Any predicate
+/// reading "not a symlink" as "clauth did not write this" is therefore wrong
+/// there, and has to ask this first.
+///
+/// Probed in the DESTINATION dir, the one the link would be created in, since
+/// that is the filesystem whose answer decides — not the source, and not the
+/// platform.
+pub(crate) fn real_symlinks_supported_in(dir: &Path) -> Result<bool> {
+    Ok(detect_link_mode(dir)? == LinkMode::Real)
 }
 
 /// Probe the OS by attempting a real symlink in `probe_dir`. Anything other than

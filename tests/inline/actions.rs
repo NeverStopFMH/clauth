@@ -1208,6 +1208,148 @@ fn overwrite_captured_profile_reapplies_live_state_when_active() {
     );
 }
 
+/// Re-applying live state must not be refusable by the very divergence the
+/// overwrite just created. The operator asked for this profile's credentials to
+/// be replaced, so a live slot holding the OLD login is the expected end of that
+/// operation, never an unresolved re-login to protect: the guarded relink reads
+/// any REGULAR live file as foreign and refuses, and nothing downstream can
+/// resolve a divergence whose other half was overwritten a few lines earlier.
+///
+/// A regular live file is CC's own shape after a re-login on any host, and it is
+/// what clauth itself leaves on a host whose `create_symlink` degrades to a copy
+/// (Windows without `SeCreateSymbolicLinkPrivilege`) — where it is the ONLY
+/// shape, so that host could not recapture an active profile at all. Measured
+/// there 2026-08-12; this pins the fix without needing that host.
+#[test]
+fn overwriting_the_active_profile_replaces_a_regular_live_file() {
+    let _home = HomeSandbox::new();
+
+    let mut acme = Profile::new("acme".to_string(), None, None);
+    acme.credentials = Some(ClaudeCredentials {
+        claude_ai_oauth: Some(crate::profile::OAuthToken {
+            access_token: "old-access".to_string(),
+            refresh_token: Some("old-refresh".to_string()),
+            expires_at: None,
+            scopes: None,
+            subscription_type: None,
+        }),
+    });
+    save_profile(&acme).expect("save acme");
+
+    // A REGULAR file, not clauth's symlink: what CC leaves after a re-login, and
+    // what clauth itself writes wherever the OS denies symlinks.
+    let live_path = crate::profile::claude_dir()
+        .unwrap()
+        .join(".credentials.json");
+    std::fs::create_dir_all(live_path.parent().unwrap()).expect("mkdir .claude");
+    std::fs::write(
+        &live_path,
+        serde_json::to_vec(
+            &serde_json::json!({ "claudeAiOauth": { "accessToken": "live-side-login" } }),
+        )
+        .unwrap(),
+    )
+    .expect("write live");
+
+    let mut config = AppConfig {
+        state: AppState {
+            profiles: vec!["acme".into()],
+            fallback_chain: vec!["acme".into()],
+            active_profile: Some("acme".into()),
+            ..AppState::default()
+        },
+        profiles: vec![acme],
+    };
+
+    let snapshot = CaptureSnapshot {
+        credentials: Some(ClaudeCredentials {
+            claude_ai_oauth: Some(crate::profile::OAuthToken {
+                access_token: "new-access".to_string(),
+                refresh_token: Some("new-refresh".to_string()),
+                expires_at: None,
+                scopes: None,
+                subscription_type: None,
+            }),
+        }),
+        base_url: None,
+        api_key: None,
+        account_uuid: None,
+    };
+    overwrite_captured_profile(&mut config, "acme", snapshot)
+        .expect("overwrite must re-apply live state over a regular live file");
+
+    assert_eq!(
+        crate::profile::read_json_file::<ClaudeCredentials>(&live_path)
+            .expect("read live")
+            .access_token(),
+        Some("new-access"),
+        "the live slot must carry the login the overwrite just stored"
+    );
+}
+
+/// The other arm of the same branch: a recapture that stores NO credentials (a
+/// third-party snapshot) must leave a clean absence, not a live slot still
+/// serving the account that was just replaced. `overwrite_captured_profile_…_when_active`
+/// pins this where the slot is clauth's symlink; this pins it where the slot is
+/// a regular file, which is the shape a host that cannot symlink always has and
+/// the one the forcing relink changed most.
+///
+/// Deliberately silent on `mcpOAuth`: the carry no-ops when the snapshot stored
+/// no file to carry into, so those logins go with the slot. That is a live
+/// defect (`docs/todo.md`), and a test asserting it here would pin it.
+#[test]
+fn overwriting_the_active_profile_with_no_credentials_clears_a_regular_live_file() {
+    let _home = HomeSandbox::new();
+
+    let mut acme = Profile::new("acme".to_string(), None, None);
+    acme.credentials = Some(ClaudeCredentials {
+        claude_ai_oauth: Some(crate::profile::OAuthToken {
+            access_token: "old-access".to_string(),
+            refresh_token: Some("old-refresh".to_string()),
+            expires_at: None,
+            scopes: None,
+            subscription_type: None,
+        }),
+    });
+    save_profile(&acme).expect("save acme");
+
+    let live_path = crate::profile::claude_dir()
+        .unwrap()
+        .join(".credentials.json");
+    std::fs::create_dir_all(live_path.parent().unwrap()).expect("mkdir .claude");
+    std::fs::write(
+        &live_path,
+        serde_json::to_vec(
+            &serde_json::json!({ "claudeAiOauth": { "accessToken": "old-access" } }),
+        )
+        .unwrap(),
+    )
+    .expect("write live");
+
+    let mut config = AppConfig {
+        state: AppState {
+            profiles: vec!["acme".into()],
+            active_profile: Some("acme".into()),
+            ..AppState::default()
+        },
+        profiles: vec![acme],
+    };
+
+    let snapshot = CaptureSnapshot {
+        credentials: None,
+        base_url: Some("https://api.example.com".to_string()),
+        api_key: Some("new-api-key".to_string()),
+        account_uuid: None,
+    };
+    overwrite_captured_profile(&mut config, "acme", snapshot)
+        .expect("a third-party recapture of the active profile must not be refusable");
+
+    assert!(
+        live_path.symlink_metadata().is_err(),
+        "the replaced account's login must not stay live once the profile stores none"
+    );
+}
+
 /// Deleting the ACTIVE API-key profile must strip its endpoint + key from the
 /// live `~/.claude/settings.json`, not only the (absent) credentials link.
 /// Otherwise the deleted account's `ANTHROPIC_AUTH_TOKEN` lingers in plaintext

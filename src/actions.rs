@@ -1023,13 +1023,33 @@ pub(crate) fn overwrite_captured_profile(
             // The overwritten profile is (and stays) the active one: unlike a
             // brand-new capture, `save_profile` just rewrote credentials.json
             // in place (or removed it, if the snapshot had none — a third-
-            // party capture). Re-run `link_profile_credentials` so the live
-            // `.credentials.json` symlink is recreated against the new file,
-            // or dropped instead of left dangling when the file is now gone;
-            // and re-apply `base_url`/`api_key` to `settings.json` the same
-            // way `edit_profile_endpoint` does, so a running `claude` doesn't
-            // keep reading the OLD endpoint/token until the next switch.
-            link_profile_credentials(name)?;
+            // party capture). Relink so the live `.credentials.json` is
+            // recreated against the new file, or dropped instead of left
+            // dangling when the file is now gone; and re-apply
+            // `base_url`/`api_key` to `settings.json` the same way
+            // `edit_profile_endpoint` does, so a running `claude` doesn't keep
+            // reading the OLD endpoint/token until the next switch.
+            //
+            // FORCE-links, joining the two sites that already do: this branch
+            // has resolved the divergence by definition, since the operator
+            // asked for exactly this profile's credentials to be replaced. The
+            // guarded call cannot work here — it reads any REGULAR live file as
+            // an unresolved re-login and refuses, naming a divergence whose
+            // other half `save_profile` overwrote a few lines up, so nothing
+            // downstream can resolve it. That made this path unreachable on any
+            // host where `create_symlink` degrades to a copy and a regular file
+            // is the only shape a live slot ever has (Windows without
+            // `SeCreateSymbolicLinkPrivilege`). Cost, accepted: an unsaved
+            // re-login for a DIFFERENT account sitting in the live slot is
+            // dropped here rather than refused. The forcing variant carries
+            // `mcpOAuth` across first, as on every other switch — but ONLY when
+            // the new snapshot stored a credentials file to carry it into. A
+            // third-party recapture stores none, so the carry no-ops and the
+            // live slot's MCP logins go with it. Pre-existing wherever the slot
+            // is a symlink (the guard never ran there either); this branch
+            // widens it to the hosts where the slot is a regular file. Open in
+            // `docs/todo.md`, and NOT the residual named above.
+            force_link_profile_credentials(name)?;
             let profile = config.find(name).context("profile not found")?;
             let prev_env_keys: Vec<String> = profile.env.keys().cloned().collect();
             apply_profile_to_claude_settings(profile, &prev_env_keys)?;

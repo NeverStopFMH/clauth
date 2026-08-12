@@ -2367,9 +2367,19 @@ fn fake_mode_shares_one_tree_across_two_sessions() {
 }
 
 /// Session 2 must neither wipe nor rebuild the tree session 1 is using — that is
-/// the whole point of sharing it. The sentinel exists ONLY in the runtime tree,
-/// so nothing can re-materialize it: if the second acquire wiped the tree, it is
-/// gone for good.
+/// the whole point of sharing it. The witness has to be a file a rebuild cannot
+/// put back, and an ordinary sentinel is not one: the fake-mode tree mirror is
+/// BIDIRECTIONAL, session 1's own watchdog publishes tree files out to
+/// `~/.claude`, and a wiping rebuild then copies them straight back in. Measured
+/// at 1.5 s of watchdog: the sentinel reached `~/.claude` and the assertion below
+/// passed over an unconditional wipe.
+///
+/// A staging-shaped name is the one class every walk over this tree skips by
+/// contract — the mirror's (`union_children`), the acquire-time build's, and
+/// `copy_tree`'s recursion under it — so it lives in the tree and nowhere else.
+/// `published` is the positive control: same tree, ordinary name, and it DOES
+/// cross over, which is what makes the sentinel's absence the exemption rather
+/// than an idle mirror.
 #[test]
 fn fake_mode_second_session_does_not_rebuild_the_tree() {
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -2381,13 +2391,26 @@ fn fake_mode_second_session_does_not_rebuild_the_tree() {
             let a = ProfileRuntime::acquire(&profile, Isolation::Shared, &[], false)
                 .expect("first acquire");
 
-            let sentinel = "session-one-was-here.txt";
+            let sentinel = ".session-one-was-here.tmp.pin";
+            assert!(
+                crate::watchdog::is_staging(std::ffi::OsStr::new(sentinel)),
+                "the sentinel is unrestorable only while the walks skip its name"
+            );
+            let published = "session-one-published.txt";
+            fs::write(a.config_dir().join(sentinel), b"do not re-copy me").expect("seed sentinel");
+            fs::write(a.config_dir().join(published), b"ordinary tree file").expect("seed control");
+
+            mirror_tree(&claude_home, a.config_dir()).expect("mirror");
+            assert!(
+                claude_home.join(published).exists(),
+                "the mirror must publish an ordinary tree file outward, or the check \
+                 below proves nothing about the sentinel"
+            );
             assert!(
                 !claude_home.join(sentinel).exists(),
-                "the sentinel must be absent from ~/.claude, or a rebuild would restore it \
-                 and this test would prove nothing"
+                "the mirror published the sentinel, so a rebuild could restore it and \
+                 this test would prove nothing"
             );
-            fs::write(a.config_dir().join(sentinel), b"do not re-copy me").expect("seed sentinel");
 
             let b = ProfileRuntime::acquire(&profile, Isolation::Shared, &[], false)
                 .expect("second acquire");

@@ -884,6 +884,30 @@ fn with_link_mode<T>(mode: LinkMode, f: impl FnOnce() -> T) -> T {
     f()
 }
 
+/// Whether this host poses the compat-marker scenario at all, for a test whose
+/// fixture needs the marker to be a SEPARATE file from the session's own.
+///
+/// That only holds under [`LinkMode::Real`]. Under the shared tree the two are
+/// one path, so there is no second marker to fabricate a foreign holder on, and
+/// such a test fails on its own fixture rather than on the behavior it guards.
+/// A host without `SeCreateSymbolicLinkPrivilege` (Windows outside Developer
+/// Mode) probes into `Fake` for every test here, which is where that bites.
+///
+/// A capability skip, not a mode force: `with_link_mode` overrides only
+/// [`detect_link_mode`], so forcing `Real` on such a host would still attempt
+/// real symlinks in the build and fail with os error 1314. Call INSIDE
+/// [`with_fake_home`], and say so out loud, since a silent skip reads as a pass.
+fn poses_the_compat_scenario(probe_dir: &Path) -> bool {
+    let mode = detect_link_mode(probe_dir).expect("probe link mode");
+    if mode != LinkMode::Real {
+        eprintln!(
+            "SKIP: {mode:?} shares one marker path, so the compat-marker scenario \
+             does not exist on this host"
+        );
+    }
+    mode == LinkMode::Real
+}
+
 /// Truncate `touch_store`'s READ-BACK to whole seconds for the duration of `f` —
 /// the one thing the receipt guard consults, not a model of a coarse filesystem
 /// end to end. `file_mtime` is untouched, so `memoized` stays full-precision and
@@ -1987,6 +2011,9 @@ fn stamp_legacy_marker_declines_a_marker_another_holder_owns() {
 fn teardown_leaves_a_pre_upgrade_marker_it_never_owned() {
     let tmp = tempfile::tempdir().expect("tempdir");
     with_fake_home(tmp.path(), || {
+        if !poses_the_compat_scenario(tmp.path()) {
+            return;
+        }
         fake_claude_home(tmp.path());
 
         // `acquire` mints exactly one `SessionId`, and `with_fake_home` holds the
@@ -2037,6 +2064,9 @@ fn teardown_leaves_a_pre_upgrade_marker_it_never_owned() {
 fn the_pre_upgrade_marker_dir_survives_until_the_last_session_leaves() {
     let tmp = tempfile::tempdir().expect("tempdir");
     with_fake_home(tmp.path(), || {
+        if !poses_the_compat_scenario(tmp.path()) {
+            return;
+        }
         fake_claude_home(tmp.path());
         let profile = make_profile("upgrade-twin");
         let legacy = tmp
@@ -4223,6 +4253,9 @@ fn gc_keeps_a_swapped_row_after_its_launch_profile_is_force_deleted() {
 fn teardown_removes_every_marker_a_swap_stamped() {
     let tmp = tempfile::tempdir().expect("tempdir");
     with_fake_home(tmp.path(), || {
+        if !poses_the_compat_scenario(tmp.path()) {
+            return;
+        }
         fake_claude_home(tmp.path());
         let launch = member("down-a");
         let intended = member("down-b");
@@ -4271,6 +4304,9 @@ fn teardown_removes_every_marker_a_swap_stamped() {
 fn teardown_leaves_a_swapped_compat_marker_it_never_owned() {
     let tmp = tempfile::tempdir().expect("tempdir");
     with_fake_home(tmp.path(), || {
+        if !poses_the_compat_scenario(tmp.path()) {
+            return;
+        }
         fake_claude_home(tmp.path());
         let launch = member("foreign-a");
         let intended = member("foreign-b");

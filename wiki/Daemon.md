@@ -59,8 +59,9 @@ stays the only resolution surface.
   cross-process state flock a tick may block on is capped at 25 s, so a
   flock-blocked tick times out and retries rather than hanging; if no tick
   completes in 30 s at all, the daemon `abort()`s for a clean supervisor
-  restart, freeing the usage lease (below). A legit ~20 s keychain switch sits
-  inside both margins.
+  restart, freeing the usage lease (below). A legit keychain switch sits inside
+  both margins: on macOS it reads the Keychain item and writes it back, and each
+  of those two is killed at 10 s.
 - **Log hygiene**: every daemon-visible stderr line carries an ISO-8601 UTC
   prefix, enabled only in daemon mode. An interactive terminal instead diverts
   its lines to `~/.clauth/clauth.log` so a background thread never paints over

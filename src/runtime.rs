@@ -121,6 +121,14 @@ impl Isolation {
 /// `acquire` with no session ever spawned.
 static SESSION_SEQ: AtomicU64 = AtomicU64::new(0);
 
+/// How many times `acquire` re-mints a [`SessionId`] whose marker a live holder
+/// already owns. The counter above makes an in-process collision impossible, so
+/// a holder here is always another PROCESS that minted the same `<pid>-<seq>`,
+/// and its own counter has to keep pace with ours for a re-mint to collide
+/// again. A handful of attempts outruns that; exhausting them is a real anomaly
+/// and fails loudly rather than waiting.
+const SID_COLLISION_REMINTS: u32 = 8;
+
 /// A session's process-unique id, `<pid>-<seq>`: the name of its liveness marker
 /// file AND the suffix keying its own runtime + sessions dirs. Digits and one
 /// `-` only, which is what makes a session id unable to spell the `isolated`
@@ -1689,7 +1697,6 @@ impl ProfileRuntime {
         if !claude_home.exists() {
             anyhow::bail!("~/.claude not found; install Claude Code first");
         }
-        let session = SessionId::mint();
         let canonical = canonical_credentials(name)?;
         let profile_root = profile_dir(name)?;
 
@@ -1702,7 +1709,7 @@ impl ProfileRuntime {
         // nothing to keep and a shorter scope would need re-proving.
         let _rotation_guard = RotationGuard::acquire(name)?;
 
-        let (paths, pid_lock, legacy_lock, mode) = with_state_lock(|| {
+        let (session, paths, pid_lock, legacy_lock, mode) = with_state_lock(|| {
             // The transport is probed FIRST: under `LinkMode::Fake` the tree is
             // shared under the bare stem, so the mode decides every path below.
             // The profile dir is the probe site because it exists independently
@@ -1711,7 +1718,26 @@ impl ProfileRuntime {
             crate::profile::mkdir_700(&profile_root)
                 .with_context(|| format!("failed to create {}", profile_root.display()))?;
             let mode = detect_link_mode(&profile_root)?;
-            let paths = SessionPaths::resolve(name, isolation, &session, mode)?;
+            // A sid is a NAME, not a claim. `<pid>-<seq>` collides only when a
+            // second LIVE process minted the same pair, which needs the shapes
+            // `stamp_legacy_marker` names: a `~/.clauth` shared across pid
+            // namespaces, or an NFS home. Under `LinkMode::Fake` that collision
+            // lands on this session's OWN marker, because the bare-stem tree puts
+            // it at the compat path, so there is no separate marker to fall back
+            // to and no `try_lock` concede on the way in. Re-mint rather than
+            // wait: the claim below runs inside the state flock, so a blocking
+            // wait there wedges every other clauth process on this home, and
+            // `is_session_alive` reads every unknown as live, so an unreadable
+            // marker moves this session aside instead of parking it.
+            let mut session = SessionId::mint();
+            let mut paths = SessionPaths::resolve(name, isolation, &session, mode)?;
+            for _ in 0..SID_COLLISION_REMINTS {
+                if !is_session_alive(&paths.pid_file) {
+                    break;
+                }
+                session = SessionId::mint();
+                paths = SessionPaths::resolve(name, isolation, &session, mode)?;
+            }
             let SessionPaths {
                 runtime,
                 sessions,
@@ -1761,8 +1787,17 @@ impl ProfileRuntime {
             )?;
             let file = open_pid_file(pid_file)
                 .with_context(|| format!("failed to open {}", pid_file.display()))?;
-            file.lock()
-                .with_context(|| format!("failed to lock {}", pid_file.display()))?;
+            // `try_lock`, not `lock`, for the reason the re-mint loop above
+            // states. Reaching here means the loop spent its re-mints against a
+            // holder that outlived every one of them, so failing loudly is the
+            // only honest end: waiting would park the state flock.
+            if let Err(e) = file.try_lock() {
+                anyhow::bail!(
+                    "failed to claim session marker {}: {e}. Another live process \
+                     holds this session id",
+                    pid_file.display()
+                );
+            }
             let legacy_lock = legacy_marker.as_deref().and_then(stamp_legacy_marker);
 
             // Register inside this same hold, once the marker is flock-held: the
@@ -1793,7 +1828,7 @@ impl ProfileRuntime {
             if let Err(e) = crate::live_sessions::register(&row) {
                 logline!("clauth: registering the live session failed: {e}");
             }
-            Ok::<_, anyhow::Error>((paths, file, legacy_lock, mode))
+            Ok::<_, anyhow::Error>((session, paths, file, legacy_lock, mode))
         })?;
         // Built from `paths` rather than from locals moved out of it, so the
         // runtime dir the swap repoints and the marker it must recognize as its

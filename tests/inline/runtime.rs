@@ -1881,6 +1881,77 @@ fn acquire_stamps_the_pre_upgrade_liveness_marker_for_both_flavors() {
     });
 }
 
+/// A live foreign holder of this session's OWN marker must never park `acquire`.
+/// Under [`LinkMode::Fake`] the session's marker sits at the bare-stem
+/// `sessions/<sid>`, the same path `stamp_legacy_marker` guards with `try_lock`
+/// under `Real`, so a colliding sid reaches the claim at a branch that has no
+/// such guard. That claim runs inside the state flock, so a blocking wait there
+/// wedges every other clauth process on the home, not just this one.
+///
+/// Runs `acquire` on a worker thread and fails on a timeout rather than hanging:
+/// a regression here parks a thread inside `with_state_lock` and would otherwise
+/// take the rest of the suite down with it, reporting nothing.
+#[test]
+fn a_foreign_holder_of_our_own_marker_never_blocks_acquire() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        with_link_mode(LinkMode::Fake, || {
+            fake_claude_home(tmp.path());
+
+            // Same sid arithmetic as the compat-marker tests: `acquire` mints
+            // exactly one id, so seq+1 is the one it is about to take.
+            let probe = SessionId::mint();
+            let (pid, seq) = probe.as_str().split_once('-').expect("<pid>-<seq>");
+            let colliding_sid = format!("{pid}-{}", seq.parse::<u64>().expect("seq") + 1);
+
+            let sessions = tmp
+                .path()
+                .join(".clauth")
+                .join("profiles")
+                .join("collide")
+                .join("sessions");
+            fs::create_dir_all(&sessions).expect("mkdir sessions");
+            let foreign_marker = sessions.join(&colliding_sid);
+            let held = open_pid_file(&foreign_marker).expect("open foreign marker");
+            held.lock().expect("lock foreign marker");
+
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let profile = make_profile("collide");
+                let claimed =
+                    ProfileRuntime::acquire(&profile, Isolation::Shared, &[], false).map(|rt| {
+                        // Read the dir while the session still holds its marker:
+                        // teardown unlinks it on drop.
+                        let names = dir_entry_names(rt.sessions_dir());
+                        drop(rt);
+                        names
+                    });
+                let _ = tx.send(claimed);
+            });
+
+            let names = rx
+                .recv_timeout(std::time::Duration::from_secs(20))
+                .expect("acquire parked on a marker a live holder owns")
+                .expect("acquire");
+
+            assert!(
+                names.contains(&colliding_sid),
+                "the foreign holder's marker was taken or renamed: {names:?}"
+            );
+            assert_eq!(
+                names.len(),
+                2,
+                "the session must stamp a marker of its own beside the foreign one: {names:?}"
+            );
+            assert!(
+                is_session_alive(&foreign_marker),
+                "the foreign holder's lock must be untouched"
+            );
+            drop(held);
+        });
+    });
+}
+
 /// `stamp_legacy_marker` must decline rather than block when the marker is
 /// already held, and leave the file exactly as it found it.
 #[test]

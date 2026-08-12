@@ -22,8 +22,19 @@ fn table(rows: &[(&str, f64, f64, f64, f64)]) -> PriceTable {
     }
     PriceTable {
         rates,
+        providers: HashMap::new(),
         fetched_at_ms: 0,
     }
+}
+
+/// Same as [`table`] but also seeds the provider map for tests exercising
+/// org-branded fallback (step f).
+fn table_pv(rows: &[(&str, f64, f64, f64, f64)], providers: &[(&str, &str)]) -> PriceTable {
+    let mut t = table(rows);
+    for &(id, provider) in providers {
+        t.providers.insert(id.to_owned(), provider.to_owned());
+    }
+    t
 }
 
 fn model(id: &str, input: u64, output: u64, cache_read: u64, cache_create: u64) -> ModelTokens {
@@ -39,29 +50,37 @@ fn model(id: &str, input: u64, output: u64, cache_read: u64, cache_create: u64) 
 // ── distill ────────────────────────────────────────────────────────────────
 
 #[test]
-fn distill_keeps_priced_bare_keys_and_drops_paths() {
+fn distill_keeps_priced_keys_including_namespaced() {
     let json = r#"{
         "claude-opus-4-8": {
             "input_cost_per_token": 0.000005,
             "output_cost_per_token": 0.000025,
             "cache_read_input_token_cost": 0.0000005,
-            "cache_creation_input_token_cost": 0.00000625
+            "cache_creation_input_token_cost": 0.00000625,
+            "litellm_provider": "anthropic"
         },
         "deepseek-chat": {
             "input_cost_per_token": 0.00000028,
             "output_cost_per_token": 0.00000042,
             "cache_read_input_token_cost": 0.000000028,
-            "cache_creation_input_token_cost": null
+            "cache_creation_input_token_cost": null,
+            "litellm_provider": "deepseek"
         },
-        "bedrock/us-east-1/claude-opus-4-8": {
-            "input_cost_per_token": 0.000005
+        "zai/glm-4.7": {
+            "input_cost_per_token": 0.0000007,
+            "output_cost_per_token": 0.0000028,
+            "litellm_provider": "zai"
+        },
+        "openrouter/z-ai/glm-4.7": {
+            "input_cost_per_token": 0.0000005,
+            "litellm_provider": "openrouter"
         },
         "some-embedding-model": {
             "output_cost_per_token": 0.0
         }
     }"#;
 
-    let rates = distill(json).expect("distill ok");
+    let (rates, providers) = distill(json).expect("distill ok");
 
     // Bare priced key kept with all four buckets.
     let opus = rates.get("claude-opus-4-8").expect("opus present");
@@ -74,8 +93,19 @@ fn distill_keeps_priced_bare_keys_and_drops_paths() {
     let ds = rates.get("deepseek-chat").expect("deepseek present");
     assert_eq!(ds.cache_write, 0.0);
 
-    // Path-style keys dropped; entries without input cost dropped.
-    assert!(!rates.contains_key("bedrock/us-east-1/claude-opus-4-8"));
+    // Namespaced keys are kept, not dropped.
+    let glm = rates.get("zai/glm-4.7").expect("zai/glm-4.7 present");
+    assert_eq!(glm.input, 0.0000007);
+    assert!(rates.contains_key("openrouter/z-ai/glm-4.7"));
+
+    // Provider map records litellm_provider for namespaced keys.
+    assert_eq!(providers.get("zai/glm-4.7"), Some(&"zai".to_owned()));
+    assert_eq!(
+        providers.get("openrouter/z-ai/glm-4.7"),
+        Some(&"openrouter".to_owned())
+    );
+
+    // Entries without input cost are still dropped.
     assert!(!rates.contains_key("some-embedding-model"));
 }
 
@@ -126,6 +156,118 @@ fn rate_fallback_never_matches_bare_family_key() {
     let t = table(&[("claude", 1e-6, 2e-6, 0.0, 0.0)]);
     assert!(t.rate("claude-sonnet-4-5-20250929").is_none());
     assert_eq!(t.rate("claude").map(|r| r.input), Some(1e-6)); // exact still works
+}
+
+// ── official-provider resolution ───────────────────────────────────────────
+
+#[test]
+fn rate_bare_id_resolves_to_official_namespace() {
+    // 'glm-4.7' has no bare key; the feed only has 'zai/glm-4.7'.
+    // Step (e) official-namespace resolves glm → zai/glm-4.7.
+    let t = table(&[("zai/glm-4.7", 7e-7, 2.8e-6, 0.0, 0.0)]);
+    assert_eq!(t.rate("glm-4.7").map(|r| r.input), Some(7e-7));
+}
+
+#[test]
+fn rate_org_branded_fallback_picks_lowest_official() {
+    // glm-5.2 has no 'zai/glm-5.2' entry. The only zai-org-branded entry is
+    // the Cloudflare-hosted one. Resellers are absent or filtered.
+    let t = table_pv(
+        &[
+            ("cloudflare/@cf/zai-org/glm-5.2", 1.4e-6, 5.6e-6, 0.0, 0.0),
+            ("fireworks_ai/glm-5p2", 1.0e-6, 2.0e-6, 0.0, 0.0),
+        ],
+        &[
+            ("cloudflare/@cf/zai-org/glm-5.2", "cloudflare"),
+            ("fireworks_ai/glm-5p2", "fireworks_ai"),
+        ],
+    );
+    assert_eq!(t.rate("glm-5.2").map(|r| r.input), Some(1.4e-6));
+}
+
+#[test]
+fn rate_org_branded_excludes_reseller_even_when_cheaper() {
+    // The reseller key passes both the org-marker check (contains 'zai-org')
+    // and the last-segment check (last segment == 'glm-5.2'), so only the
+    // RESELLERS filter excludes it. The more expensive non-reseller entry wins.
+    let t = table_pv(
+        &[
+            ("cloudflare/@cf/zai-org/glm-5.2", 1.4e-6, 5.6e-6, 0.0, 0.0),
+            ("together_ai/zai-org/glm-5.2", 1.0e-6, 2.0e-6, 0.0, 0.0),
+        ],
+        &[
+            ("cloudflare/@cf/zai-org/glm-5.2", "cloudflare"),
+            ("together_ai/zai-org/glm-5.2", "together_ai"),
+        ],
+    );
+    assert_eq!(t.rate("glm-5.2").map(|r| r.input), Some(1.4e-6));
+}
+
+#[test]
+fn rate_prefers_official_over_cheaper_reseller() {
+    // openrouter lists glm-4.7 cheaper, but step (e) hits 'zai/glm-4.7' first.
+    let t = table_pv(
+        &[
+            ("zai/glm-4.7", 7e-7, 2.8e-6, 0.0, 0.0),
+            ("openrouter/z-ai/glm-4.7", 5e-7, 1e-6, 0.0, 0.0),
+        ],
+        &[
+            ("zai/glm-4.7", "zai"),
+            ("openrouter/z-ai/glm-4.7", "openrouter"),
+        ],
+    );
+    assert_eq!(t.rate("glm-4.7").map(|r| r.input), Some(7e-7));
+}
+
+#[test]
+fn rate_dotted_rewrite_to_official() {
+    // 'zai.glm-4.7' → 'zai/glm-4.7' (not the feed's bedrock_converse entry).
+    let t = table(&[("zai/glm-4.7", 7e-7, 2.8e-6, 0.0, 0.0)]);
+    assert_eq!(t.rate("zai.glm-4.7").map(|r| r.input), Some(7e-7));
+}
+
+#[test]
+fn rate_colon_strip_namespaced() {
+    // 'zai/glm-4.7:free' → colon strip → exact 'zai/glm-4.7'.
+    let t = table(&[
+        ("zai/glm-4.7", 7e-7, 2.8e-6, 0.0, 0.0),
+        ("deepseek/deepseek-v3.2", 2.8e-7, 4.2e-7, 0.0, 0.0),
+    ]);
+    assert_eq!(t.rate("zai/glm-4.7:free").map(|r| r.input), Some(7e-7));
+    assert_eq!(
+        t.rate("deepseek/deepseek-v3.2:free").map(|r| r.input),
+        Some(2.8e-7)
+    );
+}
+
+#[test]
+fn rate_only_reseller_entries_returns_none() {
+    // Only reseller entries exist; no official key, no non-reseller org-branded.
+    let t = table_pv(
+        &[("openrouter/z-ai/glm-4.7", 5e-7, 1e-6, 0.0, 0.0)],
+        &[("openrouter/z-ai/glm-4.7", "openrouter")],
+    );
+    assert!(t.rate("glm-4.7").is_none());
+}
+
+#[test]
+fn cache_file_without_providers_parses() {
+    // An old cache written before the provider field existed must still load.
+    let json = r#"{
+        "fetched_at_ms": 12345,
+        "rates": {
+            "claude-opus-4-8": {
+                "input": 0.000005,
+                "output": 0.000025,
+                "cache_read": 0.0000005,
+                "cache_write": 0.00000625
+            }
+        }
+    }"#;
+    let cache: CacheFile = serde_json::from_str(json).expect("old cache parses");
+    assert_eq!(cache.fetched_at_ms, 12345);
+    assert!(cache.providers.is_empty());
+    assert!(cache.rates.contains_key("claude-opus-4-8"));
 }
 
 // ── cost ───────────────────────────────────────────────────────────────────

@@ -12,6 +12,9 @@
 //! write = 1.25× of input) are encoded as concrete per-token costs rather than
 //! assumed. It covers first-party Anthropic ids (bare and date-stamped),
 //! `claude-fable-5`, and third-party providers clauth recognizes (e.g. DeepSeek).
+//! Namespaced keys (`zai/glm-4.7`, `deepseek/deepseek-v3.2`) are kept so
+//! [`PriceTable::rate`] can resolve a bare id to its official provider's price,
+//! discarding reseller entries (OpenRouter, Together, Fireworks).
 //!
 //! # Design (mirrors `status.rs`)
 //!
@@ -78,6 +81,9 @@ pub(crate) struct ModelRate {
 #[derive(Debug, Clone)]
 pub(crate) struct PriceTable {
     rates: HashMap<String, ModelRate>,
+    /// `litellm_provider` per namespaced key, so `rate()` can discard reseller
+    /// entries during org-branded fallback.
+    providers: HashMap<String, String>,
     pub(crate) fetched_at_ms: u64,
 }
 
@@ -88,25 +94,53 @@ impl PriceTable {
     pub(crate) fn from_rates(rates: HashMap<String, ModelRate>) -> Self {
         Self {
             rates,
+            providers: HashMap::new(),
             fetched_at_ms: 0,
         }
     }
 }
 
 impl PriceTable {
-    /// Rate for a model id, with suffix fallback. Tries an exact match, then
-    /// progressively strips trailing `-<segment>` groups — so a date stamp
-    /// (`claude-sonnet-4-5-20250929`) or a variant suffix (`claude-opus-4-6-thinking`)
-    /// falls back to the base id (`claude-sonnet-4-5` / `claude-opus-4-6`). Only
-    /// suffixes are stripped, never the family prefix, so it never cross-matches a
-    /// different model. The fallback never matches a **bare single-token** key
-    /// (one with no `-`, e.g. `claude`): such a key would wildcard-match every
-    /// variant of the family, so it is only ever reachable via an exact match.
+    /// Rate for a model id. Lookup order (first match wins):
+    ///
+    /// 1. **Dotted rewrite** — `zai.glm-4.7` → `zai/glm-4.7`, routing to the
+    ///    official zai entry, not the feed's bedrock_converse `zai.glm-4.7`.
+    /// 2. **Exact match**.
+    /// 3. **Colon strip** — `zai/glm-4.7:free` → `zai/glm-4.7`, retry exact,
+    ///    then continue the remaining steps with the stripped id.
+    /// 4. **Suffix strip** — progressively drops trailing `-<segment>` groups so
+    ///    a date stamp (`claude-sonnet-4-5-20250929`) or variant suffix falls back
+    ///    to the base id. Never matches a bare single-token key (`claude`).
+    /// 5. **Official-namespace** — bare id resolved via `family → provider` map
+    ///    (`glm` → `zai`, `deepseek` → `deepseek`, …): looks up `<provider>/<id>`.
+    /// 6. **Org-branded fallback** — for families with an org marker (`glm` →
+    ///    `zai-org`), picks the lowest-priced namespaced entry whose provider is
+    ///    not a reseller. Resolves ids the official provider has not listed under
+    ///    its own namespace (e.g. `glm-5.2` → `cloudflare/@cf/zai-org/glm-5.2`).
     pub(crate) fn rate(&self, model: &str) -> Option<ModelRate> {
-        if let Some(r) = self.rates.get(model) {
+        // (a) Dotted rewrite.
+        let rewritten = rewrite_dotted(model);
+        let id: &str = rewritten.as_deref().unwrap_or(model);
+
+        // (b) Exact match.
+        if let Some(r) = self.rates.get(id) {
             return Some(*r);
         }
-        let mut cur = model;
+
+        // (c) Colon strip: drop from first ':', retry exact, continue with stripped id.
+        let colstripped;
+        let id: &str = if let Some(idx) = id.find(':') {
+            colstripped = id[..idx].to_owned();
+            if let Some(r) = self.rates.get(&colstripped) {
+                return Some(*r);
+            }
+            &colstripped
+        } else {
+            id
+        };
+
+        // (d) Suffix strip — progressive trailing '-<segment>' removal.
+        let mut cur = id;
         while let Some((head, _)) = cur.rsplit_once('-') {
             if head.contains('-')
                 && let Some(r) = self.rates.get(head)
@@ -115,7 +149,22 @@ impl PriceTable {
             }
             cur = head;
         }
-        None
+
+        // Steps (e)–(f) apply to bare ids only (no '/').
+        if id.contains('/') {
+            return None;
+        }
+
+        // (e) Official-namespace: '<family>' -> '<provider>/<id>'.
+        if let Some(provider) = family_provider(id) {
+            let key = format!("{provider}/{id}");
+            if let Some(r) = self.rates.get(&key) {
+                return Some(*r);
+            }
+        }
+
+        // (f) Org-branded fallback.
+        self.org_branded_fallback(id)
     }
 
     /// API-equivalent cost in USD for one model's recorded tokens. `None` when no
@@ -145,6 +194,98 @@ impl PriceTable {
         }
         (total, unpriced)
     }
+
+    /// Org-branded fallback (step f): for families with an org marker (only `glm`
+    /// → `zai-org`), among namespaced keys whose last `/` segment equals the id
+    /// and whose key contains the org marker and whose provider is not a reseller,
+    /// pick the lowest `input_cost_per_token` — a floor for models the official
+    /// provider has not yet listed under its own namespace. Ties on input price
+    /// break to the lexicographically smaller key, keeping the pick deterministic
+    /// across HashMap iteration orders.
+    fn org_branded_fallback(&self, model: &str) -> Option<ModelRate> {
+        const ORG_MARKERS: &[(&str, &str)] = &[("glm", "zai-org")];
+        const RESELLERS: &[&str] = &["openrouter", "together_ai", "fireworks_ai"];
+
+        let org = ORG_MARKERS
+            .iter()
+            .find(|(family, _)| model.starts_with(*family))
+            .map(|(_, marker)| *marker)?;
+
+        let mut best: Option<(&str, f64, ModelRate)> = None;
+        for (key, rate) in &self.rates {
+            if !key.contains('/') {
+                continue;
+            }
+            if key.rsplit('/').next() != Some(model) {
+                continue;
+            }
+            if !key.contains(org) {
+                continue;
+            }
+            let provider = self.providers.get(key).map(String::as_str).unwrap_or("");
+            if RESELLERS.contains(&provider) {
+                continue;
+            }
+            let take = match best {
+                None => true,
+                Some((_, low, _)) if rate.input < low => true,
+                Some((bk, low, _)) if rate.input <= low => key.as_str() < bk,
+                _ => false,
+            };
+            if take {
+                best = Some((key.as_str(), rate.input, *rate));
+            }
+        }
+        best.map(|(_, _, r)| r)
+    }
+}
+
+// ── Lookup helpers ───────────────────────────────────────────────────────────
+
+/// Rewrite a dotted provider prefix to a path-style namespace: `zai.glm-4.7`
+/// → `zai/glm-4.7`. This routes dotted ids to the official feed entry, never the
+/// bedrock_converse variant (`zai.glm-4.7` in the feed is an AWS entry).
+fn rewrite_dotted(model: &str) -> Option<String> {
+    const PROVIDERS: &[&str] = &[
+        "zai",
+        "anthropic",
+        "deepseek",
+        "minimax",
+        "openai",
+        "gemini",
+        "qwen",
+        "moonshotai",
+        "x-ai",
+        "nvidia",
+    ];
+    for &p in PROVIDERS {
+        if let Some(rest) = model.strip_prefix(p).and_then(|s| s.strip_prefix('.')) {
+            return Some(format!("{p}/{rest}"));
+        }
+    }
+    None
+}
+
+/// Map a bare model id to its official LiteLLM provider namespace via family
+/// prefix: `glm` → `zai`, `claude` → `anthropic`, `deepseek` → `deepseek`, …
+/// Returns the longest matching prefix's provider.
+fn family_provider(id: &str) -> Option<&'static str> {
+    const MAP: &[(&str, &str)] = &[
+        ("glm", "zai"),
+        ("claude", "anthropic"),
+        ("deepseek", "deepseek"),
+        ("minimax", "minimax"),
+        ("gpt", "openai"),
+        ("gemini", "gemini"),
+        ("qwen", "qwen"),
+        ("kimi", "moonshotai"),
+        ("grok", "x-ai"),
+        ("nemotron", "nvidia"),
+    ];
+    MAP.iter()
+        .filter(|(prefix, _)| id.starts_with(prefix))
+        .max_by_key(|(prefix, _)| prefix.len())
+        .map(|(_, provider)| *provider)
 }
 
 // ── Background thread ──────────────────────────────────────────────────────────
@@ -233,32 +374,32 @@ fn fetch_table() -> anyhow::Result<PriceTable> {
         anyhow::bail!("price feed exceeded {MAX_BODY_BYTES} byte cap");
     }
     let json = String::from_utf8(bytes).map_err(anyhow::Error::from)?;
-    let rates = distill(&json)?;
+    let (rates, providers) = distill(&json)?;
     if rates.is_empty() {
         anyhow::bail!("price feed parsed but contained no priced models");
     }
     Ok(PriceTable {
         rates,
+        providers,
         fetched_at_ms: 0, // stamped by the caller on success
     })
 }
 
-/// Parse the LiteLLM JSON into a flat `id → ModelRate` map. Tolerant: a value
+/// Parse the LiteLLM JSON into `(rates, providers)` maps. Tolerant: a value
 /// that is not an object, or lacks `input_cost_per_token`, is skipped rather
-/// than failing the whole parse. Path-style keys (`bedrock/`, `azure_ai/`) are
-/// dropped — Claude Code logs bare model ids, so keeping them only bloats the
-/// cache. Missing cache rates default to `0.0`.
-fn distill(json: &str) -> anyhow::Result<HashMap<String, ModelRate>> {
+/// than failing the whole parse. Namespaced keys (`zai/glm-4.7`,
+/// `deepseek/deepseek-v3.2`) are kept alongside their `litellm_provider` so
+/// [`PriceTable::rate`] can resolve official-provider prices and discard
+/// resellers. Missing cache rates default to `0.0`.
+fn distill(json: &str) -> anyhow::Result<(HashMap<String, ModelRate>, HashMap<String, String>)> {
     let root: serde_json::Value = serde_json::from_str(json).map_err(anyhow::Error::from)?;
     let obj = root
         .as_object()
         .ok_or_else(|| anyhow::anyhow!("price feed root is not a JSON object"))?;
 
     let mut rates = HashMap::new();
+    let mut providers = HashMap::new();
     for (id, v) in obj {
-        if id.contains('/') {
-            continue;
-        }
         let Some(input) = v
             .get("input_cost_per_token")
             .and_then(serde_json::Value::as_f64)
@@ -279,8 +420,14 @@ fn distill(json: &str) -> anyhow::Result<HashMap<String, ModelRate>> {
                 cache_write: f("cache_creation_input_token_cost"),
             },
         );
+        if let Some(p) = v
+            .get("litellm_provider")
+            .and_then(serde_json::Value::as_str)
+        {
+            providers.insert(id.clone(), p.to_owned());
+        }
     }
-    Ok(rates)
+    Ok((rates, providers))
 }
 
 // ── Disk cache ──────────────────────────────────────────────────────────────
@@ -290,6 +437,8 @@ fn distill(json: &str) -> anyhow::Result<HashMap<String, ModelRate>> {
 struct CacheFile {
     fetched_at_ms: u64,
     rates: HashMap<String, ModelRate>,
+    #[serde(default)]
+    providers: HashMap<String, String>,
 }
 
 /// `~/.clauth/price_cache.json`. Resolved ONCE at spawn time and passed into the
@@ -313,6 +462,7 @@ fn load_cache(path: &Path) -> Option<PriceTable> {
     let cache: CacheFile = serde_json::from_str(&bytes).ok()?;
     Some(PriceTable {
         rates: cache.rates,
+        providers: cache.providers,
         fetched_at_ms: cache.fetched_at_ms,
     })
 }
@@ -322,6 +472,7 @@ fn save_cache(path: &Path, table: &PriceTable) {
     let cache = CacheFile {
         fetched_at_ms: table.fetched_at_ms,
         rates: table.rates.clone(),
+        providers: table.providers.clone(),
     };
     if let Ok(json) = serde_json::to_string(&cache) {
         let _ = atomic_write_600(path, json);

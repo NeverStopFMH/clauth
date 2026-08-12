@@ -361,9 +361,14 @@ impl DeadFilter {
 /// the staging half costs a reconcile per publish and can only ever observe a
 /// path that is about to move anyway.
 ///
-/// Also the fake-mode tree mirror's skip rule (`runtime::union_children`): a
-/// walk that treats one as tree content either fails when the source is renamed
-/// away mid-copy, or lands an orphan the mirror can never delete.
+/// Also the skip rule for every walk over a shared fake-mode tree: the mirror's
+/// (`runtime::union_children`) and the acquire-time build's, which is both the
+/// top-level walk in `runtime::build_runtime_dir_with_active_env` and
+/// `runtime::copy_tree`'s recursion under it. A walk that treats one as tree
+/// content either fails when the source is renamed away mid-copy, or lands an
+/// orphan the mirror can never delete. On Windows it fails a third way, which is
+/// how this surfaced: share modes are per-handle, so a source another THREAD of
+/// this same process holds open for writing refuses the copy outright.
 pub(crate) fn is_staging(name: &OsStr) -> bool {
     name.to_str()
         .is_some_and(|n| n.starts_with('.') && n.contains(".tmp."))

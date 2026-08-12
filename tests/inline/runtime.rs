@@ -1127,6 +1127,88 @@ fn build_runtime_dir_credentials_not_from_claude_home() {
     });
 }
 
+/// A file another writer is part-way through publishing is not tree content.
+/// `union_children` skips those on the mirror side; the acquire-time walk did
+/// not, so a second session's tree build sampled a `.<name>.tmp.<pid>.<seq>`
+/// sibling the first session's mirror still held. Both halves of the loss the
+/// skip rule names are reachable from here: the copy fails when the rename lands
+/// mid-walk, and it lands an orphan the mirror never deletes when it does not.
+/// Measured on Windows 11 under a stripped symlink token, 22 of 30 narrow-filter
+/// runs, as `os error 32` — share modes there are per-handle, so one process
+/// holding the source open for writing is no exemption.
+#[test]
+fn the_tree_build_skips_a_publish_in_flight() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let claude_home = fake_claude_home(tmp.path());
+        fs::create_dir_all(claude_home.join("projects")).expect("mkdir projects");
+        let staged = crate::profile::tmp_sibling(&claude_home.join("memory.md"));
+        let nested = crate::profile::tmp_sibling(&claude_home.join("projects").join("a.jsonl"));
+        fs::write(&staged, b"half a publish").expect("stage");
+        fs::write(&nested, b"half a publish").expect("stage nested");
+        // Positive control on the same dimension the subject varies: same walk,
+        // same two directories, only the NAME differs.
+        fs::write(claude_home.join("memory.md"), b"real").expect("write real");
+        fs::write(claude_home.join("projects").join("a.jsonl"), b"real").expect("write nested");
+        let staged_name = staged.file_name().expect("staged name").to_owned();
+        let nested_name = nested.file_name().expect("nested name").to_owned();
+        let profile = make_profile("staging");
+        let canonical = tmp.path().join("profile-creds.json");
+
+        let copied = tmp.path().join("runtime-fake");
+        fs::create_dir_all(&copied).expect("mkdir runtime");
+        build_runtime_dir(
+            &copied,
+            &claude_home,
+            &profile,
+            &canonical,
+            LinkMode::Fake,
+            Isolation::Shared,
+        )
+        .expect("build");
+        assert!(
+            !copied.join(&staged_name).exists(),
+            "a publish in flight must not be copied into the runtime tree"
+        );
+        assert!(
+            !copied.join("projects").join(&nested_name).exists(),
+            "the recursion into a subtree must skip one too"
+        );
+        assert_eq!(
+            fs::read(copied.join("memory.md")).expect("read the real file"),
+            b"real",
+            "the walk still materializes real tree content"
+        );
+        assert_eq!(
+            fs::read(copied.join("projects").join("a.jsonl")).expect("read the nested real file"),
+            b"real"
+        );
+
+        // The same walk feeds real mode, where the entry becomes a symlink that
+        // dangles the moment the rename lands. Pinned so the skip cannot be
+        // moved down into the copy and read as covered.
+        let linked = tmp.path().join("runtime-real");
+        fs::create_dir_all(&linked).expect("mkdir runtime");
+        build_runtime_dir(
+            &linked,
+            &claude_home,
+            &profile,
+            &canonical,
+            LinkMode::Real,
+            Isolation::Shared,
+        )
+        .expect("build");
+        assert!(
+            linked.join(&staged_name).symlink_metadata().is_err(),
+            "a publish in flight must not be linked into the runtime tree either"
+        );
+        assert!(
+            linked.join("memory.md").symlink_metadata().is_ok(),
+            "the walk still links real tree content"
+        );
+    });
+}
+
 #[test]
 fn build_runtime_dir_fake_preserves_live_runtime_credentials() {
     let tmp = tempfile::tempdir().expect("tempdir");

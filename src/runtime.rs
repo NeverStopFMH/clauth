@@ -2287,6 +2287,17 @@ fn build_runtime_dir_with_active_env(
         if file_name == "settings.json" || file_name == ".credentials.json" {
             continue;
         }
+        // Same skip rule the mirror side applies in `union_children`, and for
+        // the same reason: a sibling session's `copy_file` publishes through a
+        // staging sibling, so this walk can meet one that is still being
+        // written. Copying it fails outright where the source is open for
+        // writing (Windows share modes are per-handle, so one process is no
+        // exemption) or where the rename lands mid-copy, and otherwise lands an
+        // orphan the mirror never deletes. Real mode needs it too: the link it
+        // would make dangles the moment that rename lands.
+        if crate::watchdog::is_staging(&file_name) {
+            continue;
+        }
         // Isolated owns its writable state — link NOTHING from ~/.claude. A clean
         // session's CC runs with an empty settings.json (default
         // `cleanupPeriodDays`), so a shared `projects/` symlink would let it delete
@@ -2571,7 +2582,14 @@ fn copy_tree(src: &Path, dst: &Path) -> Result<()> {
             std::fs::read_dir(src).with_context(|| format!("failed to read {}", src.display()))?
         {
             let entry = entry?;
-            copy_tree(&entry.path(), &dst.join(entry.file_name()))?;
+            let name = entry.file_name();
+            // The recursion's half of the caller's skip: a subtree under
+            // `~/.claude/` (`projects/`, `plugins/`) carries publishes in
+            // flight too, and this walk is what meets them.
+            if crate::watchdog::is_staging(&name) {
+                continue;
+            }
+            copy_tree(&entry.path(), &dst.join(name))?;
         }
         Ok(())
     } else {
@@ -2614,10 +2632,13 @@ fn tick(claude_home: &Path, swap: &SessionSwap) -> Result<()> {
             // mirror_tree skips settings.json / .credentials.json, so it never
             // races build_runtime_dir's per-profile writes. It CAN meet that
             // build's top-level materialize walk, since a sibling session shares
-            // this tree — both publish through `copy_file`'s rename, so the walk
-            // only ever samples a complete file. Only credential reconciliation
-            // (must not interleave with acquire/switch credential writes) stays
-            // under the lock.
+            // this tree. Publishing through `copy_file`'s rename is what keeps
+            // the walk off a half-written DESTINATION; it says nothing about the
+            // staging sibling itself, which is a real entry in a real directory
+            // until the rename, and which both walks therefore skip by name
+            // (`watchdog::is_staging`). Only credential reconciliation (must not
+            // interleave with acquire/switch credential writes) stays under the
+            // lock.
             mirror_tree(claude_home, runtime)?;
             with_state_lock(|| mirror_credentials(&link, &swap.canonical()))
         }

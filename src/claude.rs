@@ -420,25 +420,72 @@ pub(crate) fn live_diverged_and_unsaved(active: &str) -> Result<bool> {
     )
 }
 
-/// macOS: mirror a profile's stored OAuth login into the Keychain so Claude Code
-/// (which reads the Keychain, not the file) actually switches account. No-op when
-/// the profile has no stored `credentials.json` (a base_url profile, whose
-/// endpoint+token come from `settings.json`, or an OAuth profile not yet logged
-/// in) — the existing Keychain login is left untouched in that case.
+/// What the Keychain mirror does when the profile stores NO login at all (an
+/// api-key or third-party profile, whose endpoint + token come from
+/// `settings.json`). Chosen by the caller, because only the caller knows whether
+/// it meant to change which account is live.
+#[cfg(target_os = "macos")]
+enum AbsentSource {
+    /// Sign the item out. The forcing relink alone: its caller has decided this
+    /// profile's credentials are what the live slot must hold, and it deletes
+    /// that slot a few lines up. CC resolves the Keychain FIRST, so leaving the
+    /// item there kept the operator authenticated as the account they just
+    /// switched away from, with the file layer reading switched while every
+    /// request still spent the old account.
+    SignOut,
+    /// Leave the item alone, which is what every relink did before the mirror
+    /// learned to sign out. The guarded relink alone, and it is not a
+    /// conservatism: `rename_profile`, the first-ever `login` capture, and the
+    /// daemon's and TUI's boot reconcile all reach that path with nothing
+    /// switching, so a sign-out there would destroy a bare `claude` login clauth
+    /// never captured and cannot put back. `switch_profile`'s uncaptured-relogin
+    /// branch routes here too, deliberately: refusing beats dropping when a live
+    /// login is unsaved.
+    Leave,
+}
+
+/// macOS: mirror what the file layer just installed into the Keychain, which is
+/// where Claude Code actually reads its login. `path` is the install source the
+/// swap resolved: its whole JSON object becomes the item, so the incoming
+/// account's own blocks travel with its login and the outgoing account's do not
+/// (`keychain::keychain_install` carries the MCP-server logins across).
 ///
 /// Runs after the symlink swap and is `?`-fatal: a failure leaves the file layer
-/// switched while CC still reads the old Keychain login. Loud + recoverable —
-/// both writes are idempotent, so retrying the switch re-runs the pair.
+/// switched while CC still reads the old Keychain login. Loud and recoverable,
+/// since every write here is idempotent, so retrying the switch re-runs it.
 #[cfg(target_os = "macos")]
-fn keychain_write_source(path: &Path) -> Result<()> {
+fn keychain_mirror_source(path: &Path, absent: AbsentSource) -> Result<()> {
     // CLA-SPLIT: callers pass the already-resolved install source so the
-    // symlink target and the Keychain content come from ONE resolution — a
-    // session-token.json vanishing between two stats can't split them.
+    // symlink target and the Keychain content come from ONE resolution: a
+    // session-token.json vanishing between two stats can't split them. This
+    // `exists` is a SECOND stat, though, and under `SignOut` its false branch is
+    // destructive where it used to be inert. Both stats sit inside the state
+    // flock, so only a writer that is not clauth can win that race.
     if !path.exists() {
-        return Ok(());
+        return match absent {
+            AbsentSource::SignOut => crate::keychain::keychain_sign_out(),
+            AbsentSource::Leave => Ok(()),
+        };
     }
-    let creds: ClaudeCredentials = read_json_file(path)?;
-    crate::keychain::keychain_write(&creds)
+    let store: serde_json::Value = read_json_file(path)?;
+    // Typed check at the boundary, then install the untyped object: the login
+    // must be PRESENT and parse as a login, or CC is handed a credential it
+    // cannot read and nothing here would have said so. Presence is its own
+    // clause because the field is an `Option`, so `{}` and a store holding only
+    // `mcpOAuth` parse clean. The Value is what gets written, since the typed
+    // shape models the login alone and would drop the store's siblings.
+    let parsed = serde_json::from_value::<ClaudeCredentials>(store.clone()).with_context(|| {
+        format!(
+            "install source is not Claude credentials: {}",
+            path.display()
+        )
+    })?;
+    anyhow::ensure!(
+        parsed.claude_ai_oauth.is_some(),
+        "refusing to install a credential store that holds no login: {}",
+        path.display()
+    );
+    crate::keychain::keychain_install(&store)
 }
 
 #[cfg(unix)]
@@ -477,6 +524,93 @@ pub(crate) fn create_symlink(target: &Path, link: &Path) -> Result<()> {
 /// upgrade path is a startup probe that reports an unrecognised non-login key in
 /// the live store, which is only worth building once a second key exists.
 const CARRIED_CREDENTIAL_KEYS: [&str; 1] = ["mcpOAuth"];
+
+/// The credential-store keys that belong to ONE Claude account, so a sign-out
+/// drops them and nothing carries them onto another account's login. Claude Code
+/// deletes exactly these five on logout and preserves everything else
+/// (`docs/domain-knowledge.md`, read out of its own logout path), which is the
+/// other side of the line [`CARRIED_CREDENTIAL_KEYS`] draws.
+const ACCOUNT_SCOPED_CREDENTIAL_KEYS: [&str; 5] = [
+    "claudeAiOauth",
+    "organizationUuid",
+    "trustedDeviceToken",
+    "enterpriseGateway",
+    "designOauth",
+];
+
+/// Copy [`CARRIED_CREDENTIAL_KEYS`] from `live` onto `target`, reporting whether
+/// anything changed. A key `live` holds overwrites `target`'s copy; one it lacks
+/// leaves `target`'s alone; the login is never touched.
+///
+/// The value-level core of [`carry_live_extra_into`], shared with the macOS
+/// Keychain mirror, whose live slot is a Keychain item rather than a file. Both
+/// callers import from ANOTHER account's blob, which is why this takes an
+/// allowlist where `profile::preserve_extra_blocks` keeps everything.
+pub(crate) fn carry_live_extra_over(
+    target: &mut serde_json::Map<String, serde_json::Value>,
+    live: &serde_json::Map<String, serde_json::Value>,
+) -> bool {
+    let mut changed = false;
+    for key in CARRIED_CREDENTIAL_KEYS {
+        let Some(value) = live.get(key) else {
+            continue;
+        };
+        if target.get(key) != Some(value) {
+            target.insert(key.to_string(), value.clone());
+            changed = true;
+        }
+    }
+    changed
+}
+
+/// What a sign-out found in a credential store, and so what its caller owes the
+/// store it read from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(
+    not(target_os = "macos"),
+    allow(
+        dead_code,
+        reason = "the only caller is the macOS Keychain sign-out; the rule is pinned on every platform"
+    )
+)]
+pub(crate) enum SignOut {
+    /// Nothing that belongs to no account survives the strip: delete the store
+    /// outright rather than leave an empty husk where a clean absence was.
+    Delete,
+    /// Account-scoped keys were dropped and something else survives: write the
+    /// stripped blob back.
+    Write,
+    /// The store held no account-scoped key, so it is already signed out and a
+    /// write would land identical bytes. Load-bearing rather than tidy: the
+    /// daemon and the TUI relink the active profile on a tick, and a store that
+    /// is a Keychain item costs a subprocess per write.
+    Nothing,
+}
+
+/// Drop every [`ACCOUNT_SCOPED_CREDENTIAL_KEYS`] entry from `blob`, keeping what
+/// belongs to no Claude account, and report what the caller owes its store.
+/// A blob that is not an object carries nothing worth preserving.
+#[cfg_attr(
+    not(target_os = "macos"),
+    allow(
+        dead_code,
+        reason = "the only caller is the macOS Keychain sign-out; the rule is pinned on every platform"
+    )
+)]
+pub(crate) fn strip_account_credentials(blob: &mut serde_json::Value) -> SignOut {
+    let Some(obj) = blob.as_object_mut() else {
+        return SignOut::Delete;
+    };
+    let mut dropped = false;
+    for key in ACCOUNT_SCOPED_CREDENTIAL_KEYS {
+        dropped |= obj.remove(key).is_some();
+    }
+    match (dropped, obj.is_empty()) {
+        (_, true) => SignOut::Delete,
+        (true, false) => SignOut::Write,
+        (false, false) => SignOut::Nothing,
+    }
+}
 
 /// Copy [`CARRIED_CREDENTIAL_KEYS`] from the live credential onto `target`
 /// before it becomes the live credential, so an account switch keeps MCP-server
@@ -517,17 +651,7 @@ fn carry_live_extra_into(link: &Path, target: &Path, name: &str) -> Result<()> {
     let (Some(live_obj), Some(stored_obj)) = (live.as_object(), stored.as_object_mut()) else {
         return Ok(());
     };
-    let mut changed = false;
-    for key in CARRIED_CREDENTIAL_KEYS {
-        let Some(value) = live_obj.get(key) else {
-            continue;
-        };
-        if stored_obj.get(key) != Some(value) {
-            stored_obj.insert(key.to_string(), value.clone());
-            changed = true;
-        }
-    }
-    if changed {
+    if carry_live_extra_over(stored_obj, live_obj) {
         atomic_write_600(target, serde_json::to_string_pretty(&stored)?)
             .context("failed to carry MCP server logins into profile credentials")?;
     }
@@ -674,11 +798,14 @@ pub(crate) fn link_profile_credentials(name: &str) -> Result<()> {
                 std::fs::create_dir_all(parent)?;
             }
             create_symlink(&target, &link)?;
-            // macOS: make the switch real — Claude Code reads the Keychain.
-            #[cfg(target_os = "macos")]
-            if crate::keychain::enabled() {
-                keychain_write_source(&target)?;
-            }
+        }
+        // macOS: make the switch real, since Claude Code reads the Keychain.
+        // `Leave` because this is the GUARDED relink: it is also what a rename,
+        // a first-ever capture, and the daemon's and TUI's boot reconcile call,
+        // none of which is changing accounts.
+        #[cfg(target_os = "macos")]
+        if crate::keychain::enabled() {
+            keychain_mirror_source(&target, AbsentSource::Leave)?;
         }
 
         Ok(())
@@ -691,15 +818,15 @@ pub(crate) fn clear_claude_credentials() -> Result<()> {
         if link.symlink_metadata().is_ok() {
             std::fs::remove_file(&link).context("failed to remove .credentials.json")?;
         }
-        // macOS: also drop the live Keychain login so Claude Code can't spend the
-        // account (parity with removing the credential file). This deletes
-        // whatever the item holds at that moment — possibly a chain CC rotated
-        // after our last capture, or a login clauth never wrote. The write-only
-        // design can't snapshot it first (reading Claude's item prompts on every
-        // call), so that tail is lost and needs a re-login; see keychain.rs.
+        // macOS: also sign the Keychain out so Claude Code can't spend the
+        // account (parity with removing the credential file). Whatever login the
+        // item held goes, possibly a chain CC rotated after our last capture,
+        // which is lost and needs a re-login. What survives is the MCP-server
+        // logins, which belong to no account and would otherwise be collateral
+        // of every wrap-off; an item left holding nothing else is deleted.
         #[cfg(target_os = "macos")]
         if crate::keychain::enabled() {
-            crate::keychain::keychain_delete()?;
+            crate::keychain::keychain_sign_out()?;
         }
         Ok(())
     })
@@ -1076,9 +1203,21 @@ pub(crate) fn snapshot_active_credentials(config: &mut AppConfig) -> Result<()> 
 
 /// Store the live `.credentials.json` into the profile then replace it with a
 /// symlink. Must only be called after `is_first_login` returns true.
+///
+/// The store write is checked rather than assumed: its sink writes nothing when
+/// `active` names a profile the config does not carry, and this is the one
+/// caller that would then relink a profile with no install source. On macOS that
+/// forcing relink signs the Keychain out, so a silent no-op here would delete a
+/// genuine Claude Code login from BOTH the live file and the Keychain, having
+/// captured it into neither. Refusing costs an adopt; the alternative costs the
+/// login.
 pub(crate) fn adopt_first_login(config: &mut AppConfig, active: &str) -> Result<()> {
     with_state_lock(|| {
         snapshot_active_credentials_unchecked(config, active)?;
+        anyhow::ensure!(
+            install_source_path(active)?.exists(),
+            "refusing to relink '{active}': the live login was not captured into it"
+        );
         force_link_profile_credentials(active)
     })
 }
@@ -1142,11 +1281,15 @@ pub(crate) fn force_link_profile_credentials(name: &str) -> Result<()> {
                 std::fs::create_dir_all(parent)?;
             }
             create_symlink(&target, &link)?;
-            // macOS: make the switch real — Claude Code reads the Keychain.
-            #[cfg(target_os = "macos")]
-            if crate::keychain::enabled() {
-                keychain_write_source(&target)?;
-            }
+        }
+        // macOS: make the switch real, since Claude Code reads the Keychain.
+        // `SignOut` because this is the FORCING relink, which every switch path
+        // takes: the caller has decided this profile's credentials are what the
+        // live slot holds, so a profile storing none must stop the item serving
+        // the account the switch just left.
+        #[cfg(target_os = "macos")]
+        if crate::keychain::enabled() {
+            keychain_mirror_source(&target, AbsentSource::SignOut)?;
         }
         Ok(())
     })

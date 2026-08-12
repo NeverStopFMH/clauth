@@ -1678,18 +1678,31 @@ fn serialize_credentials_preserving_extra(
 ) -> Result<String> {
     let mut value = serde_json::to_value(creds).context("failed to serialize credentials")?;
     let existing = read_json_file::<serde_json::Value>(cred_path).ok();
-    if let (Some(value_obj), Some(existing_obj)) = (
-        value.as_object_mut(),
-        existing.as_ref().and_then(serde_json::Value::as_object),
-    ) {
-        for (key, extra) in existing_obj {
-            if key == "claudeAiOauth" {
-                continue;
-            }
-            value_obj.insert(key.clone(), extra.clone());
-        }
-    }
+    preserve_extra_blocks(&mut value, existing.as_ref());
     serde_json::to_string_pretty(&value).context("failed to serialize credentials")
+}
+
+/// Re-attach onto `value` every non-login top-level block `existing` holds, the
+/// value-level core of [`serialize_credentials_preserving_extra`]. Split out
+/// because the macOS Keychain mirror rewrites CC's item over itself on a
+/// rotation and owes it the same rule, while its `existing` arrives from a
+/// subprocess rather than a path. A no-op when either side is not an object.
+pub(crate) fn preserve_extra_blocks(
+    value: &mut serde_json::Value,
+    existing: Option<&serde_json::Value>,
+) {
+    let (Some(value_obj), Some(existing_obj)) = (
+        value.as_object_mut(),
+        existing.and_then(serde_json::Value::as_object),
+    ) else {
+        return;
+    };
+    for (key, extra) in existing_obj {
+        if key == "claudeAiOauth" {
+            continue;
+        }
+        value_obj.insert(key.clone(), extra.clone());
+    }
 }
 
 pub(crate) fn save_profile(profile: &Profile) -> Result<()> {

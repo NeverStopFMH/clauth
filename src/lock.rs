@@ -34,11 +34,15 @@ const LOCK_FILENAME: &str = ".lock";
 
 /// Deadline for taking the cross-process state flock before giving up with a
 /// [`StateLockTimeout`]. Sized to sit between two hard bounds: the macOS switch
-/// path holds this flock across the `/usr/bin/security` shell-out (up to its 20 s
-/// kill deadline, `keychain.rs`), so a shorter deadline would false-timeout a
+/// path holds this flock across the `/usr/bin/security` shell-outs (a
+/// read-modify-write, so TWO of them at a 10 s kill deadline each, `keychain.rs`,
+/// where the constant was halved when the read leg landed to keep ONE mirror at
+/// the 20 s this was sized for), so a shorter deadline would false-timeout a
 /// waiter during a legit slow switch; the daemon's 30 s `WATCHDOG_DEADLINE` caps
 /// it from above, so a main-loop drain waiting on the flock returns before the
-/// watchdog false-aborts.
+/// watchdog false-aborts. Known gap, pre-dating the read leg and open in
+/// `docs/todo.md`: a switch that adopts a first login runs TWO mirrors in one
+/// acquisition, so that hold can still reach 40 s and time a peer out here.
 /// On Linux the flock is only ever held across sub-millisecond disk writes, so
 /// only a genuine wedge ever reaches this deadline.
 const STATE_LOCK_TIMEOUT: Duration = Duration::from_secs(25);

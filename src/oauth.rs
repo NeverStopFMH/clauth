@@ -1184,7 +1184,7 @@ pub(crate) fn apply_rotated_tokens_locked(
     // and the next rotation or switch retries the write.
     #[cfg(target_os = "macos")]
     if let Some(creds) = mirror
-        && let Err(e) = crate::keychain::keychain_write(&creds)
+        && let Err(e) = crate::keychain::keychain_mirror_rotation(&creds)
     {
         logline!(
             "clauth: rotated '{name}' but the Keychain mirror failed: {e:#}. A \
@@ -1440,8 +1440,8 @@ pub(crate) fn try_adopt_live_rotation(
     // writes the store alone: the running claude signs out at the token we
     // just adopted. Content-neutral here — store and live hold the same pair.
     // macOS is excluded on purpose: CC reads the Keychain there and already
-    // holds the pair it minted, so this would only issue a redundant
-    // `keychain_write_source`. Loud but non-fatal, like the rotation mirror:
+    // holds the pair it minted, so this would only issue a Keychain mirror over
+    // an item that already matches. Loud but non-fatal, like the rotation mirror:
     // the adopted pair is already persisted, and dropping it would strand the
     // caller's TokenList on the refresh token CC revoked.
     #[cfg(not(target_os = "macos"))]

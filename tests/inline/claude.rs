@@ -1690,6 +1690,99 @@ fn carry_moves_only_the_allowlisted_key() {
     );
 }
 
+/// The carry's value-level core reports whether it changed anything, and the
+/// file path spends a write only when it did. A key the target already holds at
+/// the same value is not a change, so an unchanged store is left alone.
+#[test]
+fn carrying_a_key_the_target_already_holds_reports_no_change() {
+    let live = serde_json::json!({ "mcpOAuth": { "linear": { "accessToken": "same" } } });
+    let mut target = serde_json::json!({
+        "claudeAiOauth": { "accessToken": "target-login" },
+        "mcpOAuth": { "linear": { "accessToken": "same" } }
+    });
+
+    let changed = carry_live_extra_over(
+        target.as_object_mut().expect("target object"),
+        live.as_object().expect("live object"),
+    );
+
+    assert!(!changed, "an identical block is not a change to write back");
+    assert_eq!(
+        target["mcpOAuth"]["linear"]["accessToken"], "same",
+        "and the block is still there"
+    );
+}
+
+/// A sign-out drops exactly what belongs to one Claude account and keeps what
+/// belongs to none, which is the line Claude Code's own logout draws
+/// (`docs/domain-knowledge.md`). Every key is asserted by name: dropping one from
+/// the list would otherwise leave the outgoing account's block serving the next.
+#[test]
+fn a_sign_out_drops_the_account_keys_and_keeps_the_mcp_logins() {
+    let mut blob = serde_json::json!({
+        "claudeAiOauth": { "accessToken": "outgoing-login" },
+        "organizationUuid": "org-1",
+        "trustedDeviceToken": "device-1",
+        "enterpriseGateway": { "url": "https://gw.example" },
+        "designOauth": { "accessToken": "design-1" },
+        "mcpOAuth": { "linear": { "accessToken": "mock-linear" } }
+    });
+
+    assert_eq!(
+        strip_account_credentials(&mut blob),
+        SignOut::Write,
+        "an item still holding MCP logins is written back stripped"
+    );
+
+    for key in [
+        "claudeAiOauth",
+        "organizationUuid",
+        "trustedDeviceToken",
+        "enterpriseGateway",
+        "designOauth",
+    ] {
+        assert!(
+            blob.get(key).is_none(),
+            "'{key}' is account-scoped and must not survive a sign-out"
+        );
+    }
+    assert_eq!(
+        blob["mcpOAuth"]["linear"]["accessToken"], "mock-linear",
+        "MCP-server logins belong to no account and stay"
+    );
+}
+
+/// An item holding nothing but the login has nothing left to keep, and the
+/// caller deletes it rather than leaving an empty husk where a clean absence was.
+#[test]
+fn a_sign_out_over_a_login_only_item_leaves_nothing_to_keep() {
+    let mut login_only = serde_json::json!({ "claudeAiOauth": { "accessToken": "outgoing" } });
+    assert_eq!(strip_account_credentials(&mut login_only), SignOut::Delete);
+
+    let mut not_an_object = serde_json::json!("torn");
+    assert_eq!(
+        strip_account_credentials(&mut not_an_object),
+        SignOut::Delete,
+        "an item that is not an object carries nothing worth preserving"
+    );
+}
+
+/// A store already carrying no account-scoped key is already signed out, and
+/// says so instead of asking for a rewrite of identical bytes. The daemon and
+/// the TUI relink the active profile on a tick, so on macOS the difference is a
+/// `security` subprocess per tick against none.
+#[test]
+fn a_store_with_no_account_keys_is_already_signed_out() {
+    let mut mcp_only =
+        serde_json::json!({ "mcpOAuth": { "linear": { "accessToken": "mock-linear" } } });
+
+    assert_eq!(strip_account_credentials(&mut mcp_only), SignOut::Nothing);
+    assert_eq!(
+        mcp_only["mcpOAuth"]["linear"]["accessToken"], "mock-linear",
+        "and it is left exactly as it was"
+    );
+}
+
 /// The carry is a new writer of a file under `~/.clauth`, so it owes the tree's
 /// 0600 invariant like every other one.
 #[cfg(unix)]

@@ -34,7 +34,7 @@ Two consequences worth knowing:
 - The same MCP-server token ends up stored under more than one account. Every copy is `0600` like the rest, and your Claude logins are still never duplicated.
 - Signing out of an MCP server in Claude Code propagates on your next switch. A profile you have not switched into since then keeps its old copy until you do.
 
-On macOS none of this applies: Claude Code already keeps MCP tokens in their own Keychain item that clauth never touches, so they always survived a switch there.
+macOS works the other way, and it is a known defect rather than a design. Claude Code keeps your Claude login and your MCP-server logins as sibling keys inside one Keychain item. clauth's mirror writes only the login, so a switch there replaces the whole item and the MCP logins go with it. The carry above is file-side, so it cannot reach the Keychain. Until that is fixed, expect to re-authenticate any MCP server that reports a signed-out session after switching on a Mac.
 
 ## Per-platform behavior
 

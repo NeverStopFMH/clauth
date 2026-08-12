@@ -5885,6 +5885,12 @@ fn run_config_row(app: &mut App, row: ConfigRow) {
 /// and Claude Code reads no credentials at all. An idle account is left alone:
 /// force-linking it would repoint the live slot at a profile nobody switched to.
 ///
+/// The relink has TWO outcomes and the toast names which one happened. The row
+/// is refused only when an account stores neither a login nor an api key, so an
+/// api-key account clears fine onto an ABSENT install source: the forcing relink
+/// then removes the live slot and, on macOS, signs the Keychain out rather than
+/// installing anything. Both were reported as "relinked its own login".
+///
 /// Deliberately does NOT stamp `last_reload_fp`: `reload_fingerprint` folds each
 /// sidecar's write time in, so leaving it stale is what makes the next tick
 /// reload and rebuild `session_tokens` (the Overview `⊘` marker's cache). The
@@ -5896,16 +5902,22 @@ fn perform_clear_session_token(app: &mut App, name: &str) {
         return;
     }
     app.session_tokens.remove(name);
+    // Read AFTER the clear, so it names the store the relink actually finds:
+    // `install_source_path` falls back to `credentials.json` only once the
+    // sidecar is gone. An api-key account has none, so it is signed out rather
+    // than relinked, and the toast used to claim the opposite.
+    let has_login = crate::claude::has_stored_oauth_login(name);
     if active && let Err(e) = force_link_profile_credentials(name) {
         app.toast(ToastKind::Danger, format!("relink failed\n{e}"));
         return;
     }
     // No `refresh_tokens()`: `collect_tokens` reads `Profile::credentials`, which
     // a sidecar clear never touches.
-    let tail = if active {
-        ", relinked its own login"
-    } else {
-        "; the next switch installs its own login"
+    let tail = match (active, has_login) {
+        (true, true) => ", relinked its own login",
+        (true, false) => ", signed Claude Code out; it runs on its api key",
+        (false, true) => "; the next switch installs its own login",
+        (false, false) => "; it stores no login, so it runs on its api key",
     };
     app.toast(
         ToastKind::Success,

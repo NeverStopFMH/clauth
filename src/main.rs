@@ -678,6 +678,13 @@ fn cmd_login_setup_token(
 /// Refuses when the profile has no other login to fall back to (a name created
 /// by `--setup-token` alone stores no OAuth pair): clearing there would strip its
 /// only credential. `--yes` skips the confirm, never that guard.
+///
+/// "Other login" includes an API KEY, so the fall-back is not always an OAuth
+/// pair and the copy branches on which it is (`claude::has_stored_oauth_login`).
+/// An api-key profile clears onto an absent install source, where the relink
+/// removes the live slot and, on macOS, signs the Keychain out — correct, since
+/// an active api-key profile must not leave an Anthropic login serving, but the
+/// opposite of the relink every line here used to promise.
 fn cmd_static_token_clear(name: &str, yes: bool) -> Result<()> {
     use std::io::IsTerminal as _;
     platform::init();
@@ -706,11 +713,23 @@ fn cmd_static_token_clear(name: &str, yes: bool) -> Result<()> {
                 "pass --yes to clear the long-lived token for '{target}' non-interactively"
             );
         }
+        // What the confirm promises has to be what happens, so it reads the same
+        // fact the relink below branches on. An api-key profile reaches here with
+        // nothing to relink ONTO, and telling it a login comes back is the one
+        // wrong thing to say before an irreversible prompt.
         if active {
-            outln!(
-                "clauth: '{target}' is active — clearing relinks the live credentials onto its \
-                 stored OAuth login, and running sessions follow."
-            );
+            if claude::has_stored_oauth_login(target) {
+                outln!(
+                    "clauth: '{target}' is active — clearing relinks the live credentials onto \
+                     its stored OAuth login, and running sessions follow."
+                );
+            } else {
+                outln!(
+                    "clauth: '{target}' is active and stores no OAuth login — clearing signs \
+                     Claude Code out, leaving '{target}' on its api key, and running sessions \
+                     follow."
+                );
+            }
         }
         out!("Clear the long-lived token for '{target}'? [y/N] ");
         let mut answer = String::new();
@@ -722,16 +741,32 @@ fn cmd_static_token_clear(name: &str, yes: bool) -> Result<()> {
     }
 
     claude::clear_session_token(target)?;
+    // Re-read AFTER the clear: `install_source_path` only falls back to
+    // `credentials.json` once the sidecar is gone, so this is the store the
+    // relink below actually finds.
+    let has_login = claude::has_stored_oauth_login(target);
     if active {
         claude::force_link_profile_credentials(target)?;
-        outln!(
-            "clauth: cleared the long-lived token for '{target}' and relinked the live \
-             credentials onto its stored OAuth login."
-        );
-    } else {
+        if has_login {
+            outln!(
+                "clauth: cleared the long-lived token for '{target}' and relinked the live \
+                 credentials onto its stored OAuth login."
+            );
+        } else {
+            outln!(
+                "clauth: cleared the long-lived token for '{target}' and signed Claude Code \
+                 out: it stores no OAuth login, so '{target}' authenticates by api key."
+            );
+        }
+    } else if has_login {
         outln!(
             "clauth: cleared the long-lived token for '{target}'. Its stored OAuth login \
              installs on the next switch:  clauth {target}"
+        );
+    } else {
+        outln!(
+            "clauth: cleared the long-lived token for '{target}'. It stores no OAuth login, \
+             so switching to it authenticates by api key:  clauth {target}"
         );
     }
     Ok(())

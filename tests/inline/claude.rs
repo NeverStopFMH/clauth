@@ -1164,6 +1164,61 @@ fn clear_session_token_flips_the_install_source_back() {
     );
 }
 
+/// What a clear falls back TO is not the same question as whether it is allowed.
+/// The gate passes on EITHER stored credential, so an api-key profile carrying a
+/// sidecar clears onto an ABSENT install source: the forcing relink then removes
+/// the live slot and, on macOS, signs the Keychain out. Every surface reporting
+/// the clear promised "relinked onto its stored OAuth login" in both states until
+/// 2026-08-12, so the predicate the copy branches on is pinned here beside the
+/// clear itself.
+///
+/// Tracks the FILE rather than `Profile::credentials`, because the file is what
+/// the relink branches on — asserted by removing the store out from under a
+/// profile that still claims one in config.
+#[test]
+fn has_stored_oauth_login_tracks_the_store_the_relink_would_find() {
+    let _home = HomeSandbox::new();
+
+    // An api-key profile with a sidecar: clearable, nothing to relink onto.
+    let mut api = crate::profile::Profile::new("apionly".to_string(), None, None);
+    api.api_key = Some("sk-ant-api-key".to_string());
+    crate::profile::save_profile(&api).expect("save api profile");
+    fill_session_token_by_hand("apionly", "oat-access");
+    assert!(
+        !has_stored_oauth_login("apionly"),
+        "an api-key profile has no OAuth login for the clear to fall back to"
+    );
+
+    // A profile whose OAuth pair IS what the clear falls back to.
+    let mut oauth = crate::profile::Profile::new("split".to_string(), None, None);
+    oauth.credentials = Some(creds("usage-access", Some("usage-refresh")));
+    crate::profile::save_profile(&oauth).expect("save oauth profile");
+    fill_session_token_by_hand("split", "oat-access");
+    assert!(has_stored_oauth_login("split"));
+    assert!(
+        install_source_path("split")
+            .expect("source")
+            .ends_with("session-token.json"),
+        "the sidecar still outranks it until the clear runs"
+    );
+
+    // The file is the authority: dropping the store flips the answer even though
+    // the loaded config still carries the credentials.
+    std::fs::remove_file(
+        crate::profile::profile_dir("split")
+            .expect("dir")
+            .join("credentials.json"),
+    )
+    .expect("remove the store");
+    assert!(
+        !has_stored_oauth_login("split"),
+        "reads the store on disk, which is what the relink resolves"
+    );
+
+    // An unknown profile has no directory at all, so it can fall back to nothing.
+    assert!(!has_stored_oauth_login("nosuchprofile"));
+}
+
 /// A live slot holding the profile's static session token is the designed
 /// steady state: LinkedTo (the divergence machinery stays dormant), and a
 /// snapshot leaves the clauth-private usage OAuth pair untouched instead of

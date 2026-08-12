@@ -687,8 +687,15 @@ fn clear_session_token_button_dims_without_another_stored_login() {
 /// The `└` hint is value-aware like every other Setup hint: the gate's reason
 /// first, then what the clear actually does — and the ACTIVE account's wording
 /// names the relink, since that is the half a running session feels.
+///
+/// Both halves split again on what the clear falls back TO. The gate passes on
+/// EITHER credential, so an api-key account with a sidecar clears fine onto an
+/// absent install source and is signed out rather than relinked; the hint
+/// promised a relink in both states until 2026-08-12. The two api-key legs are
+/// what make `clear_falls_back_to_oauth` load-bearing rather than a restatement
+/// of `has_other_login`.
 #[test]
-fn clear_session_token_hint_names_the_gate_then_the_relink() {
+fn clear_session_token_hint_names_the_gate_then_what_the_clear_falls_back_to() {
     let mut snap = Snap::blank("a");
 
     assert_eq!(
@@ -696,15 +703,29 @@ fn clear_session_token_hint_names_the_gate_then_the_relink() {
         Some("no other login stored, log in first"),
     );
 
+    // An api key alone opens the gate, and there is no login behind it.
     snap.has_other_login = true;
     assert_eq!(
         row_hint(ConfigRow::ClearSessionToken, &snap).as_deref(),
-        Some("the next switch installs this account's own login again"),
+        Some("the next switch runs this account on its api key"),
     );
 
     snap.is_active = true;
     assert_eq!(
         row_hint(ConfigRow::ClearSessionToken, &snap).as_deref(),
+        Some("signs Claude Code out now · this account runs on its api key"),
+    );
+
+    // A stored OAuth pair is what the clear actually falls back to.
+    snap.clear_falls_back_to_oauth = true;
+    assert_eq!(
+        row_hint(ConfigRow::ClearSessionToken, &snap).as_deref(),
         Some("relinks this account's own login now · running sessions follow"),
+    );
+
+    snap.is_active = false;
+    assert_eq!(
+        row_hint(ConfigRow::ClearSessionToken, &snap).as_deref(),
+        Some("the next switch installs this account's own login again"),
     );
 }

@@ -101,6 +101,14 @@ struct Snap {
     /// `login_is_oauth` and so reads false for a hybrid whose OAuth pair is
     /// exactly what the clear would fall back to. Gates `ClearSessionToken`.
     has_other_login: bool,
+    /// Whether the clear would fall back to an OAuth LOGIN specifically, rather
+    /// than merely to some credential. Separate from `has_other_login` because
+    /// that one is satisfied by an api key alone, and such an account clears onto
+    /// an ABSENT install source: the relink removes the live slot and, on macOS,
+    /// signs the Keychain out. The `ClearSessionToken` hint promised a relink in
+    /// both states until 2026-08-12. Mirrors `claude::has_stored_oauth_login`,
+    /// which the CLI and the action itself read.
+    clear_falls_back_to_oauth: bool,
     /// `+ new` form only: the draft holds a minted login awaiting `create
     /// account` — flips the `Login` row to its `✓ logged in` state.
     captured: bool,
@@ -141,6 +149,7 @@ impl Snap {
             logged_in: false,
             login_is_oauth: true,
             has_other_login: false,
+            clear_falls_back_to_oauth: false,
             captured: false,
             provider: None,
             console_login: false,
@@ -210,6 +219,7 @@ fn build_snap(app: &App, with_text: bool) -> Snap {
             },
             login_is_oauth: p.login_is_oauth(),
             has_other_login: p.credentials.is_some() || p.api_key.is_some(),
+            clear_falls_back_to_oauth: p.credentials.is_some(),
             captured: false,
             provider: p.provider.map(|p| p.display_name()),
             console_login: p.console_login_target().is_some(),
@@ -527,14 +537,22 @@ fn row_hint(row: ConfigRow, snap: &Snap) -> Option<String> {
         // Gate reason first (same order as `Disabled` above — a gate only ever
         // bites the clearable state), then what the clear does from here. The
         // active account's wording names the relink, since that is the half a
-        // running session feels.
+        // running session feels. Both halves then split again on what the clear
+        // falls back TO: an api-key account has no login to install, so it is
+        // signed out rather than relinked.
         ConfigRow::ClearSessionToken if !snap.has_other_login => {
             "no other login stored, log in first"
         }
-        ConfigRow::ClearSessionToken if snap.is_active => {
+        ConfigRow::ClearSessionToken if snap.is_active && snap.clear_falls_back_to_oauth => {
             "relinks this account's own login now · running sessions follow"
         }
-        ConfigRow::ClearSessionToken => "the next switch installs this account's own login again",
+        ConfigRow::ClearSessionToken if snap.is_active => {
+            "signs Claude Code out now · this account runs on its api key"
+        }
+        ConfigRow::ClearSessionToken if snap.clear_falls_back_to_oauth => {
+            "the next switch installs this account's own login again"
+        }
+        ConfigRow::ClearSessionToken => "the next switch runs this account on its api key",
         ConfigRow::Delete => {
             "deletes the account and everything stored for it, usage history included"
         }

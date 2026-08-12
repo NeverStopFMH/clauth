@@ -207,6 +207,21 @@ pub(crate) fn install_source_path(name: &str) -> Result<PathBuf> {
     Ok(dir.join("credentials.json"))
 }
 
+/// Whether a switch to `name` would install an OAuth login once its long-lived
+/// sidecar is gone: the `credentials.json` [`install_source_path`] falls back to.
+///
+/// Read off the FILE rather than `Profile::credentials`, because the file is what
+/// the relink branches on. The clear paths (`clauth static-token --clear`, the
+/// Setup tab's row) are refused only when a profile stores neither a login nor an
+/// api key, so an api-key profile clears fine and lands on an ABSENT install
+/// source: the relink then removes the live slot and, on macOS, signs the Keychain
+/// out. Their copy claimed a relink onto a stored OAuth login regardless, which is
+/// why this exists rather than each surface guessing — a message derived from a
+/// different fact than the action drifts from it silently.
+pub(crate) fn has_stored_oauth_login(name: &str) -> bool {
+    profile_dir(name).is_ok_and(|dir| dir.join("credentials.json").exists())
+}
+
 /// State of `~/.claude/.credentials.json` relative to a profile's stored credentials.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum LinkState {

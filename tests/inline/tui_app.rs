@@ -1180,8 +1180,10 @@ fn clear_session_token_arms_then_clears_and_relinks_the_active_account() {
         "the active account's live link must land on its stored OAuth login, not dangle"
     );
     assert!(
-        app.toasts.iter().any(|t| t.body.contains("cleared")),
-        "the confirmed clear toasts, got {:?}",
+        app.toasts
+            .iter()
+            .any(|t| t.body.contains("cleared") && t.body.contains("relinked its own login")),
+        "the confirmed clear toasts what it actually did, got {:?}",
         app.toasts
     );
     assert_eq!(
@@ -1189,6 +1191,68 @@ fn clear_session_token_arms_then_clears_and_relinks_the_active_account() {
         None,
         "the arm must clear after firing — this row disappears with the sidecar, \
          but a stale arm would still leak onto whichever row takes its index"
+    );
+}
+
+/// The same row on an ACTIVE API-KEY account. The gate passes on EITHER stored
+/// credential, so this clears fine — onto an ABSENT install source, where the
+/// forcing relink removes the live slot and (on macOS) signs the Keychain out
+/// instead of installing anything. The toast read "relinked its own login" here
+/// until 2026-08-12, which is the opposite of what happened, and the CLI's own
+/// line said the same. This is the leg that separates the two outcomes; the
+/// OAuth leg above cannot, since both branches relink something there.
+#[test]
+fn clear_session_token_on_an_active_api_key_account_reports_the_sign_out() {
+    use super::{ConfigRow, build_draft_existing, run_config_row};
+    use crate::profile::Profile;
+    let home = crate::testutil::HomeSandbox::new();
+
+    // An api key and NO OAuth pair: clearable, with nothing to fall back to.
+    let mut acct = Profile::new("acct".to_string(), None, None);
+    acct.api_key = Some("sk-ant-api-key".to_string());
+    crate::profile::save_profile(&acct).expect("save profile");
+    seed_session_token("acct", None);
+    let dir = crate::profile::profile_dir("acct").expect("profile dir");
+    let sidecar = dir.join("session-token.json");
+    crate::claude::force_link_profile_credentials("acct").expect("link");
+    let live = home.home().join(".claude").join(".credentials.json");
+    assert_eq!(
+        std::fs::read_link(&live).expect("live is a symlink"),
+        sidecar,
+        "fixture: the live slot starts on the sidecar"
+    );
+
+    let mut app = app_with(vec![acct]);
+    app.config().state.active_profile = Some("acct".into());
+    app.profile_cursor = 0;
+    app.config_draft = Some(build_draft_existing(&app, "acct"));
+
+    run_config_row(&mut app, ConfigRow::ClearSessionToken);
+    assert!(sidecar.exists(), "the first press must only arm the row");
+    run_config_row(&mut app, ConfigRow::ClearSessionToken);
+
+    assert!(
+        !sidecar.exists(),
+        "the second press, while armed, clears the sidecar"
+    );
+    assert!(
+        live.symlink_metadata().is_err(),
+        "with no store to relink onto, the live slot is removed rather than left dangling"
+    );
+
+    let body = app
+        .toasts
+        .iter()
+        .map(|t| t.body.as_str())
+        .collect::<Vec<_>>()
+        .join(" | ");
+    assert!(
+        body.contains("signed Claude Code out") && body.contains("api key"),
+        "the toast must name the sign-out and what the account runs on: {body}"
+    );
+    assert!(
+        !body.contains("relinked"),
+        "nothing was relinked, so nothing may say so: {body}"
     );
 }
 

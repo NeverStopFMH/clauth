@@ -884,26 +884,30 @@ fn with_link_mode<T>(mode: LinkMode, f: impl FnOnce() -> T) -> T {
     f()
 }
 
-/// Whether this host poses the compat-marker scenario at all, for a test whose
-/// fixture needs the marker to be a SEPARATE file from the session's own.
-///
-/// That only holds under [`LinkMode::Real`]. Under the shared tree the two are
-/// one path, so there is no second marker to fabricate a foreign holder on, and
-/// such a test fails on its own fixture rather than on the behavior it guards.
-/// A host without `SeCreateSymbolicLinkPrivilege` (Windows outside Developer
-/// Mode) probes into `Fake` for every test here, which is where that bites.
+/// Whether this host can pose `subject`, for a fixture that needs
+/// [`LinkMode::Real`] to exist at all. Three shapes need it: a compat marker
+/// SEPARATE from the session's own, a runtime tree PER session, and the real
+/// symlink [`lone_session`] hardcodes. Under the shared tree the two marker paths
+/// collapse into one, every session of a profile shares one bare-stem tree, and
+/// `create_symlink` degrades to a copy `read_link` cannot follow — so such a test
+/// fails on its own fixture rather than on the behavior it guards. A host without
+/// `SeCreateSymbolicLinkPrivilege` (Windows outside Developer Mode) probes into
+/// `Fake` for every test here, which is where that bites.
 ///
 /// A capability skip, not a mode force: `with_link_mode` overrides only
 /// [`detect_link_mode`], so forcing `Real` on such a host would still attempt
 /// real symlinks in the build and fail with os error 1314. Call INSIDE
-/// [`with_fake_home`], and say so out loud, since a silent skip reads as a pass.
-fn poses_the_compat_scenario(probe_dir: &Path) -> bool {
+/// [`with_fake_home`], and name what is skipped out loud, since a silent skip
+/// reads as a pass.
+///
+/// Reach for it only when the fixture itself is impossible. A test whose SUBJECT
+/// survives the shared tree gets a host-aware expectation instead, so the box
+/// keeps covering it — `the_with_fallback_flag_reaches_the_row_only_where_a_swap_can_land`
+/// is the pattern.
+fn host_poses(probe_dir: &Path, subject: &str) -> bool {
     let mode = detect_link_mode(probe_dir).expect("probe link mode");
     if mode != LinkMode::Real {
-        eprintln!(
-            "SKIP: {mode:?} shares one marker path, so the compat-marker scenario \
-             does not exist on this host"
-        );
+        eprintln!("SKIP: this host is {mode:?} and cannot pose {subject}");
     }
     mode == LinkMode::Real
 }
@@ -1626,6 +1630,9 @@ fn live_session_count_counts_only_alive() {
 fn acquire_creates_runtime_and_pid_file() {
     let tmp = tempfile::tempdir().expect("tempdir");
     with_fake_home(tmp.path(), || {
+        if !host_poses(tmp.path(), "a runtime tree per session") {
+            return;
+        }
         fake_claude_home(tmp.path());
         let profile = make_profile("lifecycle");
 
@@ -1795,6 +1802,9 @@ fn acquire_twice_same_process_counts_two_sessions() {
 fn two_shared_sessions_get_independent_trees() {
     let tmp = tempfile::tempdir().expect("tempdir");
     with_fake_home(tmp.path(), || {
+        if !host_poses(tmp.path(), "a runtime tree per session") {
+            return;
+        }
         fake_claude_home(tmp.path());
         let profile = make_profile("twin");
 
@@ -2011,7 +2021,10 @@ fn stamp_legacy_marker_declines_a_marker_another_holder_owns() {
 fn teardown_leaves_a_pre_upgrade_marker_it_never_owned() {
     let tmp = tempfile::tempdir().expect("tempdir");
     with_fake_home(tmp.path(), || {
-        if !poses_the_compat_scenario(tmp.path()) {
+        if !host_poses(
+            tmp.path(),
+            "a compat marker separate from the session's own",
+        ) {
             return;
         }
         fake_claude_home(tmp.path());
@@ -2064,7 +2077,10 @@ fn teardown_leaves_a_pre_upgrade_marker_it_never_owned() {
 fn the_pre_upgrade_marker_dir_survives_until_the_last_session_leaves() {
     let tmp = tempfile::tempdir().expect("tempdir");
     with_fake_home(tmp.path(), || {
-        if !poses_the_compat_scenario(tmp.path()) {
+        if !host_poses(
+            tmp.path(),
+            "a compat marker separate from the session's own",
+        ) {
             return;
         }
         fake_claude_home(tmp.path());
@@ -2111,6 +2127,9 @@ fn the_pre_upgrade_marker_dir_survives_until_the_last_session_leaves() {
 fn dropping_one_shared_session_leaves_the_sibling_intact() {
     let tmp = tempfile::tempdir().expect("tempdir");
     with_fake_home(tmp.path(), || {
+        if !host_poses(tmp.path(), "a runtime tree per session") {
+            return;
+        }
         fake_claude_home(tmp.path());
         let profile = make_profile("survivor");
 
@@ -3248,7 +3267,10 @@ fn acquire_registers_a_row_and_teardown_removes_it() {
         let profile = make_profile("registered");
 
         let rt = ProfileRuntime::acquire(&profile, Isolation::Shared, &[], false).expect("acquire");
-        let sid = sid_of(rt.config_dir());
+        // `live_sid`, not `sid_of`: the subject here is the ROW, which a host
+        // sharing one runtime tree files exactly the same way. Reading the sid off
+        // the tree's name instead would skip this wiring on every such host.
+        let sid = live_sid(&rt);
 
         let rows = crate::live_sessions::list();
         assert_eq!(rows.len(), 1, "acquire must file exactly one row");
@@ -3450,10 +3472,12 @@ fn a_registered_session_is_opted_out_of_the_chain() {
 /// and nothing else decides whether a session is steerable.
 ///
 /// On a host whose executor refuses every swap that same field is the CLAMP, so
-/// the expected value is forked on the platform rather than the test being skipped
-/// there: such a row would collect daemon intents nothing can execute.
-/// `a_fake_mode_host_never_registers_a_session_as_following_the_chain` covers
-/// `swap_support`'s other clamp arm, and it is the only pin on this call site
+/// the expected value is forked on the HOST rather than the test being skipped
+/// there: such a row would collect daemon intents nothing can execute. Both clamp
+/// arms are read from the host itself, keyed to the same two probes the gate uses,
+/// so a Windows box outside Developer Mode covers this rather than reddening on it.
+/// `a_fake_mode_host_never_registers_a_session_as_following_the_chain` pins the
+/// transport arm against a forced mode; this is the only pin on this call site
 /// passing the host's real value rather than a constant.
 #[test]
 fn the_with_fallback_flag_reaches_the_row_only_where_a_swap_can_land() {
@@ -3464,26 +3488,26 @@ fn the_with_fallback_flag_reaches_the_row_only_where_a_swap_can_land() {
 
         let opted =
             ProfileRuntime::acquire(&profile, Isolation::Shared, &[], true).expect("acquire");
-        let opted_row =
-            crate::live_sessions::get(&sid_of(opted.config_dir())).expect("the opted-in row");
+        let opted_row = crate::live_sessions::get(&live_sid(&opted)).expect("the opted-in row");
         drop(opted);
 
         let plain =
             ProfileRuntime::acquire(&profile, Isolation::Shared, &[], false).expect("acquire");
-        let plain_row =
-            crate::live_sessions::get(&sid_of(plain.config_dir())).expect("the opted-out row");
+        let plain_row = crate::live_sessions::get(&live_sid(&plain)).expect("the opted-out row");
         drop(plain);
 
-        // Only the macOS axis is modelled here. A Windows host that probes into
-        // `LinkMode::Fake` clamps too, correctly, and reds this — the runners this
-        // suite gates on land on `Real`, so the narrower expectation is the honest
-        // one to write until one of them stops.
+        // Both clamp arms, off the host rather than off a constant: a Windows box
+        // outside Developer Mode probes into `LinkMode::Fake` and clamps for the
+        // transport reason, exactly as macOS clamps for the platform one.
+        let host_can_swap = unsupported_swap_transport("optin-flag")
+            .expect("probe the transport")
+            .is_none()
+            && unsupported_swap_platform(cfg!(target_os = "macos")).is_none();
         assert_eq!(
-            opted_row.follows_chain,
-            !cfg!(target_os = "macos"),
+            opted_row.follows_chain, host_can_swap,
             "--with-fallback must reach the registry row, and must be clamped out of \
-             it wherever the executor refuses every swap (keychain-first here; a \
-             shared runtime tree is the other arm)"
+             it wherever the executor refuses every swap — keychain-first on macOS, \
+             a shared runtime tree on a host without the symlink privilege"
         );
         assert!(
             !plain_row.follows_chain,
@@ -3566,14 +3590,23 @@ fn the_swap_platform_verdict_needs_no_probe() {
 /// The pre-`acquire` transport half: `start::run` needs the verdict BEFORE a tree
 /// is built or `claude` is spawned, and it can only get one by probing the profile
 /// dir the way `acquire` does.
+///
+/// The unforced half reads THIS host, so its expectation comes off the host too: a
+/// box without the symlink privilege answers `SharedRuntimeTree` there and is right
+/// to, and pinning `None` would assert one flavor of host rather than the probe.
 #[test]
 fn the_swap_host_probe_names_each_unsupported_transport() {
     let tmp = tempfile::tempdir().expect("tempdir");
     with_fake_home(tmp.path(), || {
+        // `detect_link_mode` directly, not `host_poses`: this test RUNS on a
+        // shared-tree host, so printing that helper's skip line would report a
+        // test as skipped while it went on to assert.
+        let host_shares_one_tree =
+            detect_link_mode(tmp.path()).expect("probe link mode") == LinkMode::Fake;
         assert_eq!(
             unsupported_swap_transport("probe-host").expect("probe"),
-            None,
-            "a real-symlink host supports the swap"
+            host_shares_one_tree.then_some(SwapUnsupported::SharedRuntimeTree),
+            "the unforced probe must name the transport this host actually has"
         );
         with_link_mode(LinkMode::Fake, || {
             assert_eq!(
@@ -3950,6 +3983,9 @@ fn a_swap_holds_both_of_the_intended_members_liveness_markers() {
 fn a_swap_refuses_a_member_whose_marker_another_process_holds() {
     let tmp = tempfile::tempdir().expect("tempdir");
     with_fake_home(tmp.path(), || {
+        if !host_poses(tmp.path(), "a real-symlink session for the swap to repoint") {
+            return;
+        }
         let launch = member("held-a");
         let intended = member("held-b");
         let launch_store = member_store(&launch);
@@ -3990,6 +4026,9 @@ fn a_swap_refuses_a_member_whose_marker_another_process_holds() {
 fn a_swap_keeps_both_members_marked_live_and_still_rotatable() {
     let tmp = tempfile::tempdir().expect("tempdir");
     with_fake_home(tmp.path(), || {
+        if !host_poses(tmp.path(), "a session whose credentials a swap can repoint") {
+            return;
+        }
         fake_claude_home(tmp.path());
         let launch = member("rot-a");
         let intended = member("rot-b");
@@ -4041,6 +4080,9 @@ fn a_swap_keeps_both_members_marked_live_and_still_rotatable() {
 fn a_swap_repoints_the_runtime_link_at_the_intended_store() {
     let tmp = tempfile::tempdir().expect("tempdir");
     with_fake_home(tmp.path(), || {
+        if !host_poses(tmp.path(), "a real-symlink session for the swap to repoint") {
+            return;
+        }
         let launch = member("link-a");
         let intended = member("link-b");
         member_store(&launch);
@@ -4104,6 +4146,9 @@ fn a_swap_drains_a_pending_relogin_into_the_launch_store() {
 fn the_tick_after_a_swap_drains_into_the_intended_store() {
     let tmp = tempfile::tempdir().expect("tempdir");
     with_fake_home(tmp.path(), || {
+        if !host_poses(tmp.path(), "a real-symlink session for the swap to repoint") {
+            return;
+        }
         let claude_home = fake_claude_home(tmp.path());
         let launch = member("tick-a");
         let intended = member("tick-b");
@@ -4253,7 +4298,10 @@ fn gc_keeps_a_swapped_row_after_its_launch_profile_is_force_deleted() {
 fn teardown_removes_every_marker_a_swap_stamped() {
     let tmp = tempfile::tempdir().expect("tempdir");
     with_fake_home(tmp.path(), || {
-        if !poses_the_compat_scenario(tmp.path()) {
+        if !host_poses(
+            tmp.path(),
+            "a compat marker separate from the session's own",
+        ) {
             return;
         }
         fake_claude_home(tmp.path());
@@ -4304,7 +4352,10 @@ fn teardown_removes_every_marker_a_swap_stamped() {
 fn teardown_leaves_a_swapped_compat_marker_it_never_owned() {
     let tmp = tempfile::tempdir().expect("tempdir");
     with_fake_home(tmp.path(), || {
-        if !poses_the_compat_scenario(tmp.path()) {
+        if !host_poses(
+            tmp.path(),
+            "a compat marker separate from the session's own",
+        ) {
             return;
         }
         fake_claude_home(tmp.path());
@@ -4474,6 +4525,9 @@ fn a_swap_does_not_start_once_teardown_has_begun() {
 fn a_swap_back_onto_a_member_the_session_already_ran_on_succeeds() {
     let tmp = tempfile::tempdir().expect("tempdir");
     with_fake_home(tmp.path(), || {
+        if !host_poses(tmp.path(), "a real-symlink session for the swap to repoint") {
+            return;
+        }
         let launch = member("back-a");
         let intended = member("back-b");
         let launch_store = member_store(&launch);
@@ -4888,6 +4942,9 @@ fn poll_does_nothing_until_the_daemon_names_a_member() {
 fn poll_executes_the_member_the_daemon_named() {
     let tmp = tempfile::tempdir().expect("tempdir");
     with_fake_home(tmp.path(), || {
+        if !host_poses(tmp.path(), "a real-symlink session for the swap to repoint") {
+            return;
+        }
         let launch = member("polled-a");
         let intended = member("polled-b");
         member_store(&launch);

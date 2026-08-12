@@ -331,6 +331,36 @@ fn profile_dir_of(name: &str) -> std::path::PathBuf {
     crate::profile::profile_dir(name).expect("profile dir")
 }
 
+/// Assert the eligible twin cleared every gate under test — the twin each refusal
+/// below keeps to prove it refused for the reason it names and not for a broken
+/// setup.
+///
+/// On a host that shares one runtime tree across a profile's sessions (Windows
+/// outside Developer Mode, which probes into `LinkMode::Fake`) the twin is refused
+/// anyway, by the transport probe. That probe runs LAST, after every gate these
+/// tests break one at a time, so reaching it concedes exactly what `Ok` concedes
+/// about the gates above — and demanding `Ok` there asserts the right thing about
+/// the wrong host. Nothing is weakened where the swap is supported: the probe
+/// answers `None` and this is the `expect` it replaced.
+///
+/// Call it only on the twin, never on a refusal under test: it reads the transport
+/// probe, which materializes the profile dir.
+#[track_caller]
+fn the_eligible_twin_clears_every_gate(verdict: Result<()>, name: &str) {
+    match crate::runtime::unsupported_swap_transport(name).expect("probe the transport") {
+        None => {
+            verdict.expect("the eligible twin must clear every gate");
+        }
+        Some(why) => assert_eq!(
+            verdict
+                .expect_err("a shared-tree host refuses the twin at the transport probe")
+                .to_string(),
+            unsupported_host_refusal(name, why),
+            "the twin must reach the transport probe and be refused only there"
+        ),
+    }
+}
+
 /// Both unsupported-host arms' copy, as literals. `cfg!(target_os = "macos")`
 /// and `LinkMode::Fake` are each unreachable through the gate from a Linux run,
 /// so the render is pinned here and the wiring by the test below it.
@@ -367,8 +397,10 @@ fn with_fallback_refuses_a_keychain_first_host() {
          resolves credentials keychain-first; start without it"
     );
 
-    refuse_unless_chain_eligible(&config, profile, Isolation::Shared, false)
-        .expect("the same profile off a keychain-first host is eligible");
+    the_eligible_twin_clears_every_gate(
+        refuse_unless_chain_eligible(&config, profile, Isolation::Shared, false),
+        "macish",
+    );
 }
 
 /// The freshness gate the decision leg runs reads only the OAuth store, which is
@@ -393,8 +425,10 @@ fn with_fallback_refuses_a_non_oauth_profile() {
 
     let oauth = chain_ready_config("thirdparty");
     let profile = oauth.find("thirdparty").expect("fixture profile");
-    refuse_unless_chain_eligible(&oauth, profile, Isolation::Shared, false)
-        .expect("the same profile without an endpoint is eligible");
+    the_eligible_twin_clears_every_gate(
+        refuse_unless_chain_eligible(&oauth, profile, Isolation::Shared, false),
+        "thirdparty",
+    );
 }
 
 /// A session's chain snapshot returns `None` for a member outside the chain, so
@@ -418,8 +452,10 @@ fn with_fallback_refuses_a_profile_outside_the_fallback_chain() {
 
     let member = chain_ready_config("loner");
     let profile = member.find("loner").expect("fixture profile");
-    refuse_unless_chain_eligible(&member, profile, Isolation::Shared, false)
-        .expect("the same profile inside the chain is eligible");
+    the_eligible_twin_clears_every_gate(
+        refuse_unless_chain_eligible(&member, profile, Isolation::Shared, false),
+        "loner",
+    );
 }
 
 /// Nothing writes a session's `intended_member` but the daemon's decision leg, so
@@ -441,8 +477,10 @@ fn with_fallback_refuses_when_no_daemon_is_running() {
     );
 
     let _daemon = crate::daemon::hold_daemon_lock();
-    refuse_unless_chain_eligible(&config, profile, Isolation::Shared, false)
-        .expect("a held singleton is the whole requirement");
+    the_eligible_twin_clears_every_gate(
+        refuse_unless_chain_eligible(&config, profile, Isolation::Shared, false),
+        "undaemoned",
+    );
 }
 
 /// `singleton_held` separates "nobody there" from "can't tell" precisely so a
@@ -469,8 +507,10 @@ fn with_fallback_refuses_when_the_daemon_lock_cannot_be_read() {
 
     fs::remove_dir(&lock_path).expect("clear the lock path");
     let _daemon = crate::daemon::hold_daemon_lock();
-    refuse_unless_chain_eligible(&config, profile, Isolation::Shared, false)
-        .expect("a readable, held lock is eligible");
+    the_eligible_twin_clears_every_gate(
+        refuse_unless_chain_eligible(&config, profile, Isolation::Shared, false),
+        "unreadable",
+    );
 }
 
 /// A chain whose only member is this profile is accepted by a bare membership
@@ -497,8 +537,10 @@ fn with_fallback_refuses_a_chain_with_nowhere_to_go() {
 
     let paired = chain_ready_config("onlyone");
     let profile = paired.find("onlyone").expect("fixture profile");
-    refuse_unless_chain_eligible(&paired, profile, Isolation::Shared, false)
-        .expect("the same profile in a chain with a second member is eligible");
+    the_eligible_twin_clears_every_gate(
+        refuse_unless_chain_eligible(&paired, profile, Isolation::Shared, false),
+        "onlyone",
+    );
 }
 
 /// `--isolated` is refused by clap, which is where the user meets it. But `run` is
@@ -520,8 +562,10 @@ fn with_fallback_refuses_an_isolated_session() {
          isolated session follows no chain"
     );
 
-    refuse_unless_chain_eligible(&config, profile, Isolation::Shared, false)
-        .expect("the same profile as a shared session is eligible");
+    the_eligible_twin_clears_every_gate(
+        refuse_unless_chain_eligible(&config, profile, Isolation::Shared, false),
+        "throwaway",
+    );
 }
 
 /// Every gate that can answer without the disk runs BEFORE the transport probe,
@@ -566,8 +610,10 @@ fn a_refused_with_fallback_start_never_probes_the_disk() {
 
     // The eligible path DOES probe — otherwise the assertions above pass for a
     // gate that simply never runs the probe at all.
-    refuse_unless_chain_eligible(&config, profile, Isolation::Shared, false)
-        .expect("the eligible setup passes");
+    the_eligible_twin_clears_every_gate(
+        refuse_unless_chain_eligible(&config, profile, Isolation::Shared, false),
+        "untouched",
+    );
     assert!(
         profile_dir_of("untouched").is_dir(),
         "the transport probe runs once everything else has cleared"

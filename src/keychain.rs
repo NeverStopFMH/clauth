@@ -32,7 +32,7 @@
 //!
 //! **A failed read never fails the write.** A locked keychain, an ACL refusal on
 //! a headless ssh session (`errSecInteractionNotAllowed`), or a dialog nobody
-//! answers inside [`SECURITY_TIMEOUT`] degrades to writing the incoming blob
+//! answers inside [`security_deadline`] degrades to writing the incoming blob
 //! alone, and names the loss on the event line. Completing a switch is
 //! load-bearing where preserving MCP logins is a convenience, the same posture
 //! `claude.rs::carry_live_extra_best_effort` takes on the file path, and refusing
@@ -60,25 +60,35 @@ const SECURITY_BIN: &str = "/usr/bin/security";
 /// single-threaded run loop, so an unbounded child would wedge auto-switch, the
 /// exact failure the daemon exists to prevent.
 ///
-/// **10 s because a mirror is now TWO invocations**, a read and then a write or
+/// **10 s because a mirror is TWO invocations**, a read and then a write or
 /// delete, where it used to be one. `lock.rs`'s 25 s state-lock timeout and the
 /// daemon's 30 s `WATCHDOG_DEADLINE` were sized against a 20 s mirror, and the
 /// daemon's comment says to bound this shell-out rather than loosen them, so
-/// halving keeps one mirror at the 20 s they assume. It does NOT bound the flock
-/// HOLD: a switch that adopts a first login runs two mirrors inside one
-/// acquisition (`adopt_first_login`, then the switch's own relink), which was 40 s
-/// before this change and still is. That one is pre-existing and open in
-/// `docs/todo.md`.
+/// halving keeps one mirror at the 20 s they assume.
+///
+/// This is the PER-CALL ceiling only. What a waiting peer actually feels is the
+/// whole flock hold, and a hold can run more than one mirror
+/// (`adopt_first_login`'s relink, then the switch's own), so [`security_deadline`]
+/// clamps this to `lock::SUBPROCESS_BUDGET`, the aggregate one hold may spend.
 ///
 /// Measured on `mac-6` 2026-08-12: a real `add-generic-password -U` costs 22-29 ms
 /// and a `find-generic-password -w` 18-19 ms, so the happy path keeps a ~210x
-/// margin. The deadline only ever binds a stuck keychain, where both legs burn
-/// it. What halving costs there is an operator with 10 s rather than 20 s to
-/// answer the one-time ACL dialog — the READ leg, which degrades to a login-only
-/// write and re-prompts next switch. The WRITE leg does not degrade: it fails the
-/// switch, so a locked keychain that prompts for a password rather than refusing
-/// outright now has half as long to be answered before that.
+/// margin against either bound. A deadline only ever binds a stuck keychain, where
+/// both legs burn it. What the 10 s costs there is an operator with 10 s rather
+/// than 20 s to answer the one-time ACL dialog — the READ leg, which degrades to a
+/// login-only write and re-prompts next switch. The WRITE leg does not degrade: it
+/// fails the switch, so a locked keychain that prompts for a password rather than
+/// refusing outright has half as long to be answered before that.
 const SECURITY_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The deadline for the next `security` invocation: [`SECURITY_TIMEOUT`], clamped
+/// to whatever the state-lock hold this call sits inside has left to spend
+/// (`lock::clamp_to_hold_budget`). Outside a hold — `oauth.rs` mirrors a rotation
+/// after its lock closure ends — it is [`SECURITY_TIMEOUT`] unchanged, because no
+/// peer is waiting on that call to finish.
+fn security_deadline() -> Duration {
+    crate::lock::clamp_to_hold_budget(SECURITY_TIMEOUT)
+}
 
 /// Run `cmd` with a wall-clock deadline, killing (and reaping) the child if it
 /// outlives `timeout`. Returns the collected [`Output`] on a normal exit, or an
@@ -143,10 +153,13 @@ fn run_with_deadline(
                 if Instant::now() >= deadline {
                     let _ = child.kill();
                     let _ = child.wait();
+                    // `{timeout:?}` rather than whole seconds: a clamped budget
+                    // hands this sub-second values, which `as_secs()` prints as
+                    // a nonsensical `0s`.
                     anyhow::bail!(
-                        "{SECURITY_BIN} exceeded its {}s deadline and was killed \
-                         (keychain locked or an ACL prompt left unanswered?)",
-                        timeout.as_secs()
+                        "{SECURITY_BIN} exceeded its {timeout:?} deadline and was killed \
+                         (keychain locked, an ACL prompt left unanswered, or an earlier \
+                         call under this lock already spent the hold's budget)"
                     );
                 }
                 std::thread::sleep(Duration::from_millis(25));
@@ -223,7 +236,7 @@ enum Keep {
 fn read_blob_at(service: &str, account: &str) -> Result<Option<Value>> {
     let mut cmd = Command::new(SECURITY_BIN);
     cmd.args(["find-generic-password", "-s", service, "-a", account, "-w"]);
-    let output = run_with_deadline(cmd, SECURITY_TIMEOUT, None)
+    let output = run_with_deadline(cmd, security_deadline(), None)
         .with_context(|| format!("failed to run {SECURITY_BIN} find-generic-password"))?;
     if output.status.success() {
         // `-w` prints only the password (our JSON) followed by a trailing newline.
@@ -377,7 +390,7 @@ fn put_blob_at(service: &str, account: &str, blob: &Value) -> Result<()> {
     );
     let mut cmd = Command::new(SECURITY_BIN);
     cmd.arg("-i");
-    let output = run_with_deadline(cmd, SECURITY_TIMEOUT, Some(&line))
+    let output = run_with_deadline(cmd, security_deadline(), Some(&line))
         .with_context(|| format!("failed to run {SECURITY_BIN} add-generic-password"))?;
     if output.status.success() {
         Ok(())
@@ -391,7 +404,7 @@ fn put_blob_at(service: &str, account: &str, blob: &Value) -> Result<()> {
 fn delete_at(service: &str, account: &str) -> Result<()> {
     let mut cmd = Command::new(SECURITY_BIN);
     cmd.args(["delete-generic-password", "-s", service, "-a", account]);
-    let output = run_with_deadline(cmd, SECURITY_TIMEOUT, None)
+    let output = run_with_deadline(cmd, security_deadline(), None)
         .with_context(|| format!("failed to run {SECURITY_BIN} delete-generic-password"))?;
     if output.status.success() || output.status.code() == Some(EXIT_ITEM_NOT_FOUND) {
         Ok(())

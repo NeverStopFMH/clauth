@@ -34,18 +34,45 @@ const LOCK_FILENAME: &str = ".lock";
 
 /// Deadline for taking the cross-process state flock before giving up with a
 /// [`StateLockTimeout`]. Sized to sit between two hard bounds: the macOS switch
-/// path holds this flock across the `/usr/bin/security` shell-outs (a
-/// read-modify-write, so TWO of them at a 10 s kill deadline each, `keychain.rs`,
-/// where the constant was halved when the read leg landed to keep ONE mirror at
-/// the 20 s this was sized for), so a shorter deadline would false-timeout a
-/// waiter during a legit slow switch; the daemon's 30 s `WATCHDOG_DEADLINE` caps
-/// it from above, so a main-loop drain waiting on the flock returns before the
-/// watchdog false-aborts. Known gap, pre-dating the read leg and open in
-/// `docs/todo.md`: a switch that adopts a first login runs TWO mirrors in one
-/// acquisition, so that hold can still reach 40 s and time a peer out here.
-/// On Linux the flock is only ever held across sub-millisecond disk writes, so
-/// only a genuine wedge ever reaches this deadline.
+/// path holds this flock across the `/usr/bin/security` shell-outs (`keychain.rs`),
+/// so a shorter deadline would false-timeout a waiter during a legit slow switch;
+/// the daemon's 30 s `WATCHDOG_DEADLINE` caps it from above, so a main-loop drain
+/// waiting on the flock returns before the watchdog false-aborts. What keeps the
+/// first bound from moving is [`SUBPROCESS_BUDGET`], which caps the shell-outs of
+/// one hold in aggregate rather than one at a time. On Linux the flock is only
+/// ever held across sub-millisecond disk writes, so only a genuine wedge ever
+/// reaches this deadline.
 const STATE_LOCK_TIMEOUT: Duration = Duration::from_secs(25);
+
+/// Wall-clock ceiling on everything ONE state-lock hold may spend in
+/// subprocesses, shared across every call it makes rather than granted per call.
+///
+/// Only macOS shells out under this lock (`keychain.rs` → `/usr/bin/security`),
+/// and a per-call deadline cannot bound a hold: `switch_profile` adopting a first
+/// login runs the Keychain mirror TWICE in one acquisition (its
+/// `adopt_first_login` relinks the outgoing profile, then the switch relinks the
+/// incoming one), each a read plus a write. At a 10 s per-call deadline that hold
+/// reached 40 s against the 25 s [`STATE_LOCK_TIMEOUT`] a peer waits out, so a
+/// legitimate switch false-timed-out the peer — the outcome that constant exists
+/// to prevent. Bounding the shell-outs is what the daemon's own comment prescribed
+/// over loosening the deadlines above it.
+///
+/// 20 s leaves 5 s of [`STATE_LOCK_TIMEOUT`] for the disk work around the
+/// shell-outs, which is sub-millisecond. What a shared budget costs, and it is
+/// real: the LAST call under a hold gets only what earlier calls left, so a switch
+/// whose first mirror burned the budget on a stuck keychain fails loudly where it
+/// used to get a fresh deadline and might have finished. That trade is deliberate.
+/// A stuck keychain means an unanswered one-time ACL dialog or a locked keychain,
+/// both of which fail the switch anyway; the write path is idempotent, so the
+/// operator answers the dialog and retries.
+///
+/// It bounds ONE hold, not one tick: the daemon drains `pending_switch` and
+/// `pending_switch_off` under two SEPARATE acquisitions, so a tick doing both can
+/// still spend 2 × this against `WATCHDOG_DEADLINE` (open in `docs/todo.md`).
+/// Arming a second budget for a wider scope needs an arm-if-not-armed rule that
+/// [`StateLock::acquire_with_timeout`] does not have today, since it is the only
+/// armer.
+const SUBPROCESS_BUDGET: Duration = Duration::from_secs(20);
 
 /// How often [`StateLock::acquire`] re-polls the flock while waiting. Small enough
 /// that a freed lock is taken promptly, large enough that the busy-wait costs
@@ -84,6 +111,35 @@ static THREAD_LOCK: Mutex<Option<File>> = Mutex::new(None);
 // THREAD_LOCK and must not try to re-acquire it (non-reentrant Mutex).
 thread_local! {
     static DEPTH: Cell<u32> = const { Cell::new(0) };
+}
+
+// When this thread's [`SUBPROCESS_BUDGET`] runs out, or None when the thread
+// holds no state lock. Set by the OUTERMOST acquisition only, so a reentrant
+// hold keeps spending the budget it entered rather than resetting it — which is
+// the whole point, since the two mirrors of an adopting switch reach the
+// keychain through nested `with_state_lock` frames.
+thread_local! {
+    static HOLD_DEADLINE: Cell<Option<Instant>> = const { Cell::new(None) };
+}
+
+/// `base`, clamped to what is left of this thread's [`SUBPROCESS_BUDGET`].
+/// Returns `base` untouched when the thread holds no state lock, which is the
+/// right answer rather than a fallback: a caller outside the lock (`oauth.rs`
+/// mirrors a rotation after its lock closure ends) blocks no peer, so nothing is
+/// waiting on it to finish. An exhausted budget clamps to zero, so the call is
+/// killed as soon as it is spawned.
+#[cfg_attr(
+    not(target_os = "macos"),
+    allow(
+        dead_code,
+        reason = "only the macOS Keychain shells out under this lock; the budget is pinned on every platform"
+    )
+)]
+pub(crate) fn clamp_to_hold_budget(base: Duration) -> Duration {
+    match HOLD_DEADLINE.get() {
+        Some(deadline) => base.min(deadline.saturating_duration_since(Instant::now())),
+        None => base,
+    }
 }
 
 // Test-only per-thread counter: increments once per OUTERMOST acquisition, i.e.
@@ -169,6 +225,11 @@ impl StateLock {
         // already be held — STATE sits inside it; `RankGuard::enter` asserts it.
         let rank = crate::lockorder::RankGuard::enter::<crate::lockorder::rank::State>();
 
+        // Arm the shared subprocess budget for this hold. After the rank guard,
+        // which panics on a rank violation: an arm before it would outlive the
+        // unwind with no `StateLock` left to disarm it.
+        HOLD_DEADLINE.set(Some(Instant::now() + SUBPROCESS_BUDGET));
+
         Ok(Self {
             _thread_guard: Some(guard),
             _rank: Some(rank),
@@ -212,6 +273,11 @@ impl Drop for StateLock {
             if let Some(ref mut g) = self._thread_guard {
                 **g = None; // close the File → flock released
             }
+            // Nobody waits on this thread once the flock is free, so the next
+            // hold starts on a full budget. Cleared on a panic unwind too, since
+            // Drop runs there — a poisoned lock must not leave a spent budget
+            // behind to strangle the recovery path.
+            HOLD_DEADLINE.set(None);
         }
         // Reentrant calls have _thread_guard = None; nothing extra to do.
     }

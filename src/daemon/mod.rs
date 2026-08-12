@@ -89,13 +89,17 @@ const FETCH_LOCK_FILE: &str = "usage-fetch.lock";
 /// Tightened 60s→30s for the single-fetcher lease (#27): a wedged-alive daemon
 /// keeps holding `usage-fetch.lock`, so no other instance can fetch until it
 /// dies — 30s frees the lease about as fast as the retired TUI freshness re-arm
-/// did. TENSION: a legit switch's keychain shell-outs can block up to their own
-/// kill deadlines inside the `StateLock`, leaving only ~10s of slack. A switch
-/// runs TWO of them (a read-modify-write) as of 2026-08-12, and the fix was the
-/// one this comment already prescribed: `SECURITY_TIMEOUT` was halved to 10s so
-/// the pair still totals 20s. If it ever false-aborts, bound the keychain
-/// shell-out further (the real fix), do NOT loosen this deadline — the lease's
-/// wedged-daemon recovery depends on it.
+/// did. TENSION: a legit switch's keychain shell-outs can block inside the
+/// `StateLock`, leaving only ~10s of slack. Twice now the count of those
+/// shell-outs grew under this deadline (a read-modify-write made one mirror two
+/// calls; a first-login adopt makes one switch two mirrors), so the bound is no
+/// longer per-call: `lock::SUBPROCESS_BUDGET` caps everything ONE state-lock
+/// hold spends in `security` at 20s in aggregate. If it ever false-aborts,
+/// shrink THAT (the real fix), do NOT loosen this deadline — the lease's
+/// wedged-daemon recovery depends on it. Known residual, open in `docs/todo.md`:
+/// the budget is per HOLD, and `tick.rs` drains `pending_switch` then
+/// `pending_switch_off` under two separate holds, so one tick doing both can
+/// still spend 2 × 20s here.
 ///
 /// SCOPE: `heartbeat` is stamped by the MAIN loop only, so this covers a wedged
 /// main loop. A wedged SCHEDULER thread (which is what actually holds the lease)

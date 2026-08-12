@@ -10,8 +10,8 @@
 //! touches the Keychain.
 
 use super::{
-    Keep, delete_at, keychain_service_for_config_dir, merge_and_put_at, merged_blob, put_blob_at,
-    read_blob_at, run_with_deadline, security_quote,
+    Keep, delete_at, keychain_service_for_config_dir, merge_and_put_at, merge_write, merged_blob,
+    put_blob_at, read_blob_at, run_with_deadline, security_quote,
 };
 use crate::profile::{ClaudeCredentials, OAuthToken};
 use std::path::Path;
@@ -257,6 +257,85 @@ fn merged_blob_over_an_absent_item_is_the_incoming_store() {
     }
 }
 
+// ── Whether the merge writes at all (pure, no Keychain touched) ───────────────
+//
+// The skip is what keeps the daemon's and the TUI's per-tick relink from costing
+// a `security` subprocess every tick, against a budget the whole lock hold
+// shares. It had no test on any platform: `merged_blob_*` above pin WHAT a write
+// would contain, and every one of them is satisfied whether or not the write
+// happens.
+
+#[test]
+fn merge_write_skips_a_relink_that_reproduces_the_item() {
+    // The daemon/TUI steady state: the active profile's own login, already
+    // installed, relinked again on a tick.
+    let installed = item("live");
+
+    assert_eq!(
+        merge_write(&installed, Some(&installed), Keep::CarriedOnly),
+        None,
+        "a relink installing exactly what the item holds must not spend a write"
+    );
+    assert_eq!(
+        merge_write(&installed, Some(&installed), Keep::Everything),
+        None,
+        "and a rotation mirror that changed nothing must not either"
+    );
+}
+
+/// The skip is keyed on the MERGED result, not on the incoming blob, so a store
+/// that merely lacks the item's siblings still skips: the carry puts them back
+/// and the two compare equal. Nothing here is a write clauth would want, and the
+/// naive `incoming != existing` spelling would perform one on every tick.
+#[test]
+fn merge_write_skips_when_only_the_carry_closes_the_difference() {
+    let login_only = serde_json::json!({ "claudeAiOauth": { "accessToken": "live" } });
+
+    assert_eq!(
+        merge_write(&login_only, Some(&item("live")), Keep::CarriedOnly),
+        None,
+        "the item's own siblings are carried back onto an identical login, so \
+         the merge reproduces it"
+    );
+}
+
+#[test]
+fn merge_write_writes_whenever_the_merge_changes_the_item() {
+    // A rotation: same account, fresh token.
+    let rotated = serde_json::json!({ "claudeAiOauth": { "accessToken": "rotated" } });
+    assert!(
+        merge_write(&rotated, Some(&item("stale")), Keep::Everything).is_some(),
+        "a fresh token must reach the item"
+    );
+
+    // A switch: a different login, and the outgoing account's org id has to GO.
+    // The write is needed for a removal here, which is the case an
+    // additions-only assertion would miss.
+    let merged =
+        merge_write(&rotated, Some(&item("outgoing")), Keep::CarriedOnly).expect("a switch writes");
+    assert!(
+        merged.get("organizationUuid").is_none(),
+        "the write exists to drop the outgoing account's blocks, not only to add"
+    );
+}
+
+/// A read that FAILED merges as `None` (`blob_to_merge_with` logs and degrades),
+/// which is indistinguishable here from an absent item — and both must WRITE.
+/// Skipping on a failed read would drop the login as well as the siblings, which
+/// is the one outcome the degrade exists to avoid.
+#[test]
+fn merge_write_always_writes_when_it_could_not_read_the_item() {
+    let installed = item("live");
+
+    for keep in [Keep::CarriedOnly, Keep::Everything] {
+        assert_eq!(
+            merge_write(&installed, None, keep),
+            Some(installed.clone()),
+            "with nothing to compare against, the incoming store is written whole"
+        );
+    }
+}
+
 // ── TECH-3: `security` subprocess deadline (no Keychain touched) ───────────────
 //
 // Exercise `run_with_deadline` with benign stand-in commands (`sleep` / `true`)
@@ -285,6 +364,36 @@ fn keychain_timeout_kills_a_hung_command() {
     assert!(
         elapsed < Duration::from_secs(3),
         "the child must be killed near the deadline (was {elapsed:?}), not left to run 30s"
+    );
+}
+
+/// A spent hold budget clamps to zero, and nothing can run in zero time, so the
+/// refusal happens before the spawn. That ordering is the point: the payload is
+/// written to the child's stdin BEFORE the deadline loop starts, so spawning
+/// anyway would hand the credential JSON to a process killed at the first poll.
+///
+/// `/bin/echo` would exit 0 instantly if it were ever spawned, so the error here
+/// cannot have come from the child.
+#[test]
+fn a_spent_budget_refuses_before_spawning_anything() {
+    use std::process::Command;
+    use std::time::Duration;
+
+    let err = run_with_deadline(
+        Command::new("/bin/echo"),
+        Duration::ZERO,
+        Some("pretend-credential-json\n"),
+    )
+    .expect_err("a spent budget must refuse, and /bin/echo would have succeeded");
+
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("budget is already spent"),
+        "the refusal must name the budget rather than read as a timeout: {msg}"
+    );
+    assert!(
+        !msg.contains("pretend-credential-json"),
+        "the payload must never reach the error text: {msg}"
     );
 }
 

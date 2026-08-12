@@ -107,6 +107,29 @@ fn run_with_deadline(
     timeout: Duration,
     stdin_payload: Option<&str>,
 ) -> Result<Output> {
+    // A hold whose budget is spent clamps to zero. Refuse BEFORE the spawn: the
+    // payload is written below before `deadline` even exists, so the write path
+    // would otherwise hand the credential JSON to a process created only to be
+    // killed. Measured on `mac-6` 2026-08-12: pre-fix that cost a real spawn at
+    // ~1.6 ms, and the refusal now returns in ~15 µs having created nothing,
+    // proven by a child whose `touch` side effect never appears.
+    //
+    // Zero is the ONLY value refused, and the reason is this loop's granularity
+    // rather than the cost of a call. The loop `try_wait`s first and consults
+    // `deadline` only on `None`, so nothing can expire before the first 25 ms
+    // sleep: every non-zero timeout under ~25 ms grants ~25 ms in practice, and a
+    // 1 ms deadline was measured letting a real child run to completion at exit 0
+    // with no error at all. So a nearly-spent budget still buys one honest
+    // attempt at a 13-29 ms `security` call, at the price of overrunning its own
+    // remainder by up to one poll interval. That overrun is bounded and paid for:
+    // 5 s separates `SUBPROCESS_BUDGET` from the `STATE_LOCK_TIMEOUT` a peer
+    // waits out, which absorbs ~200 of them.
+    if timeout.is_zero() {
+        anyhow::bail!(
+            "{SECURITY_BIN} not run: this lock hold's subprocess budget is already spent \
+             (an earlier keychain call under the same lock took all of it)"
+        );
+    }
     let mut child = cmd
         .stdin(if stdin_payload.is_some() {
             Stdio::piped()
@@ -340,18 +363,40 @@ fn security_quote(s: &str) -> Result<String> {
 /// sibling blocks alive across the `-U` replace; see the module doc for the ACL
 /// prompt it costs and the posture when it fails.
 ///
-/// A merge that reproduces the item byte for byte writes nothing. The daemon and
-/// the TUI relink the active profile on a tick, so the common call installs a
-/// login the item already holds, and skipping it is one fewer subprocess per
-/// tick. A read that FAILED leaves nothing to compare against, so that path
-/// always writes.
+/// Whether a write happens at all is [`merge_write`]'s call, which is where the
+/// skip and its reasons live.
 fn merge_and_put_at(service: &str, account: &str, incoming: &Value, keep: Keep) -> Result<()> {
     let existing = blob_to_merge_with(service, account);
-    let blob = merged_blob(incoming, existing.as_ref(), keep);
-    if existing.as_ref() == Some(&blob) {
-        return Ok(());
+    match merge_write(incoming, existing.as_ref(), keep) {
+        Some(blob) => put_blob_at(service, account, &blob),
+        None => Ok(()),
     }
-    put_blob_at(service, account, &blob)
+}
+
+/// The object [`merge_and_put_at`] must write, or `None` when the merge
+/// reproduces the item byte for byte and the write is skipped.
+///
+/// Split out of the IO so the skip is pinned without a Keychain — it is the one
+/// decision in this module that costs nothing when wrong in the cheap direction
+/// and a subprocess per tick when wrong in the other, and it had no test at all.
+/// The rules it composes are pinned on every platform where they live
+/// (`claude::carry_live_extra_over`, `profile::preserve_extra_blocks`); this and
+/// [`merged_blob`] are pinned in the ordinary macOS suite, which is as wide as a
+/// `#[cfg(target_os = "macos")]` module reaches.
+///
+/// `None` is load-bearing rather than tidy: the daemon and the TUI relink the
+/// active profile on a tick, so the common call installs a login the item already
+/// holds, and each avoided write is one fewer `security` subprocess drawing on a
+/// budget the whole lock hold shares ([`security_deadline`]). A read that FAILED
+/// merges as `None` (`blob_to_merge_with`), which compares equal to no blob, so
+/// that path always writes — losing the item's siblings is the accepted cost of
+/// completing the switch, and skipping the write would lose the LOGIN too.
+fn merge_write(incoming: &Value, existing: Option<&Value>, keep: Keep) -> Option<Value> {
+    let blob = merged_blob(incoming, existing, keep);
+    if existing == Some(&blob) {
+        return None;
+    }
+    Some(blob)
 }
 
 /// Add-or-update the item at `(service, account)` with `blob` as its password,

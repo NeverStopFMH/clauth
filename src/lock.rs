@@ -126,8 +126,10 @@ thread_local! {
 /// Returns `base` untouched when the thread holds no state lock, which is the
 /// right answer rather than a fallback: a caller outside the lock (`oauth.rs`
 /// mirrors a rotation after its lock closure ends) blocks no peer, so nothing is
-/// waiting on it to finish. An exhausted budget clamps to zero, so the call is
-/// killed as soon as it is spawned.
+/// waiting on it to finish. An exhausted budget clamps to zero, which the
+/// subprocess layer refuses outright rather than spawning: nothing completes in
+/// zero time, and the write path hands its payload to the child before the
+/// deadline is ever checked.
 #[cfg_attr(
     not(target_os = "macos"),
     allow(

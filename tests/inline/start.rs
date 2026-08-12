@@ -609,11 +609,20 @@ fn a_refused_with_fallback_start_never_probes_the_disk() {
     );
 
     // The eligible path DOES probe — otherwise the assertions above pass for a
-    // gate that simply never runs the probe at all.
-    the_eligible_twin_clears_every_gate(
-        refuse_unless_chain_eligible(&config, profile, Isolation::Shared, false),
-        "untouched",
-    );
+    // gate that simply never runs the probe at all. Read off
+    // `refuse_unless_chain_eligible` alone: `the_eligible_twin_clears_every_gate`
+    // reads the transport probe itself, which materializes the dir, so routing
+    // this control through it would assert against the helper's own side effect.
+    // Past every pure gate the only refusal left is the probe's own, and it
+    // materializes the dir before it refuses, so the dir is there either way.
+    match refuse_unless_chain_eligible(&config, profile, Isolation::Shared, false) {
+        Ok(()) => {}
+        Err(e) => assert_eq!(
+            e.to_string(),
+            unsupported_host_refusal("untouched", SwapUnsupported::SharedRuntimeTree),
+            "a host that cleared every pure gate can only be refused by the probe"
+        ),
+    }
     assert!(
         profile_dir_of("untouched").is_dir(),
         "the transport probe runs once everything else has cleared"

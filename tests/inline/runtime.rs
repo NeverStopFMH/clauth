@@ -3499,10 +3499,16 @@ fn the_with_fallback_flag_reaches_the_row_only_where_a_swap_can_land() {
         // Both clamp arms, off the host rather than off a constant: a Windows box
         // outside Developer Mode probes into `LinkMode::Fake` and clamps for the
         // transport reason, exactly as macOS clamps for the platform one.
-        let host_can_swap = unsupported_swap_transport("optin-flag")
-            .expect("probe the transport")
-            .is_none()
-            && unsupported_swap_platform(cfg!(target_os = "macos")).is_none();
+        //
+        // Derived WITHOUT `swap_support`, which is what the subject's clamp is
+        // built on: reading the expectation through the same predicate makes a
+        // broken predicate flip both sides together and the assertion hold on a
+        // host that can no longer swap. `acquire` above already materialized the
+        // profile dir, so this probes what the clamp probed.
+        let host_can_swap = detect_link_mode(&profile_dir("optin-flag").expect("profile dir"))
+            .expect("probe link mode")
+            == LinkMode::Real
+            && !cfg!(target_os = "macos");
         assert_eq!(
             opted_row.follows_chain, host_can_swap,
             "--with-fallback must reach the registry row, and must be clamped out of \
@@ -3601,8 +3607,16 @@ fn the_swap_host_probe_names_each_unsupported_transport() {
         // `detect_link_mode` directly, not `host_poses`: this test RUNS on a
         // shared-tree host, so printing that helper's skip line would report a
         // test as skipped while it went on to assert.
+        //
+        // Probe the dir the SUBJECT probes: `unsupported_swap_transport` reads
+        // the profile dir under this home, so an expectation taken off the home
+        // root is about a directory the subject never looks at. Both spellings
+        // sit in one tempdir tree, so no fixture the suite can build separates
+        // them, which is exactly why the mismatch was invisible.
+        let probed = profile_dir("probe-host").expect("profile dir");
+        crate::profile::mkdir_700(&probed).expect("materialize the probed dir");
         let host_shares_one_tree =
-            detect_link_mode(tmp.path()).expect("probe link mode") == LinkMode::Fake;
+            detect_link_mode(&probed).expect("probe link mode") == LinkMode::Fake;
         assert_eq!(
             unsupported_swap_transport("probe-host").expect("probe"),
             host_shares_one_tree.then_some(SwapUnsupported::SharedRuntimeTree),

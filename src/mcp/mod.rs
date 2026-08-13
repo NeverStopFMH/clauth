@@ -91,6 +91,25 @@ fn load_windows(name: &str) -> (Option<UsageWindow>, Option<UsageWindow>) {
     }
 }
 
+/// Percent of a profile's best-known window still free, the roster's sort key.
+/// 5h first (the pool a `delegate` actually competes for), then 7d, then a
+/// third-party provider's own cached bars. A balance-only provider yields
+/// `None`: ranking 1117 CNY against 31 USD would be an ordering clauth cannot
+/// justify, so those profiles keep config order instead.
+fn roster_headroom(name: &str) -> Option<f64> {
+    let (five_h, seven_d) = load_windows(name);
+    if let Some(w) = five_h.or(seven_d) {
+        return Some(100.0 - w.utilization);
+    }
+    let stats = load_profile_cache::<ThirdPartyStats>(name, THIRD_PARTY_CACHE_FILE)?;
+    let bar = stats
+        .bars
+        .iter()
+        .find(|b| b.label == "5h")
+        .or_else(|| stats.bars.iter().find(|b| b.label == "7d"))?;
+    Some(100.0 - bar.pct)
+}
+
 /// Live footer for the current active profile, read fresh from cache.
 fn active_footer(config: &AppConfig) -> String {
     let active = config.state.active_profile.as_deref();
@@ -1552,6 +1571,7 @@ fn build_instructions() -> String {
                 provider: provider_label(p),
                 base_url: p.base_url.clone(),
                 sub_type: tier_label(p),
+                headroom_pct: roster_headroom(name),
             }
         })
         .collect();

@@ -16,6 +16,84 @@ pub(crate) struct ProfileSnapshot {
     pub(crate) provider: String,
     pub(crate) base_url: Option<String>,
     pub(crate) sub_type: Option<String>,
+    /// Percent of this profile's best-known window still FREE, for roster
+    /// ordering only. `None` for a provider that reports a balance instead of a
+    /// window: ranking those would mean comparing a USD figure against a CNY
+    /// one, so they keep config order at the end.
+    pub(crate) headroom_pct: Option<f64>,
+}
+
+/// Host (and port) of a base url. Every profile of one provider carries the same
+/// endpoint path, so the roster prints the identifying half only.
+fn base_url_host(url: &str) -> &str {
+    let rest = url.split_once("://").map_or(url, |(_, rest)| rest);
+    rest.split('/').next().unwrap_or(rest)
+}
+
+/// The `[provider, tier, host]` bracket a roster line ends in. Profiles sharing
+/// one bracket share a line.
+fn roster_bracket(p: &ProfileSnapshot) -> String {
+    let mut parts = vec![p.provider.clone()];
+    if let Some(s) = &p.sub_type {
+        parts.push(s.clone());
+    }
+    if let Some(b) = &p.base_url {
+        parts.push(base_url_host(b).to_string());
+    }
+    format!("[{}]", parts.join(", "))
+}
+
+/// Unknown headroom ranks below a fully-spent window, so a profile clauth has no
+/// figure for never outranks one it knows is free.
+fn rank(p: &ProfileSnapshot) -> f64 {
+    p.headroom_pct.unwrap_or(-1.0)
+}
+
+/// Roster body: one line per distinct bracket, names joined, most headroom first.
+/// A fleet of same-provider profiles otherwise repeats one identical endpoint on
+/// every line, which is pure token cost in a block every session loads. The
+/// ordering is a hint rather than a claim — it freezes at server start like the
+/// rest of the roster, which is why the header calls it a snapshot.
+fn roster_lines(profiles: &[ProfileSnapshot]) -> String {
+    let mut groups: Vec<(String, Vec<&ProfileSnapshot>)> = Vec::new();
+    for p in profiles {
+        let bracket = roster_bracket(p);
+        match groups.iter_mut().find(|(b, _)| *b == bracket) {
+            Some((_, members)) => members.push(p),
+            None => groups.push((bracket, vec![p])),
+        }
+    }
+
+    // Stable sorts throughout, so config order breaks every tie. Members first,
+    // then groups by their best member — which is `first()` once members are
+    // sorted.
+    fn best(members: &[&ProfileSnapshot]) -> f64 {
+        members.first().map_or(-1.0, |p| rank(p))
+    }
+    for (_, members) in &mut groups {
+        members.sort_by(|a, b| rank(b).total_cmp(&rank(a)));
+    }
+    groups.sort_by(|a, b| best(&b.1).total_cmp(&best(&a.1)));
+
+    let mut out = String::new();
+    for (bracket, members) in &groups {
+        let names: Vec<String> = members
+            .iter()
+            .map(|p| {
+                if p.active {
+                    format!("{} (active)", p.name)
+                } else {
+                    p.name.clone()
+                }
+            })
+            .collect();
+        out.push_str("- ");
+        out.push_str(&names.join(", "));
+        out.push(' ');
+        out.push_str(bracket);
+        out.push('\n');
+    }
+    out
 }
 
 /// One-line cached headline for a third-party profile from
@@ -94,56 +172,65 @@ unaffected. Only a later session on the global credentials adopts the change."
     }
 }
 
-/// Init-time `instructions` block: identity + when-to-use intro, a session-aware
-/// `switch` note, the `delegate` cost model, then the per-profile roster. Only
-/// stable facts are baked in — usage percentages and reset timers rot within a turn,
-/// so they live in `list_profiles` (read fresh per call), not here. The roster
-/// itself is a session-start snapshot.
+/// How this session's runtime tree maps onto the real global one, for the only
+/// tier that has such a tree. A `clauth start` runtime looks per-profile and is
+/// mostly symlinks onto `~/.claude/`, so a model editing `CLAUDE.md` or
+/// `skills/…` under it is editing the global file. The note names
+/// `$CLAUDE_CONFIG_DIR` rather than a constructed path: the real dir carries a
+/// per-session suffix (`runtime-<sid>-<n>`), so any literal spelled here would
+/// point at a directory that does not exist. `Global` has no runtime dir,
+/// and `IsolatedCustom` is a foreign `CLAUDE_CONFIG_DIR` whose layout clauth does
+/// not own — neither may claim this layout. Pure mapping; the caller resolves the
+/// [`SessionAuth`].
+pub(crate) fn runtime_paths_note(auth: &SessionAuth) -> Option<String> {
+    match auth {
+        SessionAuth::IsolatedRuntime(name) => Some(format!(
+            "runtime paths: this session's config dir (`$CLAUDE_CONFIG_DIR`, profile `{name}`) \
+is mostly SYMLINKS onto the global `~/.claude/<same-name>`, and its `skills` chains on to \
+`~/.agents/skills`. Only `.claude.json`, `settings.json` and `.credentials.json` are per-profile. \
+So a write under that dir lands in the global file every profile and every future session loads, \
+and a rule gating `~/.claude/` or `~/.agents/` binds through it too. `readlink -f` before \
+treating a path as profile-local."
+        )),
+        SessionAuth::Global | SessionAuth::IsolatedCustom => None,
+    }
+}
+
+/// Init-time `instructions` block: identity intro, a one-line tool router, a
+/// session-aware `switch` note, the runtime-path note that tier earns, the
+/// `delegate` cost model, then the grouped roster. This block is the only clauth
+/// text a session is guaranteed to hold: tool descriptions are deferred in some
+/// harnesses and unloaded until searched for, so the router line stays even
+/// though every tool carries its own description. Per-tool mechanics do NOT stay
+/// — they live in that tool's description, which is loaded by the time anyone
+/// can call it. No usage percentage or reset timer is baked in; those rot within
+/// a turn, so they live in `list_profiles`.
 pub(crate) fn instructions_block(profiles: &[ProfileSnapshot], auth: &SessionAuth) -> String {
     let mut out = String::new();
     out.push_str(
         "clauth manages multiple Claude Code accounts (\"profiles\"): each an isolated \
-credential set / subscription. Use these tools to compare usage headroom across accounts, \
-relink the active account, or delegate a task to another account without spending this \
-session's window.\n\n\
-Tools: `list_profiles` (cached usage + filesystem, zero quota), \
-`which` (the profile that owns this session's credentials), \
-`switch` (relink the global active profile), \
-`delegate` (delegate a headless prompt to a profile; this BURNS a real account usage window, \
-hard-capped at depth 1 (a delegate cannot itself delegate); pass `background:true` for a `job_id` \
-now and the result later), \
-`delegate_result` (fetch a backgrounded delegate's result by `job_id`).\n\nswitch & this session: ",
+credential set / subscription. Use its tools to compare usage headroom across accounts, relink \
+the active account, or delegate a task to another account without spending this session's \
+window.\n\n\
+Tools: `list_profiles` (roster + cached usage, zero quota), `which` (this session's own profile), \
+`switch` (relink the global active profile), `delegate` (run a task on another account), \
+`delegate_result` (collect a backgrounded delegate).\n\n\
+switch & this session: ",
     );
     out.push_str(&switch_effect(auth));
-    out.push_str(
-        "\n\nCost: `delegate` to a subscription profile burns a rate-limited window (no per-token \
-charge); to a pay-as-you-go API-key profile (DeepSeek, Z.ai) it bills real USD; to a prepaid plan \
-profile (Alibaba Model Studio) it draws down a bought quota rather than billing; a local endpoint \
-is free. To pick the cheapest target, call `list_profiles` for live windows + third-party \
-balances.\n\n\
-A delegate sees nothing but the prompt you pass it. Frame the task in that prompt; it has no view \
-of this conversation.\n\n\
-Profiles (at session start, call `list_profiles` for the live roster and usage):\n",
-    );
-
-    for p in profiles {
-        out.push_str("- ");
-        out.push_str(&p.name);
-        if p.active {
-            out.push_str(" (active)");
-        }
-        out.push_str(" [");
-        out.push_str(&p.provider);
-        if let Some(s) = &p.sub_type {
-            out.push_str(", ");
-            out.push_str(s);
-        }
-        if let Some(b) = &p.base_url {
-            out.push_str(", ");
-            out.push_str(b);
-        }
-        out.push_str("]\n");
+    if let Some(note) = runtime_paths_note(auth) {
+        out.push_str("\n\n");
+        out.push_str(&note);
     }
+    out.push_str(
+        "\n\nCost: a `delegate` to a profile with no endpoint host burns that subscription's \
+rate-limited window; to DeepSeek or Z.ai it bills real money; to Alibaba Model Studio it draws \
+down a prepaid plan quota; to a loopback or LAN host it is free. Call `list_profiles` for live \
+windows and third-party balances.\n\n\
+Profiles, most headroom first (session-start snapshot; call `list_profiles` for live usage and \
+anything added since):\n",
+    );
+    out.push_str(&roster_lines(profiles));
     out
 }
 

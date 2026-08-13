@@ -987,3 +987,87 @@ fn the_which_description_names_every_source_it_can_return() {
         );
     }
 }
+
+/// The roster's sort key. `roster_lines` is pinned on the value, so nothing else
+/// reaches the code that PRODUCES it: an inverted subtraction here would order
+/// every session's roster backwards, most-spent account first, and the render
+/// test would stay green.
+#[test]
+fn roster_headroom_reports_free_percent_from_the_best_known_window() {
+    use crate::profile_cache::{THIRD_PARTY_CACHE_FILE, USAGE_CACHE_FILE, write_profile_cache};
+    use crate::providers::{ThirdPartyStats, UsageBar};
+    use crate::usage::{UsageInfo, UsageWindow};
+
+    let _home = HomeSandbox::new();
+    let window = |utilization: f64| UsageWindow {
+        utilization,
+        resets_at: None,
+    };
+
+    // 5h wins when both are cached: it is the pool a delegate competes for.
+    write_profile_cache(
+        "both",
+        USAGE_CACHE_FILE,
+        &UsageInfo {
+            five_hour: Some(window(70.0)),
+            seven_day: Some(window(10.0)),
+            ..Default::default()
+        },
+    );
+    assert_eq!(roster_headroom("both"), Some(30.0));
+
+    // 7d carries it when the 5h window is absent.
+    write_profile_cache(
+        "weekly",
+        USAGE_CACHE_FILE,
+        &UsageInfo {
+            seven_day: Some(window(25.0)),
+            ..Default::default()
+        },
+    );
+    assert_eq!(roster_headroom("weekly"), Some(75.0));
+
+    // A third-party provider has no `windows`, but its own bars carry the same
+    // percentages, and 5h still outranks 7d.
+    let bar = |label: &str, pct: f64| UsageBar {
+        label: label.to_string(),
+        pct,
+        resets_at: None,
+        used: None,
+        total: None,
+    };
+    write_profile_cache(
+        "bars",
+        THIRD_PARTY_CACHE_FILE,
+        &ThirdPartyStats {
+            is_available: true,
+            rows: Vec::new(),
+            bars: vec![bar("7d", 94.0), bar("5h", 8.0)],
+            plan: Some("pro".to_string()),
+            endpoint: None,
+            best_effort: false,
+        },
+    );
+    assert_eq!(roster_headroom("bars"), Some(92.0));
+
+    // A balance-only provider yields no key at all. Ranking 1117 CNY against 31
+    // USD is an ordering clauth cannot justify, so those keep config order.
+    write_profile_cache(
+        "balance",
+        THIRD_PARTY_CACHE_FILE,
+        &ThirdPartyStats {
+            is_available: true,
+            rows: vec![crate::providers::StatRow {
+                label: "total".to_string(),
+                value: "1117.10 CNY".to_string(),
+                kind: crate::providers::StatRowKind::Body,
+            }],
+            bars: Vec::new(),
+            plan: None,
+            endpoint: None,
+            best_effort: false,
+        },
+    );
+    assert_eq!(roster_headroom("balance"), None);
+    assert_eq!(roster_headroom("never-cached"), None);
+}

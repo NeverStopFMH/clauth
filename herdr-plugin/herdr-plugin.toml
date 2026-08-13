@@ -14,30 +14,12 @@ description = "Accounts, usage windows, and the auto-switch chain"
 placement = "popup"
 command = ["clauth"]
 
-[[panes]]
-id = "switch"
-title = "Switch clauth account"
-description = "Pick the account new Claude Code sessions link to"
-placement = "popup"
-# `clauth list` prints one row per account and a popup does not scroll, so this
-# one takes the screen rather than the default half of it.
-width = "90%"
-height = "90%"
-command = ["sh", "switch.sh"]
-
 [[actions]]
 id = "open"
 title = "Open clauth"
 description = "Open the clauth dashboard in a popup"
 contexts = ["global", "workspace"]
 command = ["sh", "open-pane.sh", "tui"]
-
-[[actions]]
-id = "switch"
-title = "Switch clauth account"
-description = "Open the account picker in a popup"
-contexts = ["global", "workspace"]
-command = ["sh", "open-pane.sh", "switch"]
 
 [[actions]]
 id = "which"

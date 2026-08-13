@@ -20,17 +20,16 @@ Local checkout instead:
 herdr plugin link /path/to/clauth/herdr-plugin
 ```
 
-`plugin install` runs the plugin's commands as you, so read them first. There are three files and none of them is long.
+`plugin install` runs the plugin's commands as you, so read them first. It is a manifest and two short shell scripts.
 
 ## What it adds
 
 | Action | Qualified id | What it does |
 |---|---|---|
 | Open clauth | `clauth.open` | The clauth dashboard in a popup. Quit it with `q`, the same as anywhere else. |
-| Switch clauth account | `clauth.switch` | The account table plus a prompt for the profile new Claude Code sessions link to. |
 | Show this pane's clauth account | `clauth.which` | Re-reads the account the focused pane burns and republishes it as pane metadata. |
 
-The first two open a popup. herdr allows one popup per session, so a second press with clauth already up does nothing instead of reporting an error.
+Switching accounts is a keystroke inside the dashboard, so the plugin ships no picker of its own. herdr allows one popup per session, so pressing the open key again with clauth already up does nothing instead of reporting an error.
 
 ## Bind a key yourself
 
@@ -72,7 +71,6 @@ Plugin UI is pane-scoped. herdr documents runtime action registration and native
 
 | File | Role |
 |---|---|
-| `herdr-plugin.toml` | Manifest: two popup entrypoints, three actions, two event hooks |
+| `herdr-plugin.toml` | Manifest: one popup entrypoint, two actions, two event hooks |
 | `open-pane.sh` | Opens an entrypoint, treating "popup already open" as a no-op |
-| `switch.sh` | The account picker popup |
 | `report-profile.sh` | Resolves the account a pane burns and publishes it as pane metadata |

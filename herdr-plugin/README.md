@@ -11,16 +11,18 @@ Opens [clauth](https://github.com/uwuclxdy/clauth) in a [herdr](https://herdr.de
 ## Install
 
 ```sh
+clauth herdr install
+```
+
+That runs herdr's installer, then adds the two things below that a herdr plugin cannot declare for itself: the key that opens the dashboard, and the sidebar row. It shows the diff and asks before touching your herdr `config.toml`, adds nothing on a second run, and `--no-config` skips that half.
+
+By hand instead:
+
+```sh
 herdr plugin install uwuclxdy/clauth/herdr-plugin
 ```
 
-Local checkout instead:
-
-```sh
-herdr plugin link /path/to/clauth/herdr-plugin
-```
-
-`plugin install` runs the plugin's commands as you, so read them first. It is a manifest and two short shell scripts.
+`plugin install` runs the plugin's commands as you, so read them first. It is a manifest and two short shell scripts. From a clauth checkout, `herdr plugin link /path/to/clauth/herdr-plugin` links them in place.
 
 ## What it adds
 
@@ -33,7 +35,7 @@ Switching accounts is a keystroke inside the dashboard, so the plugin ships no p
 
 ## Bind a key yourself
 
-A herdr plugin cannot declare a keybinding. That line lives in your own herdr `config.toml`, and nothing happens until you add it:
+A herdr plugin cannot declare a keybinding. That line lives in your own herdr `config.toml`, and nothing happens until it is there. `clauth herdr install` writes it for you; this is what it writes, and what to paste if you installed by hand:
 
 ```toml
 [[keys.command]]
@@ -49,7 +51,7 @@ description = "clauth accounts"
 
 Every herdr pane running Claude Code spends some account, and which one is invisible from the pane itself. The plugin hooks agent detection and publishes the answer as pane metadata under the name `clauth`, refreshing it on every agent status change so a `clauth start --with-fallback` session that moves onto the next chain member stops naming the account it left. herdr detects other agents too, and a pane running one of those is left untagged rather than labelled with an account it never touches.
 
-herdr renders a reported value only where your own agent-row template asks for it, so **the tag stays invisible until you add `$clauth` to a row** in your herdr `config.toml`. Claude Code panes take the `rows_by_agent` template rather than the generic one:
+herdr renders a reported value only where your own agent-row template asks for it, so **the tag stays invisible until `$clauth` is in a row** in your herdr `config.toml`. `clauth herdr install` adds this row; paste it yourself if you installed by hand. Claude Code panes take the `rows_by_agent` template rather than the generic one:
 
 ```toml
 [ui.sidebar.agents.rows_by_agent]

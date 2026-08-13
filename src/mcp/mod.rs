@@ -241,6 +241,35 @@ fn fold_active_live_usage(mut payload: serde_json::Value, config: &AppConfig) ->
     payload
 }
 
+/// Fold the target profile's live usage into a delegate envelope (the sync
+/// `delegate` and `delegate_result` done-handoff paths share this). The
+/// envelope is whatever `claude` printed, so it may be ANY json shape:
+/// `parse_delegate_envelope` returns non-objects verbatim. A non-object is
+/// wrapped under `result` (the documented self-report key) first — `serde_json`'s
+/// string-key `IndexMut` auto-vivifies only `Null` and panics on every other
+/// non-object, and the delegate's own output must survive the fold either way.
+fn fold_delegate_live_usage(
+    payload: serde_json::Value,
+    profile: &str,
+    now: i64,
+) -> serde_json::Value {
+    let mut map = match payload {
+        serde_json::Value::Object(map) => map,
+        other => {
+            let mut map = serde_json::Map::new();
+            map.insert("result".to_string(), other);
+            map
+        }
+    };
+    let (five_h, seven_d) = load_windows(profile);
+    let mut live = live_usage_json(Some(profile), five_h.as_ref(), seven_d.as_ref());
+    if let Some(note) = throughput_note(profile, now) {
+        live["throughput_warning"] = serde_json::Value::String(note);
+    }
+    map.insert("live_usage".to_string(), live);
+    serde_json::Value::Object(map)
+}
+
 #[derive(Clone)]
 pub(crate) struct ClauthServer {
     tool_router: ToolRouter<Self>,
@@ -823,13 +852,7 @@ Prose by default; pass `format: \"json\"` for the structured envelope."
             }),
         };
 
-        let (five_h, seven_d) = load_windows(&target);
-        let mut payload = envelope;
-        payload["live_usage"] =
-            live_usage_json(Some(target.as_str()), five_h.as_ref(), seven_d.as_ref());
-        if let Some(note) = throughput_note(&target, now_epoch_secs()) {
-            payload["live_usage"]["throughput_warning"] = serde_json::Value::String(note);
-        }
+        let payload = fold_delegate_live_usage(envelope, &target, now_epoch_secs());
         let is_error = payload
             .get("is_error")
             .and_then(|v| v.as_bool())
@@ -899,36 +922,17 @@ for the structured payload."
                 )))
             }
             WaitOutcome::Done(record) => {
-                // Fallback path delivered it — evict so the file doesn't linger
-                // past its purpose (GC also reaps it on a TTL).
+                let (blocks, is_error) = render_done_envelope(record, format);
+                // Fallback path delivered it — evict only now that the envelope
+                // is safely rendered, so the file doesn't linger past its
+                // purpose (GC also reaps it on a TTL) while a panic inside
+                // `render_done_envelope` still leaves the job file as the
+                // recoverable copy.
                 jobs::remove(&job_id);
-                let mut payload = record.envelope.unwrap_or_else(|| {
-                    serde_json::json!({
-                        "profile": record.profile,
-                        "is_error": true,
-                        "result": "job finished without an envelope",
-                    })
-                });
-                let (five_h, seven_d) = load_windows(&record.profile);
-                payload["live_usage"] = live_usage_json(
-                    Some(record.profile.as_str()),
-                    five_h.as_ref(),
-                    seven_d.as_ref(),
-                );
-                if let Some(note) = throughput_note(&record.profile, now_epoch_secs()) {
-                    payload["live_usage"]["throughput_warning"] = serde_json::Value::String(note);
-                }
-                let is_error = payload
-                    .get("is_error")
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(false);
-                let prose = render::delegate_result_prose(&payload);
                 if is_error {
-                    Ok(CallToolResult::error(single_block(payload, format, prose)))
+                    Ok(CallToolResult::error(blocks))
                 } else {
-                    Ok(CallToolResult::success(single_block(
-                        payload, format, prose,
-                    )))
+                    Ok(CallToolResult::success(blocks))
                 }
             }
         }
@@ -949,6 +953,30 @@ const JOB_POLL_INTERVAL: Duration = Duration::from_millis(200);
 /// Self-deadline for the `mcp-await-job` hook: outlast the max delegate timeout
 /// plus slack so it never gives up before a legitimately long delegate finishes.
 const AWAIT_JOB_DEADLINE_SECS: u64 = MAX_RUN_TIMEOUT_SECS + 600;
+
+/// Render a finished job's envelope into its response blocks and error flag.
+/// Pure of the job store: the caller evicts the file only after this returns,
+/// so a panic inside leaves the job file as the recoverable copy of the
+/// delegate's result.
+fn render_done_envelope(record: jobs::JobRecord, format: Format) -> (Vec<ContentBlock>, bool) {
+    let payload = fold_delegate_live_usage(
+        record.envelope.unwrap_or_else(|| {
+            serde_json::json!({
+                "profile": record.profile,
+                "is_error": true,
+                "result": "job finished without an envelope",
+            })
+        }),
+        &record.profile,
+        now_epoch_secs(),
+    );
+    let is_error = payload
+        .get("is_error")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let prose = render::delegate_result_prose(&payload);
+    (single_block(payload, format, prose), is_error)
+}
 
 /// Result of polling a background job file.
 enum WaitOutcome {
@@ -1956,8 +1984,8 @@ fn rate_limit_hint(text: &str) -> Option<Option<u64>> {
     Some(retry_after)
 }
 
-/// One-line throughput warning for the live footer, or `None` when nothing is
-/// degraded or rate-limited.
+/// One-line throughput warning folded into a delegate payload's `live_usage`
+/// object, or `None` when nothing is degraded or rate-limited.
 fn throughput_note(profile: &str, now: i64) -> Option<String> {
     let flagged: Vec<String> = crate::throughput::summary(profile, now)
         .into_iter()

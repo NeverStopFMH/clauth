@@ -125,7 +125,7 @@ fn which_prose_default_is_one_block_and_json_keeps_the_old_keys() {
     );
     assert_eq!(
         text,
-        "session profile unknown, source unknown, tier unknown; active profile `unknown`: 5h unknown, 7d unknown"
+        "session profile unknown, source unknown, tier unknown; active profile none: 5h unknown, 7d unknown"
     );
 
     let json = drive(ClauthServer::new().which(Parameters(WhichArgs {
@@ -189,7 +189,7 @@ fn switch_prose_default_and_json_error_keys() {
     assert_eq!(prose.content.len(), 1, "prose is a single content block");
     assert_eq!(
         first_text(&prose),
-        "switch failed: profile not found: ghost; active profile `unknown`: 5h unknown, 7d unknown"
+        "switch failed: profile not found: ghost; active profile none: 5h unknown, 7d unknown"
     );
 
     let json = drive(ClauthServer::new().switch(Parameters(SwitchArgs {

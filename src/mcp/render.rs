@@ -1,7 +1,7 @@
-//! Pure formatters for the MCP layer: init instructions block, per-call live
-//! footer, third-party headline, and the prose spellings of each tool's JSON
-//! payload. No I/O, no locks — callers pass in already-loaded cache data so
-//! these stay unit-testable.
+//! Pure formatters for the MCP layer: init instructions block, third-party
+//! headline, and the prose spellings of each tool's JSON payload, the
+//! folded-in live-usage clause included. No I/O, no locks — callers pass in
+//! already-loaded cache data so these stay unit-testable.
 
 use serde_json::Value;
 
@@ -293,16 +293,18 @@ fn pct_clause(v: Option<f64>) -> String {
 
 /// The folded-in `live_usage` object as a sentence clause. `lead` is the noun
 /// for the profile it names: `active profile` for `which`/`switch`, `target` for
-/// `delegate`. A null window reads `unknown`.
+/// `delegate`. A null profile name reads `none` (no active profile is
+/// configured — a state clauth knows, not a missing figure); a null window
+/// reads `unknown`.
 pub(crate) fn live_usage_prose(lu: &Value, lead: &str) -> String {
     let name = lu
         .get("profile")
         .and_then(Value::as_str)
-        .unwrap_or("unknown");
+        .map_or_else(|| "none".to_string(), |n| format!("`{n}`"));
     let five = lu.get("5h_used_pct").and_then(Value::as_f64);
     let seven = lu.get("7d_used_pct").and_then(Value::as_f64);
     let mut out = format!(
-        "{lead} `{name}`: 5h {}, 7d {}",
+        "{lead} {name}: 5h {}, 7d {}",
         pct_clause(five),
         pct_clause(seven)
     );
@@ -483,10 +485,12 @@ pub(crate) fn switch_prose(p: &Value) -> String {
     let live = live_usage_prose(&p["live_usage"], "active profile");
     match p.get("ok").and_then(Value::as_bool) {
         Some(true) => {
+            // A null `previous` is the logged-out state the switch started from
+            // (clauth knows there was none), not a figure clauth lost.
             let previous = p
                 .get("previous")
                 .and_then(Value::as_str)
-                .map_or_else(|| "unknown".to_string(), |v| format!("`{v}`"));
+                .map_or_else(|| "none".to_string(), |v| format!("`{v}`"));
             let active = p
                 .get("active")
                 .and_then(Value::as_str)
@@ -551,7 +555,15 @@ fn envelope_prose(e: &Value) -> String {
         out.push_str("finished");
     }
     out.push_str(": ");
-    out.push_str(e.get("result").and_then(Value::as_str).unwrap_or("unknown"));
+    // A bare scalar self-report (a non-object envelope the fold wrapped under
+    // `result`) arrives as its own type; read it as its literal so a number or
+    // bool never drops to `unknown`.
+    out.push_str(&match e.get("result") {
+        Some(Value::String(s)) => s.clone(),
+        Some(Value::Number(n)) => n.to_string(),
+        Some(Value::Bool(b)) => b.to_string(),
+        _ => "unknown".to_string(),
+    });
 
     if let Some(cost) = e.get("total_cost_usd").and_then(Value::as_f64) {
         out.push_str(&format!(" (cost ${cost})"));

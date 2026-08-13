@@ -1835,6 +1835,11 @@ fn run_delegate(opts: DelegateOpts<'_>) -> std::result::Result<serde_json::Value
 /// single `profile` resolves under), or a name resolving to no account. Runs
 /// before any spawn: N delegates is N real usage windows with no undo.
 fn resolve_fanout(config: &AppConfig, raw: &[String]) -> std::result::Result<Vec<String>, String> {
+    // An empty list passes every check below vacuously and would return a
+    // success-shaped `{"jobs": []}` that spent nothing and spawned nothing.
+    if raw.is_empty() {
+        return Err("`profiles` is empty: name at least one profile".to_string());
+    }
     if raw.len() > MAX_FANOUT {
         return Err(format!(
             "`profiles` fan-out capped at {MAX_FANOUT} names; got {}",

@@ -422,6 +422,21 @@ fn prompt_handle_at_cap_is_accepted() {
 // ── profiles fan-out guards ──────────────────────────────────────────────────
 
 #[test]
+fn profiles_empty_is_refused_by_name() {
+    let _home = HomeSandbox::new();
+    let result = call_delegate(DelegateArgs {
+        profiles: Some(vec![]),
+        prompt: Some("hi".to_string()),
+        background: Some(true),
+        ..base()
+    });
+    assert_refusal(
+        &result,
+        &["`profiles` is empty", "name at least one profile"],
+    );
+}
+
+#[test]
 fn profiles_over_cap_is_refused_by_name() {
     let _home = HomeSandbox::new();
     let names: Vec<String> = (0..=super::MAX_FANOUT).map(|i| format!("p{i}")).collect();

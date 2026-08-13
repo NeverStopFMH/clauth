@@ -543,10 +543,10 @@ fn background_depth_guard_refuses_without_writing_job() {
     );
 }
 
-// ---- mcp-await-job job_id extraction (shape-agnostic) ----
+// ---- mcp-await-job job_id extraction (shape-agnostic, every fan-out job) ----
 
 #[test]
-fn find_job_id_extracts_from_nested_mcp_result() {
+fn find_job_ids_extracts_from_nested_mcp_result() {
     // Mirrors the host's documented mcp_result shape: the background response
     // envelope is JSON-encoded as the content block's text.
     let inner = serde_json::json!({ "job_id": "d-42-0", "profile": "work", "status": "running" });
@@ -557,41 +557,130 @@ fn find_job_id_extracts_from_nested_mcp_result() {
             "content": [{ "type": "text", "text": inner.to_string() }],
         }
     });
-    assert_eq!(find_job_id(&payload).as_deref(), Some("d-42-0"));
+    assert_eq!(find_job_ids(&payload), vec!["d-42-0"]);
 }
 
 #[test]
-fn find_job_id_finds_direct_field() {
+fn find_job_ids_finds_direct_field() {
     let payload = serde_json::json!({ "tool_response": { "job_id": "d-1-2" } });
-    assert_eq!(find_job_id(&payload).as_deref(), Some("d-1-2"));
+    assert_eq!(find_job_ids(&payload), vec!["d-1-2"]);
 }
 
 #[test]
-fn find_job_id_none_for_sync_envelope() {
+fn find_job_ids_empty_for_sync_envelope() {
     // a sync delegate response carries no job_id, so the hook no-ops.
     let inner = serde_json::json!({ "profile": "work", "is_error": false, "result": "done" });
     let payload = serde_json::json!({
         "tool_response": { "content": [{ "type": "text", "text": inner.to_string() }] }
     });
-    assert_eq!(find_job_id(&payload), None);
+    assert!(find_job_ids(&payload).is_empty());
 }
 
 #[test]
-fn find_job_id_none_for_plain_text() {
+fn find_job_ids_empty_for_plain_text_without_tokens() {
     let payload =
         serde_json::json!({ "tool_response": { "content": [{ "text": "no json here" }] } });
-    assert_eq!(find_job_id(&payload), None);
+    assert!(find_job_ids(&payload).is_empty());
 }
 
 #[test]
-fn extract_job_id_prefers_tool_response_over_input() {
+fn extract_job_ids_prefers_tool_response_over_input() {
     // a delegate prompt that itself carries a `job_id` must not shadow the real
-    // handle in tool_response.
+    // handles in tool_response.
     let payload = serde_json::json!({
         "tool_input": { "prompt": "{\"job_id\":\"d-evil-0\"}" },
         "tool_response": { "content": [{ "type": "text", "text": "{\"job_id\":\"d-real-1\"}" }] },
     });
-    assert_eq!(extract_job_id(&payload).as_deref(), Some("d-real-1"));
+    assert_eq!(extract_job_ids(&payload), vec!["d-real-1"]);
+}
+
+#[test]
+fn find_job_ids_collects_every_fanout_job() {
+    // The fan-out reply: one `job_id` per account inside one content text. The
+    // hook must wait on every id, not the first one found.
+    let inner = serde_json::json!({
+        "jobs": [
+            { "job_id": "d-7-0", "profile": "solo", "status": "running" },
+            { "job_id": "d-7-1", "profile": "vendor", "status": "running" },
+        ]
+    });
+    let payload = serde_json::json!({
+        "tool_response": { "content": [{ "type": "text", "text": inner.to_string() }] }
+    });
+    assert_eq!(find_job_ids(&payload), vec!["d-7-0", "d-7-1"]);
+}
+
+#[test]
+fn find_job_ids_scans_fanout_prose() {
+    // The prose fan-out reply carries no `job_id` field at all; the token scan
+    // is the only way its jobs auto-arrive. Non-digit `d-` tokens and a lone
+    // `d-<n>` are not ids.
+    let payload = serde_json::json!({
+        "tool_response": {
+            "content": [{
+                "type": "text",
+                "text": "delegated to `solo` (job `d-1755-0`) and `vendor` (job `d-1755-1`); \
+    ignore d-evil-2 and d-12",
+            }]
+        }
+    });
+    assert_eq!(find_job_ids(&payload), vec!["d-1755-0", "d-1755-1"]);
+}
+
+#[test]
+fn await_job_outcomes_delivers_each_and_drops_absent() {
+    let _home = HomeSandbox::new();
+    jobs::write_running("d-multi-0", "solo", 1, false).unwrap();
+    jobs::write_running("d-multi-1", "vendor", 1, false).unwrap();
+    jobs::write_done(
+        "d-multi-0",
+        "solo",
+        1,
+        serde_json::json!({ "profile": "solo", "is_error": false, "result": "a" }),
+    )
+    .unwrap();
+    jobs::write_done(
+        "d-multi-1",
+        "vendor",
+        1,
+        serde_json::json!({ "profile": "vendor", "is_error": false, "result": "b" }),
+    )
+    .unwrap();
+
+    let (delivered, pending) = await_job_outcomes(
+        &[
+            "d-multi-0".to_string(),
+            "d-multi-1".to_string(),
+            "d-gone-9".to_string(),
+        ],
+        std::time::Duration::from_secs(2),
+    );
+    assert!(
+        pending.is_empty(),
+        "every done or absent id leaves the wait set: {pending:?}"
+    );
+    let results: Vec<&str> = delivered
+        .iter()
+        .map(|e| e["result"].as_str().expect("result string"))
+        .collect();
+    assert_eq!(
+        results,
+        vec!["a", "b"],
+        "one envelope per finished job, in input order"
+    );
+}
+
+#[test]
+fn await_job_outcomes_reports_still_running_at_deadline() {
+    let _home = HomeSandbox::new();
+    jobs::write_running("d-stuck-0", "solo", 1, false).unwrap();
+
+    let (delivered, pending) = await_job_outcomes(
+        &["d-stuck-0".to_string()],
+        std::time::Duration::from_millis(300),
+    );
+    assert!(delivered.is_empty(), "a still-running job delivers nothing");
+    assert_eq!(pending, vec!["d-stuck-0"], "the running id is reported");
 }
 
 #[test]

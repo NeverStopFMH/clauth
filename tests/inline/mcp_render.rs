@@ -557,7 +557,7 @@ fn switch_prose_renders_success_and_failure() {
 }
 
 #[test]
-fn delegate_prose_renders_background_depth_and_sync_envelope() {
+fn delegate_prose_renders_background_and_sync_envelope() {
     let bg = serde_json::json!({
         "job_id": "d-42-0",
         "profile": "work",
@@ -567,16 +567,6 @@ fn delegate_prose_renders_background_depth_and_sync_envelope() {
     assert_eq!(
         delegate_prose(&bg),
         "delegate to `work` running, job `d-42-0`"
-    );
-
-    let depth = serde_json::json!({
-        "profile": "any",
-        "is_error": true,
-        "result": "delegation depth exceeded (max 1)"
-    });
-    assert_eq!(
-        delegate_prose(&depth),
-        "delegate to `any` failed: delegation depth exceeded (max 1)"
     );
 
     let sync = serde_json::json!({
@@ -590,6 +580,40 @@ fn delegate_prose_renders_background_depth_and_sync_envelope() {
     assert_eq!(
         delegate_prose(&sync),
         "delegate to `work` finished: all done (cost $0.5), usage: input 100 tokens, output 50 tokens; target `work`: 5h 12% used, 7d 45.6% used"
+    );
+}
+
+#[test]
+fn delegate_refusal_prose_names_the_spelled_target() {
+    // A depth refusal fires before target resolution; the envelope carries the
+    // caller's own spelling, and the sentence names it rather than `unknown`.
+    let depth_one = serde_json::json!({
+        "profile": "any",
+        "is_error": true,
+        "result": "delegation depth exceeded (max 1)"
+    });
+    assert_eq!(
+        delegate_refusal_prose(&depth_one),
+        "delegate to `any` failed: delegation depth exceeded (max 1)"
+    );
+
+    let depth_many = serde_json::json!({
+        "profiles": ["solo", "vendor"],
+        "is_error": true,
+        "result": "delegation depth exceeded (max 1)"
+    });
+    assert_eq!(
+        delegate_refusal_prose(&depth_many),
+        "delegate to `solo`, `vendor` failed: delegation depth exceeded (max 1)"
+    );
+
+    let targetless = serde_json::json!({
+        "is_error": true,
+        "result": "exactly one of `prompt` or `prompt_file` must be given; neither was"
+    });
+    assert_eq!(
+        delegate_refusal_prose(&targetless),
+        "delegate failed: exactly one of `prompt` or `prompt_file` must be given; neither was"
     );
 }
 

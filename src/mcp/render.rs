@@ -588,8 +588,7 @@ fn envelope_prose(e: &Value) -> String {
     out
 }
 
-/// Prose for `delegate`: the background handle, the sync envelope, or the
-/// depth-guard refusal.
+/// Prose for `delegate`: the background handle or the sync envelope.
 pub(crate) fn delegate_prose(p: &Value) -> String {
     if let Some(job_id) = p.get("job_id").and_then(Value::as_str) {
         let profile = p
@@ -622,15 +621,28 @@ pub(crate) fn delegate_prose(p: &Value) -> String {
     out
 }
 
-/// Prose for a `delegate` argument/validation refusal. The envelope carries no
-/// `profile` (the refusal fired before a target was chosen), so the
-/// `delegate to `X`` prefix would name the wrong one; the sentence names the
-/// reason instead.
+/// Prose for a `delegate` argument/validation refusal. A refusal that fired
+/// before target resolution carries the target the caller spelled, so the
+/// sentence names it; an envelope with neither `profile` nor `profiles` (a
+/// refusal before any target was named) reads plainly.
 pub(crate) fn delegate_refusal_prose(p: &Value) -> String {
-    format!(
-        "delegate failed: {}",
-        p.get("result").and_then(Value::as_str).unwrap_or("unknown")
-    )
+    let reason = p.get("result").and_then(Value::as_str).unwrap_or("unknown");
+    match (
+        p.get("profile").and_then(Value::as_str),
+        p.get("profiles").and_then(Value::as_array),
+    ) {
+        (Some(t), _) => format!("delegate to `{t}` failed: {reason}"),
+        (None, Some(names)) => {
+            let list = names
+                .iter()
+                .filter_map(Value::as_str)
+                .map(|n| format!("`{n}`"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("delegate to {list} failed: {reason}")
+        }
+        (None, None) => format!("delegate failed: {reason}"),
+    }
 }
 
 /// Prose for a `delegate` `profiles` fan-out: one job per named account, echoing

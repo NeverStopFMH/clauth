@@ -19,6 +19,29 @@ use crate::testutil::HomeSandbox;
 /// still race. Restored before the function returns, so no other thread that
 /// holds the lock observes a torn value.
 fn run_with_depth(depth: &str) -> CallToolResult {
+    run_with_depth_args(
+        depth,
+        DelegateArgs {
+            profile: Some("any".to_string()),
+            profiles: None,
+            prompt: Some("hello".to_string()),
+            prompt_file: None,
+            model: None,
+            cwd: None,
+            env: None,
+            args: None,
+            timeout_secs: None,
+            idle_secs: None,
+            resume: None,
+            isolated: None,
+            background: None,
+            monitor: None,
+            format: Some("json".to_string()),
+        },
+    )
+}
+
+fn run_with_depth_args(depth: &str, args: DelegateArgs) -> CallToolResult {
     let _guard = crate::profile::HOME_TEST_LOCK
         .lock()
         .unwrap_or_else(|e| e.into_inner());
@@ -30,27 +53,7 @@ fn run_with_depth(depth: &str) -> CallToolResult {
     let rt = tokio::runtime::Builder::new_current_thread()
         .build()
         .expect("runtime");
-    let result = rt.block_on(async {
-        server
-            .delegate(Parameters(DelegateArgs {
-                profile: Some("any".to_string()),
-                profiles: None,
-                prompt: Some("hello".to_string()),
-                prompt_file: None,
-                model: None,
-                cwd: None,
-                env: None,
-                args: None,
-                timeout_secs: None,
-                idle_secs: None,
-                resume: None,
-                isolated: None,
-                background: None,
-                monitor: None,
-                format: Some("json".to_string()),
-            }))
-            .await
-    });
+    let result = rt.block_on(async { server.delegate(Parameters(args)).await });
 
     // SAFETY: same as above — restore the prior value.
     unsafe {
@@ -91,6 +94,72 @@ fn depth_guard_refuses_at_depth_one_without_spawning() {
 fn depth_guard_also_refuses_above_one() {
     let result = run_with_depth("3");
     assert_eq!(result.is_error, Some(true));
+}
+
+#[test]
+fn depth_guard_names_the_fanout_targets_the_caller_spelled() {
+    let fanout_args = |format: Option<String>| DelegateArgs {
+        profile: None,
+        profiles: Some(vec!["solo".to_string(), "vendor".to_string()]),
+        prompt: Some("hello".to_string()),
+        prompt_file: None,
+        model: None,
+        cwd: None,
+        env: None,
+        args: None,
+        timeout_secs: None,
+        idle_secs: None,
+        resume: None,
+        isolated: None,
+        background: Some(true),
+        monitor: None,
+        format,
+    };
+
+    let result = run_with_depth_args("1", fanout_args(Some("json".to_string())));
+    assert_eq!(result.is_error, Some(true), "the refusal is a tool error");
+    let text = result
+        .content
+        .first()
+        .and_then(|c| c.as_text())
+        .map(|t| t.text.clone())
+        .expect("error envelope text");
+    let envelope: serde_json::Value = serde_json::from_str(&text).expect("parse envelope");
+    assert_eq!(envelope["is_error"], serde_json::Value::Bool(true));
+    // The JSON contract stays honest: the caller spelled `profiles`, so that is
+    // the key present — no `profile: null` twin.
+    assert!(
+        envelope.get("profile").is_none(),
+        "no `profile` key when the caller used `profiles`: {envelope}"
+    );
+    let names = envelope["profiles"]
+        .as_array()
+        .expect("the spelled profiles array")
+        .iter()
+        .map(|v| v.as_str().expect("profile name"))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        names,
+        vec!["solo", "vendor"],
+        "the caller's targets, verbatim"
+    );
+    assert!(
+        envelope["result"].as_str().unwrap().contains("depth"),
+        "the refusal reason names the depth cap"
+    );
+
+    // The prose spelling names the targets end to end, never `unknown`.
+    let prose = run_with_depth_args("1", fanout_args(None));
+    let text = prose
+        .content
+        .first()
+        .and_then(|c| c.as_text())
+        .map(|t| t.text.clone())
+        .expect("prose block");
+    assert_eq!(
+        text, "delegate to `solo`, `vendor` failed: delegation depth exceeded (max 1)",
+        "prose names the targets the caller spelled"
+    );
 }
 
 /// Mirrors `disable_profile`'s own live-session refusal from the other

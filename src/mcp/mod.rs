@@ -672,12 +672,27 @@ Prose by default; pass `format: \"json\"` for the structured envelope."
             Err(_) => 0,
         };
         if depth >= 1 {
-            let payload = serde_json::json!({
-                "profile": profile,
-                "is_error": true,
-                "result": "delegation depth exceeded (max 1)",
-            });
-            let prose = render::delegate_prose(&payload);
+            // The refusal fires before target validation, but the caller's own
+            // spelling is known here: name the target it asked for instead of a
+            // `null` profile. `profile` / `profiles` are optional keys, present
+            // only when the caller named that spelling.
+            let payload = match (&profile, &profiles) {
+                (Some(t), _) => serde_json::json!({
+                    "profile": t,
+                    "is_error": true,
+                    "result": "delegation depth exceeded (max 1)",
+                }),
+                (None, Some(names)) => serde_json::json!({
+                    "profiles": names,
+                    "is_error": true,
+                    "result": "delegation depth exceeded (max 1)",
+                }),
+                (None, None) => serde_json::json!({
+                    "is_error": true,
+                    "result": "delegation depth exceeded (max 1)",
+                }),
+            };
+            let prose = render::delegate_refusal_prose(&payload);
             return Ok(CallToolResult::error(single_block(payload, format, prose)));
         }
 

@@ -36,7 +36,7 @@ use crate::profile_json::{provider_label, tier_label, windows_json};
 use crate::providers::ThirdPartyStats;
 use crate::runtime::{Isolation, ProfileRuntime};
 use crate::usage::{UsageInfo, UsageWindow, now_epoch_secs, now_ms};
-use render::ProfileSnapshot;
+use render::{ProfileSnapshot, RosterRank};
 
 /// Marks the `clauth mcp` child that [`crate::plugin_probe::mcp_boots`] spawns
 /// for the Plugin tab's handshake check. clauth owns both sides of that spawn, so
@@ -91,23 +91,51 @@ fn load_windows(name: &str) -> (Option<UsageWindow>, Option<UsageWindow>) {
     }
 }
 
-/// Percent of a profile's best-known window still free, the roster's sort key.
-/// 5h first (the pool a `delegate` actually competes for), then 7d, then a
-/// third-party provider's own cached bars. A balance-only provider yields
-/// `None`: ranking 1117 CNY against 31 USD would be an ordering clauth cannot
-/// justify, so those profiles keep config order instead.
-fn roster_headroom(name: &str) -> Option<f64> {
+/// The roster's sort key for one profile. A real window first (5h, the pool a
+/// `delegate` actually competes for, then 7d), then a third-party provider's own
+/// cached bars, then a wallet balance off its cached rows.
+fn roster_rank(name: &str) -> RosterRank {
     let (five_h, seven_d) = load_windows(name);
     if let Some(w) = five_h.or(seven_d) {
-        return Some(100.0 - w.utilization);
+        return RosterRank::Window(100.0 - w.utilization);
     }
-    let stats = load_profile_cache::<ThirdPartyStats>(name, THIRD_PARTY_CACHE_FILE)?;
-    let bar = stats
+    let Some(stats) = load_profile_cache::<ThirdPartyStats>(name, THIRD_PARTY_CACHE_FILE) else {
+        return RosterRank::Unknown;
+    };
+    if let Some(bar) = stats
         .bars
         .iter()
         .find(|b| b.label == "5h")
-        .or_else(|| stats.bars.iter().find(|b| b.label == "7d"))?;
-    Some(100.0 - bar.pct)
+        .or_else(|| stats.bars.iter().find(|b| b.label == "7d"))
+    {
+        return RosterRank::Window(100.0 - bar.pct);
+    }
+    stats
+        .rows
+        .iter()
+        .find(|r| r.label == "total")
+        .and_then(|r| parse_balance(&r.value))
+        .map_or(RosterRank::Unknown, |(currency, amount)| {
+            RosterRank::Balance { currency, amount }
+        })
+}
+
+/// `"31.45 USD"` → `("USD", 31.45)`, and nothing else. The strictness is the
+/// point: a `total` row carrying anything but one amount and one currency code
+/// (z.ai's `123.4M  (1.2k calls)`) describes no wallet, and a loose parse would
+/// invent one to rank on. Taking the FIRST such row is also what lands a profile
+/// holding two wallets in exactly one currency group.
+fn parse_balance(value: &str) -> Option<(String, f64)> {
+    let mut parts = value.split_whitespace();
+    let amount: f64 = parts.next()?.parse().ok()?;
+    let currency = parts.next()?;
+    if parts.next().is_some()
+        || !(2..=5).contains(&currency.len())
+        || !currency.chars().all(|c| c.is_ascii_alphabetic())
+    {
+        return None;
+    }
+    Some((currency.to_string(), amount))
 }
 
 /// Live footer for the current active profile, read fresh from cache.
@@ -1571,7 +1599,7 @@ fn build_instructions() -> String {
                 provider: provider_label(p),
                 base_url: p.base_url.clone(),
                 sub_type: tier_label(p),
-                headroom_pct: roster_headroom(name),
+                rank: roster_rank(name),
             }
         })
         .collect();

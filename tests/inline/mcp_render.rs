@@ -18,19 +18,31 @@ fn snapshot(name: &str, active: bool) -> ProfileSnapshot {
         provider: "anthropic".to_string(),
         base_url: None,
         sub_type: Some("max".to_string()),
-        headroom_pct: None,
+        rank: RosterRank::Unknown,
     }
 }
 
-fn third_party_snapshot(name: &str, base_url: &str, headroom_pct: Option<f64>) -> ProfileSnapshot {
+fn third_party_snapshot(name: &str, base_url: &str, rank: RosterRank) -> ProfileSnapshot {
     ProfileSnapshot {
         name: name.to_string(),
         active: false,
         provider: "DeepSeek".to_string(),
         base_url: Some(base_url.to_string()),
         sub_type: None,
-        headroom_pct,
+        rank,
     }
+}
+
+/// A wallet-ranked snapshot, the shape the DeepSeek fleet takes.
+fn wallet_snapshot(name: &str, currency: &str, amount: f64) -> ProfileSnapshot {
+    third_party_snapshot(
+        name,
+        "https://api.deepseek.com/anthropic",
+        RosterRank::Balance {
+            currency: currency.to_string(),
+            amount,
+        },
+    )
 }
 
 fn third_party_stats(
@@ -195,10 +207,10 @@ fn instructions_block_emits_stable_roster_cost_model_and_safety_prose() {
 fn roster_groups_identical_brackets_and_leads_with_most_headroom() {
     let url = "https://api.deepseek.com/anthropic";
     let profiles = vec![
-        third_party_snapshot("spent", url, Some(2.0)),
+        third_party_snapshot("spent", url, RosterRank::Window(2.0)),
         snapshot("oauth", false),
-        third_party_snapshot("unknown", url, None),
-        third_party_snapshot("fresh", url, Some(90.0)),
+        third_party_snapshot("unknown", url, RosterRank::Unknown),
+        third_party_snapshot("fresh", url, RosterRank::Window(90.0)),
     ];
     let out = roster_lines(&profiles);
 
@@ -219,6 +231,56 @@ fn roster_groups_identical_brackets_and_leads_with_most_headroom() {
     // The `anthropic` group has no host at all, and its unknown headroom puts it
     // below a DeepSeek group whose best member is 90% free.
     assert!(!out.contains("https://"), "base urls print as hosts: {out}");
+}
+
+/// Wallet profiles rank by amount inside one currency and never across two. The
+/// fleet this serves holds both: ordering 1117 CNY against 31 USD would need an
+/// exchange rate clauth has no way to obtain, so currency groups fall back to
+/// the order config first names them in — here CNY, because `cny-rich` leads.
+#[test]
+fn roster_ranks_wallets_within_a_currency_and_never_across_two() {
+    // The amounts deliberately interleave across the two currencies: the biggest
+    // number here is USD and the smallest is CNY. A fixture whose CNY amounts
+    // all beat its USD ones cannot tell grouping apart from a plain sort on
+    // magnitude, and would stay green with the currency boundary removed.
+    let profiles = vec![
+        wallet_snapshot("cny-big", "CNY", 300.0),
+        wallet_snapshot("usd-small", "USD", 41.02),
+        third_party_snapshot(
+            "no-balance",
+            "https://api.deepseek.com/anthropic",
+            RosterRank::Unknown,
+        ),
+        wallet_snapshot("usd-big", "USD", 900.0),
+        wallet_snapshot("cny-small", "CNY", 5.0),
+    ];
+    let out = roster_lines(&profiles);
+
+    assert_eq!(
+        out, "- cny-big, cny-small, usd-big, usd-small, no-balance [DeepSeek, api.deepseek.com]\n",
+        "currency groups in config-first-seen order, amount descending inside each",
+    );
+
+    // The load-bearing half: a 5.00 CNY wallet still sorts above a 900 USD one,
+    // because the group boundary decides placement before any amount does. A
+    // comparator falling through to raw magnitude would lead with `usd-big`.
+    let cny_small = out.find("cny-small").unwrap();
+    let usd_big = out.find("usd-big").unwrap();
+    assert!(cny_small < usd_big, "currency group outranks magnitude");
+}
+
+/// Every windowed profile outranks every wallet one, whatever the wallet holds.
+/// A percentage and a balance measure different things, so the roster orders by
+/// which KIND of figure it has before it compares any two numbers.
+#[test]
+fn a_spent_window_still_outranks_the_richest_wallet() {
+    let url = "https://api.deepseek.com/anthropic";
+    let profiles = vec![
+        wallet_snapshot("rich", "CNY", 9999.0),
+        third_party_snapshot("nearly-spent", url, RosterRank::Window(1.0)),
+    ];
+    let out = roster_lines(&profiles);
+    assert_eq!(out, "- nearly-spent, rich [DeepSeek, api.deepseek.com]\n");
 }
 
 #[test]

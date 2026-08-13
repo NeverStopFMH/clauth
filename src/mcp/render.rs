@@ -16,11 +16,25 @@ pub(crate) struct ProfileSnapshot {
     pub(crate) provider: String,
     pub(crate) base_url: Option<String>,
     pub(crate) sub_type: Option<String>,
-    /// Percent of this profile's best-known window still FREE, for roster
-    /// ordering only. `None` for a provider that reports a balance instead of a
-    /// window: ranking those would mean comparing a USD figure against a CNY
-    /// one, so they keep config order at the end.
-    pub(crate) headroom_pct: Option<f64>,
+    /// Where this profile sorts in the roster. See [`RosterRank`].
+    pub(crate) rank: RosterRank,
+}
+
+/// A profile's roster sort key, for ordering only.
+///
+/// The variants never interleave: every windowed profile outranks every wallet
+/// one, which outranks every profile clauth holds no figure for. That last step
+/// is what keeps "no figure" from reading as "full".
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum RosterRank {
+    /// Percent of this profile's best-known window still FREE.
+    Window(f64),
+    /// A provider reporting a wallet rather than a window. Amounts are compared
+    /// only within one `currency`: ordering 1117 CNY against 31 USD needs an
+    /// exchange rate clauth does not have and could not keep fresh.
+    Balance { currency: String, amount: f64 },
+    /// Nothing cached, or nothing a wallet could be read out of.
+    Unknown,
 }
 
 /// Host (and port) of a base url. Every profile of one provider carries the same
@@ -43,10 +57,42 @@ fn roster_bracket(p: &ProfileSnapshot) -> String {
     format!("[{}]", parts.join(", "))
 }
 
-/// Unknown headroom ranks below a fully-spent window, so a profile clauth has no
-/// figure for never outranks one it knows is free.
-fn rank(p: &ProfileSnapshot) -> f64 {
-    p.headroom_pct.unwrap_or(-1.0)
+/// Currencies in the order the roster first meets them. Two currencies carry no
+/// comparable magnitude, so their groups fall back to the order the operator's
+/// own config lists them in.
+fn currency_order(profiles: &[ProfileSnapshot]) -> Vec<&str> {
+    let mut seen: Vec<&str> = Vec::new();
+    for p in profiles {
+        if let RosterRank::Balance { currency, .. } = &p.rank
+            && !seen.contains(&currency.as_str())
+        {
+            seen.push(currency);
+        }
+    }
+    seen
+}
+
+/// Total order over [`RosterRank`] as `(tier, currency group, negated
+/// magnitude)`. Sorting ascending on it puts the freest window first and every
+/// unknown last, and negating the magnitude is what makes "more left" sort
+/// earlier without a second comparator.
+fn sort_key(p: &ProfileSnapshot, currencies: &[&str]) -> (u8, usize, f64) {
+    match &p.rank {
+        RosterRank::Window(free) => (0, 0, -free),
+        RosterRank::Balance { currency, amount } => (
+            1,
+            currencies
+                .iter()
+                .position(|c| *c == currency.as_str())
+                .unwrap_or(usize::MAX),
+            -amount,
+        ),
+        RosterRank::Unknown => (2, 0, 0.0),
+    }
+}
+
+fn cmp_key(a: (u8, usize, f64), b: (u8, usize, f64)) -> std::cmp::Ordering {
+    a.0.cmp(&b.0).then(a.1.cmp(&b.1)).then(a.2.total_cmp(&b.2))
 }
 
 /// Roster body: one line per distinct bracket, names joined, most headroom first.
@@ -55,6 +101,7 @@ fn rank(p: &ProfileSnapshot) -> f64 {
 /// ordering is a hint rather than a claim — it freezes at server start like the
 /// rest of the roster, which is why the header calls it a snapshot.
 fn roster_lines(profiles: &[ProfileSnapshot]) -> String {
+    let currencies = currency_order(profiles);
     let mut groups: Vec<(String, Vec<&ProfileSnapshot>)> = Vec::new();
     for p in profiles {
         let bracket = roster_bracket(p);
@@ -67,13 +114,15 @@ fn roster_lines(profiles: &[ProfileSnapshot]) -> String {
     // Stable sorts throughout, so config order breaks every tie. Members first,
     // then groups by their best member — which is `first()` once members are
     // sorted.
-    fn best(members: &[&ProfileSnapshot]) -> f64 {
-        members.first().map_or(-1.0, |p| rank(p))
+    fn best(members: &[&ProfileSnapshot], currencies: &[&str]) -> (u8, usize, f64) {
+        members
+            .first()
+            .map_or((2, 0, 0.0), |p| sort_key(p, currencies))
     }
     for (_, members) in &mut groups {
-        members.sort_by(|a, b| rank(b).total_cmp(&rank(a)));
+        members.sort_by(|a, b| cmp_key(sort_key(a, &currencies), sort_key(b, &currencies)));
     }
-    groups.sort_by(|a, b| best(&b.1).total_cmp(&best(&a.1)));
+    groups.sort_by(|a, b| cmp_key(best(&a.1, &currencies), best(&b.1, &currencies)));
 
     let mut out = String::new();
     for (bracket, members) in &groups {

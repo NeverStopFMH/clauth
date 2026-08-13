@@ -993,7 +993,7 @@ fn the_which_description_names_every_source_it_can_return() {
 /// every session's roster backwards, most-spent account first, and the render
 /// test would stay green.
 #[test]
-fn roster_headroom_reports_free_percent_from_the_best_known_window() {
+fn roster_rank_reports_free_percent_from_the_best_known_window() {
     use crate::profile_cache::{THIRD_PARTY_CACHE_FILE, USAGE_CACHE_FILE, write_profile_cache};
     use crate::providers::{ThirdPartyStats, UsageBar};
     use crate::usage::{UsageInfo, UsageWindow};
@@ -1014,7 +1014,7 @@ fn roster_headroom_reports_free_percent_from_the_best_known_window() {
             ..Default::default()
         },
     );
-    assert_eq!(roster_headroom("both"), Some(30.0));
+    assert_eq!(roster_rank("both"), RosterRank::Window(30.0));
 
     // 7d carries it when the 5h window is absent.
     write_profile_cache(
@@ -1025,7 +1025,7 @@ fn roster_headroom_reports_free_percent_from_the_best_known_window() {
             ..Default::default()
         },
     );
-    assert_eq!(roster_headroom("weekly"), Some(75.0));
+    assert_eq!(roster_rank("weekly"), RosterRank::Window(75.0));
 
     // A third-party provider has no `windows`, but its own bars carry the same
     // percentages, and 5h still outranks 7d.
@@ -1048,10 +1048,10 @@ fn roster_headroom_reports_free_percent_from_the_best_known_window() {
             best_effort: false,
         },
     );
-    assert_eq!(roster_headroom("bars"), Some(92.0));
+    assert_eq!(roster_rank("bars"), RosterRank::Window(92.0));
 
-    // A balance-only provider yields no key at all. Ranking 1117 CNY against 31
-    // USD is an ordering clauth cannot justify, so those keep config order.
+    // A balance-only provider ranks on its wallet instead, carrying the currency
+    // so `roster_lines` can keep two of them from ever being compared.
     write_profile_cache(
         "balance",
         THIRD_PARTY_CACHE_FILE,
@@ -1068,6 +1068,82 @@ fn roster_headroom_reports_free_percent_from_the_best_known_window() {
             best_effort: false,
         },
     );
-    assert_eq!(roster_headroom("balance"), None);
-    assert_eq!(roster_headroom("never-cached"), None);
+    assert_eq!(
+        roster_rank("balance"),
+        RosterRank::Balance {
+            currency: "CNY".to_string(),
+            amount: 1117.10,
+        }
+    );
+    assert_eq!(roster_rank("never-cached"), RosterRank::Unknown);
+}
+
+/// The wallet parse is deliberately strict. It reads a `total` row, and every
+/// provider writes something into one — z.ai's counts tokens. Anything that is
+/// not exactly one amount and one currency code describes no wallet, and a loose
+/// parse would mint a rank out of it and order the roster on token counts.
+#[test]
+fn parse_balance_takes_an_amount_and_a_currency_and_nothing_else() {
+    assert_eq!(parse_balance("31.45 USD"), Some(("USD".to_string(), 31.45)));
+    assert_eq!(
+        parse_balance("1117.65 CNY"),
+        Some(("CNY".to_string(), 1117.65))
+    );
+    for junk in [
+        "123.4M  (1.2k calls)", // z.ai's token total
+        "balance unavailable",
+        "31.45",
+        "31.45 USD extra",
+        "USD 31.45",
+        "31.45 U",
+        "31.45 TOOLONG",
+        "31.45 US1",
+        "",
+    ] {
+        assert_eq!(parse_balance(junk), None, "must not rank on `{junk}`");
+    }
+}
+
+/// A profile holding two wallets joins exactly one currency group: the first its
+/// provider lists. Appearing in both would double a name in the roster, and
+/// picking the larger would be the cross-currency compare this whole design
+/// refuses to make.
+#[test]
+fn a_two_wallet_profile_ranks_on_the_first_currency_listed() {
+    use crate::profile_cache::{THIRD_PARTY_CACHE_FILE, write_profile_cache};
+    use crate::providers::{StatRow, StatRowKind, ThirdPartyStats};
+
+    let _home = HomeSandbox::new();
+    let row = |label: &str, value: &str| StatRow {
+        label: label.to_string(),
+        value: value.to_string(),
+        kind: StatRowKind::Body,
+    };
+    // DeepSeek's real shape for a dual-wallet account: USD block, then CNY.
+    write_profile_cache(
+        "both-wallets",
+        THIRD_PARTY_CACHE_FILE,
+        &ThirdPartyStats {
+            is_available: true,
+            rows: vec![
+                row("USD balance", ""),
+                row("total", "1.19 USD"),
+                row("granted", "0.00 USD"),
+                row("CNY balance", ""),
+                row("total", "1117.65 CNY"),
+            ],
+            bars: Vec::new(),
+            plan: None,
+            endpoint: None,
+            best_effort: false,
+        },
+    );
+    assert_eq!(
+        roster_rank("both-wallets"),
+        RosterRank::Balance {
+            currency: "USD".to_string(),
+            amount: 1.19,
+        },
+        "the first `total` row wins, not the larger amount",
+    );
 }

@@ -78,4 +78,8 @@ Runs a headless `claude -p` under another profile and returns what it produced.
 
 ## What the server tells the model
 
-On connect it sends a short brief: the five tools, their cost model, what `switch` would do to this specific session, a reminder that a delegate sees only its prompt, and a roster of your profiles as of session start. Live usage numbers are deliberately left out of that snapshot, since they go stale immediately. `list_profiles` is the live read.
+On connect it sends a short brief: a one-line index of the five tools, their cost model, what `switch` would do to this specific session, and a roster of your profiles as of session start. A `clauth start` session gets one more note: its runtime directory is mostly symlinks onto your real `~/.claude`, so an edit there is an edit to the global file.
+
+The roster groups profiles that share a provider, tier and endpoint host onto one line, and leads with the account that has the most window left. Live usage numbers are deliberately left out of that snapshot, since they go stale immediately; only the ordering reflects them. `list_profiles` is the live read.
+
+Everything specific to one tool rides that tool's own description rather than the brief: what a delegate costs, that it sees only its prompt, the depth cap. It loads when the tool does, and is never stated twice.

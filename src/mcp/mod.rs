@@ -1834,12 +1834,23 @@ fn read_prompt_file(cwd: Option<&str>, rel: &str) -> std::result::Result<String,
             "prompt_file `{rel}` refused: {size} bytes over the {PROMPT_FILE_CAP} byte cap"
         ));
     }
-    // Bounded read on the same handle the size check just statted: the cap above
-    // pins the inode, this backstops it if the file grows between stat and read.
+    read_prompt_handle(file, rel)
+}
+
+/// Read the validated prompt handle with a hard byte ceiling. A file can grow
+/// past the cap between the size check above and the read; `take` bounds the
+/// read to cap + 1, and a read that actually hit the bound is refused by name
+/// instead of silently truncating the prompt.
+fn read_prompt_handle(file: std::fs::File, rel: &str) -> std::result::Result<String, String> {
     let mut reader = file.take(PROMPT_FILE_CAP + 1);
-    let mut buf = Vec::with_capacity(size as usize);
+    let mut buf = Vec::new();
     std::io::Read::read_to_end(&mut reader, &mut buf)
         .map_err(|e| format!("prompt_file `{rel}` refused: {e}"))?;
+    if buf.len() > PROMPT_FILE_CAP as usize {
+        return Err(format!(
+            "prompt_file `{rel}` refused: grew past the {PROMPT_FILE_CAP} byte cap during the read"
+        ));
+    }
     Ok(String::from_utf8_lossy(&buf).into_owned())
 }
 

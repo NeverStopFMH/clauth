@@ -11,6 +11,7 @@
 use super::*;
 use crate::profile::{AppConfig, AppState};
 use crate::testutil::HomeSandbox;
+use std::io::{Seek, SeekFrom, Write};
 
 /// A `DelegateArgs` with every optional field unset and JSON format, so each
 /// test overrides only what it exercises.
@@ -356,6 +357,66 @@ fn prompt_file_refuses_a_fifo_without_blocking() {
         ),
     }
     handle.join().expect("reader thread joins");
+}
+
+/// A file grown past the cap after its size was checked must be refused by the
+/// bounded read, never silently truncated: `take(cap + 1)` alone returns a
+/// short Ok that reads as success.
+#[test]
+fn prompt_handle_growth_past_cap_is_refused_by_name() {
+    let home = HomeSandbox::new();
+    let path = home.home().join("grow.txt");
+    let mut f = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&path)
+        .expect("create grow.txt");
+    f.write_all(&vec![b'a'; super::PROMPT_FILE_CAP as usize])
+        .expect("cap bytes");
+    // Grow past the cap on the same handle: a size check statting this file
+    // before the growth sees a passing size; the read then sees past-cap bytes.
+    f.write_all(b"more").expect("grow");
+    f.seek(SeekFrom::Start(0)).expect("rewind");
+
+    let reason = super::read_prompt_handle(f, "grow.txt")
+        .expect_err("a past-cap read is refused, not truncated");
+    for needle in [
+        "prompt_file `grow.txt`",
+        "grew past the",
+        "byte cap",
+        "during the read",
+    ] {
+        assert!(
+            reason.contains(needle),
+            "the reason names {needle:?}: {reason}"
+        );
+    }
+}
+
+/// The cap itself stays accepted: the growth refusal fires only past it.
+#[test]
+fn prompt_handle_at_cap_is_accepted() {
+    let home = HomeSandbox::new();
+    let path = home.home().join("exact.txt");
+    let mut f = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&path)
+        .expect("create exact.txt");
+    f.write_all(&vec![b'a'; super::PROMPT_FILE_CAP as usize])
+        .expect("cap bytes");
+    f.seek(SeekFrom::Start(0)).expect("rewind");
+
+    let text = super::read_prompt_handle(f, "exact.txt").expect("at-cap file is accepted");
+    assert_eq!(
+        text.len(),
+        super::PROMPT_FILE_CAP as usize,
+        "the at-cap file is read whole, not truncated"
+    );
 }
 
 // ── profiles fan-out guards ──────────────────────────────────────────────────

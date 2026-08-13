@@ -25,13 +25,15 @@ The TUI's Plugin tab writes exactly that entry for you with <kbd>f</kbd>. The ma
 
 | Tool | Input | Returns | Cost |
 |------|-------|---------|------|
-| `list_profiles` | none | every profile with cached 5h / 7d percentages, provider, tier, active flag, live-session flag, observed throughput | none, reads the disk cache |
+| `list_profiles` | `names` (optional, case-insensitive) | every profile with cached 5h / 7d percentages, provider, tier, endpoint host, active flag | none, reads the disk cache |
 | `which` | none | the profile owning this session's credentials, its plan, its throughput | none |
 | `switch` | `name` | relinks the global active profile | none |
 | `delegate` | see below | the target account's answer, or a `job_id` | **a real usage window on the target account** |
 | `delegate_result` | `job_id`, `wait_secs` (0-60, default 0) | a backgrounded job's envelope, or its running status | none |
 
 `which` is the authority on which account owns the current session. `list_profiles` reads a cache and can lag it.
+
+`list_profiles` answers for every profile by default, and `names` narrows it to the ones you ask for. Two fields appear only when they have something to say: the live-session flag when a clauth-managed session already owns that profile, and the throughput rows when a model there is degraded or was recently rate-limited. On a 27-profile fleet that reply is a third the size it would otherwise be, which matters because the model is told to call it at the start of every session.
 
 ## `switch` inside a session
 

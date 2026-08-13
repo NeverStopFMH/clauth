@@ -10,6 +10,7 @@ mod jobs;
 mod render;
 
 use std::collections::HashMap;
+use std::io::Read;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -62,6 +63,13 @@ const PARTIAL_TEXT_CAP: usize = 8 * 1024;
 /// Raise the delegate's max output budget above CC's default so a long headless
 /// build doesn't die on the 32k cap. Overridable via the `env` arg.
 const DEFAULT_MAX_OUTPUT_TOKENS: &str = "64000";
+/// Cap on one `prompt_file` in bytes. Well under Linux's ~128 KiB single-argument
+/// ceiling (the prompt becomes one `-p` argv element), so a file that passes can
+/// always be handed to `claude`, and far above any real reusable prompt.
+const PROMPT_FILE_CAP: u64 = 64 * 1024;
+/// Cap on one `profiles` fan-out. Each target is a real usage window with no
+/// undo, so a runaway list is bounded here.
+const MAX_FANOUT: usize = 8;
 
 /// Compact per-model throughput rows for a profile (observed tok/s, degraded /
 /// rate-limited flags). Empty array when clauth has launched no runs for it.
@@ -188,6 +196,15 @@ fn format_refusal(reason: String) -> CallToolResult {
     )])
 }
 
+/// A `delegate` argument/validation refusal: one `{is_error, result}` envelope in
+/// one content block, honouring the caller's `format`. Prose reads as a sentence;
+/// JSON keeps the same keys as every other delegate refusal.
+fn delegate_refusal(format: Format, reason: &str) -> CallToolResult {
+    let payload = serde_json::json!({ "is_error": true, "result": reason });
+    let prose = render::delegate_refusal_prose(&payload);
+    CallToolResult::error(single_block(payload, format, prose))
+}
+
 /// The live-usage footer folded into a payload as data: which profile the
 /// percentages describe, and the 5h/7d share used (null when uncached). The
 /// throughput warning is added by the caller when the tool has one.
@@ -248,10 +265,19 @@ pub(crate) struct ListProfilesArgs {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub(crate) struct DelegateArgs {
-    /// Profile name to run the headless delegate session under.
-    profile: String,
-    /// Prompt passed to the delegated `claude -p` session.
-    prompt: String,
+    /// Profile name to run the headless delegate session under. Exactly one of
+    /// `profile` or `profiles`.
+    profile: Option<String>,
+    /// Fan out one delegate per named account, background-only. Exactly one of
+    /// `profile` or `profiles`; a fan-out spends one usage window per account.
+    profiles: Option<Vec<String>>,
+    /// Prompt passed to the delegated `claude -p` session. Exactly one of
+    /// `prompt` or `prompt_file`.
+    prompt: Option<String>,
+    /// Path (relative to `cwd`) of a file whose contents are the prompt. Read
+    /// once and reused across a fan-out. Exactly one of `prompt` or
+    /// `prompt_file`.
+    prompt_file: Option<String>,
     /// Optional model override for the delegated session.
     model: Option<String>,
     /// Working directory for the delegate (must exist). Defaults to the MCP
@@ -555,6 +581,12 @@ this session is in. Prose by default; pass `format: \"json\"` for the structured
 under that account's credentials. It SPENDS that account's window or money, so pick the target \
 from `list_profiles`. It sees only the `prompt` you pass and has no view of this conversation, so \
 state the whole task there.\n\n\
+Give exactly one prompt source: `prompt` inline, or `prompt_file` — a path relative to `cwd` \
+whose contents are the prompt. `prompt_file` is read once (validated against `cwd`, size-capped) \
+so a long reusable prompt costs your context nothing to pass, and a `profiles` fan-out reuses \
+that one read across every account. Exactly one target too: `profile` for one account, or \
+`profiles` for a background-only fan-out that spawns one delegate per named account and spends \
+one usage window per account, returning one `job_id` per account.\n\n\
 Blocking by default. Pass `background: true` for a `{job_id}` now; the result auto-arrives via \
 clauth's PostToolUse hook, and `delegate_result({job_id})` is the fallback when hooks are off. \
 Prefer `background` for a slow or third-party endpoint, where a blocking call ties up this turn. \
@@ -581,7 +613,9 @@ Prose by default; pass `format: \"json\"` for the structured envelope."
         &self,
         Parameters(DelegateArgs {
             profile,
+            profiles,
             prompt,
+            prompt_file,
             model,
             cwd,
             env,
@@ -616,6 +650,70 @@ Prose by default; pass `format: \"json\"` for the structured envelope."
             return Ok(CallToolResult::error(single_block(payload, format, prose)));
         }
 
+        // Exactly one prompt source. A prompt read from a file still costs the
+        // target account once, but no longer costs the CALLING model its own
+        // context to pass the same long prompt inline.
+        if prompt.is_some() == prompt_file.is_some() {
+            let reason = if prompt.is_some() {
+                "exactly one of `prompt` or `prompt_file` must be given; both were"
+            } else {
+                "exactly one of `prompt` or `prompt_file` must be given; neither was"
+            };
+            return Ok(delegate_refusal(format, reason));
+        }
+
+        // Exactly one target: a single account, or a `profiles` fan-out.
+        if profile.is_some() == profiles.is_some() {
+            let reason = if profile.is_some() {
+                "exactly one of `profile` or `profiles` must be given; both were"
+            } else {
+                "exactly one of `profile` or `profiles` must be given; neither was"
+            };
+            return Ok(delegate_refusal(format, reason));
+        }
+
+        let config = load_config().map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+
+        // Which accounts to spend, in canonical spelling, resolved BEFORE any
+        // spawn or read. A fan-out is background-only: blocking N accounts has no
+        // sensible timeout story, so it is refused by name here.
+        enum Target {
+            One(String),
+            Many(Vec<String>),
+        }
+        let target = if let Some(raw) = profiles.as_deref() {
+            if !background.unwrap_or(false) {
+                return Ok(delegate_refusal(
+                    format,
+                    "`profiles` requires `background: true`",
+                ));
+            }
+            match resolve_fanout(&config, raw) {
+                Ok(names) => Target::Many(names),
+                Err(reason) => return Ok(delegate_refusal(format, &reason)),
+            }
+        } else {
+            // `profile` is Some here: the exactly-one guard above just proved it.
+            let raw = profile.as_deref().unwrap_or_default();
+            let Some(name) = config.canonical_name(raw) else {
+                return Ok(delegate_refusal(
+                    format,
+                    &format!("profile not found: {raw}"),
+                ));
+            };
+            Target::One(name)
+        };
+
+        // Resolve the prompt text once, before any spawn, so a fan-out reuses one
+        // read across every account.
+        let prompt: std::sync::Arc<str> = match prompt_file.as_deref() {
+            Some(rel) => match read_prompt_file(cwd.as_deref(), rel) {
+                Ok(text) => text.into(),
+                Err(reason) => return Ok(delegate_refusal(format, &reason)),
+            },
+            None => prompt.as_deref().unwrap_or_default().to_string().into(),
+        };
+
         // Both deadlines resolve inside `run_delegate`: the wall clock's fallback
         // depends on whether the child ends up streaming, which only the composed
         // arg list knows.
@@ -625,72 +723,83 @@ Prose by default; pass `format: \"json\"` for the structured envelope."
             Isolation::Shared
         };
 
-        // Background: persist a `running` job file, run the delegate on a detached
-        // blocking task that finalizes the file on completion, and return the
-        // handle now. The detached task outlives this call (it runs on the
-        // blocking pool, not this turn's future) so N delegates overlap.
         if background.unwrap_or(false) {
-            let started_at = now_ms();
-            let job_id = jobs::new_job_id(started_at);
-            jobs::write_running(&job_id, &profile, started_at, monitor.unwrap_or(false)).map_err(
-                |e| ErrorData::internal_error(format!("failed to record job: {e}"), None),
-            )?;
-
-            let job_id_task = job_id.clone();
-            let profile_task = profile.clone();
-            tokio::task::spawn_blocking(move || {
-                // Catch a panic in the detached task: the handle is dropped, so an
-                // unwind would otherwise be swallowed and leave the job stuck
-                // `running` until GC — the waiter would hang on its deadline. The
-                // job file is always finalized, mirroring the sync contract.
-                let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    run_delegate(DelegateOpts {
-                        profile: &profile_task,
-                        prompt: &prompt,
-                        model: model.as_deref(),
-                        cwd: cwd.as_deref(),
+            match target {
+                Target::One(name) => {
+                    let opts = BackgroundOpts {
+                        prompt,
+                        model,
+                        cwd,
                         env: env.unwrap_or_default(),
                         extra_args: args.unwrap_or_default(),
                         timeout_secs,
                         idle_secs,
-                        resume: resume.as_deref(),
+                        resume,
                         isolation,
                         depth,
-                    })
-                }));
-                let envelope = match outcome {
-                    Ok(Ok(v)) => v,
-                    Ok(Err(reason)) => serde_json::json!({
-                        "profile": profile_task,
-                        "is_error": true,
-                        "result": reason,
-                    }),
-                    Err(_) => serde_json::json!({
-                        "profile": profile_task,
-                        "is_error": true,
-                        "result": "delegate task panicked",
-                    }),
-                };
-                let _ = jobs::write_done(&job_id_task, &profile_task, started_at, envelope);
-            });
-
-            let payload = serde_json::json!({
-                "job_id": job_id,
-                "profile": profile,
-                "started_at": started_at,
-                "status": "running",
-            });
-            let prose = render::delegate_prose(&payload);
-            return Ok(CallToolResult::success(single_block(
-                payload, format, prose,
-            )));
+                    };
+                    let (job_id, started_at) =
+                        launch_background_delegate(name.clone(), opts, monitor.unwrap_or(false))?;
+                    let payload = serde_json::json!({
+                        "job_id": job_id,
+                        "profile": name,
+                        "started_at": started_at,
+                        "status": "running",
+                    });
+                    let prose = render::delegate_prose(&payload);
+                    return Ok(CallToolResult::success(single_block(
+                        payload, format, prose,
+                    )));
+                }
+                Target::Many(names) => {
+                    let opts = BackgroundOpts {
+                        prompt,
+                        model,
+                        cwd,
+                        env: env.unwrap_or_default(),
+                        extra_args: args.unwrap_or_default(),
+                        timeout_secs,
+                        idle_secs,
+                        resume,
+                        isolation,
+                        depth,
+                    };
+                    let mut jobs = Vec::with_capacity(names.len());
+                    for name in &names {
+                        let (job_id, started_at) = launch_background_delegate(
+                            name.clone(),
+                            opts.clone(),
+                            monitor.unwrap_or(false),
+                        )?;
+                        jobs.push(serde_json::json!({
+                            "job_id": job_id,
+                            "profile": name,
+                            "started_at": started_at,
+                            "status": "running",
+                        }));
+                    }
+                    let payload = serde_json::json!({ "jobs": jobs });
+                    let prose = render::delegate_fanout_prose(&payload);
+                    return Ok(CallToolResult::success(single_block(
+                        payload, format, prose,
+                    )));
+                }
+            }
         }
 
-        let target = profile.clone();
+        // Blocking single delegate. A fan-out never reaches here: it is refused
+        // above unless `background` is set.
+        let Target::One(target) = target else {
+            return Err(ErrorData::internal_error(
+                "fan-out reached the blocking path".to_string(),
+                None,
+            ));
+        };
+        let target_for_task = target.clone();
         let outcome = tokio::task::spawn_blocking(move || {
             run_delegate(DelegateOpts {
-                profile: &target,
-                prompt: &prompt,
+                profile: &target_for_task,
+                prompt: prompt.as_ref(),
                 model: model.as_deref(),
                 cwd: cwd.as_deref(),
                 env: env.unwrap_or_default(),
@@ -708,17 +817,17 @@ Prose by default; pass `format: \"json\"` for the structured envelope."
         let envelope = match outcome {
             Ok(v) => v,
             Err(reason) => serde_json::json!({
-                "profile": profile,
+                "profile": target,
                 "is_error": true,
                 "result": reason,
             }),
         };
 
-        let (five_h, seven_d) = load_windows(&profile);
+        let (five_h, seven_d) = load_windows(&target);
         let mut payload = envelope;
         payload["live_usage"] =
-            live_usage_json(Some(profile.as_str()), five_h.as_ref(), seven_d.as_ref());
-        if let Some(note) = throughput_note(&profile, now_epoch_secs()) {
+            live_usage_json(Some(target.as_str()), five_h.as_ref(), seven_d.as_ref());
+        if let Some(note) = throughput_note(&target, now_epoch_secs()) {
             payload["live_usage"]["throughput_warning"] = serde_json::Value::String(note);
         }
         let is_error = payload
@@ -960,6 +1069,24 @@ struct DelegateOpts<'a> {
     timeout_secs: Option<u64>,
     idle_secs: Option<u64>,
     resume: Option<&'a str>,
+    isolation: Isolation,
+    depth: u32,
+}
+
+/// Owned twin of [`DelegateOpts`] for a background launch: the detached task is
+/// `'static`, so it owns its inputs rather than borrowing the handler's locals.
+/// Grouped so `launch_background_delegate` keeps a short signature and a fan-out
+/// clones the whole set once per account instead of field by field.
+#[derive(Clone)]
+struct BackgroundOpts {
+    prompt: std::sync::Arc<str>,
+    model: Option<String>,
+    cwd: Option<String>,
+    env: HashMap<String, String>,
+    extra_args: Vec<String>,
+    timeout_secs: Option<u64>,
+    idle_secs: Option<u64>,
+    resume: Option<String>,
     isolation: Isolation,
     depth: u32,
 }
@@ -1564,6 +1691,181 @@ fn run_delegate(opts: DelegateOpts<'_>) -> std::result::Result<serde_json::Value
     Ok(envelope)
 }
 
+/// Resolve a `profiles` fan-out list to canonical target names. Refuses by name:
+/// a list over [`MAX_FANOUT`], a duplicate (case-insensitive, the same rule a
+/// single `profile` resolves under), or a name resolving to no account. Runs
+/// before any spawn: N delegates is N real usage windows with no undo.
+fn resolve_fanout(config: &AppConfig, raw: &[String]) -> std::result::Result<Vec<String>, String> {
+    if raw.len() > MAX_FANOUT {
+        return Err(format!(
+            "`profiles` fan-out capped at {MAX_FANOUT} names; got {}",
+            raw.len()
+        ));
+    }
+    let mut seen = std::collections::HashSet::with_capacity(raw.len());
+    for name in raw {
+        if !seen.insert(name.to_ascii_lowercase()) {
+            return Err(format!(
+                "duplicate profile in `profiles`: `{name}` (case-insensitive)"
+            ));
+        }
+    }
+    let mut resolved = Vec::with_capacity(raw.len());
+    let mut missing = Vec::new();
+    for name in raw {
+        match config.canonical_name(name) {
+            Some(canonical) => resolved.push(canonical),
+            None => missing.push(name.clone()),
+        }
+    }
+    if !missing.is_empty() {
+        return Err(format!("profile not found: {}", missing.join(", ")));
+    }
+    Ok(resolved)
+}
+
+/// Join a relative path onto `base` lexically, resolving `.` and `..` without
+/// touching the filesystem. Refuses an absolute path and a `..` that escapes
+/// `base`. `base` is already canonical, so the result is lexically under it;
+/// the caller re-checks symlinks right before the read.
+fn normalize_join(
+    base: &std::path::Path,
+    rel: &str,
+) -> std::result::Result<std::path::PathBuf, String> {
+    if std::path::Path::new(rel).is_absolute() {
+        return Err(format!(
+            "prompt_file `{rel}` refused: absolute path (must be relative to `cwd`)"
+        ));
+    }
+    let mut parts: Vec<std::ffi::OsString> = Vec::new();
+    for comp in std::path::Path::new(rel).components() {
+        match comp {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                if parts.pop().is_none() {
+                    return Err(format!("prompt_file `{rel}` refused: path escapes `cwd`"));
+                }
+            }
+            std::path::Component::Normal(part) => parts.push(part.to_os_string()),
+            // Unreachable: the absolute check above refuses anything with a root.
+            std::path::Component::RootDir | std::path::Component::Prefix(_) => {}
+        }
+    }
+    let mut out = base.to_path_buf();
+    for part in parts {
+        out.push(part);
+    }
+    Ok(out)
+}
+
+/// Resolve and read a `prompt_file` relative to the delegate's `cwd`, validating
+/// at the boundary and re-checking immediately before the read. The path is
+/// canonicalized and checked against `cwd` in one place, then opened and read
+/// with no work in between, so the thing checked is the thing read. Returns the
+/// prompt text.
+fn read_prompt_file(cwd: Option<&str>, rel: &str) -> std::result::Result<String, String> {
+    let base = match cwd {
+        Some(dir) => std::path::PathBuf::from(dir),
+        None => std::env::current_dir().map_err(|e| format!("cwd cannot be resolved: {e}"))?,
+    };
+    let base_real = std::fs::canonicalize(&base)
+        .map_err(|e| format!("cwd '{}' cannot be resolved: {e}", base.display()))?;
+    let candidate = normalize_join(&base_real, rel)?;
+    // Re-check immediately before the read: canonicalize resolves any symlink, so
+    // a link pointing outside `cwd` fails the starts_with check, and the resolved
+    // path is the file opened below.
+    let real = std::fs::canonicalize(&candidate)
+        .map_err(|e| format!("prompt_file `{rel}` refused: {e}"))?;
+    if !real.starts_with(&base_real) {
+        return Err(format!(
+            "prompt_file `{rel}` refused: symlink target resolves outside `cwd`"
+        ));
+    }
+    let file =
+        std::fs::File::open(&real).map_err(|e| format!("prompt_file `{rel}` refused: {e}"))?;
+    let size = file
+        .metadata()
+        .map_err(|e| format!("prompt_file `{rel}` refused: {e}"))?
+        .len();
+    if size > PROMPT_FILE_CAP {
+        return Err(format!(
+            "prompt_file `{rel}` refused: {size} bytes over the {PROMPT_FILE_CAP} byte cap"
+        ));
+    }
+    // Bounded read on the same handle the size check just statted: the cap above
+    // pins the inode, this backstops it if the file grows between stat and read.
+    let mut reader = file.take(PROMPT_FILE_CAP + 1);
+    let mut buf = Vec::with_capacity(size as usize);
+    std::io::Read::read_to_end(&mut reader, &mut buf)
+        .map_err(|e| format!("prompt_file `{rel}` refused: {e}"))?;
+    Ok(String::from_utf8_lossy(&buf).into_owned())
+}
+
+/// Record and launch ONE background delegate on the blocking pool, returning the
+/// `(job_id, started_at)` handle for the caller's reply. `opts.prompt` is an
+/// `Arc<str>` so a fan-out reads the prompt once and reuses it across N accounts.
+fn launch_background_delegate(
+    profile: String,
+    opts: BackgroundOpts,
+    monitor: bool,
+) -> std::result::Result<(String, u64), ErrorData> {
+    let started_at = now_ms();
+    let job_id = jobs::new_job_id(started_at);
+    jobs::write_running(&job_id, &profile, started_at, monitor)
+        .map_err(|e| ErrorData::internal_error(format!("failed to record job: {e}"), None))?;
+
+    let job_id_task = job_id.clone();
+    let profile_task = profile.clone();
+    tokio::task::spawn_blocking(move || {
+        // Catch a panic in the detached task: the handle is dropped, so an unwind
+        // would otherwise be swallowed and leave the job stuck `running` until
+        // GC — the waiter would hang on its deadline. The job file is always
+        // finalized, mirroring the sync contract.
+        let BackgroundOpts {
+            prompt,
+            model,
+            cwd,
+            env,
+            extra_args,
+            timeout_secs,
+            idle_secs,
+            resume,
+            isolation,
+            depth,
+        } = opts;
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            run_delegate(DelegateOpts {
+                profile: &profile_task,
+                prompt: prompt.as_ref(),
+                model: model.as_deref(),
+                cwd: cwd.as_deref(),
+                env,
+                extra_args,
+                timeout_secs,
+                idle_secs,
+                resume: resume.as_deref(),
+                isolation,
+                depth,
+            })
+        }));
+        let envelope = match outcome {
+            Ok(Ok(v)) => v,
+            Ok(Err(reason)) => serde_json::json!({
+                "profile": profile_task,
+                "is_error": true,
+                "result": reason,
+            }),
+            Err(_) => serde_json::json!({
+                "profile": profile_task,
+                "is_error": true,
+                "result": "delegate task panicked",
+            }),
+        };
+        let _ = jobs::write_done(&job_id_task, &profile_task, started_at, envelope);
+    });
+    Ok((job_id, started_at))
+}
+
 /// Reduce `claude`'s captured stdout to its single terminal `type:"result"`
 /// envelope. Under clauth's own `stream-json` the reader already retained just
 /// that line, but a caller-pinned `--output-format json` emits the bare object
@@ -1865,3 +2167,7 @@ mod list_profiles_tool_tests;
 #[cfg(test)]
 #[path = "../../tests/inline/mcp_format.rs"]
 mod format_tests;
+
+#[cfg(test)]
+#[path = "../../tests/inline/mcp_delegate_args.rs"]
+mod delegate_args_tests;

@@ -33,8 +33,10 @@ fn run_with_depth(depth: &str) -> CallToolResult {
     let result = rt.block_on(async {
         server
             .delegate(Parameters(DelegateArgs {
-                profile: "any".to_string(),
-                prompt: "hello".to_string(),
+                profile: Some("any".to_string()),
+                profiles: None,
+                prompt: Some("hello".to_string()),
+                prompt_file: None,
                 model: None,
                 cwd: None,
                 env: None,
@@ -357,8 +359,10 @@ fn background_depth_guard_refuses_without_writing_job() {
     let result = rt.block_on(async {
         server
             .delegate(Parameters(DelegateArgs {
-                profile: "any".to_string(),
-                prompt: "hello".to_string(),
+                profile: Some("any".to_string()),
+                profiles: None,
+                prompt: Some("hello".to_string()),
+                prompt_file: None,
                 model: None,
                 cwd: None,
                 env: None,

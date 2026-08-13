@@ -610,6 +610,43 @@ pub(crate) fn delegate_prose(p: &Value) -> String {
     out
 }
 
+/// Prose for a `delegate` argument/validation refusal. The envelope carries no
+/// `profile` (the refusal fired before a target was chosen), so the
+/// `delegate to `X`` prefix would name the wrong one; the sentence names the
+/// reason instead.
+pub(crate) fn delegate_refusal_prose(p: &Value) -> String {
+    format!(
+        "delegate failed: {}",
+        p.get("result").and_then(Value::as_str).unwrap_or("unknown")
+    )
+}
+
+/// Prose for a `delegate` `profiles` fan-out: one job per named account, echoing
+/// the resolved target list so the caller sees what it just spent.
+pub(crate) fn delegate_fanout_prose(p: &Value) -> String {
+    let jobs = p
+        .get("jobs")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
+    let mut out = String::from("delegated to ");
+    for (i, job) in jobs.iter().enumerate() {
+        if i > 0 {
+            out.push_str(", ");
+        }
+        let profile = job
+            .get("profile")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        let job_id = job
+            .get("job_id")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        out.push_str(&format!("`{profile}` (job `{job_id}`)"));
+    }
+    out
+}
+
 /// Prose for `delegate_result`: the running status (with optional `quota`), the
 /// done envelope, or an invalid/unknown job_id refusal.
 pub(crate) fn delegate_result_prose(p: &Value) -> String {

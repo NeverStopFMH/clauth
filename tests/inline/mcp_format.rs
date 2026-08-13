@@ -84,8 +84,10 @@ fn every_tool_refuses_an_unrecognised_format_by_name() {
     );
     assert_refusal(
         &drive(server.delegate(Parameters(DelegateArgs {
-            profile: "any".to_string(),
-            prompt: "hi".to_string(),
+            profile: Some("any".to_string()),
+            profiles: None,
+            prompt: Some("hi".to_string()),
+            prompt_file: None,
             model: None,
             cwd: None,
             env: None,
@@ -214,8 +216,10 @@ fn delegate_depth_prose_default_and_json_keys() {
 
     let args = |format| {
         Parameters(DelegateArgs {
-            profile: "any".to_string(),
-            prompt: "hi".to_string(),
+            profile: Some("any".to_string()),
+            profiles: None,
+            prompt: Some("hi".to_string()),
+            prompt_file: None,
             model: None,
             cwd: None,
             env: None,

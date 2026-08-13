@@ -2949,6 +2949,75 @@ fn arming_from_disk_stamps_the_post_guard_chain_not_a_stale_snapshot() {
     );
 }
 
+/// The post-guard re-read covers the FLAG, not just the chain: a
+/// `static-token --clear` can hold this same guard, disarm the profile, take
+/// the sidecar and the preserved mint, and release — all while the arming leg
+/// parks. Stamping from the pre-guard routing would land a fresh rolling
+/// bearer on the profile the operator just cleared, with the flag now off so
+/// nothing ever re-stamps it: a dies-in-hours credential with no exit. Same
+/// Barrier seam as the chain test above, so the interleaving is pinned by
+/// construction.
+#[test]
+fn arming_from_disk_skips_a_profile_cleared_while_it_waited() {
+    let _home = HomeSandbox::new();
+    let name = "arm-cleared";
+    let dir = crate::profile::profile_dir(name).expect("dir");
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    let now = crate::usage::now_ms() as i64;
+
+    let mut profile = crate::profile::Profile::new(name.to_string(), None, None);
+    profile.rolling_token = true;
+    profile.credentials = Some(ClaudeCredentials {
+        claude_ai_oauth: Some(OAuthToken {
+            access_token: "at-comfortable".to_string(),
+            refresh_token: Some("rt-live".to_string()),
+            expires_at: Some(now + 8 * 3_600_000),
+            scopes: None,
+            subscription_type: Some("max".into()),
+        }),
+    });
+    crate::profile::save_profile(&profile).expect("save");
+
+    // A stale sidecar, so the pre-guard pre-filter sees work to do.
+    let stale = ClaudeCredentials {
+        claude_ai_oauth: Some(OAuthToken {
+            access_token: "at-stale-sidecar".to_string(),
+            refresh_token: None,
+            expires_at: Some(now + 60_000),
+            scopes: None,
+            subscription_type: Some("max".into()),
+        }),
+    };
+    std::fs::write(
+        dir.join("session-token.json"),
+        serde_json::to_vec_pretty(&stale).expect("ser"),
+    )
+    .expect("write sidecar");
+
+    // Stand in for the clear: hold the guard, let the arming leg pass its
+    // pre-filter and park, then disarm the flag and take the sidecar — the
+    // clear's own writes — and release.
+    let guard = crate::runtime::RotationGuard::acquire(name).expect("hold the guard");
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+    let armer_barrier = std::sync::Arc::clone(&barrier);
+    let armer = std::thread::spawn(move || {
+        arm_rolling_from_disk_synced("arm-cleared", || {
+            armer_barrier.wait();
+        })
+    });
+    barrier.wait();
+    profile.rolling_token = false;
+    crate::profile::save_profile(&profile).expect("disarm");
+    std::fs::remove_file(dir.join("session-token.json")).expect("take the sidecar");
+    drop(guard);
+    armer.join().expect("arming thread");
+
+    assert!(
+        !dir.join("session-token.json").exists(),
+        "a cleared profile stays cleared — the pre-guard routing must not re-create the sidecar"
+    );
+}
+
 /// The restore paths CONSUME the backup, which under the marker design made
 /// them the one place a stale claim could destroy the only copy. With
 /// classification derived from content, the property is structural — a

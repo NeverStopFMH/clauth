@@ -833,7 +833,6 @@ fn cmd_static_token_clear(name: &str, yes: bool) -> Result<()> {
     // the operator's own mint.
     claude::quarantine_misfilled_sidecar(target)?;
     claude::clear_session_token(target)?;
-    let backup_removed = claude::clear_static_backup(target)?;
     let active = load_config()?.is_active(target);
     // Re-read AFTER the clear: `install_source_path` only falls back to
     // `credentials.json` once the sidecar is gone, so this is the store the
@@ -846,10 +845,19 @@ fn cmd_static_token_clear(name: &str, yes: bool) -> Result<()> {
                 "clauth: cleared the long-lived token for '{target}' and relinked the live \
                  credentials onto its stored OAuth login."
             );
-        } else {
+        } else if on_disk.api_key.is_some() {
             outln!(
                 "clauth: cleared the long-lived token for '{target}' and signed Claude Code \
                  out: it stores no OAuth login, so '{target}' authenticates by api key."
+            );
+        } else {
+            // Reachable only on the flag-only widening (a stored piece with no
+            // other login is refused above): claiming an api key the profile
+            // does not hold would be this line's own lie.
+            outln!(
+                "clauth: cleared the long-lived token for '{target}' and signed Claude Code \
+                 out: it stores no login at all now — run `clauth login {target}` before \
+                 switching to it."
             );
         }
     } else if has_login {
@@ -857,19 +865,47 @@ fn cmd_static_token_clear(name: &str, yes: bool) -> Result<()> {
             "clauth: cleared the long-lived token for '{target}'. Its stored OAuth login \
              installs on the next switch:  clauth {target}"
         );
-    } else {
+    } else if on_disk.api_key.is_some() {
         outln!(
             "clauth: cleared the long-lived token for '{target}'. It stores no OAuth login, \
              so switching to it authenticates by api key:  clauth {target}"
         );
+    } else {
+        outln!(
+            "clauth: cleared the long-lived token for '{target}'. It stores no login at all \
+             now — run `clauth login {target}` before switching to it."
+        );
     }
-    if rolling_armed {
-        outln!("{}", clear_disarmed_postscript(target));
-    }
-    if backup_removed {
-        outln!("{}", clear_backup_postscript(target));
+    // The backup goes LAST, after the relink: failing between the sidecar
+    // removal and the relink would leave an active profile's live slot a
+    // dangling symlink under a bare "remove failed" — a broken login reported
+    // as nothing-happened. From here the live slot is already sound, so a
+    // failed removal is exactly what its context says and no more.
+    let backup_removed = claude::clear_static_backup(target).with_context(|| {
+        format!(
+            "the long-lived token for '{target}' is cleared, but the preserved mint at \
+             session-token.static.json remains — remove it by hand, or re-run"
+        )
+    })?;
+    for line in clear_postscripts(target, rolling_armed, backup_removed) {
+        outln!("{line}");
     }
     Ok(())
+}
+
+/// The post-clear report, composed as a value so its GATING is pinnable: there
+/// is no stdout capture in this crate by construction, so a test cannot see
+/// what the command printed — but it can see what this returns for each state,
+/// and the single caller keeps a deleted print a dead-code error.
+fn clear_postscripts(target: &str, rolling_armed: bool, backup_removed: bool) -> Vec<String> {
+    let mut lines = Vec::new();
+    if rolling_armed {
+        lines.push(clear_disarmed_postscript(target));
+    }
+    if backup_removed {
+        lines.push(clear_backup_postscript(target));
+    }
+    lines
 }
 
 /// The pre-prompt warning that a rolling profile's re-stamping stops with the

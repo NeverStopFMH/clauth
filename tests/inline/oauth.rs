@@ -2624,6 +2624,54 @@ fn rolling_gate_fresh_sidecar_ready_without_refresh() {
     assert_eq!(oauth.access_token, "at-fed", "sidecar untouched");
 }
 
+/// The flag is re-read from DISK under the guard, on both wait arms: the
+/// in-memory config that routed here can predate a completed
+/// `static-token --clear` (a separate process the daemon's snapshot never
+/// sees), and stamping from that stale routing would re-create the very
+/// sidecar the operator was just told is gone — with the flag now off so
+/// nothing ever re-stamps it. The scheduler leg reports Ready (its still-due
+/// re-read then drops the pacing hold); the switch-in leg drops the guard and
+/// falls to the vanilla gate, which installs the stored login.
+#[test]
+fn rolling_gate_disk_disarm_under_the_guard_stops_the_stamp() {
+    let _home = HomeSandbox::new();
+    let name = "test-feed-cleared";
+    // In-memory: ARMED, with a comfortable chain a roll would happily stamp.
+    let config = rolling_config(name, Some("rt-live"), Some(future_expiry()));
+    // On disk: the clear already landed — flag off, no sidecar, no backup.
+    let mut on_disk = config.profiles[0].clone();
+    on_disk.rolling_token = false;
+    crate::profile::save_profile(&on_disk).expect("save profile");
+    let dir = profile_dir(name).expect("dir");
+    assert!(
+        !dir.join("session-token.json").exists(),
+        "fixture: the profile is cleared"
+    );
+    let handle = Arc::new(RankedMutex::new(config));
+
+    // The scheduler leg (NoWait).
+    let gate = restamp_rolling_token(&handle, name, never_refresh);
+    assert!(
+        matches!(gate, AuthGate::Ready),
+        "the scheduler leg has nothing to re-stamp"
+    );
+    assert!(
+        !dir.join("session-token.json").exists(),
+        "a cleared profile stays cleared on the scheduler leg"
+    );
+
+    // The switch-in leg (Block) — the vanilla fallback serves the login.
+    let gate = ensure_installable(&handle, name, never_refresh);
+    assert!(
+        matches!(gate, AuthGate::Ready),
+        "the vanilla fallback serves the login"
+    );
+    assert!(
+        !dir.join("session-token.json").exists(),
+        "a cleared profile stays cleared on the switch-in leg"
+    );
+}
+
 /// Stale fed sidecar + comfortably live stored chain → re-stamped from the
 /// store, no refresh spent, chain metadata (subscriptionType) carried.
 #[test]

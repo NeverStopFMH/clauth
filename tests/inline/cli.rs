@@ -1710,6 +1710,28 @@ mod armed_report_copy {
         );
     }
 
+    /// The post-clear report's GATING, pinned as a value since no stdout
+    /// capture exists: each line rides exactly its own fact — the disarm line
+    /// the flag, the backup line the removal — and a clear that moved neither
+    /// reports neither. An unconditional backup line would tell every ordinary
+    /// clear a year-scale credential was destroyed when none existed.
+    #[test]
+    fn the_clear_postscripts_ride_exactly_what_moved() {
+        assert!(clear_postscripts("acme", false, false).is_empty());
+        let disarm_only = clear_postscripts("acme", true, false);
+        assert_eq!(disarm_only.len(), 1, "{disarm_only:?}");
+        assert!(disarm_only[0].contains("rolling-token is off"));
+        let backup_only = clear_postscripts("acme", false, true);
+        assert_eq!(backup_only.len(), 1, "{backup_only:?}");
+        assert!(backup_only[0].contains("is gone"));
+        let both = clear_postscripts("acme", true, true);
+        assert_eq!(both.len(), 2, "{both:?}");
+        assert!(
+            both[0].contains("rolling-token is off") && both[1].contains("is gone"),
+            "{both:?}"
+        );
+    }
+
     /// The disclosure is the feature's entire security posture in user-facing
     /// copy — there is no confirm prompt by design — so the widening, its
     /// consequence, and the way back must each survive verbatim.
@@ -1863,37 +1885,131 @@ mod static_token_clear {
     fn the_other_login_refusal_is_rechecked_under_the_guard() {
         let home = HomeSandbox::new();
         cleared_profile("cl-race", false, true);
+        let dir = crate::profile::profile_dir("cl-race").expect("dir");
+
+        // One attempt of the race. NOTHING between the guard acquire and the
+        // join may panic: an unwound attempt would detach the worker, release
+        // the flock, and drop the sandbox out from under a thread that then
+        // resolves the REAL home — the exact hazard `HomeSandbox`'s drop-order
+        // doc exists for. Every fallible step in the window reports through
+        // the return value instead.
+        let attempt = || -> (bool, String) {
+            crate::claude::write_session_token(
+                "cl-race",
+                "sk-ant-oat01-clear-race-mint0000",
+                crate::usage::now_ms() as i64 + 300 * 24 * 3_600_000,
+            )
+            .expect("mint");
+            std::fs::write(
+                dir.join("credentials.json"),
+                serde_json::to_vec(&crate::profile::ClaudeCredentials {
+                    claude_ai_oauth: Some(crate::profile::OAuthToken {
+                        access_token: "at-race".to_string(),
+                        refresh_token: Some("rt-race".to_string()),
+                        expires_at: Some(crate::usage::now_ms() as i64 + 8 * 3_600_000),
+                        scopes: None,
+                        subscription_type: None,
+                    }),
+                })
+                .expect("serialize login"),
+            )
+            .expect("store the login");
+            let guard = crate::runtime::RotationGuard::acquire("cl-race").expect("hold the lock");
+            let worker = std::thread::spawn(move || super::cmd_static_token_clear("cl-race", true));
+            // Give the clear time to pass its pre-guard snapshot and park on
+            // the guard; then take the login away and let it through.
+            std::thread::sleep(std::time::Duration::from_millis(250));
+            let logged_out = std::fs::remove_file(dir.join("credentials.json")).is_ok();
+            drop(guard);
+            let result = worker.join().expect("the clear thread survives");
+            assert!(logged_out, "the fixture's login vanished before the race");
+            // WHICHEVER check catches the state, nothing may be stripped —
+            // green is timing-proof even when the worker loses the 250ms race
+            // and its pre-guard check fires instead.
+            let err = result.expect_err("clearing the last credential must refuse");
+            assert!(
+                format!("{err:#}").contains("stores no other login"),
+                "the refusal names the reason: {err:#}"
+            );
+            assert!(
+                dir.join("session-token.json").exists(),
+                "a refused clear removes nothing"
+            );
+            // "anymore" appears ONLY in the under-guard re-check's message —
+            // the discriminator that says the race was actually won.
+            (
+                format!("{err:#}").contains("stores no other login anymore"),
+                format!("{err:#}"),
+            )
+        };
+
+        // The under-guard leg is what this test is FOR, so retry a lost race
+        // instead of silently degrading into a second pin of the pre-guard
+        // check: five parked-thread attempts losing 250ms each is not a
+        // plausible machine, it is a broken re-check.
+        let mut last = String::new();
+        for _ in 0..5 {
+            let (under_guard, err) = attempt();
+            last = err;
+            if under_guard {
+                break;
+            }
+        }
+        assert!(
+            last.contains("stores no other login anymore"),
+            "the UNDER-GUARD re-check never fired across five attempts: {last}"
+        );
+        drop(home);
+    }
+
+    /// The preserved mint goes LAST, after the relink: a backup-removal
+    /// failure between the sidecar removal and the relink would leave an
+    /// ACTIVE profile's live slot a dangling symlink under a bare "remove
+    /// failed" — a broken login reported as nothing-happened. Driven by
+    /// blocking the backup slot with a directory: the sidecar clears, the
+    /// relink lands, and only then does the removal fail — with a context
+    /// line owning the partial state.
+    #[test]
+    fn the_clear_relinks_before_the_backup_removal_can_fail() {
+        let home = HomeSandbox::new();
+        cleared_profile("cl-mid", false, true);
         crate::claude::write_session_token(
-            "cl-race",
-            "sk-ant-oat01-clear-race-mint0000",
+            "cl-mid",
+            "sk-ant-oat01-clear-mid-mint00000",
             crate::usage::now_ms() as i64 + 300 * 24 * 3_600_000,
         )
         .expect("mint");
-        let dir = crate::profile::profile_dir("cl-race").expect("dir");
-        assert!(
-            dir.join("credentials.json").exists(),
-            "fixture: login stored"
+        let dir = crate::profile::profile_dir("cl-mid").expect("dir");
+        let state = crate::profile::AppState {
+            profiles: vec!["cl-mid".into()],
+            active_profile: Some("cl-mid".into()),
+            ..Default::default()
+        };
+        crate::profile::save_app_state(&state).expect("activate");
+        crate::claude::force_link_profile_credentials("cl-mid").expect("link");
+        let live = home.home().join(".claude").join(".credentials.json");
+        assert_eq!(
+            std::fs::read_link(&live).expect("live is a symlink"),
+            dir.join("session-token.json"),
+            "fixture: the live slot starts on the sidecar"
         );
+        std::fs::create_dir(dir.join("session-token.static.json")).expect("block the slot");
 
-        let guard = crate::runtime::RotationGuard::acquire("cl-race").expect("hold the lock");
-        let worker = std::thread::spawn(move || super::cmd_static_token_clear("cl-race", true));
-        // Give the clear time to pass its pre-prompt snapshot and park on the
-        // guard; then take the login away and let it through.
-        std::thread::sleep(std::time::Duration::from_millis(250));
-        std::fs::remove_file(dir.join("credentials.json")).expect("log out under the prompt");
-        drop(guard);
-
-        let result = worker.join().expect("the clear thread survives");
-        let err = result.expect_err("clearing the last credential must refuse");
+        let err = cmd_static_token_clear("cl-mid", true)
+            .expect_err("the blocked backup slot fails the removal");
         assert!(
-            format!("{err:#}").contains("stores no other login"),
-            "the refusal names the reason: {err:#}"
+            format!("{err:#}").contains("the preserved mint at session-token.static.json remains"),
+            "the partial state is owned in the error: {err:#}"
         );
         assert!(
-            dir.join("session-token.json").exists(),
-            "a refused clear removes nothing"
+            !dir.join("session-token.json").exists(),
+            "the sidecar clear itself succeeded"
         );
-        drop(home);
+        assert_eq!(
+            std::fs::read_link(&live).expect("live survives as a symlink"),
+            dir.join("credentials.json"),
+            "the relink landed BEFORE the backup removal failed — no dangling live slot"
+        );
     }
 
     /// The widened nothing-to-clear gate: a set flag with NO files is exactly

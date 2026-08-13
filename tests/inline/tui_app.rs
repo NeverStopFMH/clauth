@@ -1440,11 +1440,119 @@ fn clear_session_token_disarms_a_flag_only_account_with_no_other_login() {
         !p.rolling_token,
         "the disarm lands on disk, as the CLI's does"
     );
+    let body = app
+        .toasts
+        .iter()
+        .map(|t| t.body.as_str())
+        .collect::<Vec<_>>()
+        .join(" | ");
+    assert!(
+        body.contains("re-stamping off"),
+        "the disarm is reported: {body}"
+    );
+    // The account holds NO credential of any kind — the api-key arms of the
+    // tail were written for a different account shape, and the backup suffix
+    // is gated on a removal that never happened here.
+    assert!(
+        body.contains("it stores no login at all"),
+        "the tail must not promise an api key this account does not hold: {body}"
+    );
+    assert!(
+        !body.contains("the preserved mint is gone"),
+        "no backup existed, so none may be reported destroyed: {body}"
+    );
+}
+
+/// The other-login refusal is re-checked from DISK under the guard — the TUI
+/// half of the CLI's own re-check, and stricter: `reload_fingerprint` does not
+/// stat `credentials.json`, so an out-of-band log-out (a script's `rm`, another
+/// tool) leaves `app.config()` claiming a stored login INDEFINITELY, and the
+/// in-memory gate in `run_config_row` would wave the clear through into
+/// stripping the account's last credential.
+#[test]
+fn clear_session_token_refuses_when_the_disk_login_is_gone() {
+    use super::{ConfigRow, build_draft_existing, run_config_row};
+    use crate::profile::Profile;
+    let _home = crate::testutil::HomeSandbox::new();
+
+    let mut acct = Profile::new("ghost".to_string(), None, None);
+    acct.credentials = Some(split_creds("stored-oauth", Some("stored-refresh")));
+    crate::profile::save_profile(&acct).expect("save profile");
+    seed_session_token("ghost", None);
+    let dir = crate::profile::profile_dir("ghost").expect("profile dir");
+
+    let mut app = app_with(vec![acct]);
+    app.profile_cursor = 0;
+    app.config_draft = Some(build_draft_existing(&app, "ghost"));
+
+    // The out-of-band log-out: disk loses the login, the snapshot keeps it.
+    std::fs::remove_file(dir.join("credentials.json")).expect("log out on disk");
+
+    run_config_row(&mut app, ConfigRow::ClearSessionToken);
+    run_config_row(&mut app, ConfigRow::ClearSessionToken);
+
+    assert!(
+        dir.join("session-token.json").exists(),
+        "a refused clear removes nothing"
+    );
     assert!(
         app.toasts
             .iter()
-            .any(|t| t.body.contains("re-stamping off")),
-        "the disarm is reported, got {:?}",
+            .any(|t| t.body.contains("no other login anymore")),
+        "the refusal is loud and names the reason, got {:?}",
+        app.toasts
+    );
+}
+
+/// The preserved mint goes LAST, after the relink: a backup-removal failure
+/// between the sidecar removal and the relink would leave an ACTIVE account's
+/// live slot a dangling symlink under a "clear failed" toast — a broken login
+/// reported as nothing-happened. Driven by blocking the backup slot with a
+/// directory: the sidecar clears, the relink lands, and only then does the
+/// removal fail, loudly and honestly.
+#[test]
+fn clear_session_token_relinks_before_the_backup_removal_can_fail() {
+    use super::{ConfigRow, build_draft_existing, run_config_row};
+    use crate::profile::Profile;
+    let home = crate::testutil::HomeSandbox::new();
+
+    let mut acct = Profile::new("mid".to_string(), None, None);
+    acct.credentials = Some(split_creds("stored-oauth", Some("stored-refresh")));
+    crate::profile::save_profile(&acct).expect("save profile");
+    seed_session_token("mid", None);
+    let dir = crate::profile::profile_dir("mid").expect("profile dir");
+    crate::claude::force_link_profile_credentials("mid").expect("link");
+    let live = home.home().join(".claude").join(".credentials.json");
+    assert_eq!(
+        std::fs::read_link(&live).expect("live is a symlink"),
+        dir.join("session-token.json"),
+        "fixture: the live slot starts on the sidecar"
+    );
+    // A directory in the backup slot fails `remove_file`, nothing else.
+    std::fs::create_dir(dir.join("session-token.static.json")).expect("block the backup slot");
+
+    let mut app = app_with(vec![acct]);
+    app.config().state.active_profile = Some("mid".into());
+    app.profile_cursor = 0;
+    app.config_draft = Some(build_draft_existing(&app, "mid"));
+
+    run_config_row(&mut app, ConfigRow::ClearSessionToken);
+    run_config_row(&mut app, ConfigRow::ClearSessionToken);
+
+    assert!(
+        !dir.join("session-token.json").exists(),
+        "the sidecar clear itself succeeded"
+    );
+    assert_eq!(
+        std::fs::read_link(&live).expect("live survives as a symlink"),
+        dir.join("credentials.json"),
+        "the relink landed BEFORE the backup removal failed — no dangling live slot"
+    );
+    assert!(
+        app.toasts
+            .iter()
+            .any(|t| t.body.contains("the preserved mint remains")),
+        "the partial outcome is named, not folded into 'clear failed', got {:?}",
         app.toasts
     );
 }
@@ -1455,9 +1563,11 @@ fn clear_session_token_disarms_a_flag_only_account_with_no_other_login() {
 /// it (config mtime did not move), and any later unrelated save makes the lie
 /// durable: a live rolling sidecar nothing re-stamps.
 #[test]
+#[cfg(unix)]
 fn clear_session_token_keeps_the_flag_when_the_persist_fails() {
     use super::{ConfigRow, build_draft_existing, run_config_row};
     use crate::profile::Profile;
+    use std::os::unix::fs::PermissionsExt as _;
     let _home = crate::testutil::HomeSandbox::new();
 
     let mut acct = Profile::new("stuck".to_string(), None, None);
@@ -1471,18 +1581,19 @@ fn clear_session_token_keeps_the_flag_when_the_persist_fails() {
     app.profile_cursor = 0;
     app.config_draft = Some(build_draft_existing(&app, "stuck"));
 
-    // Fail the persist stage alone: a directory where `config.toml` should be
-    // fails the under-guard `load_profile` (and any save), while the rotation
-    // lock, the sidecar reads, and everything else stay untouched. Byte-restore
-    // afterwards — the failed save never moved the original content.
-    let cfg_path = dir.join("config.toml");
-    let original = std::fs::read(&cfg_path).expect("read config.toml");
-    std::fs::remove_file(&cfg_path).expect("displace config.toml");
-    std::fs::create_dir(&cfg_path).expect("block the slot");
+    // Fail the persist stage ALONE: a read-only profile dir fails
+    // `save_profile`'s tempfile creation while every read — the under-guard
+    // `load_profile`, the sidecar stats — still works, so the clear provably
+    // reaches the persist and dies exactly there. The rotation lock is
+    // pre-created while the dir is still writable (its parent `mkdir_700` is
+    // recursive-create-only and never re-chmods an existing dir).
+    drop(crate::runtime::RotationGuard::acquire("stuck").expect("pre-create the lock"));
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o500))
+        .expect("make the dir read-only");
     run_config_row(&mut app, ConfigRow::ClearSessionToken);
     run_config_row(&mut app, ConfigRow::ClearSessionToken);
-    std::fs::remove_dir(&cfg_path).expect("unblock the slot");
-    std::fs::write(&cfg_path, original).expect("restore config.toml");
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
+        .expect("restore the dir");
 
     assert!(
         app.toasts.iter().any(|t| t.body.contains("clear failed")),
@@ -1501,11 +1612,6 @@ fn clear_session_token_keeps_the_flag_when_the_persist_fails() {
     assert!(p.rolling_token, "disk still says armed");
 }
 
-/// The TUI clear takes the rotation guard NON-BLOCKING: a rotation in flight —
-/// the exact writer that could re-stamp the sidecar after the removal — fails
-/// the clear loudly into a toast, and nothing on disk or in config moves. A UI
-/// thread must never park behind a timeout-less flock, so `try_acquire` is the
-/// only correct spelling of the CLI's load-bearing guard here.
 /// The TUI clear takes the rotation guard NON-BLOCKING: a rotation in flight —
 /// the exact writer that could re-stamp the sidecar after the removal — fails
 /// the clear loudly into a toast, and nothing on disk or in config moves. A UI

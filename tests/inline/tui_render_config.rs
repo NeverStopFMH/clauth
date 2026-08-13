@@ -682,6 +682,39 @@ fn clear_session_token_button_dims_without_another_stored_login() {
         gated.spans[1].style.fg, ungated.spans[1].style.fg,
         "a gated row must render distinctly from the same row ungated"
     );
+
+    // The FLAG-ONLY state is never gated, even with no other login: the press
+    // disarms without touching a credential (`run_config_row`'s widened gate),
+    // and a row that dims while its press acts would be the renderer's own
+    // lie. `Snap::clear_gated` is the one spelling all three surfaces share.
+    let mut flag_only = Snap::blank("a");
+    flag_only.rolling_armed = true;
+    let acting = detail_row(
+        ConfigRow::ClearSessionToken,
+        true,
+        false,
+        None,
+        &flag_only,
+        &input,
+    );
+    assert_eq!(
+        acting.spans[1].style.fg,
+        theme::danger().fg,
+        "a flag-only account renders the acting button, not the dim"
+    );
+    let armed = detail_row(
+        ConfigRow::ClearSessionToken,
+        true,
+        false,
+        Some(ConfigRow::ClearSessionToken),
+        &flag_only,
+        &input,
+    );
+    assert_eq!(
+        line_text(&armed),
+        "❯ press again to clear",
+        "the first press arms VISIBLY on a flag-only account"
+    );
 }
 
 /// The `└` hint is value-aware like every other Setup hint: the gate's reason
@@ -760,11 +793,13 @@ fn clear_session_token_hint_names_the_gate_then_what_the_clear_falls_back_to() {
     );
 }
 
-/// The gate arm reads the SAME condition as `run_config_row`'s refusal: a
-/// flag-only account (armed, nothing stamped, no preserved mint) disarms
-/// without stripping a credential, so its hint must describe the act, not
-/// claim a refusal the press does not make. The moment a stored piece exists,
-/// the gate line is back — clearing THAT would strip the last credential.
+/// The gate arm reads the SAME condition as `run_config_row`'s refusal
+/// (`Snap::clear_gated`): a flag-only account (armed, nothing stamped, no
+/// preserved mint) disarms without stripping a credential, so its hint must
+/// describe the act — with its OWN copy, since the 4-way base's api-key arms
+/// would promise a credential this account does not hold. The moment a stored
+/// piece exists, the gate line is back — clearing THAT would strip the last
+/// credential.
 #[test]
 fn clear_session_token_hint_lets_a_flag_only_account_past_the_gate() {
     let mut snap = Snap::blank("a");
@@ -772,8 +807,20 @@ fn clear_session_token_hint_lets_a_flag_only_account_past_the_gate() {
 
     assert_eq!(
         row_hint(ConfigRow::ClearSessionToken, &snap).as_deref(),
-        Some("the next switch runs this account on its api key · re-stamping stops"),
+        Some("stops the daemon re-stamping this account · nothing else is stored"),
     );
+
+    // Active, the relink onto an absent install source signs Claude Code out,
+    // and the hint says so instead of hiding it behind the disarm.
+    snap.is_active = true;
+    assert_eq!(
+        row_hint(ConfigRow::ClearSessionToken, &snap).as_deref(),
+        Some(
+            "stops the daemon re-stamping this account · signs Claude Code out — nothing is \
+             stored behind it"
+        ),
+    );
+    snap.is_active = false;
 
     snap.session_token = Some(crate::claude::SessionTokenStatus::LongLived(None));
     assert_eq!(

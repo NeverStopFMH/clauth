@@ -145,6 +145,22 @@ struct Snap {
 }
 
 impl Snap {
+    /// The `ClearSessionToken` gate — ONE spelling for both render readers
+    /// (`detail_row`'s dim and `row_hint`'s gate line; `run_config_row` makes
+    /// the same judgment from a fresh disk read): refused only when clearing
+    /// would strip the account's LAST credential, i.e. a stored PIECE (sidecar
+    /// or preserved mint) with no other login behind it. A flag-only account
+    /// disarms without touching a credential, so it is never gated — a row
+    /// that dims while its press acts would be the renderer's own lie.
+    fn clear_gated(&self) -> bool {
+        if self.has_other_login {
+            return false;
+        }
+        let flag_only =
+            self.rolling_armed && self.session_token.is_none() && !self.has_static_backup;
+        !flag_only
+    }
+
     /// Blank snapshot for the `+ new` form and the empty fallback.
     fn blank(title: &str) -> Snap {
         Snap {
@@ -612,17 +628,24 @@ fn row_hint(row: ConfigRow, snap: &Snap) -> Option<String> {
         // prints two explicit lines for the same act, and a two-press arm is
         // not a disclosure).
         //
-        // The gate arm matches `run_config_row`'s refusal EXACTLY: a flag-only
-        // account (armed, nothing stamped, no preserved mint) disarms without
-        // stripping a credential, so it skips past to the acting hint — a gate
-        // line over a row that acts would be the one lie a hint can tell.
-        ConfigRow::ClearSessionToken
-            if !snap.has_other_login
-                && !((snap.rolling_armed || snap.rolling_token)
-                    && snap.session_token.is_none()
-                    && !snap.has_static_backup) =>
-        {
-            "no other login stored, log in first"
+        // The gate arm is `Snap::clear_gated` — the same judgment
+        // `run_config_row` makes and `detail_row` dims on: a flag-only account
+        // (armed, nothing stamped, no preserved mint) disarms without
+        // stripping a credential, so it skips past — a gate line over a row
+        // that acts would be the one lie a hint can tell.
+        ConfigRow::ClearSessionToken if snap.clear_gated() => "no other login stored, log in first",
+        // The flag-only state with NO login gets its own lines rather than the
+        // 4-way base below: those arms were written under the old invariant
+        // that "no OAuth login" implies an api key behind it, and promising an
+        // api key this account does not hold would be the same lie in a
+        // different tense. Active still names the sign-out — the relink onto
+        // an absent install source removes the live slot.
+        ConfigRow::ClearSessionToken if !snap.has_other_login && snap.is_active => {
+            "stops the daemon re-stamping this account · signs Claude Code out — nothing is \
+             stored behind it"
+        }
+        ConfigRow::ClearSessionToken if !snap.has_other_login => {
+            "stops the daemon re-stamping this account · nothing else is stored"
         }
         ConfigRow::ClearSessionToken => {
             let base = match (snap.is_active, snap.clear_falls_back_to_oauth) {
@@ -774,10 +797,11 @@ fn detail_row(
         // `Delete`'s button class — always-bold DANGER, `press again to <verb>`
         // once armed — because a clear retargets every future switch and moves
         // the active account's live credentials. Dimmed/inert (arrow included,
-        // matching the gated `disabled` row) when the account stores no other
-        // login: `run_config_row`'s own gate no-ops there.
+        // matching the gated `disabled` row) when clearing would strip the
+        // account's last credential: `run_config_row`'s own gate no-ops there,
+        // and `Snap::clear_gated` is the one spelling all three surfaces share.
         ConfigRow::ClearSessionToken => {
-            let gated = !snap.has_other_login;
+            let gated = snap.clear_gated();
             let row_arrow = if gated && selected {
                 Span::styled("❯ ", theme::faint())
             } else {

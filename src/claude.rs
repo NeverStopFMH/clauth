@@ -661,6 +661,15 @@ fn arm_rolling_from_disk_synced(name: &str, pre_guard_done: impl FnOnce()) {
             return;
         }
     };
+    // The FLAG is part of that re-read: a `static-token --clear` can hold this
+    // same guard, disarm the profile, take the sidecar and the preserved mint,
+    // and release — all while this thread parks. Stamping from the pre-guard
+    // routing would land a fresh rolling bearer on the profile the operator
+    // just cleared, with the flag now off so nothing ever re-stamps it: a
+    // dies-in-hours credential with no exit.
+    if !fresh.rolling_token {
+        return;
+    }
     let Some(oauth) = fresh
         .credentials
         .as_ref()
@@ -860,8 +869,9 @@ pub(crate) fn install_source_path(name: &str) -> Result<PathBuf> {
 ///
 /// Read off the FILE rather than `Profile::credentials`, because the file is what
 /// the relink branches on. The clear paths (`clauth static-token --clear`, the
-/// Setup tab's row) are refused only when a profile stores neither a login nor an
-/// api key, so an api-key profile clears fine and lands on an ABSENT install
+/// Setup tab's row) are refused only when clearing would strip a profile's last
+/// credential — a stored piece with neither a login nor an api key behind it —
+/// so an api-key profile clears fine and lands on an ABSENT install
 /// source: the relink then removes the live slot and, on macOS, signs the Keychain
 /// out. Their copy claimed a relink onto a stored OAuth login regardless, which is
 /// why this exists rather than each surface guessing — a message derived from a

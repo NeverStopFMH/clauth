@@ -1901,6 +1901,30 @@ fn rolling_install_gate(
     if rolling_fresh() {
         return AuthGate::Ready;
     }
+    // The FLAG is re-read from DISK under the guard: the pre-guard routing
+    // that chose this gate can be a full clear older than the wait — a
+    // `static-token --clear` holding this same guard disarms the profile,
+    // takes the sidecar and the preserved mint, and releases. Stamping from
+    // the stale routing (an in-memory config the clear's own process never
+    // touches) would land a fresh rolling bearer on the profile the operator
+    // just cleared, with the flag now off so nothing ever re-stamps it: a
+    // dies-in-hours credential with no exit. Disk is what the clear wrote, so
+    // disk decides; an unreadable profile keeps the pre-guard routing rather
+    // than letting an ~/.clauth hiccup break the arm this leg exists for.
+    if matches!(crate::profile::load_profile(name), Ok(p) if !p.rolling_token) {
+        return match wait {
+            // The switch-in path still has an install to make — the same
+            // plain gate a never-armed profile takes. The guard drops FIRST:
+            // the vanilla gate blocks on its own acquire of this same lock.
+            LockWait::Block => {
+                drop(guard);
+                vanilla_install_gate(config, name, refresher)
+            }
+            // The scheduler leg has nothing to re-stamp anymore; its still-due
+            // re-read sees the sidecar gone and drops the pacing hold.
+            LockWait::NoWait => AuthGate::Ready,
+        };
+    }
     match roll_from_stored_chain(config, name, &guard, fresh_horizon_ms) {
         RollAttempt::Stamped => return AuthGate::Ready,
         // A stamp WRITE failure with a live sidecar still installs what that

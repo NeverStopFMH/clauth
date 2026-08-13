@@ -38,3 +38,20 @@ title = "Switch clauth account"
 description = "Open the account picker in a popup"
 contexts = ["global", "workspace"]
 command = ["sh", "open-pane.sh", "switch"]
+
+[[actions]]
+id = "which"
+title = "Show this pane's clauth account"
+description = "Publish the account the focused pane burns as pane metadata"
+contexts = ["global", "workspace", "pane"]
+command = ["sh", "report-profile.sh"]
+
+# A --with-fallback session moves onto another account mid-run, so the tag is
+# refreshed on every status change and not only when the agent first appears.
+[[events]]
+on = "pane.agent_detected"
+command = ["sh", "report-profile.sh"]
+
+[[events]]
+on = "pane.agent_status_changed"
+command = ["sh", "report-profile.sh"]

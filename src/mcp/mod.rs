@@ -142,7 +142,9 @@ pub(crate) struct DelegateArgs {
     /// replaces clauth's, which also turns the idle deadline off.
     args: Option<Vec<String>>,
     /// Wall-clock ceiling in seconds (1..=3600). Backstop only; `idle_secs` is
-    /// what normally ends a stuck delegate. Defaults to 3600.
+    /// what normally ends a stuck delegate. Defaults to 3600 while the event
+    /// stream is on; with a caller-pinned `--output-format` there is no liveness
+    /// signal, so an unset wall clock falls back to `idle_secs` instead.
     timeout_secs: Option<u64>,
     /// Kill the delegate after this many seconds with NO output at all
     /// (1..=3600). Defaults to 300. A delegate that keeps streaming is never cut
@@ -187,19 +189,13 @@ impl ClauthServer {
     }
 
     #[tool(
-        description = "List all clauth profiles from disk cache (zero quota). Per profile: \
-`name`, `active` (is this the currently active profile), `provider` (`anthropic` or a recognised \
-third-party name), and `base_url` (endpoint URL, null for a default OAuth profile) identify it; \
-`tier` is the account plan label (e.g. `Max 5x`), null for a third-party/API-key profile or when \
-no plan data is cached yet; a dead subscription reports the org's post-cancellation tier (`Free`), \
-never the word `canceled` — cancellation is a status, not a tier; \
-`windows[]` carries the 5h, 7d, and per-model weekly (`7d <model>`) `{label, utilization_pct, \
-resets_at}` where `utilization_pct` is the percent of that window already USED (higher = less \
-headroom) and `resets_at` is ISO-8601; \
-`has_live_session` = a clauth-managed `claude` session currently owns it; `throughput[]` = \
-observed per-model `{model, tok_s, samples, degraded, rate_limited_recent, retry_after_s}` from \
-past `delegate` calls; \
-`third_party` = a cached one-line headline for provider-key profiles (deepseek/zai/…)"
+        description = "Every clauth profile from disk cache; zero quota, no network. Call it at \
+session start and before picking a `delegate` target. Reading the JSON: `utilization_pct` in \
+`windows[]` is the percent of that window already USED, so higher means less headroom. `tier` is \
+the plan label; a canceled subscription reports the org's post-cancellation tier (`Free`), never \
+the word `canceled`. `third_party` is a cached balance or quota headline for provider-key \
+profiles. `throughput[]` is observed tok/s from past `delegate` calls: a `degraded` or \
+`rate_limited_recent` target is a bad pick"
     )]
     async fn list_profiles(&self) -> Result<CallToolResult, ErrorData> {
         let config = load_config().map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
@@ -238,10 +234,11 @@ past `delegate` calls; \
     }
 
     #[tool(
-        description = "Report which profile owns the credentials this session loaded. `source` \
-explains how it resolved: `refresh_match` (a profile's stored token matches the live credentials), \
-`session_dir` (this session's runtime dir pins the profile), `credential_less_active` (the \
-configured active profile, with no credentials on disk to match). Appends a live usage footer (% used)"
+        description = "Which profile owns the credentials THIS session loaded, which is not \
+always the active one. `source` says how it resolved: `refresh_match` / `session_token_match` (a \
+profile's stored credential matches the live one), `session_dir` (this session's runtime dir pins \
+the profile), `credential_less_active` (the configured active profile, nothing on disk to match). \
+Appends a live usage footer (% used)"
     )]
     async fn which(&self) -> Result<CallToolResult, ErrorData> {
         let config = load_config().map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
@@ -270,7 +267,9 @@ configured active profile, with no credentials on disk to match). Appends a live
     }
 
     #[tool(
-        description = "Relink the global active profile (`~/.claude` credentials). A `clauth start` session is pinned to its own runtime and unaffected; a session on the global credentials adopts the change on its next token refresh"
+        description = "Relink the global `~/.claude` credentials to another profile. What that \
+does to THIS session depends on how it reads credentials; the server instructions say which case \
+this session is in"
     )]
     async fn switch(
         &self,
@@ -336,30 +335,30 @@ configured active profile, with no credentials on disk to match). Appends a live
     }
 
     #[tool(
-        description = "Delegate a headless task to a profile; SPENDS that account's real usage \
-window. The depth-1 cap blocks only a nested clauth `delegate` (a delegate cannot delegate again); \
-in-delegate subagents run, but under the SAME delegated profile, not other accounts. For a \
-one-shot task, prefer `isolated: true`: a clean blind session that skips the operator persona \
-(the runtime's `CLAUDE.md`, plugins, hooks, skills) and loads no MCP servers, so it is cheaper \
-(and on an API-key profile, fewer billed tokens). A shared delegate (the default) instead inherits \
-that persona plus the runtime config-dir's MCP servers; use it only when the task needs repo tools \
-/ codebase nav. Scope a shared delegate with `args:[\"--mcp-config\",\"<json|path>\",\"--strict-mcp-config\"]`. \
-Separately, a delegate loads the project `CLAUDE.md` of its `cwd` (defaults to this server's cwd) \
-regardless of `isolated`, so set `cwd` to a clean dir for a one-shot to avoid an unrelated \
-project's house-style. Optional cwd/env/args/timeout_secs/idle_secs/isolated shape the spawned \
-`claude`. A delegate is killed only once it has emitted nothing for `idle_secs` (default 300) or \
-hits the `timeout_secs` wall clock (default 3600), so a run that keeps working is never cut off; \
-raise `idle_secs` when the task makes one long blocking call. A killed delegate returns \
-`timed_out` plus whatever text it had produced in `partial_result` (its window is spent either \
-way), and a `session_id` when the run can be picked back up: pass it as `resume` with a new \
-`prompt` to continue that conversation instead of paying for the work again. An `isolated` run is \
-resumable only with clauth's auto-rescue on, and the killed envelope says which case it is. \
-Returns the delegate envelope (`result`, \
-`is_error`, `total_cost_usd`, token usage): read `total_cost_usd`/usage to self-throttle; the \
-`result` is the delegate's own self-report, so spot-verify it like any subagent. Set \
-`background: true` to get a `{job_id}` back at once instead of blocking; the result auto-arrives \
-via a hook, or fetch it with `delegate_result({job_id})`. Add `monitor: true` so a \
-`delegate_result` poll on the still-running job reports `elapsed_secs` + the target's live `quota`"
+        description = "Run a task on another clauth profile: a fresh headless `claude` session \
+under that account's credentials. It SPENDS that account's window or money, so pick the target \
+from `list_profiles`. It sees only the `prompt` you pass and has no view of this conversation, so \
+state the whole task there.\n\n\
+Blocking by default. Pass `background: true` for a `{job_id}` now; the result auto-arrives via \
+clauth's PostToolUse hook, and `delegate_result({job_id})` is the fallback when hooks are off. \
+Prefer `background` for a slow or third-party endpoint, where a blocking call ties up this turn. \
+Add `monitor: true` so a `delegate_result` poll reports `elapsed_secs` + the target's live \
+`quota`.\n\n\
+`isolated: true` for a one-shot: a clean session with no operator `CLAUDE.md`, plugins, hooks, \
+skills or MCP servers, so it is cheaper and bills fewer tokens. Leave it false only when the task \
+needs this repo's tools, and scope those with \
+`args:[\"--mcp-config\",\"<json|path>\",\"--strict-mcp-config\"]`. Either way the delegate loads \
+the project `CLAUDE.md` of its `cwd` (defaults to this server's cwd), so point `cwd` at a clean \
+dir for an unrelated one-shot.\n\n\
+Depth-capped at 1: a delegate cannot call `delegate` again. Its own subagents do run, under the \
+SAME profile.\n\n\
+Killed after `idle_secs` of total silence or the `timeout_secs` wall clock; a run that keeps \
+streaming is never cut off. A kill returns `timed_out`, whatever text it had in `partial_result` \
+(the window is spent either way), and a `session_id` when the run is resumable — pass it as \
+`resume` with a new `prompt` instead of paying for the work twice. An `isolated` run is resumable \
+only with clauth's auto-rescue on, and the killed envelope says which case it is.\n\n\
+Returns the envelope (`result`, `is_error`, `total_cost_usd`, token usage). `result` is the \
+delegate's own self-report, so spot-verify it like any subagent"
     )]
     async fn delegate(
         &self,
@@ -513,12 +512,11 @@ via a hook, or fetch it with `delegate_result({job_id})`. Add `monitor: true` so
     }
 
     #[tool(
-        description = "Fetch the result of a `delegate` call made with `background: true`, by \
-`job_id`. `wait_secs` (0..=60, default 0) long-polls for completion. Returns the delegate \
-envelope when done (same shape as a blocking `delegate`, with the live usage footer), \
-`{job_id, status:\"running\", elapsed_secs, quota?}` if it hasn't finished (`quota` present only \
-when the job's `delegate` call set `monitor: true`), or an error for an unknown `job_id`. Normally \
-the result auto-arrives via a hook. Use this only when delegate hooks are disabled"
+        description = "Collect a backgrounded `delegate` by `job_id`. Normally unnecessary: \
+clauth's PostToolUse hook delivers the result on its own. Use it when hooks are off, or to check \
+progress; `wait_secs` (0..=60) long-polls. Returns the delegate envelope when done, else \
+`{status:\"running\", elapsed_secs, quota?}` (`quota` only when that `delegate` call set \
+`monitor: true`), or an error for an unknown `job_id`"
     )]
     async fn delegate_result(
         &self,

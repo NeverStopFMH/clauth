@@ -927,3 +927,63 @@ fn the_plugin_probes_own_child_registers_no_bare_marker() {
         true
     ));
 }
+
+/// Safety prose that used to sit in the init `instructions` block now lives in
+/// `delegate`'s own description, where it loads with the tool instead of in
+/// every session. That move only holds if something still pins it: a
+/// `#[tool(description = ...)]` attribute has no other test reaching it, so
+/// dropping a warning during a prose edit would otherwise be silent.
+#[test]
+fn the_delegate_description_keeps_its_load_bearing_warnings() {
+    let tools = ClauthServer::new().tool_router.list_all();
+    let delegate = tools
+        .iter()
+        .find(|t| t.name == "delegate")
+        .expect("delegate tool is registered");
+    let text = delegate.description.as_deref().unwrap_or_default();
+
+    for phrase in [
+        // spends a real account's window or money
+        "SPENDS that account's window or money",
+        // the fork-bomb cap
+        "Depth-capped at 1",
+        // a delegate is blind to this conversation, so the prompt is the whole brief
+        "no view of this conversation",
+        // filed 2026-07-23: a blocking call to a ~25 tok/s endpoint ate its own
+        // deadline, and nothing in the text steered toward `background`
+        "Prefer `background` for a slow or third-party endpoint",
+        // a self-report is not a verified result
+        "spot-verify it like any subagent",
+    ] {
+        assert!(
+            text.contains(phrase),
+            "`delegate` description dropped {phrase:?}: {text}",
+        );
+    }
+}
+
+/// `which` can return a fourth `source` its description never named
+/// (`session_token_match`, the CLA-SPLIT credential a switch installs), so a
+/// model reading the description would meet an undocumented value.
+#[test]
+fn the_which_description_names_every_source_it_can_return() {
+    let tools = ClauthServer::new().tool_router.list_all();
+    let which = tools
+        .iter()
+        .find(|t| t.name == "which")
+        .expect("which tool is registered");
+    let text = which.description.as_deref().unwrap_or_default();
+
+    for source in [
+        crate::which::Source::RefreshMatch,
+        crate::which::Source::SessionTokenMatch,
+        crate::which::Source::SessionDir,
+        crate::which::Source::CredentialLessActive,
+    ] {
+        assert!(
+            text.contains(source.as_str()),
+            "`which` description omits `{}`: {text}",
+            source.as_str(),
+        );
+    }
+}

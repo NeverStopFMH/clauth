@@ -342,6 +342,146 @@ fn delegate_result_done_returns_envelope_and_evicts() {
     );
 }
 
+/// A delegate whose `claude -p` printed a bare JSON scalar (`parse_delegate_envelope`'s
+/// fall-through arm returns non-objects verbatim) must not panic the fold, and
+/// its own output must reach the caller.
+#[test]
+fn delegate_result_done_scalar_envelope_is_wrapped_not_panicked() {
+    let _home = HomeSandbox::new();
+    jobs::write_done("d-scalar-0", "work", 1, serde_json::json!("unauthorized")).unwrap();
+
+    let result = call_delegate_result("d-scalar-0", Some(0), Some("json"));
+    assert_ne!(
+        result.is_error,
+        Some(true),
+        "a scalar self-report is delivered, not an error"
+    );
+    let text = result
+        .content
+        .first()
+        .and_then(|c| c.as_text())
+        .map(|t| t.text.clone())
+        .expect("envelope text");
+    let body: serde_json::Value = serde_json::from_str(&text).expect("envelope parses as JSON");
+    assert_eq!(
+        body["result"], "unauthorized",
+        "the delegate's own output survives the fold"
+    );
+    assert!(
+        body.get("live_usage").is_some(),
+        "live usage still folds in around the wrapped result"
+    );
+    assert!(
+        jobs::read("d-scalar-0").is_none(),
+        "the delivered job is evicted"
+    );
+}
+
+/// The eviction must run only after the envelope rendered: a panic between the
+/// two (the pre-fix scalar fold) destroyed the job file, the only surviving
+/// copy of the delegate's result.
+#[test]
+fn delegate_result_done_keeps_the_job_until_the_result_renders() {
+    let _home = HomeSandbox::new();
+    jobs::write_done("d-keep-0", "work", 1, serde_json::json!(42)).unwrap();
+
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        call_delegate_result("d-keep-0", Some(0), Some("json"))
+    }));
+    match outcome {
+        Ok(result) => {
+            let text = result
+                .content
+                .first()
+                .and_then(|c| c.as_text())
+                .map(|t| t.text.clone())
+                .expect("envelope text");
+            let body: serde_json::Value =
+                serde_json::from_str(&text).expect("envelope parses as JSON");
+            assert_eq!(
+                body["result"], 42,
+                "a numeric self-report survives the fold"
+            );
+            assert!(
+                jobs::read("d-keep-0").is_none(),
+                "the delivered job is evicted"
+            );
+        }
+        Err(_) => {
+            assert!(
+                jobs::read("d-keep-0").is_some(),
+                "a failed render must leave the job file as the recoverable copy"
+            );
+        }
+    }
+}
+
+/// The done-arm renderer is pure of the job store: it renders without evicting,
+/// and the handler evicts only after it returned. An eviction moved inside the
+/// renderer would destroy the only copy before the envelope was safely out.
+#[test]
+fn render_done_envelope_leaves_the_job_until_the_caller_evicts() {
+    let _home = HomeSandbox::new();
+    jobs::write_done("d-render-0", "work", 1, serde_json::json!("unauthorized")).unwrap();
+    let record = jobs::read("d-render-0").expect("seeded job");
+
+    let (blocks, is_error) = render_done_envelope(record, Format::Json);
+
+    assert!(
+        !is_error,
+        "a scalar self-report renders as a delivery, not an error"
+    );
+    assert!(
+        jobs::read("d-render-0").is_some(),
+        "rendering never evicts; the handler does, after it returned"
+    );
+    let text = blocks
+        .first()
+        .and_then(|c| c.as_text())
+        .map(|t| t.text.clone())
+        .expect("block text");
+    let body: serde_json::Value = serde_json::from_str(&text).expect("envelope parses as JSON");
+    assert_eq!(
+        body["result"], "unauthorized",
+        "the delegate's own output survives the fold"
+    );
+}
+
+/// Every non-object envelope shape folds without panicking and keeps the
+/// delegate's own output verbatim under `result`.
+#[test]
+fn fold_delegate_live_usage_wraps_non_objects_and_folds_objects() {
+    let _home = HomeSandbox::new();
+    for scalar in [
+        serde_json::json!("unauthorized"),
+        serde_json::json!(42),
+        serde_json::json!(true),
+        serde_json::json!([1, 2]),
+    ] {
+        let folded = fold_delegate_live_usage(scalar.clone(), "work", 0);
+        let obj = folded.as_object().expect("a folded envelope is an object");
+        assert_eq!(
+            obj.get("result"),
+            Some(&scalar),
+            "the delegate's own output survives the fold verbatim"
+        );
+        assert!(obj.get("live_usage").is_some(), "live usage folds in");
+    }
+
+    // An object envelope folds in place and keeps its own fields.
+    let folded = fold_delegate_live_usage(
+        serde_json::json!({"profile": "work", "is_error": false, "result": "all done"}),
+        "work",
+        0,
+    );
+    assert_eq!(folded["result"], "all done");
+    assert_eq!(folded["live_usage"]["profile"], "work");
+    assert!(
+        folded.get("is_error").is_some(),
+        "the envelope's own fields survive"
+    );
+}
+
 #[test]
 fn background_depth_guard_refuses_without_writing_job() {
     let _home = HomeSandbox::new();

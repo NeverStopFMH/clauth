@@ -551,7 +551,15 @@ fn envelope_prose(e: &Value) -> String {
         out.push_str("finished");
     }
     out.push_str(": ");
-    out.push_str(e.get("result").and_then(Value::as_str).unwrap_or("unknown"));
+    // A bare scalar self-report (a non-object envelope the fold wrapped under
+    // `result`) arrives as its own type; read it as its literal so a number or
+    // bool never drops to `unknown`.
+    out.push_str(&match e.get("result") {
+        Some(Value::String(s)) => s.clone(),
+        Some(Value::Number(n)) => n.to_string(),
+        Some(Value::Bool(b)) => b.to_string(),
+        _ => "unknown".to_string(),
+    });
 
     if let Some(cost) = e.get("total_cost_usd").and_then(Value::as_f64) {
         out.push_str(&format!(" (cost ${cost})"));

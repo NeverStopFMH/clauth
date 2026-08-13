@@ -620,3 +620,26 @@ fn delegate_result_prose_renders_running_invalid_and_done() {
         "delegate to `work` finished: done (cost $1.25); target `work`: 5h 12% used, 7d 45.6% used"
     );
 }
+
+/// A bare scalar self-report (wrapped under `result` by the fold) reaches the
+/// prose caller as its literal; a non-string one must never drop to `unknown`.
+#[test]
+fn delegate_result_prose_renders_a_wrapped_scalar_self_report() {
+    let wrapped = serde_json::json!({
+        "result": "unauthorized",
+        "live_usage": {"profile": "work", "5h_used_pct": null, "7d_used_pct": null}
+    });
+    assert_eq!(
+        delegate_result_prose(&wrapped),
+        "delegate to `work` finished: unauthorized; target `work`: 5h unknown, 7d unknown"
+    );
+
+    let numeric = serde_json::json!({
+        "result": 42,
+        "live_usage": {"profile": "work", "5h_used_pct": null, "7d_used_pct": null}
+    });
+    assert_eq!(
+        delegate_result_prose(&numeric),
+        "delegate to `work` finished: 42; target `work`: 5h unknown, 7d unknown"
+    );
+}

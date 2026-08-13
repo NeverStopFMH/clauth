@@ -196,6 +196,7 @@ fn dispatch(cli: Cli) -> Result<()> {
                 no_config,
                 yes,
             } => herdr::install(key.as_deref(), no_config, yes),
+            cli::HerdrCommand::Uninstall { no_config, yes } => herdr::uninstall(no_config, yes),
         },
         Command::Run { .. } => anyhow::bail!(
             "`clauth run` isn't a command; for a headless delegate use \

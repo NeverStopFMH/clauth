@@ -381,8 +381,7 @@ impl LoginArgs {
     }
 }
 
-/// `clauth herdr <cmd>`. One member today; the shape leaves room for the
-/// uninstall side without renaming the command a user has in their notes.
+/// `clauth herdr <cmd>`: install and uninstall the plugin and its config wiring.
 #[derive(Subcommand, Debug)]
 pub(crate) enum HerdrCommand {
     /// Install the plugin into herdr and wire it into herdr's own config
@@ -401,6 +400,18 @@ pub(crate) enum HerdrCommand {
         no_config: bool,
         /// Skip both confirm prompts, herdr's install preview included.
         /// Required on a non-TTY stdin, which gets no prompt.
+        #[arg(long, short = 'y')]
+        yes: bool,
+    },
+
+    /// Uninstall the plugin from herdr and drop the config clauth added
+    ///
+    /// Runs herdr's uninstall, then takes the keybinding and sidebar row `install` wrote back out of herdr's `config.toml`, leaving anything else in the file alone.
+    Uninstall {
+        /// Uninstall the plugin and leave herdr's config.toml untouched.
+        #[arg(long)]
+        no_config: bool,
+        /// Skip the confirm prompt. Required on a non-TTY stdin, which gets no prompt.
         #[arg(long, short = 'y')]
         yes: bool,
     },

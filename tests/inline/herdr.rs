@@ -270,3 +270,265 @@ fn the_config_root_is_derived_from_herdrs_own_path_or_refused() {
     );
     assert_eq!(config_path_from_plugin_dir("clauth"), None);
 }
+
+/// The seam `install` writes through: a plan appended onto its file must strip back to that file, byte for byte.
+fn round_trips(orig: &str) {
+    let plan = plan_config(orig, "prefix+a").expect("plan");
+    let text = with_append(orig, &plan.append);
+    assert_eq!(without_marked_blocks(&text), orig, "round trip lost bytes");
+}
+
+#[test]
+fn removing_marked_blocks_round_trips() {
+    round_trips("");
+    round_trips("# my config\n[ui]\naccent = \"cyan\"\n[keys]\nleader = \"ctrl+a\"\n");
+    round_trips("[[keys.command]]\nkey = \"prefix+z\"\ntype = \"shell\"\ncommand = \"ls\"\n");
+}
+
+#[test]
+fn hand_edited_marked_blocks_are_still_removed() {
+    let orig = "# my config\n[ui]\naccent = \"cyan\"\n";
+    let plan = plan_config(orig, "prefix+a").expect("plan");
+    let wired = with_append(orig, &plan.append);
+    let edited = wired
+        .replace(r#"key = "prefix+a""#, r#"key = "prefix+z""#)
+        .replace(r#"["agent", "$clauth"]"#, r#"["agent", "custom"]"#);
+    assert_eq!(without_marked_blocks(&edited), orig);
+}
+
+#[test]
+fn marked_blocks_mid_file_leave_trailing_content() {
+    let orig = "# my config\n[ui]\naccent = \"cyan\"\n";
+    let plan = plan_config(orig, "prefix+a").expect("plan");
+    let wired = with_append(orig, &plan.append);
+    let trailing = format!("{wired}\n[extra]\nx = 1\n");
+    assert_eq!(
+        without_marked_blocks(&trailing),
+        format!("{orig}\n[extra]\nx = 1\n")
+    );
+}
+
+#[test]
+fn nothing_marked_round_trips_unchanged() {
+    let existing = "# my config\n[ui]\naccent = \"cyan\"\n[keys]\nleader = \"ctrl+a\"\n";
+    assert_eq!(without_marked_blocks(existing), existing);
+}
+
+fn plugin_list_json(entry: &str) -> String {
+    format!(r#"{{"id":"cli:plugin","result":{{"plugins":[{entry}],"type":"plugin_list"}}}}"#)
+}
+
+const LINKED: &str = r#"{"enabled":true,"manifest_path":"/home/uwuclxdy/repos/rs/clauth/herdr-plugin/herdr-plugin.toml","min_herdr_version":"0.8.0","name":"clauth","platforms":["linux","macos"],"plugin_id":"clauth","plugin_root":"/home/uwuclxdy/repos/rs/clauth/herdr-plugin","source":{"kind":"local"},"version":"0.1.0"}"#;
+const GITHUB: &str = r#"{"enabled":true,"min_herdr_version":"0.8.0","name":"clauth","platforms":["linux","macos"],"plugin_id":"clauth","source":{"kind":"github","owner":"uwuclxdy","repo":"clauth","resolved_commit":"abc123","managed_path":"/home/u/.config/herdr/plugins/clauth","installed_unix_ms":1784231727746},"version":"0.1.0"}"#;
+const DISABLED: &str = r#"{"enabled":false,"min_herdr_version":"0.8.0","name":"clauth","platforms":["linux","macos"],"plugin_id":"clauth","plugin_root":"/home/uwuclxdy/repos/rs/clauth/herdr-plugin","source":{"kind":"local"},"version":"0.1.0"}"#;
+const STALE: &str = r#"{"enabled":true,"manifest_path":"/home/uwuclxdy/repos/rs/clauth/herdr-plugin/herdr-plugin.toml","min_herdr_version":"0.8.0","name":"clauth","platforms":["linux","macos"],"plugin_id":"clauth","plugin_root":"/gone/clauth/herdr-plugin","source":{"kind":"local"},"version":"0.1.0","warnings":["manifest unavailable: No such file or directory (os error 2)"]}"#;
+
+#[test]
+fn registry_entry_from_reads_every_real_shape() {
+    let linked = registry_entry_from(&plugin_list_json(LINKED)).expect("linked");
+    assert!(linked.enabled);
+    assert_eq!(linked.version.as_deref(), Some("0.1.0"));
+    assert_eq!(linked.min_herdr_version.as_deref(), Some("0.8.0"));
+    assert_eq!(
+        linked.plugin_root.as_deref(),
+        Some("/home/uwuclxdy/repos/rs/clauth/herdr-plugin")
+    );
+    assert_eq!(linked.source_kind.as_deref(), Some("local"));
+    assert!(linked.warnings.is_empty());
+
+    let github = registry_entry_from(&plugin_list_json(GITHUB)).expect("github");
+    assert!(github.enabled);
+    assert_eq!(github.source_kind.as_deref(), Some("github"));
+    assert_eq!(github.plugin_root, None);
+    assert!(github.warnings.is_empty());
+
+    let disabled = registry_entry_from(&plugin_list_json(DISABLED)).expect("disabled");
+    assert!(!disabled.enabled);
+    assert_eq!(disabled.source_kind.as_deref(), Some("local"));
+
+    let stale = registry_entry_from(&plugin_list_json(STALE)).expect("stale");
+    assert!(stale.enabled);
+    assert_eq!(
+        stale.plugin_root.as_deref(),
+        Some("/gone/clauth/herdr-plugin")
+    );
+    assert_eq!(
+        stale.warnings,
+        vec!["manifest unavailable: No such file or directory (os error 2)".to_string()]
+    );
+
+    assert!(registry_entry_from("garbage").is_none());
+    assert!(registry_entry_from("").is_none());
+    assert!(
+        registry_entry_from(&plugin_list_json(r#"{"plugin_id":"other","enabled":true}"#)).is_none(),
+        "another plugin is not ours"
+    );
+}
+
+#[test]
+fn version_from_parses_the_real_line() {
+    assert_eq!(version_from("herdr 0.8.0"), Some("0.8.0".to_string()));
+    assert_eq!(version_from("herdr 0.8.0\n"), Some("0.8.0".to_string()));
+    assert_eq!(version_from("herdr"), None);
+    assert_eq!(version_from("0.8.0"), None);
+    assert_eq!(version_from(""), None);
+}
+
+#[test]
+fn config_status_reads_binding_and_sidebar() {
+    let empty = config_status("");
+    assert!(empty.parsed);
+    assert_eq!(empty.bound_key, None);
+    assert_eq!(empty.sidebar, SidebarState::Absent);
+
+    let bound_other_key = config_status(concat!(
+        "[[keys.command]]\n",
+        "key = \"ctrl+alt+c\"\n",
+        "type = \"plugin_action\"\n",
+        "command = \"clauth.open\"\n",
+    ));
+    assert_eq!(bound_other_key.bound_key.as_deref(), Some("ctrl+alt+c"));
+    assert_eq!(bound_other_key.sidebar, SidebarState::Absent);
+
+    let templated = config_status(concat!(
+        "[ui.sidebar.agents.rows_by_agent]\n",
+        r#"claude = [["agent", "$clauth"]]"#,
+        "\n",
+    ));
+    assert_eq!(templated.sidebar, SidebarState::Templated);
+
+    let other_claude = config_status(concat!(
+        "[ui.sidebar.agents.rows_by_agent]\n",
+        r#"claude = [["agent"]]"#,
+        "\n",
+    ));
+    assert_eq!(other_claude.sidebar, SidebarState::OtherClaudeRow);
+
+    let other_agents = config_status(concat!(
+        "[ui.sidebar.agents.rows_by_agent]\n",
+        r#"codex = [["agent"]]"#,
+        "\n",
+    ));
+    assert_eq!(other_agents.sidebar, SidebarState::OtherAgentsOnly);
+
+    let broken = config_status("not toml");
+    assert!(!broken.parsed);
+    assert_eq!(broken.bound_key, None);
+    assert_eq!(broken.sidebar, SidebarState::Absent);
+}
+
+#[test]
+fn plan_config_and_config_status_agree() {
+    let configs: &[&str] = &[
+        "",
+        "[[keys.command]]\nkey = \"prefix+z\"\ntype = \"shell\"\ncommand = \"ls\"\n",
+        "[[keys.command]]\nkey = \"ctrl+alt+c\"\ntype = \"plugin_action\"\ncommand = \"clauth.open\"\n",
+        "[ui.sidebar.agents.rows_by_agent]\nclaude = [[\"agent\", \"$clauth\"]]\n",
+        "[ui.sidebar.agents.rows_by_agent]\nclaude = [[\"agent\"]]\n",
+        "[ui.sidebar.agents.rows_by_agent]\ncodex = [[\"agent\"]]\n",
+        "[ui.sidebar.agents]\nrow_gap = 1\n",
+    ];
+    for existing in configs {
+        let status = config_status(existing);
+        let plan = plan_config(existing, "prefix+a").expect("plan");
+        assert_eq!(
+            status.bound_key.is_some(),
+            plan.notes.iter().any(|n| n.contains("already bound")),
+            "binding verdicts drifted for {existing:?}"
+        );
+        assert_eq!(
+            status.sidebar == SidebarState::Templated,
+            plan.notes.iter().any(|n| n.contains("already renders")),
+            "templated verdicts drifted for {existing:?}"
+        );
+        assert_eq!(
+            status.sidebar == SidebarState::OtherClaudeRow,
+            plan.notes
+                .iter()
+                .any(|n| n.contains("already sets a claude row")),
+            "other-claude verdicts drifted for {existing:?}"
+        );
+        assert_eq!(
+            status.sidebar == SidebarState::OtherAgentsOnly,
+            plan.notes.iter().any(|n| n.contains("covers other agents")),
+            "other-agents verdicts drifted for {existing:?}"
+        );
+    }
+}
+
+#[test]
+fn a_marker_as_the_last_line_drops_alone() {
+    let existing = "# my config\n[ui]\naccent = \"cyan\"\n# clauth herdr plugin";
+    assert_eq!(
+        without_marked_blocks(existing),
+        "# my config\n[ui]\naccent = \"cyan\"\n"
+    );
+}
+
+#[test]
+fn a_marker_before_user_content_keeps_the_content() {
+    let existing = "[misc]\n# clauth herdr plugin\n\nsomething = \"user value\"\n";
+    assert_eq!(
+        without_marked_blocks(existing),
+        "[misc]\n\nsomething = \"user value\"\n"
+    );
+}
+
+#[test]
+fn bound_key_reads_the_open_binding_not_the_first_entry() {
+    let doc: toml::Value = toml::from_str(concat!(
+        "[[keys.command]]\n",
+        "key = \"prefix+z\"\n",
+        "type = \"shell\"\n",
+        "command = \"ls\"\n",
+        "\n",
+        "[[keys.command]]\n",
+        "key = \"prefix+a\"\n",
+        "type = \"plugin_action\"\n",
+        "command = \"clauth.open\"\n",
+    ))
+    .expect("parses");
+    assert_eq!(bound_key(&doc).as_deref(), Some("prefix+a"));
+}
+
+#[test]
+fn a_registry_entry_without_enabled_reads_as_enabled() {
+    let entry = registry_entry_from(&plugin_list_json(
+        r#"{"plugin_id":"clauth","version":"0.1.0"}"#,
+    ))
+    .expect("entry");
+    assert!(entry.enabled);
+}
+
+#[test]
+fn registry_warnings_skip_non_strings_without_panicking() {
+    let entry = registry_entry_from(&plugin_list_json(
+        r#"{"plugin_id":"clauth","warnings":["a",1,"b"]}"#,
+    ))
+    .expect("entry");
+    assert_eq!(entry.warnings, vec!["a".to_string(), "b".to_string()]);
+}
+
+#[test]
+fn version_from_stops_at_the_first_token() {
+    assert_eq!(
+        version_from("herdr 0.8.0 (abcdef)"),
+        Some("0.8.0".to_string())
+    );
+}
+
+#[test]
+fn read_config_treats_absent_as_empty_and_fails_on_non_utf8() {
+    let sandbox = crate::testutil::HomeSandbox::new();
+
+    let absent = sandbox.home().join("no-such.toml");
+    assert_eq!(read_config(&absent).expect("absent reads empty"), "");
+
+    let garbage = sandbox.home().join("garbage.toml");
+    std::fs::write(&garbage, [0xFF, 0xFE, 0x00, 0x00]).expect("write non-utf-8");
+    let err = read_config(&garbage).expect_err("non-utf-8 fails, not empty");
+    assert!(
+        format!("{err:#}").contains("garbage.toml"),
+        "names the path: {err:#}"
+    );
+}

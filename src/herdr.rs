@@ -17,6 +17,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use anyhow::{Context, Result, bail};
+use serde_json::Value;
 
 use crate::out::{errln, out, outln};
 
@@ -27,7 +28,7 @@ const OPEN_ACTION: &str = "clauth.open";
 /// `owner/repo/subdir`, the only source shape `herdr plugin install` accepts.
 const GITHUB_SOURCE: &str = "uwuclxdy/clauth/herdr-plugin";
 /// Offered when `--key` is absent. `prefix+` is herdr's own leader.
-const DEFAULT_KEY: &str = "prefix+a";
+pub(crate) const DEFAULT_KEY: &str = "prefix+a";
 /// The pane-metadata name `report-profile.sh` publishes the account under.
 const TOKEN: &str = "$clauth";
 /// Marks this crate's additions inside a file clauth does not own.
@@ -86,7 +87,7 @@ pub(crate) fn install(key: Option<&str>, no_config: bool, yes: bool) -> Result<(
     }
 
     let path = config_path(&bin)?;
-    let existing = std::fs::read_to_string(&path).unwrap_or_default();
+    let existing = read_config(&path)?;
     let plan = plan_config(&existing, &key)?;
 
     for note in &plan.notes {
@@ -105,7 +106,7 @@ pub(crate) fn install(key: Option<&str>, no_config: bool, yes: bool) -> Result<(
     }
     outln!("");
 
-    if !confirm(yes)? {
+    if !confirm("write these to herdr's config?", yes)? {
         outln!("clauth: nothing written");
         print_manual(&key);
         return Ok(());
@@ -122,7 +123,7 @@ pub(crate) fn install(key: Option<&str>, no_config: bool, yes: bool) -> Result<(
 /// The running herdr when clauth was launched from one of its panes, else
 /// whatever is on `PATH`. Inside a pane the injected path names the binary that
 /// owns the session being configured, which a bare name can miss.
-fn herdr_bin() -> String {
+pub(crate) fn herdr_bin() -> String {
     std::env::var("HERDR_BIN_PATH").unwrap_or_else(|_| "herdr".to_string())
 }
 
@@ -176,7 +177,7 @@ fn run_quiet(bin: &str, args: &[&str]) -> Result<()> {
 /// herdr resolves its own config root per OS and exposes no command that prints
 /// it, so this derives the root from the one path command it does have: a
 /// plugin config dir is always `<root>/plugins/config/<component>`.
-fn config_path(bin: &str) -> Result<PathBuf> {
+pub(crate) fn config_path(bin: &str) -> Result<PathBuf> {
     if let Ok(explicit) = std::env::var("HERDR_CONFIG_PATH")
         && !explicit.is_empty()
     {
@@ -216,6 +217,170 @@ fn config_path_from_plugin_dir(printed: &str) -> Option<PathBuf> {
     Some(root.join("config.toml"))
 }
 
+/// Reads herdr's config for the callers that edit it. A missing file is an absent config and reads as empty; any other failure is a real error, since writing an empty string back would destroy a config that merely failed to read.
+fn read_config(path: &Path) -> Result<String> {
+    match std::fs::read_to_string(path) {
+        Ok(text) => Ok(text),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
+        Err(e) => Err(e).with_context(|| {
+            format!(
+                "cannot read herdr's config at {} (encoding or permissions); fix it before clauth edits it",
+                path.display()
+            )
+        }),
+    }
+}
+
+/// One clauth entry from `herdr plugin list --json`. Every field is optional: herdr's schema is read leniently, so a shape change degrades to "unknown" rather than an error, the same way the Plugin tab reads CC's registry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RegistryEntry {
+    pub(crate) enabled: bool,
+    pub(crate) version: Option<String>,
+    pub(crate) min_herdr_version: Option<String>,
+    pub(crate) plugin_root: Option<String>,
+    pub(crate) source_kind: Option<String>,
+    pub(crate) warnings: Vec<String>,
+}
+
+/// Everything the Plugin tab's herdr row needs that costs a subprocess.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct HerdrProbe {
+    /// The version token after `herdr ` in `herdr --version`.
+    pub(crate) version: Option<String>,
+    /// `None` when clauth is not in the registry.
+    pub(crate) entry: Option<RegistryEntry>,
+    pub(crate) config_path: Option<PathBuf>,
+    /// Registry read failed (not "absent"); `None` when it was only absent.
+    pub(crate) error: Option<String>,
+}
+
+/// Probes the installed herdr. `None` when herdr does not resolve, so the caller renders no row at all.
+#[allow(
+    dead_code,
+    reason = "consumed by the Plugin tab's herdr row (T24 lane B)"
+)]
+pub(crate) fn probe() -> Option<HerdrProbe> {
+    let bin = herdr_bin();
+    let bin = if bin == "herdr" {
+        crate::plugin_probe::on_path("herdr")?
+            .to_string_lossy()
+            .into_owned()
+    } else {
+        bin
+    };
+
+    let version = version_command(&bin);
+    let (entry, error) = registry_probe(&bin);
+    let config_path = config_path(&bin).ok();
+
+    Some(HerdrProbe {
+        version,
+        entry,
+        config_path,
+        error,
+    })
+}
+
+fn version_command(bin: &str) -> Option<String> {
+    let out = Command::new(bin).arg("--version").output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    version_from(text.lines().next()?)
+}
+
+/// `herdr 0.8.0` -> `Some("0.8.0")`. Pure, so the test feeds the real line.
+fn version_from(line: &str) -> Option<String> {
+    line.trim()
+        .strip_prefix("herdr ")?
+        .split_whitespace()
+        .next()
+        .map(str::to_string)
+}
+
+fn registry_probe(bin: &str) -> (Option<RegistryEntry>, Option<String>) {
+    let out = match Command::new(bin)
+        .args(["plugin", "list", "--json"])
+        .output()
+    {
+        Ok(out) => out,
+        Err(e) => {
+            return (
+                None,
+                Some(format!("could not run `{bin} plugin list --json`: {e}")),
+            );
+        }
+    };
+    if !out.status.success() {
+        let why = String::from_utf8_lossy(&out.stderr);
+        let why = why.trim();
+        return (
+            None,
+            Some(if why.is_empty() {
+                format!("`{bin} plugin list --json` failed")
+            } else {
+                format!("`{bin} plugin list --json` failed: {why}")
+            }),
+        );
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    let root: Value = match serde_json::from_str(&text) {
+        Ok(root) => root,
+        Err(e) => {
+            return (
+                None,
+                Some(format!("herdr's plugin list did not parse: {e}")),
+            );
+        }
+    };
+    (registry_entry_from_value(&root), None)
+}
+
+/// The pure half of the registry read, split out so tests feed it the real bytes with no subprocess.
+#[cfg(test)]
+fn registry_entry_from(json: &str) -> Option<RegistryEntry> {
+    let root: Value = serde_json::from_str(json).ok()?;
+    registry_entry_from_value(&root)
+}
+
+fn registry_entry_from_value(root: &Value) -> Option<RegistryEntry> {
+    let entry = root
+        .get("result")?
+        .get("plugins")?
+        .as_array()?
+        .iter()
+        .find(|e| e.get("plugin_id").and_then(Value::as_str) == Some(PLUGIN_ID))?;
+
+    let field = |key: &str| entry.get(key).and_then(Value::as_str).map(str::to_string);
+    Some(RegistryEntry {
+        // A listed plugin is enabled unless herdr says otherwise, so an absent `enabled` reads as enabled rather than disabled.
+        enabled: entry
+            .get("enabled")
+            .and_then(Value::as_bool)
+            .unwrap_or(true),
+        version: field("version"),
+        min_herdr_version: field("min_herdr_version"),
+        plugin_root: field("plugin_root"),
+        source_kind: entry
+            .get("source")
+            .and_then(|source| source.get("kind"))
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        warnings: entry
+            .get("warnings")
+            .and_then(Value::as_array)
+            .map(|warnings| {
+                warnings
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default(),
+    })
+}
+
 fn resolve_key(key: Option<&str>, yes: bool) -> Result<String> {
     let key = match key {
         Some(k) => k.trim().to_string(),
@@ -251,16 +416,16 @@ fn is_tty() -> bool {
     std::io::stdin().is_terminal() && std::io::stdout().is_terminal()
 }
 
-/// Default-no: this edits a file clauth does not own.
-fn confirm(yes: bool) -> Result<bool> {
+/// Default-no: every caller changes something clauth does not own. The question is the caller's, since one of them adds to a config and the other removes a plugin as well as config lines.
+fn confirm(question: &str, yes: bool) -> Result<bool> {
     if yes {
         return Ok(true);
     }
     if !is_tty() {
-        errln!("clauth: not a terminal, so herdr's config was left alone; rerun with --yes");
+        errln!("clauth: not a terminal, so nothing was changed; rerun with --yes");
         return Ok(false);
     }
-    out!("clauth: write these to herdr's config? [y/N] ");
+    out!("clauth: {question} [y/N] ");
     let mut line = String::new();
     std::io::stdin().read_line(&mut line)?;
     let answer = line.trim();
@@ -325,10 +490,84 @@ fn with_append(existing: &str, append: &str) -> String {
     text
 }
 
+/// What the sidebar half of the config says. Maps one-to-one onto the four arms `plan_config` matches.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SidebarState {
+    /// The claude row already renders the token.
+    Templated,
+    /// The claude row exists but does not render the token.
+    OtherClaudeRow,
+    /// `rows_by_agent` covers other agents but has no claude row.
+    OtherAgentsOnly,
+    /// No `rows_by_agent` table at all.
+    Absent,
+}
+
+/// The config-side verdicts the Plugin tab's herdr row shows, read straight from the parsed document. `parsed` is false when the file does not parse.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ConfigStatus {
+    pub(crate) parsed: bool,
+    /// The key spelling bound to `clauth.open`, when one is.
+    pub(crate) bound_key: Option<String>,
+    pub(crate) sidebar: SidebarState,
+}
+
+/// Pure string -> verdict. The caller does the file read, so the row can show a missing or unreadable file without a second parse.
+#[allow(
+    dead_code,
+    reason = "consumed by the Plugin tab's herdr row (T24 lane B)"
+)]
+pub(crate) fn config_status(existing: &str) -> ConfigStatus {
+    match toml::from_str::<toml::Value>(existing) {
+        Ok(doc) => ConfigStatus {
+            parsed: true,
+            bound_key: bound_key(&doc),
+            sidebar: sidebar_state(&doc),
+        },
+        Err(_) => ConfigStatus {
+            parsed: false,
+            bound_key: None,
+            sidebar: SidebarState::Absent,
+        },
+    }
+}
+
+/// The key spelling of the entry bound to `clauth.open`, if any.
+fn bound_key(doc: &toml::Value) -> Option<String> {
+    doc.get("keys")
+        .and_then(|k| k.get("command"))
+        .and_then(toml::Value::as_array)
+        .and_then(|entries| {
+            entries
+                .iter()
+                .find(|e| e.get("command").and_then(toml::Value::as_str) == Some(OPEN_ACTION))
+        })
+        .and_then(|e| e.get("key").and_then(toml::Value::as_str))
+        .map(str::to_string)
+}
+
+fn sidebar_state(doc: &toml::Value) -> SidebarState {
+    let Some(table) = doc
+        .get("ui")
+        .and_then(|u| u.get("sidebar"))
+        .and_then(|s| s.get("agents"))
+        .and_then(|a| a.get("rows_by_agent"))
+    else {
+        return SidebarState::Absent;
+    };
+    match table.get("claude") {
+        Some(row) if mentions_token(row) => SidebarState::Templated,
+        Some(_) => SidebarState::OtherClaudeRow,
+        None => SidebarState::OtherAgentsOnly,
+    }
+}
+
 /// Decides what an existing herdr config is missing. Append-only by design: a
 /// table the config already defines is reported for the user to merge rather
 /// than emitted twice, since a duplicate key is a parse error, and rewriting
 /// the file structurally would drop their comments and ordering.
+///
+/// Both verdicts route through the same helpers `config_status` uses, so the row and the install plan cannot drift.
 fn plan_config(existing: &str, key: &str) -> Result<ConfigPlan> {
     let doc: toml::Value = toml::from_str(existing)
         .context("herdr's config.toml does not parse; fix it before wiring clauth into it")?;
@@ -338,16 +577,7 @@ fn plan_config(existing: &str, key: &str) -> Result<ConfigPlan> {
         notes: Vec::new(),
     };
 
-    let bound = doc
-        .get("keys")
-        .and_then(|k| k.get("command"))
-        .and_then(toml::Value::as_array)
-        .is_some_and(|entries| {
-            entries
-                .iter()
-                .any(|e| e.get("command").and_then(toml::Value::as_str) == Some(OPEN_ACTION))
-        });
-    if bound {
+    if bound_key(&doc).is_some() {
         plan.notes.push(format!(
             "`{OPEN_ACTION}` is already bound, so the keybinding is left alone"
         ));
@@ -359,29 +589,182 @@ fn plan_config(existing: &str, key: &str) -> Result<ConfigPlan> {
         );
     }
 
-    let rows = doc
-        .get("ui")
-        .and_then(|u| u.get("sidebar"))
-        .and_then(|s| s.get("agents"))
-        .and_then(|a| a.get("rows_by_agent"));
-    match rows {
-        None => {
+    match sidebar_state(&doc) {
+        SidebarState::Templated => plan.notes.push(
+            "the sidebar already renders the account, so the rows are left alone".to_string(),
+        ),
+        SidebarState::OtherClaudeRow => plan.notes.push(format!(
+            "your `[ui.sidebar.agents.rows_by_agent]` already sets a claude row, so add `\"{TOKEN}\"` to one of its groups yourself: {SIDEBAR_ROW}"
+        )),
+        SidebarState::OtherAgentsOnly => plan.notes.push(format!(
+            "your `[ui.sidebar.agents.rows_by_agent]` covers other agents, so add this line under it yourself: {SIDEBAR_ROW}"
+        )),
+        SidebarState::Absent => {
             plan.try_append(existing, &format!("\n{}", sidebar_block()), "the sidebar row");
         }
-        Some(table) => match table.get("claude") {
-            Some(row) if mentions_token(row) => {
-                plan.notes.push("the sidebar already renders the account, so the rows are left alone".to_string());
-            }
-            Some(_) => plan.notes.push(format!(
-                "your `[ui.sidebar.agents.rows_by_agent]` already sets a claude row, so add `\"{TOKEN}\"` to one of its groups yourself: {SIDEBAR_ROW}"
-            )),
-            None => plan.notes.push(format!(
-                "your `[ui.sidebar.agents.rows_by_agent]` covers other agents, so add this line under it yourself: {SIDEBAR_ROW}"
-            )),
-        },
     }
 
     Ok(plan)
+}
+
+/// Appends whatever `plan_config` says is missing. Returns the plan's notes (the pieces it refused to touch), empty when it wrote everything.
+#[allow(
+    dead_code,
+    reason = "consumed by the Plugin tab's herdr row (T24 lane B)"
+)]
+pub(crate) fn heal(config_path: &Path, key: &str, bin: &str) -> Result<Vec<String>> {
+    let existing = read_config(config_path)?;
+    let plan = plan_config(&existing, key)?;
+    if !plan.append.is_empty() {
+        let text = with_append(&existing, &plan.append);
+        write_validated(config_path, &existing, &text, bin)?;
+    }
+    Ok(plan.notes)
+}
+
+/// Test seam over [`strip_marked_blocks`], so the round-trip tests name the rule they pin.
+#[cfg(test)]
+fn without_marked_blocks(existing: &str) -> String {
+    strip_marked_blocks(existing).0
+}
+
+/// Drops every block this crate marked with `MARKER`, nothing else, plus the lines it removed in order so `uninstall` can print a `- ` diff that mirrors the `+ ` one `install` prints.
+///
+/// A block is real only when a `[`-leading line follows the marker, since that header is what `install` always writes; the blank `install` prepends before it is dropped too. A marker standing alone drops itself and leaves the next line on the normal path. The residue is a marker inside a multi-line string whose next line happens to begin with `[`; telling that apart needs a TOML parser, and this strip only runs over lines `install` wrote, where the header always follows.
+fn strip_marked_blocks(existing: &str) -> (String, Vec<String>) {
+    let mut out: Vec<String> = Vec::new();
+    let mut removed: Vec<String> = Vec::new();
+    let mut skipping = false;
+    let mut lines = existing.split_inclusive('\n').peekable();
+
+    while let Some(raw) = lines.next() {
+        let content = raw.strip_suffix('\n').unwrap_or(raw);
+        let lead = content.trim_start();
+
+        if skipping {
+            if lead.is_empty() || lead.starts_with('[') {
+                skipping = false;
+                out.push(raw.to_string());
+            } else {
+                removed.push(content.to_string());
+            }
+            continue;
+        }
+
+        if lead.starts_with(MARKER) {
+            // Pop the blank install prepends only when a real block follows, so
+            // a standalone marker keeps the line above it too.
+            if lines
+                .peek()
+                .is_some_and(|next| next.trim_start().starts_with('['))
+                && out.last().is_some_and(|last| last.trim().is_empty())
+                && let Some(blank) = out.pop()
+            {
+                removed.push(blank.strip_suffix('\n').unwrap_or(&blank).to_string());
+            }
+            removed.push(content.to_string());
+            // `next_if` leaves a non-`[` line for the normal path rather than
+            // consuming it as a header.
+            if let Some(header) = lines.next_if(|next| next.trim_start().starts_with('[')) {
+                removed.push(header.strip_suffix('\n').unwrap_or(header).to_string());
+                skipping = true;
+            }
+            continue;
+        }
+
+        out.push(raw.to_string());
+    }
+
+    (out.concat(), removed)
+}
+
+pub(crate) fn uninstall(no_config: bool, yes: bool) -> Result<()> {
+    let bin = herdr_bin();
+
+    // Read and strip before touching herdr, so one confirm covers both halves
+    // and a decline leaves the plugin and the config both untouched.
+    let config_edit: Option<(PathBuf, String, String, Vec<String>)> = if no_config {
+        None
+    } else {
+        let path = config_path(&bin)?;
+        let previous = read_config(&path)?;
+        let (text, removed) = strip_marked_blocks(&previous);
+        (text != previous).then_some((path, previous, text, removed))
+    };
+
+    outln!("clauth: this removes the clauth plugin from herdr");
+    if let Some((path, _, _, removed)) = &config_edit {
+        let mut diff = removed.clone();
+        // The first removed line is the blank `install` prepends before its first block; `install`'s diff trims it, so this one does too.
+        if diff.first().is_some_and(String::is_empty) {
+            diff.remove(0);
+        }
+        outln!("");
+        outln!("{}:", path.display());
+        for line in &diff {
+            outln!("- {line}");
+        }
+        outln!("");
+    }
+
+    let question = if config_edit.is_some() {
+        "remove the plugin and these config lines?"
+    } else {
+        "remove the clauth plugin from herdr?"
+    };
+    if !confirm(question, yes)? {
+        outln!("clauth: nothing changed");
+        return Ok(());
+    }
+
+    match uninstall_plugin(&bin)? {
+        PluginUninstall::Done => outln!("clauth: uninstalled the herdr plugin"),
+        PluginUninstall::NotInstalled => {
+            outln!("clauth: herdr had no clauth plugin to uninstall (plugin not installed)")
+        }
+    }
+
+    if let Some((path, previous, text, _)) = config_edit {
+        write_validated(&path, &previous, &text, &bin)?;
+        outln!("clauth: removed clauth's additions from {}", path.display());
+    }
+
+    Ok(())
+}
+
+enum PluginUninstall {
+    Done,
+    NotInstalled,
+}
+
+/// `herdr plugin uninstall clauth`. herdr exits 1 with a `plugin not installed` line when there is nothing to remove; the caller treats that as a no-op. The phrase must start a line, so a real failure that merely mentions it still fails.
+fn uninstall_plugin(bin: &str) -> Result<PluginUninstall> {
+    let out = Command::new(bin)
+        .args(["plugin", "uninstall", PLUGIN_ID])
+        .output()
+        .with_context(|| {
+            format!(
+                "could not run `{bin} plugin uninstall {PLUGIN_ID}`; is herdr installed and on PATH?"
+            )
+        })?;
+    if out.status.success() {
+        return Ok(PluginUninstall::Done);
+    }
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let not_installed = format!("{stdout}\n{stderr}")
+        .lines()
+        .any(|line| line.trim_start().starts_with("plugin not installed"));
+    if out.status.code() == Some(1) && not_installed {
+        return Ok(PluginUninstall::NotInstalled);
+    }
+    let mut why = stdout.trim().to_string();
+    let err = stderr.trim();
+    if !err.is_empty() {
+        why.push('\n');
+        why.push_str(err);
+    }
+    bail!("`{bin} plugin uninstall {PLUGIN_ID}` failed:\n{why}");
 }
 
 /// Walks a row template looking for the token. A row is an array of arrays of

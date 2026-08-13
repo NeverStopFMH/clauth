@@ -1346,3 +1346,36 @@ fn herdr_install_parses_with_every_flag() {
     assert!(parse(&["herdr"]).is_err());
     assert!(parse(&["herdr", "instal"]).is_err());
 }
+
+/// `clauth herdr uninstall` and its flags, mirroring the install grammar so the two stay siblings rather than drifting apart.
+#[test]
+fn herdr_uninstall_parses_with_every_flag() {
+    let bare = command(&["herdr", "uninstall"]);
+    let Command::Herdr {
+        cmd: crate::cli::HerdrCommand::Uninstall { no_config, yes },
+    } = bare
+    else {
+        panic!("`herdr uninstall` must select the uninstall arm");
+    };
+    assert!(!no_config);
+    assert!(!yes);
+
+    let full = command(&["herdr", "uninstall", "--no-config", "--yes"]);
+    let Command::Herdr {
+        cmd: crate::cli::HerdrCommand::Uninstall { no_config, yes },
+    } = full
+    else {
+        panic!("flagged form must select the uninstall arm");
+    };
+    assert!(no_config);
+    assert!(yes);
+
+    let short = command(&["herdr", "uninstall", "-y"]);
+    let Command::Herdr {
+        cmd: crate::cli::HerdrCommand::Uninstall { yes, .. },
+    } = short
+    else {
+        panic!("`-y` must select the uninstall arm");
+    };
+    assert!(yes);
+}

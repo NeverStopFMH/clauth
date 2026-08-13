@@ -1940,6 +1940,115 @@ fn acquire_isolates_credentials_from_real_home() {
     });
 }
 
+/// Pins the runtime-tree partition the MCP init note hands every model:
+/// `runtime_paths_note` in `src/mcp/render.rs`. In a shared session every
+/// top-level entry under `$CLAUDE_CONFIG_DIR` is a symlink onto
+/// `~/.claude/<same-name>`, except three per-profile files. Those three are
+/// `.claude.json`, `settings.json` and `.credentials.json`. A fourth
+/// profile-local file or a changed link target leaves that note lying to every
+/// session it reaches. Drives the real `acquire` rather than a hand-built
+/// fixture, since a fixture agrees with whatever its author guessed the layout
+/// to be.
+#[cfg(unix)]
+#[test]
+fn acquire_builds_the_runtime_partition_the_mcp_note_describes() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let claude_home = fake_claude_home(tmp.path());
+        // A realistic spread: one dir, one nested dir, one plain file, one
+        // dotfile, plus the two exclusions the walk must not link.
+        fs::create_dir_all(claude_home.join("projects")).expect("mkdir projects");
+        fs::create_dir_all(claude_home.join("plugins").join("repos")).expect("mkdir plugins");
+        fs::write(claude_home.join("history.jsonl"), b"{}").expect("write history");
+        fs::write(claude_home.join(".foo.json"), b"{}").expect("write dotfile");
+        fs::write(claude_home.join("settings.json"), br#"{"home":true}"#).expect("write settings");
+        fs::write(claude_home.join(".credentials.json"), CREDS_V1).expect("write live creds");
+        fs::write(tmp.path().join(".claude.json"), br#"{"numStartups":1}"#)
+            .expect("write global .claude.json");
+
+        // Pre-stage the profile's canonical credentials: without them the
+        // runtime's `.credentials.json` has no per-profile target to link to.
+        let profile = make_profile("partition");
+        let canonical = tmp
+            .path()
+            .join(".clauth")
+            .join("profiles")
+            .join("partition")
+            .join("credentials.json");
+        fs::create_dir_all(canonical.parent().expect("canonical parent"))
+            .expect("mkdir profile dir");
+        fs::write(&canonical, CREDS_V2).expect("write canonical");
+
+        let rt = ProfileRuntime::acquire(&profile, Isolation::Shared, &[], false).expect("acquire");
+        let runtime = rt.config_dir();
+
+        // 1. The partition holds exhaustively: every top-level entry is one of
+        // the three per-profile names or a symlink onto ~/.claude/<same-name>.
+        for name in dir_entry_names(runtime) {
+            if matches!(
+                name.as_str(),
+                "settings.json" | ".claude.json" | ".credentials.json"
+            ) {
+                continue;
+            }
+            let path = runtime.join(&name);
+            assert!(
+                path.symlink_metadata()
+                    .expect("runtime entry meta")
+                    .file_type()
+                    .is_symlink(),
+                "`{name}` is not a per-profile file and is not a symlink"
+            );
+            assert_eq!(
+                fs::read_link(&path).expect("read link"),
+                claude_home.join(&name),
+                "`{name}` must link onto ~/.claude/{name}"
+            );
+        }
+
+        // 2. The three per-profile names are exactly right: settings.json and
+        // .claude.json are regular files, .credentials.json links into the
+        // profile's canonical store rather than into ~/.claude/.
+        for file in [runtime.join("settings.json"), runtime.join(".claude.json")] {
+            let meta = file.symlink_metadata().expect("meta");
+            assert!(
+                meta.file_type().is_file(),
+                "{} must be a per-profile regular file",
+                file.display()
+            );
+        }
+        let creds = runtime.join(".credentials.json");
+        assert!(
+            creds
+                .symlink_metadata()
+                .expect("creds meta")
+                .file_type()
+                .is_symlink(),
+            ".credentials.json must be a symlink"
+        );
+        assert_eq!(
+            fs::read_link(&creds).expect("read creds link"),
+            canonical,
+            ".credentials.json must link into the profile's canonical store ({}), not ~/.claude/",
+            canonical.display()
+        );
+
+        // 3. Nothing dropped: every ~/.claude/ top-level entry except the two
+        // exclusions has a counterpart in the runtime tree.
+        for name in dir_entry_names(&claude_home) {
+            if name == "settings.json" || name == ".credentials.json" {
+                continue;
+            }
+            assert!(
+                runtime.join(&name).symlink_metadata().is_ok(),
+                "~/.claude/{name} was dropped from the runtime tree"
+            );
+        }
+
+        drop(rt);
+    });
+}
+
 /// Regression: one process holding two concurrent sessions of the same
 /// profile+flavor must not collide on the session file. Before the per-acquire
 /// `-<n>` suffix both keyed `sessions/<pid>`, so the second `acquire` blocked

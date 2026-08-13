@@ -69,9 +69,9 @@ Runs a headless `claude -p` under another profile and returns what it produced.
 
 **What it sees.** Only the prompt you pass. It has no view of the calling conversation, so the prompt has to carry the whole task.
 
-**Prompt file.** `prompt_file` reads the prompt from a path relative to the delegate's `cwd` instead of passing it inline, so a long reusable prompt costs your context nothing to hand over. It is validated against `cwd` and refused by name when it is absolute, escapes `cwd`, resolves through a symlink outside `cwd`, or is over 64 KiB. Give exactly one of `prompt` / `prompt_file`.
+**Prompt file.** `prompt_file` reads the prompt from a path relative to the delegate's `cwd` instead of passing it inline, so a long reusable prompt costs your context nothing to hand over. It is validated against `cwd` and refused by name when it is absolute, escapes `cwd`, resolves through a symlink outside `cwd`, is not a regular file, or is over 64 KiB. Give exactly one of `prompt` / `prompt_file`.
 
-**Fan-out.** `profiles` spawns one delegate per named account, background-only, and spends one real usage window per account. It returns one `job_id` per account and echoes the resolved target list. Duplicate names (case-insensitive), unknown names, and a blocking call are refused before any spawn. Give exactly one of `profile` / `profiles`.
+**Fan-out.** `profiles` spawns one delegate per named account, background-only, and spends one real usage window per account. It returns one `job_id` per account and echoes the resolved target list. Duplicate names (case-insensitive), unknown names, an empty list, and a blocking call are refused before any spawn. Give exactly one of `profile` / `profiles`.
 
 **Recursion.** Hard-capped at depth 1. A delegated session cannot call `delegate` again.
 
@@ -81,7 +81,7 @@ Runs a headless `claude -p` under another profile and returns what it produced.
 
 **Isolated.** `isolated: true` drops your operator memory, plugins, hooks, and every MCP server, keeping the account's auth. Good for blind runs and evals.
 
-**Background.** `background: true` returns a `job_id` immediately so the session keeps working. With the plugin installed, a bundled `PostToolUse` hook delivers the result as soon as the job finishes. Otherwise call `delegate_result` with the `job_id`, optionally long-polling up to 60 s. Jobs live in `~/.clauth/jobs/`, swept an hour after they finish.
+**Background.** `background: true` returns a `job_id` immediately so the session keeps working. With the plugin installed, a bundled `PostToolUse` hook delivers the result as soon as the job finishes. A fan-out is delivered the same way: the hook waits on every job and prints each finished envelope together. A job still running at the hook's deadline is named, so collect it with `delegate_result`. Otherwise call `delegate_result` with each `job_id`, optionally long-polling up to 60 s. Jobs live in `~/.clauth/jobs/`, swept an hour after they finish.
 
 **Permissions.** A delegate spawns with Claude Code's permission gate armed and nobody to answer it, so a task that writes files fails on a denial rather than doing the work. Pass the permission flag through `args` when the delegate is meant to edit anything, and add `--add-dir` for reads outside `cwd`. Denials come back in a `permission_denials` array, so check that field rather than the prose result.
 

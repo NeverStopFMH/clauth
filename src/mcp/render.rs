@@ -38,8 +38,10 @@ pub(crate) enum RosterRank {
 }
 
 /// Host (and port) of a base url. Every profile of one provider carries the same
-/// endpoint path, so the roster prints the identifying half only.
-fn base_url_host(url: &str) -> &str {
+/// endpoint path, so both the roster and `list_profiles` print the identifying
+/// half only. Shared so the two can never disagree on what a profile's endpoint
+/// is called.
+pub(super) fn base_url_host(url: &str) -> &str {
     let rest = url.split_once("://").map_or(url, |(_, rest)| rest);
     rest.split('/').next().unwrap_or(rest)
 }

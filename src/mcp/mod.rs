@@ -68,18 +68,34 @@ const DEFAULT_MAX_OUTPUT_TOKENS: &str = "64000";
 fn throughput_json(profile: &str, now: i64) -> serde_json::Value {
     let rows: Vec<serde_json::Value> = crate::throughput::summary(profile, now)
         .into_iter()
-        .map(|m| {
-            serde_json::json!({
-                "model": m.model,
-                "tok_s": (m.tok_s * 10.0).round() / 10.0,
-                "samples": m.samples,
-                "degraded": m.degraded,
-                "rate_limited_recent": m.rate_limited_recent,
-                "retry_after_s": m.retry_after_s,
-            })
-        })
+        .map(throughput_row)
         .collect();
     serde_json::Value::Array(rows)
+}
+
+/// One row of [`throughput_json`], shared with [`throughput_warnings`] so the
+/// two surfaces cannot drift into describing a model differently.
+fn throughput_row(m: crate::throughput::ModelSummary) -> serde_json::Value {
+    serde_json::json!({
+        "model": m.model,
+        "tok_s": (m.tok_s * 10.0).round() / 10.0,
+        "samples": m.samples,
+        "degraded": m.degraded,
+        "rate_limited_recent": m.rate_limited_recent,
+        "retry_after_s": m.retry_after_s,
+    })
+}
+
+/// The subset of [`throughput_json`] a roster is worth spending tokens on: only
+/// models a past `delegate` found degraded or recently rate-limited. A healthy
+/// row tells a picker nothing it would act on, and one operator's 19 healthy
+/// rows measured 31% of the whole `list_profiles` response.
+fn throughput_warnings(profile: &str, now: i64) -> Vec<serde_json::Value> {
+    crate::throughput::summary(profile, now)
+        .into_iter()
+        .filter(|m| m.degraded || m.rate_limited_recent)
+        .map(throughput_row)
+        .collect()
 }
 
 /// Fresh-from-cache 5h/7d windows for a profile. Each call re-reads the disk
@@ -168,6 +184,13 @@ pub(crate) struct SwitchArgs {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub(crate) struct ListProfilesArgs {
+    /// Restrict the roster to these profiles (case-insensitive). Omit it, or
+    /// pass an empty list, for every profile.
+    names: Option<Vec<String>>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub(crate) struct DelegateArgs {
     /// Profile name to run the headless delegate session under.
     profile: String,
@@ -237,20 +260,63 @@ impl ClauthServer {
 
     #[tool(
         description = "Every clauth profile from disk cache; zero quota, no network. Call it at \
-session start and before picking a `delegate` target. Reading the JSON: `utilization_pct` in \
-`windows[]` is the percent of that window already USED, so higher means less headroom. `tier` is \
-the plan label; a canceled subscription reports the org's post-cancellation tier (`Free`), never \
-the word `canceled`. `third_party` is a cached balance or quota headline for provider-key \
-profiles. `throughput[]` is observed tok/s from past `delegate` calls: a `degraded` or \
-`rate_limited_recent` target is a bad pick"
+session start, and pass `names` to re-check one profile instead of pulling the whole roster. \
+Reading the JSON: `utilization_pct` in `windows[]` is the percent of that window already USED, so \
+higher means less headroom. `tier` is the plan label; a canceled subscription reports the org's \
+post-cancellation tier (`Free`), never the word `canceled`. `host` is the endpoint's host, absent \
+for a default OAuth profile. `third_party` is a cached balance or quota headline for provider-key \
+profiles. Two fields appear only when they carry news: `has_live_session` when a clauth-managed \
+session already owns the profile, and `throughput[]` (observed tok/s from past `delegate` calls) \
+only for a model that is `degraded` or `rate_limited_recent` — either makes it a bad pick"
     )]
-    async fn list_profiles(&self) -> Result<CallToolResult, ErrorData> {
+    async fn list_profiles(
+        &self,
+        Parameters(ListProfilesArgs { names }): Parameters<ListProfilesArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
         let config = load_config().map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
         let now = now_epoch_secs();
+
+        // Resolve the filter before rendering anything. A name matching nothing
+        // is a caller mistake, and silently dropping it would answer with a
+        // roster that reads exactly like "that profile is gone".
+        let wanted = match names.as_deref() {
+            None | Some([]) => None,
+            Some(raw) => {
+                let (found, unknown): (Vec<_>, Vec<_>) = raw
+                    .iter()
+                    .map(|n| config.canonical_name(n).ok_or_else(|| n.clone()))
+                    .partition(Result::is_ok);
+                if !unknown.is_empty() {
+                    let missing: Vec<String> =
+                        unknown.into_iter().map(Result::unwrap_err).collect();
+                    let payload = serde_json::json!({
+                        "ok": false,
+                        "reason": format!(
+                            "profile not found: {}; omit `names` for the full roster",
+                            missing.join(", ")
+                        ),
+                    });
+                    return Ok(CallToolResult::error(vec![ContentBlock::text(
+                        payload.to_string(),
+                    )]));
+                }
+                Some(
+                    found
+                        .into_iter()
+                        .map(Result::unwrap)
+                        .collect::<Vec<String>>(),
+                )
+            }
+        };
 
         let profiles: Vec<serde_json::Value> = config
             .profiles
             .iter()
+            .filter(|p| {
+                wanted
+                    .as_ref()
+                    .is_none_or(|w| w.iter().any(|n| n == p.name.as_str()))
+            })
             .map(|p| {
                 let name = p.name.as_str();
                 let third_party = if p.is_third_party() {
@@ -260,17 +326,31 @@ profiles. `throughput[]` is observed tok/s from past `delegate` calls: a `degrad
                 } else {
                     None
                 };
-                serde_json::json!({
+                let mut row = serde_json::json!({
                     "name": name,
                     "active": config.is_active(name),
                     "provider": provider_label(p),
-                    "base_url": p.base_url,
                     "tier": tier_label(p),
-                    "has_live_session": crate::runtime::has_live_session(name),
                     "windows": windows_json(name),
                     "third_party": third_party,
-                    "throughput": throughput_json(name, now),
-                })
+                });
+                // Host, not the full endpoint: every profile of one provider
+                // repeats the same path, and the cost model only ever asks
+                // whether the host is loopback or LAN.
+                if let Some(url) = &p.base_url {
+                    row["host"] = serde_json::json!(render::base_url_host(url));
+                }
+                // Both of these are absent unless they say something. Emitted
+                // unconditionally they were 39% of a 27-profile response, nearly
+                // all of it `false` and rows carrying no warning.
+                if crate::runtime::has_live_session(name) {
+                    row["has_live_session"] = serde_json::json!(true);
+                }
+                let warnings = throughput_warnings(name, now);
+                if !warnings.is_empty() {
+                    row["throughput"] = serde_json::Value::Array(warnings);
+                }
+                row
             })
             .collect();
 
@@ -1671,3 +1751,7 @@ mod switch_tool_tests;
 #[cfg(test)]
 #[path = "../../tests/inline/mcp_which_tool.rs"]
 mod which_tool_tests;
+
+#[cfg(test)]
+#[path = "../../tests/inline/mcp_list_profiles_tool.rs"]
+mod list_profiles_tool_tests;

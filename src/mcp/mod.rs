@@ -154,22 +154,70 @@ fn parse_balance(value: &str) -> Option<(String, f64)> {
     Some((currency.to_string(), amount))
 }
 
-/// Live footer for the current active profile, read fresh from cache.
-fn active_footer(config: &AppConfig) -> String {
+/// Output format for every tool. `prose` is the default; `json` is the opt-in a
+/// caller must name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Format {
+    Prose,
+    Json,
+}
+
+impl Format {
+    /// Resolve the tool's `format` argument. Unset means prose. An unrecognised
+    /// value is refused by name so a typo cannot silently degrade to prose.
+    fn parse(raw: Option<&str>) -> std::result::Result<Self, String> {
+        match raw {
+            None | Some("prose") => Ok(Format::Prose),
+            Some("json") => Ok(Format::Json),
+            Some(other) => Err(format!(
+                "unrecognized format \"{other}\": accepted \"prose\" and \"json\""
+            )),
+        }
+    }
+}
+
+/// Refuse an unrecognised `format` value. There is no format to honour yet, so
+/// the refusal is a JSON text block like every other error envelope.
+fn format_refusal(reason: String) -> CallToolResult {
+    CallToolResult::error(vec![ContentBlock::text(
+        serde_json::json!({ "ok": false, "reason": reason }).to_string(),
+    )])
+}
+
+/// The live-usage footer folded into a payload as data: which profile the
+/// percentages describe, and the 5h/7d share used (null when uncached). The
+/// throughput warning is added by the caller when the tool has one.
+fn live_usage_json(
+    profile: Option<&str>,
+    five_h: Option<&UsageWindow>,
+    seven_d: Option<&UsageWindow>,
+) -> serde_json::Value {
+    serde_json::json!({
+        "profile": profile,
+        "5h_used_pct": five_h.map(|w| w.utilization),
+        "7d_used_pct": seven_d.map(|w| w.utilization),
+    })
+}
+
+/// Collapse one payload to exactly one content block in the requested format.
+/// `prose` is the payload's prose spelling (already computed).
+fn single_block(payload: serde_json::Value, format: Format, prose: String) -> Vec<ContentBlock> {
+    vec![ContentBlock::text(match format {
+        Format::Json => payload.to_string(),
+        Format::Prose => prose,
+    })]
+}
+
+/// Fold the active profile's live usage into a payload, replacing the old
+/// second-block footer.
+fn fold_active_live_usage(mut payload: serde_json::Value, config: &AppConfig) -> serde_json::Value {
     let active = config.state.active_profile.as_deref();
     let (five_h, seven_d) = match active {
         Some(name) => load_windows(name),
         None => (None, None),
     };
-    render::live_footer(active, five_h.as_ref(), seven_d.as_ref())
-}
-
-/// Append the live footer to a JSON text payload as a second content block.
-fn with_footer(json: serde_json::Value, footer: String) -> Vec<ContentBlock> {
-    vec![
-        ContentBlock::text(json.to_string()),
-        ContentBlock::text(footer),
-    ]
+    payload["live_usage"] = live_usage_json(active, five_h.as_ref(), seven_d.as_ref());
+    payload
 }
 
 #[derive(Clone)]
@@ -181,6 +229,8 @@ pub(crate) struct ClauthServer {
 pub(crate) struct SwitchArgs {
     /// Profile name to relink the global active credentials to.
     name: String,
+    /// Output format: `prose` (default) or `json`.
+    format: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -188,6 +238,8 @@ pub(crate) struct ListProfilesArgs {
     /// Restrict the roster to these profiles (case-insensitive). Omit it, or
     /// pass an empty list, for every profile.
     names: Option<Vec<String>>,
+    /// Output format: `prose` (default) or `json`.
+    format: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -239,6 +291,8 @@ pub(crate) struct DelegateArgs {
     /// usage windows (`quota`) alongside `elapsed_secs`. No effect on a blocking
     /// call. Defaults to false.
     monitor: Option<bool>,
+    /// Output format: `prose` (default) or `json`.
+    format: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -248,6 +302,14 @@ pub(crate) struct DelegateResultArgs {
     /// Seconds to long-poll for completion before returning (0..=60, default 0 =
     /// reply instantly with the current state).
     wait_secs: Option<u64>,
+    /// Output format: `prose` (default) or `json`.
+    format: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub(crate) struct WhichArgs {
+    /// Output format: `prose` (default) or `json`.
+    format: Option<String>,
 }
 
 #[tool_router]
@@ -267,12 +329,17 @@ post-cancellation tier (`Free`), never the word `canceled`. `host` is the endpoi
 for a default OAuth profile. `third_party` is a cached balance or quota headline for provider-key \
 profiles. Two fields appear only when they carry news: `has_live_session` when a clauth-managed \
 session already owns the profile, and `throughput[]` (observed tok/s from past `delegate` calls) \
-only for a model that is `degraded` or `rate_limited_recent` — either makes it a bad pick"
+only for a model that is `degraded` or `rate_limited_recent` — either makes it a bad pick. \
+Replies in prose by default; pass `format: \"json\"` for the structured roster."
     )]
     async fn list_profiles(
         &self,
-        Parameters(ListProfilesArgs { names }): Parameters<ListProfilesArgs>,
+        Parameters(ListProfilesArgs { names, format }): Parameters<ListProfilesArgs>,
     ) -> Result<CallToolResult, ErrorData> {
+        let format = match Format::parse(format.as_deref()) {
+            Ok(f) => f,
+            Err(reason) => return Ok(format_refusal(reason)),
+        };
         let config = load_config().map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
         let now = now_epoch_secs();
 
@@ -296,9 +363,8 @@ only for a model that is `degraded` or `rate_limited_recent` — either makes it
                             missing.join(", ")
                         ),
                     });
-                    return Ok(CallToolResult::error(vec![ContentBlock::text(
-                        payload.to_string(),
-                    )]));
+                    let prose = render::list_profiles_prose(&payload);
+                    return Ok(CallToolResult::error(single_block(payload, format, prose)));
                 }
                 Some(
                     found
@@ -355,9 +421,10 @@ only for a model that is `degraded` or `rate_limited_recent` — either makes it
             .collect();
 
         let payload = serde_json::json!({ "profiles": profiles });
-        Ok(CallToolResult::success(vec![ContentBlock::text(
-            payload.to_string(),
-        )]))
+        let prose = render::list_profiles_prose(&payload);
+        Ok(CallToolResult::success(single_block(
+            payload, format, prose,
+        )))
     }
 
     #[tool(
@@ -365,9 +432,17 @@ only for a model that is `degraded` or `rate_limited_recent` — either makes it
 always the active one. `source` says how it resolved: `refresh_match` / `session_token_match` (a \
 profile's stored credential matches the live one), `session_dir` (this session's runtime dir pins \
 the profile), `credential_less_active` (the configured active profile, nothing on disk to match). \
-Appends a live usage footer (% used)"
+The reply carries the active profile's live 5h/7d usage. Prose by default; pass `format: \
+\"json\"` for the structured payload."
     )]
-    async fn which(&self) -> Result<CallToolResult, ErrorData> {
+    async fn which(
+        &self,
+        Parameters(WhichArgs { format }): Parameters<WhichArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let format = match Format::parse(format.as_deref()) {
+            Ok(f) => f,
+            Err(reason) => return Ok(format_refusal(reason)),
+        };
         let config = load_config().map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
         let resolved = crate::which::resolve_active(&config);
         let throughput = resolved
@@ -381,27 +456,34 @@ Appends a live usage footer (% used)"
                 .find(|p| p.name.as_str() == name.as_str())
                 .and_then(tier_label)
         });
-        let payload = serde_json::json!({
-            "profile": resolved.as_ref().map(|(name, _)| name),
-            "source": resolved.as_ref().map(|(_, source)| source.as_str()),
-            "tier": tier,
-            "throughput": throughput,
-        });
-        Ok(CallToolResult::success(with_footer(
-            payload,
-            active_footer(&config),
+        let payload = fold_active_live_usage(
+            serde_json::json!({
+                "profile": resolved.as_ref().map(|(name, _)| name),
+                "source": resolved.as_ref().map(|(_, source)| source.as_str()),
+                "tier": tier,
+                "throughput": throughput,
+            }),
+            &config,
+        );
+        let prose = render::which_prose(&payload);
+        Ok(CallToolResult::success(single_block(
+            payload, format, prose,
         )))
     }
 
     #[tool(
         description = "Relink the global `~/.claude` credentials to another profile. What that \
 does to THIS session depends on how it reads credentials; the server instructions say which case \
-this session is in"
+this session is in. Prose by default; pass `format: \"json\"` for the structured payload."
     )]
     async fn switch(
         &self,
-        Parameters(SwitchArgs { name }): Parameters<SwitchArgs>,
+        Parameters(SwitchArgs { name, format }): Parameters<SwitchArgs>,
     ) -> Result<CallToolResult, ErrorData> {
+        let format = match Format::parse(format.as_deref()) {
+            Ok(f) => f,
+            Err(reason) => return Ok(format_refusal(reason)),
+        };
         let config = load_config().map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
 
         // Resolve the raw tool argument to a stored profile (case-insensitive)
@@ -412,10 +494,9 @@ this session is in"
         let Some(name) = config.canonical_name(&name) else {
             let payload =
                 serde_json::json!({ "ok": false, "reason": format!("profile not found: {name}") });
-            return Ok(CallToolResult::error(with_footer(
-                payload,
-                active_footer(&config),
-            )));
+            let payload = fold_active_live_usage(payload, &config);
+            let prose = render::switch_prose(&payload);
+            return Ok(CallToolResult::error(single_block(payload, format, prose)));
         };
         let on_divergence = config.state.default_divergence;
 
@@ -441,22 +522,26 @@ this session is in"
 
         match outcome {
             Ok((previous, active)) => {
-                let payload = serde_json::json!({
-                    "ok": true,
-                    "previous": previous,
-                    "active": active,
-                });
-                Ok(CallToolResult::success(with_footer(
-                    payload,
-                    active_footer(&config),
+                let payload = fold_active_live_usage(
+                    serde_json::json!({
+                        "ok": true,
+                        "previous": previous,
+                        "active": active,
+                    }),
+                    &config,
+                );
+                let prose = render::switch_prose(&payload);
+                Ok(CallToolResult::success(single_block(
+                    payload, format, prose,
                 )))
             }
             Err(e) => {
-                let payload = serde_json::json!({ "ok": false, "reason": e.to_string() });
-                Ok(CallToolResult::error(with_footer(
-                    payload,
-                    active_footer(&config),
-                )))
+                let payload = fold_active_live_usage(
+                    serde_json::json!({ "ok": false, "reason": e.to_string() }),
+                    &config,
+                );
+                let prose = render::switch_prose(&payload);
+                Ok(CallToolResult::error(single_block(payload, format, prose)))
             }
         }
     }
@@ -485,7 +570,8 @@ streaming is never cut off. A kill returns `timed_out`, whatever text it had in 
 `resume` with a new `prompt` instead of paying for the work twice. An `isolated` run is resumable \
 only with clauth's auto-rescue on, and the killed envelope says which case it is.\n\n\
 Returns the envelope (`result`, `is_error`, `total_cost_usd`, token usage). `result` is the \
-delegate's own self-report, so spot-verify it like any subagent"
+delegate's own self-report, so spot-verify it like any subagent.\n\n\
+Prose by default; pass `format: \"json\"` for the structured envelope."
     )]
     async fn delegate(
         &self,
@@ -502,8 +588,13 @@ delegate's own self-report, so spot-verify it like any subagent"
             isolated,
             background,
             monitor,
+            format,
         }): Parameters<DelegateArgs>,
     ) -> Result<CallToolResult, ErrorData> {
+        let format = match Format::parse(format.as_deref()) {
+            Ok(f) => f,
+            Err(reason) => return Ok(format_refusal(reason)),
+        };
         // Fail closed: a present-but-unparseable value is treated as max depth
         // (refuse), so a corrupt env can never re-enable delegation. Only a truly
         // absent var is depth 0.
@@ -517,9 +608,8 @@ delegate's own self-report, so spot-verify it like any subagent"
                 "is_error": true,
                 "result": "delegation depth exceeded (max 1)",
             });
-            return Ok(CallToolResult::error(vec![ContentBlock::text(
-                payload.to_string(),
-            )]));
+            let prose = render::delegate_prose(&payload);
+            return Ok(CallToolResult::error(single_block(payload, format, prose)));
         }
 
         // Both deadlines resolve inside `run_delegate`: the wall clock's fallback
@@ -586,9 +676,10 @@ delegate's own self-report, so spot-verify it like any subagent"
                 "started_at": started_at,
                 "status": "running",
             });
-            return Ok(CallToolResult::success(vec![ContentBlock::text(
-                payload.to_string(),
-            )]));
+            let prose = render::delegate_prose(&payload);
+            return Ok(CallToolResult::success(single_block(
+                payload, format, prose,
+            )));
         }
 
         let target = profile.clone();
@@ -620,21 +711,23 @@ delegate's own self-report, so spot-verify it like any subagent"
         };
 
         let (five_h, seven_d) = load_windows(&profile);
-        let mut footer =
-            render::live_footer(Some(profile.as_str()), five_h.as_ref(), seven_d.as_ref());
+        let mut payload = envelope;
+        payload["live_usage"] =
+            live_usage_json(Some(profile.as_str()), five_h.as_ref(), seven_d.as_ref());
         if let Some(note) = throughput_note(&profile, now_epoch_secs()) {
-            footer.push('\n');
-            footer.push_str(&note);
+            payload["live_usage"]["throughput_warning"] = serde_json::Value::String(note);
         }
-        let is_error = envelope
+        let is_error = payload
             .get("is_error")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
-        let content = with_footer(envelope, footer);
+        let prose = render::delegate_prose(&payload);
         if is_error {
-            Ok(CallToolResult::error(content))
+            Ok(CallToolResult::error(single_block(payload, format, prose)))
         } else {
-            Ok(CallToolResult::success(content))
+            Ok(CallToolResult::success(single_block(
+                payload, format, prose,
+            )))
         }
     }
 
@@ -643,17 +736,25 @@ delegate's own self-report, so spot-verify it like any subagent"
 clauth's PostToolUse hook delivers the result on its own. Use it when hooks are off, or to check \
 progress; `wait_secs` (0..=60) long-polls. Returns the delegate envelope when done, else \
 `{status:\"running\", elapsed_secs, quota?}` (`quota` only when that `delegate` call set \
-`monitor: true`), or an error for an unknown `job_id`"
+`monitor: true`), or an error for an unknown `job_id`. Prose by default; pass `format: \"json\"` \
+for the structured payload."
     )]
     async fn delegate_result(
         &self,
-        Parameters(DelegateResultArgs { job_id, wait_secs }): Parameters<DelegateResultArgs>,
+        Parameters(DelegateResultArgs {
+            job_id,
+            wait_secs,
+            format,
+        }): Parameters<DelegateResultArgs>,
     ) -> Result<CallToolResult, ErrorData> {
+        let format = match Format::parse(format.as_deref()) {
+            Ok(f) => f,
+            Err(reason) => return Ok(format_refusal(reason)),
+        };
         if !jobs::is_safe_job_id(&job_id) {
             let payload = serde_json::json!({ "is_error": true, "result": "invalid job_id" });
-            return Ok(CallToolResult::error(vec![ContentBlock::text(
-                payload.to_string(),
-            )]));
+            let prose = render::delegate_result_prose(&payload);
+            return Ok(CallToolResult::error(single_block(payload, format, prose)));
         }
         let wait = wait_secs.unwrap_or(0).min(MAX_RESULT_WAIT_SECS);
         let jid = job_id.clone();
@@ -664,9 +765,8 @@ progress; `wait_secs` (0..=60) long-polls. Returns the delegate envelope when do
         match outcome {
             WaitOutcome::Unknown => {
                 let payload = serde_json::json!({ "is_error": true, "result": format!("unknown job_id: {job_id}") });
-                Ok(CallToolResult::error(vec![ContentBlock::text(
-                    payload.to_string(),
-                )]))
+                let prose = render::delegate_result_prose(&payload);
+                Ok(CallToolResult::error(single_block(payload, format, prose)))
             }
             WaitOutcome::Running(record) => {
                 let elapsed_secs = now_ms().saturating_sub(record.started_at) / 1000;
@@ -680,15 +780,16 @@ progress; `wait_secs` (0..=60) long-polls. Returns the delegate envelope when do
                 if record.monitor {
                     payload["quota"] = windows_json(&record.profile);
                 }
-                Ok(CallToolResult::success(vec![ContentBlock::text(
-                    payload.to_string(),
-                )]))
+                let prose = render::delegate_result_prose(&payload);
+                Ok(CallToolResult::success(single_block(
+                    payload, format, prose,
+                )))
             }
             WaitOutcome::Done(record) => {
                 // Fallback path delivered it — evict so the file doesn't linger
                 // past its purpose (GC also reaps it on a TTL).
                 jobs::remove(&job_id);
-                let envelope = record.envelope.unwrap_or_else(|| {
+                let mut payload = record.envelope.unwrap_or_else(|| {
                     serde_json::json!({
                         "profile": record.profile,
                         "is_error": true,
@@ -696,24 +797,25 @@ progress; `wait_secs` (0..=60) long-polls. Returns the delegate envelope when do
                     })
                 });
                 let (five_h, seven_d) = load_windows(&record.profile);
-                let mut footer = render::live_footer(
+                payload["live_usage"] = live_usage_json(
                     Some(record.profile.as_str()),
                     five_h.as_ref(),
                     seven_d.as_ref(),
                 );
                 if let Some(note) = throughput_note(&record.profile, now_epoch_secs()) {
-                    footer.push('\n');
-                    footer.push_str(&note);
+                    payload["live_usage"]["throughput_warning"] = serde_json::Value::String(note);
                 }
-                let is_error = envelope
+                let is_error = payload
                     .get("is_error")
                     .and_then(|v| v.as_bool())
                     .unwrap_or(false);
-                let content = with_footer(envelope, footer);
+                let prose = render::delegate_result_prose(&payload);
                 if is_error {
-                    Ok(CallToolResult::error(content))
+                    Ok(CallToolResult::error(single_block(payload, format, prose)))
                 } else {
-                    Ok(CallToolResult::success(content))
+                    Ok(CallToolResult::success(single_block(
+                        payload, format, prose,
+                    )))
                 }
             }
         }
@@ -1755,3 +1857,7 @@ mod which_tool_tests;
 #[cfg(test)]
 #[path = "../../tests/inline/mcp_list_profiles_tool.rs"]
 mod list_profiles_tool_tests;
+
+#[cfg(test)]
+#[path = "../../tests/inline/mcp_format.rs"]
+mod format_tests;

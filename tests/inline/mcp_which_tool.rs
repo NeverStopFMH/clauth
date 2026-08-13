@@ -57,8 +57,14 @@ fn call_which() -> CallToolResult {
     let rt = tokio::runtime::Builder::new_current_thread()
         .build()
         .expect("runtime");
-    rt.block_on(async { server.which().await })
-        .expect("which returns a tool result, never a transport error")
+    rt.block_on(async {
+        server
+            .which(Parameters(WhichArgs {
+                format: Some("json".to_string()),
+            }))
+            .await
+    })
+    .expect("which returns a tool result, never a transport error")
 }
 
 /// The tool's payload is the first content block; the second is the usage footer.

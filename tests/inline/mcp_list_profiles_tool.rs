@@ -40,6 +40,7 @@ fn call_list(names: Option<Vec<&str>>) -> CallToolResult {
         server
             .list_profiles(Parameters(ListProfilesArgs {
                 names: names.map(|v| v.into_iter().map(str::to_string).collect()),
+                format: Some("json".to_string()),
             }))
             .await
     })

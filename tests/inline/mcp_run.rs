@@ -45,6 +45,7 @@ fn run_with_depth(depth: &str) -> CallToolResult {
                 isolated: None,
                 background: None,
                 monitor: None,
+                format: Some("json".to_string()),
             }))
             .await
     });
@@ -248,7 +249,11 @@ fn delegate_env_caller_reauthority_and_clauth_keys_win() {
 
 /// Drive `delegate_result` on a current-thread runtime under a home sandbox the
 /// caller has already entered.
-fn call_delegate_result(job_id: &str, wait_secs: Option<u64>) -> CallToolResult {
+fn call_delegate_result(
+    job_id: &str,
+    wait_secs: Option<u64>,
+    format: Option<&str>,
+) -> CallToolResult {
     let server = ClauthServer::new();
     let rt = tokio::runtime::Builder::new_current_thread()
         .build()
@@ -258,6 +263,7 @@ fn call_delegate_result(job_id: &str, wait_secs: Option<u64>) -> CallToolResult 
             .delegate_result(Parameters(DelegateResultArgs {
                 job_id: job_id.to_string(),
                 wait_secs,
+                format: format.map(str::to_string),
             }))
             .await
     })
@@ -267,7 +273,7 @@ fn call_delegate_result(job_id: &str, wait_secs: Option<u64>) -> CallToolResult 
 #[test]
 fn delegate_result_unknown_job_is_error() {
     let _home = HomeSandbox::new();
-    let result = call_delegate_result("d-doesnotexist-0", Some(0));
+    let result = call_delegate_result("d-doesnotexist-0", Some(0), None);
     assert_eq!(
         result.is_error,
         Some(true),
@@ -278,7 +284,7 @@ fn delegate_result_unknown_job_is_error() {
 #[test]
 fn delegate_result_invalid_job_id_is_error() {
     let _home = HomeSandbox::new();
-    let result = call_delegate_result("../escape", Some(0));
+    let result = call_delegate_result("../escape", Some(0), None);
     assert_eq!(result.is_error, Some(true), "path-unsafe job_id refused");
 }
 
@@ -286,7 +292,7 @@ fn delegate_result_invalid_job_id_is_error() {
 fn delegate_result_running_reports_status() {
     let _home = HomeSandbox::new();
     jobs::write_running("d-run-0", "work", 1, false).unwrap();
-    let result = call_delegate_result("d-run-0", Some(0));
+    let result = call_delegate_result("d-run-0", Some(0), Some("json"));
     assert_ne!(result.is_error, Some(true), "a running job is not an error");
     let text = result
         .content
@@ -303,7 +309,7 @@ fn delegate_result_running_reports_status() {
 fn delegate_result_running_monitor_reports_quota() {
     let _home = HomeSandbox::new();
     jobs::write_running("d-mon-0", "work", 1, true).unwrap();
-    let result = call_delegate_result("d-mon-0", Some(0));
+    let result = call_delegate_result("d-mon-0", Some(0), Some("json"));
     assert_ne!(result.is_error, Some(true), "a running job is not an error");
     let text = result
         .content
@@ -321,7 +327,7 @@ fn delegate_result_done_returns_envelope_and_evicts() {
     let env = serde_json::json!({ "profile": "work", "is_error": false, "result": "all done" });
     jobs::write_done("d-done-0", "work", 1, env).unwrap();
 
-    let result = call_delegate_result("d-done-0", Some(0));
+    let result = call_delegate_result("d-done-0", Some(0), None);
     assert_ne!(result.is_error, Some(true));
     let text = result
         .content
@@ -363,6 +369,7 @@ fn background_depth_guard_refuses_without_writing_job() {
                 isolated: None,
                 background: Some(true),
                 monitor: None,
+                format: None,
             }))
             .await
     });
@@ -456,7 +463,7 @@ fn delegate_result_long_poll_sees_completion() {
             serde_json::json!({ "profile": "work", "is_error": false, "result": "late finish" });
         jobs::write_done("d-poll-0", "work", 1, env).unwrap();
     });
-    let result = call_delegate_result("d-poll-0", Some(5));
+    let result = call_delegate_result("d-poll-0", Some(5), None);
     writer.join().unwrap();
 
     assert_ne!(result.is_error, Some(true));

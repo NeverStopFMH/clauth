@@ -52,6 +52,7 @@ fn call_switch(name: &str) -> CallToolResult {
         server
             .switch(Parameters(SwitchArgs {
                 name: name.to_string(),
+                format: None,
             }))
             .await
     })

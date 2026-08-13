@@ -2,14 +2,6 @@
 
 use super::*;
 use crate::providers::{StatRow, StatRowKind, ThirdPartyStats, UsageBar};
-use crate::usage::UsageWindow;
-
-fn window(util: f64, resets_at: Option<&str>) -> UsageWindow {
-    UsageWindow {
-        utilization: util,
-        resets_at: resets_at.map(str::to_string),
-    }
-}
 
 fn snapshot(name: &str, active: bool) -> ProfileSnapshot {
     ProfileSnapshot {
@@ -119,22 +111,6 @@ fn third_party_headline_unavailable_when_empty() {
     let mut s = third_party_stats(vec![], vec![], None);
     s.is_available = false;
     assert_eq!(third_party_headline(&s), "unavailable");
-}
-
-#[test]
-fn live_footer_joins_present_parts() {
-    let five = window(33.0, None);
-    let seven = window(8.0, None);
-    assert_eq!(
-        live_footer(Some("work"), Some(&five), Some(&seven)),
-        "active=work | 5h 33% used | 7d 8% used"
-    );
-}
-
-#[test]
-fn live_footer_omits_absent_parts() {
-    assert_eq!(live_footer(None, None, None), "");
-    assert_eq!(live_footer(Some("x"), None, None), "active=x");
 }
 
 #[test]
@@ -336,4 +312,207 @@ fn session_auth_variants_shape_switch_note_and_runtime_paths() {
             "only an isolated `clauth start` runtime may claim the symlink layout",
         );
     }
+}
+
+#[test]
+fn live_usage_prose_names_every_window_and_warns() {
+    let full = live_usage_prose(
+        &serde_json::json!({"profile": "work", "5h_used_pct": 12.3, "7d_used_pct": 45.6}),
+        "target",
+    );
+    assert_eq!(full, "target `work`: 5h 12.3% used, 7d 45.6% used");
+
+    // A null window reads `unknown`, never drops out as if it were zero.
+    let nulls = live_usage_prose(
+        &serde_json::json!({"profile": null, "5h_used_pct": null, "7d_used_pct": null}),
+        "active profile",
+    );
+    assert_eq!(nulls, "active profile `unknown`: 5h unknown, 7d unknown");
+
+    let warned = live_usage_prose(
+        &serde_json::json!({
+            "profile": "work",
+            "5h_used_pct": 12.0,
+            "7d_used_pct": 45.6,
+            "throughput_warning": "⚠ throughput: deepseek-chat degraded"
+        }),
+        "target",
+    );
+    assert_eq!(
+        warned,
+        "target `work`: 5h 12% used, 7d 45.6% used; ⚠ throughput: deepseek-chat degraded"
+    );
+}
+
+#[test]
+fn list_profiles_prose_renders_each_row_with_unknown_for_null_fields() {
+    let solo = serde_json::json!({
+        "name": "solo",
+        "active": true,
+        "provider": "anthropic",
+        "tier": null,
+        "windows": [],
+        "third_party": null
+    });
+    let vendor = serde_json::json!({
+        "name": "vendor",
+        "active": false,
+        "provider": "DeepSeek",
+        "tier": null,
+        "host": "api.deepseek.com",
+        "windows": [
+            {"label": "5h", "utilization_pct": 12.3, "resets_at": null},
+            {"label": "7d", "utilization_pct": 45.0, "resets_at": "2026-08-13T00:00:00Z"}
+        ],
+        "third_party": "pro: 5h 50% used",
+        "has_live_session": true,
+        "throughput": [{
+            "model": "deepseek-chat",
+            "tok_s": 12.3,
+            "samples": 5,
+            "degraded": true,
+            "rate_limited_recent": false,
+            "retry_after_s": null
+        }]
+    });
+    let text = list_profiles_prose(&serde_json::json!({"profiles": [solo, vendor]}));
+    assert_eq!(
+        text,
+        "- solo (active) [anthropic]: usage unknown; tier unknown\n\
+         - vendor [DeepSeek, api.deepseek.com]: 5h 12.3% used, 7d 45% used (resets_at 2026-08-13T00:00:00Z); pro: 5h 50% used; live session; throughput: `deepseek-chat` 12.3 tok/s, 5 samples, degraded true, rate_limited_recent false"
+    );
+}
+
+#[test]
+fn list_profiles_prose_handles_empty_roster_and_error_envelope() {
+    assert_eq!(
+        list_profiles_prose(&serde_json::json!({"profiles": []})),
+        "no profiles"
+    );
+    assert_eq!(
+        list_profiles_prose(
+            &serde_json::json!({"ok": false, "reason": "profile not found: ghost"})
+        ),
+        "error: profile not found: ghost"
+    );
+}
+
+#[test]
+fn which_prose_names_identity_and_usage() {
+    let p = serde_json::json!({
+        "profile": "kerry",
+        "source": "session_dir",
+        "tier": "Free",
+        "throughput": [],
+        "live_usage": {"profile": "kerry", "5h_used_pct": 12.0, "7d_used_pct": null}
+    });
+    assert_eq!(
+        which_prose(&p),
+        "session profile `kerry`, source `session_dir`, tier `Free`; active profile `kerry`: 5h 12% used, 7d unknown"
+    );
+}
+
+#[test]
+fn which_prose_says_unknown_when_unresolved() {
+    let p = serde_json::json!({
+        "profile": null,
+        "source": null,
+        "tier": null,
+        "throughput": [],
+        "live_usage": {"profile": null, "5h_used_pct": null, "7d_used_pct": null}
+    });
+    assert_eq!(
+        which_prose(&p),
+        "session profile unknown, source unknown, tier unknown; active profile `unknown`: 5h unknown, 7d unknown"
+    );
+}
+
+#[test]
+fn switch_prose_renders_success_and_failure() {
+    let ok = serde_json::json!({
+        "ok": true,
+        "previous": null,
+        "active": "work",
+        "live_usage": {"profile": "work", "5h_used_pct": 12.0, "7d_used_pct": null}
+    });
+    assert_eq!(
+        switch_prose(&ok),
+        "switched the global active profile from unknown to `work`; active profile `work`: 5h 12% used, 7d unknown"
+    );
+
+    let err = serde_json::json!({
+        "ok": false,
+        "reason": "profile not found: ghost",
+        "live_usage": {"profile": null, "5h_used_pct": null, "7d_used_pct": null}
+    });
+    assert_eq!(
+        switch_prose(&err),
+        "switch failed: profile not found: ghost; active profile `unknown`: 5h unknown, 7d unknown"
+    );
+}
+
+#[test]
+fn delegate_prose_renders_background_depth_and_sync_envelope() {
+    let bg = serde_json::json!({
+        "job_id": "d-42-0",
+        "profile": "work",
+        "status": "running",
+        "started_at": 123
+    });
+    assert_eq!(
+        delegate_prose(&bg),
+        "delegate to `work` running, job_id `d-42-0`, started_at 123"
+    );
+
+    let depth = serde_json::json!({
+        "profile": "any",
+        "is_error": true,
+        "result": "delegation depth exceeded (max 1)"
+    });
+    assert_eq!(
+        delegate_prose(&depth),
+        "delegate to `any` failed: delegation depth exceeded (max 1)"
+    );
+
+    let sync = serde_json::json!({
+        "profile": "work",
+        "is_error": false,
+        "result": "all done",
+        "total_cost_usd": 0.5,
+        "usage": {"input_tokens": 100, "output_tokens": 50},
+        "live_usage": {"profile": "work", "5h_used_pct": 12.0, "7d_used_pct": 45.6}
+    });
+    assert_eq!(
+        delegate_prose(&sync),
+        "delegate to `work` finished: all done (cost $0.5), usage: input_tokens 100, output_tokens 50; target `work`: 5h 12% used, 7d 45.6% used"
+    );
+}
+
+#[test]
+fn delegate_result_prose_renders_running_invalid_and_done() {
+    let running = serde_json::json!({
+        "job_id": "d-7",
+        "status": "running",
+        "elapsed_secs": 7,
+        "quota": [{"label": "5h", "utilization_pct": 12.0, "resets_at": null}]
+    });
+    assert_eq!(
+        delegate_result_prose(&running),
+        "job `d-7` running, elapsed 7s; quota: 5h 12% used"
+    );
+
+    let invalid = serde_json::json!({"is_error": true, "result": "invalid job_id"});
+    assert_eq!(delegate_result_prose(&invalid), "error: invalid job_id");
+
+    let done = serde_json::json!({
+        "profile": "work",
+        "is_error": false,
+        "result": "done",
+        "total_cost_usd": 1.25,
+        "live_usage": {"profile": "work", "5h_used_pct": 12.0, "7d_used_pct": 45.6}
+    });
+    assert_eq!(
+        delegate_result_prose(&done),
+        "delegate to `work` finished: done (cost $1.25); target `work`: 5h 12% used, 7d 45.6% used"
+    );
 }

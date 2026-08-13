@@ -1,10 +1,12 @@
 //! Pure formatters for the MCP layer: init instructions block, per-call live
-//! footer, single usage line, third-party headline. No I/O, no locks — callers
-//! pass in already-loaded cache data so these stay unit-testable.
+//! footer, third-party headline, and the prose spellings of each tool's JSON
+//! payload. No I/O, no locks — callers pass in already-loaded cache data so
+//! these stay unit-testable.
+
+use serde_json::Value;
 
 use crate::format::format_pct;
 use crate::providers::ThirdPartyStats;
-use crate::usage::UsageWindow;
 use crate::which::SessionAuth;
 
 /// Per-profile snapshot fed to [`instructions_block`]: stable identity only (name,
@@ -178,28 +180,6 @@ pub(crate) fn third_party_headline(s: &ThirdPartyStats) -> String {
     }
 }
 
-/// Compact freshness footer appended to every `which`/`switch`/`delegate` result:
-/// active profile + 5h/7d percent-used for the touched profile, read fresh from
-/// cache. Percentages are the share of the window consumed (higher = less
-/// headroom), labeled `% used` so the reader can't invert it.
-pub(crate) fn live_footer(
-    active: Option<&str>,
-    five_h: Option<&UsageWindow>,
-    seven_d: Option<&UsageWindow>,
-) -> String {
-    let mut parts = Vec::with_capacity(3);
-    if let Some(a) = active {
-        parts.push(format!("active={a}"));
-    }
-    if let Some(w) = five_h {
-        parts.push(format!("5h {} used", format_pct(w.utilization)));
-    }
-    if let Some(w) = seven_d {
-        parts.push(format!("7d {} used", format_pct(w.utilization)));
-    }
-    parts.join(" | ")
-}
-
 /// What a `switch` does to *this* session, keyed on how it reads its credentials.
 /// A global session reads the exact file `switch` repoints; an isolated session
 /// (a `clauth start` runtime or a custom `CLAUDE_CONFIG_DIR`) reads its own, so a
@@ -289,6 +269,369 @@ anything added since):\n",
     );
     out.push_str(&roster_lines(profiles));
     out
+}
+
+// ── prose spellings (`format: "prose"` is the default) ──────────────────────
+//
+// Each tool's JSON payload has exactly one prose spelling, produced here. The
+// contract: every non-null field the payload carries is named, a null number
+// reads as `unknown` (never `0%` or an omission a reader takes for `none`), and
+// no figure appears that the payload did not have. Raw timestamps are named,
+// not re-derived into `resets in N` — a derived figure is one the JSON did not
+// carry.
+
+/// A window's share as a prose clause: `12% used` for a number, `unknown` for
+/// `None` (so a null reads as unknown, never as `unknown used`).
+fn pct_clause(v: Option<f64>) -> String {
+    v.map_or_else(
+        || "unknown".to_string(),
+        |p| format!("{} used", format_pct(p)),
+    )
+}
+
+/// The folded-in `live_usage` object as a sentence clause. `lead` is the noun
+/// for the profile it names: `active profile` for `which`/`switch`, `target` for
+/// `delegate`. A null window reads `unknown`.
+pub(crate) fn live_usage_prose(lu: &Value, lead: &str) -> String {
+    let name = lu
+        .get("profile")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    let five = lu.get("5h_used_pct").and_then(Value::as_f64);
+    let seven = lu.get("7d_used_pct").and_then(Value::as_f64);
+    let mut out = format!(
+        "{lead} `{name}`: 5h {}, 7d {}",
+        pct_clause(five),
+        pct_clause(seven)
+    );
+    if let Some(w) = lu.get("throughput_warning").and_then(Value::as_str) {
+        out.push_str("; ");
+        out.push_str(w);
+    }
+    out
+}
+
+/// The `windows` array (or `quota` array) as one clause. Empty array is `usage
+/// unknown`: no cache is not a zero.
+fn windows_prose(windows: &Value) -> String {
+    let Some(ws) = windows.as_array() else {
+        return "usage unknown".to_string();
+    };
+    if ws.is_empty() {
+        return "usage unknown".to_string();
+    }
+    ws.iter()
+        .map(|w| {
+            let label = w.get("label").and_then(Value::as_str).unwrap_or("unknown");
+            let pct = w.get("utilization_pct").and_then(Value::as_f64);
+            let mut s = format!("{label} {}", pct_clause(pct));
+            if let Some(r) = w.get("resets_at").and_then(Value::as_str) {
+                s.push_str(&format!(" (resets_at {r})"));
+            }
+            s
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Per-model throughput rows (`which`'s full summary or a roster's warnings).
+/// Every row field is named, `unknown` where the payload is null.
+fn throughput_prose(rows: &[Value]) -> String {
+    rows.iter()
+        .map(|m| {
+            let model = m.get("model").and_then(Value::as_str).unwrap_or("unknown");
+            let tok_s = m
+                .get("tok_s")
+                .and_then(Value::as_f64)
+                .map_or_else(|| "unknown".to_string(), |v| v.to_string());
+            let samples = m
+                .get("samples")
+                .and_then(Value::as_u64)
+                .map_or_else(|| "unknown".to_string(), |v| v.to_string());
+            let degraded = m
+                .get("degraded")
+                .and_then(Value::as_bool)
+                .map_or_else(|| "unknown".to_string(), |v| v.to_string());
+            let limited = m
+                .get("rate_limited_recent")
+                .and_then(Value::as_bool)
+                .map_or_else(|| "unknown".to_string(), |v| v.to_string());
+            let mut s = format!(
+                "`{model}` {tok_s} tok/s, {samples} samples, degraded {degraded}, rate_limited_recent {limited}"
+            );
+            if let Some(r) = m.get("retry_after_s").and_then(Value::as_u64) {
+                s.push_str(&format!(", retry_after_s {r}"));
+            }
+            s
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+/// One roster row as a prose line: name + active marker, the
+/// `[provider, tier, host]` bracket, the live windows, the third-party
+/// headline, then the quiet flags. A null tier on an anthropic account and a
+/// missing third-party balance both read `unknown` rather than dropping out.
+fn profile_line(row: &Value) -> String {
+    let name = row.get("name").and_then(Value::as_str).unwrap_or("unknown");
+    let active = row.get("active").and_then(Value::as_bool).unwrap_or(false);
+    let provider = row
+        .get("provider")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    let tier = row.get("tier").and_then(Value::as_str);
+    let host = row.get("host").and_then(Value::as_str);
+
+    let mut bracket = vec![provider.to_string()];
+    if let Some(t) = tier {
+        bracket.push(t.to_string());
+    }
+    if let Some(h) = host {
+        bracket.push(h.to_string());
+    }
+
+    let mut out = format!(
+        "- {}{} [{}]: {}",
+        name,
+        if active { " (active)" } else { "" },
+        bracket.join(", "),
+        windows_prose(&row["windows"]),
+    );
+
+    // `third_party` is null for every anthropic profile (not third-party at all)
+    // AND for a third-party profile with no cache yet; `provider` disambiguates.
+    let third = row.get("third_party").and_then(Value::as_str);
+    match (provider, third) {
+        (_, Some(t)) if !t.is_empty() => {
+            out.push_str(&format!("; {t}"));
+        }
+        ("anthropic", _) => {}
+        (_, _) => out.push_str("; balance unknown"),
+    }
+
+    // A null tier is structural for third-party accounts, but on an anthropic
+    // account it means the plan is unknown.
+    if tier.is_none() && provider == "anthropic" {
+        out.push_str("; tier unknown");
+    }
+    if row
+        .get("has_live_session")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        out.push_str("; live session");
+    }
+    if let Some(rows) = row.get("throughput").and_then(Value::as_array)
+        && !rows.is_empty()
+    {
+        out.push_str("; throughput: ");
+        out.push_str(&throughput_prose(rows));
+    }
+    out
+}
+
+/// Prose for `list_profiles`: its error envelope, or one line per profile.
+pub(crate) fn list_profiles_prose(p: &Value) -> String {
+    if p.get("ok").and_then(Value::as_bool) == Some(false) {
+        return format!(
+            "error: {}",
+            p.get("reason").and_then(Value::as_str).unwrap_or("unknown")
+        );
+    }
+    let Some(rows) = p.get("profiles").and_then(Value::as_array) else {
+        return "unknown".to_string();
+    };
+    if rows.is_empty() {
+        return "no profiles".to_string();
+    }
+    rows.iter().map(profile_line).collect::<Vec<_>>().join("\n")
+}
+
+/// Prose for `which`: session identity, throughput when observed, then the
+/// active profile's live usage.
+pub(crate) fn which_prose(p: &Value) -> String {
+    let profile = p
+        .get("profile")
+        .and_then(Value::as_str)
+        .map_or_else(|| "unknown".to_string(), |v| format!("`{v}`"));
+    let source = p
+        .get("source")
+        .and_then(Value::as_str)
+        .map_or_else(|| "unknown".to_string(), |v| format!("`{v}`"));
+    let tier = p
+        .get("tier")
+        .and_then(Value::as_str)
+        .map_or_else(|| "unknown".to_string(), |v| format!("`{v}`"));
+    let mut out = format!("session profile {profile}, source {source}, tier {tier}");
+    if let Some(rows) = p.get("throughput").and_then(Value::as_array)
+        && !rows.is_empty()
+    {
+        out.push_str("; throughput: ");
+        out.push_str(&throughput_prose(rows));
+    }
+    out.push_str("; ");
+    out.push_str(&live_usage_prose(&p["live_usage"], "active profile"));
+    out
+}
+
+/// Prose for `switch`: the outcome, then the active profile's live usage.
+pub(crate) fn switch_prose(p: &Value) -> String {
+    let live = live_usage_prose(&p["live_usage"], "active profile");
+    match p.get("ok").and_then(Value::as_bool) {
+        Some(true) => {
+            let previous = p
+                .get("previous")
+                .and_then(Value::as_str)
+                .map_or_else(|| "unknown".to_string(), |v| format!("`{v}`"));
+            let active = p
+                .get("active")
+                .and_then(Value::as_str)
+                .map_or_else(|| "unknown".to_string(), |v| format!("`{v}`"));
+            format!("switched the global active profile from {previous} to {active}; {live}")
+        }
+        _ => {
+            let reason = p.get("reason").and_then(Value::as_str).unwrap_or("unknown");
+            format!("switch failed: {reason}; {live}")
+        }
+    }
+}
+
+/// The token-usage object of a delegate envelope as one clause, keyed on every
+/// field claude put there. `unknown` for a null value.
+fn usage_prose(u: &Value) -> String {
+    let Some(obj) = u.as_object() else {
+        return "unknown".to_string();
+    };
+    if obj.is_empty() {
+        return String::new();
+    }
+    obj.iter()
+        .map(|(k, v)| {
+            let val = match v {
+                Value::Number(n) => n.to_string(),
+                Value::Bool(b) => b.to_string(),
+                Value::String(s) => s.clone(),
+                Value::Null => "unknown".to_string(),
+                other => other.to_string(),
+            };
+            format!("{k} {val}")
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Prose for a delegate envelope: the verdict (`finished` / `failed` / `timed
+/// out`), the self-report, cost and tokens, then the kill/resume markers. The
+/// raw envelope may carry more of claude's own fields; those stay in the JSON
+/// spelling, and this names the fields clauth documents.
+fn envelope_prose(e: &Value) -> String {
+    let mut out = String::new();
+    if let Some(t) = e.get("timed_out").and_then(Value::as_str) {
+        out.push_str(&format!("timed out ({t})"));
+        if let Some(el) = e.get("elapsed_secs").and_then(Value::as_u64) {
+            out.push_str(&format!(" after {el}s"));
+        }
+    } else if e.get("is_error").and_then(Value::as_bool).unwrap_or(false) {
+        out.push_str("failed");
+    } else {
+        out.push_str("finished");
+    }
+    out.push_str(": ");
+    out.push_str(e.get("result").and_then(Value::as_str).unwrap_or("unknown"));
+
+    if let Some(cost) = e.get("total_cost_usd").and_then(Value::as_f64) {
+        out.push_str(&format!(" (cost ${cost})"));
+    }
+    if let Some(u) = e.get("usage") {
+        let tokens = usage_prose(u);
+        if !tokens.is_empty() {
+            out.push_str(&format!(", usage: {tokens}"));
+        }
+    }
+    if let Some(p) = e.get("partial_result").and_then(Value::as_str) {
+        out.push_str(&format!("; partial_result: {p}"));
+    }
+    if let Some(sid) = e.get("session_id").and_then(Value::as_str) {
+        out.push_str(&format!("; resume with session_id `{sid}`"));
+    }
+    if let Some(denials) = e.get("permission_denials")
+        && !denials.is_null()
+    {
+        out.push_str(&format!("; permission_denials: {denials}"));
+    }
+    out
+}
+
+/// Prose for `delegate`: the background handle, the sync envelope, or the
+/// depth-guard refusal.
+pub(crate) fn delegate_prose(p: &Value) -> String {
+    if let Some(job_id) = p.get("job_id").and_then(Value::as_str) {
+        let profile = p
+            .get("profile")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        let status = p.get("status").and_then(Value::as_str).unwrap_or("unknown");
+        let mut out = format!("delegate to `{profile}` {status}, job_id `{job_id}`");
+        if let Some(s) = p.get("started_at").and_then(Value::as_u64) {
+            out.push_str(&format!(", started_at {s}"));
+        }
+        return out;
+    }
+    let target = p
+        .get("live_usage")
+        .and_then(|lu| lu.get("profile"))
+        .and_then(Value::as_str);
+    let mut out = match target {
+        Some(t) => format!("delegate to `{t}` {}", envelope_prose(p)),
+        None => {
+            let profile = p
+                .get("profile")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown");
+            format!("delegate to `{profile}` {}", envelope_prose(p))
+        }
+    };
+    if let Some(lu) = p.get("live_usage") {
+        out.push_str("; ");
+        out.push_str(&live_usage_prose(lu, "target"));
+    }
+    out
+}
+
+/// Prose for `delegate_result`: the running status (with optional `quota`), the
+/// done envelope, or an invalid/unknown job_id refusal.
+pub(crate) fn delegate_result_prose(p: &Value) -> String {
+    if p.get("job_id").and_then(Value::as_str).is_some()
+        && p.get("status").and_then(Value::as_str).is_some()
+    {
+        let job_id = p.get("job_id").and_then(Value::as_str).unwrap_or("unknown");
+        let status = p.get("status").and_then(Value::as_str).unwrap_or("unknown");
+        let elapsed = p
+            .get("elapsed_secs")
+            .and_then(Value::as_u64)
+            .map_or_else(|| "unknown".to_string(), |v| format!("{v}s"));
+        let mut out = format!("job `{job_id}` {status}, elapsed {elapsed}");
+        if let Some(q) = p.get("quota") {
+            out.push_str(&format!("; quota: {}", windows_prose(q)));
+        }
+        return out;
+    }
+    if let Some(lu) = p.get("live_usage") {
+        let target = lu
+            .get("profile")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        let mut out = format!("delegate to `{target}` {}", envelope_prose(p));
+        out.push_str("; ");
+        out.push_str(&live_usage_prose(lu, "target"));
+        return out;
+    }
+    let result = p.get("result").and_then(Value::as_str).unwrap_or("unknown");
+    if p.get("is_error").and_then(Value::as_bool).unwrap_or(false) {
+        format!("error: {result}")
+    } else {
+        result.to_string()
+    }
 }
 
 #[cfg(test)]

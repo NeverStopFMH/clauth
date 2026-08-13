@@ -1283,3 +1283,66 @@ mod api_key_helper_tests {
         dispatch_api_key("ghost-profile").expect_err("missing profile must fail closed");
     }
 }
+
+/// `clauth herdr install` and its flags. The grammar is what makes the setup a
+/// single command, so a rename or a dropped flag reds here rather than in a
+/// user's shell.
+#[test]
+fn herdr_install_parses_with_every_flag() {
+    let bare = command(&["herdr", "install"]);
+    let Command::Herdr {
+        cmd:
+            crate::cli::HerdrCommand::Install {
+                key,
+                no_config,
+                yes,
+            },
+    } = bare
+    else {
+        panic!("`herdr install` must select the install arm");
+    };
+    assert_eq!(
+        key, None,
+        "an omitted key is prompted for, never defaulted at the parser"
+    );
+    assert!(!no_config);
+    assert!(!yes);
+
+    let full = command(&[
+        "herdr",
+        "install",
+        "--key",
+        "prefix+a",
+        "--no-config",
+        "--yes",
+    ]);
+    let Command::Herdr {
+        cmd:
+            crate::cli::HerdrCommand::Install {
+                key,
+                no_config,
+                yes,
+            },
+    } = full
+    else {
+        panic!("flagged form must select the install arm");
+    };
+    assert_eq!(key.as_deref(), Some("prefix+a"));
+    assert!(no_config);
+    assert!(yes);
+
+    // `-y` is the short spelling every other confirm-gated command uses.
+    let short = command(&["herdr", "install", "-y"]);
+    let Command::Herdr {
+        cmd: crate::cli::HerdrCommand::Install { yes, .. },
+    } = short
+    else {
+        panic!("`-y` must select the install arm");
+    };
+    assert!(yes);
+
+    // A bare `clauth herdr` names no operation, and `install` is not the only
+    // one it will ever have, so it must stay a usage error rather than a default.
+    assert!(parse(&["herdr"]).is_err());
+    assert!(parse(&["herdr", "instal"]).is_err());
+}

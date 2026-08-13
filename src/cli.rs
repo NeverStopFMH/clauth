@@ -226,6 +226,18 @@ pub(crate) enum Command {
     /// Run the stdio MCP server (claude code launches this)
     Mcp,
 
+    /// Set up the herdr plugin: install it and bind a key to it
+    ///
+    /// `clauth herdr install` runs herdr's own installer, then adds the two
+    /// things a herdr plugin cannot declare for itself: the keybinding that
+    /// opens the dashboard, and the sidebar row that renders which account
+    /// each Claude Code pane burns. Both land in the user's herdr
+    /// `config.toml`, and herdr validates the result before it is written.
+    Herdr {
+        #[command(subcommand)]
+        cmd: HerdrCommand,
+    },
+
     /// Print a shell completion script, or install one
     ///
     /// `clauth completions <bash|zsh|fish>` prints the script to stdout.
@@ -367,4 +379,29 @@ impl LoginArgs {
     pub(crate) fn is_api_mode(&self) -> bool {
         self.base_url.is_some() || self.api_key.is_some()
     }
+}
+
+/// `clauth herdr <cmd>`. One member today; the shape leaves room for the
+/// uninstall side without renaming the command a user has in their notes.
+#[derive(Subcommand, Debug)]
+pub(crate) enum HerdrCommand {
+    /// Install the plugin into herdr and wire it into herdr's own config
+    ///
+    /// herdr's installer prints every command the plugin would run as you and
+    /// asks before registering it; this passes that prompt straight through
+    /// rather than answering it. Run from a clauth checkout it links the local
+    /// `herdr-plugin/` directory instead of fetching the published one.
+    Install {
+        /// Key that opens the dashboard, in herdr's own binding syntax
+        /// (`prefix+a`, `ctrl+alt+c`). Prompted for when omitted.
+        #[arg(long, value_name = "SPEC")]
+        key: Option<String>,
+        /// Install the plugin and leave herdr's config.toml untouched.
+        #[arg(long)]
+        no_config: bool,
+        /// Skip both confirm prompts, herdr's install preview included.
+        /// Required on a non-TTY stdin, which gets no prompt.
+        #[arg(long, short = 'y')]
+        yes: bool,
+    },
 }

@@ -7,6 +7,7 @@ mod completions;
 mod daemon;
 mod fallback;
 mod format;
+mod herdr;
 mod jsonsync;
 // macOS-only: Claude Code reads its login from the Keychain, not the credentials
 // file, so a switch must also write there. Gated so non-macOS builds stay clean.
@@ -189,6 +190,13 @@ fn dispatch(cli: Cli) -> Result<()> {
         }
         Command::ApiKey { profile } => cmd_api_key(&profile),
         Command::Completions { target, shell } => cmd_completions(&target, shell.as_deref()),
+        Command::Herdr { cmd } => match cmd {
+            cli::HerdrCommand::Install {
+                key,
+                no_config,
+                yes,
+            } => herdr::install(key.as_deref(), no_config, yes),
+        },
         Command::Run { .. } => anyhow::bail!(
             "`clauth run` isn't a command; for a headless delegate use \
              `clauth start <profile> -p \"<prompt>\"` (or the MCP `delegate` tool)"

@@ -12,7 +12,7 @@ const BASH: &str = r#"_clauth() {
     if [ "$COMP_CWORD" -eq 1 ]; then
         local profiles
         profiles=$(clauth __complete 2>/dev/null)
-        COMPREPLY=( $(compgen -W "${profiles} start login delete disable enable static-token which list sessions resume info daemon status mcp completions --theme" -- "${cur}") )
+        COMPREPLY=( $(compgen -W "${profiles} start login delete disable enable static-token which list sessions resume info daemon status mcp herdr completions --theme" -- "${cur}") )
     elif [ "$prev" = "--theme" ]; then
         COMPREPLY=( $(compgen -W "full compatible" -- "${cur}") )
     elif [ "${COMP_WORDS[1]}" = "login" ] && [ "${cur:0:2}" = "--" ]; then
@@ -33,6 +33,10 @@ const BASH: &str = r#"_clauth() {
         COMPREPLY=( $(compgen -W "--json" -- "${cur}") )
     elif [ "$COMP_CWORD" -eq 2 ] && [ "$prev" = "sessions" ]; then
         COMPREPLY=( $(compgen -W "--json --tokens" -- "${cur}") )
+    elif [ "$COMP_CWORD" -eq 2 ] && [ "$prev" = "herdr" ]; then
+        COMPREPLY=( $(compgen -W "install" -- "${cur}") )
+    elif [ "${COMP_WORDS[1]}" = "herdr" ] && [ "${cur:0:2}" = "--" ]; then
+        COMPREPLY=( $(compgen -W "--key --no-config --yes -y" -- "${cur}") )
     elif [ "${COMP_WORDS[1]}" = "resume" ] && [ "${cur:0:2}" = "--" ]; then
         COMPREPLY=( $(compgen -W "--profile" -- "${cur}") )
     elif [ "${COMP_WORDS[1]}" = "delete" ] && [ "${cur:0:2}" = "--" ]; then
@@ -72,6 +76,7 @@ _clauth() {
             'daemon[run the headless scheduler with no TUI]' \
             'status[print the usage / auto-switch snapshot as JSON]' \
             'mcp[run the stdio MCP server]' \
+            'herdr[install the herdr plugin and bind a key to it]' \
             'completions[emit shell completion script]'
         _values 'option' '--theme[force a color depth instead of auto-detecting]'
     elif (( CURRENT >= 3 )) && [[ "${words[CURRENT-1]}" == "--theme" ]]; then
@@ -92,6 +97,10 @@ _clauth() {
         local -a profiles
         profiles=("${(@f)$(clauth __complete 2>/dev/null)}")
         _describe 'profile' profiles
+    elif (( CURRENT == 3 )) && [[ "${words[2]}" == herdr ]]; then
+        _values 'subcommand' 'install[install the plugin and wire it into herdr'"'"'s config]'
+    elif (( CURRENT >= 4 )) && [[ "${words[2]}" == herdr ]]; then
+        _values 'flag' '--key[key that opens the dashboard]' '--no-config[leave herdr'"'"'s config.toml alone]' '--yes[skip both confirm prompts]' '-y[skip both confirm prompts]'
     elif (( CURRENT == 3 )) && [[ "${words[2]}" == which ]]; then
         _values 'flag' '--json[emit JSON instead of plain name]'
     elif (( CURRENT == 3 )) && [[ "${words[2]}" == sessions ]]; then
@@ -142,6 +151,11 @@ complete -c clauth -f -n __fish_is_first_token -a completions -d "Emit shell com
 complete -c clauth -f -n __fish_is_first_token -a daemon -d "Run the headless scheduler with no TUI"
 complete -c clauth -f -n __fish_is_first_token -a status -d "Print the usage / auto-switch snapshot as JSON"
 complete -c clauth -f -n __fish_is_first_token -a mcp -d "Run the stdio MCP server"
+complete -c clauth -f -n __fish_is_first_token -a herdr -d "Install the herdr plugin and bind a key to it"
+complete -c clauth -f -n "__fish_seen_subcommand_from herdr" -a install -d "Install the plugin and wire it into herdr's config"
+complete -c clauth -f -n "__fish_seen_subcommand_from herdr" -a --key -d "Key that opens the dashboard"
+complete -c clauth -f -n "__fish_seen_subcommand_from herdr" -a --no-config -d "Leave herdr's config.toml alone"
+complete -c clauth -f -n "__fish_seen_subcommand_from herdr" -a --yes -d "Skip both confirm prompts"
 complete -c clauth -f -n __fish_is_first_token -a --theme -d "Force a color depth instead of auto-detecting"
 complete -c clauth -f -n 'set -l t (commandline -opc); and test "$t[-1]" = "--theme"' -a "full compatible"
 complete -c clauth -f -n "__fish_seen_subcommand_from start login delete disable enable static-token" -a "(__clauth_profiles)" -d Profile

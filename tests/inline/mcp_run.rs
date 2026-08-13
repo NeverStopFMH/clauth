@@ -1080,8 +1080,8 @@ fn roster_rank_reports_free_percent_from_the_best_known_window() {
 
 /// The wallet parse is deliberately strict. It reads a `total` row, and every
 /// provider writes something into one — z.ai's counts tokens. Anything that is
-/// not exactly one amount and one currency code describes no wallet, and a loose
-/// parse would mint a rank out of it and order the roster on token counts.
+/// not exactly one finite amount and one currency code describes no wallet, and
+/// a loose parse would mint a rank out of it and order the roster on token counts.
 #[test]
 fn parse_balance_takes_an_amount_and_a_currency_and_nothing_else() {
     assert_eq!(parse_balance("31.45 USD"), Some(("USD".to_string(), 31.45)));
@@ -1098,10 +1098,21 @@ fn parse_balance_takes_an_amount_and_a_currency_and_nothing_else() {
         "31.45 U",
         "31.45 TOOLONG",
         "31.45 US1",
+        // A non-finite amount must never rank: it outranks (inf) or sinks
+        // below (nan) every real wallet in its currency group.
+        "nan USD",
+        "inf USD",
+        "infinity CNY",
+        "-inf USD",
         "",
     ] {
         assert_eq!(parse_balance(junk), None, "must not rank on `{junk}`");
     }
+    // Exponent and explicit-sign forms parse as finite numbers, so they stay
+    // accepted: they order sanely, and refusing them would silently drop the
+    // wallet rank of an unknown provider that spelled its total that way.
+    assert_eq!(parse_balance("1e3 USD"), Some(("USD".to_string(), 1000.0)));
+    assert_eq!(parse_balance("+1.5 USD"), Some(("USD".to_string(), 1.5)));
 }
 
 /// A profile holding two wallets joins exactly one currency group: the first its

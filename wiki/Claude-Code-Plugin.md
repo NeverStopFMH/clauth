@@ -25,11 +25,13 @@ The TUI's Plugin tab writes exactly that entry for you with <kbd>f</kbd>. The ma
 
 | Tool | Input | Returns | Cost |
 |------|-------|---------|------|
-| `list_profiles` | `names` (optional, case-insensitive) | every profile with cached 5h / 7d percentages, provider, tier, endpoint host, active flag | none, reads the disk cache |
-| `which` | none | the profile owning this session's credentials, its plan, its throughput | none |
-| `switch` | `name` | relinks the global active profile | none |
+| `list_profiles` | `names` (optional, case-insensitive), `format` | every profile with cached 5h / 7d percentages, provider, tier, endpoint host, active flag | none, reads the disk cache |
+| `which` | `format` | the profile owning this session's credentials, its plan, its throughput | none |
+| `switch` | `name`, `format` | relinks the global active profile | none |
 | `delegate` | see below | the target account's answer, or a `job_id` | **a real usage window on the target account** |
-| `delegate_result` | `job_id`, `wait_secs` (0-60, default 0) | a backgrounded job's envelope, or its running status | none |
+| `delegate_result` | `job_id`, `wait_secs` (0-60, default 0), `format` | a backgrounded job's envelope, or its running status | none |
+
+Every tool takes `format` and answers in prose by default; pass `format: "json"` for the structured payload. An unrecognized value is refused by name, never treated as prose.
 
 `which` is the authority on which account owns the current session. `list_profiles` reads a cache and can lag it.
 
@@ -59,6 +61,7 @@ Runs a headless `claude -p` under another profile and returns what it produced.
 | `isolated` | bool | `false` |
 | `background` | bool | `false` |
 | `monitor` | bool | `false` |
+| `format` | string | `prose` (default), or `json` |
 
 **Cost.** A delegate to a subscription account opens a real 5-hour window there. To a pay-as-you-go API-key account it bills real money. To a prepaid plan account it draws down quota you already bought, so it costs nothing extra. Call `list_profiles` first to pick the account with headroom.
 

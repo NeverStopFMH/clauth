@@ -1672,6 +1672,44 @@ mod static_token_verdicts {
 mod armed_report_copy {
     use super::*;
 
+    /// The four clear copy lines, pinned on CONTENT like every other line in
+    /// this mod: single-caller keeps a deleted print a dead-code error, but
+    /// only a pin keeps the WORDS — both pre-prompt lines are TTY-only, so no
+    /// behavioral test ever executes them, and the two postscripts are the
+    /// operator's only confirmation of what actually moved.
+    #[test]
+    fn the_clear_copy_names_the_disarm_the_backup_and_both_postscripts() {
+        let disarm = clear_disarm_note("acme");
+        assert!(
+            disarm.contains("clearing also turns its re-stamping off"),
+            "{disarm}"
+        );
+        let backup = clear_backup_note("acme");
+        assert!(
+            backup.contains("the preserved mint at session-token.static.json goes with it"),
+            "{backup}"
+        );
+        assert!(
+            backup.contains("`clauth static-token acme` will have nothing to restore"),
+            "{backup}"
+        );
+        let disarmed = clear_disarmed_postscript("acme");
+        assert!(disarmed.contains("rolling-token is off"), "{disarmed}");
+        assert!(
+            disarmed.contains("nothing re-stamps a sidecar for 'acme' now"),
+            "{disarmed}"
+        );
+        let swept = clear_backup_postscript("acme");
+        assert!(
+            swept.contains("the preserved mint at session-token.static.json is gone"),
+            "{swept}"
+        );
+        assert!(
+            swept.contains("`clauth static-token acme` has nothing to restore now"),
+            "{swept}"
+        );
+    }
+
     /// The disclosure is the feature's entire security posture in user-facing
     /// copy — there is no confirm prompt by design — so the widening, its
     /// consequence, and the way back must each survive verbatim.
@@ -1808,6 +1846,54 @@ mod static_token_clear {
             !p.rolling_token,
             "the flag goes too, or the daemon re-stamps a sidecar over the clear"
         );
+    }
+
+    /// The other-login refusal is re-checked UNDER the rotation guard, not only
+    /// on the pre-prompt snapshot: the prompt is an unbounded wait, and a
+    /// log-out (the TUI's row, or `rm credentials.json` by hand) can land
+    /// inside it — the one interleaving where this command strips a profile's
+    /// last credential. Driven here through the guard itself: the test holds
+    /// the profile's rotation lock, deletes the stored login while the clear is
+    /// parked on `acquire`, and only then releases.
+    ///
+    /// Green is deliberately timing-proof (WHICHEVER check catches the state,
+    /// nothing may be stripped); the sleep only makes the under-guard check the
+    /// one that fires, which is what the mutation sweep measures.
+    #[test]
+    fn the_other_login_refusal_is_rechecked_under_the_guard() {
+        let home = HomeSandbox::new();
+        cleared_profile("cl-race", false, true);
+        crate::claude::write_session_token(
+            "cl-race",
+            "sk-ant-oat01-clear-race-mint0000",
+            crate::usage::now_ms() as i64 + 300 * 24 * 3_600_000,
+        )
+        .expect("mint");
+        let dir = crate::profile::profile_dir("cl-race").expect("dir");
+        assert!(
+            dir.join("credentials.json").exists(),
+            "fixture: login stored"
+        );
+
+        let guard = crate::runtime::RotationGuard::acquire("cl-race").expect("hold the lock");
+        let worker = std::thread::spawn(move || super::cmd_static_token_clear("cl-race", true));
+        // Give the clear time to pass its pre-prompt snapshot and park on the
+        // guard; then take the login away and let it through.
+        std::thread::sleep(std::time::Duration::from_millis(250));
+        std::fs::remove_file(dir.join("credentials.json")).expect("log out under the prompt");
+        drop(guard);
+
+        let result = worker.join().expect("the clear thread survives");
+        let err = result.expect_err("clearing the last credential must refuse");
+        assert!(
+            format!("{err:#}").contains("stores no other login"),
+            "the refusal names the reason: {err:#}"
+        );
+        assert!(
+            dir.join("session-token.json").exists(),
+            "a refused clear removes nothing"
+        );
+        drop(home);
     }
 
     /// The widened nothing-to-clear gate: a set flag with NO files is exactly

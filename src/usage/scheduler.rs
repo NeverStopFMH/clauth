@@ -3649,10 +3649,10 @@ pub(super) fn claude_rolling_tick(
         // roll that `roll_from_stored_chain` routes to `ChainStale` by flag.
         // Read AFTER the gate, which is what may have just raised it.
         let flagged = config.lock().ok().is_some_and(|c| c.is_auth_broken(&name));
-        let retry_ms = if flagged {
-            ROLLING_BROKEN_RETRY_MS
+        let kind = if flagged {
+            HoldKind::ReloginShaped
         } else {
-            ROLLING_RETRY_MS
+            HoldKind::Transient
         };
         match gate {
             // Ready = re-stamped no-spend or degraded to a serving fallback;
@@ -3666,7 +3666,7 @@ pub(super) fn claude_rolling_tick(
                 // taken — the rank is a leaf precisely because nothing else,
                 // locks or IO, ever happens under it.
                 let still_due = crate::oauth::rolling_sidecar_restamp_due(&name, now as i64);
-                let hold = still_due.then(|| retry_hold(&name, now, retry_ms));
+                let hold = still_due.then(|| retry_hold(&name, now, kind));
                 if let Ok(mut p) = pacing.lock() {
                     match hold {
                         Some(hold) => {
@@ -3687,18 +3687,18 @@ pub(super) fn claude_rolling_tick(
                 // transient for pacing purposes: the 15-minute cadence
                 // against it re-logs the same refusal ~24 times a bearer
                 // lifetime without one of them ever succeeding.
-                let retry_ms = if e.permanent_until_relogin() {
-                    ROLLING_BROKEN_RETRY_MS
+                let kind = if e.permanent_until_relogin() {
+                    HoldKind::ReloginShaped
                 } else {
-                    retry_ms
+                    kind
                 };
-                let hold = retry_hold(&name, now, retry_ms);
+                let hold = retry_hold(&name, now, kind);
                 if let Ok(mut p) = pacing.lock() {
                     p.retry_after_ms.insert(name.clone(), hold);
                 }
             }
             crate::oauth::AuthGate::Broken => {
-                let hold = retry_hold(&name, now, ROLLING_BROKEN_RETRY_MS);
+                let hold = retry_hold(&name, now, HoldKind::ReloginShaped);
                 if let Ok(mut p) = pacing.lock() {
                     p.retry_after_ms.insert(name.clone(), hold);
                 }
@@ -3707,16 +3707,35 @@ pub(super) fn claude_rolling_tick(
     }
 }
 
-/// Build the paced hold for one verdict. The watch rides the DURATION: every
-/// [`ROLLING_BROKEN_RETRY_MS`]-length hold is by construction a re-login-shaped
-/// one (permanent transient, quarantined chain, Broken verdict), and those are
-/// exactly the holds whose real exit is the operator changing a credential
-/// file. Computed before the pacing lock is taken — the fingerprint is
-/// metadata IO, and that rank is a leaf.
-fn retry_hold(name: &str, now: u64, retry_ms: u64) -> RetryHold {
-    RetryHold {
-        not_before: now + retry_ms,
-        watched: (retry_ms == ROLLING_BROKEN_RETRY_MS)
-            .then(|| crate::claude::credential_fingerprint(name)),
+/// Which leash a paced re-stamp hold rides. Every call site KNOWS which one it
+/// is minting (the quarantine read, `permanent_until_relogin`, the Broken
+/// verdict), so the kind is passed rather than inferred back from the duration
+/// — the same move `sidecar_kind_of` made for the other inference: a numeric
+/// coincidence is correct at every site today and breaks silently the first
+/// time a non-re-login verdict wants a long leash.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum HoldKind {
+    /// The minutes cadence ([`ROLLING_RETRY_MS`]) — genuinely transient, and
+    /// the clock is the honest exit.
+    Transient,
+    /// The noise leash ([`ROLLING_BROKEN_RETRY_MS`]) — re-login-shaped
+    /// (permanent transient, quarantined chain, Broken verdict), whose real
+    /// exit is a credential file changing, so the hold carries the watch.
+    ReloginShaped,
+}
+
+/// Build the paced hold for one verdict. The duration and the watch both
+/// derive from the KIND, so they cannot disagree. Computed before the pacing
+/// lock is taken — the fingerprint is metadata IO, and that rank is a leaf.
+fn retry_hold(name: &str, now: u64, kind: HoldKind) -> RetryHold {
+    match kind {
+        HoldKind::Transient => RetryHold {
+            not_before: now + ROLLING_RETRY_MS,
+            watched: None,
+        },
+        HoldKind::ReloginShaped => RetryHold {
+            not_before: now + ROLLING_BROKEN_RETRY_MS,
+            watched: Some(crate::claude::credential_fingerprint(name)),
+        },
     }
 }

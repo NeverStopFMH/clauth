@@ -1087,6 +1087,34 @@ fn config_rows_clear_session_token_row_tracks_the_sidecar() {
         config_rows(&app).contains(&ConfigRow::ClearSessionToken),
         "a mis-filled sidecar needs the same exit"
     );
+
+    // The widened arms, each alone. A set flag with nothing stamped is the
+    // state where hiding the row leaves the daemon to re-create what the
+    // operator has no surface left to remove; a preserved mint alone is a
+    // year-scale credential only this row owns.
+    let dir = crate::profile::profile_dir("acct").expect("profile dir");
+    std::fs::remove_file(dir.join("session-token.json")).expect("drop the sidecar");
+    {
+        let mut cfg = app.config();
+        cfg.find_mut("acct").expect("acct").rolling_token = true;
+    }
+    assert!(
+        config_rows(&app).contains(&ConfigRow::ClearSessionToken),
+        "a set flag alone keeps the row"
+    );
+    {
+        let mut cfg = app.config();
+        cfg.find_mut("acct").expect("acct").rolling_token = false;
+    }
+    assert!(
+        !config_rows(&app).contains(&ConfigRow::ClearSessionToken),
+        "flag down, nothing stored — the row goes again"
+    );
+    std::fs::write(dir.join("session-token.static.json"), b"{}").expect("backup");
+    assert!(
+        config_rows(&app).contains(&ConfigRow::ClearSessionToken),
+        "a preserved mint alone keeps the row"
+    );
 }
 
 /// The row refuses on a profile storing no OTHER login — the same refusal
@@ -1374,6 +1402,103 @@ fn clear_session_token_on_a_rolling_profile_disarms_and_takes_the_backup() {
         "the toast names the disarm, got {:?}",
         app.toasts
     );
+    // Unconditional on the removal, like the CLI's postscript: the hint's
+    // pre-action disclosure is not a report, and `--yes` has no hint at all.
+    assert!(
+        app.toasts
+            .iter()
+            .any(|t| t.body.contains("the preserved mint is gone")),
+        "the toast reports the destroyed backup, got {:?}",
+        app.toasts
+    );
+}
+
+/// The refusal gate reads the same condition as the CLI's: only a stored PIECE
+/// (a sidecar or a preserved mint) is a credential the clear could strip. A
+/// flag-only account with no other login therefore DISARMS — before this, the
+/// widening made its row visible while the press returned silently, a surface
+/// with no behavior on the one state whose only remaining fix it was.
+#[test]
+fn clear_session_token_disarms_a_flag_only_account_with_no_other_login() {
+    use super::{ConfigRow, build_draft_existing, run_config_row};
+    use crate::profile::Profile;
+    let _home = crate::testutil::HomeSandbox::new();
+
+    let mut acct = Profile::new("solo".to_string(), None, None);
+    acct.rolling_token = true;
+    crate::profile::save_profile(&acct).expect("save profile");
+
+    let mut app = app_with(vec![acct]);
+    app.profile_cursor = 0;
+    app.config_draft = Some(build_draft_existing(&app, "solo"));
+
+    run_config_row(&mut app, ConfigRow::ClearSessionToken);
+    run_config_row(&mut app, ConfigRow::ClearSessionToken);
+
+    let p = crate::profile::load_profile("solo").expect("reload");
+    assert!(
+        !p.rolling_token,
+        "the disarm lands on disk, as the CLI's does"
+    );
+    assert!(
+        app.toasts
+            .iter()
+            .any(|t| t.body.contains("re-stamping off")),
+        "the disarm is reported, got {:?}",
+        app.toasts
+    );
+}
+
+/// The renderer's in-memory flag flips only AFTER the persist lands. Flipped
+/// first, a failed `save_profile` leaves `app.config()` claiming the flag is
+/// off against a disk that still says on — `reload_fingerprint` never corrects
+/// it (config mtime did not move), and any later unrelated save makes the lie
+/// durable: a live rolling sidecar nothing re-stamps.
+#[test]
+fn clear_session_token_keeps_the_flag_when_the_persist_fails() {
+    use super::{ConfigRow, build_draft_existing, run_config_row};
+    use crate::profile::Profile;
+    let _home = crate::testutil::HomeSandbox::new();
+
+    let mut acct = Profile::new("stuck".to_string(), None, None);
+    acct.credentials = Some(split_creds("stored-oauth", Some("stored-refresh")));
+    acct.rolling_token = true;
+    crate::profile::save_profile(&acct).expect("save profile");
+    seed_session_token("stuck", None);
+    let dir = crate::profile::profile_dir("stuck").expect("profile dir");
+
+    let mut app = app_with(vec![acct]);
+    app.profile_cursor = 0;
+    app.config_draft = Some(build_draft_existing(&app, "stuck"));
+
+    // Fail the persist stage alone: a directory where `config.toml` should be
+    // fails the under-guard `load_profile` (and any save), while the rotation
+    // lock, the sidecar reads, and everything else stay untouched. Byte-restore
+    // afterwards — the failed save never moved the original content.
+    let cfg_path = dir.join("config.toml");
+    let original = std::fs::read(&cfg_path).expect("read config.toml");
+    std::fs::remove_file(&cfg_path).expect("displace config.toml");
+    std::fs::create_dir(&cfg_path).expect("block the slot");
+    run_config_row(&mut app, ConfigRow::ClearSessionToken);
+    run_config_row(&mut app, ConfigRow::ClearSessionToken);
+    std::fs::remove_dir(&cfg_path).expect("unblock the slot");
+    std::fs::write(&cfg_path, original).expect("restore config.toml");
+
+    assert!(
+        app.toasts.iter().any(|t| t.body.contains("clear failed")),
+        "the failed persist is loud, got {:?}",
+        app.toasts
+    );
+    assert!(
+        dir.join("session-token.json").exists(),
+        "a failed persist stops the clear before anything is removed"
+    );
+    assert!(
+        app.config().find("stuck").is_some_and(|p| p.rolling_token),
+        "the in-memory flag must not claim a disarm the disk refused"
+    );
+    let p = crate::profile::load_profile("stuck").expect("reload");
+    assert!(p.rolling_token, "disk still says armed");
 }
 
 /// The TUI clear takes the rotation guard NON-BLOCKING: a rotation in flight —

@@ -728,9 +728,7 @@ fn cmd_static_token_clear(name: &str, yes: bool) -> Result<()> {
         .find(target)
         .ok_or_else(|| anyhow::anyhow!("no profile named '{target}'"))?;
     let sidecar_present = claude::session_token_status(target).is_some();
-    let backup_present = profile::profile_dir(target)?
-        .join("session-token.static.json")
-        .exists();
+    let backup_present = claude::has_static_backup(target);
     let rolling_armed = profile.rolling_token;
     // "Nothing to clear" only when ALL THREE pieces are absent. A set flag with
     // no sidecar (the daemon just hasn't stamped yet, or someone removed the
@@ -808,6 +806,20 @@ fn cmd_static_token_clear(name: &str, yes: bool) -> Result<()> {
     // (the exact hazard `adopt_disk_rotation` names, one layer up), and acting
     // on the pre-prompt `active` relinks the wrong world in both directions.
     let mut on_disk = profile::load_profile(target)?;
+    // The other-login REFUSAL re-checks here too — it is the one decision in
+    // this function that can strip a profile of its last credential, and the
+    // prompt above is an unbounded wait a log-out can land inside: a profile
+    // that stored an OAuth pair when the prompt was printed may store nothing
+    // by the time the operator confirms.
+    if (claude::session_token_status(target).is_some() || claude::has_static_backup(target))
+        && on_disk.credentials.is_none()
+        && on_disk.api_key.is_none()
+    {
+        anyhow::bail!(
+            "'{target}' stores no other login anymore, so clearing its long-lived token would \
+             leave it with no credentials at all. Run `clauth login {target}` first, then clear."
+        );
+    }
     let rolling_armed = on_disk.rolling_token;
     if rolling_armed {
         on_disk.rolling_token = false;
@@ -821,7 +833,7 @@ fn cmd_static_token_clear(name: &str, yes: bool) -> Result<()> {
     // the operator's own mint.
     claude::quarantine_misfilled_sidecar(target)?;
     claude::clear_session_token(target)?;
-    claude::clear_static_backup(target)?;
+    let backup_removed = claude::clear_static_backup(target)?;
     let active = load_config()?.is_active(target);
     // Re-read AFTER the clear: `install_source_path` only falls back to
     // `credentials.json` once the sidecar is gone, so this is the store the
@@ -854,6 +866,9 @@ fn cmd_static_token_clear(name: &str, yes: bool) -> Result<()> {
     if rolling_armed {
         outln!("{}", clear_disarmed_postscript(target));
     }
+    if backup_removed {
+        outln!("{}", clear_backup_postscript(target));
+    }
     Ok(())
 }
 
@@ -881,6 +896,19 @@ fn clear_backup_note(target: &str) -> String {
 /// moved.
 fn clear_disarmed_postscript(target: &str) -> String {
     format!("clauth: rolling-token is off · nothing re-stamps a sidecar for '{target}' now.")
+}
+
+/// The post-clear statement that the preserved mint is destroyed. UNCONDITIONAL
+/// on the removal, unlike [`clear_backup_note`], which prints only on the
+/// interactive path: a non-TTY stdin refuses without `--yes`, so every scripted
+/// clear skips the prompt copy entirely — and a year-scale credential removed
+/// with nothing saying so is exactly the silence the disarm postscript already
+/// refuses for the flag.
+fn clear_backup_postscript(target: &str) -> String {
+    format!(
+        "clauth: the preserved mint at session-token.static.json is gone · \
+         `clauth static-token {target}` has nothing to restore now."
+    )
 }
 
 /// `clauth delete <name> [--yes] [--force]` — remove a profile and all its

@@ -611,7 +611,17 @@ fn row_hint(row: ConfigRow, snap: &Snap) -> Option<String> {
         // that re-stamping stops and the preserved mint goes too (the CLI
         // prints two explicit lines for the same act, and a two-press arm is
         // not a disclosure).
-        ConfigRow::ClearSessionToken if !snap.has_other_login => {
+        //
+        // The gate arm matches `run_config_row`'s refusal EXACTLY: a flag-only
+        // account (armed, nothing stamped, no preserved mint) disarms without
+        // stripping a credential, so it skips past to the acting hint — a gate
+        // line over a row that acts would be the one lie a hint can tell.
+        ConfigRow::ClearSessionToken
+            if !snap.has_other_login
+                && !((snap.rolling_armed || snap.rolling_token)
+                    && snap.session_token.is_none()
+                    && !snap.has_static_backup) =>
+        {
             "no other login stored, log in first"
         }
         ConfigRow::ClearSessionToken => {

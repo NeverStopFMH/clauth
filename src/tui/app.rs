@@ -5870,15 +5870,21 @@ fn run_config_row(app: &mut App, row: ConfigRow) {
         }
         ConfigRow::ClearSessionToken => {
             if let Some(name) = name {
-                // Same refusal the CLI makes (`cmd_static_token_clear`):
-                // with no other login stored, clearing the sidecar leaves the
-                // account with no credentials at all.
+                // Same refusal the CLI makes (`cmd_static_token_clear`), on the
+                // same condition: with no other login stored, clearing would
+                // strip the account's last credential — but only a stored PIECE
+                // (a sidecar or a preserved mint) is a credential to strip. A
+                // flag-only account disarms without touching one, so it clears
+                // here exactly as the CLI does, instead of a silent return
+                // behind a row the widening made visible.
                 let stores_other_login = {
                     let cfg = app.config();
                     cfg.find(&name)
                         .is_some_and(|p| p.credentials.is_some() || p.api_key.is_some())
                 };
-                if !stores_other_login {
+                let holds_credential_piece = crate::claude::session_token_status(&name).is_some()
+                    || crate::claude::has_static_backup(&name);
+                if holds_credential_piece && !stores_other_login {
                     return;
                 }
                 let armed = app
@@ -5949,16 +5955,14 @@ fn perform_clear_session_token(app: &mut App, name: &str) {
     let active = app.config().is_active(name);
     let rolling_armed = app.config().find(name).is_some_and(|p| p.rolling_token);
     if rolling_armed {
-        // The in-memory flag flips for the renderer; the PERSIST is written
-        // from a fresh disk read under the guard, never from the in-memory
-        // snapshot — an external daemon's rotation may have landed since the
-        // last reload, and `save_profile` writes the whole profile back.
-        {
-            let mut cfg = app.config();
-            if let Some(p) = cfg.find_mut(name) {
-                p.rolling_token = false;
-            }
-        }
+        // The PERSIST is written from a fresh disk read under the guard, never
+        // from the in-memory snapshot — an external daemon's rotation may have
+        // landed since the last reload, and `save_profile` writes the whole
+        // profile back. The renderer's in-memory flag flips only AFTER that
+        // write lands: flipped first, a failed save leaves the config lying
+        // (`reload_fingerprint` never corrects it — config mtime did not move)
+        // until an unrelated save makes the lie durable, and the end state is
+        // a live rolling sidecar nothing re-stamps.
         let save_err = crate::profile::load_profile(name)
             .and_then(|mut p| {
                 p.rolling_token = false;
@@ -5969,14 +5973,21 @@ fn perform_clear_session_token(app: &mut App, name: &str) {
             app.toast(ToastKind::Danger, format!("clear failed\n{e}"));
             return;
         }
+        let mut cfg = app.config();
+        if let Some(p) = cfg.find_mut(name) {
+            p.rolling_token = false;
+        }
     }
-    if let Err(e) = crate::claude::quarantine_misfilled_sidecar(name)
+    let backup_removed = match crate::claude::quarantine_misfilled_sidecar(name)
         .and_then(|_| crate::claude::clear_session_token(name))
         .and_then(|_| crate::claude::clear_static_backup(name))
     {
-        app.toast(ToastKind::Danger, format!("clear failed\n{e}"));
-        return;
-    }
+        Ok(removed) => removed,
+        Err(e) => {
+            app.toast(ToastKind::Danger, format!("clear failed\n{e}"));
+            return;
+        }
+    };
     app.session_tokens.remove(name);
     // Read AFTER the clear, so it names the store the relink actually finds:
     // `install_source_path` falls back to `credentials.json` only once the
@@ -6000,9 +6011,18 @@ fn perform_clear_session_token(app: &mut App, name: &str) {
     } else {
         ""
     };
+    // Unconditional on the removal, like the CLI's `clear_backup_postscript`:
+    // the pre-action disclosure lives in the row hint, but a hint is not a
+    // report, and a year-scale credential destroyed with nothing saying so is
+    // the silence the `rolled` suffix already refuses for the flag.
+    let swept = if backup_removed {
+        " · the preserved mint is gone"
+    } else {
+        ""
+    };
     app.toast(
         ToastKind::Success,
-        format!("cleared the long-lived token for '{name}'{tail}{rolled}"),
+        format!("cleared the long-lived token for '{name}'{tail}{rolled}{swept}"),
     );
 }
 

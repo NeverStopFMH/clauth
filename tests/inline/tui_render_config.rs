@@ -733,7 +733,8 @@ fn clear_session_token_hint_names_the_gate_then_what_the_clear_falls_back_to() {
     // The full-scope disclosure: this hint is the TUI's ONLY statement that a
     // clear on a rolling profile stops the re-stamping and destroys the
     // preserved mint — the CLI prints two explicit lines for the same act,
-    // and a two-press arm is not a disclosure.
+    // and a two-press arm is not a disclosure. (The gate-vs-flag-only split
+    // has its own test below.)
     snap.rolling_armed = true;
     assert_eq!(
         row_hint(ConfigRow::ClearSessionToken, &snap).as_deref(),
@@ -756,6 +757,35 @@ fn clear_session_token_hint_names_the_gate_then_what_the_clear_falls_back_to() {
     assert_eq!(
         row_hint(ConfigRow::ClearSessionToken, &snap).as_deref(),
         Some("relinks this account's own login now · running sessions follow · re-stamping stops"),
+    );
+}
+
+/// The gate arm reads the SAME condition as `run_config_row`'s refusal: a
+/// flag-only account (armed, nothing stamped, no preserved mint) disarms
+/// without stripping a credential, so its hint must describe the act, not
+/// claim a refusal the press does not make. The moment a stored piece exists,
+/// the gate line is back — clearing THAT would strip the last credential.
+#[test]
+fn clear_session_token_hint_lets_a_flag_only_account_past_the_gate() {
+    let mut snap = Snap::blank("a");
+    snap.rolling_armed = true;
+
+    assert_eq!(
+        row_hint(ConfigRow::ClearSessionToken, &snap).as_deref(),
+        Some("the next switch runs this account on its api key · re-stamping stops"),
+    );
+
+    snap.session_token = Some(crate::claude::SessionTokenStatus::LongLived(None));
+    assert_eq!(
+        row_hint(ConfigRow::ClearSessionToken, &snap).as_deref(),
+        Some("no other login stored, log in first"),
+    );
+
+    snap.session_token = None;
+    snap.has_static_backup = true;
+    assert_eq!(
+        row_hint(ConfigRow::ClearSessionToken, &snap).as_deref(),
+        Some("no other login stored, log in first"),
     );
 }
 

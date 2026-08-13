@@ -1,6 +1,8 @@
 # clauth herdr plugin
 
-Opens [clauth](https://github.com/uwuclxdy/clauth) in a [herdr](https://herdr.dev) popup: the account table, the usage windows, and the auto-switch chain, over whatever you were doing, without a pane of its own.
+Opens [clauth](https://github.com/uwuclxdy/clauth) in a [herdr](https://herdr.dev) popup: the account table, the usage windows, and the auto-switch chain, over whatever you were doing, without a pane of its own. It labels every herdr pane with the account that pane is spending, too.
+
+**The manual for all of it lives in the wiki: [herdr plugin](https://github.com/uwuclxdy/clauth/wiki/Herdr-Plugin).** This file covers what the plugin itself is, for anyone reading it before letting herdr run it.
 
 ## Requires
 
@@ -14,28 +16,20 @@ Opens [clauth](https://github.com/uwuclxdy/clauth) in a [herdr](https://herdr.de
 clauth herdr install
 ```
 
-That runs herdr's installer, then adds the two things below that a herdr plugin cannot declare for itself: the key that opens the dashboard, and the sidebar row. It shows the diff and asks before touching your herdr `config.toml`, adds nothing on a second run, and `--no-config` skips that half.
+That runs herdr's installer, then writes the two things a herdr plugin cannot declare for itself: the key that opens the dashboard, and the sidebar row that renders the pane tag. `clauth herdr uninstall` reverses both. Flags, the by-hand route, and everything the plugin does once installed are in the wiki page linked above.
 
-By hand instead:
+## What it runs as you
 
-```sh
-herdr plugin install uwuclxdy/clauth/herdr-plugin
-```
+Two actions and two event hooks, all of them one of the two shell scripts below:
 
-`plugin install` runs the plugin's commands as you, so read them first. It is a manifest and two short shell scripts. From a clauth checkout, `herdr plugin link /path/to/clauth/herdr-plugin` links them in place.
+- `clauth.open` opens the dashboard in a popup.
+- `clauth.which` re-reads the account the focused pane burns and publishes it as pane metadata, and the same script runs on herdr's `pane.agent_detected` and `pane.agent_status_changed` events.
 
-## What it adds
+Neither script writes anything outside herdr's own pane metadata.
 
-| Action | Qualified id | What it does |
-|---|---|---|
-| Open clauth | `clauth.open` | The clauth dashboard in a popup. Quit it with `q`, the same as anywhere else. |
-| Show this pane's clauth account | `clauth.which` | Re-reads the account the focused pane burns and republishes it as pane metadata. |
+## Paste these if you installed by hand
 
-Switching accounts is a keystroke inside the dashboard, so the plugin ships no picker of its own. herdr allows one popup per session, so pressing the open key again with clauth already up does nothing instead of reporting an error.
-
-## Bind a key yourself
-
-A herdr plugin cannot declare a keybinding. That line lives in your own herdr `config.toml`, and nothing happens until it is there. `clauth herdr install` writes it for you; this is what it writes, and what to paste if you installed by hand:
+`clauth herdr install` writes both. herdr does not let a plugin declare either one, so without them the key does nothing and the tag stays invisible.
 
 ```toml
 [[keys.command]]
@@ -45,34 +39,15 @@ command = "clauth.open"
 description = "clauth accounts"
 ```
 
-`command` takes the qualified action id from the table above. Without a binding the actions are still reachable from herdr's action menu and from `herdr plugin action invoke clauth.open`.
-
-## Show the account each pane burns
-
-Every herdr pane running Claude Code spends some account, and which one is invisible from the pane itself. The plugin hooks agent detection and publishes the answer as pane metadata under the name `clauth`, refreshing it on every agent status change so a `clauth start --with-fallback` session that moves onto the next chain member stops naming the account it left. herdr detects other agents too, and a pane running one of those is left untagged rather than labelled with an account it never touches.
-
-herdr renders a reported value only where your own agent-row template asks for it, so **the tag stays invisible until `$clauth` is in a row** in your herdr `config.toml`. `clauth herdr install` adds this row; paste it yourself if you installed by hand. Claude Code panes take the `rows_by_agent` template rather than the generic one:
-
 ```toml
 [ui.sidebar.agents.rows_by_agent]
 claude = [["state_icon", "workspace", "tab"], ["terminal_title_stripped"], ["agent", "$clauth"]]
 ```
 
-That row reads `claude · D1` in the sidebar for a pane started as `clauth start D1`. A pane running Claude Code some other way reports whichever account owns the global credentials. Point `CLAUDE_CONFIG_DIR` somewhere else yourself and the tag stops matching what that pane spends.
-
-## What this plugin cannot do, by design of herdr's plugin v1
-
-Plugin UI is pane-scoped. herdr documents runtime action registration and native non-terminal plugin UI as out of plugin v1, so none of the following is a missing feature here:
-
-- no button or row beside the sidebar spaces list, and no status-bar item
-- no menu outside a pane
-- no mouse binding of any kind. herdr's key parser rejects mouse tokens, and the only click routed to a plugin is a Control-click on a URL matching a `link_handlers` pattern
-- no click-outside dismiss. A popup holds every keystroke, Escape included, until its command exits
-
 ## Files
 
 | File | Role |
-|---|---|
+|------|------|
 | `herdr-plugin.toml` | Manifest: one popup entrypoint, two actions, two event hooks |
 | `open-pane.sh` | Opens an entrypoint, treating "popup already open" as a no-op |
 | `report-profile.sh` | Resolves the account a pane burns and publishes it as pane metadata |

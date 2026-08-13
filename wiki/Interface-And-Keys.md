@@ -122,11 +122,12 @@ There is no `remove field`: an env row's <kbd>⏎</kbd> edits its value, and an 
 
 ## Plugin tab
 
-Each row is a check on your Claude Code wiring: `clauth` on `PATH`, the `mcpServers` entry, the plugin install record, `claude --version`, and each profile's runtime state. <kbd>f</kbd> applies a fix on rows that offer one, behind a confirm that defaults to cancel:
+Each row is a check on your Claude Code wiring: `clauth` on `PATH`, the `mcpServers` entry, the plugin install record, `claude --version`, and each profile's runtime state. A `herdr` row joins them when [herdr](Herdr-Plugin) is installed. <kbd>f</kbd> applies a fix on rows that offer one, behind a confirm that defaults to cancel:
 
 | Fix | When it appears |
 |-----|-----------------|
 | `wire mcpServers into ~/.claude.json` | the entry is missing, project-local only, or points somewhere stale |
 | `repair credentials` | the active profile's stored login disagrees with the live one |
 | `relink credentials` | the active profile's credential link is missing while its stored credentials are intact |
+| `add the keybinding and sidebar row to herdr's config` | the herdr plugin is installed but its key is unbound or its sidebar row is untemplated |
 | `install plugin` | guidance only: the two `/plugin` commands to copy |

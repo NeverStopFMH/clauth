@@ -198,6 +198,7 @@ More, including what to check when something misbehaves: [FAQ](https://github.co
 | [Auto-switch](https://github.com/uwuclxdy/clauth/wiki/Auto-Switch) | thresholds, exclusion rules, burn-aware mode, spend ceilings |
 | [Daemon](https://github.com/uwuclxdy/clauth/wiki/Daemon) | `clauth daemon` and the `status.json` read contract |
 | [Claude Code plugin](https://github.com/uwuclxdy/clauth/wiki/Claude-Code-Plugin) | the MCP server and `delegate` in full |
+| [herdr plugin](https://github.com/uwuclxdy/clauth/wiki/Herdr-Plugin) | the clauth popup in herdr, the key, the per-pane account tag |
 | [Tokens and cost](https://github.com/uwuclxdy/clauth/wiki/Tokens-And-Cost) | where the dashboard reads from, what the cost figure means |
 | [Security](https://github.com/uwuclxdy/clauth/wiki/Security) | where credentials live and how they move |
 

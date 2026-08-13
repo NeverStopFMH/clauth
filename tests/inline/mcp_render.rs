@@ -379,7 +379,7 @@ fn list_profiles_prose_renders_each_row_with_unknown_for_null_fields() {
     assert_eq!(
         text,
         "- solo (active) [anthropic]: usage unknown; tier unknown\n\
-         - vendor [DeepSeek, api.deepseek.com]: 5h 12.3% used, 7d 45% used (resets_at 2026-08-13T00:00:00Z); pro: 5h 50% used; live session; throughput: `deepseek-chat` 12.3 tok/s, 5 samples, degraded true, rate_limited_recent false"
+         - vendor [DeepSeek, api.deepseek.com]: 5h 12.3% used, 7d 45% used (resets at 2026-08-13T00:00:00Z); pro: 5h 50% used; live session; throughput: `deepseek-chat` 12.3 tok/s (degraded)"
     );
 }
 
@@ -427,6 +427,110 @@ fn which_prose_says_unknown_when_unresolved() {
     );
 }
 
+/// A healthy row is the model's name and rate. `degraded` / `rate_limited_recent`
+/// / `samples` are payload fields a healthy row spells as `false` or noise, so
+/// none may reach the prose: a spelled-out `false` costs tokens for nothing.
+#[test]
+fn throughput_prose_healthy_row_is_name_and_rate_only() {
+    let rows = vec![serde_json::json!({
+        "model": "default",
+        "tok_s": 64.5,
+        "samples": 4,
+        "degraded": false,
+        "rate_limited_recent": false,
+        "retry_after_s": null
+    })];
+    let out = throughput_prose(&rows);
+    assert_eq!(out, "`default` 64.5 tok/s");
+    assert!(
+        !out.contains("degraded")
+            && !out.contains("rate_limited")
+            && !out.contains("samples")
+            && !out.contains("false"),
+        "a healthy row must not spell its false flags or its sample count: {out}",
+    );
+}
+
+/// Flags appear as words only when true, and the retry delay rides with the
+/// rate-limit flag, never alone.
+#[test]
+fn throughput_prose_flags_appear_only_when_true_with_retry_delay() {
+    let rows = vec![
+        serde_json::json!({
+            "model": "a",
+            "tok_s": 12.3,
+            "samples": 5,
+            "degraded": true,
+            "rate_limited_recent": false,
+            "retry_after_s": null
+        }),
+        serde_json::json!({
+            "model": "b",
+            "tok_s": 0.0,
+            "samples": 0,
+            "degraded": false,
+            "rate_limited_recent": true,
+            "retry_after_s": 30
+        }),
+        serde_json::json!({
+            "model": "c",
+            "tok_s": 1.1,
+            "samples": 2,
+            "degraded": true,
+            "rate_limited_recent": true,
+            "retry_after_s": null
+        }),
+    ];
+    assert_eq!(
+        throughput_prose(&rows),
+        "`a` 12.3 tok/s (degraded); `b` 0 tok/s (rate-limited recently, retry in 30s); `c` 1.1 tok/s (degraded, rate-limited recently)"
+    );
+}
+
+/// The documented usage fields read as English; a field claude added that
+/// clauth does not document keeps its name in backticks so no figure vanishes.
+#[test]
+fn usage_prose_documented_fields_read_english_and_unknown_keys_survive() {
+    let u = serde_json::json!({
+        "input_tokens": 100,
+        "output_tokens": 50,
+        "cache_read_input_tokens": 30
+    });
+    assert_eq!(
+        usage_prose(&u),
+        "input 100 tokens, output 50 tokens, `cache_read_input_tokens` 30"
+    );
+}
+
+/// `which` keeps its throughput clause (one profile's rows, and the rate itself
+/// is news), but a healthy row reads as name + rate with no false flags.
+#[test]
+fn which_prose_throughput_names_healthy_rows_without_false_flags() {
+    let p = serde_json::json!({
+        "profile": "kerry",
+        "source": "refresh_match",
+        "tier": "Max 20x",
+        "throughput": [{
+            "model": "default",
+            "tok_s": 64.5,
+            "samples": 4,
+            "degraded": false,
+            "rate_limited_recent": false,
+            "retry_after_s": null
+        }],
+        "live_usage": {"profile": "kerry", "5h_used_pct": 19.0, "7d_used_pct": 95.0}
+    });
+    let out = which_prose(&p);
+    assert!(
+        out.contains("throughput: `default` 64.5 tok/s"),
+        "which keeps the rate for a healthy model: {out}",
+    );
+    assert!(
+        !out.contains("degraded") && !out.contains("rate_limited") && !out.contains("samples"),
+        "no false flags or sample counts in which prose: {out}",
+    );
+}
+
 #[test]
 fn switch_prose_renders_success_and_failure() {
     let ok = serde_json::json!({
@@ -461,7 +565,7 @@ fn delegate_prose_renders_background_depth_and_sync_envelope() {
     });
     assert_eq!(
         delegate_prose(&bg),
-        "delegate to `work` running, job_id `d-42-0`, started_at 123"
+        "delegate to `work` running, job `d-42-0`"
     );
 
     let depth = serde_json::json!({
@@ -484,7 +588,7 @@ fn delegate_prose_renders_background_depth_and_sync_envelope() {
     });
     assert_eq!(
         delegate_prose(&sync),
-        "delegate to `work` finished: all done (cost $0.5), usage: input_tokens 100, output_tokens 50; target `work`: 5h 12% used, 7d 45.6% used"
+        "delegate to `work` finished: all done (cost $0.5), usage: input 100 tokens, output 50 tokens; target `work`: 5h 12% used, 7d 45.6% used"
     );
 }
 

@@ -274,11 +274,13 @@ anything added since):\n",
 // ── prose spellings (`format: "prose"` is the default) ──────────────────────
 //
 // Each tool's JSON payload has exactly one prose spelling, produced here. The
-// contract: every non-null field the payload carries is named, a null number
-// reads as `unknown` (never `0%` or an omission a reader takes for `none`), and
-// no figure appears that the payload did not have. Raw timestamps are named,
-// not re-derived into `resets in N` — a derived figure is one the JSON did not
-// carry.
+// contract: prose names what carries news. A boolean flag appears as a word
+// only when true (a spelled-out `false` costs tokens for nothing), telemetry a
+// reader cannot act on (a sample count) stays in the JSON spelling, a null
+// number reads as `unknown` (never `0%` or an omission a reader takes for
+// `none`), and no figure appears that the payload did not have. Raw timestamps
+// are named, not re-derived into `resets in N` — a derived figure is one the
+// JSON did not carry.
 
 /// A window's share as a prose clause: `12% used` for a number, `unknown` for
 /// `None` (so a null reads as unknown, never as `unknown used`).
@@ -326,7 +328,7 @@ fn windows_prose(windows: &Value) -> String {
             let pct = w.get("utilization_pct").and_then(Value::as_f64);
             let mut s = format!("{label} {}", pct_clause(pct));
             if let Some(r) = w.get("resets_at").and_then(Value::as_str) {
-                s.push_str(&format!(" (resets_at {r})"));
+                s.push_str(&format!(" (resets at {r})"));
             }
             s
         })
@@ -335,7 +337,10 @@ fn windows_prose(windows: &Value) -> String {
 }
 
 /// Per-model throughput rows (`which`'s full summary or a roster's warnings).
-/// Every row field is named, `unknown` where the payload is null.
+/// A healthy row is the model's name and rate; `degraded` and the rate-limit
+/// flag appear as words only when true, the retry delay with them. The sample
+/// count is clauth's own confidence telemetry, not a figure a reader acts on,
+/// so it stays in the JSON spelling.
 fn throughput_prose(rows: &[Value]) -> String {
     rows.iter()
         .map(|m| {
@@ -344,23 +349,22 @@ fn throughput_prose(rows: &[Value]) -> String {
                 .get("tok_s")
                 .and_then(Value::as_f64)
                 .map_or_else(|| "unknown".to_string(), |v| v.to_string());
-            let samples = m
-                .get("samples")
-                .and_then(Value::as_u64)
-                .map_or_else(|| "unknown".to_string(), |v| v.to_string());
-            let degraded = m
-                .get("degraded")
+            let mut flags: Vec<String> = Vec::new();
+            if m.get("degraded").and_then(Value::as_bool).unwrap_or(false) {
+                flags.push("degraded".to_string());
+            }
+            if m.get("rate_limited_recent")
                 .and_then(Value::as_bool)
-                .map_or_else(|| "unknown".to_string(), |v| v.to_string());
-            let limited = m
-                .get("rate_limited_recent")
-                .and_then(Value::as_bool)
-                .map_or_else(|| "unknown".to_string(), |v| v.to_string());
-            let mut s = format!(
-                "`{model}` {tok_s} tok/s, {samples} samples, degraded {degraded}, rate_limited_recent {limited}"
-            );
-            if let Some(r) = m.get("retry_after_s").and_then(Value::as_u64) {
-                s.push_str(&format!(", retry_after_s {r}"));
+                .unwrap_or(false)
+            {
+                flags.push("rate-limited recently".to_string());
+                if let Some(r) = m.get("retry_after_s").and_then(Value::as_u64) {
+                    flags.push(format!("retry in {r}s"));
+                }
+            }
+            let mut s = format!("`{model}` {tok_s} tok/s");
+            if !flags.is_empty() {
+                s.push_str(&format!(" ({})", flags.join(", ")));
             }
             s
         })
@@ -496,8 +500,10 @@ pub(crate) fn switch_prose(p: &Value) -> String {
     }
 }
 
-/// The token-usage object of a delegate envelope as one clause, keyed on every
-/// field claude put there. `unknown` for a null value.
+/// The token-usage object of a delegate envelope as one clause. The two fields
+/// clauth's envelope contract documents read as English (`input N tokens`);
+/// anything else claude put there (cache tiers arrive version-dependent) keeps
+/// its field name in backticks so no figure silently vanishes.
 fn usage_prose(u: &Value) -> String {
     let Some(obj) = u.as_object() else {
         return "unknown".to_string();
@@ -514,7 +520,15 @@ fn usage_prose(u: &Value) -> String {
                 Value::Null => "unknown".to_string(),
                 other => other.to_string(),
             };
-            format!("{k} {val}")
+            let noun = match (k.as_str(), v) {
+                ("input_tokens", Value::Number(_)) => Some("input"),
+                ("output_tokens", Value::Number(_)) => Some("output"),
+                _ => None,
+            };
+            match noun {
+                Some(n) => format!("{n} {val} tokens"),
+                None => format!("`{k}` {val}"),
+            }
         })
         .collect::<Vec<_>>()
         .join(", ")
@@ -549,15 +563,15 @@ fn envelope_prose(e: &Value) -> String {
         }
     }
     if let Some(p) = e.get("partial_result").and_then(Value::as_str) {
-        out.push_str(&format!("; partial_result: {p}"));
+        out.push_str(&format!("; partial result: {p}"));
     }
     if let Some(sid) = e.get("session_id").and_then(Value::as_str) {
-        out.push_str(&format!("; resume with session_id `{sid}`"));
+        out.push_str(&format!("; resume with session id `{sid}`"));
     }
     if let Some(denials) = e.get("permission_denials")
         && !denials.is_null()
     {
-        out.push_str(&format!("; permission_denials: {denials}"));
+        out.push_str(&format!("; permission denials: {denials}"));
     }
     out
 }
@@ -571,11 +585,9 @@ pub(crate) fn delegate_prose(p: &Value) -> String {
             .and_then(Value::as_str)
             .unwrap_or("unknown");
         let status = p.get("status").and_then(Value::as_str).unwrap_or("unknown");
-        let mut out = format!("delegate to `{profile}` {status}, job_id `{job_id}`");
-        if let Some(s) = p.get("started_at").and_then(Value::as_u64) {
-            out.push_str(&format!(", started_at {s}"));
-        }
-        return out;
+        // A raw start epoch carries no news a reader acts on; the JSON spelling
+        // keeps it.
+        return format!("delegate to `{profile}` {status}, job `{job_id}`");
     }
     let target = p
         .get("live_usage")

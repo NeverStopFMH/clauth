@@ -1682,8 +1682,8 @@ fn rate_limit_hint(text: &str) -> Option<Option<u64>> {
     Some(retry_after)
 }
 
-/// One-line throughput warning for the live footer, or `None` when nothing is
-/// degraded or rate-limited.
+/// One-line throughput warning folded into a delegate payload's `live_usage`
+/// object, or `None` when nothing is degraded or rate-limited.
 fn throughput_note(profile: &str, now: i64) -> Option<String> {
     let flagged: Vec<String> = crate::throughput::summary(profile, now)
         .into_iter()

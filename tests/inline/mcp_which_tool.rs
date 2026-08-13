@@ -67,7 +67,7 @@ fn call_which() -> CallToolResult {
     .expect("which returns a tool result, never a transport error")
 }
 
-/// The tool's payload is the first content block; the second is the usage footer.
+/// The tool's payload is its single content block.
 fn which_payload(result: &CallToolResult) -> serde_json::Value {
     let text = result
         .content

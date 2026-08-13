@@ -1,7 +1,7 @@
-//! Pure formatters for the MCP layer: init instructions block, per-call live
-//! footer, third-party headline, and the prose spellings of each tool's JSON
-//! payload. No I/O, no locks — callers pass in already-loaded cache data so
-//! these stay unit-testable.
+//! Pure formatters for the MCP layer: init instructions block, third-party
+//! headline, and the prose spellings of each tool's JSON payload, the
+//! folded-in live-usage clause included. No I/O, no locks — callers pass in
+//! already-loaded cache data so these stay unit-testable.
 
 use serde_json::Value;
 

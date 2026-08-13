@@ -35,7 +35,7 @@ Every tool takes `format` and answers in prose by default; pass `format: "json"`
 
 `which` is the authority on which account owns the current session. `list_profiles` reads a cache and can lag it.
 
-`list_profiles` answers for every profile by default, and `names` narrows it to the ones you ask for. Two fields appear only when they have something to say: the live-session flag when a clauth-managed session already owns that profile, and the throughput rows when a model there is degraded or was recently rate-limited. On a 27-profile fleet that reply is a third the size it would otherwise be, which matters because the model is told to call it at the start of every session.
+`list_profiles` answers for every profile by default, and `names` narrows it to the ones you ask for. Two fields appear only when they have something to say: the live-session flag when a clauth-managed session already owns that profile, and the throughput rows when a model there is degraded or was recently rate-limited. On a 27-profile fleet that reply is just over half the size it would otherwise be, which matters because the model is told to call it at the start of every session.
 
 ## `switch` inside a session
 

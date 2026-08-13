@@ -136,14 +136,18 @@ fn roster_rank(name: &str) -> RosterRank {
         })
 }
 
-/// `"31.45 USD"` → `("USD", 31.45)`, and nothing else. The strictness is the
-/// point: a `total` row carrying anything but one amount and one currency code
-/// (z.ai's `123.4M  (1.2k calls)`) describes no wallet, and a loose parse would
-/// invent one to rank on. Taking the FIRST such row is also what lands a profile
-/// holding two wallets in exactly one currency group.
+/// `"31.45 USD"` → `("USD", 31.45)`: one finite amount plus one 2-5 letter
+/// ASCII currency code. The narrowness is the point: a `total` row carrying
+/// anything else (z.ai's `123.4M  (1.2k calls)`, a second word, `nan`/`inf`)
+/// describes no wallet. A loose parse would invent one to rank on. Taking the
+/// FIRST such row is also what lands a profile holding two wallets in exactly
+/// one currency group.
 fn parse_balance(value: &str) -> Option<(String, f64)> {
     let mut parts = value.split_whitespace();
     let amount: f64 = parts.next()?.parse().ok()?;
+    if !amount.is_finite() {
+        return None;
+    }
     let currency = parts.next()?;
     if parts.next().is_some()
         || !(2..=5).contains(&currency.len())

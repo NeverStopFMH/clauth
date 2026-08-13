@@ -638,10 +638,10 @@ fn row_hint(row: ConfigRow, snap: &Snap) -> Option<String> {
         // 4-way base below: those arms were written under the old invariant
         // that "no OAuth login" implies an api key behind it, and promising an
         // api key this account does not hold would be the same lie in a
-        // different tense. Active still names the sign-out — the relink onto
-        // an absent install source removes the live slot.
+        // different tense. Active still names the sign-out: the relink onto an
+        // absent install source removes the live slot.
         ConfigRow::ClearSessionToken if !snap.has_other_login && snap.is_active => {
-            "stops the daemon re-stamping this account · signs Claude Code out — nothing is \
+            "stops the daemon re-stamping this account · signs Claude Code out · nothing is \
              stored behind it"
         }
         ConfigRow::ClearSessionToken if !snap.has_other_login => {

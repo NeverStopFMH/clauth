@@ -816,7 +816,7 @@ fn clear_session_token_hint_lets_a_flag_only_account_past_the_gate() {
     assert_eq!(
         row_hint(ConfigRow::ClearSessionToken, &snap).as_deref(),
         Some(
-            "stops the daemon re-stamping this account · signs Claude Code out — nothing is \
+            "stops the daemon re-stamping this account · signs Claude Code out · nothing is \
              stored behind it"
         ),
     );

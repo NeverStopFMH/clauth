@@ -1157,6 +1157,17 @@ fn clear_session_token_row_is_inert_without_another_stored_login() {
 }
 
 /// Arm-then-confirm, and the relink that makes the confirm safe. On the ACTIVE
+/// Make `name` the active account the way production does, in memory AND on
+/// disk. Every write of `active_profile` in the tree persists in the same
+/// breath (`actions::finish_switch`, and both TUI sites), so an in-memory-only
+/// fixture is a state no code path can produce, and it stops driving the arm
+/// under test the moment a reader goes to disk for it.
+fn make_active(app: &mut App, name: &str) {
+    let mut cfg = app.config();
+    cfg.state.active_profile = Some(name.into());
+    crate::profile::save_app_state(&cfg.state).expect("persist the active account");
+}
+
 /// profile the live `~/.claude/.credentials.json` is a symlink INTO the store
 /// pointed at `session-token.json`, so removing that target without relinking
 /// leaves a dangling link and Claude Code reads no credentials at all — the
@@ -1185,7 +1196,7 @@ fn clear_session_token_arms_then_clears_and_relinks_the_active_account() {
     );
 
     let mut app = app_with(vec![acct]);
-    app.config().state.active_profile = Some("acct".into());
+    make_active(&mut app, "acct");
     app.profile_cursor = 0;
     app.config_draft = Some(build_draft_existing(&app, "acct"));
 
@@ -1252,7 +1263,7 @@ fn clear_session_token_on_an_active_api_key_account_reports_the_sign_out() {
     );
 
     let mut app = app_with(vec![acct]);
-    app.config().state.active_profile = Some("acct".into());
+    make_active(&mut app, "acct");
     app.profile_cursor = 0;
     app.config_draft = Some(build_draft_existing(&app, "acct"));
 
@@ -1306,7 +1317,7 @@ fn clear_session_token_on_an_idle_account_leaves_the_live_link_alone() {
     crate::claude::force_link_profile_credentials("live").expect("link live");
 
     let mut app = app_with(vec![live_acct, idle]);
-    app.config().state.active_profile = Some("live".into());
+    make_active(&mut app, "live");
     app.profile_cursor = 1;
     app.config_draft = Some(build_draft_existing(&app, "idle"));
 
@@ -1518,6 +1529,11 @@ fn clear_session_token_relinks_before_the_backup_removal_can_fail() {
 
     let mut acct = Profile::new("mid".to_string(), None, None);
     acct.credentials = Some(split_creds("stored-oauth", Some("stored-refresh")));
+    // Armed, because only `preserve_static_mint` on the rolling path ever
+    // writes the backup slot: a profile holding one and NOT armed is a shape
+    // production cannot reach, and it leaves the disarm half of the report
+    // unexercised.
+    acct.rolling_token = true;
     crate::profile::save_profile(&acct).expect("save profile");
     seed_session_token("mid", None);
     let dir = crate::profile::profile_dir("mid").expect("profile dir");
@@ -1532,7 +1548,7 @@ fn clear_session_token_relinks_before_the_backup_removal_can_fail() {
     std::fs::create_dir(dir.join("session-token.static.json")).expect("block the backup slot");
 
     let mut app = app_with(vec![acct]);
-    app.config().state.active_profile = Some("mid".into());
+    make_active(&mut app, "mid");
     app.profile_cursor = 0;
     app.config_draft = Some(build_draft_existing(&app, "mid"));
 
@@ -1554,6 +1570,73 @@ fn clear_session_token_relinks_before_the_backup_removal_can_fail() {
             .any(|t| t.body.contains("the preserved mint remains")),
         "the partial outcome is named, not folded into 'clear failed', got {:?}",
         app.toasts
+    );
+    // The relink and the disarm both already LANDED and are durable, so the
+    // failure message carries them. Reporting only the mint leaves the operator
+    // believing a sign-out and a stopped re-stamp are still pending.
+    let body = app
+        .toasts
+        .iter()
+        .find(|t| t.body.contains("the preserved mint remains"))
+        .map(|t| t.body.clone())
+        .expect("the partial-outcome toast");
+    assert!(
+        body.contains("relinked its own login"),
+        "the failure toast must still report the relink it completed, got {body:?}"
+    );
+    assert!(
+        body.contains("re-stamping off"),
+        "the failure toast must still report the disarm it persisted, got {body:?}"
+    );
+}
+
+/// The relink follows the account that is active ON DISK, never the snapshot
+/// this process happens to hold. `daemon::tick` and `fallback` both reach
+/// `actions::switch_profile`, so the active account moves with no keypress
+/// here and `reload_fingerprint` corrects the snapshot a tick later at best.
+/// Acting on the stale one skips the relink for the account that IS active and
+/// leaves its live slot a dangling symlink into the file just removed, which is
+/// the exact failure the relink exists to prevent.
+#[cfg(unix)]
+#[test]
+fn clear_session_token_relinks_the_account_active_on_disk_not_in_the_snapshot() {
+    use super::{ConfigRow, build_draft_existing, run_config_row};
+    use crate::profile::Profile;
+    let home = crate::testutil::HomeSandbox::new();
+
+    let mut acct = Profile::new("acct".to_string(), None, None);
+    acct.credentials = Some(split_creds("stored-oauth", Some("stored-refresh")));
+    crate::profile::save_profile(&acct).expect("save profile");
+    seed_session_token("acct", None);
+    let dir = crate::profile::profile_dir("acct").expect("profile dir");
+    crate::claude::force_link_profile_credentials("acct").expect("link");
+    let live = home.home().join(".claude").join(".credentials.json");
+    assert_eq!(
+        std::fs::read_link(&live).expect("live is a symlink"),
+        dir.join("session-token.json"),
+        "fixture: the live slot starts on the sidecar"
+    );
+
+    let mut app = app_with(vec![acct]);
+    make_active(&mut app, "acct");
+    app.profile_cursor = 0;
+    app.config_draft = Some(build_draft_existing(&app, "acct"));
+    // What an out-of-band switch away and back leaves behind: disk is current,
+    // the snapshot in this process is not. Only the in-memory copy is rewound,
+    // so the ONLY thing separating the two readers is which one they consult.
+    app.config().state.active_profile = Some("someone-else".into());
+
+    run_config_row(&mut app, ConfigRow::ClearSessionToken);
+    run_config_row(&mut app, ConfigRow::ClearSessionToken);
+
+    assert!(
+        !dir.join("session-token.json").exists(),
+        "the clear itself must still happen"
+    );
+    assert_eq!(
+        std::fs::read_link(&live).expect("live must survive as a symlink"),
+        dir.join("credentials.json"),
+        "the relink follows the on-disk active account, so the live slot never dangles"
     );
 }
 

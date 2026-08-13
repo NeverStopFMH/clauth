@@ -6156,12 +6156,6 @@ fn perform_clear_session_token(app: &mut App, name: &str) {
         );
         return;
     }
-    // `active` deliberately stays the in-memory read: the TUI is itself the
-    // thing that switches accounts in this process, so its own state is the
-    // authority (and upstream's tests pin exactly that). The disk re-reads
-    // above cover the two facts an EXTERNAL writer can move under the guard —
-    // the stored login and the flag.
-    let active = app.config().is_active(name);
     let rolling_armed = on_disk.rolling_token;
     if rolling_armed {
         // The PERSIST is written from the same under-guard disk read, never
@@ -6195,25 +6189,22 @@ fn perform_clear_session_token(app: &mut App, name: &str) {
     // sidecar is gone. An api-key account has none, so it is signed out rather
     // than relinked, and the toast used to claim the opposite.
     let has_login = crate::claude::has_stored_oauth_login(name);
+    // `active` comes off DISK for the same reason every other fact here does.
+    // This process is not the only thing that switches: `daemon::tick` and
+    // `fallback` both reach `actions::switch_profile`, so the active account
+    // moves with no keypress at all, and the snapshot behind the row is a tick
+    // old at best. Acting on a stale one relinks the account the operator just
+    // switched AWAY from, or skips the relink on the one that IS active and
+    // leaves its live slot a dangling symlink into the file just removed. A
+    // config that will not parse is a larger failure than this decision, so
+    // that arm keeps the old in-memory read rather than inventing a verdict.
+    let active = crate::profile::load_config()
+        .map(|c| c.is_active(name))
+        .unwrap_or_else(|_| app.config().is_active(name));
     if active && let Err(e) = force_link_profile_credentials(name) {
         app.toast(ToastKind::Danger, format!("relink failed\n{e}"));
         return;
     }
-    // The backup goes LAST, after the relink: failing between the sidecar
-    // removal and the relink would leave an active profile's live slot a
-    // dangling symlink under a toast reading "clear failed" — a broken login
-    // reported as nothing-happened. From here the live slot is already sound,
-    // so a failed backup removal is exactly what its toast says and no more.
-    let backup_removed = match crate::claude::clear_static_backup(name) {
-        Ok(removed) => removed,
-        Err(e) => {
-            app.toast(
-                ToastKind::Danger,
-                format!("cleared the long-lived token, but the preserved mint remains\n{e}"),
-            );
-            return;
-        }
-    };
     // No `refresh_tokens()`: `collect_tokens` reads `Profile::credentials`, which
     // a sidecar clear never touches.
     let tail = match (active, has_login) {
@@ -6229,12 +6220,36 @@ fn perform_clear_session_token(app: &mut App, name: &str) {
         (false, false) if on_disk.api_key.is_some() => {
             "; it stores no login, so it runs on its api key"
         }
-        (false, false) => "; it stores no login at all — log in before switching to it",
+        (false, false) => "; it stores no login at all · log in before switching to it",
     };
     let rolled = if rolling_armed {
         " · re-stamping off"
     } else {
         ""
+    };
+    // The backup goes LAST, after the relink: failing between the sidecar
+    // removal and the relink would leave an active profile's live slot a
+    // dangling symlink under a toast reading "clear failed", a broken login
+    // reported as nothing-happened. From here the live slot is already sound,
+    // so a failed backup removal is exactly what its toast says and no more.
+    //
+    // `tail` and `rolled` are composed ABOVE so this arm can carry them: the
+    // sign-out and the disarm both already happened and are durable, and a
+    // failure message that reports neither is the same silence the postscripts
+    // exist to refuse. The CLI keeps them for free by printing before its own
+    // removal.
+    let backup_removed = match crate::claude::clear_static_backup(name) {
+        Ok(removed) => removed,
+        Err(e) => {
+            app.toast(
+                ToastKind::Danger,
+                format!(
+                    "cleared the long-lived token for '{name}'{tail}{rolled}, but the preserved \
+                     mint remains\n{e}"
+                ),
+            );
+            return;
+        }
     };
     // Unconditional on the removal, like the CLI's `clear_backup_postscript`:
     // the pre-action disclosure lives in the row hint, but a hint is not a

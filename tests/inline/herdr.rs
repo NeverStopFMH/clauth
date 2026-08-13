@@ -314,15 +314,6 @@ fn nothing_marked_round_trips_unchanged() {
     assert_eq!(without_marked_blocks(existing), existing);
 }
 
-fn plugin_list_json(entry: &str) -> String {
-    format!(r#"{{"id":"cli:plugin","result":{{"plugins":[{entry}],"type":"plugin_list"}}}}"#)
-}
-
-const LINKED: &str = r#"{"enabled":true,"manifest_path":"/home/uwuclxdy/repos/rs/clauth/herdr-plugin/herdr-plugin.toml","min_herdr_version":"0.8.0","name":"clauth","platforms":["linux","macos"],"plugin_id":"clauth","plugin_root":"/home/uwuclxdy/repos/rs/clauth/herdr-plugin","source":{"kind":"local"},"version":"0.1.0"}"#;
-const GITHUB: &str = r#"{"enabled":true,"min_herdr_version":"0.8.0","name":"clauth","platforms":["linux","macos"],"plugin_id":"clauth","source":{"kind":"github","owner":"uwuclxdy","repo":"clauth","resolved_commit":"abc123","managed_path":"/home/u/.config/herdr/plugins/clauth","installed_unix_ms":1784231727746},"version":"0.1.0"}"#;
-const DISABLED: &str = r#"{"enabled":false,"min_herdr_version":"0.8.0","name":"clauth","platforms":["linux","macos"],"plugin_id":"clauth","plugin_root":"/home/uwuclxdy/repos/rs/clauth/herdr-plugin","source":{"kind":"local"},"version":"0.1.0"}"#;
-const STALE: &str = r#"{"enabled":true,"manifest_path":"/home/uwuclxdy/repos/rs/clauth/herdr-plugin/herdr-plugin.toml","min_herdr_version":"0.8.0","name":"clauth","platforms":["linux","macos"],"plugin_id":"clauth","plugin_root":"/gone/clauth/herdr-plugin","source":{"kind":"local"},"version":"0.1.0","warnings":["manifest unavailable: No such file or directory (os error 2)"]}"#;
-
 #[test]
 fn registry_entry_from_reads_every_real_shape() {
     let linked = registry_entry_from(&plugin_list_json(LINKED)).expect("linked");

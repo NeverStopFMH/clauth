@@ -530,6 +530,8 @@ pub(crate) enum ConfirmAction {
     /// its login in a Keychain entry clauth cannot write). Confirming just
     /// dismisses; `run_confirm_action` does nothing.
     Acknowledge,
+    /// Plugin tab: run `crate::herdr::heal` on the named config file.
+    HealHerdrConfig(std::path::PathBuf),
 }
 
 /// One-field name prompt shared by the Setup menu's two naming actions. The
@@ -1243,6 +1245,9 @@ pub(crate) enum PluginFix {
     RepairDivergence(String),
     /// Relink a `missing` active-profile credential link to its own stored creds.
     RelinkCredentials(String),
+    /// Append the keybinding + sidebar row to herdr's config (the config half of
+    /// `clauth herdr install`). `PathBuf` = the resolved config file.
+    HealHerdrConfig(std::path::PathBuf),
 }
 
 /// A computed integration-check row (global, profile-independent).
@@ -1282,6 +1287,11 @@ pub(crate) struct PluginState {
     /// on `r` (heavier than the others — it boots the real server), never on a tab
     /// switch or the per-tick refresh.
     pub(crate) mcp_boot: Option<crate::plugin_probe::McpProbe>,
+    /// Cached herdr probe: `None` = unprobed, `Some(None)` = herdr does not
+    /// resolve (no row), `Some(Some(p))` = the probe. Re-probed only on `r`; it
+    /// spawns three subprocesses, so a tab switch and the per-tick refresh reuse
+    /// the cached value.
+    pub(crate) herdr: Option<Option<crate::herdr::HerdrProbe>>,
 }
 
 impl Default for PluginState {
@@ -1296,6 +1306,7 @@ impl Default for PluginState {
             checks: Vec::new(),
             cc_version: None,
             mcp_boot: None,
+            herdr: None,
         }
     }
 }
@@ -3024,6 +3035,150 @@ fn apply_plugin_fix(app: &mut App) {
                 on_confirm: ConfirmAction::RelinkCredentials(name),
             }));
         }
+        PluginFix::HealHerdrConfig(path) => {
+            app.disarm_quit();
+            app.modals.push(Modal::Confirm(ConfirmState {
+                message: "add the keybinding and sidebar row to herdr's config?".to_string(),
+                detail: Some(
+                    "writes them into herdr's config.toml and validates the result with `herdr config check`.".to_string(),
+                ),
+                choice: false,
+                on_confirm: ConfirmAction::HealHerdrConfig(path),
+            }));
+        }
+    }
+}
+
+/// Componentwise numeric comparison of two dotted version strings. `None` when
+/// either side is not a dotted run of numbers — an unrecognisable version is
+/// unknown, not stale, so a caller stays quiet rather than warning on a shape it
+/// has never seen.
+fn compare_versions(a: &str, b: &str) -> Option<std::cmp::Ordering> {
+    let parts = |s: &str| -> Option<Vec<u64>> {
+        s.split('.').map(|part| part.parse::<u64>().ok()).collect()
+    };
+    Some(parts(a)?.cmp(&parts(b)?))
+}
+
+/// `probed >= min` componentwise. Either side absent or unparseable reads as
+/// satisfied: a false warn on an unrecognisable version is worse than staying
+/// quiet.
+fn version_satisfies(probed: Option<&str>, min: Option<&str>) -> bool {
+    let (Some(probed), Some(min)) = (probed, min) else {
+        return true;
+    };
+    match compare_versions(probed, min) {
+        Some(ord) => ord != std::cmp::Ordering::Less,
+        None => true,
+    }
+}
+
+/// The Plugin tab's `herdr` row: the installed herdr's clauth plugin plus the
+/// keybinding/sidebar config `clauth herdr install` adds. Pure so the verdict
+/// logic unit-tests without an `App`; the caller supplies the probe and the
+/// config readout (`None` when the config file could not be read at all).
+pub(crate) fn herdr_check(
+    probe: &crate::herdr::HerdrProbe,
+    config: Option<&crate::herdr::ConfigStatus>,
+) -> Check {
+    let mut detail = Vec::new();
+    detail.push(match &probe.version {
+        Some(version) => format!("herdr: {version}"),
+        None => "herdr: unknown".to_string(),
+    });
+
+    let mut danger = false;
+    let mut warn = false;
+    let mut fix = None;
+
+    // Indented, because herdr's own prose carries colons ("manifest unavailable: No such file or directory") and `detail_line` splits the first `": "` into a key column: left flush, a warning renders as a field named after its first clause and widens that column for every real field above it.
+    if let Some(error) = &probe.error {
+        danger = true;
+        detail.push(format!("  {error}"));
+    }
+
+    if let Some(entry) = &probe.entry {
+        // `herdr plugin list --json` spells a linked plugin's source `local`, measured against 0.8.0; `link` is the verb that creates one, not the kind it reports.
+        let local = entry.source_kind.as_deref() == Some("local");
+
+        if !entry.warnings.is_empty() {
+            danger = true;
+        }
+        if !entry.enabled {
+            warn = true;
+            detail.push("plugin: disabled".to_string());
+        } else if local {
+            detail.push("plugin: linked (local)".to_string());
+        } else {
+            detail.push("plugin: installed (github)".to_string());
+        }
+        if local && let Some(root) = &entry.plugin_root {
+            detail.push(format!("root: {root}"));
+        }
+        for warning in &entry.warnings {
+            detail.push(format!("  {warning}"));
+        }
+        if !version_satisfies(probe.version.as_deref(), entry.min_herdr_version.as_deref()) {
+            warn = true;
+            detail.push(format!(
+                "plugin needs herdr {} or newer",
+                entry.min_herdr_version.as_deref().unwrap_or("unknown")
+            ));
+        }
+
+        let parsed = config.is_some_and(|c| c.parsed);
+        let templated = config.is_some_and(|c| c.sidebar == crate::herdr::SidebarState::Templated);
+        match config {
+            Some(c) if !c.parsed => {
+                warn = true;
+                detail.push("herdr's config doesn't parse".to_string());
+            }
+            Some(c) => {
+                match &c.bound_key {
+                    Some(key) => detail.push(format!("key: {key}")),
+                    None => {
+                        warn = true;
+                        detail.push("key: not bound".to_string());
+                    }
+                }
+                if c.sidebar == crate::herdr::SidebarState::Templated {
+                    detail.push("sidebar: templated".to_string());
+                } else {
+                    warn = true;
+                    detail.push("sidebar: not templated".to_string());
+                }
+            }
+            None => {
+                warn = true;
+                detail.push("herdr's config can't be read".to_string());
+            }
+        }
+
+        if parsed && (config.and_then(|c| c.bound_key.as_deref()).is_none() || !templated) {
+            detail.push(String::new());
+            detail.push("[f] add the keybinding and sidebar row to herdr's config".to_string());
+            fix = probe.config_path.clone().map(PluginFix::HealHerdrConfig);
+        }
+    } else if probe.error.is_none() {
+        warn = true;
+        detail.push("plugin: not installed".to_string());
+        detail.push(String::new());
+        detail.push("  clauth herdr install".to_string());
+    }
+
+    let health = if danger {
+        Health::Danger
+    } else if warn {
+        Health::Warn
+    } else {
+        Health::Ok
+    };
+
+    Check {
+        label: "herdr",
+        health,
+        detail,
+        fix,
     }
 }
 
@@ -3109,6 +3264,13 @@ fn recompute_plugin_checks(app: &mut App, refresh_version: bool) {
         app.plugin.fetching = false;
     }
     let mcp_boot = app.plugin.mcp_boot.clone();
+
+    // herdr probe — three subprocesses, so it is `r`-gated like `mcp_boot`.
+    // Skipped under test rather than set to a fixed value, so a test that
+    // injected a probe keeps it.
+    if refresh_version && !cfg!(test) {
+        app.plugin.herdr = Some(crate::herdr::probe());
+    }
 
     // "global" == active in every project: a CC `user`-scope plugin install. A
     // `local`/`project` install (or a `./.mcp.json`) binds clauth to one repo.
@@ -3256,6 +3418,20 @@ fn recompute_plugin_checks(app: &mut App, refresh_version: bool) {
         }
     };
     checks.push(plugin_check);
+
+    // herdr — the installed herdr's clauth plugin + keybinding/sidebar config.
+    // The probe is cached (`r`-gated, three subprocesses); the config read is a
+    // cheap `fs::read_to_string` that rides the tick, using the path the probe
+    // already resolved. No row when herdr does not resolve or was never probed.
+    if let Some(Some(probe)) = &app.plugin.herdr {
+        let config = probe
+            .config_path
+            .as_deref()
+            .map(crate::herdr::read_config)
+            .and_then(Result::ok)
+            .map(|text| crate::herdr::config_status(&text));
+        checks.push(herdr_check(probe, config.as_ref()));
+    }
 
     // runtime — fold every profile's live sessions / credential link / token
     // freshness into one summary row. Snapshot the names under the config lock,
@@ -7453,6 +7629,28 @@ fn run_confirm_action(app: &mut App, action: ConfirmAction) {
             }
             Err(e) => app.toast(ToastKind::Danger, format!("relink failed\n{e}")),
         },
+        ConfirmAction::HealHerdrConfig(path) => {
+            match crate::herdr::heal(&path, crate::herdr::DEFAULT_KEY, &crate::herdr::herdr_bin()) {
+                Ok(notes) if notes.is_empty() => {
+                    app.toast(
+                        ToastKind::Success,
+                        "added the keybinding and sidebar row to herdr's config",
+                    );
+                    recompute_plugin_checks(app, false);
+                }
+                Ok(notes) => {
+                    // Non-empty notes = pieces clauth refused to touch (a table it
+                    // cannot extend by appending). Reporting success over those is a
+                    // lie, so the notes surface verbatim.
+                    app.toast(
+                        ToastKind::Warning,
+                        format!("herdr's config needs attention\n{}", notes.join("\n")),
+                    );
+                    recompute_plugin_checks(app, false);
+                }
+                Err(e) => app.toast(ToastKind::Danger, format!("herdr config fix failed\n{e}")),
+            }
+        }
         ConfirmAction::BlankCredentials(name) => {
             let result = {
                 let mut cfg = app.config();

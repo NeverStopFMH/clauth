@@ -218,7 +218,7 @@ fn config_path_from_plugin_dir(printed: &str) -> Option<PathBuf> {
 }
 
 /// Reads herdr's config for the callers that edit it. A missing file is an absent config and reads as empty; any other failure is a real error, since writing an empty string back would destroy a config that merely failed to read.
-fn read_config(path: &Path) -> Result<String> {
+pub(crate) fn read_config(path: &Path) -> Result<String> {
     match std::fs::read_to_string(path) {
         Ok(text) => Ok(text),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
@@ -255,10 +255,6 @@ pub(crate) struct HerdrProbe {
 }
 
 /// Probes the installed herdr. `None` when herdr does not resolve, so the caller renders no row at all.
-#[allow(
-    dead_code,
-    reason = "consumed by the Plugin tab's herdr row (T24 lane B)"
-)]
 pub(crate) fn probe() -> Option<HerdrProbe> {
     let bin = herdr_bin();
     let bin = if bin == "herdr" {
@@ -339,10 +335,26 @@ fn registry_probe(bin: &str) -> (Option<RegistryEntry>, Option<String>) {
 
 /// The pure half of the registry read, split out so tests feed it the real bytes with no subprocess.
 #[cfg(test)]
-fn registry_entry_from(json: &str) -> Option<RegistryEntry> {
+pub(crate) fn registry_entry_from(json: &str) -> Option<RegistryEntry> {
     let root: Value = serde_json::from_str(json).ok()?;
     registry_entry_from_value(&root)
 }
+
+/// One entry wrapped in the envelope `herdr plugin list --json` prints around it.
+#[cfg(test)]
+pub(crate) fn plugin_list_json(entry: &str) -> String {
+    format!(r#"{{"id":"cli:plugin","result":{{"plugins":[{entry}],"type":"plugin_list"}}}}"#)
+}
+
+// Real `herdr plugin list --json` entries, captured against 0.8.0 on 2026-08-13. They live here rather than in one test file because every consumer that reads a field off a `RegistryEntry` has to pin its reading against herdr's own spelling: a hand-built fixture agrees with whatever the reader guessed, which is how `source_kind` was first read as `link` when herdr emits `local`.
+#[cfg(test)]
+pub(crate) const LINKED: &str = r#"{"enabled":true,"manifest_path":"/home/uwuclxdy/repos/rs/clauth/herdr-plugin/herdr-plugin.toml","min_herdr_version":"0.8.0","name":"clauth","platforms":["linux","macos"],"plugin_id":"clauth","plugin_root":"/home/uwuclxdy/repos/rs/clauth/herdr-plugin","source":{"kind":"local"},"version":"0.1.0"}"#;
+#[cfg(test)]
+pub(crate) const GITHUB: &str = r#"{"enabled":true,"min_herdr_version":"0.8.0","name":"clauth","platforms":["linux","macos"],"plugin_id":"clauth","source":{"kind":"github","owner":"uwuclxdy","repo":"clauth","resolved_commit":"abc123","managed_path":"/home/u/.config/herdr/plugins/clauth","installed_unix_ms":1784231727746},"version":"0.1.0"}"#;
+#[cfg(test)]
+pub(crate) const DISABLED: &str = r#"{"enabled":false,"min_herdr_version":"0.8.0","name":"clauth","platforms":["linux","macos"],"plugin_id":"clauth","plugin_root":"/home/uwuclxdy/repos/rs/clauth/herdr-plugin","source":{"kind":"local"},"version":"0.1.0"}"#;
+#[cfg(test)]
+pub(crate) const STALE: &str = r#"{"enabled":true,"manifest_path":"/home/uwuclxdy/repos/rs/clauth/herdr-plugin/herdr-plugin.toml","min_herdr_version":"0.8.0","name":"clauth","platforms":["linux","macos"],"plugin_id":"clauth","plugin_root":"/gone/clauth/herdr-plugin","source":{"kind":"local"},"version":"0.1.0","warnings":["manifest unavailable: No such file or directory (os error 2)"]}"#;
 
 fn registry_entry_from_value(root: &Value) -> Option<RegistryEntry> {
     let entry = root
@@ -513,10 +525,6 @@ pub(crate) struct ConfigStatus {
 }
 
 /// Pure string -> verdict. The caller does the file read, so the row can show a missing or unreadable file without a second parse.
-#[allow(
-    dead_code,
-    reason = "consumed by the Plugin tab's herdr row (T24 lane B)"
-)]
 pub(crate) fn config_status(existing: &str) -> ConfigStatus {
     match toml::from_str::<toml::Value>(existing) {
         Ok(doc) => ConfigStatus {
@@ -608,10 +616,6 @@ fn plan_config(existing: &str, key: &str) -> Result<ConfigPlan> {
 }
 
 /// Appends whatever `plan_config` says is missing. Returns the plan's notes (the pieces it refused to touch), empty when it wrote everything.
-#[allow(
-    dead_code,
-    reason = "consumed by the Plugin tab's herdr row (T24 lane B)"
-)]
 pub(crate) fn heal(config_path: &Path, key: &str, bin: &str) -> Result<Vec<String>> {
     let existing = read_config(config_path)?;
     let plan = plan_config(&existing, key)?;

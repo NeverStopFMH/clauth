@@ -317,6 +317,13 @@ fn value_tone(key: &str, value: &str) -> Style {
         ("link", "linked") => theme::success(),
         ("link", "diverged") => theme::warning(),
         ("link", "missing") => theme::danger(),
+        ("plugin", "linked") => theme::success(),
+        ("plugin", "installed") => theme::success(),
+        ("plugin", "disabled") => theme::warning(),
+        ("plugin", "not") => theme::warning(),
+        ("key", "not") => theme::warning(),
+        ("sidebar", "templated") => theme::success(),
+        ("sidebar", "not") => theme::warning(),
         _ => theme::body(),
     }
 }
@@ -330,3 +337,7 @@ fn health_color(health: Health) -> ratatui::style::Color {
         Health::Idle => theme::text_dim_color(),
     }
 }
+
+#[cfg(test)]
+#[path = "../../../tests/inline/tui_render_plugin.rs"]
+mod tests;

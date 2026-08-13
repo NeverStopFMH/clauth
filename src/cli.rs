@@ -226,13 +226,14 @@ pub(crate) enum Command {
     /// Run the stdio MCP server (claude code launches this)
     Mcp,
 
-    /// Set up the herdr plugin: install it and bind a key to it
+    /// Set the herdr plugin up, or take it back out
     ///
     /// `clauth herdr install` runs herdr's own installer, then adds the two
     /// things a herdr plugin cannot declare for itself: the keybinding that
     /// opens the dashboard, and the sidebar row that renders which account
     /// each Claude Code pane burns. Both land in the user's herdr
     /// `config.toml`, and herdr validates the result before it is written.
+    /// `clauth herdr uninstall` reverses both halves together.
     Herdr {
         #[command(subcommand)]
         cmd: HerdrCommand,

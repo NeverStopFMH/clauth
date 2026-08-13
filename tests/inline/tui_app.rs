@@ -7068,3 +7068,325 @@ fn the_login_row_keeps_its_other_two_flows() {
         "the `+ new` form has no account to read a type off"
     );
 }
+
+// ── herdr row (Plugin tab) ──────────────────────────────────────────────────
+
+use crate::herdr::{ConfigStatus, HerdrProbe, RegistryEntry, SidebarState};
+
+fn herdr_entry(enabled: bool, min: Option<&str>, warnings: Vec<&str>) -> RegistryEntry {
+    RegistryEntry {
+        enabled,
+        version: Some("0.1.0".into()),
+        min_herdr_version: min.map(str::to_string),
+        plugin_root: None,
+        source_kind: Some("github".into()),
+        warnings: warnings.into_iter().map(str::to_string).collect(),
+    }
+}
+
+fn herdr_probe(
+    version: Option<&str>,
+    entry: Option<RegistryEntry>,
+    error: Option<&str>,
+) -> HerdrProbe {
+    HerdrProbe {
+        version: version.map(str::to_string),
+        entry,
+        config_path: Some(std::path::PathBuf::from("/tmp/herdr/config.toml")),
+        error: error.map(str::to_string),
+    }
+}
+
+fn herdr_config(parsed: bool, key: Option<&str>, sidebar: SidebarState) -> ConfigStatus {
+    ConfigStatus {
+        parsed,
+        bound_key: key.map(str::to_string),
+        sidebar,
+    }
+}
+
+fn healthy_herdr_probe() -> HerdrProbe {
+    herdr_probe(
+        Some("0.8.0"),
+        Some(herdr_entry(true, Some("0.8.0"), vec![])),
+        None,
+    )
+}
+
+fn healthy_herdr_config() -> ConfigStatus {
+    herdr_config(true, Some("prefix+a"), SidebarState::Templated)
+}
+
+#[test]
+fn herdr_check_ok_when_fully_wired() {
+    let check = super::herdr_check(&healthy_herdr_probe(), Some(&healthy_herdr_config()));
+    assert_eq!(check.health, super::Health::Ok);
+    assert!(check.fix.is_none());
+    assert!(check.detail.iter().any(|l| l == "herdr: 0.8.0"));
+    assert!(
+        check
+            .detail
+            .iter()
+            .any(|l| l == "plugin: installed (github)")
+    );
+    assert!(check.detail.iter().any(|l| l == "key: prefix+a"));
+    assert!(check.detail.iter().any(|l| l == "sidebar: templated"));
+}
+
+#[test]
+fn herdr_check_danger_on_registry_warnings() {
+    let probe = herdr_probe(
+        Some("0.8.0"),
+        Some(herdr_entry(true, None, vec!["plugin root is gone"])),
+        None,
+    );
+    let check = super::herdr_check(&probe, Some(&healthy_herdr_config()));
+    assert_eq!(check.health, super::Health::Danger);
+    assert!(check.detail.iter().any(|l| l == "  plugin root is gone"));
+    assert!(
+        check.fix.is_none(),
+        "a healthy config offers no fix, even on danger"
+    );
+}
+
+#[test]
+fn herdr_check_danger_on_registry_error() {
+    let probe = herdr_probe(
+        Some("0.8.0"),
+        None,
+        Some("herdr's plugin list did not parse"),
+    );
+    let check = super::herdr_check(&probe, Some(&healthy_herdr_config()));
+    assert_eq!(check.health, super::Health::Danger);
+    assert!(
+        check
+            .detail
+            .iter()
+            .any(|l| l == "  herdr's plugin list did not parse")
+    );
+}
+
+#[test]
+fn herdr_check_warns_without_fix_when_not_installed() {
+    let check = super::herdr_check(
+        &herdr_probe(Some("0.8.0"), None, None),
+        Some(&healthy_herdr_config()),
+    );
+    assert_eq!(check.health, super::Health::Warn);
+    assert!(check.detail.iter().any(|l| l == "plugin: not installed"));
+    assert!(check.detail.iter().any(|l| l == "  clauth herdr install"));
+    assert!(check.fix.is_none());
+}
+
+#[test]
+fn herdr_check_warns_without_fix_when_disabled() {
+    let probe = herdr_probe(Some("0.8.0"), Some(herdr_entry(false, None, vec![])), None);
+    let check = super::herdr_check(&probe, Some(&healthy_herdr_config()));
+    assert_eq!(check.health, super::Health::Warn);
+    assert!(check.detail.iter().any(|l| l == "plugin: disabled"));
+    assert!(check.fix.is_none());
+}
+
+#[test]
+fn herdr_check_warns_without_fix_when_version_too_old() {
+    let probe = herdr_probe(
+        Some("0.7.0"),
+        Some(herdr_entry(true, Some("0.8.0"), vec![])),
+        None,
+    );
+    let check = super::herdr_check(&probe, Some(&healthy_herdr_config()));
+    assert_eq!(check.health, super::Health::Warn);
+    assert!(
+        check
+            .detail
+            .iter()
+            .any(|l| l == "plugin needs herdr 0.8.0 or newer")
+    );
+    assert!(check.fix.is_none());
+}
+
+#[test]
+fn herdr_check_warns_without_fix_when_config_does_not_parse() {
+    let check = super::herdr_check(
+        &healthy_herdr_probe(),
+        Some(&herdr_config(false, None, SidebarState::Absent)),
+    );
+    assert_eq!(check.health, super::Health::Warn);
+    assert!(
+        check
+            .detail
+            .iter()
+            .any(|l| l == "herdr's config doesn't parse")
+    );
+    assert!(check.fix.is_none());
+}
+
+#[test]
+fn herdr_check_warns_and_offers_fix_when_key_unbound() {
+    let check = super::herdr_check(
+        &healthy_herdr_probe(),
+        Some(&herdr_config(true, None, SidebarState::Templated)),
+    );
+    assert_eq!(check.health, super::Health::Warn);
+    assert!(check.detail.iter().any(|l| l == "key: not bound"));
+    assert!(matches!(
+        &check.fix,
+        Some(super::PluginFix::HealHerdrConfig(p)) if p == &std::path::PathBuf::from("/tmp/herdr/config.toml")
+    ));
+}
+
+#[test]
+fn herdr_check_warns_and_offers_fix_when_sidebar_untemplated() {
+    let check = super::herdr_check(
+        &healthy_herdr_probe(),
+        Some(&herdr_config(true, Some("prefix+a"), SidebarState::Absent)),
+    );
+    assert_eq!(check.health, super::Health::Warn);
+    assert!(check.detail.iter().any(|l| l == "sidebar: not templated"));
+    assert!(check.fix.is_some());
+}
+
+#[test]
+fn herdr_check_warns_without_fix_when_config_unreadable() {
+    let check = super::herdr_check(&healthy_herdr_probe(), None);
+    assert_eq!(check.health, super::Health::Warn);
+    assert!(
+        check
+            .detail
+            .iter()
+            .any(|l| l == "herdr's config can't be read")
+    );
+    assert!(check.fix.is_none());
+}
+
+#[test]
+fn version_satisfies_compares_componentwise() {
+    assert!(super::version_satisfies(Some("0.10.0"), Some("0.9.0")));
+    assert!(!super::version_satisfies(Some("0.9.0"), Some("0.10.0")));
+    assert!(super::version_satisfies(Some("0.8.0"), Some("0.8.0")));
+    assert!(super::version_satisfies(Some("1.0.0"), Some("1.0")));
+    assert!(!super::version_satisfies(Some("0.8.9"), Some("0.9.0")));
+}
+
+#[test]
+fn version_satisfies_stays_quiet_on_unparseable() {
+    assert!(super::version_satisfies(Some("v0.7.0"), Some("0.8.0")));
+    assert!(super::version_satisfies(Some("0.8.0"), Some("v0.7.0")));
+    assert!(super::version_satisfies(None, Some("0.8.0")));
+    assert!(super::version_satisfies(Some("0.8.0"), None));
+}
+
+#[test]
+fn herdr_row_absent_when_herdr_does_not_resolve() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = bare_app();
+    app.plugin.herdr = Some(None);
+    super::recompute_plugin_checks(&mut app, false);
+    assert!(
+        !app.plugin.checks.iter().any(|c| c.label == "herdr"),
+        "a resolved-but-absent herdr must not render a row, got {:?}",
+        app.plugin
+            .checks
+            .iter()
+            .map(|c| c.label)
+            .collect::<Vec<_>>()
+    );
+}
+
+/// The row reads `source_kind` to decide whether a plugin is a local link, and herdr's own output is the only authority on that spelling. Driving the real captured bytes through the parse and into the check is what stops the row drifting onto a spelling herdr never emits: a hand-built fixture agrees with whatever the reader guessed.
+#[test]
+fn a_real_linked_payload_reads_as_a_local_link() {
+    use crate::herdr::{GITHUB, LINKED, plugin_list_json, registry_entry_from};
+
+    let entry = registry_entry_from(&plugin_list_json(LINKED)).expect("linked");
+    let root = entry.plugin_root.clone().expect("root");
+    let check = super::herdr_check(
+        &crate::herdr::HerdrProbe {
+            version: Some("0.8.0".to_string()),
+            entry: Some(entry),
+            config_path: None,
+            error: None,
+        },
+        None,
+    );
+    assert!(
+        check.detail.iter().any(|l| l == "plugin: linked (local)"),
+        "reads as a local link: {:?}",
+        check.detail
+    );
+    assert!(
+        check.detail.iter().any(|l| *l == format!("root: {root}")),
+        "names the checkout it links: {:?}",
+        check.detail
+    );
+
+    let entry = registry_entry_from(&plugin_list_json(GITHUB)).expect("github");
+    let check = super::herdr_check(
+        &crate::herdr::HerdrProbe {
+            version: Some("0.8.0".to_string()),
+            entry: Some(entry),
+            config_path: None,
+            error: None,
+        },
+        None,
+    );
+    assert!(
+        check
+            .detail
+            .iter()
+            .any(|l| l == "plugin: installed (github)"),
+        "a github install is not a local link: {:?}",
+        check.detail
+    );
+    assert!(
+        !check.detail.iter().any(|l| l.starts_with("root: ")),
+        "a github install names no checkout: {:?}",
+        check.detail
+    );
+}
+
+/// herdr's warnings and clauth's own probe errors are prose that happens to carry a colon, and `detail_line` turns the first `": "` of an un-indented line into a key column. Left flush, "manifest unavailable: No such file or directory" renders as a field called `manifest unavailable` and widens the key column for every real field in the row, which is what a live run against a stale link showed.
+#[test]
+fn herdr_prose_lines_are_indented_so_they_do_not_read_as_fields() {
+    use crate::herdr::{STALE, plugin_list_json, registry_entry_from};
+
+    let entry = registry_entry_from(&plugin_list_json(STALE)).expect("stale");
+    let warning = entry.warnings.first().cloned().expect("a warning");
+    assert!(
+        warning.contains(": "),
+        "the hazard needs a colon: {warning}"
+    );
+
+    let check = super::herdr_check(
+        &crate::herdr::HerdrProbe {
+            version: Some("0.8.0".to_string()),
+            entry: Some(entry),
+            config_path: None,
+            error: None,
+        },
+        None,
+    );
+    assert!(
+        check.detail.iter().any(|l| *l == format!("  {warning}")),
+        "the warning renders as an indented sub-line: {:?}",
+        check.detail
+    );
+
+    let check = super::herdr_check(
+        &crate::herdr::HerdrProbe {
+            version: None,
+            entry: None,
+            config_path: None,
+            error: Some("could not run `herdr plugin list --json`: boom".to_string()),
+        },
+        None,
+    );
+    assert!(
+        check
+            .detail
+            .iter()
+            .any(|l| *l == "  could not run `herdr plugin list --json`: boom"),
+        "the probe error renders as an indented sub-line: {:?}",
+        check.detail
+    );
+}

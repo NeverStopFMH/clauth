@@ -322,12 +322,13 @@ fn live_usage_prose_names_every_window_and_warns() {
     );
     assert_eq!(full, "target `work`: 5h 12.3% used, 7d 45.6% used");
 
-    // A null window reads `unknown`, never drops out as if it were zero.
+    // A null window reads `unknown` (never drops out as if it were zero); a null
+    // profile name reads `none` (no active profile configured, not a lost figure).
     let nulls = live_usage_prose(
         &serde_json::json!({"profile": null, "5h_used_pct": null, "7d_used_pct": null}),
         "active profile",
     );
-    assert_eq!(nulls, "active profile `unknown`: 5h unknown, 7d unknown");
+    assert_eq!(nulls, "active profile none: 5h unknown, 7d unknown");
 
     let warned = live_usage_prose(
         &serde_json::json!({
@@ -423,7 +424,7 @@ fn which_prose_says_unknown_when_unresolved() {
     });
     assert_eq!(
         which_prose(&p),
-        "session profile unknown, source unknown, tier unknown; active profile `unknown`: 5h unknown, 7d unknown"
+        "session profile unknown, source unknown, tier unknown; active profile none: 5h unknown, 7d unknown"
     );
 }
 
@@ -541,7 +542,7 @@ fn switch_prose_renders_success_and_failure() {
     });
     assert_eq!(
         switch_prose(&ok),
-        "switched the global active profile from unknown to `work`; active profile `work`: 5h 12% used, 7d unknown"
+        "switched the global active profile from none to `work`; active profile `work`: 5h 12% used, 7d unknown"
     );
 
     let err = serde_json::json!({
@@ -551,7 +552,7 @@ fn switch_prose_renders_success_and_failure() {
     });
     assert_eq!(
         switch_prose(&err),
-        "switch failed: profile not found: ghost; active profile `unknown`: 5h unknown, 7d unknown"
+        "switch failed: profile not found: ghost; active profile none: 5h unknown, 7d unknown"
     );
 }
 

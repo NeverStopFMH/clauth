@@ -49,8 +49,10 @@ Runs a headless `claude -p` under another profile and returns what it produced.
 
 | Field | Type | Default |
 |-------|------|---------|
-| `profile` | string | required |
-| `prompt` | string | required |
+| `profile` | string | exactly one of `profile` / `profiles` |
+| `profiles` | array of strings | exactly one of `profile` / `profiles`; background-only fan-out |
+| `prompt` | string | exactly one of `prompt` / `prompt_file` |
+| `prompt_file` | string | exactly one of `prompt` / `prompt_file`; path relative to `cwd` |
 | `model` | string | the profile's own default |
 | `cwd` | string | the server's working directory |
 | `env` | object | none |
@@ -66,6 +68,10 @@ Runs a headless `claude -p` under another profile and returns what it produced.
 **Cost.** A delegate to a subscription account opens a real 5-hour window there. To a pay-as-you-go API-key account it bills real money. To a prepaid plan account it draws down quota you already bought, so it costs nothing extra. Call `list_profiles` first to pick the account with headroom.
 
 **What it sees.** Only the prompt you pass. It has no view of the calling conversation, so the prompt has to carry the whole task.
+
+**Prompt file.** `prompt_file` reads the prompt from a path relative to the delegate's `cwd` instead of passing it inline, so a long reusable prompt costs your context nothing to hand over. It is validated against `cwd` and refused by name when it is absolute, escapes `cwd`, resolves through a symlink outside `cwd`, or is over 64 KiB. Give exactly one of `prompt` / `prompt_file`.
+
+**Fan-out.** `profiles` spawns one delegate per named account, background-only, and spends one real usage window per account. It returns one `job_id` per account and echoes the resolved target list. Duplicate names (case-insensitive), unknown names, and a blocking call are refused before any spawn. Give exactly one of `profile` / `profiles`.
 
 **Recursion.** Hard-capped at depth 1. A delegated session cannot call `delegate` again.
 

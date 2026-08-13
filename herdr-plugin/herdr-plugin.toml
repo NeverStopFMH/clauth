@@ -1,0 +1,40 @@
+id = "clauth"
+name = "clauth"
+version = "0.1.0"
+min_herdr_version = "0.8.0"
+description = "Claude Code account switcher and usage dashboard, in a herdr popup"
+platforms = ["linux", "macos"]
+
+[[panes]]
+id = "tui"
+title = "clauth"
+description = "Accounts, usage windows, and the auto-switch chain"
+# A popup at the default half size renders the full desktop layout on any host
+# 152 columns or wider, and clauth's own narrow rules take over below that.
+placement = "popup"
+command = ["clauth"]
+
+[[panes]]
+id = "switch"
+title = "Switch clauth account"
+description = "Pick the account new Claude Code sessions link to"
+placement = "popup"
+# `clauth list` prints one row per account and a popup does not scroll, so this
+# one takes the screen rather than the default half of it.
+width = "90%"
+height = "90%"
+command = ["sh", "switch.sh"]
+
+[[actions]]
+id = "open"
+title = "Open clauth"
+description = "Open the clauth dashboard in a popup"
+contexts = ["global", "workspace"]
+command = ["sh", "open-pane.sh", "tui"]
+
+[[actions]]
+id = "switch"
+title = "Switch clauth account"
+description = "Open the account picker in a popup"
+contexts = ["global", "workspace"]
+command = ["sh", "open-pane.sh", "switch"]

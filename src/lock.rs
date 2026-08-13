@@ -90,6 +90,18 @@ pub(crate) struct StateLockTimeout {
     waited: Duration,
 }
 
+impl StateLockTimeout {
+    /// A pre-built timeout for tests that pin how OTHER modules render this
+    /// error (contention, never a permissions fault) without staging a real
+    /// cross-process flock wait.
+    #[cfg(test)]
+    pub(crate) fn stub() -> Self {
+        Self {
+            waited: STATE_LOCK_TIMEOUT,
+        }
+    }
+}
+
 impl std::fmt::Display for StateLockTimeout {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(

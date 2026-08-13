@@ -70,6 +70,7 @@ fn cue_profile(status: Option<FetchStatus>) -> Profile {
         weekly_threshold: None,
         last_resort: false,
         preferred: false,
+        rolling_token: false,
         max_auto_spend: None,
         check_weekly: true,
         check_scoped: true,

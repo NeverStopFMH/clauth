@@ -18,6 +18,7 @@ fn row(session_id: &str, profile: &str) -> LiveSession {
         chain_cursor: None,
         current_member: None,
         last_swap_at: None,
+        launch_store: None,
     }
 }
 

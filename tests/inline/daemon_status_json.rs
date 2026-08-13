@@ -78,6 +78,7 @@ fn build_status_top_level_shape_and_active() {
             "name",
             "next_refresh_at",
             "provider",
+            "rolling_token",
             "stale",
             "third_party",
             "tier",
@@ -686,5 +687,111 @@ fn build_status_leaves_a_never_fetched_profile_unknown() {
     assert!(
         v["profiles"][0]["fetch_status"].is_null(),
         "no cache and no verdict is unknown, not a status",
+    );
+}
+
+/// The published `rolling_token` is what the sidecar HOLDS — the same content
+/// classification the TUI renders — never the config flag. status.json is the
+/// one surface where a reader has no second source to check against, so a
+/// flag-driven value would tell external readers a degraded mint is routine
+/// hours-scale maintenance (or hide a rolling bearer behind a mint's 30-day
+/// warning ramp).
+#[test]
+fn build_status_rolling_token_is_the_sidecar_content_not_the_config_flag() {
+    let _home = HomeSandbox::new();
+    let name = "roll-truth";
+    let dir = crate::profile::profile_dir(name).expect("dir");
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    let config_with_flag = |rolling_token: bool| {
+        let mut p = oauth_profile(name);
+        p.rolling_token = rolling_token;
+        AppConfig {
+            state: AppState::default(),
+            profiles: vec![p],
+        }
+    };
+    let sidecar = |scopes: Vec<&str>, plan: Option<&str>| ClaudeCredentials {
+        claude_ai_oauth: Some(OAuthToken {
+            access_token: "sk-ant-oat01-status-fixture".to_string(),
+            refresh_token: None,
+            expires_at: Some(crate::usage::now_ms() as i64 + 3_600_000),
+            scopes: Some(scopes.into_iter().map(String::from).collect()),
+            subscription_type: plan.map(String::from),
+        }),
+    };
+
+    // Flag ON, sidecar degraded onto the mint: publish the mint.
+    std::fs::write(
+        dir.join("session-token.json"),
+        serde_json::to_vec_pretty(&sidecar(
+            vec!["user:inference", "user:sessions:claude_code"],
+            None,
+        ))
+        .unwrap(),
+    )
+    .unwrap();
+    let v = build_status(&config_with_flag(true), 300_000, None, false);
+    assert_eq!(
+        v["profiles"][0]["rolling_token"], false,
+        "a degraded profile must publish the mint it is actually on"
+    );
+
+    // Flag OFF, sidecar holding a rolling bearer: publish the bearer.
+    std::fs::write(
+        dir.join("session-token.json"),
+        serde_json::to_vec_pretty(&sidecar(
+            vec!["user:inference", "user:profile"],
+            Some("max"),
+        ))
+        .unwrap(),
+    )
+    .unwrap();
+    let v = build_status(&config_with_flag(false), 300_000, None, false);
+    assert_eq!(
+        v["profiles"][0]["rolling_token"], true,
+        "what sessions actually hold outranks the flag in both directions"
+    );
+}
+
+/// A mis-fill (rotating pair) publishes `rolling_token: false` even though its
+/// chain-shaped scopes would scope-classify as rolling — the classifier's
+/// refresh-token arm pre-empts the inference. Without it, status.json told
+/// external readers "routine hours-scale maintenance" over the exact state the
+/// TUI renders `[ mis-filled ]` for, on the same file, same frame.
+#[test]
+fn build_status_rolling_token_is_false_for_a_misfill() {
+    let _home = HomeSandbox::new();
+    let name = "roll-misfill";
+    let dir = crate::profile::profile_dir(name).expect("dir");
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    let mut p = oauth_profile(name);
+    p.rolling_token = true;
+    let config = AppConfig {
+        state: AppState::default(),
+        profiles: vec![p],
+    };
+    // What a mis-fill IS: a copy of credentials.json — refresh token, chain
+    // scopes, plan stamp and all.
+    let misfill = ClaudeCredentials {
+        claude_ai_oauth: Some(OAuthToken {
+            access_token: "at-misfill".to_string(),
+            refresh_token: Some("rt-misfill".to_string()),
+            expires_at: Some(crate::usage::now_ms() as i64 + 3_600_000),
+            scopes: Some(vec![
+                "user:inference".to_string(),
+                "user:profile".to_string(),
+            ]),
+            subscription_type: Some("max".to_string()),
+        }),
+    };
+    std::fs::write(
+        dir.join("session-token.json"),
+        serde_json::to_vec_pretty(&misfill).unwrap(),
+    )
+    .unwrap();
+    let v = build_status(&config, 300_000, None, false);
+    assert_eq!(
+        v["profiles"][0]["rolling_token"], false,
+        "a mis-fill is the state the split exists to detect, not a rolling token"
     );
 }

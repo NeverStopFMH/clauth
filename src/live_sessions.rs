@@ -64,6 +64,25 @@ pub(crate) struct LiveSession {
     /// Session-owned: when this session last executed a swap.
     #[serde(default)]
     pub(crate) last_swap_at: Option<u64>,
+    /// The credential source this session LAUNCHED on, as an absolute path.
+    /// Set once at registration from the same value the runtime tree was built
+    /// from, never mutated.
+    ///
+    /// A path rather than a decoded verdict, deliberately. What the rotation
+    /// gate needs to know is whether this session is holding something
+    /// rotatable, and the CONTENT at this path can change under a running
+    /// session — `claude::heal_misfilled_sidecar` exists precisely because a
+    /// rotating pair can land in a `session-token.json`. Freezing a boolean
+    /// here would keep answering "refresh-less" while the file the session
+    /// actually reads holds a live chain, so the test is made at rotation time
+    /// against this path (`runtime::live_session_holds_rotatable`).
+    ///
+    /// `serde(default)` is the upgrade gate and the fail-closed direction at
+    /// once: a row written by a clauth that predates the field reads `None`,
+    /// which every consumer must treat as "assume rotatable", so the macOS
+    /// rotation refusal keeps applying to it exactly as it does today.
+    #[serde(default)]
+    pub(crate) launch_store: Option<PathBuf>,
 }
 
 impl LiveSession {
@@ -74,6 +93,7 @@ impl LiveSession {
         start_profile: &str,
         isolated: bool,
         follows_chain: bool,
+        launch_store: Option<PathBuf>,
     ) -> Self {
         Self {
             session_id: session_id.as_str().to_string(),
@@ -87,6 +107,7 @@ impl LiveSession {
             chain_cursor: None,
             current_member: None,
             last_swap_at: None,
+            launch_store,
         }
     }
 }

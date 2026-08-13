@@ -259,6 +259,7 @@ fn runtime_check_counts_a_swapped_session_once_on_the_member_it_moved_to() {
         chain_cursor: None,
         current_member: Some("swap-b".to_string()),
         last_swap_at: Some(1_700_000_060_000),
+        launch_store: None,
     };
     crate::live_sessions::register(&row).expect("register row");
     // Both markers, exactly as a swapped session holds them.
@@ -1086,6 +1087,34 @@ fn config_rows_clear_session_token_row_tracks_the_sidecar() {
         config_rows(&app).contains(&ConfigRow::ClearSessionToken),
         "a mis-filled sidecar needs the same exit"
     );
+
+    // The widened arms, each alone. A set flag with nothing stamped is the
+    // state where hiding the row leaves the daemon to re-create what the
+    // operator has no surface left to remove; a preserved mint alone is a
+    // year-scale credential only this row owns.
+    let dir = crate::profile::profile_dir("acct").expect("profile dir");
+    std::fs::remove_file(dir.join("session-token.json")).expect("drop the sidecar");
+    {
+        let mut cfg = app.config();
+        cfg.find_mut("acct").expect("acct").rolling_token = true;
+    }
+    assert!(
+        config_rows(&app).contains(&ConfigRow::ClearSessionToken),
+        "a set flag alone keeps the row"
+    );
+    {
+        let mut cfg = app.config();
+        cfg.find_mut("acct").expect("acct").rolling_token = false;
+    }
+    assert!(
+        !config_rows(&app).contains(&ConfigRow::ClearSessionToken),
+        "flag down, nothing stored — the row goes again"
+    );
+    std::fs::write(dir.join("session-token.static.json"), b"{}").expect("backup");
+    assert!(
+        config_rows(&app).contains(&ConfigRow::ClearSessionToken),
+        "a preserved mint alone keeps the row"
+    );
 }
 
 /// The row refuses on a profile storing no OTHER login — the same refusal
@@ -1298,6 +1327,329 @@ fn clear_session_token_on_an_idle_account_leaves_the_live_link_alone() {
             .expect("profile dir")
             .join("credentials.json"),
         "clearing an idle account must not repoint the live slot at it"
+    );
+}
+
+/// The TUI clear is the same FULL exit as `clauth static-token --clear`, or the
+/// two surfaces fight the daemon differently: on a rolling profile the
+/// `rolling_token` flag goes FIRST (a set flag has the daemon re-stamp a fresh
+/// bearer over the removal on its next scan) and the preserved mint goes too
+/// (a "cleared" long-lived token with a year-scale mint still in
+/// `session-token.static.json` is not cleared).
+#[test]
+fn clear_session_token_on_a_rolling_profile_disarms_and_takes_the_backup() {
+    use super::{ConfigRow, build_draft_existing, run_config_row};
+    use crate::profile::Profile;
+    let _home = crate::testutil::HomeSandbox::new();
+
+    let mut acct = Profile::new("roll".to_string(), None, None);
+    acct.credentials = Some(split_creds("stored-oauth", Some("stored-refresh")));
+    acct.rolling_token = true;
+    crate::profile::save_profile(&acct).expect("save profile");
+    // A mint first, then the rolling stamp: the first stamp preserves the mint
+    // into the backup slot — the exact two-file state a rolling profile
+    // carries in production.
+    crate::claude::write_session_token(
+        "roll",
+        "sk-ant-oat01-tui-clear-rolling-mint0",
+        crate::usage::now_ms() as i64,
+    )
+    .expect("mint");
+    crate::claude::stamp_rolling_token(
+        "roll",
+        &crate::profile::OAuthToken {
+            access_token: "at-rolled".to_string(),
+            refresh_token: None,
+            expires_at: Some(crate::usage::now_ms() as i64 + 8 * 3_600_000),
+            scopes: Some(vec![
+                "user:inference".to_string(),
+                "user:profile".to_string(),
+            ]),
+            subscription_type: Some("max".into()),
+        },
+    )
+    .expect("stamp");
+    let dir = crate::profile::profile_dir("roll").expect("profile dir");
+    assert!(
+        dir.join("session-token.static.json").exists(),
+        "fixture: the stamp preserved the mint"
+    );
+
+    let mut app = app_with(vec![acct]);
+    app.profile_cursor = 0;
+    app.config_draft = Some(build_draft_existing(&app, "roll"));
+
+    run_config_row(&mut app, ConfigRow::ClearSessionToken);
+    run_config_row(&mut app, ConfigRow::ClearSessionToken);
+
+    assert!(
+        !dir.join("session-token.json").exists(),
+        "the sidecar is gone"
+    );
+    assert!(
+        !dir.join("session-token.static.json").exists(),
+        "the preserved mint is a long-lived credential and goes with the clear"
+    );
+    let p = crate::profile::load_profile("roll").expect("reload");
+    assert!(
+        !p.rolling_token,
+        "the flag goes too, or the daemon re-stamps a sidecar over the clear"
+    );
+    assert!(
+        app.toasts
+            .iter()
+            .any(|t| t.body.contains("re-stamping off")),
+        "the toast names the disarm, got {:?}",
+        app.toasts
+    );
+    // Unconditional on the removal, like the CLI's postscript: the hint's
+    // pre-action disclosure is not a report, and `--yes` has no hint at all.
+    assert!(
+        app.toasts
+            .iter()
+            .any(|t| t.body.contains("the preserved mint is gone")),
+        "the toast reports the destroyed backup, got {:?}",
+        app.toasts
+    );
+}
+
+/// The refusal gate reads the same condition as the CLI's: only a stored PIECE
+/// (a sidecar or a preserved mint) is a credential the clear could strip. A
+/// flag-only account with no other login therefore DISARMS — before this, the
+/// widening made its row visible while the press returned silently, a surface
+/// with no behavior on the one state whose only remaining fix it was.
+#[test]
+fn clear_session_token_disarms_a_flag_only_account_with_no_other_login() {
+    use super::{ConfigRow, build_draft_existing, run_config_row};
+    use crate::profile::Profile;
+    let _home = crate::testutil::HomeSandbox::new();
+
+    let mut acct = Profile::new("solo".to_string(), None, None);
+    acct.rolling_token = true;
+    crate::profile::save_profile(&acct).expect("save profile");
+
+    let mut app = app_with(vec![acct]);
+    app.profile_cursor = 0;
+    app.config_draft = Some(build_draft_existing(&app, "solo"));
+
+    run_config_row(&mut app, ConfigRow::ClearSessionToken);
+    run_config_row(&mut app, ConfigRow::ClearSessionToken);
+
+    let p = crate::profile::load_profile("solo").expect("reload");
+    assert!(
+        !p.rolling_token,
+        "the disarm lands on disk, as the CLI's does"
+    );
+    let body = app
+        .toasts
+        .iter()
+        .map(|t| t.body.as_str())
+        .collect::<Vec<_>>()
+        .join(" | ");
+    assert!(
+        body.contains("re-stamping off"),
+        "the disarm is reported: {body}"
+    );
+    // The account holds NO credential of any kind — the api-key arms of the
+    // tail were written for a different account shape, and the backup suffix
+    // is gated on a removal that never happened here.
+    assert!(
+        body.contains("it stores no login at all"),
+        "the tail must not promise an api key this account does not hold: {body}"
+    );
+    assert!(
+        !body.contains("the preserved mint is gone"),
+        "no backup existed, so none may be reported destroyed: {body}"
+    );
+}
+
+/// The other-login refusal is re-checked from DISK under the guard — the TUI
+/// half of the CLI's own re-check, and stricter: `reload_fingerprint` does not
+/// stat `credentials.json`, so an out-of-band log-out (a script's `rm`, another
+/// tool) leaves `app.config()` claiming a stored login INDEFINITELY, and the
+/// in-memory gate in `run_config_row` would wave the clear through into
+/// stripping the account's last credential.
+#[test]
+fn clear_session_token_refuses_when_the_disk_login_is_gone() {
+    use super::{ConfigRow, build_draft_existing, run_config_row};
+    use crate::profile::Profile;
+    let _home = crate::testutil::HomeSandbox::new();
+
+    let mut acct = Profile::new("ghost".to_string(), None, None);
+    acct.credentials = Some(split_creds("stored-oauth", Some("stored-refresh")));
+    crate::profile::save_profile(&acct).expect("save profile");
+    seed_session_token("ghost", None);
+    let dir = crate::profile::profile_dir("ghost").expect("profile dir");
+
+    let mut app = app_with(vec![acct]);
+    app.profile_cursor = 0;
+    app.config_draft = Some(build_draft_existing(&app, "ghost"));
+
+    // The out-of-band log-out: disk loses the login, the snapshot keeps it.
+    std::fs::remove_file(dir.join("credentials.json")).expect("log out on disk");
+
+    run_config_row(&mut app, ConfigRow::ClearSessionToken);
+    run_config_row(&mut app, ConfigRow::ClearSessionToken);
+
+    assert!(
+        dir.join("session-token.json").exists(),
+        "a refused clear removes nothing"
+    );
+    assert!(
+        app.toasts
+            .iter()
+            .any(|t| t.body.contains("no other login anymore")),
+        "the refusal is loud and names the reason, got {:?}",
+        app.toasts
+    );
+}
+
+/// The preserved mint goes LAST, after the relink: a backup-removal failure
+/// between the sidecar removal and the relink would leave an ACTIVE account's
+/// live slot a dangling symlink under a "clear failed" toast — a broken login
+/// reported as nothing-happened. Driven by blocking the backup slot with a
+/// directory: the sidecar clears, the relink lands, and only then does the
+/// removal fail, loudly and honestly.
+#[test]
+fn clear_session_token_relinks_before_the_backup_removal_can_fail() {
+    use super::{ConfigRow, build_draft_existing, run_config_row};
+    use crate::profile::Profile;
+    let home = crate::testutil::HomeSandbox::new();
+
+    let mut acct = Profile::new("mid".to_string(), None, None);
+    acct.credentials = Some(split_creds("stored-oauth", Some("stored-refresh")));
+    crate::profile::save_profile(&acct).expect("save profile");
+    seed_session_token("mid", None);
+    let dir = crate::profile::profile_dir("mid").expect("profile dir");
+    crate::claude::force_link_profile_credentials("mid").expect("link");
+    let live = home.home().join(".claude").join(".credentials.json");
+    assert_eq!(
+        std::fs::read_link(&live).expect("live is a symlink"),
+        dir.join("session-token.json"),
+        "fixture: the live slot starts on the sidecar"
+    );
+    // A directory in the backup slot fails `remove_file`, nothing else.
+    std::fs::create_dir(dir.join("session-token.static.json")).expect("block the backup slot");
+
+    let mut app = app_with(vec![acct]);
+    app.config().state.active_profile = Some("mid".into());
+    app.profile_cursor = 0;
+    app.config_draft = Some(build_draft_existing(&app, "mid"));
+
+    run_config_row(&mut app, ConfigRow::ClearSessionToken);
+    run_config_row(&mut app, ConfigRow::ClearSessionToken);
+
+    assert!(
+        !dir.join("session-token.json").exists(),
+        "the sidecar clear itself succeeded"
+    );
+    assert_eq!(
+        std::fs::read_link(&live).expect("live survives as a symlink"),
+        dir.join("credentials.json"),
+        "the relink landed BEFORE the backup removal failed — no dangling live slot"
+    );
+    assert!(
+        app.toasts
+            .iter()
+            .any(|t| t.body.contains("the preserved mint remains")),
+        "the partial outcome is named, not folded into 'clear failed', got {:?}",
+        app.toasts
+    );
+}
+
+/// The renderer's in-memory flag flips only AFTER the persist lands. Flipped
+/// first, a failed `save_profile` leaves `app.config()` claiming the flag is
+/// off against a disk that still says on — `reload_fingerprint` never corrects
+/// it (config mtime did not move), and any later unrelated save makes the lie
+/// durable: a live rolling sidecar nothing re-stamps.
+#[test]
+#[cfg(unix)]
+fn clear_session_token_keeps_the_flag_when_the_persist_fails() {
+    use super::{ConfigRow, build_draft_existing, run_config_row};
+    use crate::profile::Profile;
+    use std::os::unix::fs::PermissionsExt as _;
+    let _home = crate::testutil::HomeSandbox::new();
+
+    let mut acct = Profile::new("stuck".to_string(), None, None);
+    acct.credentials = Some(split_creds("stored-oauth", Some("stored-refresh")));
+    acct.rolling_token = true;
+    crate::profile::save_profile(&acct).expect("save profile");
+    seed_session_token("stuck", None);
+    let dir = crate::profile::profile_dir("stuck").expect("profile dir");
+
+    let mut app = app_with(vec![acct]);
+    app.profile_cursor = 0;
+    app.config_draft = Some(build_draft_existing(&app, "stuck"));
+
+    // Fail the persist stage ALONE: a read-only profile dir fails
+    // `save_profile`'s tempfile creation while every read — the under-guard
+    // `load_profile`, the sidecar stats — still works, so the clear provably
+    // reaches the persist and dies exactly there. The rotation lock is
+    // pre-created while the dir is still writable (its parent `mkdir_700` is
+    // recursive-create-only and never re-chmods an existing dir).
+    drop(crate::runtime::RotationGuard::acquire("stuck").expect("pre-create the lock"));
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o500))
+        .expect("make the dir read-only");
+    run_config_row(&mut app, ConfigRow::ClearSessionToken);
+    run_config_row(&mut app, ConfigRow::ClearSessionToken);
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
+        .expect("restore the dir");
+
+    assert!(
+        app.toasts.iter().any(|t| t.body.contains("clear failed")),
+        "the failed persist is loud, got {:?}",
+        app.toasts
+    );
+    assert!(
+        dir.join("session-token.json").exists(),
+        "a failed persist stops the clear before anything is removed"
+    );
+    assert!(
+        app.config().find("stuck").is_some_and(|p| p.rolling_token),
+        "the in-memory flag must not claim a disarm the disk refused"
+    );
+    let p = crate::profile::load_profile("stuck").expect("reload");
+    assert!(p.rolling_token, "disk still says armed");
+}
+
+/// The TUI clear takes the rotation guard NON-BLOCKING: a rotation in flight —
+/// the exact writer that could re-stamp the sidecar after the removal — fails
+/// the clear loudly into a toast, and nothing on disk or in config moves. A UI
+/// thread must never park behind a timeout-less flock, so `try_acquire` is the
+/// only correct spelling of the CLI's load-bearing guard here.
+#[test]
+fn clear_session_token_refuses_while_a_rotation_holds_the_profile() {
+    use super::{ConfigRow, build_draft_existing, run_config_row};
+    use crate::profile::Profile;
+    let _home = crate::testutil::HomeSandbox::new();
+
+    let mut acct = Profile::new("held".to_string(), None, None);
+    acct.credentials = Some(split_creds("stored-oauth", Some("stored-refresh")));
+    acct.rolling_token = true;
+    crate::profile::save_profile(&acct).expect("save profile");
+    seed_session_token("held", None);
+    let dir = crate::profile::profile_dir("held").expect("profile dir");
+
+    let _outside = crate::runtime::RotationGuard::acquire("held").expect("hold the lock");
+
+    let mut app = app_with(vec![acct]);
+    app.profile_cursor = 0;
+    app.config_draft = Some(build_draft_existing(&app, "held"));
+    run_config_row(&mut app, ConfigRow::ClearSessionToken);
+    run_config_row(&mut app, ConfigRow::ClearSessionToken);
+
+    assert!(
+        dir.join("session-token.json").exists(),
+        "a refused clear removes nothing"
+    );
+    let p = crate::profile::load_profile("held").expect("reload");
+    assert!(p.rolling_token, "a refused clear disarms nothing");
+    assert!(
+        app.toasts
+            .iter()
+            .any(|t| t.body.contains("rotation is in flight")),
+        "the refusal is loud, got {:?}",
+        app.toasts
     );
 }
 
@@ -5905,6 +6257,7 @@ fn a_tick_re_tallies_live_sessions_that_appeared_after_startup() {
         chain_cursor: None,
         current_member: None,
         last_swap_at: None,
+        launch_store: None,
     };
     crate::live_sessions::register(&row).expect("register row");
     let _marker = crate::runtime::hold_session_row_marker("late", false, sid)
@@ -5965,6 +6318,7 @@ fn runtime_check_names_a_multi_session_account_with_its_count() {
             chain_cursor: None,
             current_member: None,
             last_swap_at: None,
+            launch_store: None,
         })
         .expect("register row");
         markers.push(
@@ -6026,6 +6380,7 @@ fn runtime_check_says_one_account_when_every_live_session_shares_it() {
             chain_cursor: None,
             current_member: None,
             last_swap_at: None,
+            launch_store: None,
         })
         .expect("register row");
         markers.push(
@@ -6078,6 +6433,7 @@ fn mini_profile(name: &str, api_key: Option<&str>) -> Profile {
         weekly_threshold: None,
         last_resort: false,
         preferred: false,
+        rolling_token: false,
         max_auto_spend: None,
         check_weekly: true,
         check_scoped: true,

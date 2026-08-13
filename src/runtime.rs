@@ -498,6 +498,69 @@ fn rotation_blocked_by_live_session(has_live_session: bool, is_macos: bool) -> b
     is_macos && has_live_session
 }
 
+/// Whether ANY live `clauth start` session for `name` launched on a credential
+/// that carries a refresh token — the only kind a rotation can strand.
+///
+/// [`rotation_blocked_by_live_session`] spells out why a live session blocks
+/// rotation on macOS: that session's Claude Code holds the pair in a Keychain
+/// item clauth cannot write, so a rotation leaves it spending a superseded
+/// refresh token, and the `invalid_grant` that follows blanks its item and
+/// signs the session out mid-task. Every step of that mechanism needs a refresh
+/// token to attempt. A session launched on a `session-token.json` sidecar has
+/// none — CLA-SPLIT put it there exactly so sessions hold nothing rotatable —
+/// so there is nothing for it to spend and nothing for a rotation to strand.
+///
+/// Deliberately feature-agnostic: it asks what the session HOLDS, never
+/// whether the rolling token is enabled. An upstream #53 `claude setup-token` mint answers the
+/// same way a rolling token does, and gets the same exemption for the same
+/// reason, which is why this is a narrowing of the refusal rather than a
+/// carve-out bolted beside it.
+///
+/// Read at ROTATION time and keyed on the row's PATH, not on a verdict frozen
+/// at launch: the content at that path can change under a running session
+/// ([`crate::claude::heal_misfilled_sidecar`] exists because a rotating pair
+/// can land in a sidecar), and a frozen bool would keep saying "refresh-less"
+/// while the file the session reads holds a live chain.
+///
+/// EVERY unknown reads as rotatable, matching [`has_live_session`]'s own
+/// fail-closed asymmetry: an unreadable marker dir, a marker with no registry
+/// row (`acquire` tolerates a failed registration), a row from a clauth that
+/// predates `launch_store`, and an unreadable or half-written credential file
+/// all return `true` and refuse exactly as today. The one readable shape that
+/// ALLOWS is a file that parses with no `claudeAiOauth` block at all (`{}`):
+/// it holds no refresh token to strand, so permitting the rotation is the
+/// verdict, not a hole in the enumeration. Bare `claude` sessions never
+/// reach this predicate at all — their stand-in markers live under
+/// [`live_bare_dir`], not the profile — so the refusal is unchanged for them
+/// by construction rather than by this check.
+fn live_session_holds_rotatable(name: &str) -> bool {
+    let Some(dirs) = session_marker_dirs(name) else {
+        return true;
+    };
+    for dir in &dirs {
+        let Some(ids) = live_marker_names(dir) else {
+            return true;
+        };
+        for id in ids {
+            let Some(session_id) = id.to_str() else {
+                return true;
+            };
+            let Some(store) = crate::live_sessions::get(session_id).and_then(|r| r.launch_store)
+            else {
+                return true;
+            };
+            let refreshless =
+                crate::profile::read_json_file::<crate::profile::ClaudeCredentials>(&store)
+                    .ok()
+                    .is_some_and(|c| c.refresh_token().is_none());
+            if !refreshless {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 /// [`rotation_blocked_by_live_session`] against the live host and marker state —
 /// what every rotation leg and both TUI pre-refusals call.
 ///
@@ -505,8 +568,15 @@ fn rotation_blocked_by_live_session(has_live_session: bool, is_macos: bool) -> b
 /// [`has_live_session`] is a `read_dir` plus an `open` + `try_lock` per marker,
 /// and passing it as an argument would pay that on every Linux poll of every
 /// profile for a value the predicate discards.
+///
+/// [`live_session_holds_rotatable`] is tested LAST for the same reason: it is
+/// strictly the more expensive probe (a registry read plus a credential parse
+/// per live session), and it only ever narrows an answer that is already
+/// `true`, so it is never paid by a profile that was not about to be refused.
 pub(crate) fn rotation_blocked_for(name: &str) -> bool {
-    cfg!(target_os = "macos") && rotation_blocked_by_live_session(has_live_session(name), true)
+    cfg!(target_os = "macos")
+        && rotation_blocked_by_live_session(has_live_session(name), true)
+        && live_session_holds_rotatable(name)
 }
 
 /// Count of live `clauth start` sessions for the profile, deduped by marker NAME
@@ -847,6 +917,12 @@ pub(crate) fn live_isolated_stores() -> Vec<(String, PathBuf)> {
 }
 
 fn canonical_credentials(name: &str) -> Result<PathBuf> {
+    // CLA-ROLL: arm a rolling-token profile's sidecar BEFORE resolving the source —
+    // a session launched inside an arming window (flag on, sidecar not yet
+    // rolling) would otherwise copy the rotating pair, and the daemon's later
+    // rotations (exempted from the live-session bail only for ARMED
+    // sidecars) could still race a hand-armed state. Best-effort by design.
+    crate::claude::arm_rolling_from_disk(name);
     // CLA-SPLIT: a `clauth start` session runs on what a switch would install —
     // the static session token when the profile has one. The rotating usage
     // pair in `credentials.json` must never be handed to a session (it would
@@ -908,6 +984,31 @@ impl RotationGuard {
         // trip, before `config` and the state flock are ever taken.
         let _rank = crate::lockorder::RankGuard::enter::<crate::lockorder::rank::Rotation>();
         Ok(Self { _file: file, _rank })
+    }
+
+    /// Like [`RotationGuard::acquire`], but `Ok(None)` when another holder has
+    /// the lock instead of parking behind it. For callers on threads that must
+    /// never wait an unbounded time — the scheduler's tick thread above all,
+    /// where a `clauth start` holding this lock across its recursive
+    /// `~/.claude` copy would otherwise stall every account's poll while the
+    /// heartbeat (stamped in the main loop, not here) stays fresh.
+    pub(crate) fn try_acquire(name: &str) -> Result<Option<Self>> {
+        let path = rotation_lock_path(name)?;
+        if let Some(parent) = path.parent() {
+            crate::profile::mkdir_700(parent)
+                .with_context(|| format!("failed to create {}", parent.display()))?;
+        }
+        let file =
+            open_pid_file(&path).with_context(|| format!("failed to open {}", path.display()))?;
+        match file.try_lock() {
+            Ok(()) => {}
+            Err(std::fs::TryLockError::WouldBlock) => return Ok(None),
+            Err(std::fs::TryLockError::Error(e)) => {
+                return Err(e).with_context(|| format!("failed to lock {}", path.display()));
+            }
+        }
+        let _rank = crate::lockorder::RankGuard::enter::<crate::lockorder::rank::Rotation>();
+        Ok(Some(Self { _file: file, _rank }))
     }
 }
 
@@ -1824,6 +1925,16 @@ impl ProfileRuntime {
                 name,
                 isolation == Isolation::Isolated,
                 opt_in,
+                // The SAME value the runtime tree is built from below, so the
+                // row cannot disagree with what this session actually reads —
+                // on macOS, which is the only place it is consulted. The
+                // stronger "never" would need `swap_to` to update it when it
+                // moves `cell.canonical`, and it deliberately does not: swaps
+                // refuse macOS (`swap_support`), and macOS is where
+                // `live_session_holds_rotatable` reads this. A platform that
+                // gains both swaps and the rotation refusal inherits that
+                // update as a prerequisite.
+                Some(canonical.clone()),
             );
             if let Err(e) = crate::live_sessions::register(&row) {
                 logline!("clauth: registering the live session failed: {e}");
@@ -2287,14 +2398,17 @@ fn build_runtime_dir_with_active_env(
         if file_name == "settings.json" || file_name == ".credentials.json" {
             continue;
         }
-        // Same skip rule the mirror side applies in `union_children`, and for
-        // the same reason: a sibling session's `copy_file` publishes through a
-        // staging sibling, so this walk can meet one that is still being
-        // written. Copying it fails outright where the source is open for
-        // writing (Windows share modes are per-handle, so one process is no
-        // exemption) or where the rename lands mid-copy, and otherwise lands an
-        // orphan the mirror never deletes. Real mode needs it too: the link it
-        // would make dangles the moment that rename lands.
+        // A `copy_file` publish in flight, not content. `union_children` skips
+        // these for the watchdog mirror; this walk has the same exposure and a
+        // sharper consequence, because it PROPAGATES its error — the whole
+        // `acquire` fails instead of a tick that would have re-converged.
+        //
+        // The shared fake-mode tree is where it bites: the watchdog's lockless
+        // `mirror_tree` publishes a runtime-side file back into `~/.claude`
+        // while a sibling session is acquiring, and on Windows the publishing
+        // thread still has the staging file OPEN, so the copy fails with
+        // "used by another process". Linking one in real mode is no better —
+        // it lands a link to a path that is about to be renamed away.
         if crate::watchdog::is_staging(&file_name) {
             continue;
         }
@@ -2582,10 +2696,19 @@ fn copy_tree(src: &Path, dst: &Path) -> Result<()> {
             std::fs::read_dir(src).with_context(|| format!("failed to read {}", src.display()))?
         {
             let entry = entry?;
+            // Same staging-sibling skip `union_children` makes, and for the
+            // same reason: a shared fake-mode tree has a `copy_file` publish or
+            // several in flight at any moment (the watchdog's `mirror_tree`
+            // runs lockless), so this walk can meet a `.tmp.<pid>.<seq>` that
+            // is about to be renamed away.
+            //
+            // Here it is worse than in the mirror, because THIS walk propagates
+            // its error: on Windows the staging file is still open by the
+            // publishing thread and `copy_file` fails with "used by another
+            // process", which fails the whole `acquire` rather than a tick that
+            // would have re-converged. Copying one would also land an orphan
+            // nothing ever removes, since nothing here deletes.
             let name = entry.file_name();
-            // The recursion's half of the caller's skip: a subtree under
-            // `~/.claude/` (`projects/`, `plugins/`) carries publishes in
-            // flight too, and this walk is what meets them.
             if crate::watchdog::is_staging(&name) {
                 continue;
             }

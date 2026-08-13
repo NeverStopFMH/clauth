@@ -15,9 +15,9 @@ Every key below has a TUI equivalent on the Setup, Fallback, or Config tab ([Int
 
 **Long-lived setup token.** `clauth login <name> --setup-token` stores a `claude setup-token` mint as `session-token.json`. Sessions run on that static login, which never races clauth's token refresher. The Setup tab then shows a `token` row counting down to the re-mint.
 
-The token outranks the profile's OAuth pair at every switch for as long as it exists, so a later `clauth login <name>` updates only what clauth polls usage with. `clauth static-token <name> --clear` drops it and puts the OAuth login back in front of sessions.
+The token outranks the profile's OAuth pair at every switch for as long as it exists, so a later `clauth login <name>` updates only what clauth polls usage with. `clauth static-token <name> --clear` drops it and puts the OAuth login back in front of sessions — the full exit: the preserved mint backup and the `rolling_token` flag go with it, so nothing re-creates a sidecar afterwards.
 
-A mint is a narrower credential than a `/login` session: it carries `user:inference` and `user:sessions:claude_code` and no refresh token, against the five scopes a browser login stores. Claude Code turns off anything gated on the wider set, Claude in Chrome by name. Clear the token if you want those features back.
+A mint is a narrower credential than a `/login` session: it carries `user:inference` and `user:sessions:claude_code` and no refresh token, against the five scopes a browser login stores. Claude Code turns off anything gated on the wider set, Claude in Chrome by name. Clear the token if you want those features back — or arm `clauth rolling-token <name>`, which has the daemon re-stamp the sidecar from the profile's own usage chain: still no refresh token in front of sessions, but the chain's full scope set and plan stamp, so plan-gated models work. The superseded mint waits at `session-token.static.json` and the bare `clauth static-token <name>` puts it back.
 
 ### Third-party usage data
 
@@ -152,6 +152,7 @@ If the messages limiter is blocking Claude Code, a live 5h window will not clear
 | `preferred` | bool | `false` | the home account clauth returns to once it is clear |
 | `max_auto_spend` | float | `0.0` | dollar ceiling on pay-as-you-go fallback |
 | `bell_threshold` | float | none | 5h % that fires a bell toast |
+| `rolling_token` | bool | `false` | daemon re-stamps the sidecar from the usage chain; set by `clauth rolling-token`, cleared by `clauth static-token` (bare or `--clear`) |
 | `[env]` | table | `{}` | extra environment variables merged into `settings.json` while active |
 | `[models]` | table | `{}` | `default`, `opus`, `sonnet`, `haiku`, `fable`, `subagent` |
 | `[console]` | table | `{}` | Alibaba Model Studio usage session: `token`, `site` (`international` / `domestic`), `region` (`ap-southeast-1` / `cn-beijing`). `clauth login` writes it ([above](Configuration#the-alibaba-console-session)) |
@@ -175,6 +176,7 @@ If the messages limiter is blocking Claude Code, a live 5h window will not clear
       config.toml          # everything in the table above
       credentials.json     # OAuth snapshot (.pending while a rotation is mid-write)
       session-token.json   # long-lived setup-token login, when captured
+      session-token.static.json # the mint a rolling token superseded, kept for the restore
       usage_cache.json     # last-known utilization and plan
       usage_history.jsonl  # 2 days of samples, feeding burn-aware switching
       third_party_cache.json

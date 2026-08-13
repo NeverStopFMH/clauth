@@ -1040,6 +1040,7 @@ fn credential_and_cache_files_have_restricted_permissions() {
         weekly_threshold: None,
         last_resort: false,
         preferred: false,
+        rolling_token: false,
         max_auto_spend: None,
         check_weekly: true,
         check_scoped: true,
@@ -2047,5 +2048,27 @@ fn pending_recovery_preserves_the_stores_mcp_oauth() {
     assert_eq!(
         after["mcpOAuth"]["linear"]["accessToken"], "mock-linear",
         "the MCP-server login survives an interrupted rotation"
+    );
+}
+
+#[test]
+fn rolling_token_round_trips_through_config_toml() {
+    let mut profile = Profile::new("p".to_string(), None, None);
+    profile.rolling_token = true;
+    let rendered = render_config_toml(&profile);
+    let parsed: ProfileConfig = toml::from_str(&rendered).expect("parse rendered toml");
+    assert!(parsed.rolling_token);
+}
+
+/// The pre-rename `session_feed` spelling is deliberately NOT aliased: no
+/// released clauth ever wrote it, and a permanent alias for something that
+/// never shipped is pure legacy surface. An unknown key parses as OFF.
+#[test]
+fn the_pre_rename_session_feed_key_is_not_carried() {
+    let legacy: ProfileConfig =
+        toml::from_str("session_feed = true\n").expect("parse legacy config");
+    assert!(
+        !legacy.rolling_token,
+        "installs that ran the feature branch re-run `clauth rolling-token <p>` once"
     );
 }

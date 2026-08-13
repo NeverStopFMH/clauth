@@ -113,6 +113,51 @@ pub(crate) enum Cause {
     InternalLock,
     /// The refresh landed but the rotated pair could not be written.
     PersistFailed(String),
+    /// CLA-ROLL: the rolling session token could not be written to (or restored
+    /// into) the profile's sidecar. The chain itself is fine — what failed is
+    /// the file in front of it, so this is a filesystem problem and not an
+    /// account one.
+    SidecarWriteFailed(String),
+    /// CLA-ROLL: a live `clauth start` session is holding this profile's
+    /// ROTATING pair, because it started before the sidecar was armed. Spending
+    /// the refresh now revokes the chain under a running session, which is the
+    /// exact death the static-token split exists to prevent.
+    ///
+    /// Distinct from [`Self::RotationLockUnavailable`] on purpose: nothing is
+    /// locked and nothing is broken. The next step is the operator's, and it is
+    /// specific enough that a generic retry hint would be wrong.
+    LiveSessionOnRotatingChain(String),
+    /// CLA-ROLL: another holder has the profile's rotation lock and the caller
+    /// runs on a thread that must not park behind it (the scheduler's re-stamp
+    /// leg). Genuine contention — the opposite claim from
+    /// [`Self::RotationLockUnavailable`], which is why it is not that arm: the
+    /// holder's own path usually re-stamps the sidecar itself, and the scan
+    /// retries in minutes against an hours-wide horizon either way.
+    RotationLockHeld(String),
+    /// CLA-ROLL: the usage chain's RECORDED grant cannot be told from a
+    /// setup-token mint (no scope beyond the setup pair, no plan stamp), so
+    /// stamping a rolling bearer from it is refused — the bearer could later
+    /// be preserved as "the mint". Not a filesystem problem and not retryable
+    /// in-process: only a fresh `clauth login` records the chain's real grant.
+    RollingGrantUnrecorded(String),
+    /// CLA-ROLL: the sidecar holds a rotating pair (mis-filled) with no live
+    /// mint backup to heal it, and the caller runs on the thread that must not
+    /// fall into the blocking vanilla gate (the scheduler's re-stamp leg —
+    /// which also has no re-stamp work to do on a disengaged split). Not
+    /// retryable in-process: only a fresh `clauth login <p> --setup-token`
+    /// re-captures the mint.
+    SidecarMisfilled(String),
+    /// CLA-ROLL: a sidecar repair could not take the cross-process state flock
+    /// inside its bounded wait — another clauth process is busy under
+    /// `~/.clauth` (on macOS that flock is even held across a
+    /// `/usr/bin/security` shell-out for up to 20 seconds). Genuine
+    /// contention, not a fault: the holder finishes and a retry goes through.
+    /// Distinct from [`Self::SidecarWriteFailed`] on purpose — that copy
+    /// prescribes a permissions check, which a busy sibling would send the
+    /// operator on for nothing. Same contention-vs-fault split as
+    /// [`Self::RotationLockUnavailable`] (fault) vs
+    /// [`Self::RotationLockHeld`] (contention).
+    StateLockBusy(String),
 }
 
 impl Cause {
@@ -125,6 +170,43 @@ impl Cause {
                 )
             }
             Self::InternalLock => "clauth hit an internal lock error, restart clauth".to_string(),
+            Self::SidecarWriteFailed(profile) => {
+                format!(
+                    "could not write '{profile}' session token · check permissions on ~/.clauth"
+                )
+            }
+            Self::LiveSessionOnRotatingChain(profile) => {
+                format!(
+                    "'{profile}' has a live clauth start session holding its rotating chain \
+                     (it started before the rolling token was armed); restart that session or \
+                     retry once it ends"
+                )
+            }
+            Self::RotationLockHeld(profile) => {
+                format!(
+                    "an in-flight rotation holds '{profile}' · the re-stamp retries on its \
+                     next scan"
+                )
+            }
+            Self::RollingGrantUnrecorded(profile) => {
+                format!(
+                    "'{profile}' usage chain has no recorded grant beyond the setup-token \
+                     scopes, so a rolling bearer cannot be told from a mint · run \
+                     `clauth login {profile}` to record the chain's real grant"
+                )
+            }
+            Self::SidecarMisfilled(profile) => {
+                format!(
+                    "'{profile}' session token holds a rotating pair and no live mint backup \
+                     exists to heal it · re-capture with `clauth login {profile} --setup-token`"
+                )
+            }
+            Self::StateLockBusy(profile) => {
+                format!(
+                    "another clauth process holds ~/.clauth's state lock · '{profile}' session \
+                     token left untouched"
+                )
+            }
             Self::PersistFailed(profile) => {
                 format!("refreshed '{profile}' but failed to persist the rotated tokens")
             }
@@ -173,6 +255,26 @@ impl Transient {
     /// Cause + next step, no status. TUI toasts and the MCP `reason`.
     pub(crate) fn text(&self) -> String {
         format!("{}{}", self.cause.text(), self.suffix())
+    }
+
+    /// The causes only a fresh `clauth login` clears — no in-process retry
+    /// can: an unrecorded chain grant ([`Cause::RollingGrantUnrecorded`]) and
+    /// a mis-filled sidecar with nothing live to heal it
+    /// ([`Cause::SidecarMisfilled`]). The scheduler paces these on the same
+    /// long leash as a `Broken` verdict — a minutes-scale retry against a
+    /// condition no retry can clear is pure log noise. The re-login itself
+    /// stamps NOTHING scheduler-side (a browser login writes only
+    /// `credentials.json`, and a `--setup-token` re-mint writes a mint, which
+    /// disarms rather than re-arms), which is why these holds carry a
+    /// credential-file watch in the scheduler: a write to any watched file —
+    /// the fix, or clauth's own successful rotation, either of which is
+    /// reason to re-judge — releases the leash on the next scan instead of
+    /// waiting out the clock.
+    pub(crate) fn permanent_until_relogin(&self) -> bool {
+        matches!(
+            self.cause,
+            Cause::RollingGrantUnrecorded(_) | Cause::SidecarMisfilled(_)
+        )
     }
 
     /// Cause + status + next step. CLI stderr and the daemon log, the two

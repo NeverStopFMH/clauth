@@ -134,10 +134,11 @@ fn only_the_status_bearing_form_names_the_status() {
     assert_eq!(no_status.text_with_status(), no_status.text());
 }
 
-/// Every arm of the closed cause set renders, and the two name-bearing ones
+/// Every arm of the closed cause set renders, and the name-bearing ones
 /// interpolate the profile. Pinned because `Cause` is what replaced a
 /// `cause: String` that would have accepted a response body: if an arm is ever
-/// added, this is where its copy has to be stated rather than passed in.
+/// added, this is where its copy has to be stated rather than passed in — ALL
+/// of it, or a blanked-out arm ships mute.
 #[test]
 fn every_transient_cause_renders_its_own_copy() {
     for (cause, want) in [
@@ -157,8 +158,60 @@ fn every_transient_cause_renders_its_own_copy() {
             Cause::PersistFailed("work".to_string()),
             "refreshed 'work' but failed to persist the rotated tokens",
         ),
+        (
+            Cause::SidecarWriteFailed("work".to_string()),
+            "could not write 'work' session token · check permissions on ~/.clauth",
+        ),
+        (
+            Cause::LiveSessionOnRotatingChain("work".to_string()),
+            "'work' has a live clauth start session holding its rotating chain (it started \
+             before the rolling token was armed); restart that session or retry once it ends",
+        ),
+        (
+            Cause::RotationLockHeld("work".to_string()),
+            "an in-flight rotation holds 'work' · the re-stamp retries on its next scan",
+        ),
+        (
+            Cause::RollingGrantUnrecorded("work".to_string()),
+            "'work' usage chain has no recorded grant beyond the setup-token scopes, so a \
+             rolling bearer cannot be told from a mint · run `clauth login work` to record \
+             the chain's real grant",
+        ),
+        (
+            Cause::SidecarMisfilled("work".to_string()),
+            "'work' session token holds a rotating pair and no live mint backup exists to \
+             heal it · re-capture with `clauth login work --setup-token`",
+        ),
+        (
+            Cause::StateLockBusy("work".to_string()),
+            "another clauth process holds ~/.clauth's state lock · 'work' session token left \
+             untouched",
+        ),
     ] {
         assert_eq!(Transient::new(cause, Retry::Stated).text(), want);
+    }
+}
+
+/// The re-login-only causes — and ONLY those — read as permanent to the
+/// scheduler's pacing: a minutes-scale retry against a condition no in-process
+/// retry can clear is log noise, while parking a genuinely transient cause on
+/// the six-hour leash would silence recovery the next scan could have made.
+#[test]
+fn only_the_relogin_causes_read_as_permanent() {
+    for (cause, want) in [
+        (Cause::RollingGrantUnrecorded("work".to_string()), true),
+        (Cause::SidecarMisfilled("work".to_string()), true),
+        (Cause::Endpoint("anthropic is throttling requests"), false),
+        (Cause::RotationLockHeld("work".to_string()), false),
+        (Cause::RotationLockUnavailable("work".to_string()), false),
+        (Cause::SidecarWriteFailed("work".to_string()), false),
+        (Cause::LiveSessionOnRotatingChain("work".to_string()), false),
+        (Cause::InternalLock, false),
+        (Cause::PersistFailed("work".to_string()), false),
+        (Cause::StateLockBusy("work".to_string()), false),
+    ] {
+        let t = Transient::new(cause, Retry::Stated);
+        assert_eq!(t.permanent_until_relogin(), want, "{}", t.text());
     }
 }
 

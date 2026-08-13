@@ -62,6 +62,7 @@ fn single_profile_config(name: &str, refresh_token: &str) -> AppConfig {
         weekly_threshold: None,
         last_resort: false,
         preferred: false,
+        rolling_token: false,
         max_auto_spend: None,
         check_weekly: true,
         check_scoped: true,
@@ -188,6 +189,7 @@ fn rotate_one_no_stamp_when_no_refresh_token() {
         weekly_threshold: None,
         last_resort: false,
         preferred: false,
+        rolling_token: false,
         max_auto_spend: None,
         check_weekly: true,
         check_scoped: true,
@@ -244,6 +246,7 @@ fn profile_without_refresh_token_excluded() {
         weekly_threshold: None,
         last_resort: false,
         preferred: false,
+        rolling_token: false,
         max_auto_spend: None,
         check_weekly: true,
         check_scoped: true,
@@ -336,6 +339,7 @@ fn oauth_config(name: &str, refresh_token: Option<&str>, expires_at: Option<i64>
         weekly_threshold: None,
         last_resort: false,
         preferred: false,
+        rolling_token: false,
         max_auto_spend: None,
         check_weekly: true,
         check_scoped: true,
@@ -377,6 +381,7 @@ fn third_party_config(name: &str) -> AppConfig {
         weekly_threshold: None,
         last_resort: false,
         preferred: false,
+        rolling_token: false,
         max_auto_spend: None,
         check_weekly: true,
         check_scoped: true,
@@ -1331,9 +1336,70 @@ fn gate_under_guard_installs_a_sibling_refreshed_pair_as_is() {
         Some(future_expiry()),
     )));
     assert!(matches!(
-        gate_under_guard(&handle, name, never_refresh, &gate_guard(name)),
+        gate_under_guard(
+            &handle,
+            name,
+            never_refresh,
+            &gate_guard(name),
+            AUTH_GATE_GRACE_MS
+        ),
         AuthGate::Ready
     ));
+}
+
+/// A sidecar repair that failed on the bounded state-flock wait is CONTENTION
+/// — another clauth process is busy under ~/.clauth, on macOS possibly across
+/// a 20-second Keychain shell-out — and must never render as
+/// `SidecarWriteFailed`'s "check permissions", which sends the operator
+/// hunting a fault that does not exist. Any other error keeps the fault copy.
+#[test]
+fn a_state_lock_timeout_reads_as_contention_not_permissions() {
+    let busy = anyhow::Error::new(crate::lock::StateLockTimeout::stub())
+        .context("quarantine session-token.json");
+    let t = sidecar_repair_transient("busy", &busy);
+    assert!(
+        t.text().contains("another clauth process holds"),
+        "contention names the holder, got: {}",
+        t.text()
+    );
+    assert!(
+        !t.text().contains("check permissions"),
+        "contention must not prescribe a permissions hunt, got: {}",
+        t.text()
+    );
+
+    let fault = anyhow::anyhow!("read-only file system").context("write session-token.json");
+    let t = sidecar_repair_transient("busy", &fault);
+    assert!(
+        t.text().contains("check permissions on ~/.clauth"),
+        "a genuine filesystem fault keeps the fault copy, got: {}",
+        t.text()
+    );
+}
+
+/// The install-gate grace IS Claude Code's refresh threshold, shared with the
+/// backup-restore verdicts: identical bytes must never read as dead in the
+/// backup slot ([`crate::claude::BACKUP_EXPIRY_GRACE_MS`]) and installable in
+/// the live one. A mint with three minutes of life sits inside CC's own
+/// five-minute refresh window — a refresh-less credential the client is
+/// already trying to refresh — so every gate this constant feeds must treat
+/// it as expiring.
+#[test]
+fn the_install_grace_is_ccs_refresh_window_shared_with_the_backup_verdicts() {
+    assert_eq!(
+        AUTH_GATE_GRACE_MS,
+        crate::claude::BACKUP_EXPIRY_GRACE_MS,
+        "one number, one home — the two slots must agree on what dead means"
+    );
+    let now = crate::usage::now_ms() as i64;
+    assert!(
+        expiring(Some(now + 3 * 60 * 1000), false),
+        "three minutes of life is inside CC's five-minute refresh window"
+    );
+    assert!(
+        !expiring(Some(now + 10 * 60 * 1000), false),
+        "ten minutes clears the window"
+    );
 }
 
 /// Still expiring under the guard → the refresher is fed the CURRENTLY stored
@@ -1360,7 +1426,13 @@ fn gate_under_guard_spends_the_currently_stored_refresh_token() {
         })
     };
     assert!(matches!(
-        gate_under_guard(&handle, name, refresher, &gate_guard(name)),
+        gate_under_guard(
+            &handle,
+            name,
+            refresher,
+            &gate_guard(name),
+            AUTH_GATE_GRACE_MS
+        ),
         AuthGate::Refreshed
     ));
 }
@@ -1381,7 +1453,13 @@ fn gate_under_guard_adopts_a_cross_process_rotation_from_disk() {
     )));
     save_disk_profile(name, "rt-peer", Some(future_expiry()));
     assert!(matches!(
-        gate_under_guard(&handle, name, never_refresh, &gate_guard(name)),
+        gate_under_guard(
+            &handle,
+            name,
+            never_refresh,
+            &gate_guard(name),
+            AUTH_GATE_GRACE_MS
+        ),
         AuthGate::Ready
     ));
     assert_eq!(
@@ -1414,7 +1492,13 @@ fn gate_under_guard_spends_the_disk_pair_after_an_external_rotation() {
         })
     };
     assert!(matches!(
-        gate_under_guard(&handle, name, refresher, &gate_guard(name)),
+        gate_under_guard(
+            &handle,
+            name,
+            refresher,
+            &gate_guard(name),
+            AUTH_GATE_GRACE_MS
+        ),
         AuthGate::Refreshed
     ));
 }
@@ -1435,7 +1519,13 @@ fn gate_under_guard_disk_adoption_lifts_a_stale_quarantine() {
     handle.lock().unwrap().set_auth_broken(name, true);
     save_disk_profile(name, "rt-peer", Some(future_expiry()));
     assert!(matches!(
-        gate_under_guard(&handle, name, never_refresh, &gate_guard(name)),
+        gate_under_guard(
+            &handle,
+            name,
+            never_refresh,
+            &gate_guard(name),
+            AUTH_GATE_GRACE_MS
+        ),
         AuthGate::Ready
     ));
     assert!(
@@ -1809,6 +1899,58 @@ fn gate_session_token_ready_even_when_auth_broken() {
         ensure_installable(&handle, name, never_refresh),
         AuthGate::Ready
     ));
+}
+
+/// CLA-SPLIT: the install arm reads a mint with the SAME grace every other
+/// verdict on these bytes uses (`AUTH_GATE_GRACE_MS` = CC's five-minute
+/// refresh threshold = the backup-restore rule). Three minutes of life is
+/// inside CC's own refresh window — a refresh-less credential the client
+/// immediately tries to refresh, signing the session out — so the switch must
+/// refuse it exactly where `clauth static-token` calls the identical bytes
+/// EXPIRED; ten minutes clears the window and installs. Zero grace here was
+/// the one arm that INSTALLS a mint while every other slot called it dead.
+#[test]
+fn gate_refuses_a_mint_inside_ccs_refresh_window() {
+    let _home = HomeSandbox::new();
+    let name = "test-gate-mint-window";
+    let config = oauth_config(name, Some("rt-good"), Some(future_expiry()));
+    crate::profile::save_profile(&config.profiles[0]).expect("save profile");
+    let dir = crate::profile::profile_dir(name).expect("dir");
+    let mint = |exp_in_ms: i64| {
+        std::fs::write(
+            dir.join("session-token.json"),
+            serde_json::to_vec(&ClaudeCredentials {
+                claude_ai_oauth: Some(OAuthToken {
+                    access_token: "oat-static".to_string(),
+                    refresh_token: None,
+                    expires_at: Some(crate::usage::now_ms() as i64 + exp_in_ms),
+                    scopes: None,
+                    subscription_type: None,
+                }),
+            })
+            .expect("ser"),
+        )
+        .expect("write session token");
+    };
+    let handle = Arc::new(RankedMutex::new(config));
+
+    mint(3 * 60 * 1000);
+    assert!(
+        matches!(
+            ensure_installable(&handle, name, never_refresh),
+            AuthGate::Broken
+        ),
+        "three minutes of life is inside CC's refresh window — refused"
+    );
+
+    mint(10 * 60 * 1000);
+    assert!(
+        matches!(
+            ensure_installable(&handle, name, never_refresh),
+            AuthGate::Ready
+        ),
+        "ten minutes clears the window — installs as-is"
+    );
 }
 
 // ── rotate_one_inner, driven offline ─────────────────────────────────────────
@@ -2425,5 +2567,960 @@ fn refresh_classification_survives_the_real_wire_in_both_directions() {
         seen,
         vec!["/v1/oauth/token".to_string(); 2],
         "proof of execution: both legs actually answered the endpoint"
+    );
+}
+
+/// `oauth_config` with the rolling token enabled and a plan-capable chain
+/// (full scopes + subscriptionType) — the shape `clauth rolling-token <p>`
+/// requires.
+fn rolling_config(name: &str, refresh_token: Option<&str>, expires_at: Option<i64>) -> AppConfig {
+    let mut config = oauth_config(name, refresh_token, expires_at);
+    let p = config.profiles.first_mut().expect("profile");
+    p.rolling_token = true;
+    if let Some(oauth) = p
+        .credentials
+        .as_mut()
+        .and_then(|c| c.claude_ai_oauth.as_mut())
+    {
+        oauth.scopes = Some(vec!["user:profile".into(), "user:inference".into()]);
+        oauth.subscription_type = Some("max".into());
+    }
+    config
+}
+
+/// Read the sidecar's OAuth block back for assertions.
+fn sidecar_oauth(name: &str) -> Option<OAuthToken> {
+    let dir = profile_dir(name).expect("dir");
+    let creds: ClaudeCredentials =
+        serde_json::from_slice(&std::fs::read(dir.join("session-token.json")).ok()?).ok()?;
+    creds.claude_ai_oauth
+}
+
+/// Fresh fed sidecar → install as-is; neither the chain clock nor the
+/// refresher is consulted (the chain here is stone dead).
+#[test]
+fn rolling_gate_fresh_sidecar_ready_without_refresh() {
+    let _home = HomeSandbox::new();
+    let name = "test-feed-fresh";
+    let config = rolling_config(name, Some("rt-dead"), Some(past_expiry()));
+    crate::profile::save_profile(&config.profiles[0]).expect("save profile");
+    crate::claude::stamp_rolling_token(
+        name,
+        &OAuthToken {
+            access_token: "at-fed".to_string(),
+            refresh_token: None,
+            expires_at: Some(future_expiry()),
+            scopes: None,
+            subscription_type: Some("max".into()),
+        },
+    )
+    .expect("feed");
+    let handle = Arc::new(RankedMutex::new(config));
+    assert!(matches!(
+        ensure_installable(&handle, name, never_refresh),
+        AuthGate::Ready
+    ));
+    let oauth = sidecar_oauth(name).expect("sidecar");
+    assert_eq!(oauth.access_token, "at-fed", "sidecar untouched");
+}
+
+/// The flag is re-read from DISK under the guard, on both wait arms: the
+/// in-memory config that routed here can predate a completed
+/// `static-token --clear` (a separate process the daemon's snapshot never
+/// sees), and stamping from that stale routing would re-create the very
+/// sidecar the operator was just told is gone — with the flag now off so
+/// nothing ever re-stamps it. The scheduler leg reports Ready (its still-due
+/// re-read then drops the pacing hold); the switch-in leg drops the guard and
+/// falls to the vanilla gate, which installs the stored login.
+#[test]
+fn rolling_gate_disk_disarm_under_the_guard_stops_the_stamp() {
+    let _home = HomeSandbox::new();
+    let name = "test-feed-cleared";
+    // In-memory: ARMED, with a comfortable chain a roll would happily stamp.
+    let config = rolling_config(name, Some("rt-live"), Some(future_expiry()));
+    // On disk: the clear already landed — flag off, no sidecar, no backup.
+    let mut on_disk = config.profiles[0].clone();
+    on_disk.rolling_token = false;
+    crate::profile::save_profile(&on_disk).expect("save profile");
+    let dir = profile_dir(name).expect("dir");
+    assert!(
+        !dir.join("session-token.json").exists(),
+        "fixture: the profile is cleared"
+    );
+    let handle = Arc::new(RankedMutex::new(config));
+
+    // The scheduler leg (NoWait).
+    let gate = restamp_rolling_token(&handle, name, never_refresh);
+    assert!(
+        matches!(gate, AuthGate::Ready),
+        "the scheduler leg has nothing to re-stamp"
+    );
+    assert!(
+        !dir.join("session-token.json").exists(),
+        "a cleared profile stays cleared on the scheduler leg"
+    );
+
+    // The switch-in leg (Block) — the vanilla fallback serves the login.
+    let gate = ensure_installable(&handle, name, never_refresh);
+    assert!(
+        matches!(gate, AuthGate::Ready),
+        "the vanilla fallback serves the login"
+    );
+    assert!(
+        !dir.join("session-token.json").exists(),
+        "a cleared profile stays cleared on the switch-in leg"
+    );
+}
+
+/// Stale fed sidecar + comfortably live stored chain → re-stamped from the
+/// store, no refresh spent, chain metadata (subscriptionType) carried.
+#[test]
+fn rolling_gate_stale_sidecar_feeds_from_comfortable_chain_without_spend() {
+    let _home = HomeSandbox::new();
+    let name = "test-feed-nospend";
+    let config = rolling_config(name, Some("rt-good"), Some(future_expiry()));
+    crate::profile::save_profile(&config.profiles[0]).expect("save profile");
+    crate::claude::stamp_rolling_token(
+        name,
+        &OAuthToken {
+            access_token: "at-fed-stale".to_string(),
+            refresh_token: None,
+            expires_at: Some(past_expiry()),
+            scopes: None,
+            subscription_type: Some("max".into()),
+        },
+    )
+    .expect("feed");
+    let handle = Arc::new(RankedMutex::new(config));
+    assert!(matches!(
+        ensure_installable(&handle, name, never_refresh),
+        AuthGate::Ready
+    ));
+    let oauth = sidecar_oauth(name).expect("sidecar");
+    assert_eq!(
+        oauth.access_token, "at-old",
+        "re-stamped from the stored chain"
+    );
+    assert!(
+        oauth.refresh_token.is_none(),
+        "the pair never leaves clauth custody"
+    );
+    assert_eq!(oauth.subscription_type.as_deref(), Some("max"));
+    assert_eq!(oauth.expires_at, Some(future_expiry_of(&handle, name)));
+}
+
+/// The chain expiry the gate fed from — read back from the handle so the
+/// assertion tracks the fixture rather than re-deriving clock math.
+fn future_expiry_of(handle: &crate::profile::ConfigHandle, name: &str) -> i64 {
+    handle
+        .lock()
+        .expect("config")
+        .find(name)
+        .and_then(|p| p.access_token_expires_at())
+        .expect("chain expiry")
+}
+
+/// Stale sidecar + stale chain → guarded refresh; the rotation persist
+/// re-stamps the sidecar with the freshly minted access token.
+#[test]
+fn rolling_gate_stale_sidecar_stale_chain_refreshes_and_restamps() {
+    let _home = HomeSandbox::new();
+    let name = "test-feed-refresh";
+    let config = rolling_config(name, Some("rt-old"), Some(past_expiry()));
+    crate::profile::save_profile(&config.profiles[0]).expect("save profile");
+    crate::claude::stamp_rolling_token(
+        name,
+        &OAuthToken {
+            access_token: "at-fed-stale".to_string(),
+            refresh_token: None,
+            expires_at: Some(past_expiry()),
+            scopes: None,
+            subscription_type: Some("max".into()),
+        },
+    )
+    .expect("feed");
+    let handle = Arc::new(RankedMutex::new(config));
+    let refresher = |_rt: &str, _scopes: Option<&str>| {
+        Ok(TokenResponse {
+            access_token: "at-new".to_string(),
+            refresh_token: "rt-new".to_string(),
+            expires_in: 3600,
+            scope: None,
+        })
+    };
+    assert!(matches!(
+        ensure_installable(&handle, name, refresher),
+        AuthGate::Refreshed
+    ));
+    let oauth = sidecar_oauth(name).expect("sidecar");
+    assert_eq!(
+        oauth.access_token, "at-new",
+        "hook re-stamped the rotated access token"
+    );
+    assert!(oauth.refresh_token.is_none());
+}
+
+/// Feed flag on but NO sidecar yet → the gate arms it through the refresh
+/// leg instead of falling through to a vanilla pair install (which would put
+/// the shared rotating chain in front of sessions).
+#[test]
+fn rolling_gate_absent_sidecar_arms_instead_of_vanilla_install() {
+    let _home = HomeSandbox::new();
+    let name = "test-feed-arm";
+    let config = rolling_config(name, Some("rt-old"), Some(past_expiry()));
+    crate::profile::save_profile(&config.profiles[0]).expect("save profile");
+    let handle = Arc::new(RankedMutex::new(config));
+    let refresher = |_rt: &str, _scopes: Option<&str>| {
+        Ok(TokenResponse {
+            access_token: "at-armed".to_string(),
+            refresh_token: "rt-new".to_string(),
+            expires_in: 3600,
+            scope: None,
+        })
+    };
+    assert!(matches!(
+        ensure_installable(&handle, name, refresher),
+        AuthGate::Refreshed
+    ));
+    let oauth = sidecar_oauth(name).expect("sidecar armed");
+    assert_eq!(oauth.access_token, "at-armed");
+    assert!(oauth.refresh_token.is_none());
+    let expected = crate::claude::install_source_path(name).expect("source");
+    assert!(
+        expected.ends_with("session-token.json"),
+        "the armed sidecar is now the install source"
+    );
+}
+
+/// Terminally dead chain + preserved static mint → degrade to the mint
+/// (Ready) instead of benching the account; the backup is consumed.
+#[test]
+fn rolling_gate_dead_chain_restores_static_mint() {
+    let _home = HomeSandbox::new();
+    let name = "test-feed-degrade";
+    let config = rolling_config(name, Some("rt-dead"), Some(past_expiry()));
+    crate::profile::save_profile(&config.profiles[0]).expect("save profile");
+    // A genuine mint first (1yr horizon, no subscriptionType)…
+    crate::claude::write_session_token(name, "sk-ant-oat01-mint", crate::usage::now_ms() as i64)
+        .expect("mint");
+    // …then the roll takes over, preserving it…
+    crate::claude::stamp_rolling_token(
+        name,
+        &OAuthToken {
+            access_token: "at-fed-stale".to_string(),
+            refresh_token: None,
+            expires_at: Some(past_expiry()),
+            scopes: None,
+            subscription_type: Some("max".into()),
+        },
+    )
+    .expect("feed");
+    let handle = Arc::new(RankedMutex::new(config));
+    let refresher =
+        |_rt: &str, _scopes: Option<&str>| Err(RefreshError::Invalid(TokenFailure::Status(400)));
+    assert!(matches!(
+        ensure_installable(&handle, name, refresher),
+        AuthGate::Ready
+    ));
+    let oauth = sidecar_oauth(name).expect("sidecar");
+    assert_eq!(oauth.access_token, "sk-ant-oat01-mint", "the mint is back");
+    let backup = profile_dir(name)
+        .expect("dir")
+        .join("session-token.static.json");
+    assert!(!backup.exists(), "backup consumed by the restore");
+}
+
+/// Terminally dead chain and no mint to fall back to → Broken stands (the
+/// pre-stamp refusal), never a vanilla install of the dead pair.
+#[test]
+fn rolling_gate_dead_chain_without_backup_stays_broken() {
+    let _home = HomeSandbox::new();
+    let name = "test-feed-broken";
+    let config = rolling_config(name, Some("rt-dead"), Some(past_expiry()));
+    crate::profile::save_profile(&config.profiles[0]).expect("save profile");
+    crate::claude::stamp_rolling_token(
+        name,
+        &OAuthToken {
+            access_token: "at-fed-stale".to_string(),
+            refresh_token: None,
+            expires_at: Some(past_expiry()),
+            scopes: None,
+            subscription_type: Some("max".into()),
+        },
+    )
+    .expect("feed");
+    let handle = Arc::new(RankedMutex::new(config));
+    let refresher =
+        |_rt: &str, _scopes: Option<&str>| Err(RefreshError::Invalid(TokenFailure::Status(400)));
+    assert!(matches!(
+        ensure_installable(&handle, name, refresher),
+        AuthGate::Broken
+    ));
+}
+
+/// The rotation persist re-stamps a feed-enabled profile's sidecar (parked or
+/// active) and preserves a genuine mint on first contact; a non-feed split
+/// profile's sidecar stays untouched (the CLA-SPLIT quiet branch).
+#[test]
+fn rotation_hook_stamps_enabled_profiles_and_preserves_the_mint() {
+    let _home = HomeSandbox::new();
+    let name = "test-feed-hook";
+    let config = rolling_config(name, Some("rt-old"), Some(past_expiry()));
+    crate::profile::save_profile(&config.profiles[0]).expect("save profile");
+    crate::claude::write_session_token(name, "sk-ant-oat01-mint", crate::usage::now_ms() as i64)
+        .expect("mint");
+    let handle = Arc::new(RankedMutex::new(config));
+    apply_rotated_tokens_locked(
+        &handle,
+        name,
+        TokenResponse {
+            access_token: "at-rotated".to_string(),
+            refresh_token: "rt-rotated".to_string(),
+            expires_in: 3600,
+            scope: None,
+        },
+    )
+    .expect("persist");
+    let oauth = sidecar_oauth(name).expect("sidecar");
+    assert_eq!(oauth.access_token, "at-rotated", "rotation fed the sidecar");
+    assert!(oauth.refresh_token.is_none());
+    let backup = profile_dir(name)
+        .expect("dir")
+        .join("session-token.static.json");
+    let backed: ClaudeCredentials =
+        serde_json::from_slice(&std::fs::read(&backup).expect("backup")).expect("parse");
+    assert_eq!(
+        backed.access_token(),
+        Some("sk-ant-oat01-mint"),
+        "first roll preserved the mint"
+    );
+}
+
+/// Same rotation on a split profile WITHOUT the rolling token: the sidecar is the
+/// static mint and stays byte-identical (the designed quiet steady state).
+#[test]
+fn rotation_hook_leaves_non_rolling_split_sidecars_alone() {
+    let _home = HomeSandbox::new();
+    let name = "test-nofeed-hook";
+    let config = oauth_config(name, Some("rt-old"), Some(past_expiry()));
+    crate::profile::save_profile(&config.profiles[0]).expect("save profile");
+    crate::claude::write_session_token(name, "sk-ant-oat01-mint", crate::usage::now_ms() as i64)
+        .expect("mint");
+    let handle = Arc::new(RankedMutex::new(config));
+    apply_rotated_tokens_locked(
+        &handle,
+        name,
+        TokenResponse {
+            access_token: "at-rotated".to_string(),
+            refresh_token: "rt-rotated".to_string(),
+            expires_in: 3600,
+            scope: None,
+        },
+    )
+    .expect("persist");
+    let oauth = sidecar_oauth(name).expect("sidecar");
+    assert_eq!(oauth.access_token, "sk-ant-oat01-mint", "mint untouched");
+}
+
+/// A mis-filled sidecar (rotating pair) is never overwritten by the roll —
+/// the DANGER evidence survives for the operator to see.
+#[test]
+fn rotation_hook_never_overwrites_a_misfilled_sidecar() {
+    let _home = HomeSandbox::new();
+    let name = "test-misfill-hook";
+    let config = rolling_config(name, Some("rt-old"), Some(past_expiry()));
+    crate::profile::save_profile(&config.profiles[0]).expect("save profile");
+    let dir = profile_dir(name).expect("dir");
+    std::fs::write(
+        dir.join("session-token.json"),
+        serde_json::to_vec(&ClaudeCredentials {
+            claude_ai_oauth: Some(OAuthToken {
+                access_token: "at-misfill".to_string(),
+                refresh_token: Some("rt-misfill".to_string()),
+                expires_at: Some(future_expiry()),
+                scopes: None,
+                subscription_type: None,
+            }),
+        })
+        .expect("ser"),
+    )
+    .expect("write misfill");
+    let handle = Arc::new(RankedMutex::new(config));
+    apply_rotated_tokens_locked(
+        &handle,
+        name,
+        TokenResponse {
+            access_token: "at-rotated".to_string(),
+            refresh_token: "rt-rotated".to_string(),
+            expires_in: 3600,
+            scope: None,
+        },
+    )
+    .expect("persist");
+    let oauth = sidecar_oauth(name).expect("sidecar");
+    assert_eq!(
+        oauth.access_token, "at-misfill",
+        "mis-fill evidence survives"
+    );
+    assert_eq!(oauth.refresh_token.as_deref(), Some("rt-misfill"));
+}
+
+/// Feed profile + mis-filled sidecar + preserved mint → the gate heals
+/// (quarantine + restore) and installs the mint; the pair never fronts CC.
+#[test]
+fn rolling_gate_heals_a_misfilled_sidecar_when_a_backup_exists() {
+    let _home = HomeSandbox::new();
+    let name = "test-feed-heal";
+    let config = rolling_config(name, Some("rt-good"), Some(future_expiry()));
+    crate::profile::save_profile(&config.profiles[0]).expect("save profile");
+    crate::claude::write_session_token(name, "sk-ant-oat01-mint", crate::usage::now_ms() as i64)
+        .expect("mint");
+    crate::claude::stamp_rolling_token(
+        name,
+        &OAuthToken {
+            access_token: "at-fed".to_string(),
+            refresh_token: None,
+            expires_at: Some(future_expiry()),
+            scopes: None,
+            subscription_type: Some("max".into()),
+        },
+    )
+    .expect("feed preserves mint");
+    let dir = profile_dir(name).expect("dir");
+    std::fs::write(
+        dir.join("session-token.json"),
+        serde_json::to_vec(&ClaudeCredentials {
+            claude_ai_oauth: Some(OAuthToken {
+                access_token: "at-misfill".to_string(),
+                refresh_token: Some("rt-misfill".to_string()),
+                expires_at: Some(future_expiry()),
+                scopes: None,
+                subscription_type: None,
+            }),
+        })
+        .expect("ser"),
+    )
+    .expect("misfill");
+    let handle = Arc::new(RankedMutex::new(config));
+    assert!(matches!(
+        ensure_installable(&handle, name, never_refresh),
+        AuthGate::Ready
+    ));
+    // Healed AND re-armed in one pass: the restored mint is immediately
+    // superseded by a fed bearer from the comfortable chain (no spend).
+    let oauth = sidecar_oauth(name).expect("sidecar");
+    assert_eq!(
+        oauth.access_token, "at-old",
+        "healed then re-stamped from the chain"
+    );
+    assert!(oauth.refresh_token.is_none());
+    let source = crate::claude::install_source_path(name).expect("source");
+    assert!(
+        source.ends_with("session-token.json"),
+        "the pair is never the install source after a heal"
+    );
+}
+
+/// A static MINT on a feed profile is a fallback, not a fresh fed token — the
+/// gate supersedes it from the comfortable chain (no spend) and the mint
+/// lands in the degrade backup. Regression for the deploy-day bug where the
+/// mint's ~1yr stamp read as "fresh" and arming never fed anything.
+#[test]
+fn rolling_gate_supersedes_a_static_mint_with_a_fed_bearer() {
+    let _home = HomeSandbox::new();
+    let name = "test-feed-mint-supersede";
+    let config = rolling_config(name, Some("rt-good"), Some(future_expiry()));
+    crate::profile::save_profile(&config.profiles[0]).expect("save profile");
+    crate::claude::write_session_token(name, "sk-ant-oat01-mint", crate::usage::now_ms() as i64)
+        .expect("mint");
+    let handle = Arc::new(RankedMutex::new(config));
+    assert!(matches!(
+        ensure_installable(&handle, name, never_refresh),
+        AuthGate::Ready
+    ));
+    let oauth = sidecar_oauth(name).expect("sidecar");
+    assert_eq!(oauth.access_token, "at-old", "fed from the stored chain");
+    assert!(oauth.refresh_token.is_none());
+    let backup: ClaudeCredentials = serde_json::from_slice(
+        &std::fs::read(
+            profile_dir(name)
+                .expect("dir")
+                .join("session-token.static.json"),
+        )
+        .expect("backup"),
+    )
+    .expect("parse");
+    assert_eq!(
+        backup.access_token(),
+        Some("sk-ant-oat01-mint"),
+        "the superseded mint became the degrade backup"
+    );
+}
+
+/// Feed profile + mis-filled sidecar + NO backup → the disengaged-vanilla
+/// posture stands (documented CLA-SPLIT-3 semantics): the plain gate runs and
+/// a comfortable chain installs credentials.json, loudly.
+#[test]
+fn rolling_gate_misfill_without_backup_keeps_the_disengaged_vanilla_posture() {
+    let _home = HomeSandbox::new();
+    let name = "test-feed-misfill-vanilla";
+    let config = rolling_config(name, Some("rt-good"), Some(future_expiry()));
+    crate::profile::save_profile(&config.profiles[0]).expect("save profile");
+    let dir = profile_dir(name).expect("dir");
+    std::fs::write(
+        dir.join("session-token.json"),
+        serde_json::to_vec(&ClaudeCredentials {
+            claude_ai_oauth: Some(OAuthToken {
+                access_token: "at-misfill".to_string(),
+                refresh_token: Some("rt-misfill".to_string()),
+                expires_at: Some(future_expiry()),
+                scopes: None,
+                subscription_type: None,
+            }),
+        })
+        .expect("ser"),
+    )
+    .expect("misfill");
+    let handle = Arc::new(RankedMutex::new(config));
+    assert!(matches!(
+        ensure_installable(&handle, name, never_refresh),
+        AuthGate::Ready
+    ));
+    let source = crate::claude::install_source_path(name).expect("source");
+    assert!(
+        source.ends_with("credentials.json"),
+        "no backup to degrade to — disengaged split behaves as vanilla"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// CLA-ROLL: scheduler-leg re-stamp (`restamp_rolling_token`) — renew the fed
+// bearer HOURS before its clock death, not seconds.
+// ---------------------------------------------------------------------------
+
+/// Epoch-ms comfortably beyond the re-stamp horizon — a chain the no-spend
+/// re-stamp path may clone from.
+fn beyond_horizon_expiry() -> i64 {
+    crate::usage::now_ms() as i64 + 6 * 3_600_000
+}
+
+/// The due predicate fires for an armed, exp-carrying sidecar inside the
+/// horizon — and for a MIS-FILL at any clock, because the content is the
+/// defect and this leg is the only one a running daemon has that can repair
+/// it. Absent sidecars stay the switch-time gate's job.
+#[test]
+fn restamp_due_fires_inside_the_horizon_or_on_a_misfill() {
+    let _home = HomeSandbox::new();
+    let now = crate::usage::now_ms() as i64;
+    let name = "test-restamp-due";
+    assert!(
+        !rolling_sidecar_restamp_due(name, now),
+        "absent sidecar is not the timer's job"
+    );
+    // A rotating pair with 8h of clock — comfortably OUTSIDE the horizon, so
+    // only the content classification can make it due. This is the arm whose
+    // deletion turns the daemon-side heal back into dead code.
+    let dir = crate::profile::profile_dir(name).expect("dir");
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    std::fs::write(
+        dir.join("session-token.json"),
+        serde_json::to_vec(&crate::profile::ClaudeCredentials {
+            claude_ai_oauth: Some(OAuthToken {
+                access_token: "at-misfill".to_string(),
+                refresh_token: Some("rt-misfill".to_string()),
+                expires_at: Some(beyond_horizon_expiry()),
+                scopes: None,
+                subscription_type: None,
+            }),
+        })
+        .expect("ser"),
+    )
+    .expect("write misfill");
+    assert!(
+        rolling_sidecar_restamp_due(name, now),
+        "a mis-fill is due NOW, whatever its clock says"
+    );
+    std::fs::remove_file(dir.join("session-token.json")).expect("clean the misfill fixture");
+    crate::claude::stamp_rolling_token(
+        name,
+        &OAuthToken {
+            access_token: "at-rolled".to_string(),
+            refresh_token: None,
+            expires_at: Some(beyond_horizon_expiry()),
+            scopes: Some(vec![
+                "user:inference".to_string(),
+                "user:profile".to_string(),
+            ]),
+            subscription_type: None,
+        },
+    )
+    .expect("stamp");
+    assert!(
+        !rolling_sidecar_restamp_due(name, now),
+        "a bearer clear of the horizon is left alone"
+    );
+    crate::claude::stamp_rolling_token(
+        name,
+        &OAuthToken {
+            access_token: "at-rolled-dying".to_string(),
+            refresh_token: None,
+            expires_at: Some(future_expiry()), // +1h, inside the 2h horizon
+            scopes: Some(vec![
+                "user:inference".to_string(),
+                "user:profile".to_string(),
+            ]),
+            subscription_type: None,
+        },
+    )
+    .expect("stamp");
+    assert!(
+        rolling_sidecar_restamp_due(name, now),
+        "a bearer inside the horizon is due"
+    );
+}
+
+/// A dying fed bearer + a chain clear of the horizon → no-spend re-stamp,
+/// exactly where the switch gate (minutes-tight grace) would have no-opped —
+/// the contrast that pins the horizon semantics.
+#[test]
+fn restamp_restamps_a_dying_bearer_the_switch_gate_calls_fresh() {
+    let _home = HomeSandbox::new();
+    let name = "test-restamp-nospend";
+    let config = rolling_config(name, Some("rt-good"), Some(beyond_horizon_expiry()));
+    crate::profile::save_profile(&config.profiles[0]).expect("save profile");
+    crate::claude::stamp_rolling_token(
+        name,
+        &OAuthToken {
+            access_token: "at-fed-dying".to_string(),
+            refresh_token: None,
+            expires_at: Some(future_expiry()), // +1h: dying, but "fresh" to the switch gate
+            scopes: None,
+            subscription_type: Some("max".into()),
+        },
+    )
+    .expect("feed");
+    let handle = Arc::new(RankedMutex::new(config));
+    // Switch gate: +1h clears the five-minute grace → install as-is, no re-stamp.
+    assert!(matches!(
+        ensure_installable(&handle, name, never_refresh),
+        AuthGate::Ready
+    ));
+    assert_eq!(
+        sidecar_oauth(name).expect("sidecar").access_token,
+        "at-fed-dying",
+        "the switch gate leaves a +1h bearer alone"
+    );
+    // Re-feed leg: +1h is inside the 2h horizon → re-stamped from the chain,
+    // still without spending a refresh.
+    assert!(matches!(
+        restamp_rolling_token(&handle, name, never_refresh),
+        AuthGate::Ready
+    ));
+    let oauth = sidecar_oauth(name).expect("sidecar");
+    assert_eq!(oauth.access_token, "at-old", "re-stamped from the chain");
+    assert!(oauth.refresh_token.is_none(), "pair never leaves custody");
+}
+
+/// Dying bearer + chain itself inside the horizon (they usually share an
+/// expiry — the fed token IS the chain's access token) → guarded refresh; the
+/// rotation hook re-stamps the freshly minted token.
+#[test]
+fn restamp_rotates_when_the_chain_is_inside_the_horizon_too() {
+    let _home = HomeSandbox::new();
+    let name = "test-restamp-rotate";
+    let config = rolling_config(name, Some("rt-old"), Some(future_expiry()));
+    crate::profile::save_profile(&config.profiles[0]).expect("save profile");
+    crate::claude::stamp_rolling_token(
+        name,
+        &OAuthToken {
+            access_token: "at-fed-dying".to_string(),
+            refresh_token: None,
+            expires_at: Some(future_expiry()),
+            scopes: None,
+            subscription_type: Some("max".into()),
+        },
+    )
+    .expect("feed");
+    let handle = Arc::new(RankedMutex::new(config));
+    let refresher = |_rt: &str, _scopes: Option<&str>| {
+        Ok(TokenResponse {
+            access_token: "at-new".to_string(),
+            refresh_token: "rt-new".to_string(),
+            expires_in: 8 * 3600,
+            scope: None,
+        })
+    };
+    assert!(matches!(
+        restamp_rolling_token(&handle, name, refresher),
+        AuthGate::Refreshed
+    ));
+    let oauth = sidecar_oauth(name).expect("sidecar");
+    assert_eq!(
+        oauth.access_token, "at-new",
+        "hook re-stamped the rotated token"
+    );
+    assert!(oauth.refresh_token.is_none());
+}
+
+/// The missing arm of the dead-chain degrade: a preserved mint whose stamped
+/// `expiresAt` has PASSED. Restoring it would install a credential that signs
+/// every session out on first use (the Incident C shape the vanilla gate's
+/// clock check guards), so the restore refuses, the backup survives as
+/// evidence, and with nothing live to serve the verdict is Broken — never
+/// Ready-on-a-dead-mint.
+#[test]
+fn rolling_gate_dead_chain_with_expired_backup_stays_broken() {
+    let _home = HomeSandbox::new();
+    let name = "test-expired-backup";
+    let config = rolling_config(name, Some("rt-dead"), Some(past_expiry()));
+    crate::profile::save_profile(&config.profiles[0]).expect("save profile");
+    let dir = profile_dir(name).expect("dir");
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    // A backup that aged out on the shelf: mint-scoped, stamped in the past.
+    let expired_mint = crate::profile::ClaudeCredentials {
+        claude_ai_oauth: Some(OAuthToken {
+            access_token: "sk-ant-oat01-aged-out".to_string(),
+            refresh_token: None,
+            expires_at: Some(past_expiry()),
+            scopes: Some(vec![
+                "user:inference".to_string(),
+                "user:sessions:claude_code".to_string(),
+            ]),
+            subscription_type: None,
+        }),
+    };
+    std::fs::write(
+        dir.join("session-token.static.json"),
+        serde_json::to_vec_pretty(&expired_mint).expect("ser"),
+    )
+    .expect("write backup");
+    // The sidecar holds the last rolling bearer, itself past its clock.
+    crate::claude::stamp_rolling_token(
+        name,
+        &OAuthToken {
+            access_token: "at-rolled-dead".to_string(),
+            refresh_token: None,
+            expires_at: Some(past_expiry()),
+            scopes: None,
+            subscription_type: Some("max".into()),
+        },
+    )
+    .expect("stamp");
+    let handle = Arc::new(RankedMutex::new(config));
+    let refresher =
+        |_rt: &str, _scopes: Option<&str>| Err(RefreshError::Invalid(TokenFailure::Status(400)));
+    assert!(
+        matches!(
+            ensure_installable(&handle, name, refresher),
+            AuthGate::Broken
+        ),
+        "an expired backup must not launder a dead chain into Ready"
+    );
+    assert!(
+        dir.join("session-token.static.json").exists(),
+        "the refused backup stays on disk instead of being consumed"
+    );
+    let oauth = sidecar_oauth(name).expect("sidecar");
+    assert_eq!(
+        oauth.access_token, "at-rolled-dead",
+        "and the expired mint never reached the sidecar"
+    );
+}
+
+/// The scheduler's re-stamp leg must never park behind a held rotation lock:
+/// it runs inline on the tick thread and `rotation.lock` has no timeout, so a
+/// `clauth start` holding the lock across its recursive copy would stall
+/// every account's poll. With the lock held, the gate answers Transient
+/// promptly (the NoWait path) instead of blocking until release.
+#[test]
+fn restamp_never_parks_behind_a_held_rotation_lock() {
+    let _home = HomeSandbox::new();
+    let name = "test-noblock";
+    let config = rolling_config(name, Some("rt-live"), Some(beyond_horizon_expiry()));
+    crate::profile::save_profile(&config.profiles[0]).expect("save profile");
+    // A rolling sidecar inside the re-stamp horizon, so the gate has work
+    // that reaches the lock.
+    crate::claude::stamp_rolling_token(
+        name,
+        &OAuthToken {
+            access_token: "at-dying".to_string(),
+            refresh_token: None,
+            expires_at: Some(future_expiry()), // +1h, inside the 2h horizon
+            scopes: Some(vec![
+                "user:inference".to_string(),
+                "user:profile".to_string(),
+            ]),
+            subscription_type: None,
+        },
+    )
+    .expect("stamp");
+    let guard = crate::runtime::RotationGuard::acquire(name).expect("hold the lock");
+    let handle = Arc::new(RankedMutex::new(config));
+    let (tx, rx) = std::sync::mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        let refresher =
+            |_rt: &str, _scopes: Option<&str>| panic!("a held lock must never reach the refresher");
+        let gate = restamp_rolling_token(&handle, "test-noblock", refresher);
+        let text = match gate {
+            AuthGate::Transient(e) => Some(e.text()),
+            _ => None,
+        };
+        tx.send(text).expect("send");
+    });
+    // Generous for a loaded runner, tiny next to the block it guards against
+    // (the lock is held for the whole wait, so a parking implementation can
+    // only fail this by timeout).
+    let verdict = rx.recv_timeout(std::time::Duration::from_secs(10));
+    drop(guard);
+    worker.join().expect("worker");
+    let text = verdict
+        .expect("the re-stamp leg parked behind a held rotation lock")
+        .expect("a held lock answers Transient, never Ready and never a wait");
+    // The HELD copy, not the UNAVAILABLE one: this is genuine contention, and
+    // the arm whose copy upstream corrected in round 1 describes a filesystem
+    // fault that is not what happened here.
+    assert!(
+        text.contains("an in-flight rotation holds"),
+        "a held lock renders as contention: {text}"
+    );
+}
+
+/// The mis-fill arm is the one path that leaves [`rolling_install_gate`] for
+/// the vanilla gate — whose own acquire BLOCKS — so the NoWait axis must
+/// cover it too, or the non-parking property holds everywhere except on the
+/// arm that widened last. The scenario that defeats it: a mis-filled sidecar,
+/// an EXPIRED preserved mint (so the heal has nothing live to restore), an
+/// expiring chain (so the vanilla gate would proceed to its blocking
+/// acquire), and a `clauth start` holding `rotation.lock`. The tick's leg
+/// must answer Transient with the mis-fill's own cause, promptly, touching
+/// neither the refresher nor the evidence on disk.
+#[test]
+fn restamp_on_a_misfill_with_no_live_backup_never_takes_the_vanilla_gate() {
+    let _home = HomeSandbox::new();
+    let name = "test-misfill-nowait";
+    // Chain inside the vanilla gate's own grace: the fall-through would not
+    // stop at the pre-check but go on to acquire the held lock and refresh.
+    let config = rolling_config(name, Some("rt-live"), Some(now_ms() as i64 + 10_000));
+    crate::profile::save_profile(&config.profiles[0]).expect("save profile");
+    let dir = crate::profile::profile_dir(name).expect("dir");
+    // The mis-fill: a rotating pair in the sidecar.
+    let pair = crate::profile::ClaudeCredentials {
+        claude_ai_oauth: Some(OAuthToken {
+            access_token: "at-misfill".to_string(),
+            refresh_token: Some("rt-misfill".to_string()),
+            expires_at: Some(now_ms() as i64 + 3_600_000),
+            scopes: None,
+            subscription_type: None,
+        }),
+    };
+    std::fs::write(
+        dir.join("session-token.json"),
+        serde_json::to_vec(&pair).expect("ser"),
+    )
+    .expect("misfill");
+    // The preserved mint: genuine, but past its clock — nothing live to heal
+    // with, and refused without being consumed.
+    let dead_mint = crate::profile::ClaudeCredentials {
+        claude_ai_oauth: Some(OAuthToken {
+            access_token: "sk-ant-oat01-dead-mint".to_string(),
+            refresh_token: None,
+            expires_at: Some(now_ms() as i64 - 1_000),
+            scopes: Some(vec![
+                "user:inference".to_string(),
+                "user:sessions:claude_code".to_string(),
+            ]),
+            subscription_type: None,
+        }),
+    };
+    std::fs::write(
+        dir.join("session-token.static.json"),
+        serde_json::to_vec(&dead_mint).expect("ser"),
+    )
+    .expect("expired backup");
+    let guard = crate::runtime::RotationGuard::acquire(name).expect("hold the lock");
+    let handle = Arc::new(RankedMutex::new(config));
+    let (tx, rx) = std::sync::mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        let refresher = |_rt: &str, _scopes: Option<&str>| {
+            panic!("the NoWait leg must never do the vanilla gate's refresh work")
+        };
+        let gate = restamp_rolling_token(&handle, "test-misfill-nowait", refresher);
+        let text = match gate {
+            AuthGate::Transient(e) => Some(e.text()),
+            _ => None,
+        };
+        tx.send(text).expect("send");
+    });
+    let verdict = rx.recv_timeout(std::time::Duration::from_secs(10));
+    drop(guard);
+    worker.join().expect("worker");
+    let text = verdict
+        .expect("the re-stamp leg parked behind the vanilla gate's blocking acquire")
+        .expect("a disengaged mis-fill answers Transient on the NoWait leg, never vanilla-Ready");
+    assert!(
+        text.contains("rotating pair and no live mint backup"),
+        "the mis-fill's own cause, not a lock or write flavor: {text}"
+    );
+    assert!(
+        dir.join("session-token.static.json").exists(),
+        "the expired mint stays on disk as evidence"
+    );
+    let sidecar: crate::profile::ClaudeCredentials =
+        serde_json::from_slice(&std::fs::read(dir.join("session-token.json")).expect("read"))
+            .expect("parse");
+    assert_eq!(
+        sidecar.access_token(),
+        Some("at-misfill"),
+        "the sidecar is untouched — the evidence quarantine is the CLI's explicit-intent path"
+    );
+}
+
+/// A profile whose chain grant is UNRECORDED (no scopes, no plan stamp — the
+/// shape `stamp_rolling_token` refuses) but whose sidecar holds a live,
+/// installable mint must still switch in on that mint. The GrantUnusable
+/// verdict's first cut returned Transient unconditionally and turned this
+/// profile into a hard switch refusal — losing the live-sidecar fallback the
+/// old WriteFailed path had (verification fleet, round 3).
+#[test]
+fn rolling_gate_unrecorded_grant_still_installs_a_live_mint() {
+    let _home = HomeSandbox::new();
+    let name = "test-grant-mint";
+    // A LIVE chain with no recorded grant at all.
+    let config = rolling_config(name, Some("rt-live"), Some(beyond_horizon_expiry()));
+    let mut profile = config.profiles[0].clone();
+    if let Some(oauth) = profile
+        .credentials
+        .as_mut()
+        .and_then(|c| c.claude_ai_oauth.as_mut())
+    {
+        oauth.scopes = None;
+        oauth.subscription_type = None;
+    }
+    crate::profile::save_profile(&profile).expect("save profile");
+    let config = Arc::new(RankedMutex::new(crate::profile::AppConfig {
+        state: config.state.clone(),
+        profiles: vec![profile],
+    }));
+    // The sidecar: a genuine live mint.
+    crate::claude::write_session_token(
+        name,
+        "sk-ant-oat01-live-mint",
+        crate::usage::now_ms() as i64,
+    )
+    .expect("mint");
+    let refresher = |_rt: &str, _scopes: Option<&str>| {
+        panic!("a live chain with an unusable grant must not spend a refresh")
+    };
+    assert!(
+        matches!(
+            ensure_installable(&config, name, refresher),
+            AuthGate::Ready
+        ),
+        "the live mint installs; the unusable grant only stops the ROLL"
+    );
+    let oauth = sidecar_oauth(name).expect("sidecar");
+    assert_eq!(
+        oauth.access_token, "sk-ant-oat01-live-mint",
+        "mint untouched"
     );
 }

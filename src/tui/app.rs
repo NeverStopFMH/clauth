@@ -1647,10 +1647,10 @@ pub(crate) struct App {
 
     /// Cached long-lived-token status per profile, keyed by name (absent when a
     /// profile has no sidecar). Read by the Overview render for the `⊘` danger
-    /// marker + the type tag, so it needn't stat each `session-token.json` per
-    /// frame. Seeded at construct and refreshed on config reload; the expiry
-    /// stamp it carries is compared to live `now_ms` at render time, so the
-    /// clock ticking past expiry never needs a re-read — only an add / delete /
+    /// marker, so it needn't stat each `session-token.json` per frame. Seeded
+    /// at construct and refreshed on config reload; the expiry stamp it
+    /// carries is compared to live `now_ms` at render time, so the clock
+    /// ticking past expiry never needs a re-read — only an add / delete /
     /// re-mint does, which `reload_fingerprint` now catches.
     pub(crate) session_tokens: HashMap<String, crate::claude::SessionTokenStatus>,
     /// Live `clauth start` sessions per account, for the Overview `active`
@@ -1674,7 +1674,21 @@ pub(crate) struct App {
 fn collect_session_tokens(names: &[String]) -> HashMap<String, crate::claude::SessionTokenStatus> {
     names
         .iter()
-        .filter_map(|n| crate::claude::session_token_status(n).map(|s| (n.clone(), s)))
+        .filter_map(|n| {
+            // ONE sidecar read per profile, the same derivation `build_snap`
+            // uses: Misfilled ⇔ NotLongLived, everything readable else is
+            // LongLived. (The cache held the `SidecarKind` too while the
+            // Overview wore a type tag; upstream 5dde024 removed the tag, and
+            // the kind went with it.)
+            let (kind, oauth) = crate::claude::sidecar_summary(n)?;
+            let status = match kind {
+                crate::claude::SidecarKind::Misfilled => {
+                    crate::claude::SessionTokenStatus::NotLongLived
+                }
+                _ => crate::claude::SessionTokenStatus::LongLived(oauth.expires_at),
+            };
+            Some((n.clone(), status))
+        })
         .collect()
 }
 
@@ -5754,12 +5768,19 @@ pub(crate) fn config_rows(app: &App) -> Vec<ConfigRow> {
         rows.push(ConfigRow::DeleteCreds);
     }
     // CLA-SPLIT escape hatch, beside the log-out row because it drops the OTHER
-    // credential a split profile holds. Gated on the sidecar EXISTING
-    // (`session_token_status`), not on the split being engaged
-    // (`has_session_token`): a mis-filled sidecar needs the same exit, and until
-    // this row there was none from either state short of deleting the file by
-    // hand. The no-other-login refusal is a dim, not a hide — see `run_config_row`.
-    if profile.is_some_and(|p| crate::claude::session_token_status(p.name.as_str()).is_some()) {
+    // credential a split profile holds. Gated on ANY long-lived piece existing
+    // — the sidecar (`session_token_status`, so a mis-fill gets the same
+    // exit), the preserved mint backup, or a set `rolling_token` flag — never
+    // on the split being ENGAGED: a flag with no sidecar is exactly the state
+    // where hiding the row leaves the daemon to re-create what the operator
+    // has no surface left to remove (the CLI's widened nothing-to-clear gate,
+    // rendered). The no-other-login refusal is a dim, not a hide — see
+    // `run_config_row`.
+    if profile.is_some_and(|p| {
+        crate::claude::session_token_status(p.name.as_str()).is_some()
+            || p.rolling_token
+            || crate::claude::has_static_backup(p.name.as_str())
+    }) {
         rows.push(ConfigRow::ClearSessionToken);
     }
     // The account-actions group's tail: disable/enable (reversible) one severity
@@ -6025,15 +6046,21 @@ fn run_config_row(app: &mut App, row: ConfigRow) {
         }
         ConfigRow::ClearSessionToken => {
             if let Some(name) = name {
-                // Same refusal the CLI makes (`cmd_static_token_clear`):
-                // with no other login stored, clearing the sidecar leaves the
-                // account with no credentials at all.
+                // Same refusal the CLI makes (`cmd_static_token_clear`), on the
+                // same condition: with no other login stored, clearing would
+                // strip the account's last credential — but only a stored PIECE
+                // (a sidecar or a preserved mint) is a credential to strip. A
+                // flag-only account disarms without touching one, so it clears
+                // here exactly as the CLI does, instead of a silent return
+                // behind a row the widening made visible.
                 let stores_other_login = {
                     let cfg = app.config();
                     cfg.find(&name)
                         .is_some_and(|p| p.credentials.is_some() || p.api_key.is_some())
                 };
-                if !stores_other_login {
+                let holds_credential_piece = crate::claude::session_token_status(&name).is_some()
+                    || crate::claude::has_static_backup(&name);
+                if holds_credential_piece && !stores_other_login {
                     return;
                 }
                 let armed = app
@@ -6061,19 +6088,104 @@ fn run_config_row(app: &mut App, row: ConfigRow) {
 /// and Claude Code reads no credentials at all. An idle account is left alone:
 /// force-linking it would repoint the live slot at a profile nobody switched to.
 ///
+/// Same full-exit contract as the CLI's `static-token --clear`, or the two
+/// surfaces fight the daemon differently: the `rolling_token` flag goes FIRST
+/// (a set flag re-stamps a fresh bearer over the removal on the daemon's next
+/// scan), the preserved mint backup goes too (a "cleared" long-lived token
+/// with a year-scale mint still in `session-token.static.json` is not
+/// cleared), and a mis-filled sidecar is quarantined as evidence before the
+/// removal, exactly as every other repair path does.
+///
+/// The rotation guard is the same load-bearing piece it is on the CLI path —
+/// a rotation in flight that still saw the flag set would re-stamp the
+/// sidecar AFTER the removal — but a UI thread must never park behind a
+/// timeout-less flock, so this takes `try_acquire` and fails LOUDLY into a
+/// toast when a rotation holds the profile, instead of silently losing the
+/// race.
+///
 /// The relink has TWO outcomes and the toast names which one happened. The row
-/// is refused only when an account stores neither a login nor an api key, so an
-/// api-key account clears fine onto an ABSENT install source: the forcing relink
-/// then removes the live slot and, on macOS, signs the Keychain out rather than
-/// installing anything. Both were reported as "relinked its own login".
+/// is refused only when clearing would strip the account's LAST credential — a
+/// stored piece (sidecar or preserved mint) with neither a login nor an api key
+/// behind it; a flag-only account disarms regardless, touching no credential.
+/// An api-key account clears fine onto an ABSENT install source: the forcing
+/// relink then removes the live slot and, on macOS, signs the Keychain out
+/// rather than installing anything. Both were reported as "relinked its own
+/// login". The refusal is re-checked from DISK under the guard: the in-memory
+/// gate in `run_config_row` reads a snapshot `reload_fingerprint` can never
+/// invalidate (it does not stat `credentials.json`), so an out-of-band log-out
+/// would otherwise slip past it forever.
 ///
 /// Deliberately does NOT stamp `last_reload_fp`: `reload_fingerprint` folds each
 /// sidecar's write time in, so leaving it stale is what makes the next tick
 /// reload and rebuild `session_tokens` (the Overview `⊘` marker's cache). The
 /// local `remove` below only spares that marker one tick of staleness.
 fn perform_clear_session_token(app: &mut App, name: &str) {
+    let _guard = match crate::runtime::RotationGuard::try_acquire(name) {
+        Ok(Some(guard)) => guard,
+        Ok(None) => {
+            app.toast(
+                ToastKind::Danger,
+                format!("a rotation is in flight for '{name}' · try again in a moment"),
+            );
+            return;
+        }
+        Err(e) => {
+            app.toast(ToastKind::Danger, format!("clear failed\n{e}"));
+            return;
+        }
+    };
+    // Everything the ACTIONS key off is re-read under the guard — the CLI's
+    // own rule, and stricter here: the TUI's config is a tick-stale snapshot,
+    // and `reload_fingerprint` does not stat `credentials.json` at all, so an
+    // out-of-band log-out leaves the snapshot claiming a stored login
+    // INDEFINITELY, not for one tick. `run_config_row`'s gate fed the row's
+    // rendering and nothing else.
+    let on_disk = match crate::profile::load_profile(name) {
+        Ok(p) => p,
+        Err(e) => {
+            app.toast(ToastKind::Danger, format!("clear failed\n{e}"));
+            return;
+        }
+    };
+    let holds_credential_piece = crate::claude::session_token_status(name).is_some()
+        || crate::claude::has_static_backup(name);
+    if holds_credential_piece && on_disk.credentials.is_none() && on_disk.api_key.is_none() {
+        app.toast(
+            ToastKind::Danger,
+            format!("'{name}' stores no other login anymore · log in first, then clear"),
+        );
+        return;
+    }
+    // `active` deliberately stays the in-memory read: the TUI is itself the
+    // thing that switches accounts in this process, so its own state is the
+    // authority (and upstream's tests pin exactly that). The disk re-reads
+    // above cover the two facts an EXTERNAL writer can move under the guard —
+    // the stored login and the flag.
     let active = app.config().is_active(name);
-    if let Err(e) = crate::claude::clear_session_token(name) {
+    let rolling_armed = on_disk.rolling_token;
+    if rolling_armed {
+        // The PERSIST is written from the same under-guard disk read, never
+        // the in-memory snapshot — an external daemon's rotation may have
+        // landed since the last reload, and `save_profile` writes the whole
+        // profile back. The renderer's in-memory flag flips only AFTER that
+        // write lands: flipped first, a failed save leaves the config lying
+        // (`reload_fingerprint` never corrects it — config mtime did not move)
+        // until an unrelated save makes the lie durable, and the end state is
+        // a live rolling sidecar nothing re-stamps.
+        let mut disarmed = on_disk.clone();
+        disarmed.rolling_token = false;
+        if let Err(e) = save_profile(&disarmed) {
+            app.toast(ToastKind::Danger, format!("clear failed\n{e}"));
+            return;
+        }
+        let mut cfg = app.config();
+        if let Some(p) = cfg.find_mut(name) {
+            p.rolling_token = false;
+        }
+    }
+    if let Err(e) = crate::claude::quarantine_misfilled_sidecar(name)
+        .and_then(|_| crate::claude::clear_session_token(name))
+    {
         app.toast(ToastKind::Danger, format!("clear failed\n{e}"));
         return;
     }
@@ -6087,17 +6199,55 @@ fn perform_clear_session_token(app: &mut App, name: &str) {
         app.toast(ToastKind::Danger, format!("relink failed\n{e}"));
         return;
     }
+    // The backup goes LAST, after the relink: failing between the sidecar
+    // removal and the relink would leave an active profile's live slot a
+    // dangling symlink under a toast reading "clear failed" — a broken login
+    // reported as nothing-happened. From here the live slot is already sound,
+    // so a failed backup removal is exactly what its toast says and no more.
+    let backup_removed = match crate::claude::clear_static_backup(name) {
+        Ok(removed) => removed,
+        Err(e) => {
+            app.toast(
+                ToastKind::Danger,
+                format!("cleared the long-lived token, but the preserved mint remains\n{e}"),
+            );
+            return;
+        }
+    };
     // No `refresh_tokens()`: `collect_tokens` reads `Profile::credentials`, which
     // a sidecar clear never touches.
     let tail = match (active, has_login) {
         (true, true) => ", relinked its own login",
-        (true, false) => ", signed Claude Code out; it runs on its api key",
+        (true, false) if on_disk.api_key.is_some() => {
+            ", signed Claude Code out; it runs on its api key"
+        }
+        // Reachable only on the flag-only widening (a stored piece with no
+        // other login is refused above): nothing backs this account now, and
+        // claiming an api key it does not hold would be the toast's own lie.
+        (true, false) => ", signed Claude Code out; it stores no login at all",
         (false, true) => "; the next switch installs its own login",
-        (false, false) => "; it stores no login, so it runs on its api key",
+        (false, false) if on_disk.api_key.is_some() => {
+            "; it stores no login, so it runs on its api key"
+        }
+        (false, false) => "; it stores no login at all — log in before switching to it",
+    };
+    let rolled = if rolling_armed {
+        " · re-stamping off"
+    } else {
+        ""
+    };
+    // Unconditional on the removal, like the CLI's `clear_backup_postscript`:
+    // the pre-action disclosure lives in the row hint, but a hint is not a
+    // report, and a year-scale credential destroyed with nothing saying so is
+    // the silence the `rolled` suffix already refuses for the flag.
+    let swept = if backup_removed {
+        " · the preserved mint is gone"
+    } else {
+        ""
     };
     app.toast(
         ToastKind::Success,
-        format!("cleared the long-lived token for '{name}'{tail}"),
+        format!("cleared the long-lived token for '{name}'{tail}{rolled}{swept}"),
     );
 }
 

@@ -25,6 +25,7 @@ fn profile(name: &str, threshold: f64, util: f64, reset_secs: i64) -> Profile {
         weekly_threshold: None,
         last_resort: false,
         preferred: false,
+        rolling_token: false,
         max_auto_spend: None,
         check_weekly: true,
         check_scoped: true,
@@ -1411,6 +1412,7 @@ fn live_row(
         chain_cursor: None,
         current_member: None,
         last_swap_at,
+        launch_store: None,
     }
 }
 

@@ -1090,6 +1090,28 @@ fn installed_session_token_tracks_what_a_switch_installs() {
         Some("oat-access")
     );
 
+    // CLA-ROLL: a rolling stamp is refresh-less by construction, exactly like
+    // the mint, so it attributes the same way — `clauth which` must keep
+    // naming a session when the daemon swaps the mint for a rolling bearer.
+    // Re-gating this on a mint-only predicate is what would silently turn
+    // every rolling session's statusline to `unknown`.
+    stamp_rolling_token(
+        "split",
+        &OAuthToken {
+            access_token: "at-rolling".to_string(),
+            refresh_token: Some("rt-chain".to_string()),
+            expires_at: Some(crate::usage::now_ms() as i64 + 8 * 3_600_000),
+            scopes: Some(vec!["user:profile".into(), "user:inference".into()]),
+            subscription_type: Some("max".into()),
+        },
+    )
+    .expect("stamp rolling");
+    assert_eq!(
+        installed_session_token("split").as_deref(),
+        Some("at-rolling"),
+        "a rolling stamp attributes like the mint"
+    );
+
     // Mis-fill: a rotating pair in the sidecar leaves the split disengaged, so
     // the install source is the OAuth pair and there is nothing to attribute by.
     let dir = crate::profile::profile_dir("split").expect("profile dir");
@@ -1120,6 +1142,45 @@ fn installed_session_token_tracks_what_a_switch_installs() {
         installed_session_token("split"),
         None,
         "blank is not a token"
+    );
+}
+
+/// The scheduler's re-login leash watches this fingerprint, and every recovery
+/// it prescribes lands as a write to ONE of the three files — so each file
+/// must move the fingerprint independently, or the recovery that touches the
+/// untracked one waits out the full six-hour leash the watch exists to cut
+/// short.
+#[test]
+fn the_credential_fingerprint_tracks_each_of_the_three_files() {
+    let _home = HomeSandbox::new();
+    let dir = crate::profile::profile_dir("fp").expect("dir");
+    fs::create_dir_all(&dir).expect("mkdir");
+    let f0 = credential_fingerprint("fp");
+    assert_eq!(
+        f0,
+        [None, None, None],
+        "an empty profile has no fingerprint"
+    );
+
+    fs::write(dir.join("credentials.json"), b"{\"a\":1}").expect("write");
+    let f1 = credential_fingerprint("fp");
+    assert_ne!(
+        f1, f0,
+        "a re-login (credentials.json) moves the fingerprint"
+    );
+
+    fs::write(dir.join("session-token.json"), b"{\"b\":22}").expect("write");
+    let f2 = credential_fingerprint("fp");
+    assert_ne!(
+        f2, f1,
+        "a re-mint (session-token.json) moves the fingerprint"
+    );
+
+    fs::write(dir.join("session-token.static.json"), b"{\"c\":333}").expect("write");
+    let f3 = credential_fingerprint("fp");
+    assert_ne!(
+        f3, f2,
+        "a hand-restored backup (session-token.static.json) moves the fingerprint"
     );
 }
 
@@ -2277,5 +2338,1361 @@ fn a_failed_carry_still_completes_the_switch() {
     assert_eq!(
         after["claudeAiOauth"]["accessToken"], "login-b",
         "the switch installed account B even though its MCP carry could not land"
+    );
+}
+
+/// The fed sidecar carries the chain's access token, real expiry, scopes, and
+/// subscriptionType — and NEVER a refresh token, so the classifier stays
+/// LongLived and every split guard keeps working unmodified.
+#[test]
+fn stamp_rolling_token_writes_a_refreshless_long_lived_shape() {
+    let _home = HomeSandbox::new();
+    let name = "feed-shape";
+    std::fs::create_dir_all(crate::profile::profile_dir(name).expect("dir")).expect("mkdir");
+    let exp = crate::usage::now_ms() as i64 + 8 * 3_600_000;
+    stamp_rolling_token(
+        name,
+        &OAuthToken {
+            access_token: "at-chain".to_string(),
+            refresh_token: Some("rt-chain".to_string()),
+            expires_at: Some(exp),
+            scopes: Some(vec!["user:profile".into(), "user:inference".into()]),
+            subscription_type: Some("max".into()),
+        },
+    )
+    .expect("feed");
+    let status = session_token_status(name).expect("sidecar");
+    assert_eq!(status, SessionTokenStatus::LongLived(Some(exp)));
+    let dir = crate::profile::profile_dir(name).expect("dir");
+    let creds: ClaudeCredentials =
+        serde_json::from_slice(&std::fs::read(dir.join("session-token.json")).expect("read"))
+            .expect("parse");
+    let oauth = creds.claude_ai_oauth.expect("oauth");
+    assert_eq!(oauth.access_token, "at-chain");
+    assert!(
+        oauth.refresh_token.is_none(),
+        "the pair never reaches the sidecar"
+    );
+    assert_eq!(oauth.subscription_type.as_deref(), Some("max"));
+    assert_eq!(
+        oauth.scopes.as_deref(),
+        Some(&["user:profile".to_string(), "user:inference".to_string()][..])
+    );
+}
+
+/// First feed preserves a genuine mint exactly once; later feeds leave the
+/// backup alone, and a fed (hours-horizon) sidecar is never mistaken for one.
+#[test]
+fn first_stamp_preserves_the_mint_once_and_only_the_mint() {
+    let _home = HomeSandbox::new();
+    let name = "feed-preserve";
+    std::fs::create_dir_all(crate::profile::profile_dir(name).expect("dir")).expect("mkdir");
+    let now = crate::usage::now_ms() as i64;
+    write_session_token(name, "sk-ant-oat01-genuine-mint-value-1234567890", now).expect("mint");
+    let fed = |token: &str| OAuthToken {
+        access_token: token.to_string(),
+        refresh_token: None,
+        expires_at: Some(now + 8 * 3_600_000),
+        scopes: None,
+        subscription_type: Some("max".into()),
+    };
+    stamp_rolling_token(name, &fed("at-1")).expect("feed 1");
+    stamp_rolling_token(name, &fed("at-2")).expect("feed 2");
+    let dir = crate::profile::profile_dir(name).expect("dir");
+    let backup: ClaudeCredentials = serde_json::from_slice(
+        &std::fs::read(dir.join("session-token.static.json")).expect("backup exists"),
+    )
+    .expect("parse");
+    assert_eq!(
+        backup.access_token(),
+        Some("sk-ant-oat01-genuine-mint-value-1234567890"),
+        "the backup is the ORIGINAL mint, not a fed value"
+    );
+
+    // A fed sidecar with the backup consumed is never re-preserved as a mint
+    // (subscriptionType + hours horizon both disqualify it).
+    std::fs::remove_file(dir.join("session-token.static.json")).expect("consume");
+    stamp_rolling_token(name, &fed("at-3")).expect("feed 3");
+    assert!(
+        !dir.join("session-token.static.json").exists(),
+        "a fed value must never become the degrade fallback"
+    );
+}
+
+/// Restore round-trip: the mint comes back byte-identical, the backup is
+/// consumed, and a second restore is a no-op `false`.
+#[test]
+fn restore_static_mint_round_trip() {
+    let _home = HomeSandbox::new();
+    let name = "feed-restore";
+    std::fs::create_dir_all(crate::profile::profile_dir(name).expect("dir")).expect("mkdir");
+    let now = crate::usage::now_ms() as i64;
+    write_session_token(name, "sk-ant-oat01-genuine-mint-value-1234567890", now).expect("mint");
+    let dir = crate::profile::profile_dir(name).expect("dir");
+    let mint_bytes = std::fs::read(dir.join("session-token.json")).expect("mint bytes");
+    stamp_rolling_token(
+        name,
+        &OAuthToken {
+            access_token: "at-fed".to_string(),
+            refresh_token: None,
+            expires_at: Some(now + 3_600_000),
+            scopes: None,
+            subscription_type: Some("max".into()),
+        },
+    )
+    .expect("feed");
+    assert!(restore_static_mint(name).expect("restore"));
+    assert_eq!(
+        std::fs::read(dir.join("session-token.json")).expect("sidecar"),
+        mint_bytes,
+        "mint restored byte-identical"
+    );
+    assert!(
+        !restore_static_mint(name).expect("second restore"),
+        "backup consumed"
+    );
+}
+
+/// `write_session_token_with_backup` stamps the fresh mint into the sidecar
+/// AND the degrade backup from the same bytes (one flock section — the
+/// re-mint-on-a-feed-profile path, immune to a concurrent rotation feed
+/// landing between a write and a read-back).
+#[test]
+fn write_session_token_with_backup_stamps_both_from_the_same_mint() {
+    let _home = HomeSandbox::new();
+    let name = "feed-remint";
+    std::fs::create_dir_all(crate::profile::profile_dir(name).expect("dir")).expect("mkdir");
+    let now = crate::usage::now_ms() as i64;
+    write_session_token(name, "sk-ant-oat01-genuine-mint-value-1234567890", now).expect("mint 1");
+    stamp_rolling_token(
+        name,
+        &OAuthToken {
+            access_token: "at-fed".to_string(),
+            refresh_token: None,
+            expires_at: Some(now + 3_600_000),
+            scopes: None,
+            subscription_type: Some("max".into()),
+        },
+    )
+    .expect("feed preserves mint 1");
+    write_session_token_with_backup(name, "sk-ant-oat01-fresher-mint-value-0987654321", now)
+        .expect("re-mint");
+    let dir = crate::profile::profile_dir(name).expect("dir");
+    let sidecar = std::fs::read(dir.join("session-token.json")).expect("sidecar");
+    let backup = std::fs::read(dir.join("session-token.static.json")).expect("backup");
+    assert_eq!(sidecar, backup, "one mint, two byte-identical copies");
+    let parsed: ClaudeCredentials = serde_json::from_slice(&backup).expect("parse");
+    assert_eq!(
+        parsed.access_token(),
+        Some("sk-ant-oat01-fresher-mint-value-0987654321"),
+        "the FRESH mint is the degrade fallback now"
+    );
+}
+
+/// A feed profile's mis-filled sidecar heals when a backup exists: evidence
+/// lands in quarantine, the mint comes back, the backup is consumed. Without
+/// a backup nothing is touched (`NoLiveBackup` — the disengaged posture).
+#[test]
+fn heal_misfilled_sidecar_quarantines_and_restores_the_mint() {
+    let _home = HomeSandbox::new();
+    let name = "feed-heal";
+    std::fs::create_dir_all(crate::profile::profile_dir(name).expect("dir")).expect("mkdir");
+    let now = crate::usage::now_ms() as i64;
+    write_session_token(name, "sk-ant-oat01-genuine-mint-value-1234567890", now).expect("mint");
+    let dir = crate::profile::profile_dir(name).expect("dir");
+    let mint_bytes = std::fs::read(dir.join("session-token.json")).expect("mint bytes");
+    stamp_rolling_token(
+        name,
+        &OAuthToken {
+            access_token: "at-fed".to_string(),
+            refresh_token: None,
+            expires_at: Some(now + 3_600_000),
+            scopes: None,
+            subscription_type: Some("max".into()),
+        },
+    )
+    .expect("feed preserves mint");
+    // Something scribbles a rotating pair into the sidecar (the mis-fill).
+    std::fs::write(
+        dir.join("session-token.json"),
+        serde_json::to_vec(&creds("at-misfill", Some("rt-misfill"))).expect("ser"),
+    )
+    .expect("misfill");
+    assert_eq!(
+        heal_misfilled_sidecar(name).expect("heal"),
+        HealOutcome::Healed
+    );
+    assert_eq!(
+        std::fs::read(dir.join("session-token.json")).expect("sidecar"),
+        mint_bytes,
+        "mint restored"
+    );
+    assert!(
+        !dir.join("session-token.static.json").exists(),
+        "backup consumed"
+    );
+    // Under the PROFILE, so `clauth delete` sweeps the rotating pair it holds
+    // along with everything else that account owns.
+    let quarantine = dir.join("quarantine");
+    let quarantined = std::fs::read_dir(&quarantine)
+        .expect("quarantine dir")
+        .filter_map(|e| e.ok())
+        .any(|e| {
+            e.file_name()
+                .to_string_lossy()
+                .ends_with(".session-token.json")
+        });
+    assert!(quarantined, "mis-fill evidence preserved in quarantine");
+
+    // Second mis-fill, no backup left: nothing healed, nothing touched.
+    std::fs::write(
+        dir.join("session-token.json"),
+        serde_json::to_vec(&creds("at-misfill-2", Some("rt-misfill-2"))).expect("ser"),
+    )
+    .expect("misfill 2");
+    assert_eq!(
+        heal_misfilled_sidecar(name).expect("no-backup heal"),
+        HealOutcome::NoLiveBackup
+    );
+    assert!(
+        matches!(
+            session_token_status(name),
+            Some(SessionTokenStatus::NotLongLived)
+        ),
+        "mis-fill left in place without a backup"
+    );
+    // And a sidecar that is not mis-filled at all reports itself as exactly
+    // that — the state the install gate lets fall through to the normal
+    // rolling table, never the vanilla path.
+    write_session_token(name, "sk-ant-oat01-genuine-mint-value-1234567890", now).expect("re-mint");
+    assert_eq!(
+        heal_misfilled_sidecar(name).expect("healthy heal"),
+        HealOutcome::NotMisfilled
+    );
+}
+
+// ── the mint-vs-rolling discriminator ────────────────────────────────────────
+//
+// The two are told apart by the SCOPE SET, the one signal every sidecar ever
+// written carries: a mint records `SETUP_TOKEN_SCOPES`, a rolling stamp clones
+// the chain's grant, and a chain fit to be a usage chain can never carry the
+// mint's set (`/api/oauth/usage` 403s exactly those scopes — the #52 root
+// cause). The old 30-day-horizon inference was wrong on both sides of itself;
+// these pin both failures as fixed, and pin that expiry no longer decides
+// anything.
+
+/// A refresh-less token builder for classification fixtures.
+fn refreshless(
+    scopes: Option<Vec<&str>>,
+    plan: Option<&str>,
+    expires_at: Option<i64>,
+) -> OAuthToken {
+    OAuthToken {
+        access_token: "at".to_string(),
+        refresh_token: None,
+        expires_at,
+        scopes: scopes.map(|s| s.into_iter().map(String::from).collect()),
+        subscription_type: plan.map(String::from),
+    }
+}
+
+#[test]
+fn classification_is_the_scope_set_never_the_clock() {
+    let now = crate::usage::now_ms() as i64;
+    let mint_scopes = || Some(vec!["user:inference", "user:sessions:claude_code"]);
+    let chain_scopes = || Some(vec!["user:inference", "user:profile"]);
+
+    // A mint is a mint at any remaining life — ten days out included, which
+    // the old horizon read as rolling and destroyed with no backup.
+    for exp in [
+        Some(now + 300 * 86_400_000),
+        Some(now + 10 * 86_400_000),
+        None,
+    ] {
+        assert_eq!(
+            sidecar_kind_of(&refreshless(mint_scopes(), None, exp)),
+            SidecarKind::Mint,
+            "a mint's remaining life must not reclassify it (exp={exp:?})"
+        );
+    }
+    // A chain grant is rolling at any stamped expiry — a year-scale stamp
+    // included, which the old horizon read as a mint. Expiry is hand-editable
+    // (`SETUP_TOKEN_ASSUMED_LIFETIME_MS`'s doc invites it); scopes are not.
+    for exp in [Some(now + 3_600_000), Some(now + 300 * 86_400_000), None] {
+        assert_eq!(
+            sidecar_kind_of(&refreshless(chain_scopes(), None, exp)),
+            SidecarKind::Rolling,
+            "a scope beyond the setup pair proves the chain wrote it (exp={exp:?})"
+        );
+    }
+    // The plan stamp is the belt: no mint write ever sets it.
+    assert_eq!(
+        sidecar_kind_of(&refreshless(None, Some("max"), Some(now + 3_600_000))),
+        SidecarKind::Rolling
+    );
+    // Absent or subset scopes read Mint — the failure direction that KEEPS a
+    // copy. `stamp_rolling_token` refuses to write such a bearer, so only a
+    // hand-edit can reach these shapes.
+    assert_eq!(
+        sidecar_kind_of(&refreshless(None, None, Some(now + 3_600_000))),
+        SidecarKind::Mint
+    );
+    assert_eq!(
+        sidecar_kind_of(&refreshless(Some(vec!["user:inference"]), None, None)),
+        SidecarKind::Mint
+    );
+    assert_eq!(
+        sidecar_kind_of(&refreshless(Some(vec![]), None, None)),
+        SidecarKind::Mint
+    );
+}
+
+/// The write-site guard that makes the classifier total: the only writer of
+/// rolling content refuses a chain grant it could not later tell from a mint,
+/// and leaves the sidecar untouched when it does.
+#[test]
+fn stamp_rolling_token_refuses_a_mint_shaped_chain_grant() {
+    let _home = HomeSandbox::new();
+    let name = "stamp-refuse";
+    let dir = crate::profile::profile_dir(name).expect("dir");
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    let err = stamp_rolling_token(
+        name,
+        &refreshless(
+            Some(vec!["user:inference", "user:sessions:claude_code"]),
+            None,
+            Some(crate::usage::now_ms() as i64 + 8 * 3_600_000),
+        ),
+    );
+    assert!(
+        err.is_err(),
+        "a mint-classifying grant must never be stamped as rolling"
+    );
+    assert!(
+        !dir.join("session-token.json").exists(),
+        "refusal writes nothing"
+    );
+}
+
+/// Round 1's blocker 3, closed for EVERY sidecar in the field: a real mint in
+/// its final month was read as a rolling value and destroyed with NO backup —
+/// precisely the month in which having one matters most. The scope set makes
+/// remaining life irrelevant, with no marker to have been written first: this
+/// fixture is exactly what `write_session_token` leaves on disk, which is
+/// exactly what every pre-upgrade install holds.
+#[test]
+fn a_mint_in_its_final_month_is_still_preserved() {
+    let _home = HomeSandbox::new();
+    let name = "kind-late-mint";
+    let dir = crate::profile::profile_dir(name).expect("dir");
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    let now = crate::usage::now_ms() as i64;
+
+    // A genuine mint stamped only 10 days out: well inside the 30-day horizon
+    // the old inference used to disqualify it.
+    let mint = ClaudeCredentials {
+        claude_ai_oauth: Some(OAuthToken {
+            access_token: "sk-ant-oat01-a-mint-in-its-final-month-1234".to_string(),
+            refresh_token: None,
+            expires_at: Some(now + 10 * 86_400_000),
+            scopes: Some(vec![
+                "user:inference".to_string(),
+                "user:sessions:claude_code".to_string(),
+            ]),
+            subscription_type: None,
+        }),
+    };
+    std::fs::write(
+        dir.join("session-token.json"),
+        serde_json::to_vec_pretty(&mint).expect("ser"),
+    )
+    .expect("write mint");
+
+    stamp_rolling_token(
+        name,
+        &OAuthToken {
+            access_token: "at-rolling".to_string(),
+            refresh_token: None,
+            expires_at: Some(now + 8 * 3_600_000),
+            scopes: Some(vec![
+                "user:inference".to_string(),
+                "user:profile".to_string(),
+            ]),
+            subscription_type: Some("max".into()),
+        },
+    )
+    .expect("roll");
+
+    let backup: ClaudeCredentials = serde_json::from_slice(
+        &std::fs::read(dir.join("session-token.static.json"))
+            .expect("the mint must have been preserved"),
+    )
+    .expect("parse");
+    assert_eq!(
+        backup.access_token(),
+        Some("sk-ant-oat01-a-mint-in-its-final-month-1234"),
+        "a mint's remaining life must not decide whether it is worth keeping"
+    );
+    assert!(
+        matches!(sidecar_summary(name), Some((SidecarKind::Rolling, _))),
+        "and the sidecar now classifies as the rolling bearer it holds"
+    );
+}
+
+/// The other side of the same inference: a rolling bearer must never be
+/// snapshotted as "the mint", or a later restore installs a token that died
+/// hours after it was taken. Two fixtures, because the second is the one the
+/// old horizon heuristic got WRONG: a rolling bearer whose stamped expiry is
+/// year-scale (a hand-edited clock, or a chain with an anomalous expiry) reads
+/// mint-shaped on every axis except its scope set.
+#[test]
+fn a_rolling_bearer_is_never_preserved_as_the_mint() {
+    let _home = HomeSandbox::new();
+    let name = "kind-roll-shape";
+    let dir = crate::profile::profile_dir(name).expect("dir");
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    let now = crate::usage::now_ms() as i64;
+
+    let chain_scoped = |at: &str, exp: i64, plan: Option<&str>| ClaudeCredentials {
+        claude_ai_oauth: Some(OAuthToken {
+            access_token: at.to_string(),
+            refresh_token: None,
+            expires_at: Some(exp),
+            scopes: Some(vec![
+                "user:inference".to_string(),
+                "user:profile".to_string(),
+            ]),
+            subscription_type: plan.map(String::from),
+        }),
+    };
+
+    // What a roll actually writes: hours-scale, plan-stamped, chain-scoped.
+    std::fs::write(
+        dir.join("session-token.json"),
+        serde_json::to_vec_pretty(&chain_scoped(
+            "at-rolling",
+            now + 8 * 3_600_000,
+            Some("max"),
+        ))
+        .expect("ser"),
+    )
+    .expect("write");
+    stamp_rolling_token(
+        name,
+        &OAuthToken {
+            access_token: "at-next".to_string(),
+            refresh_token: None,
+            expires_at: Some(now + 8 * 3_600_000),
+            scopes: Some(vec![
+                "user:inference".to_string(),
+                "user:profile".to_string(),
+            ]),
+            subscription_type: Some("max".into()),
+        },
+    )
+    .expect("roll");
+    assert!(
+        !dir.join("session-token.static.json").exists(),
+        "a rolling bearer must never become the degrade backup"
+    );
+
+    // The horizon heuristic's blind spot: year-scale expiry, no plan stamp —
+    // only the chain scopes give it away. Under the old inference this was
+    // snapshotted as "the mint", permanently, since a backup is never replaced.
+    std::fs::write(
+        dir.join("session-token.json"),
+        serde_json::to_vec_pretty(&chain_scoped(
+            "at-far-rolling",
+            now + 300 * 86_400_000,
+            None,
+        ))
+        .expect("ser"),
+    )
+    .expect("write");
+    stamp_rolling_token(
+        name,
+        &OAuthToken {
+            access_token: "at-next-2".to_string(),
+            refresh_token: None,
+            expires_at: Some(now + 8 * 3_600_000),
+            scopes: Some(vec![
+                "user:inference".to_string(),
+                "user:profile".to_string(),
+            ]),
+            subscription_type: Some("max".into()),
+        },
+    )
+    .expect("roll 2");
+    assert!(
+        !dir.join("session-token.static.json").exists(),
+        "a far-future stamp must not launder a chain-scoped bearer into the backup"
+    );
+}
+
+/// Quarantine (the CLI pre-clear) REMOVES a mis-filled sidecar after copying
+/// the evidence under the profile.
+#[test]
+fn quarantining_a_misfill_removes_the_sidecar() {
+    let _home = HomeSandbox::new();
+    let name = "kind-quarantine";
+    let dir = crate::profile::profile_dir(name).expect("dir");
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    let misfill = ClaudeCredentials {
+        claude_ai_oauth: Some(OAuthToken {
+            access_token: "at".to_string(),
+            refresh_token: Some("rt-present".to_string()),
+            expires_at: Some(crate::usage::now_ms() as i64 + 3_600_000),
+            scopes: None,
+            subscription_type: None,
+        }),
+    };
+    std::fs::write(
+        dir.join("session-token.json"),
+        serde_json::to_vec_pretty(&misfill).expect("ser"),
+    )
+    .expect("write");
+    assert!(quarantine_misfilled_sidecar(name).expect("quarantine"));
+    assert!(!dir.join("session-token.json").exists(), "sidecar removed");
+    assert!(
+        dir.join("quarantine").exists(),
+        "evidence kept under the profile"
+    );
+}
+
+/// `arm_rolling_from_disk` used to stamp the sidecar with the token it read
+/// BEFORE taking the rotation guard. `RotationGuard::acquire` BLOCKS, so the
+/// ordinary interleaving is: wait for the daemon's rotation to land, then write
+/// the value that rotation just superseded. Whether a refresh invalidates its
+/// predecessor or leaves it alive to its own `exp`, the outcome is wrong the
+/// same way — the session gets a bearer with less life than it should have, or
+/// a dead one with no refresh path behind it.
+///
+/// Reproduced for real: this thread HOLDS the guard while the arming thread is
+/// blocked inside `acquire`, advances the stored chain underneath it, and only
+/// then releases. What lands in the sidecar must be the post-guard read.
+///
+/// The interleaving is EXACT, not slept into: the armer runs through the
+/// `arm_rolling_from_disk_synced` seam, whose closure fires after the
+/// pre-guard read and immediately before `acquire` — so by the time this
+/// thread passes the barrier and advances the chain, the pre-guard snapshot
+/// provably holds the superseded value. Without the barrier, a pre-guard read
+/// landing after the advance would pass against unfixed code too.
+#[test]
+fn arming_from_disk_stamps_the_post_guard_chain_not_a_stale_snapshot() {
+    let _home = HomeSandbox::new();
+    let name = "arm-postguard";
+    let dir = crate::profile::profile_dir(name).expect("dir");
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    let now = crate::usage::now_ms() as i64;
+
+    let chain = |at: &str, rt: &str, life_h: i64| ClaudeCredentials {
+        claude_ai_oauth: Some(OAuthToken {
+            access_token: at.to_string(),
+            refresh_token: Some(rt.to_string()),
+            expires_at: Some(now + life_h * 3_600_000),
+            scopes: None,
+            subscription_type: Some("max".into()),
+        }),
+    };
+
+    let mut profile = crate::profile::Profile::new(name.to_string(), None, None);
+    profile.rolling_token = true;
+    profile.credentials = Some(chain("at-superseded", "rt-old", 8));
+    crate::profile::save_profile(&profile).expect("save");
+
+    // A sidecar inside the arming grace, so the leg has work to do.
+    let stale = ClaudeCredentials {
+        claude_ai_oauth: Some(OAuthToken {
+            access_token: "at-stale-sidecar".to_string(),
+            refresh_token: None,
+            expires_at: Some(now + 60_000),
+            scopes: None,
+            subscription_type: Some("max".into()),
+        }),
+    };
+    std::fs::write(
+        dir.join("session-token.json"),
+        serde_json::to_vec_pretty(&stale).expect("ser"),
+    )
+    .expect("write sidecar");
+
+    // Stand in for the daemon's in-flight rotation: hold the guard, let the
+    // arming leg finish its pre-guard read and park on the flock, move the
+    // chain, then release.
+    let guard = crate::runtime::RotationGuard::acquire(name).expect("hold the guard");
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+    let armer_barrier = std::sync::Arc::clone(&barrier);
+    let armer = std::thread::spawn(move || {
+        arm_rolling_from_disk_synced("arm-postguard", || {
+            armer_barrier.wait();
+        })
+    });
+    // Past this wait the armer has PROVABLY taken its pre-guard snapshot and
+    // is headed into `acquire`, where the held guard parks it.
+    barrier.wait();
+    profile.credentials = Some(chain("at-rotated", "rt-new", 9));
+    crate::profile::save_profile(&profile).expect("save rotated");
+    drop(guard);
+    armer.join().expect("arming thread");
+
+    let creds: ClaudeCredentials =
+        serde_json::from_slice(&std::fs::read(dir.join("session-token.json")).expect("read"))
+            .expect("parse");
+    assert_eq!(
+        creds.access_token(),
+        Some("at-rotated"),
+        "the sidecar must carry the POST-guard chain, never the pre-guard snapshot"
+    );
+    assert!(
+        creds.refresh_token().is_none(),
+        "nothing rotatable ever reaches the sidecar"
+    );
+}
+
+/// The post-guard re-read covers the FLAG, not just the chain: a
+/// `static-token --clear` can hold this same guard, disarm the profile, take
+/// the sidecar and the preserved mint, and release — all while the arming leg
+/// parks. Stamping from the pre-guard routing would land a fresh rolling
+/// bearer on the profile the operator just cleared, with the flag now off so
+/// nothing ever re-stamps it: a dies-in-hours credential with no exit. Same
+/// Barrier seam as the chain test above, so the interleaving is pinned by
+/// construction.
+#[test]
+fn arming_from_disk_skips_a_profile_cleared_while_it_waited() {
+    let _home = HomeSandbox::new();
+    let name = "arm-cleared";
+    let dir = crate::profile::profile_dir(name).expect("dir");
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    let now = crate::usage::now_ms() as i64;
+
+    let mut profile = crate::profile::Profile::new(name.to_string(), None, None);
+    profile.rolling_token = true;
+    profile.credentials = Some(ClaudeCredentials {
+        claude_ai_oauth: Some(OAuthToken {
+            access_token: "at-comfortable".to_string(),
+            refresh_token: Some("rt-live".to_string()),
+            expires_at: Some(now + 8 * 3_600_000),
+            scopes: None,
+            subscription_type: Some("max".into()),
+        }),
+    });
+    crate::profile::save_profile(&profile).expect("save");
+
+    // A stale sidecar, so the pre-guard pre-filter sees work to do.
+    let stale = ClaudeCredentials {
+        claude_ai_oauth: Some(OAuthToken {
+            access_token: "at-stale-sidecar".to_string(),
+            refresh_token: None,
+            expires_at: Some(now + 60_000),
+            scopes: None,
+            subscription_type: Some("max".into()),
+        }),
+    };
+    std::fs::write(
+        dir.join("session-token.json"),
+        serde_json::to_vec_pretty(&stale).expect("ser"),
+    )
+    .expect("write sidecar");
+
+    // Stand in for the clear: hold the guard, let the arming leg pass its
+    // pre-filter and park, then disarm the flag and take the sidecar — the
+    // clear's own writes — and release.
+    let guard = crate::runtime::RotationGuard::acquire(name).expect("hold the guard");
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+    let armer_barrier = std::sync::Arc::clone(&barrier);
+    let armer = std::thread::spawn(move || {
+        arm_rolling_from_disk_synced("arm-cleared", || {
+            armer_barrier.wait();
+        })
+    });
+    barrier.wait();
+    profile.rolling_token = false;
+    crate::profile::save_profile(&profile).expect("disarm");
+    std::fs::remove_file(dir.join("session-token.json")).expect("take the sidecar");
+    drop(guard);
+    armer.join().expect("arming thread");
+
+    assert!(
+        !dir.join("session-token.json").exists(),
+        "a cleared profile stays cleared — the pre-guard routing must not re-create the sidecar"
+    );
+}
+
+/// The restore paths CONSUME the backup, which under the marker design made
+/// them the one place a stale claim could destroy the only copy. With
+/// classification derived from content, the property is structural — a
+/// restored mint classifies as a mint because it IS one — but the end-to-end
+/// consequence still deserves its own pin: restore over a rolling sidecar,
+/// roll again, and the mint must be back in the backup rather than gone.
+#[test]
+fn a_restored_mint_is_preserved_again_on_the_next_roll() {
+    let _home = HomeSandbox::new();
+    let name = "kind-restore-reroll";
+    let dir = crate::profile::profile_dir(name).expect("dir");
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    let now = crate::usage::now_ms() as i64;
+
+    let mint = ClaudeCredentials {
+        claude_ai_oauth: Some(OAuthToken {
+            access_token: "sk-ant-oat01-the-preserved-mint-111111111".to_string(),
+            refresh_token: None,
+            expires_at: Some(now + 300 * 86_400_000),
+            scopes: Some(vec![
+                "user:inference".to_string(),
+                "user:sessions:claude_code".to_string(),
+            ]),
+            subscription_type: None,
+        }),
+    };
+    std::fs::write(
+        dir.join("session-token.static.json"),
+        serde_json::to_vec_pretty(&mint).expect("ser"),
+    )
+    .expect("write backup");
+    std::fs::write(dir.join("session-token.json"), b"{}").expect("write sidecar");
+
+    assert!(restore_static_mint(name).expect("restore"));
+    assert!(
+        matches!(sidecar_summary(name), Some((SidecarKind::Mint, _))),
+        "a restored mint classifies as the mint it is"
+    );
+    assert!(
+        !dir.join("session-token.static.json").exists(),
+        "backup consumed"
+    );
+
+    // The next roll must put it straight back — the degrade ladder's rung is
+    // rebuilt, not spent.
+    stamp_rolling_token(
+        name,
+        &OAuthToken {
+            access_token: "at-rolling".to_string(),
+            refresh_token: None,
+            expires_at: Some(now + 8 * 3_600_000),
+            scopes: Some(vec![
+                "user:inference".to_string(),
+                "user:profile".to_string(),
+            ]),
+            subscription_type: Some("max".into()),
+        },
+    )
+    .expect("re-roll");
+    let backup: ClaudeCredentials = serde_json::from_slice(
+        &std::fs::read(dir.join("session-token.static.json"))
+            .expect("the restored mint must be preserved again"),
+    )
+    .expect("parse");
+    assert_eq!(
+        backup.access_token(),
+        Some("sk-ant-oat01-the-preserved-mint-111111111")
+    );
+}
+
+/// The chain-staleness gate is re-applied AFTER the guard wait, against a
+/// re-taken clock: the pre-guard pass only proved a comfortable chain existed
+/// THEN, and `acquire` can block for a full rotation round trip. If the chain
+/// re-read under the guard is already inside the arming grace, stamping it
+/// would install a bearer with less life than a session can rely on — the
+/// guarded refresh owns that case, so the armer must write nothing.
+#[test]
+fn arming_from_disk_rechecks_chain_staleness_after_the_guard_wait() {
+    let _home = HomeSandbox::new();
+    let name = "arm-restale";
+    let dir = crate::profile::profile_dir(name).expect("dir");
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    let now = crate::usage::now_ms() as i64;
+
+    let chain = |at: &str, life_min: i64| ClaudeCredentials {
+        claude_ai_oauth: Some(OAuthToken {
+            access_token: at.to_string(),
+            refresh_token: Some("rt".to_string()),
+            expires_at: Some(now + life_min * 60_000),
+            scopes: Some(vec![
+                "user:inference".to_string(),
+                "user:profile".to_string(),
+            ]),
+            subscription_type: Some("max".into()),
+        }),
+    };
+
+    let mut profile = crate::profile::Profile::new(name.to_string(), None, None);
+    profile.rolling_token = true;
+    // Comfortable at the pre-guard read: 8h of life.
+    profile.credentials = Some(chain("at-was-comfortable", 8 * 60));
+    crate::profile::save_profile(&profile).expect("save");
+
+    // A sidecar inside the arming grace, so the leg has work to do.
+    let stale = ClaudeCredentials {
+        claude_ai_oauth: Some(OAuthToken {
+            access_token: "at-stale-sidecar".to_string(),
+            refresh_token: None,
+            expires_at: Some(now + 60_000),
+            scopes: Some(vec![
+                "user:inference".to_string(),
+                "user:profile".to_string(),
+            ]),
+            subscription_type: Some("max".into()),
+        }),
+    };
+    std::fs::write(
+        dir.join("session-token.json"),
+        serde_json::to_vec_pretty(&stale).expect("ser"),
+    )
+    .expect("write sidecar");
+
+    // While the armer is parked on the guard, the chain goes stale: the value
+    // it will re-read post-guard has only 10 minutes left — inside the grace.
+    let guard = crate::runtime::RotationGuard::acquire(name).expect("hold the guard");
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+    let armer_barrier = std::sync::Arc::clone(&barrier);
+    let armer = std::thread::spawn(move || {
+        arm_rolling_from_disk_synced("arm-restale", || {
+            armer_barrier.wait();
+        })
+    });
+    barrier.wait();
+    profile.credentials = Some(chain("at-now-stale", 10));
+    crate::profile::save_profile(&profile).expect("save stale");
+    drop(guard);
+    armer.join().expect("arming thread");
+
+    let creds: ClaudeCredentials =
+        serde_json::from_slice(&std::fs::read(dir.join("session-token.json")).expect("read"))
+            .expect("parse");
+    assert_eq!(
+        creds.access_token(),
+        Some("at-stale-sidecar"),
+        "a chain that went stale during the guard wait must not be stamped"
+    );
+}
+
+/// A mis-fill classifies as ITSELF, never as the rolling bearer its
+/// chain-shaped scopes would suggest — the refresh token is a content fact
+/// that pre-empts the scope inference. This is the arm `status.json` rides
+/// on: without it a mis-fill published `rolling_token: true` while the TUI
+/// rendered `[ mis-filled ]` on the same file, same frame.
+#[test]
+fn a_rotating_pair_classifies_misfilled_never_rolling() {
+    let with_refresh = OAuthToken {
+        access_token: "at".to_string(),
+        refresh_token: Some("rt".to_string()),
+        expires_at: Some(crate::usage::now_ms() as i64 + 3_600_000),
+        scopes: Some(vec![
+            "user:inference".to_string(),
+            "user:profile".to_string(),
+        ]),
+        subscription_type: Some("max".into()),
+    };
+    assert_eq!(sidecar_kind_of(&with_refresh), SidecarKind::Misfilled);
+    // And a mis-fill is never preserved as the mint, through the classifier
+    // rather than a sibling check.
+    let _home = HomeSandbox::new();
+    let name = "misfill-preserve";
+    let dir = crate::profile::profile_dir(name).expect("dir");
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    std::fs::write(
+        dir.join("session-token.json"),
+        serde_json::to_vec_pretty(&ClaudeCredentials {
+            claude_ai_oauth: Some(with_refresh),
+        })
+        .expect("ser"),
+    )
+    .expect("write");
+    stamp_rolling_token(
+        name,
+        &OAuthToken {
+            access_token: "at-next".to_string(),
+            refresh_token: None,
+            expires_at: Some(crate::usage::now_ms() as i64 + 8 * 3_600_000),
+            scopes: None,
+            subscription_type: Some("max".into()),
+        },
+    )
+    .expect("roll");
+    assert!(
+        !dir.join("session-token.static.json").exists(),
+        "a rotating pair must never become the degrade backup"
+    );
+}
+
+/// The backup slot's one shared rule ([`classify_backup_bytes`]): bytes that
+/// are not a genuine mint never restore, from ANY consumer. The shape that
+/// motivated it — a parseable file with no `claudeAiOauth` block — used to
+/// split the pair: `preserve_static_mint` read it as dead (replace) while the
+/// restore path read it as live, installed it, `has_session_token` went
+/// false, and sessions got the rotating pair. Not-a-mint content is
+/// quarantined (evidence, same as a mis-filled sidecar) and the slot cleared,
+/// so it also cannot trap `clauth static-token` in a loop its own recovery
+/// advice cannot exit.
+#[test]
+fn a_backup_that_is_not_a_mint_is_quarantined_never_restored() {
+    let _home = HomeSandbox::new();
+    let name = "nonmint-backup";
+    let dir = crate::profile::profile_dir(name).expect("dir");
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    let now = crate::usage::now_ms() as i64;
+    // A live rolling bearer in the sidecar — what a bad restore would destroy.
+    stamp_rolling_token(
+        name,
+        &OAuthToken {
+            access_token: "at-alive".to_string(),
+            refresh_token: None,
+            expires_at: Some(now + 8 * 3_600_000),
+            scopes: None,
+            subscription_type: Some("max".into()),
+        },
+    )
+    .expect("stamp");
+    for (label, bytes) in [
+        (
+            "blockless",
+            serde_json::to_vec(&ClaudeCredentials {
+                claude_ai_oauth: None,
+            })
+            .expect("ser"),
+        ),
+        (
+            "rotating pair",
+            serde_json::to_vec(&creds("at-pair", Some("rt-pair"))).expect("ser"),
+        ),
+    ] {
+        std::fs::write(dir.join("session-token.static.json"), &bytes).expect("write backup");
+        assert!(
+            !restore_static_mint(name).expect("restore verdict"),
+            "a {label} backup restores nothing"
+        );
+        assert!(
+            !dir.join("session-token.static.json").exists(),
+            "the {label} slot-holder is quarantined away, not left in place"
+        );
+        let sidecar: ClaudeCredentials =
+            serde_json::from_slice(&std::fs::read(dir.join("session-token.json")).expect("read"))
+                .expect("parse");
+        assert_eq!(
+            sidecar.access_token(),
+            Some("at-alive"),
+            "the live bearer is untouched by a refused {label} restore"
+        );
+    }
+    let quarantined = std::fs::read_dir(dir.join("quarantine"))
+        .expect("quarantine dir")
+        .filter(|e| {
+            e.as_ref().is_ok_and(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .ends_with(".session-token.static.json")
+            })
+        })
+        .count();
+    assert_eq!(
+        quarantined, 2,
+        "both refused slot-holders survive as evidence"
+    );
+}
+
+/// An EXPIRED backup is refused by every restore path and left on disk:
+/// installing it would sign sessions out on first use, and consuming it would
+/// also destroy whatever life the current sidecar has left.
+#[test]
+fn an_expired_backup_is_never_restored() {
+    let _home = HomeSandbox::new();
+    let name = "expired-backup";
+    let dir = crate::profile::profile_dir(name).expect("dir");
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    let now = crate::usage::now_ms() as i64;
+    let expired = ClaudeCredentials {
+        claude_ai_oauth: Some(OAuthToken {
+            access_token: "sk-ant-oat01-aged-out".to_string(),
+            refresh_token: None,
+            expires_at: Some(now - 86_400_000),
+            scopes: Some(vec![
+                "user:inference".to_string(),
+                "user:sessions:claude_code".to_string(),
+            ]),
+            subscription_type: None,
+        }),
+    };
+    std::fs::write(
+        dir.join("session-token.static.json"),
+        serde_json::to_vec_pretty(&expired).expect("ser"),
+    )
+    .expect("write backup");
+    let live_bearer = ClaudeCredentials {
+        claude_ai_oauth: Some(OAuthToken {
+            access_token: "at-still-alive".to_string(),
+            refresh_token: None,
+            expires_at: Some(now + 2 * 3_600_000),
+            scopes: Some(vec![
+                "user:inference".to_string(),
+                "user:profile".to_string(),
+            ]),
+            subscription_type: Some("max".into()),
+        }),
+    };
+    std::fs::write(
+        dir.join("session-token.json"),
+        serde_json::to_vec_pretty(&live_bearer).expect("ser"),
+    )
+    .expect("write sidecar");
+
+    assert!(
+        !restore_static_mint(name).expect("restore"),
+        "an expired backup reads as nothing-to-restore"
+    );
+    assert!(
+        dir.join("session-token.static.json").exists(),
+        "and stays on disk as evidence"
+    );
+    let sidecar_now: ClaudeCredentials =
+        serde_json::from_slice(&std::fs::read(dir.join("session-token.json")).expect("read"))
+            .expect("parse");
+    assert_eq!(
+        sidecar_now.access_token(),
+        Some("at-still-alive"),
+        "the sidecar's remaining live bearer is not destroyed for a dead mint"
+    );
+
+    // The heal path refuses the same way: a mis-fill plus an expired backup
+    // keeps the disengaged-but-working posture instead of installing a dead
+    // credential over it.
+    std::fs::write(
+        dir.join("session-token.json"),
+        serde_json::to_vec(&creds("at-misfill", Some("rt-misfill"))).expect("ser"),
+    )
+    .expect("misfill");
+    assert_eq!(
+        heal_misfilled_sidecar(name).expect("heal"),
+        HealOutcome::NoLiveBackup
+    );
+    assert!(
+        matches!(
+            session_token_status(name),
+            Some(SessionTokenStatus::NotLongLived)
+        ),
+        "the mis-fill stays in place rather than trading working-vanilla for a dead mint"
+    );
+    assert!(dir.join("session-token.static.json").exists());
+}
+
+/// One transient read failure on the sidecar must ABORT the roll, not forfeit
+/// the mint: `preserve_static_mint`'s verdict decides whether the stamp may
+/// overwrite the file, and a swallowed `EISDIR`/`EIO` there would destroy a
+/// genuine mint with no backup written — the one unrecoverable direction.
+#[test]
+fn an_unreadable_sidecar_aborts_the_roll_instead_of_forfeiting_the_mint() {
+    let _home = HomeSandbox::new();
+    let name = "unreadable-sidecar";
+    let dir = crate::profile::profile_dir(name).expect("dir");
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    // A directory where the sidecar goes: reads fail with a non-NotFound
+    // error on every platform, which is the shape of a transient fault.
+    std::fs::create_dir(dir.join("session-token.json")).expect("block the sidecar path");
+    let err = stamp_rolling_token(
+        name,
+        &OAuthToken {
+            access_token: "at-next".to_string(),
+            refresh_token: None,
+            expires_at: Some(crate::usage::now_ms() as i64 + 8 * 3_600_000),
+            scopes: None,
+            subscription_type: Some("max".into()),
+        },
+    );
+    let err =
+        err.expect_err("a roll that cannot read what it is about to overwrite must not proceed");
+    // Pinned to the READ arm's context, not just "some error": a directory at
+    // the sidecar path also fails the WRITE, so an any-error assert passed
+    // against the unfixed code (verification fleet, round 3).
+    assert!(
+        format!("{err:#}").contains("before overwriting"),
+        "the failure must come from the pre-overwrite read, not the later write: {err:#}"
+    );
+    assert!(
+        !dir.join("session-token.static.json").exists(),
+        "and no half-truth backup appears"
+    );
+}
+
+/// An expired backup does not poison the slot: the next preserve REPLACES it
+/// with the fresh mint being superseded. Left in place behind the bare
+/// `exists()` idempotence guard, the dead file blocked every future mint from
+/// preservation — re-mint, re-arm, and the fresh mint was destroyed on the
+/// next roll with only the dead backup left to restore.
+#[test]
+fn a_fresh_mint_replaces_an_expired_backup_on_the_next_roll() {
+    let _home = HomeSandbox::new();
+    let name = "expired-backup-replaced";
+    let dir = crate::profile::profile_dir(name).expect("dir");
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    let now = crate::usage::now_ms() as i64;
+    let expired = ClaudeCredentials {
+        claude_ai_oauth: Some(OAuthToken {
+            access_token: "sk-ant-oat01-dead-m1".to_string(),
+            refresh_token: None,
+            expires_at: Some(now - 86_400_000),
+            scopes: Some(vec![
+                "user:inference".to_string(),
+                "user:sessions:claude_code".to_string(),
+            ]),
+            subscription_type: None,
+        }),
+    };
+    std::fs::write(
+        dir.join("session-token.static.json"),
+        serde_json::to_vec_pretty(&expired).expect("ser"),
+    )
+    .expect("write dead backup");
+    // The fresh mint the operator just captured (flag was off, so no
+    // with-backup write happened).
+    write_session_token(name, "sk-ant-oat01-fresh-m2", now).expect("mint");
+
+    stamp_rolling_token(
+        name,
+        &OAuthToken {
+            access_token: "at-rolled".to_string(),
+            refresh_token: None,
+            expires_at: Some(now + 8 * 3_600_000),
+            scopes: Some(vec![
+                "user:inference".to_string(),
+                "user:profile".to_string(),
+            ]),
+            subscription_type: Some("max".into()),
+        },
+    )
+    .expect("roll");
+
+    let backup: ClaudeCredentials = serde_json::from_slice(
+        &std::fs::read(dir.join("session-token.static.json")).expect("read backup"),
+    )
+    .expect("parse");
+    assert_eq!(
+        backup.access_token(),
+        Some("sk-ant-oat01-fresh-m2"),
+        "the fresh mint displaces the dead backup instead of dying behind it"
+    );
+}
+
+/// A LIVE backup is not enough to stand — it must also be at least as FRESH
+/// as the mint the roll is about to overwrite. The subtler variant of the
+/// dead-slot failure: flag off, `clauth login --setup-token` writes the
+/// sidecar alone, and "an existing backup is never replaced" let the next
+/// roll destroy the fresh year-scale mint while preserving a stale
+/// weeks-from-death one. A genuinely staler sidecar mint must NOT displace a
+/// fresher backup, and repeated rolls (rolling content in the sidecar) must
+/// touch nothing — the idempotence that made the old rule attractive, kept.
+#[test]
+fn a_fresher_sidecar_mint_upgrades_a_live_but_older_backup() {
+    let _home = HomeSandbox::new();
+    let name = "older-backup-upgraded";
+    let dir = crate::profile::profile_dir(name).expect("dir");
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    let now = crate::usage::now_ms() as i64;
+    let mint = |token: &str, exp: i64| ClaudeCredentials {
+        claude_ai_oauth: Some(OAuthToken {
+            access_token: token.to_string(),
+            refresh_token: None,
+            expires_at: Some(exp),
+            scopes: Some(vec![
+                "user:inference".to_string(),
+                "user:sessions:claude_code".to_string(),
+            ]),
+            subscription_type: None,
+        }),
+    };
+    let roll = || {
+        stamp_rolling_token(
+            name,
+            &OAuthToken {
+                access_token: "at-rolled".to_string(),
+                refresh_token: None,
+                expires_at: Some(crate::usage::now_ms() as i64 + 8 * 3_600_000),
+                scopes: Some(vec![
+                    "user:inference".to_string(),
+                    "user:profile".to_string(),
+                ]),
+                subscription_type: Some("max".into()),
+            },
+        )
+        .expect("roll");
+    };
+    // Live but three days from death — the stale holder.
+    std::fs::write(
+        dir.join("session-token.static.json"),
+        serde_json::to_vec_pretty(&mint("sk-ant-oat01-stale-m1", now + 3 * 86_400_000))
+            .expect("ser"),
+    )
+    .expect("write stale backup");
+    // The fresh re-mint sits only in the sidecar (flag was off).
+    write_session_token(name, "sk-ant-oat01-fresh-m2", now).expect("mint");
+    roll();
+    let read_backup = || -> ClaudeCredentials {
+        serde_json::from_slice(
+            &std::fs::read(dir.join("session-token.static.json")).expect("read backup"),
+        )
+        .expect("parse")
+    };
+    assert_eq!(
+        read_backup().access_token(),
+        Some("sk-ant-oat01-fresh-m2"),
+        "the fresher mint displaces the live-but-older backup"
+    );
+    // A second roll sees rolling content in the sidecar: nothing to preserve,
+    // the upgraded backup stands.
+    roll();
+    assert_eq!(read_backup().access_token(), Some("sk-ant-oat01-fresh-m2"));
+    // And the comparison is not "sidecar always wins": a STALER mint placed
+    // in the sidecar leaves a fresher live backup exactly where it is.
+    std::fs::write(
+        dir.join("session-token.json"),
+        serde_json::to_vec_pretty(&mint("sk-ant-oat01-staler-m3", now + 86_400_000)).expect("ser"),
+    )
+    .expect("write staler sidecar mint");
+    roll();
+    assert_eq!(
+        read_backup().access_token(),
+        Some("sk-ant-oat01-fresh-m2"),
+        "a staler sidecar mint never displaces a fresher live backup"
+    );
+}
+
+/// The displaced-holder disposal rule matches `live_backup_bytes`: a slot
+/// holder that never was a mint is quarantined as evidence before the mint
+/// replaces it, while a dead mint is just a superseded credential and is
+/// overwritten in place (the sibling tests above pin that half).
+#[test]
+fn preserve_quarantines_a_displaced_slot_holder_that_was_never_a_mint() {
+    let _home = HomeSandbox::new();
+    let name = "nonmint-slot-displaced";
+    let dir = crate::profile::profile_dir(name).expect("dir");
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    let now = crate::usage::now_ms() as i64;
+    std::fs::write(
+        dir.join("session-token.static.json"),
+        serde_json::to_vec(&creds("at-pair", Some("rt-pair"))).expect("ser"),
+    )
+    .expect("write pair into the slot");
+    write_session_token(name, "sk-ant-oat01-genuine", now).expect("mint");
+    stamp_rolling_token(
+        name,
+        &OAuthToken {
+            access_token: "at-rolled".to_string(),
+            refresh_token: None,
+            expires_at: Some(now + 8 * 3_600_000),
+            scopes: Some(vec![
+                "user:inference".to_string(),
+                "user:profile".to_string(),
+            ]),
+            subscription_type: Some("max".into()),
+        },
+    )
+    .expect("roll");
+    let backup: ClaudeCredentials = serde_json::from_slice(
+        &std::fs::read(dir.join("session-token.static.json")).expect("read backup"),
+    )
+    .expect("parse");
+    assert_eq!(
+        backup.access_token(),
+        Some("sk-ant-oat01-genuine"),
+        "the mint takes the slot"
+    );
+    let quarantined = std::fs::read_dir(dir.join("quarantine"))
+        .expect("quarantine dir")
+        .filter_map(|e| e.ok())
+        .any(|e| {
+            e.file_name()
+                .to_string_lossy()
+                .ends_with(".session-token.static.json")
+        });
+    assert!(quarantined, "the displaced pair survives as evidence");
+}
+
+/// A backup inside Claude Code's own five-minute refresh window reads as
+/// expired: CC refreshes a credential once it is inside five minutes of
+/// expiry, and a refresh-less mint cannot answer that — restoring one
+/// consumes the backup only to sign the session out moments later. Pins the
+/// WINDOW itself, not just past-expiry (a zero grace leaves past-expiry
+/// refusals intact and this test red).
+#[test]
+fn a_backup_inside_ccs_refresh_window_reads_as_expired() {
+    let _home = HomeSandbox::new();
+    let name = "window-backup";
+    let dir = crate::profile::profile_dir(name).expect("dir");
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    let now = crate::usage::now_ms() as i64;
+    let closing = ClaudeCredentials {
+        claude_ai_oauth: Some(OAuthToken {
+            access_token: "sk-ant-oat01-two-minutes-left".to_string(),
+            refresh_token: None,
+            expires_at: Some(now + 2 * 60 * 1000),
+            scopes: Some(vec![
+                "user:inference".to_string(),
+                "user:sessions:claude_code".to_string(),
+            ]),
+            subscription_type: None,
+        }),
+    };
+    std::fs::write(
+        dir.join("session-token.static.json"),
+        serde_json::to_vec_pretty(&closing).expect("ser"),
+    )
+    .expect("write closing backup");
+    assert!(
+        !restore_static_mint(name).expect("restore verdict"),
+        "two minutes of life is dead-on-arrival for a refresh-less mint"
+    );
+    assert!(
+        dir.join("session-token.static.json").exists(),
+        "refused like any expired mint: left in place, never quarantined"
+    );
+}
+
+/// `restore_static_mint` overwrites the sidecar — and when the sidecar holds
+/// a rotating pair (a mis-fill), that content is EVIDENCE, quarantined
+/// exactly as the heal and CLI pre-clear paths quarantine it. This was the
+/// one repair that destroyed the pair silently.
+#[test]
+fn restore_quarantines_a_misfilled_sidecar_before_overwriting_it() {
+    let _home = HomeSandbox::new();
+    let name = "restore-misfill-evidence";
+    let dir = crate::profile::profile_dir(name).expect("dir");
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    let now = crate::usage::now_ms() as i64;
+    let live_mint = ClaudeCredentials {
+        claude_ai_oauth: Some(OAuthToken {
+            access_token: "sk-ant-oat01-preserved".to_string(),
+            refresh_token: None,
+            expires_at: Some(now + 180 * 86_400_000),
+            scopes: Some(vec![
+                "user:inference".to_string(),
+                "user:sessions:claude_code".to_string(),
+            ]),
+            subscription_type: None,
+        }),
+    };
+    std::fs::write(
+        dir.join("session-token.static.json"),
+        serde_json::to_vec_pretty(&live_mint).expect("ser"),
+    )
+    .expect("write backup");
+    std::fs::write(
+        dir.join("session-token.json"),
+        serde_json::to_vec(&creds("at-misfill", Some("rt-misfill"))).expect("ser"),
+    )
+    .expect("misfill");
+    assert!(restore_static_mint(name).expect("restore"));
+    let sidecar: ClaudeCredentials =
+        serde_json::from_slice(&std::fs::read(dir.join("session-token.json")).expect("read"))
+            .expect("parse");
+    assert_eq!(sidecar.access_token(), Some("sk-ant-oat01-preserved"));
+    let quarantined = std::fs::read_dir(dir.join("quarantine"))
+        .expect("quarantine dir")
+        .filter_map(|e| e.ok())
+        .any(|e| {
+            e.file_name()
+                .to_string_lossy()
+                .ends_with(".session-token.json")
+        });
+    assert!(
+        quarantined,
+        "the overwritten pair survives as evidence, same as every other repair path"
     );
 }

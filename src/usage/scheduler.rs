@@ -577,14 +577,22 @@ fn rotate_lead_ms(interval_ms: u64) -> i64 {
 /// and a bare `claude` both read the very credential file a rotation writes,
 /// so neither is a reason to hold off. An unknown expiry never rotates
 /// proactively (never spend a single-use refresh on a token whose expiry we
-/// can't prove).
+/// can't prove). That rule is unconditional: the CHAIN's own stored expiry is
+/// what gates this leg, and the CLA-ROLL flag only widens WHEN a rotation is
+/// due, never WHETHER a provable expiry is required first.
 fn proactive_rotation_due(
     enabled: bool,
+    rolling: bool,
     access_expires_at: Option<i64>,
     now_ms: i64,
     interval_ms: u64,
 ) -> bool {
-    enabled && access_expires_at.is_some_and(|exp| now_ms + rotate_lead_ms(interval_ms) >= exp)
+    // CLA-ROLL: a rolling profile forces the preemptive leg regardless of the
+    // global toggle, because here the rotation is not only about the chain —
+    // its persist re-stamps the session token, and a stale sidecar has a live
+    // claude reading it.
+    (enabled || rolling)
+        && access_expires_at.is_some_and(|exp| now_ms + rotate_lead_ms(interval_ms) >= exp)
 }
 
 /// Backing store for [`memoized_identity`], keyed by the SHA-256 of the access
@@ -735,7 +743,7 @@ fn fetch_with_rotation(
     // persisted the fresh expiry there, while the entry still carries the
     // pre-kick one, and a stale past expiry here would read as clock-expired
     // and re-spend the just-minted single-use pair.
-    let (is_active, access_expires_at, interval_ms, preemptive) = config
+    let (is_active, access_expires_at, interval_ms, preemptive, rolling_token) = config
         .lock()
         .map(|c| {
             (
@@ -743,20 +751,29 @@ fn fetch_with_rotation(
                 c.find(name).and_then(|p| p.access_token_expires_at()),
                 c.state.refresh_interval_ms,
                 c.state.preemptive_rotation,
+                c.find(name).is_some_and(|p| p.rolling_token),
             )
         })
         // Poisoned-lock fallback. The `None` expiry alone already forces the
-        // lazy path, so the other three are unreachable rather than chosen —
+        // lazy path, so the other four are unreachable rather than chosen —
         // they still mirror the shipped defaults so a future reader isn't told
-        // preemptive rotation is off by default.
+        // preemptive rotation is off by default. `rolling_token` falls back to
+        // OFF: the rolling-token axis only ever ADDS a rotation, so the safe unreachable
+        // value is the one that adds none.
         .unwrap_or((
             false,
             None,
             crate::profile::DEFAULT_REFRESH_INTERVAL_MS,
             true,
+            false,
         ));
-    let proactive =
-        proactive_rotation_due(preemptive, access_expires_at, now_ms() as i64, interval_ms);
+    let proactive = proactive_rotation_due(
+        preemptive,
+        rolling_token,
+        access_expires_at,
+        now_ms() as i64,
+        interval_ms,
+    );
     let mut unmask_429: Option<Option<Duration>> = None;
     if !proactive {
         let result = fetch_raw(name, access_token, prev_plan.clone(), false, Some(activity));
@@ -2338,6 +2355,9 @@ pub(crate) struct SchedulerState {
     /// as epoch ms. Seeded at the startup pass in [`spawn_refresher`]; the tick
     /// re-runs the trim once [`HISTORY_PRUNE_INTERVAL_MS`] has elapsed.
     last_history_prune: AtomicU64,
+    /// CLA-ROLL pacing for the rolling-sidecar freshness scan.
+    claude_rolling:
+        crate::lockorder::RankedMutex<ClaudeRollingPacing, crate::lockorder::rank::RollingPacing>,
 }
 
 /// One scheduler tick: drain forced refetches, partition both legs, publish
@@ -2374,6 +2394,27 @@ fn tick(state: &SchedulerState) {
     // it never races its own appends, and ahead of the fetch legs so a long-run
     // process re-trims before adding to the file rather than after.
     prune_histories_if_due(&state.last_history_prune, &state.config, now_ms());
+
+    // CLA-ROLL: rolling-sidecar freshness scan — renew a rolling-token profile's
+    // session bearer hours ahead of its clock death instead of relying on
+    // rotation side effects (lease-holder only, like every other leg).
+    //
+    // Inline and serial on the tick thread, ahead of the fanned-out fetch
+    // legs, ON PURPOSE — a deliberate departure from the `fetch_oauth_due_with`
+    // worker pattern, not an oversight of it. The steady state is one due
+    // profile per chain lifetime (~hours), so the fan-out's reason to exist
+    // (one slow account stalling every other account's poll, every tick) has
+    // no analogue here. What makes inline SAFE is `LockWait::NoWait`: the
+    // gate's rotation-lock acquisition is a try-lock on this leg, because
+    // `rotation.lock` itself has no timeout of any kind and a `clauth start`
+    // holding it across its recursive `~/.claude` copy would otherwise park
+    // this thread — and with it every account's poll — while the heartbeat
+    // (stamped in the main loop, not here) kept reading fresh. What remains
+    // is one token round trip on a cold re-stamp, which delays a single tick.
+    // Anyone adding per-tick work to this leg inherits the fan-out question.
+    claude_rolling_tick(&state.config, &state.claude_rolling, now_ms(), &|name| {
+        crate::oauth::restamp_rolling_token(&state.config, name, crate::oauth::refresh_result)
+    });
 
     // Names pushed by rotation or manual refresh — bypass cadence this tick.
     // Drained once and handed to both legs; a forced name only matches the leg
@@ -2741,6 +2782,7 @@ pub(crate) fn spawn_refresher(
         fetch_lease,
         standdown_active: AtomicBool::new(false),
         last_history_prune,
+        claude_rolling: crate::lockorder::RankedMutex::new(ClaudeRollingPacing::default()),
     };
     // Same test-skip rationale as the status/tokens/pricing workers in
     // `tui/app.rs`: a detached tick thread is never joined, so it could run
@@ -3444,3 +3486,256 @@ fn clear_orphaned_forced(
 #[cfg(test)]
 #[path = "../../tests/inline/scheduler.rs"]
 mod tests;
+
+/// CLA-ROLL cadence for the rolling-sidecar freshness scan. The due predicate is
+/// stateless against the wall clock ([`crate::oauth::rolling_sidecar_restamp_due`]),
+/// so a machine-sleep gap self-corrects on the first tick after wake — no
+/// monotonic bookkeeping needed.
+const ROLLING_SCAN_GAP_MS: u64 = 5 * 60 * 1000;
+/// Widening after a transient re-stamp failure (network trouble, a busy
+/// rotation lock) — the horizon is hours wide, so minutes-scale retries lose
+/// nothing while avoiding per-scan log spam.
+const ROLLING_RETRY_MS: u64 = 15 * 60 * 1000;
+/// A Broken verdict (dead chain, no mint to degrade to) and the re-login-shaped
+/// transients change only when the operator acts, so retrying them on the
+/// minutes cadence is pure log noise — they pace on this long leash instead.
+/// The leash is a NOISE gate, not the exit: a browser re-login writes
+/// `credentials.json` and never touches the sidecar or the flag (and a
+/// `--setup-token` re-mint writes a MINT, which disarms rather than re-arms),
+/// so a hold only the clock releases would sit on the operator's fix for up to
+/// six hours. Every hold this long therefore records a
+/// [`crate::claude::credential_fingerprint`] of the profile, and a change to
+/// any of the three files — the operator's fix, or clauth's own successful
+/// rotation of the chain, either of which is exactly a reason to re-judge —
+/// releases the hold on the next scan: the gate runs right after the write,
+/// not six hours later. A self-release re-runs one gate and, if the verdict
+/// stands, re-inserts the hold — bounded by the writes themselves.
+const ROLLING_BROKEN_RETRY_MS: u64 = 6 * 60 * 60 * 1000;
+
+/// One paced re-stamp hold. `watched` is `Some` exactly on the
+/// [`ROLLING_BROKEN_RETRY_MS`]-length holds — the re-login-shaped ones, whose
+/// real exit is a credential file changing (the operator's fix, or clauth's
+/// own successful rotation — either one is reason to re-judge), not the
+/// clock. The short transient cadence stays purely time-based, and the
+/// backwards-clock clamp reads the kind off `watched`, so the coupling holds
+/// under a clock step too.
+pub(super) struct RetryHold {
+    not_before: u64,
+    watched: Option<[Option<(std::time::SystemTime, u64)>; 3]>,
+}
+
+/// Pacing for the re-stamp scan: an in-memory throttle only — the durable
+/// truth is the sidecar's own expiry, which every leg re-reads.
+#[derive(Default)]
+pub(super) struct ClaudeRollingPacing {
+    next_scan_ms: u64,
+    retry_after_ms: HashMap<String, RetryHold>,
+}
+
+/// CLA-ROLL: rolling-sidecar freshness scan. For every rolling-token claude
+/// profile whose armed sidecar is inside the re-stamp horizon of its clock
+/// death, run the full feed decision table (no-spend re-stamp / guarded
+/// refresh / mint degrade) NOW instead of waiting for a rotation side effect
+/// — the failure this exists for was exactly a rolling bearer expiring under a running session
+/// while rotations sat parked (spent-window poll parking, daemon idle,
+/// machine sleep). Lease-holder tick only, like every other leg.
+///
+/// Deliberately scans every ENABLED rolling profile, not just the active one
+/// (`AppConfig::enabled_profiles`): a parked profile's sessions may still be
+/// running on its rolling bearer (sessions
+/// survive switches by design), and a fresh sidecar makes the next switch-in
+/// instant. The extra rotation pressure is nil — claude usage chains already
+/// rotate on the ~8h access-token cadence for usage polling, and the daemon
+/// is the single writer for parked chains either way.
+///
+/// `gate_fn` is injected (production: [`crate::oauth::restamp_rolling_token`])
+/// so the orchestration — candidates → due → pace/widen — is testable
+/// offline; only the injected closure ever touches locks or the network.
+pub(super) fn claude_rolling_tick(
+    config: &crate::profile::ConfigHandle,
+    pacing: &crate::lockorder::RankedMutex<
+        ClaudeRollingPacing,
+        crate::lockorder::rank::RollingPacing,
+    >,
+    now: u64,
+    gate_fn: &dyn Fn(&str) -> crate::oauth::AuthGate,
+) {
+    {
+        let Ok(mut p) = pacing.lock() else { return };
+        // Clamped, not just compared: these are WALL-CLOCK epoch-ms, and a
+        // backwards NTP step of ΔT would otherwise suppress the entire scan
+        // for ΔT while the sidecar this leg exists to renew keeps running its
+        // clock down. A stamp further out than one full gap can only mean the
+        // clock moved back under it, so it is pulled back into range.
+        if p.next_scan_ms > now + ROLLING_SCAN_GAP_MS {
+            p.next_scan_ms = now + ROLLING_SCAN_GAP_MS;
+        }
+        if now < p.next_scan_ms {
+            return;
+        }
+        p.next_scan_ms = now + ROLLING_SCAN_GAP_MS;
+    }
+    let candidates: Vec<String> = {
+        let Ok(cfg) = config.lock() else { return };
+        // `enabled_profiles()`, not `profiles`: a disabled profile is off every
+        // operational surface by definition, and this leg can reach a GUARDED
+        // REFRESH, so sourcing the raw list spends single-use refresh tokens on
+        // accounts the operator took out of service. Same view `collect_tokens`
+        // uses one screen up.
+        cfg.enabled_profiles()
+            .filter(|p| p.rolling_token)
+            .map(|p| p.name.as_str().to_string())
+            .collect()
+    };
+    // Names that leave the candidate set — profile deleted, disabled, or the
+    // flag turned off — take their retry stamps with them: the map is
+    // in-memory and small, but an entry nothing can ever clear is still a
+    // leak, and a re-created profile of the same name would inherit a stale
+    // leash it never earned.
+    if let Ok(mut p) = pacing.lock() {
+        p.retry_after_ms
+            .retain(|held, _| candidates.iter().any(|c| c == held));
+    }
+    for name in candidates {
+        let held = pacing.lock().ok().and_then(|mut p| {
+            // Same backwards-clock clamp as the scan stamp: a retry stamp
+            // further out than its own leash can only mean the wall clock
+            // moved back under it. The hold KNOWS its leash now — `watched`
+            // rides exactly the long one — so each kind clamps to its own
+            // bound, and a backwards step can no longer stretch a 15-minute
+            // retry into an unwatched six-hour stall (the one combination
+            // with no exit but the clock, which the watch exists to remove).
+            let hold = p.retry_after_ms.get_mut(&name)?;
+            let bound = if hold.watched.is_some() {
+                ROLLING_BROKEN_RETRY_MS
+            } else {
+                ROLLING_RETRY_MS
+            };
+            hold.not_before = hold.not_before.min(now + bound);
+            Some((hold.not_before, hold.watched))
+        });
+        if let Some((not_before, watched)) = held
+            && now < not_before
+        {
+            // A watched (re-login-shaped) hold releases the moment the
+            // profile's credential files change: the operator just did the
+            // thing the cause prescribed, and holding the gate shut for the
+            // rest of the leash would delay the very recovery it named. The
+            // fingerprint read is metadata-only IO, done OUTSIDE the pacing
+            // lock — that rank is a leaf precisely because nothing else
+            // happens under it.
+            let released =
+                watched.is_some_and(|w| w != crate::claude::credential_fingerprint(&name));
+            if !released {
+                continue;
+            }
+            if let Ok(mut p) = pacing.lock() {
+                p.retry_after_ms.remove(&name);
+            }
+            logline!(
+                "clauth: '{name}' credentials changed under a re-stamp hold — re-checking now"
+            );
+        }
+        if !crate::oauth::rolling_sidecar_restamp_due(&name, now as i64) {
+            continue;
+        }
+        let gate = gate_fn(&name);
+        // A standing `auth_broken` changes only via re-login, which re-arms
+        // the rolling token anyway — so a quarantined chain takes the Broken
+        // leash on EVERY verdict, not just a literal `Broken`. Without this, a
+        // quarantined profile whose sidecar is running out its clock lands in
+        // the Ready-still-due / Transient arms below and picks up a second
+        // 15-minute cadence on top of the poll leg's own backoff, retrying a
+        // roll that `roll_from_stored_chain` routes to `ChainStale` by flag.
+        // Read AFTER the gate, which is what may have just raised it.
+        let flagged = config.lock().ok().is_some_and(|c| c.is_auth_broken(&name));
+        let kind = if flagged {
+            HoldKind::ReloginShaped
+        } else {
+            HoldKind::Transient
+        };
+        match gate {
+            // Ready = re-stamped no-spend or degraded to a serving fallback;
+            // Refreshed = the rotation hook fed (and, active, mirrored). Both
+            // logged at their source. A Ready that left the sidecar STILL due
+            // is the degrade leg masking transient chain trouble behind a
+            // live mint/bearer (review LOW) — pace it like a transient
+            // instead of re-running the gate every scan.
+            crate::oauth::AuthGate::Ready | crate::oauth::AuthGate::Refreshed => {
+                // The due re-read (a file read) runs BEFORE the pacing lock is
+                // taken — the rank is a leaf precisely because nothing else,
+                // locks or IO, ever happens under it.
+                let still_due = crate::oauth::rolling_sidecar_restamp_due(&name, now as i64);
+                let hold = still_due.then(|| retry_hold(&name, now, kind));
+                if let Ok(mut p) = pacing.lock() {
+                    match hold {
+                        Some(hold) => {
+                            p.retry_after_ms.insert(name.clone(), hold);
+                        }
+                        None => {
+                            p.retry_after_ms.remove(&name);
+                        }
+                    }
+                }
+            }
+            crate::oauth::AuthGate::Transient(e) => {
+                logline!(
+                    "clauth: re-stamp for '{name}' failed (will retry): {}",
+                    e.text_with_status()
+                );
+                // A transient whose cause only a re-login clears is not
+                // transient for pacing purposes: the 15-minute cadence
+                // against it re-logs the same refusal ~24 times a bearer
+                // lifetime without one of them ever succeeding.
+                let kind = if e.permanent_until_relogin() {
+                    HoldKind::ReloginShaped
+                } else {
+                    kind
+                };
+                let hold = retry_hold(&name, now, kind);
+                if let Ok(mut p) = pacing.lock() {
+                    p.retry_after_ms.insert(name.clone(), hold);
+                }
+            }
+            crate::oauth::AuthGate::Broken => {
+                let hold = retry_hold(&name, now, HoldKind::ReloginShaped);
+                if let Ok(mut p) = pacing.lock() {
+                    p.retry_after_ms.insert(name.clone(), hold);
+                }
+            }
+        }
+    }
+}
+
+/// Which leash a paced re-stamp hold rides. Every call site KNOWS which one it
+/// is minting (the quarantine read, `permanent_until_relogin`, the Broken
+/// verdict), so the kind is passed rather than inferred back from the duration
+/// — the same move `sidecar_kind_of` made for the other inference: a numeric
+/// coincidence is correct at every site today and breaks silently the first
+/// time a non-re-login verdict wants a long leash.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum HoldKind {
+    /// The minutes cadence ([`ROLLING_RETRY_MS`]) — genuinely transient, and
+    /// the clock is the honest exit.
+    Transient,
+    /// The noise leash ([`ROLLING_BROKEN_RETRY_MS`]) — re-login-shaped
+    /// (permanent transient, quarantined chain, Broken verdict), whose real
+    /// exit is a credential file changing, so the hold carries the watch.
+    ReloginShaped,
+}
+
+/// Build the paced hold for one verdict. The duration and the watch both
+/// derive from the KIND, so they cannot disagree. Computed before the pacing
+/// lock is taken — the fingerprint is metadata IO, and that rank is a leaf.
+fn retry_hold(name: &str, now: u64, kind: HoldKind) -> RetryHold {
+    match kind {
+        HoldKind::Transient => RetryHold {
+            not_before: now + ROLLING_RETRY_MS,
+            watched: None,
+        },
+        HoldKind::ReloginShaped => RetryHold {
+            not_before: now + ROLLING_BROKEN_RETRY_MS,
+            watched: Some(crate::claude::credential_fingerprint(name)),
+        },
+    }
+}

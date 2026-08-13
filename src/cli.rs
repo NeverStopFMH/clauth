@@ -102,31 +102,50 @@ pub(crate) enum Command {
         yes: bool,
     },
 
-    /// Operate on a profile's long-lived session token
+    /// Restore or remove a profile's long-lived session token
     ///
-    /// Today the only operation is `--clear`, which drops the profile's
-    /// `session-token.json` so its stored OAuth login is what switches install
-    /// again. The live credentials are relinked when the profile is active, and
-    /// the clear is refused when the profile stores no other login.
+    /// The bare form is the inverse of `rolling-token`: it restores the static
+    /// `claude setup-token` mint the rolling token superseded, so sessions go
+    /// back to a year-scale bearer carrying two scopes, which nothing has to
+    /// re-stamp.
     ///
-    /// The bare form is reserved: `--clear` is required rather than defaulted,
-    /// so adding an operation later cannot silently change what a bare
-    /// `clauth static-token <profile>` already did for somebody.
+    /// `--clear` is the FULL exit instead: it removes the long-lived token,
+    /// the preserved mint backup, and the rolling-token flag together, so the
+    /// profile's stored OAuth login is what switches install again and
+    /// nothing re-creates a sidecar afterwards. The live credentials are
+    /// relinked when the profile is active, and the clear is refused when the
+    /// profile stores no other login.
     #[command(name = "static-token")]
     StaticToken {
         /// Profile whose long-lived token to operate on.
         profile: String,
-        /// Remove the long-lived token.
-        #[arg(long, required = true)]
+        /// Remove the long-lived token, its preserved mint backup, and the
+        /// rolling-token flag, instead of restoring the mint.
+        #[arg(long)]
         clear: bool,
-        /// Skip the confirm prompt. Required on a non-TTY stdin.
-        #[arg(long, short = 'y')]
+        /// Skip `--clear`'s confirm prompt. Required on a non-TTY stdin.
+        #[arg(long, short = 'y', requires = "clear")]
         yes: bool,
     },
 
     /// Restore a disabled profile to every operational surface
     Enable {
         /// Profile to re-enable.
+        profile: String,
+    },
+
+    /// Serve a profile's sessions a rolling token from its usage chain
+    ///
+    /// The daemon re-stamps `session-token.json` with the usage chain's current
+    /// access token: full scopes and the account's `subscriptionType`, but NO
+    /// refresh token. Sessions run bearers that unlock plan-gated models while
+    /// the rotating chain stays clauth-private.
+    ///
+    /// Needs the clauth daemon running: the bearer dies in hours, and the
+    /// daemon's scan is what re-stamps it before then.
+    #[command(name = "rolling-token")]
+    RollingToken {
+        /// Profile to arm.
         profile: String,
     },
 

@@ -125,9 +125,42 @@ struct Snap {
     /// not-long-lived shape the split disengages for. Read per frame for the
     /// selected profile only (one small file).
     session_token: Option<crate::claude::SessionTokenStatus>,
+    /// What the sidecar HOLDS, not what the profile is flagged for. The two
+    /// disagree in a state that is both reachable and permanent: a terminally
+    /// dead chain degrades a rolling profile onto its static mint and leaves
+    /// the flag set, and nothing clears it. Keyed on the flag, the row then
+    /// promises a re-stamp in ~8760h for a year-scale mint no one is going to
+    /// re-stamp — which is the same class of comfortable-looking lie the
+    /// honest hours-scale countdown exists to prevent.
+    rolling_token: bool,
+    /// The CONFIG flag, for the clear row's disclosure alone: "re-stamping
+    /// stops" must fire whenever the daemon would re-stamp — flag truth — even
+    /// while the sidecar holds a mint (degraded) or nothing (not yet stamped).
+    /// Every RENDERING surface keys off `rolling_token` above; this one names
+    /// what the clear is about to turn off.
+    rolling_armed: bool,
+    /// Whether a preserved mint backup sits beside the sidecar — the clear
+    /// row's disclosure that a second, restorable credential goes with it.
+    has_static_backup: bool,
 }
 
 impl Snap {
+    /// The `ClearSessionToken` gate — ONE spelling for both render readers
+    /// (`detail_row`'s dim and `row_hint`'s gate line; `run_config_row` makes
+    /// the same judgment from a fresh disk read): refused only when clearing
+    /// would strip the account's LAST credential, i.e. a stored PIECE (sidecar
+    /// or preserved mint) with no other login behind it. A flag-only account
+    /// disarms without touching a credential, so it is never gated — a row
+    /// that dims while its press acts would be the renderer's own lie.
+    fn clear_gated(&self) -> bool {
+        if self.has_other_login {
+            return false;
+        }
+        let flag_only =
+            self.rolling_armed && self.session_token.is_none() && !self.has_static_backup;
+        !flag_only
+    }
+
     /// Blank snapshot for the `+ new` form and the empty fallback.
     fn blank(title: &str) -> Snap {
         Snap {
@@ -154,6 +187,9 @@ impl Snap {
             provider: None,
             console_login: false,
             session_token: None,
+            rolling_token: false,
+            rolling_armed: false,
+            has_static_backup: false,
         }
     }
 }
@@ -178,53 +214,70 @@ fn build_snap(app: &App, with_text: bool) -> Snap {
         return snap;
     }
     match cfg.profiles.get(app.profile_cursor) {
-        Some(p) => Snap {
-            title: p.name.to_string(),
-            name: if with_text {
-                p.name.to_string()
-            } else {
-                String::new()
-            },
-            base_url: text(&p.base_url),
-            api_key: text(&p.api_key),
-            model: text(&p.models.default),
-            opus: text(&p.models.opus),
-            sonnet: text(&p.models.sonnet),
-            haiku: text(&p.models.haiku),
-            fable: text(&p.models.fable),
-            subagent: text(&p.models.subagent),
-            // Env rows render from the snapshot (no per-entry draft buffer), so
-            // they're always populated — even while a draft owns the text fields.
-            env: p.env.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
-            auto_start: p.auto_start,
-            disabled: p.is_disabled(),
-            is_active: cfg.is_active(&p.name),
-            // Read per frame for the selected profile only, same as
-            // `session_token` below — a single small directory stat, not a
-            // per-profile loop.
-            has_live_session: crate::runtime::has_live_session(p.name.as_str()),
-            // OAuth accounts carry a token; API accounts carry an api key. Either
-            // one flips the Login row to "re-login" and shows the log-out row.
-            // A console account's `log in` row captures the SESSION, so that
-            // is the credential its done-state names. Its api key is a
-            // different credential on a different row and cannot stand in:
-            // a keyless account with a live session is logged in for this
-            // row's purposes, and a keyed one with no session is not.
-            logged_in: if p.console_login_target().is_some() {
-                p.console.is_some()
-            } else if p.login_is_oauth() {
-                p.credentials.is_some()
-            } else {
-                p.api_key.as_deref().is_some_and(|k| !k.trim().is_empty())
-            },
-            login_is_oauth: p.login_is_oauth(),
-            has_other_login: p.credentials.is_some() || p.api_key.is_some(),
-            clear_falls_back_to_oauth: p.credentials.is_some(),
-            captured: false,
-            provider: p.provider.map(|p| p.display_name()),
-            console_login: p.console_login_target().is_some(),
-            session_token: crate::claude::session_token_status(p.name.as_str()),
-        },
+        Some(p) => {
+            let sidecar = crate::claude::sidecar_summary(p.name.as_str());
+            Snap {
+                title: p.name.to_string(),
+                name: if with_text {
+                    p.name.to_string()
+                } else {
+                    String::new()
+                },
+                base_url: text(&p.base_url),
+                api_key: text(&p.api_key),
+                model: text(&p.models.default),
+                opus: text(&p.models.opus),
+                sonnet: text(&p.models.sonnet),
+                haiku: text(&p.models.haiku),
+                fable: text(&p.models.fable),
+                subagent: text(&p.models.subagent),
+                // Env rows render from the snapshot (no per-entry draft buffer), so
+                // they're always populated — even while a draft owns the text fields.
+                env: p.env.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+                auto_start: p.auto_start,
+                disabled: p.is_disabled(),
+                is_active: cfg.is_active(&p.name),
+                // Read per frame for the selected profile only, same as
+                // `session_token` below — a single small directory stat, not a
+                // per-profile loop.
+                has_live_session: crate::runtime::has_live_session(p.name.as_str()),
+                // OAuth accounts carry a token; API accounts carry an api key. Either
+                // one flips the Login row to "re-login" and shows the log-out row.
+                // A console account's `log in` row captures the SESSION, so that
+                // is the credential its done-state names. Its api key is a
+                // different credential on a different row and cannot stand in:
+                // a keyless account with a live session is logged in for this
+                // row's purposes, and a keyed one with no session is not.
+                logged_in: if p.console_login_target().is_some() {
+                    p.console.is_some()
+                } else if p.login_is_oauth() {
+                    p.credentials.is_some()
+                } else {
+                    p.api_key.as_deref().is_some_and(|k| !k.trim().is_empty())
+                },
+                login_is_oauth: p.login_is_oauth(),
+                has_other_login: p.credentials.is_some() || p.api_key.is_some(),
+                clear_falls_back_to_oauth: p.credentials.is_some(),
+                captured: false,
+                provider: p.provider.map(|p| p.display_name()),
+                console_login: p.console_login_target().is_some(),
+                // ONE sidecar read per frame feeds both facts. The status is
+                // derived from the same classification rather than a second
+                // parse: Misfilled ⇔ `NotLongLived` (both mean "refresh token
+                // present"), everything readable else is `LongLived` with its
+                // recorded expiry, and an absent/corrupt sidecar is `None` on
+                // both readers.
+                session_token: sidecar.as_ref().map(|(kind, oauth)| match kind {
+                    crate::claude::SidecarKind::Misfilled => {
+                        crate::claude::SessionTokenStatus::NotLongLived
+                    }
+                    _ => crate::claude::SessionTokenStatus::LongLived(oauth.expires_at),
+                }),
+                rolling_token: matches!(&sidecar, Some((crate::claude::SidecarKind::Rolling, _))),
+                rolling_armed: p.rolling_token,
+                has_static_backup: crate::claude::has_static_backup(p.name.as_str()),
+            }
+        }
         None => Snap::blank("settings"),
     }
 }
@@ -264,6 +317,8 @@ fn draw_settings(frame: &mut Frame<'_>, area: Rect, app: &App) {
 /// tooltip wrap.
 fn session_token_lines(
     status: &crate::claude::SessionTokenStatus,
+    rolling: bool,
+    name: &str,
     now_ms: i64,
     width: usize,
 ) -> Vec<Line<'static>> {
@@ -283,7 +338,29 @@ fn session_token_lines(
     match status {
         SessionTokenStatus::LongLived(Some(ms)) => {
             if now_ms >= *ms {
-                charged("expired".to_string(), "re-mint with claude setup-token")
+                if rolling {
+                    charged(
+                        "rolling token stalled".to_string(),
+                        &format!(
+                            "nothing re-stamped it before expiry · clauth rolling-token {name} re-arms"
+                        ),
+                    )
+                } else {
+                    charged("expired".to_string(), "re-mint with claude setup-token")
+                }
+            } else if rolling {
+                // Hours-scale countdown, accent not warning: the daemon
+                // re-stamps well inside this window. Counted to the RE-STAMP
+                // (expiry minus the renewal horizon), not to the expiry — the
+                // leg fires `ROLLING_RESTAMP_HORIZON_MS` ahead, so an
+                // expiry-based label read 2h high everywhere except zero.
+                let until_restamp = (ms - crate::oauth::ROLLING_RESTAMP_HORIZON_MS - now_ms).max(0);
+                let label = if until_restamp < 3_600_000 {
+                    "rolling · re-stamp due".to_string()
+                } else {
+                    format!("rolling · re-stamps in ~{}h", until_restamp / 3_600_000)
+                };
+                plain(label, theme::accent())
             } else {
                 // Truncating division: an expiry inside the next 24h reads
                 // "~0d" and still warns; only a past expiry (handled above) is
@@ -301,7 +378,11 @@ fn session_token_lines(
             }
         }
         SessionTokenStatus::LongLived(None) => plain(
-            "long-lived · no recorded expiry".to_string(),
+            if rolling {
+                "rolling · no recorded expiry".to_string()
+            } else {
+                "long-lived · no recorded expiry".to_string()
+            },
             theme::accent(),
         ),
         SessionTokenStatus::NotLongLived => charged(
@@ -366,6 +447,8 @@ fn draw_settings_rows(
     if let Some(status) = &snap.session_token {
         lines.extend(session_token_lines(
             status,
+            snap.rolling_token,
+            &snap.title,
             crate::usage::now_ms() as i64,
             inner.width as usize,
         ));
@@ -539,20 +622,47 @@ fn row_hint(row: ConfigRow, snap: &Snap) -> Option<String> {
         // active account's wording names the relink, since that is the half a
         // running session feels. Both halves then split again on what the clear
         // falls back TO: an api-key account has no login to install, so it is
-        // signed out rather than relinked.
+        // signed out rather than relinked — and the FULL scope of the clear is
+        // spelled out below, because this hint is the TUI's entire disclosure
+        // that re-stamping stops and the preserved mint goes too (the CLI
+        // prints two explicit lines for the same act, and a two-press arm is
+        // not a disclosure).
+        //
+        // The gate arm is `Snap::clear_gated` — the same judgment
+        // `run_config_row` makes and `detail_row` dims on: a flag-only account
+        // (armed, nothing stamped, no preserved mint) disarms without
+        // stripping a credential, so it skips past — a gate line over a row
+        // that acts would be the one lie a hint can tell.
+        ConfigRow::ClearSessionToken if snap.clear_gated() => "no other login stored, log in first",
+        // The flag-only state with NO login gets its own lines rather than the
+        // 4-way base below: those arms were written under the old invariant
+        // that "no OAuth login" implies an api key behind it, and promising an
+        // api key this account does not hold would be the same lie in a
+        // different tense. Active still names the sign-out — the relink onto
+        // an absent install source removes the live slot.
+        ConfigRow::ClearSessionToken if !snap.has_other_login && snap.is_active => {
+            "stops the daemon re-stamping this account · signs Claude Code out — nothing is \
+             stored behind it"
+        }
         ConfigRow::ClearSessionToken if !snap.has_other_login => {
-            "no other login stored, log in first"
+            "stops the daemon re-stamping this account · nothing else is stored"
         }
-        ConfigRow::ClearSessionToken if snap.is_active && snap.clear_falls_back_to_oauth => {
-            "relinks this account's own login now · running sessions follow"
+        ConfigRow::ClearSessionToken => {
+            let base = match (snap.is_active, snap.clear_falls_back_to_oauth) {
+                (true, true) => "relinks this account's own login now · running sessions follow",
+                (true, false) => "signs Claude Code out now · this account runs on its api key",
+                (false, true) => "the next switch installs this account's own login again",
+                (false, false) => "the next switch runs this account on its api key",
+            };
+            let mut hint = base.to_string();
+            if snap.rolling_armed || snap.rolling_token {
+                hint.push_str(" · re-stamping stops");
+            }
+            if snap.has_static_backup {
+                hint.push_str(" · the preserved mint goes too");
+            }
+            return Some(hint);
         }
-        ConfigRow::ClearSessionToken if snap.is_active => {
-            "signs Claude Code out now · this account runs on its api key"
-        }
-        ConfigRow::ClearSessionToken if snap.clear_falls_back_to_oauth => {
-            "the next switch installs this account's own login again"
-        }
-        ConfigRow::ClearSessionToken => "the next switch runs this account on its api key",
         ConfigRow::Delete => {
             "deletes the account and everything stored for it, usage history included"
         }
@@ -687,10 +797,11 @@ fn detail_row(
         // `Delete`'s button class — always-bold DANGER, `press again to <verb>`
         // once armed — because a clear retargets every future switch and moves
         // the active account's live credentials. Dimmed/inert (arrow included,
-        // matching the gated `disabled` row) when the account stores no other
-        // login: `run_config_row`'s own gate no-ops there.
+        // matching the gated `disabled` row) when clearing would strip the
+        // account's last credential: `run_config_row`'s own gate no-ops there,
+        // and `Snap::clear_gated` is the one spelling all three surfaces share.
         ConfigRow::ClearSessionToken => {
-            let gated = !snap.has_other_login;
+            let gated = snap.clear_gated();
             let row_arrow = if gated && selected {
                 Span::styled("❯ ", theme::faint())
             } else {

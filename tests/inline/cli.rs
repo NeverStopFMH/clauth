@@ -374,10 +374,17 @@ fn static_token(args: &[&str]) -> (String, bool, bool) {
 }
 
 /// The clear half of the sidecar is a VERB, not a flag on `login`: it removes a
-/// credential, and `login` is the command that adds one. `--clear` is required,
-/// so the bare verb stays reserved rather than silently meaning "clear".
+/// credential, and `login` is the command that adds one. The bare verb is the
+/// restore (the inverse of `rolling-token`), `--clear` selects the removal, and
+/// `--yes` belongs to the clear alone — the restore never prompts, so a `--yes`
+/// beside the bare form would be accepted noise that later grew a meaning.
 #[test]
-fn static_token_needs_clear_and_takes_an_unprompted_yes() {
+fn static_token_bare_restores_and_clear_takes_an_unprompted_yes() {
+    let (profile, clear, yes) = static_token(&["static-token", "acme"]);
+    assert_eq!(profile, "acme");
+    assert!(!clear, "the bare verb is the restore, not the clear");
+    assert!(!yes);
+
     let (profile, clear, yes) = static_token(&["static-token", "acme", "--clear"]);
     assert_eq!(profile, "acme");
     assert!(clear);
@@ -388,10 +395,11 @@ fn static_token_needs_clear_and_takes_an_unprompted_yes() {
         "-y is the short spelling"
     );
 
-    let err = parse(&["static-token", "acme"]).expect_err("the bare verb must be refused");
+    let err = parse(&["static-token", "acme", "--yes"])
+        .expect_err("--yes without --clear must be refused");
     assert!(
         err.to_string().contains("--clear"),
-        "the error must name what is missing, got: {err}"
+        "the error must name what --yes requires, got: {err}"
     );
     assert_eq!(err.exit_code(), 2);
 }
@@ -1378,4 +1386,831 @@ fn herdr_uninstall_parses_with_every_flag() {
         panic!("`-y` must select the uninstall arm");
     };
     assert!(yes);
+}
+
+/// The `static-token` verdicts, distinguished by what the sidecar HOLDS — a
+/// profile already on its mint is a successful no-op, a rolling bearer left
+/// with nothing re-stamping it is exit-non-zero, and an expired backup is
+/// named rather than left for the operator to hunt down. This module is also
+/// the exit-contract pin the review measured as missing: reverting any bail
+/// to a print + `Ok(())` reds here.
+mod static_token_verdicts {
+    use super::*;
+    use crate::testutil::HomeSandbox;
+
+    fn seeded_profile(name: &str, rolling_flag: bool) {
+        let mut profile = crate::profile::Profile::new(name.to_string(), None, None);
+        profile.rolling_token = rolling_flag;
+        crate::profile::save_profile(&profile).expect("save profile");
+        let state = crate::profile::AppState {
+            profiles: vec![profile.name.clone()],
+            ..Default::default()
+        };
+        crate::profile::save_app_state(&state).expect("save state");
+    }
+
+    fn rolling_sidecar(name: &str, exp_in_ms: i64) {
+        crate::claude::stamp_rolling_token(
+            name,
+            &crate::profile::OAuthToken {
+                access_token: "at-rolled".to_string(),
+                refresh_token: None,
+                expires_at: Some(crate::usage::now_ms() as i64 + exp_in_ms),
+                scopes: Some(vec![
+                    "user:inference".to_string(),
+                    "user:profile".to_string(),
+                ]),
+                subscription_type: Some("max".into()),
+            },
+        )
+        .expect("stamp");
+    }
+
+    #[test]
+    fn a_mint_profile_is_a_noop_success() {
+        let _home = HomeSandbox::new();
+        seeded_profile("st-mint", false);
+        crate::claude::write_session_token(
+            "st-mint",
+            "sk-ant-oat01-static-verdicts-mint-000",
+            crate::usage::now_ms() as i64,
+        )
+        .expect("mint");
+        cmd_static_token("st-mint").expect("already on the mint is a no-op, not a failure");
+    }
+
+    #[test]
+    fn a_rolling_bearer_with_no_backup_fails_loud() {
+        let _home = HomeSandbox::new();
+        seeded_profile("st-roll", true);
+        rolling_sidecar("st-roll", 8 * 3_600_000);
+        let err = cmd_static_token("st-roll")
+            .expect_err("a bearer left with nothing re-stamping it is a failed restore");
+        assert!(
+            format!("{err:#}").contains("no live static mint to restore"),
+            "{err:#}"
+        );
+        assert!(
+            format!("{err:#}").contains("this command is what stopped its re-stamping"),
+            "the copy owns the state the flag flip created, not just describes it: {err:#}"
+        );
+        // The flag flip IS durable on this path — stopping the re-stamps is
+        // what the operator asked for; the missing mint is the error.
+        let p = crate::profile::load_profile("st-roll").expect("reload");
+        assert!(
+            !p.rolling_token,
+            "the rolling flag turns off even when the restore fails"
+        );
+    }
+
+    #[test]
+    fn an_expired_backup_is_named_and_kept() {
+        let _home = HomeSandbox::new();
+        seeded_profile("st-aged", true);
+        rolling_sidecar("st-aged", 8 * 3_600_000);
+        let dir = crate::profile::profile_dir("st-aged").expect("dir");
+        let expired = crate::profile::ClaudeCredentials {
+            claude_ai_oauth: Some(crate::profile::OAuthToken {
+                access_token: "sk-ant-oat01-aged".to_string(),
+                refresh_token: None,
+                expires_at: Some(crate::usage::now_ms() as i64 - 86_400_000),
+                scopes: Some(vec![
+                    "user:inference".to_string(),
+                    "user:sessions:claude_code".to_string(),
+                ]),
+                subscription_type: None,
+            }),
+        };
+        std::fs::write(
+            dir.join("session-token.static.json"),
+            serde_json::to_vec_pretty(&expired).expect("ser"),
+        )
+        .expect("write backup");
+        let err = cmd_static_token("st-aged").expect_err("an expired backup restores nothing");
+        assert!(
+            format!("{err:#}").contains("expired"),
+            "the backup that exists but cannot serve is NAMED: {err:#}"
+        );
+        assert!(
+            dir.join("session-token.static.json").exists(),
+            "and left on disk"
+        );
+    }
+
+    /// `rolling-token` on a quarantined chain bails BEFORE anything
+    /// destructive: the sidecar (even a mis-filled one) is untouched and the
+    /// flag stays off — a failed command leaves nothing durable behind.
+    #[test]
+    fn rolling_token_on_a_dead_chain_touches_nothing() {
+        let _home = HomeSandbox::new();
+        let mut profile = crate::profile::Profile::new("rt-dead".to_string(), None, None);
+        profile.credentials = Some(crate::profile::ClaudeCredentials {
+            claude_ai_oauth: Some(crate::profile::OAuthToken {
+                access_token: "at-dead".to_string(),
+                refresh_token: Some("rt-dead".to_string()),
+                expires_at: Some(crate::usage::now_ms() as i64 + 3_600_000),
+                scopes: Some(vec![
+                    "user:inference".to_string(),
+                    "user:profile".to_string(),
+                ]),
+                subscription_type: Some("max".into()),
+            }),
+        });
+        crate::profile::save_profile(&profile).expect("save profile");
+        let state = crate::profile::AppState {
+            profiles: vec![profile.name.clone()],
+            auth_broken: vec![profile.name.clone()],
+            ..Default::default()
+        };
+        crate::profile::save_app_state(&state).expect("save state");
+        // A mis-filled sidecar that the pre-clear would have quarantined away.
+        let dir = crate::profile::profile_dir("rt-dead").expect("dir");
+        std::fs::write(
+            dir.join("session-token.json"),
+            serde_json::to_vec_pretty(&profile.credentials).expect("ser"),
+        )
+        .expect("write misfill");
+
+        let err = cmd_rolling_token("rt-dead").expect_err("a dead chain refuses up front");
+        assert!(
+            format!("{err:#}").contains("usage chain is dead"),
+            "{err:#}"
+        );
+        assert!(
+            dir.join("session-token.json").exists(),
+            "the mis-fill is NOT quarantined away by a command that then failed"
+        );
+        let p = crate::profile::load_profile("rt-dead").expect("reload");
+        assert!(!p.rolling_token, "nothing durable from a failed arm");
+    }
+
+    /// A mint chain shape for the arm tests: a real access token whose grant
+    /// was never recorded (setup scopes only, no plan stamp) — the shape
+    /// `roll_from_stored_chain` refuses pre-stamp, so the arm fails AFTER the
+    /// flag persist without touching the network.
+    fn unrecorded_chain_profile(name: &str, rolling_flag: bool) {
+        let mut profile = crate::profile::Profile::new(name.to_string(), None, None);
+        profile.rolling_token = rolling_flag;
+        profile.credentials = Some(crate::profile::ClaudeCredentials {
+            claude_ai_oauth: Some(crate::profile::OAuthToken {
+                access_token: "at-unrecorded".to_string(),
+                refresh_token: Some("rt-unrecorded".to_string()),
+                expires_at: Some(crate::usage::now_ms() as i64 + 8 * 3_600_000),
+                scopes: Some(vec![
+                    "user:inference".to_string(),
+                    "user:sessions:claude_code".to_string(),
+                ]),
+                subscription_type: None,
+            }),
+        });
+        crate::profile::save_profile(&profile).expect("save profile");
+        let state = crate::profile::AppState {
+            profiles: vec![profile.name.clone()],
+            ..Default::default()
+        };
+        crate::profile::save_app_state(&state).expect("save state");
+    }
+
+    /// The persist-before-arm shape's other half: a failed arm rolls the flag
+    /// back to the value it FOUND — off stays off, and a flag that was
+    /// already on is not stolen by the rollback. Reaches past the up-front
+    /// pre-checks (the dead-chain test pins those) to the persist + rollback
+    /// pair itself.
+    #[test]
+    fn a_failed_arm_rolls_the_flag_back_to_what_it_found() {
+        let _home = HomeSandbox::new();
+        unrecorded_chain_profile("rt-back", false);
+        let err = cmd_rolling_token("rt-back").expect_err("an unrecorded grant refuses the arm");
+        assert!(format!("{err:#}").contains("no recorded grant"), "{err:#}");
+        let p = crate::profile::load_profile("rt-back").expect("reload");
+        assert!(
+            !p.rolling_token,
+            "the flag persisted for the arm is rolled back when the arm fails"
+        );
+
+        unrecorded_chain_profile("rt-keep", true);
+        cmd_rolling_token("rt-keep").expect_err("same refusal");
+        let p = crate::profile::load_profile("rt-keep").expect("reload");
+        assert!(
+            p.rolling_token,
+            "a flag that was already on is left on — rollback restores the PRIOR value, \
+             never a hardcoded one"
+        );
+    }
+
+    /// The read-back report refuses to claim success it cannot verify: no
+    /// readable sidecar is an error, and a sidecar re-filled with a rotating
+    /// pair mid-arm is an error — neither may decay into an `Ok(())` print.
+    #[test]
+    fn the_arming_report_fails_on_what_it_cannot_verify() {
+        let _home = HomeSandbox::new();
+        seeded_profile("rt-report", true);
+        let err = report_armed_sidecar("rt-report", false)
+            .expect_err("no readable sidecar must not report armed");
+        assert!(
+            format!("{err:#}").contains("no readable sidecar"),
+            "{err:#}"
+        );
+
+        let dir = crate::profile::profile_dir("rt-report").expect("dir");
+        let pair = crate::profile::ClaudeCredentials {
+            claude_ai_oauth: Some(crate::profile::OAuthToken {
+                access_token: "at-raced".to_string(),
+                refresh_token: Some("rt-raced".to_string()),
+                expires_at: Some(crate::usage::now_ms() as i64 + 3_600_000),
+                scopes: None,
+                subscription_type: None,
+            }),
+        };
+        std::fs::write(
+            dir.join("session-token.json"),
+            serde_json::to_vec_pretty(&pair).expect("ser"),
+        )
+        .expect("write misfill");
+        let err = report_armed_sidecar("rt-report", false)
+            .expect_err("a raced-in rotating pair must not report armed");
+        assert!(
+            format!("{err:#}").contains("rotating pair while arming"),
+            "{err:#}"
+        );
+    }
+
+    /// "Already on its mint" is only a no-op success while the mint is ALIVE:
+    /// an expired one signs sessions out on the next switch, which is a
+    /// failed restore whatever the file layout says.
+    #[test]
+    fn an_expired_mint_in_the_sidecar_is_a_failed_restore() {
+        let _home = HomeSandbox::new();
+        seeded_profile("st-deadmint", false);
+        let dir = crate::profile::profile_dir("st-deadmint").expect("dir");
+        let dead = crate::profile::ClaudeCredentials {
+            claude_ai_oauth: Some(crate::profile::OAuthToken {
+                access_token: "sk-ant-oat01-clock-dead".to_string(),
+                refresh_token: None,
+                expires_at: Some(crate::usage::now_ms() as i64 - 1_000),
+                scopes: Some(vec![
+                    "user:inference".to_string(),
+                    "user:sessions:claude_code".to_string(),
+                ]),
+                subscription_type: None,
+            }),
+        };
+        std::fs::write(
+            dir.join("session-token.json"),
+            serde_json::to_vec_pretty(&dead).expect("ser"),
+        )
+        .expect("write sidecar");
+        let err = cmd_static_token("st-deadmint").expect_err("an expired mint is not a no-op");
+        assert!(format!("{err:#}").contains("EXPIRED"), "{err:#}");
+
+        // Same verdict on the same grace the restore rule uses: a mint inside
+        // Claude Code's five-minute refresh window is dead-on-arrival, and
+        // identical bytes must not read as dead in the backup slot but fine
+        // in the live one.
+        seeded_profile("st-window", false);
+        let dir = crate::profile::profile_dir("st-window").expect("dir");
+        let closing = crate::profile::ClaudeCredentials {
+            claude_ai_oauth: Some(crate::profile::OAuthToken {
+                access_token: "sk-ant-oat01-two-minutes".to_string(),
+                refresh_token: None,
+                expires_at: Some(crate::usage::now_ms() as i64 + 2 * 60 * 1000),
+                scopes: Some(vec![
+                    "user:inference".to_string(),
+                    "user:sessions:claude_code".to_string(),
+                ]),
+                subscription_type: None,
+            }),
+        };
+        std::fs::write(
+            dir.join("session-token.json"),
+            serde_json::to_vec_pretty(&closing).expect("ser"),
+        )
+        .expect("write sidecar");
+        let err = cmd_static_token("st-window")
+            .expect_err("a mint inside CC's refresh window is not a no-op either");
+        assert!(format!("{err:#}").contains("EXPIRED"), "{err:#}");
+    }
+
+    /// A restore that ERRORS (backup unreadable, not merely absent) exits
+    /// after the flag flip already persisted, so the error must own that
+    /// state the way the bail verdicts do — a raw filesystem error read as
+    /// though the command had done nothing.
+    #[test]
+    fn a_failed_restore_error_owns_the_flag_it_flipped() {
+        let _home = HomeSandbox::new();
+        seeded_profile("st-eio", true);
+        rolling_sidecar("st-eio", 8 * 3_600_000);
+        let dir = crate::profile::profile_dir("st-eio").expect("dir");
+        // A directory where the backup goes: reads fail with a non-NotFound
+        // error on every platform.
+        std::fs::create_dir(dir.join("session-token.static.json")).expect("block the backup path");
+        let err = cmd_static_token("st-eio").expect_err("an unreadable backup is loud");
+        assert!(
+            format!("{err:#}").contains("is off the rolling token now"),
+            "the error owns the flag state the command already changed: {err:#}"
+        );
+        let p = crate::profile::load_profile("st-eio").expect("reload");
+        assert!(!p.rolling_token, "the flip it owns is real");
+    }
+
+    /// The trap a corrupt backup used to spring: `static-token` flipped the
+    /// flag off, errored on the unparseable file, and the re-mint it
+    /// prescribed ran with the flag off — the no-backup write path — so the
+    /// file survived to fail the next attempt identically. The way out was
+    /// `rolling-token`, re-arming the mode being left. Now the corrupt slot
+    /// is quarantined (evidence kept under the profile) and the prescribed
+    /// recovery actually recovers.
+    #[test]
+    fn a_corrupt_backup_is_quarantined_and_the_recovery_path_stays_open() {
+        let _home = HomeSandbox::new();
+        seeded_profile("st-corrupt", true);
+        rolling_sidecar("st-corrupt", 8 * 3_600_000);
+        let dir = crate::profile::profile_dir("st-corrupt").expect("dir");
+        std::fs::write(dir.join("session-token.static.json"), b"not json at all")
+            .expect("corrupt backup");
+
+        let err = cmd_static_token("st-corrupt").expect_err("nothing restorable yet");
+        assert!(
+            format!("{err:#}").contains("no live static mint to restore"),
+            "{err:#}"
+        );
+        assert!(
+            !dir.join("session-token.static.json").exists(),
+            "the corrupt slot-holder is cleared, not left to fail the next attempt"
+        );
+        let quarantined = std::fs::read_dir(dir.join("quarantine"))
+            .expect("quarantine dir")
+            .filter_map(|e| e.ok())
+            .any(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .ends_with(".session-token.static.json")
+            });
+        assert!(quarantined, "the bytes survive as evidence");
+
+        // The prescribed recovery: re-mint (the flag is off, so this is the
+        // plain no-backup write — exactly what `clauth login --setup-token`
+        // runs), then the command reports the mint as already in front.
+        crate::claude::write_session_token(
+            "st-corrupt",
+            "sk-ant-oat01-fresh-recovery-mint",
+            crate::usage::now_ms() as i64,
+        )
+        .expect("re-mint");
+        cmd_static_token("st-corrupt").expect("the recovery path converges instead of looping");
+    }
+}
+
+/// The arm-report copy surfaces the round-6 review measured as silently
+/// deletable or interchangeable, pinned as CONTENT (the print sites can no
+/// longer lose them silently either — each fn has exactly one caller, so a
+/// deleted print is a dead-code error under `-D warnings`).
+mod armed_report_copy {
+    use super::*;
+
+    /// The four clear copy lines, pinned on CONTENT like every other line in
+    /// this mod: single-caller keeps a deleted print a dead-code error, but
+    /// only a pin keeps the WORDS — both pre-prompt lines are TTY-only, so no
+    /// behavioral test ever executes them, and the two postscripts are the
+    /// operator's only confirmation of what actually moved.
+    #[test]
+    fn the_clear_copy_names_the_disarm_the_backup_and_both_postscripts() {
+        let disarm = clear_disarm_note("acme");
+        assert!(
+            disarm.contains("clearing also turns its re-stamping off"),
+            "{disarm}"
+        );
+        let backup = clear_backup_note("acme");
+        assert!(
+            backup.contains("the preserved mint at session-token.static.json goes with it"),
+            "{backup}"
+        );
+        assert!(
+            backup.contains("`clauth static-token acme` will have nothing to restore"),
+            "{backup}"
+        );
+        let disarmed = clear_disarmed_postscript("acme");
+        assert!(disarmed.contains("rolling-token is off"), "{disarmed}");
+        assert!(
+            disarmed.contains("nothing re-stamps a sidecar for 'acme' now"),
+            "{disarmed}"
+        );
+        let swept = clear_backup_postscript("acme");
+        assert!(
+            swept.contains("the preserved mint at session-token.static.json is gone"),
+            "{swept}"
+        );
+        assert!(
+            swept.contains("`clauth static-token acme` has nothing to restore now"),
+            "{swept}"
+        );
+    }
+
+    /// The post-clear report's GATING, pinned as a value since no stdout
+    /// capture exists: each line rides exactly its own fact — the disarm line
+    /// the flag, the backup line the removal — and a clear that moved neither
+    /// reports neither. An unconditional backup line would tell every ordinary
+    /// clear a year-scale credential was destroyed when none existed.
+    #[test]
+    fn the_clear_postscripts_ride_exactly_what_moved() {
+        assert!(clear_postscripts("acme", false, false).is_empty());
+        let disarm_only = clear_postscripts("acme", true, false);
+        assert_eq!(disarm_only.len(), 1, "{disarm_only:?}");
+        assert!(disarm_only[0].contains("rolling-token is off"));
+        let backup_only = clear_postscripts("acme", false, true);
+        assert_eq!(backup_only.len(), 1, "{backup_only:?}");
+        assert!(backup_only[0].contains("is gone"));
+        let both = clear_postscripts("acme", true, true);
+        assert_eq!(both.len(), 2, "{both:?}");
+        assert!(
+            both[0].contains("rolling-token is off") && both[1].contains("is gone"),
+            "{both:?}"
+        );
+    }
+
+    /// The disclosure is the feature's entire security posture in user-facing
+    /// copy — there is no confirm prompt by design — so the widening, its
+    /// consequence, and the way back must each survive verbatim.
+    #[test]
+    fn the_scope_widening_disclosure_names_the_widening_and_the_way_back() {
+        let line = scope_widening_disclosure("acme");
+        assert!(
+            line.contains("wider than the setup-token mint it supersedes"),
+            "{line}"
+        );
+        assert!(
+            line.contains("Anything that can read this profile's session credential"),
+            "{line}"
+        );
+        assert!(
+            line.contains("`clauth static-token acme` puts the mint back"),
+            "{line}"
+        );
+    }
+
+    /// Each health state makes its OWN claim: `Fresh` promising while no
+    /// daemon runs reads the arm as durable when nothing will re-stamp it.
+    #[test]
+    fn each_daemon_health_state_makes_its_own_restamp_claim() {
+        let absent = restamp_promise(crate::daemon::DaemonHealth::Absent);
+        let stale = restamp_promise(crate::daemon::DaemonHealth::Stale);
+        let fresh = restamp_promise(crate::daemon::DaemonHealth::Fresh);
+        assert!(
+            absent.contains("No daemon appears to be running"),
+            "{absent}"
+        );
+        assert!(absent.contains("`clauth daemon` starts"), "{absent}");
+        assert!(stale.contains("looks stale"), "{stale}");
+        assert!(stale.contains("`clauth daemon --status`"), "{stale}");
+        assert!(fresh.contains("re-stamps it before it expires"), "{fresh}");
+        assert!(
+            !fresh.contains("No daemon") && !fresh.contains("stale"),
+            "the healthy claim carries no warning language: {fresh}"
+        );
+    }
+
+    /// The warning for a failed arm whose rollback also failed to save: the
+    /// only line telling the operator a durable flag-on-with-nothing-armed
+    /// state exists. It owns the state, carries the save error, and names the
+    /// exit.
+    #[test]
+    fn the_stranded_rollback_warning_owns_the_flag_and_the_exit() {
+        let w = rollback_stranded_warning("acme", &anyhow::anyhow!("read-only file system"));
+        assert!(
+            w.contains("could not roll the rolling-token flag back for 'acme'"),
+            "{w}"
+        );
+        assert!(w.contains("read-only file system"), "{w}");
+        assert!(w.contains("`clauth static-token acme` to clear it"), "{w}");
+    }
+}
+
+/// `static-token --clear` as the FULL exit from the long-lived token: all three
+/// pieces of that state go together (sidecar, preserved mint, `rolling_token`
+/// flag), because each one left behind resurrects what the operator was told is
+/// gone — a lingering flag has the daemon re-stamp a fresh sidecar, and a
+/// lingering backup keeps the actual year-scale credential on disk under a
+/// command that just printed "cleared".
+mod static_token_clear {
+    use super::*;
+    use crate::testutil::HomeSandbox;
+
+    /// A profile with a stored OAuth pair (so the other-login guard passes),
+    /// the rolling flag as given, saved into app state.
+    fn cleared_profile(name: &str, rolling_flag: bool, with_login: bool) {
+        let mut profile = crate::profile::Profile::new(name.to_string(), None, None);
+        profile.rolling_token = rolling_flag;
+        if with_login {
+            profile.credentials = Some(crate::profile::ClaudeCredentials {
+                claude_ai_oauth: Some(crate::profile::OAuthToken {
+                    access_token: "at-usage".to_string(),
+                    refresh_token: Some("rt-usage".to_string()),
+                    expires_at: Some(crate::usage::now_ms() as i64 + 8 * 3_600_000),
+                    scopes: None,
+                    subscription_type: None,
+                }),
+            });
+        }
+        crate::profile::save_profile(&profile).expect("save profile");
+        let state = crate::profile::AppState {
+            profiles: vec![profile.name.clone()],
+            ..Default::default()
+        };
+        crate::profile::save_app_state(&state).expect("save state");
+    }
+
+    #[test]
+    fn clear_takes_the_sidecar_the_backup_and_the_flag_together() {
+        let _home = HomeSandbox::new();
+        cleared_profile("cl-roll", true, true);
+        // A mint first, then the rolling stamp: the first stamp preserves the
+        // mint into `session-token.static.json`, which is exactly the two-file
+        // state a rolling profile carries in production.
+        crate::claude::write_session_token(
+            "cl-roll",
+            "sk-ant-oat01-clear-full-exit-mint",
+            crate::usage::now_ms() as i64,
+        )
+        .expect("mint");
+        crate::claude::stamp_rolling_token(
+            "cl-roll",
+            &crate::profile::OAuthToken {
+                access_token: "at-rolled".to_string(),
+                refresh_token: None,
+                expires_at: Some(crate::usage::now_ms() as i64 + 8 * 3_600_000),
+                scopes: Some(vec![
+                    "user:inference".to_string(),
+                    "user:profile".to_string(),
+                ]),
+                subscription_type: Some("max".into()),
+            },
+        )
+        .expect("stamp");
+        let dir = crate::profile::profile_dir("cl-roll").expect("dir");
+        assert!(dir.join("session-token.static.json").exists(), "fixture");
+
+        cmd_static_token_clear("cl-roll", true).expect("the clear succeeds");
+
+        assert!(
+            !dir.join("session-token.json").exists(),
+            "the sidecar is gone"
+        );
+        assert!(
+            !dir.join("session-token.static.json").exists(),
+            "the preserved mint is a long-lived credential and goes with the clear"
+        );
+        let p = crate::profile::load_profile("cl-roll").expect("reload");
+        assert!(
+            !p.rolling_token,
+            "the flag goes too, or the daemon re-stamps a sidecar over the clear"
+        );
+    }
+
+    /// The other-login refusal is re-checked UNDER the rotation guard, not only
+    /// on the pre-prompt snapshot: the prompt is an unbounded wait, and a
+    /// log-out (the TUI's row, or `rm credentials.json` by hand) can land
+    /// inside it — the one interleaving where this command strips a profile's
+    /// last credential. Driven here through the guard itself: the test holds
+    /// the profile's rotation lock, deletes the stored login while the clear is
+    /// parked on `acquire`, and only then releases.
+    ///
+    /// Green is deliberately timing-proof (WHICHEVER check catches the state,
+    /// nothing may be stripped); the sleep only makes the under-guard check the
+    /// one that fires, which is what the mutation sweep measures.
+    #[test]
+    fn the_other_login_refusal_is_rechecked_under_the_guard() {
+        let home = HomeSandbox::new();
+        cleared_profile("cl-race", false, true);
+        let dir = crate::profile::profile_dir("cl-race").expect("dir");
+
+        // One attempt of the race. NOTHING between the guard acquire and the
+        // join may panic: an unwound attempt would detach the worker, release
+        // the flock, and drop the sandbox out from under a thread that then
+        // resolves the REAL home — the exact hazard `HomeSandbox`'s drop-order
+        // doc exists for. Every fallible step in the window reports through
+        // the return value instead.
+        let attempt = || -> (bool, String) {
+            crate::claude::write_session_token(
+                "cl-race",
+                "sk-ant-oat01-clear-race-mint0000",
+                crate::usage::now_ms() as i64 + 300 * 24 * 3_600_000,
+            )
+            .expect("mint");
+            std::fs::write(
+                dir.join("credentials.json"),
+                serde_json::to_vec(&crate::profile::ClaudeCredentials {
+                    claude_ai_oauth: Some(crate::profile::OAuthToken {
+                        access_token: "at-race".to_string(),
+                        refresh_token: Some("rt-race".to_string()),
+                        expires_at: Some(crate::usage::now_ms() as i64 + 8 * 3_600_000),
+                        scopes: None,
+                        subscription_type: None,
+                    }),
+                })
+                .expect("serialize login"),
+            )
+            .expect("store the login");
+            let guard = crate::runtime::RotationGuard::acquire("cl-race").expect("hold the lock");
+            let worker = std::thread::spawn(move || super::cmd_static_token_clear("cl-race", true));
+            // Give the clear time to pass its pre-guard snapshot and park on
+            // the guard; then take the login away and let it through.
+            std::thread::sleep(std::time::Duration::from_millis(250));
+            let logged_out = std::fs::remove_file(dir.join("credentials.json")).is_ok();
+            drop(guard);
+            let result = worker.join().expect("the clear thread survives");
+            assert!(logged_out, "the fixture's login vanished before the race");
+            // WHICHEVER check catches the state, nothing may be stripped —
+            // green is timing-proof even when the worker loses the 250ms race
+            // and its pre-guard check fires instead.
+            let err = result.expect_err("clearing the last credential must refuse");
+            assert!(
+                format!("{err:#}").contains("stores no other login"),
+                "the refusal names the reason: {err:#}"
+            );
+            assert!(
+                dir.join("session-token.json").exists(),
+                "a refused clear removes nothing"
+            );
+            // "anymore" appears ONLY in the under-guard re-check's message —
+            // the discriminator that says the race was actually won.
+            (
+                format!("{err:#}").contains("stores no other login anymore"),
+                format!("{err:#}"),
+            )
+        };
+
+        // The under-guard leg is what this test is FOR, so retry a lost race
+        // instead of silently degrading into a second pin of the pre-guard
+        // check: five parked-thread attempts losing 250ms each is not a
+        // plausible machine, it is a broken re-check.
+        let mut last = String::new();
+        for _ in 0..5 {
+            let (under_guard, err) = attempt();
+            last = err;
+            if under_guard {
+                break;
+            }
+        }
+        assert!(
+            last.contains("stores no other login anymore"),
+            "the UNDER-GUARD re-check never fired across five attempts: {last}"
+        );
+        drop(home);
+    }
+
+    /// The preserved mint goes LAST, after the relink: a backup-removal
+    /// failure between the sidecar removal and the relink would leave an
+    /// ACTIVE profile's live slot a dangling symlink under a bare "remove
+    /// failed" — a broken login reported as nothing-happened. Driven by
+    /// blocking the backup slot with a directory: the sidecar clears, the
+    /// relink lands, and only then does the removal fail — with a context
+    /// line owning the partial state.
+    #[test]
+    fn the_clear_relinks_before_the_backup_removal_can_fail() {
+        let home = HomeSandbox::new();
+        cleared_profile("cl-mid", false, true);
+        crate::claude::write_session_token(
+            "cl-mid",
+            "sk-ant-oat01-clear-mid-mint00000",
+            crate::usage::now_ms() as i64 + 300 * 24 * 3_600_000,
+        )
+        .expect("mint");
+        let dir = crate::profile::profile_dir("cl-mid").expect("dir");
+        let state = crate::profile::AppState {
+            profiles: vec!["cl-mid".into()],
+            active_profile: Some("cl-mid".into()),
+            ..Default::default()
+        };
+        crate::profile::save_app_state(&state).expect("activate");
+        crate::claude::force_link_profile_credentials("cl-mid").expect("link");
+        let live = home.home().join(".claude").join(".credentials.json");
+        assert_eq!(
+            std::fs::read_link(&live).expect("live is a symlink"),
+            dir.join("session-token.json"),
+            "fixture: the live slot starts on the sidecar"
+        );
+        std::fs::create_dir(dir.join("session-token.static.json")).expect("block the slot");
+
+        let err = cmd_static_token_clear("cl-mid", true)
+            .expect_err("the blocked backup slot fails the removal");
+        assert!(
+            format!("{err:#}").contains("the preserved mint at session-token.static.json remains"),
+            "the partial state is owned in the error: {err:#}"
+        );
+        assert!(
+            !dir.join("session-token.json").exists(),
+            "the sidecar clear itself succeeded"
+        );
+        assert_eq!(
+            std::fs::read_link(&live).expect("live survives as a symlink"),
+            dir.join("credentials.json"),
+            "the relink landed BEFORE the backup removal failed — no dangling live slot"
+        );
+    }
+
+    /// The widened nothing-to-clear gate: a set flag with NO files is exactly
+    /// the state where an early "nothing to clear" would leave the daemon to
+    /// re-create what the operator was told is gone.
+    #[test]
+    fn a_set_flag_with_no_files_is_still_something_to_clear() {
+        let _home = HomeSandbox::new();
+        cleared_profile("cl-flag", true, true);
+        cmd_static_token_clear("cl-flag", true).expect("the disarm succeeds");
+        let p = crate::profile::load_profile("cl-flag").expect("reload");
+        assert!(!p.rolling_token, "the clear turned re-stamping off");
+    }
+
+    /// The other-login guard covers the backup slot: a preserved mint is
+    /// restorable by the bare verb, so destroying it when it is the profile's
+    /// only credential strips the profile the same way removing the sidecar
+    /// would.
+    #[test]
+    fn the_backup_slot_counts_as_the_last_credential() {
+        let _home = HomeSandbox::new();
+        cleared_profile("cl-last", false, false);
+        let dir = crate::profile::profile_dir("cl-last").expect("dir");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        // A live mint in the backup slot and nothing else: the one credential.
+        crate::claude::write_session_token(
+            "cl-last",
+            "sk-ant-oat01-last-credential-mint",
+            crate::usage::now_ms() as i64,
+        )
+        .expect("mint");
+        std::fs::rename(
+            dir.join("session-token.json"),
+            dir.join("session-token.static.json"),
+        )
+        .expect("move into the backup slot");
+
+        let err = cmd_static_token_clear("cl-last", true)
+            .expect_err("clearing the only credential is refused");
+        assert!(
+            format!("{err:#}").contains("stores no other login"),
+            "{err:#}"
+        );
+        assert!(
+            dir.join("session-token.static.json").exists(),
+            "a refused clear removes nothing"
+        );
+    }
+
+    /// With all three pieces absent the clear is a quiet no-op success, not an
+    /// error — the requested end state already holds. The early return is
+    /// pinned by a side-effect the fall-through path cannot avoid: the full
+    /// path acquires the rotation guard, which materializes
+    /// `rotation.lock` in the profile dir, so the lock file's absence is what
+    /// proves the no-op branch ran rather than a false "cleared" printing
+    /// through the whole body.
+    #[test]
+    fn nothing_to_clear_is_a_noop_success() {
+        let _home = HomeSandbox::new();
+        cleared_profile("cl-none", false, true);
+        cmd_static_token_clear("cl-none", true).expect("nothing to clear is success");
+        let dir = crate::profile::profile_dir("cl-none").expect("dir");
+        assert!(
+            !dir.join("rotation.lock").exists(),
+            "the no-op branch returns before the rotation guard — a lock file \
+             here means the full clear body ran against nothing"
+        );
+    }
+
+    /// A mis-filled sidecar is EVIDENCE — the anomaly the split exists to
+    /// detect, and one the operator did not name (the prompt says "the
+    /// long-lived token"; a rotating pair is precisely not that). The clear
+    /// quarantines it before removal, like every other path that disposes of
+    /// one.
+    #[test]
+    fn clear_quarantines_a_misfilled_sidecar_instead_of_plain_deleting_it() {
+        let _home = HomeSandbox::new();
+        cleared_profile("cl-mf", false, true);
+        let dir = crate::profile::profile_dir("cl-mf").expect("dir");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        std::fs::write(
+            dir.join("session-token.json"),
+            serde_json::to_vec(&crate::profile::ClaudeCredentials {
+                claude_ai_oauth: Some(crate::profile::OAuthToken {
+                    access_token: "at-misfill".to_string(),
+                    refresh_token: Some("rt-misfill".to_string()),
+                    expires_at: Some(crate::usage::now_ms() as i64 + 8 * 3_600_000),
+                    scopes: None,
+                    subscription_type: None,
+                }),
+            })
+            .expect("ser"),
+        )
+        .expect("write misfill");
+
+        cmd_static_token_clear("cl-mf", true).expect("the clear succeeds");
+
+        assert!(!dir.join("session-token.json").exists(), "sidecar removed");
+        let quarantined: Vec<_> = std::fs::read_dir(dir.join("quarantine"))
+            .expect("quarantine dir exists")
+            .collect();
+        assert_eq!(
+            quarantined.len(),
+            1,
+            "the rotating pair is moved aside as evidence, never plain-deleted"
+        );
+    }
 }

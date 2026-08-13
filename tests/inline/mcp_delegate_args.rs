@@ -477,6 +477,27 @@ fn profiles_blocking_is_refused_by_name() {
     assert_refusal(&result, &["`profiles` requires `background: true`"]);
 }
 
+/// A reserve failure refuses before any spawn: with the jobs dir replaced by a
+/// regular file the first job-file write fails (ENOTDIR), and the fan-out must
+/// name that failure and launch nothing rather than spending one window per
+/// account mid-loop and losing the job ids.
+#[test]
+fn fanout_reserve_failure_is_refused_by_name() {
+    let home = HomeSandbox::new();
+    seed_profiles(&["solo", "vendor"], true);
+    let jobs = home.home().join(".clauth").join("jobs");
+    std::fs::create_dir_all(jobs.parent().unwrap()).expect("clauth dir");
+    std::fs::write(&jobs, b"not a dir").expect("jobs path is a file");
+
+    let result = call_delegate(DelegateArgs {
+        profiles: Some(vec!["solo".to_string(), "vendor".to_string()]),
+        prompt: Some("hi".to_string()),
+        background: Some(true),
+        ..base()
+    });
+    assert_refusal(&result, &["failed to record job"]);
+}
+
 // ── happy path + format honouring ────────────────────────────────────────────
 
 #[test]

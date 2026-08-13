@@ -768,7 +768,9 @@ Prose by default; pass `format: \"json\"` for the structured envelope."
                         depth,
                     };
                     let (job_id, started_at) =
-                        launch_background_delegate(name.clone(), opts, monitor.unwrap_or(false))?;
+                        reserve_background_job(&name, monitor.unwrap_or(false))
+                            .map_err(|e| ErrorData::internal_error(e, None))?;
+                    launch_background_delegate(name.clone(), opts, job_id.clone(), started_at);
                     let payload = serde_json::json!({
                         "job_id": job_id,
                         "profile": name,
@@ -793,13 +795,32 @@ Prose by default; pass `format: \"json\"` for the structured envelope."
                         isolation,
                         depth,
                     };
-                    let mut jobs = Vec::with_capacity(names.len());
+                    let monitor = monitor.unwrap_or(false);
+                    // Reserve every job file BEFORE the first spawn: the reserve
+                    // is the only fallible step (ENOSPC / perms on the jobs dir),
+                    // so a failure here spends no window and loses no job id. The
+                    // ids already reserved exist nowhere else; drop them and keep
+                    // the all-or-nothing contract.
+                    let mut handles = Vec::with_capacity(names.len());
                     for name in &names {
-                        let (job_id, started_at) = launch_background_delegate(
+                        match reserve_background_job(name, monitor) {
+                            Ok(handle) => handles.push(handle),
+                            Err(reason) => {
+                                for (job_id, _) in &handles {
+                                    jobs::remove(job_id);
+                                }
+                                return Ok(delegate_refusal(format, &reason));
+                            }
+                        }
+                    }
+                    let mut jobs = Vec::with_capacity(names.len());
+                    for (name, (job_id, started_at)) in names.iter().zip(handles) {
+                        launch_background_delegate(
                             name.clone(),
                             opts.clone(),
-                            monitor.unwrap_or(false),
-                        )?;
+                            job_id.clone(),
+                            started_at,
+                        );
                         jobs.push(serde_json::json!({
                             "job_id": job_id,
                             "profile": name,
@@ -1854,21 +1875,33 @@ fn read_prompt_handle(file: std::fs::File, rel: &str) -> std::result::Result<Str
     Ok(String::from_utf8_lossy(&buf).into_owned())
 }
 
-/// Record and launch ONE background delegate on the blocking pool, returning the
-/// `(job_id, started_at)` handle for the caller's reply. `opts.prompt` is an
+/// Record ONE background job's `running` file and return its `(job_id,
+/// started_at)` handle. This is the only fallible step of a background
+/// delegate; the spawn that follows cannot fail, so a fan-out reserves every
+/// job before launching any.
+fn reserve_background_job(
+    profile: &str,
+    monitor: bool,
+) -> std::result::Result<(String, u64), String> {
+    let started_at = now_ms();
+    let job_id = jobs::new_job_id(started_at);
+    jobs::write_running(&job_id, profile, started_at, monitor)
+        .map_err(|e| format!("failed to record job: {e}"))?;
+    Ok((job_id, started_at))
+}
+
+/// Launch ONE background delegate on the blocking pool for the reserved
+/// `(job_id, started_at)` handle. Infallible: `spawn_blocking` cannot fail, so
+/// every failure path lives in [`reserve_background_job`]. `opts.prompt` is an
 /// `Arc<str>` so a fan-out reads the prompt once and reuses it across N accounts.
 fn launch_background_delegate(
     profile: String,
     opts: BackgroundOpts,
-    monitor: bool,
-) -> std::result::Result<(String, u64), ErrorData> {
-    let started_at = now_ms();
-    let job_id = jobs::new_job_id(started_at);
-    jobs::write_running(&job_id, &profile, started_at, monitor)
-        .map_err(|e| ErrorData::internal_error(format!("failed to record job: {e}"), None))?;
-
-    let job_id_task = job_id.clone();
-    let profile_task = profile.clone();
+    job_id: String,
+    started_at: u64,
+) {
+    let job_id_task = job_id;
+    let profile_task = profile;
     tokio::task::spawn_blocking(move || {
         // Catch a panic in the detached task: the handle is dropped, so an unwind
         // would otherwise be swallowed and leave the job stuck `running` until
@@ -1916,7 +1949,6 @@ fn launch_background_delegate(
         };
         let _ = jobs::write_done(&job_id_task, &profile_task, started_at, envelope);
     });
-    Ok((job_id, started_at))
 }
 
 /// Reduce `claude`'s captured stdout to its single terminal `type:"result"`

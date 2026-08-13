@@ -258,7 +258,14 @@ fn session_auth_variants_shape_switch_note_and_runtime_paths() {
     );
     assert!(
         !runtime_block.contains("/runtime/"),
-        "no constructed runtime path: the real dir is `runtime-<sid>-<n>`",
+        "no constructed runtime path: the real dir is `runtime-<pid>-<seq>`",
+    );
+    // The note may name `~/.claude/` and nothing beyond it. Where a `~/.claude/`
+    // entry chains on to is the operator's own layout, so a second destination
+    // spelled here is true on the box that wrote it and false everywhere else.
+    assert!(
+        !runtime_block.contains("~/.agents"),
+        "the note must not name a path clauth never builds: {runtime_block}",
     );
     for other in [SessionAuth::Global, SessionAuth::IsolatedCustom] {
         assert!(runtime_paths_note(&other).is_none());

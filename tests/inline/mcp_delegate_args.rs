@@ -303,6 +303,61 @@ fn prompt_file_oversize_is_refused_by_name() {
     );
 }
 
+/// A directory used to end in an EISDIR-shaped refusal at read time. The type
+/// check refuses it deliberately, by name, before any open.
+#[test]
+fn prompt_file_directory_is_refused_by_name() {
+    let home = HomeSandbox::new();
+    seed_profiles(&["solo"], true);
+    let cwd = work_dir(home.home());
+
+    let result = call_delegate(DelegateArgs {
+        profile: Some("solo".to_string()),
+        prompt_file: Some(".".to_string()),
+        cwd: Some(cwd.to_str().unwrap().to_string()),
+        ..base()
+    });
+    assert_refusal(&result, &["prompt_file `.`", "not a regular file"]);
+}
+
+/// A FIFO blocks a read-only open until a writer appears, and the MCP server
+/// runs on the only thread of its current-thread runtime, so reading one as a
+/// `prompt_file` would freeze every tool until the process dies. The type check
+/// must refuse it without ever opening it. On a regression the call below hangs
+/// forever; the receive timeout turns that hang into a failing test instead of
+/// a wedged runner.
+#[cfg(unix)]
+#[test]
+fn prompt_file_refuses_a_fifo_without_blocking() {
+    let home = HomeSandbox::new();
+    let cwd = work_dir(home.home());
+    let fifo = cwd.join("pipe");
+    let status = std::process::Command::new("mkfifo")
+        .arg(&fifo)
+        .status()
+        .expect("mkfifo runs");
+    assert!(status.success(), "mkfifo creates the fifo");
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    let cwd_str = cwd.to_str().unwrap().to_string();
+    let handle = std::thread::spawn(move || {
+        let _ = tx.send(super::read_prompt_file(Some(&cwd_str), "pipe"));
+    });
+    match rx.recv_timeout(std::time::Duration::from_secs(5)) {
+        Ok(Err(reason)) => {
+            assert!(
+                reason.contains("not a regular file"),
+                "the refusal names the file type: {reason}"
+            );
+        }
+        Ok(Ok(_)) => panic!("a FIFO must never be read as a prompt"),
+        Err(_) => panic!(
+            "read_prompt_file blocked on a FIFO: the type check no longer refuses before the open"
+        ),
+    }
+    handle.join().expect("reader thread joins");
+}
+
 // ── profiles fan-out guards ──────────────────────────────────────────────────
 
 #[test]

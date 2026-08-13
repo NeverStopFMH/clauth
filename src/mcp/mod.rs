@@ -1789,8 +1789,8 @@ fn normalize_join(
 /// Resolve and read a `prompt_file` relative to the delegate's `cwd`, validating
 /// at the boundary and re-checking immediately before the read. The path is
 /// canonicalized and checked against `cwd` in one place, then opened and read
-/// with no work in between, so the thing checked is the thing read. Returns the
-/// prompt text.
+/// with no work in between, so the thing checked is the thing read. Only a
+/// regular file is accepted. Returns the prompt text.
 fn read_prompt_file(cwd: Option<&str>, rel: &str) -> std::result::Result<String, String> {
     let base = match cwd {
         Some(dir) => std::path::PathBuf::from(dir),
@@ -1809,12 +1809,26 @@ fn read_prompt_file(cwd: Option<&str>, rel: &str) -> std::result::Result<String,
             "prompt_file `{rel}` refused: symlink target resolves outside `cwd`"
         ));
     }
+    // Type check BEFORE the open: `metadata` is a stat and never opens the path,
+    // so a FIFO is refused here instead of freezing the read-only open (which
+    // blocks until a writer appears) on the server's only thread. A directory
+    // used to slip through to an EISDIR-shaped refusal at read time; it is now
+    // refused by type too.
+    let meta = std::fs::metadata(&real).map_err(|e| format!("prompt_file `{rel}` refused: {e}"))?;
+    if !meta.is_file() {
+        return Err(format!("prompt_file `{rel}` refused: not a regular file"));
+    }
     let file =
         std::fs::File::open(&real).map_err(|e| format!("prompt_file `{rel}` refused: {e}"))?;
-    let size = file
+    // The check that binds, on the opened handle: a path swapped between the
+    // stat above and the open cannot sneak a non-regular file past it.
+    let meta = file
         .metadata()
-        .map_err(|e| format!("prompt_file `{rel}` refused: {e}"))?
-        .len();
+        .map_err(|e| format!("prompt_file `{rel}` refused: {e}"))?;
+    if !meta.is_file() {
+        return Err(format!("prompt_file `{rel}` refused: not a regular file"));
+    }
+    let size = meta.len();
     if size > PROMPT_FILE_CAP {
         return Err(format!(
             "prompt_file `{rel}` refused: {size} bytes over the {PROMPT_FILE_CAP} byte cap"

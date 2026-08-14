@@ -6,6 +6,7 @@
 //!
 //! All logging MUST go to stderr — stdout carries the JSON-RPC frame.
 
+mod herdr_report;
 mod jobs;
 mod render;
 
@@ -287,6 +288,10 @@ fn fold_delegate_live_usage(
 #[derive(Clone)]
 pub(crate) struct ClauthServer {
     tool_router: ToolRouter<Self>,
+    /// `Some` only when the serve path resolved a herdr pane: `delegate` then
+    /// reports `working`/`idle` to herdr's agents panel. A server built
+    /// without it is a silent no-op.
+    herdr_pane: Option<herdr_report::PaneReporter>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -397,7 +402,21 @@ impl ClauthServer {
     pub(crate) fn new() -> Self {
         Self {
             tool_router: Self::tool_router(),
+            herdr_pane: None,
         }
+    }
+
+    /// Attach the pane reporter the serve path resolved at startup. Kept off
+    /// `new()` so an in-process test, which builds its server directly, never
+    /// inherits an ambient `HERDR_PANE_ID` and reports at the operator's live
+    /// herdr socket. `tests/mcp_handshake.rs` does reach this path: it spawns
+    /// the real binary, so it clears the herdr env on the child itself.
+    pub(crate) fn with_herdr_pane(
+        mut self,
+        herdr_pane: Option<herdr_report::PaneReporter>,
+    ) -> Self {
+        self.herdr_pane = herdr_pane;
+        self
     }
 
     #[tool(
@@ -833,7 +852,20 @@ Prose by default; pass `format: \"json\"` for the structured envelope."
                     let (job_id, started_at) =
                         reserve_background_job(&name, monitor.unwrap_or(false))
                             .map_err(|e| ErrorData::internal_error(e, None))?;
-                    launch_background_delegate(name.clone(), opts, job_id.clone(), started_at);
+                    // Commits to launch: the job file is reserved and the task
+                    // spawns next. `begin` reports `working` on the 0→1
+                    // transition; each task's end-guard decrements, and the
+                    // last one reports `idle`.
+                    if let Some(pane) = &self.herdr_pane {
+                        pane.begin();
+                    }
+                    launch_background_delegate(
+                        name.clone(),
+                        opts,
+                        job_id.clone(),
+                        started_at,
+                        self.herdr_pane.clone(),
+                    );
                     let payload = serde_json::json!({
                         "job_id": job_id,
                         "profile": name,
@@ -879,11 +911,15 @@ Prose by default; pass `format: \"json\"` for the structured envelope."
                     }
                     let mut jobs = Vec::with_capacity(names.len());
                     for (name, (job_id, started_at)) in names.iter().zip(handles) {
+                        if let Some(pane) = &self.herdr_pane {
+                            pane.begin();
+                        }
                         launch_background_delegate(
                             name.clone(),
                             opts.clone(),
                             job_id.clone(),
                             started_at,
+                            self.herdr_pane.clone(),
                         );
                         jobs.push(serde_json::json!({
                             "job_id": job_id,
@@ -910,6 +946,14 @@ Prose by default; pass `format: \"json\"` for the structured envelope."
             ));
         };
         let target_for_task = target.clone();
+        // Commits to spawn: from here the delegate is in flight. The guard
+        // reports `working` to herdr's agents panel; its drop reports `idle`
+        // on every exit path — clean result, deadline kill, non-zero exit,
+        // unparseable output, or a task panic.
+        let _pane_guard = self
+            .herdr_pane
+            .as_ref()
+            .map(herdr_report::InFlightGuard::begin);
         let outcome = tokio::task::spawn_blocking(move || {
             run_delegate(DelegateOpts {
                 profile: &target_for_task,
@@ -2284,10 +2328,15 @@ fn launch_background_delegate(
     opts: BackgroundOpts,
     job_id: String,
     started_at: u64,
+    herdr_pane: Option<herdr_report::PaneReporter>,
 ) {
     let job_id_task = job_id;
     let profile_task = profile;
     tokio::task::spawn_blocking(move || {
+        // Decrements the pane's in-flight count on every exit path, panic
+        // included; the drop reports `idle` once nothing is left in flight.
+        // Created first so no early return can skip it.
+        let _pane_end = herdr_pane.map(herdr_report::InFlightGuard::end_only);
         // Catch a panic in the detached task: the handle is dropped, so an unwind
         // would otherwise be swallowed and leave the job stuck `running` until
         // GC — the waiter would hang on its deadline. The job file is always
@@ -2613,7 +2662,11 @@ pub(crate) fn serve() -> Result<()> {
 
 async fn run_server() -> Result<()> {
     use rmcp::{ServiceExt, transport::stdio};
-    let service = ClauthServer::new().serve(stdio()).await?;
+    // Resolve the pane reporter once, at startup: the pane env is what this
+    // process inherited from herdr, and a per-call re-read would race a
+    // delegate with a changed environment.
+    let server = ClauthServer::new().with_herdr_pane(herdr_report::PaneReporter::resolve());
+    let service = server.serve(stdio()).await?;
     service.waiting().await?;
     Ok(())
 }
@@ -2641,3 +2694,7 @@ mod format_tests;
 #[cfg(test)]
 #[path = "../../tests/inline/mcp_delegate_args.rs"]
 mod delegate_args_tests;
+
+#[cfg(test)]
+#[path = "../../tests/inline/mcp_herdr_report.rs"]
+mod herdr_report_tests;

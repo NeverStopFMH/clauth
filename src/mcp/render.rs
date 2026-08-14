@@ -204,30 +204,38 @@ unaffected. Only a later session on the global credentials adopts the change."
 }
 
 /// How this session's runtime tree maps onto the real global one, for the only
-/// tier that has such a tree. A `clauth start` runtime looks per-profile and is
-/// mostly symlinks onto `~/.claude/`, so a model editing `CLAUDE.md` or
-/// `skills/…` under it is editing the global file. The note names
-/// `$CLAUDE_CONFIG_DIR` rather than a constructed path: the real dir carries a
-/// per-session suffix (`runtime-<sid>`, the sid being `<pid>-<seq>`), so any
-/// literal spelled here would point at a directory that does not exist.
+/// tier that has such a tree. A `clauth start` runtime looks per-profile, so a
+/// model editing `CLAUDE.md` or `skills/…` under it may believe the edit is
+/// scoped. The note frames the consequence rather than the transport: a write
+/// under the dir reaches the global file every profile loads, directly on a
+/// symlink host and through the watchdog's newer-mtime mirror on a copy host.
+/// One text serves both, because pinning one mechanism is where the old note
+/// went false: a copy-mode host (Windows without symlink privilege) builds the
+/// tree by recursive copy, so "mostly symlinks" was false there and a
+/// `readlink -f` nudge had nothing to resolve. The dropped gate-binding claim
+/// fell the same way: on a copy the runtime path is not the gated path; the
+/// write reaches the gated file only once the mirror lands it there.
 ///
+/// The note names `$CLAUDE_CONFIG_DIR` rather than a constructed path: the real
+/// dir carries a per-session suffix (`runtime-<sid>`, the sid being `<pid>-<seq>`),
+/// so any literal spelled here would point at a directory that does not exist.
 /// It also names no destination past `~/.claude/`. Whether an entry there chains
 /// on somewhere else is the operator's own layout rather than anything clauth
 /// builds: this box reaches `~/.agents/skills` through a `~/.claude/skills`
 /// symlink the operator made, and a box without it would be told a falsehood.
-/// The closing `readlink -f` covers the general case for every box.
 ///
 /// `Global` has no runtime dir, and `IsolatedCustom` is a foreign
-/// `CLAUDE_CONFIG_DIR` whose layout clauth does not own — neither may claim this
-/// layout. Pure mapping; the caller resolves the [`SessionAuth`].
+/// `CLAUDE_CONFIG_DIR` whose layout clauth does not own, so neither may claim
+/// this layout. Pure mapping; the caller resolves the [`SessionAuth`].
 pub(crate) fn runtime_paths_note(auth: &SessionAuth) -> Option<String> {
     match auth {
         SessionAuth::IsolatedRuntime(name) => Some(format!(
             "runtime paths: this session's config dir (`$CLAUDE_CONFIG_DIR`, profile `{name}`) \
-is mostly SYMLINKS onto the global `~/.claude/<same-name>`. Only `.claude.json`, `settings.json` \
-and `.credentials.json` are per-profile. So a write under that dir lands in the global file every \
-profile and every future session loads, and a rule gating `~/.claude/` binds through it too. \
-`readlink -f` before treating a path as profile-local."
+mirrors the global `~/.claude/<same-name>`: symlinks onto it where the host allows them, a \
+recursive copy the watchdog reconciles where it does not. Only `.claude.json`, `settings.json` \
+and `.credentials.json` are per-profile. So a write under that dir reaches the global file every \
+profile and every future session loads. It lands directly on a symlink host. On a copy host it \
+lands via the watchdog's newer-mtime mirror, at its sync cadence."
         )),
         SessionAuth::Global | SessionAuth::IsolatedCustom => None,
     }

@@ -279,8 +279,8 @@ fn session_auth_variants_shape_switch_note_and_runtime_paths() {
 
     // The runtime-path note is earned by the one tier whose tree clauth builds.
     // A `Global` session has no runtime dir at all, and a custom
-    // `CLAUDE_CONFIG_DIR` is somebody else's layout — claiming the symlink
-    // forest for either would send a model editing a path that does not exist,
+    // `CLAUDE_CONFIG_DIR` is somebody else's layout, so claiming the runtime
+    // layout for either would send a model editing a path that does not exist,
     // or describe a foreign tree it has never read.
     let profiles = vec![snapshot("work", true)];
     let runtime_block = instructions_block(&profiles, &SessionAuth::IsolatedRuntime("work".into()));
@@ -305,11 +305,35 @@ fn session_auth_variants_shape_switch_note_and_runtime_paths() {
         !runtime_block.contains("~/.agents"),
         "the note must not name a path clauth never builds: {runtime_block}",
     );
+    // The transport must never read as one universal mechanism. On a copy-mode
+    // host (no symlink privilege) the tree is a recursive copy, so "mostly
+    // SYMLINKS", the gate-binding claim, and the `readlink -f` nudge were all
+    // false there. The note names both transports and the consequence instead.
+    assert!(
+        runtime_block.contains("watchdog"),
+        "the note must name the copy-host transport: {runtime_block}",
+    );
+    assert!(
+        runtime_block.contains("reaches the global file"),
+        "the note must state the consequence under both transports: {runtime_block}",
+    );
+    assert!(
+        !runtime_block.contains("SYMLINKS"),
+        "the note must not spell the symlink forest as universal: {runtime_block}",
+    );
+    assert!(
+        !runtime_block.contains("binds through"),
+        "the gate-binding claim is false on a copy host: {runtime_block}",
+    );
+    assert!(
+        !runtime_block.contains("readlink"),
+        "the readlink nudge resolves nothing on a copy host: {runtime_block}",
+    );
     for other in [SessionAuth::Global, SessionAuth::IsolatedCustom] {
         assert!(runtime_paths_note(&other).is_none());
         assert!(
             !instructions_block(&profiles, &other).contains("runtime paths:"),
-            "only an isolated `clauth start` runtime may claim the symlink layout",
+            "only an isolated `clauth start` runtime may claim the runtime layout",
         );
     }
 }

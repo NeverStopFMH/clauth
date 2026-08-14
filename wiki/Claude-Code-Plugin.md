@@ -89,7 +89,7 @@ Runs a headless `claude -p` under another profile and returns what it produced.
 
 ## What the server tells the model
 
-On connect it sends a short brief: a one-line index of the five tools, their cost model, what `switch` would do to this specific session, and a roster of your profiles as of session start. A `clauth start` session gets one more note: its runtime directory is mostly symlinks onto your real `~/.claude`, so an edit there is an edit to the global file.
+On connect it sends a short brief: a one-line index of the five tools, their cost model, what `switch` would do to this specific session, and a roster of your profiles as of session start. A `clauth start` session gets one more note: its runtime directory mirrors your real `~/.claude`, so an edit there reaches the global file. On a symlink host it lands directly. On a host that copies the tree (no symlink privilege), clauth's background sync lands it at sync cadence.
 
 The roster groups profiles that share a provider, tier and endpoint host onto one line, and leads with the account that has the most window left. Live usage numbers are deliberately left out of that snapshot, since they go stale immediately; only the ordering reflects them. `list_profiles` is the live read.
 

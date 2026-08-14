@@ -1033,7 +1033,9 @@ async fn delegate_result_one(
 /// The `job_ids` half of `delegate_result`: one result per requested id in the
 /// order given. An absent id is its own `unknown` result, never a batch-level
 /// failure; a done id is evicted only after the whole batch rendered, so a
-/// mid-fold panic leaves every done file as its recoverable copy.
+/// mid-fold panic leaves every done file as its recoverable copy. The
+/// protocol-level error flag mirrors the per-result flags: any failed done
+/// envelope makes the whole batch an error.
 async fn delegate_result_batch(
     job_ids: Vec<String>,
     wait: u64,
@@ -1067,6 +1069,7 @@ async fn delegate_result_batch(
 
     let mut results = Vec::with_capacity(outcomes.len());
     let mut delivered = Vec::new();
+    let mut any_error = false;
     for (id, outcome) in outcomes {
         let entry = match outcome {
             WaitOutcome::Unknown => serde_json::json!({ "job_id": id, "status": "unknown" }),
@@ -1083,18 +1086,26 @@ async fn delegate_result_batch(
                 payload
             }
             WaitOutcome::Done(record) => {
-                let (mut payload, _) = fold_done_envelope(&record);
+                let (mut payload, is_error) = fold_done_envelope(&record);
+                any_error |= is_error;
                 // The folded envelope is always an object (a non-object
                 // self-report is wrapped under `result` first), so the caller's
                 // per-id markers cannot collide with delegate output.
                 if let serde_json::Value::Object(map) = &mut payload {
-                    map.insert("job_id".to_string(), serde_json::Value::String(id));
+                    map.insert("job_id".to_string(), serde_json::Value::String(id.clone()));
                     map.insert(
                         "status".to_string(),
                         serde_json::Value::String("done".to_string()),
                     );
                 }
-                delivered.push(record.job_id);
+                // Evict only when the file self-reports the id it was fetched
+                // under, and evict by that caller-supplied id, never the
+                // stored one: `jobs::remove` joins the id into a path without
+                // a safety check, so a mismatched self-report (a hand-written
+                // file) must never pick the eviction path.
+                if record.job_id == id {
+                    delivered.push(id);
+                }
                 payload
             }
         };
@@ -1106,7 +1117,14 @@ async fn delegate_result_batch(
     for id in delivered {
         jobs::remove(&id);
     }
-    Ok(CallToolResult::success(blocks))
+    // The batch-level error flag mirrors the per-result flags: any failed
+    // delegate makes the whole batch an error, so a client branching on
+    // `isError` reads a failed job the same way in both spellings.
+    if any_error {
+        Ok(CallToolResult::error(blocks))
+    } else {
+        Ok(CallToolResult::success(blocks))
+    }
 }
 
 /// Fold a finished job's envelope the way every delivery path does, returning
@@ -1194,7 +1212,11 @@ fn wait_for_batch(job_ids: &[String], deadline_secs: u64) -> Vec<(String, WaitOu
                 None => *slot = Some(WaitOutcome::Unknown),
             }
         }
-        if !unresolved || start.elapsed() >= deadline {
+        // The deadline is not a break condition: when it passes mid-pass,
+        // the next pass resolves every still-running slot through the
+        // `Running` arm above, so a running id never falls out of the map
+        // below as `Unknown` (that verdict belongs to a missing file only).
+        if !unresolved {
             break;
         }
         std::thread::sleep(JOB_POLL_INTERVAL);

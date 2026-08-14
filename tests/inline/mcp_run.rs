@@ -1208,11 +1208,14 @@ fn delegate_result_batch_returns_one_result_per_id_in_order() {
 #[test]
 fn delegate_result_batch_prose_is_one_block_with_one_line_per_job() {
     let _home = HomeSandbox::new();
+    // The done result is multi-line on purpose: real delegate output wraps,
+    // and a single-line fixture would let the line count pass for the wrong
+    // reason (the count would pin the fixture, not the per-job shape).
     jobs::write_done(
         "d-b1-0",
         "work",
         1,
-        serde_json::json!({"profile": "work", "is_error": false, "result": "all done"}),
+        serde_json::json!({"profile": "work", "is_error": false, "result": "line one\nline two"}),
     )
     .unwrap();
     jobs::write_running("d-b2-0", "work", 1, false).unwrap();
@@ -1231,13 +1234,179 @@ fn delegate_result_batch_prose_is_one_block_with_one_line_per_job() {
         "the prose default must not be a JSON blob"
     );
     let lines: Vec<&str> = text.split('\n').collect();
-    assert_eq!(lines.len(), 3, "one line per job");
-    assert_eq!(lines[0], "job `d-b1-0` finished: all done");
+    let named: Vec<&str> = lines
+        .iter()
+        .copied()
+        .filter(|l| l.starts_with("job `"))
+        .collect();
+    assert_eq!(
+        lines.len(),
+        4,
+        "three named job lines plus one wrapped line of the multi-line result"
+    );
+    assert_eq!(named.len(), 3, "one named line per job");
+    assert_eq!(named[0], "job `d-b1-0` finished: line one");
+    assert_eq!(
+        lines[1], "line two",
+        "a multi-line result wraps inside its own job line"
+    );
     assert!(
-        lines[1].starts_with("job `d-b2-0` running, elapsed"),
+        named[1].starts_with("job `d-b2-0` running, elapsed"),
         "a running line names its id and state: {lines:?}"
     );
-    assert_eq!(lines[2], "job `d-b3-0` unknown");
+    assert_eq!(named[2], "job `d-b3-0` unknown");
+}
+
+/// A batch scan whose deadline passes mid-pass must resolve every id checked
+/// before the crossing by its own state: a still-running file reads
+/// `running`, never the byte-identical `unknown` of an absent id. The scan
+/// straddles the 1s deadline deterministically: the running id sits first
+/// and enough absent ids trail it that one pass of the loop outlasts the
+/// deadline, so the crossing lands between the running id's check and the
+/// loop-bottom deadline test. CPU contention only lengthens the pass.
+#[test]
+fn wait_for_batch_running_id_never_falls_out_as_unknown_at_deadline() {
+    let _home = HomeSandbox::new();
+    jobs::write_running("d-race-0", "work", 1, false).unwrap();
+
+    let trailing = 1_000_000;
+    let mut ids = Vec::with_capacity(trailing + 1);
+    ids.push("d-race-0".to_string());
+    ids.extend((1..=trailing).map(|i| format!("d-race-{i}")));
+
+    let outcomes = wait_for_batch(&ids, 1);
+    assert!(
+        matches!(&outcomes[0].1, WaitOutcome::Running(_)),
+        "a still-running id at the deadline resolves running, never unknown"
+    );
+    assert!(
+        matches!(&outcomes[1].1, WaitOutcome::Unknown),
+        "an absent id resolves unknown, so the scan really read the list"
+    );
+}
+
+#[test]
+fn delegate_result_batch_failed_job_is_a_protocol_error() {
+    let _home = HomeSandbox::new();
+    jobs::write_done(
+        "d-fail-0",
+        "work",
+        1,
+        serde_json::json!({"profile": "work", "is_error": true, "result": "boom"}),
+    )
+    .unwrap();
+    jobs::write_done(
+        "d-ok-0",
+        "work",
+        1,
+        serde_json::json!({"profile": "work", "is_error": false, "result": "fine"}),
+    )
+    .unwrap();
+
+    let result = call_delegate_result_batch(vec!["d-fail-0", "d-ok-0"], Some(0), Some("json"));
+    assert_eq!(
+        result.is_error,
+        Some(true),
+        "any failed job makes the batch a protocol-level error"
+    );
+    let text = result
+        .content
+        .first()
+        .and_then(|c| c.as_text())
+        .map(|t| t.text.clone())
+        .expect("results text");
+    let body: serde_json::Value = serde_json::from_str(&text).expect("results parses as JSON");
+    let results = body["results"].as_array().expect("results is an array");
+    assert_eq!(
+        results[0]["is_error"], true,
+        "the per-result error flag survives inside the content"
+    );
+    assert_eq!(
+        results[1]["is_error"], false,
+        "an ok result keeps its own flag"
+    );
+    assert!(
+        jobs::read("d-fail-0").is_none(),
+        "a failed job is still evicted"
+    );
+    assert!(jobs::read("d-ok-0").is_none(), "an ok job is still evicted");
+
+    jobs::write_done(
+        "d-ok2-0",
+        "work",
+        1,
+        serde_json::json!({"profile": "work", "is_error": false, "result": "fine"}),
+    )
+    .unwrap();
+    let ok_only = call_delegate_result_batch(vec!["d-ok2-0"], Some(0), Some("json"));
+    assert_eq!(
+        ok_only.is_error,
+        Some(false),
+        "an all-ok batch is a protocol-level success"
+    );
+}
+
+#[test]
+fn delegate_result_batch_never_evicts_a_mismatched_stored_job_id() {
+    let _home = HomeSandbox::new();
+    // The unrelated file the stored `job_id` names: it must survive a fetch
+    // of the mismatched file. With the pre-fix code the batch evicted by the
+    // stored id, deleting whatever path the hand-written file pointed at.
+    jobs::write_done(
+        "d-decoy-0",
+        "work",
+        1,
+        serde_json::json!({"profile": "work", "is_error": false, "result": "decoy"}),
+    )
+    .unwrap();
+    // A hand-written job file whose stored `job_id` disagrees with its
+    // filename, a shape `jobs::read` deserializes without complaint.
+    let dir = jobs::jobs_dir().expect("jobs dir");
+    let record = serde_json::json!({
+        "job_id": "d-decoy-0",
+        "profile": "work",
+        "state": "done",
+        "started_at": 1,
+        "monitor": false,
+        "envelope": {"profile": "work", "is_error": false, "result": "stolen"},
+    });
+    std::fs::write(
+        dir.join("d-mis-0.json"),
+        serde_json::to_vec(&record).unwrap(),
+    )
+    .unwrap();
+
+    let result = call_delegate_result_batch(vec!["d-mis-0"], Some(0), Some("json"));
+    assert_eq!(
+        result.is_error,
+        Some(false),
+        "a delivered mismatched file is not an error"
+    );
+    let text = result
+        .content
+        .first()
+        .and_then(|c| c.as_text())
+        .map(|t| t.text.clone())
+        .expect("results text");
+    let body: serde_json::Value = serde_json::from_str(&text).expect("results parses as JSON");
+    let results = body["results"].as_array().expect("results is an array");
+    assert_eq!(
+        results[0]["job_id"], "d-mis-0",
+        "the result is reported under the caller-supplied id"
+    );
+    assert_eq!(results[0]["status"], "done");
+    assert_eq!(
+        results[0]["result"], "stolen",
+        "the mismatched file's envelope is still delivered"
+    );
+    assert!(
+        jobs::read("d-decoy-0").is_some(),
+        "the file the stored id names is never evicted"
+    );
+    assert!(
+        jobs::read("d-mis-0").is_some(),
+        "the mismatched file itself is not evicted"
+    );
 }
 
 #[test]

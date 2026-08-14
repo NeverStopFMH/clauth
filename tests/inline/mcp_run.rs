@@ -206,6 +206,333 @@ fn run_delegate_refuses_a_disabled_target_before_acquiring_a_runtime() {
     );
 }
 
+// ── keyless third-party guard ───────────────────────────────────────────────
+
+/// Mirrors the disabled-target test above: a recognised third-party profile
+/// with no api key is refused before `ProfileRuntime::acquire`, because the
+/// spawned `claude` has nothing to authenticate with and dies on an empty
+/// envelope. The keyed / OAuth / Alibaba tests below are the canaries that the
+/// guard does not over-fire.
+#[test]
+fn run_delegate_refuses_a_keyless_third_party_target_before_acquiring_a_runtime() {
+    let home = HomeSandbox::new();
+    let mut config = crate::profile::AppConfig {
+        state: crate::profile::AppState::default(),
+        profiles: Vec::new(),
+    };
+    crate::actions::create_blank_profile(
+        &mut config,
+        "ds-nokey".to_string(),
+        Some("https://api.deepseek.com".to_string()),
+        None,
+        None,
+    )
+    .expect("create profile");
+
+    let err = run_delegate(DelegateOpts {
+        profile: "ds-nokey",
+        prompt: "hello",
+        model: None,
+        cwd: None,
+        env: HashMap::new(),
+        extra_args: Vec::new(),
+        timeout_secs: Some(30),
+        idle_secs: None,
+        resume: None,
+        isolation: Isolation::Shared,
+        depth: 0,
+    })
+    .expect_err("a keyless third-party target must be refused");
+    assert_eq!(err, "profile has no api key: ds-nokey");
+
+    assert!(
+        !home
+            .home()
+            .join(".clauth")
+            .join("profiles")
+            .join("ds-nokey")
+            .join("runtime")
+            .exists(),
+        "the refusal must happen before any runtime is acquired"
+    );
+}
+
+/// Drive `run_delegate` for `profile` with a `cwd` that does not exist. The
+/// cwd check is the first gate AFTER the credential guard, so reaching it
+/// proves the guard let the profile through while the run still stops before
+/// `ProfileRuntime::acquire` or any spawn. Returns the refusal reason.
+fn delegate_stops_at_the_cwd_gate(profile: &str, cwd: &std::path::Path) -> String {
+    run_delegate(DelegateOpts {
+        profile,
+        prompt: "hello",
+        model: None,
+        cwd: cwd.to_str(),
+        env: HashMap::new(),
+        extra_args: Vec::new(),
+        timeout_secs: Some(30),
+        idle_secs: None,
+        resume: None,
+        isolation: Isolation::Shared,
+        depth: 0,
+    })
+    .expect_err("the cwd gate must refuse the run")
+}
+
+#[test]
+fn run_delegate_does_not_refuse_a_keyed_third_party_target() {
+    let home = HomeSandbox::new();
+    let mut config = crate::profile::AppConfig {
+        state: crate::profile::AppState::default(),
+        profiles: Vec::new(),
+    };
+    crate::actions::create_blank_profile(
+        &mut config,
+        "ds-key".to_string(),
+        Some("https://api.deepseek.com".to_string()),
+        Some("sk-test".to_string()),
+        None,
+    )
+    .expect("create profile");
+
+    let bad_cwd = home.home().join("does-not-exist");
+    let err = delegate_stops_at_the_cwd_gate("ds-key", &bad_cwd);
+    assert_eq!(
+        err,
+        format!(
+            "cwd does not exist or is not a directory: {}",
+            bad_cwd.display()
+        ),
+        "a keyed third-party profile passes the guard and stops at the cwd gate"
+    );
+}
+
+#[test]
+fn run_delegate_does_not_refuse_an_oauth_profile() {
+    let home = HomeSandbox::new();
+    let mut config = crate::profile::AppConfig {
+        state: crate::profile::AppState::default(),
+        profiles: Vec::new(),
+    };
+    crate::actions::create_blank_profile(&mut config, "oauth1".to_string(), None, None, None)
+        .expect("create profile");
+
+    let bad_cwd = home.home().join("does-not-exist");
+    let err = delegate_stops_at_the_cwd_gate("oauth1", &bad_cwd);
+    assert_eq!(
+        err,
+        format!(
+            "cwd does not exist or is not a directory: {}",
+            bad_cwd.display()
+        ),
+        "an OAuth profile passes the guard and stops at the cwd gate"
+    );
+}
+
+#[test]
+fn run_delegate_does_not_refuse_a_keyless_alibaba_profile() {
+    let home = HomeSandbox::new();
+    let mut config = crate::profile::AppConfig {
+        state: crate::profile::AppState::default(),
+        profiles: Vec::new(),
+    };
+    crate::actions::create_blank_profile(
+        &mut config,
+        "qwen".to_string(),
+        Some("https://token-plan.ap-southeast-1.maas.aliyuncs.com".to_string()),
+        None,
+        None,
+    )
+    .expect("create profile");
+
+    let bad_cwd = home.home().join("does-not-exist");
+    let err = delegate_stops_at_the_cwd_gate("qwen", &bad_cwd);
+    assert_eq!(
+        err,
+        format!(
+            "cwd does not exist or is not a directory: {}",
+            bad_cwd.display()
+        ),
+        "an Alibaba profile passes the guard and stops at the cwd gate"
+    );
+}
+
+#[test]
+fn resolve_fanout_refuses_a_keyless_third_party_member_by_name() {
+    let _home = HomeSandbox::new();
+    let mut config = crate::profile::AppConfig {
+        state: crate::profile::AppState::default(),
+        profiles: Vec::new(),
+    };
+    crate::actions::create_blank_profile(
+        &mut config,
+        "ds-key".to_string(),
+        Some("https://api.deepseek.com".to_string()),
+        Some("sk-test".to_string()),
+        None,
+    )
+    .expect("create profile");
+    crate::actions::create_blank_profile(&mut config, "oauth1".to_string(), None, None, None)
+        .expect("create profile");
+    crate::actions::create_blank_profile(
+        &mut config,
+        "qwen".to_string(),
+        Some("https://token-plan.ap-southeast-1.maas.aliyuncs.com".to_string()),
+        None,
+        None,
+    )
+    .expect("create profile");
+    crate::actions::create_blank_profile(
+        &mut config,
+        "ds-nokey".to_string(),
+        Some("https://api.deepseek.com".to_string()),
+        None,
+        None,
+    )
+    .expect("create profile");
+
+    // The keyed, OAuth, and Alibaba members come FIRST on purpose: if the
+    // guard over-fired on any of them the refusal would name that name and
+    // this assertion would red.
+    let raw: Vec<String> = ["ds-key", "oauth1", "qwen", "ds-nokey"]
+        .iter()
+        .map(|n| (*n).to_string())
+        .collect();
+    let err =
+        resolve_fanout(&config, &raw).expect_err("a keyless member refuses the whole fan-out");
+    assert_eq!(err, "profile has no api key: ds-nokey");
+}
+
+#[test]
+fn resolve_fanout_passes_when_every_member_is_delegable() {
+    let _home = HomeSandbox::new();
+    let mut config = crate::profile::AppConfig {
+        state: crate::profile::AppState::default(),
+        profiles: Vec::new(),
+    };
+    crate::actions::create_blank_profile(
+        &mut config,
+        "ds-key".to_string(),
+        Some("https://api.deepseek.com".to_string()),
+        Some("sk-test".to_string()),
+        None,
+    )
+    .expect("create profile");
+    crate::actions::create_blank_profile(&mut config, "oauth1".to_string(), None, None, None)
+        .expect("create profile");
+    crate::actions::create_blank_profile(
+        &mut config,
+        "qwen".to_string(),
+        Some("https://token-plan.ap-southeast-1.maas.aliyuncs.com".to_string()),
+        None,
+        None,
+    )
+    .expect("create profile");
+
+    let raw: Vec<String> = ["ds-key", "oauth1", "qwen"]
+        .iter()
+        .map(|n| (*n).to_string())
+        .collect();
+    let names = resolve_fanout(&config, &raw).expect("every member has a credential");
+    assert_eq!(names, vec!["ds-key", "oauth1", "qwen"]);
+}
+
+/// The handler-level pin: a background fan-out with a keyless member refuses
+/// before any job file is reserved, so no account gets spent under a call
+/// reported as failed. Mirrors `background_depth_guard_refuses_without_writing_job`.
+#[test]
+fn background_fanout_refuses_a_keyless_member_before_writing_jobs() {
+    let _home = HomeSandbox::new();
+    let mut config = crate::profile::AppConfig {
+        state: crate::profile::AppState::default(),
+        profiles: Vec::new(),
+    };
+    crate::actions::create_blank_profile(
+        &mut config,
+        "solo".to_string(),
+        Some("https://api.deepseek.com".to_string()),
+        Some("sk-test".to_string()),
+        None,
+    )
+    .expect("create profile");
+    crate::actions::create_blank_profile(
+        &mut config,
+        "vendor".to_string(),
+        Some("https://api.deepseek.com".to_string()),
+        None,
+        None,
+    )
+    .expect("create profile");
+
+    // Pin the depth to 0: the host that runs this suite may itself be a
+    // delegate child (`CLAUTH_MCP_DEPTH=1`), which would refuse at the depth
+    // guard before the fan-out guard this test pins.
+    let saved = std::env::var(MCP_DEPTH_ENV).ok();
+    // SAFETY: test-only, serialized by HOME_TEST_LOCK (held by the sandbox),
+    // restored unconditionally below.
+    unsafe { std::env::set_var(MCP_DEPTH_ENV, "0") };
+
+    let server = ClauthServer::new();
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .expect("runtime");
+    let result = rt
+        .block_on(async {
+            server
+                .delegate(Parameters(DelegateArgs {
+                    profile: None,
+                    profiles: Some(vec!["solo".to_string(), "vendor".to_string()]),
+                    prompt: Some("hello".to_string()),
+                    prompt_file: None,
+                    model: None,
+                    cwd: None,
+                    env: None,
+                    args: None,
+                    timeout_secs: None,
+                    idle_secs: None,
+                    resume: None,
+                    isolated: None,
+                    background: Some(true),
+                    monitor: None,
+                    format: Some("json".to_string()),
+                }))
+                .await
+        })
+        .expect("delegate returns a tool result, never a transport error");
+
+    // SAFETY: same as above — restore the prior value.
+    unsafe {
+        match &saved {
+            Some(v) => std::env::set_var(MCP_DEPTH_ENV, v),
+            None => std::env::remove_var(MCP_DEPTH_ENV),
+        }
+    }
+
+    assert_eq!(
+        result.is_error,
+        Some(true),
+        "a keyless member refuses the fan-out"
+    );
+    let text = result
+        .content
+        .first()
+        .and_then(|c| c.as_text())
+        .map(|t| t.text.clone())
+        .expect("error envelope text");
+    let envelope: serde_json::Value = serde_json::from_str(&text).expect("parse envelope");
+    assert_eq!(envelope["is_error"], serde_json::Value::Bool(true));
+    assert_eq!(
+        envelope["result"].as_str().expect("reason string"),
+        "profile has no api key: vendor",
+        "the refusal names the keyless profile and what it lacks"
+    );
+    let job_count = jobs::jobs_dir()
+        .ok()
+        .and_then(|d| std::fs::read_dir(d).ok())
+        .map(|rd| rd.flatten().count())
+        .unwrap_or(0);
+    assert_eq!(job_count, 0, "a refused fan-out writes no job file");
+}
+
 // TODO(manual/integration): the live-spawn paths cannot be unit-tested without a
 // real `claude` on PATH, and we deliberately do NOT fake one (a fake binary
 // would assert nothing about the real envelope contract). Verify by hand:

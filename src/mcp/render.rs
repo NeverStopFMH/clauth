@@ -427,6 +427,9 @@ fn profile_line(row: &Value) -> String {
     {
         out.push_str("; live session");
     }
+    if row.get("keyless").and_then(Value::as_bool).unwrap_or(false) {
+        out.push_str("; no api key");
+    }
     if let Some(rows) = row.get("throughput").and_then(Value::as_array)
         && !rows.is_empty()
     {

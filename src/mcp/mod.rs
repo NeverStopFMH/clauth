@@ -393,9 +393,10 @@ Reading the JSON: `utilization_pct` in `windows[]` is the percent of that window
 higher means less headroom. `tier` is the plan label; a canceled subscription reports the org's \
 post-cancellation tier (`Free`), never the word `canceled`. `host` is the endpoint's host, absent \
 for a default OAuth profile. `third_party` is a cached balance or quota headline for provider-key \
-profiles. Two fields appear only when they carry news: `has_live_session` when a clauth-managed \
-session already owns the profile, and `throughput[]` (observed tok/s from past `delegate` calls) \
-only for a model that is `degraded` or `rate_limited_recent` — either makes it a bad pick. \
+profiles. Three fields appear only when they carry news: `has_live_session` when a clauth-managed \
+session already owns the profile, `throughput[]` (observed tok/s from past `delegate` calls) only \
+for a model that is `degraded` or `rate_limited_recent` (either makes it a bad pick), and `keyless` \
+when a third-party profile has no inference auth source (a `delegate` there refuses). \
 Replies in prose by default; pass `format: \"json\"` for the structured roster."
     )]
     async fn list_profiles(
@@ -481,6 +482,15 @@ Replies in prose by default; pass `format: \"json\"` for the structured roster."
                 let warnings = throughput_warnings(name, now);
                 if !warnings.is_empty() {
                     row["throughput"] = serde_json::Value::Array(warnings);
+                }
+                // A third-party profile with no inference auth source is a
+                // delegate target that refuses at the spawn gate, so this flags
+                // it before the picker spends the call. `has_inference_auth` is
+                // the delegate guard's own predicate, not the usage predicate
+                // `third_party_credentialed` (which wrongly exempts Alibaba's
+                // console session).
+                if p.is_third_party() && !crate::claude::has_inference_auth(p) {
+                    row["keyless"] = serde_json::json!(true);
                 }
                 row
             })

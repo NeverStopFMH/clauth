@@ -451,6 +451,51 @@ fn prompt_handle_at_cap_is_accepted() {
     );
 }
 
+/// An invalid byte sequence must be refused by name with the byte offset of the
+/// first invalid byte, never lossily decoded: a delegate spends a real window on
+/// the prompt, so a mis-encoded file must not become a subtly wrong prompt.
+/// The prefix carries multi-byte characters so the pinned offset can only be a
+/// byte offset — a char-offset reading of the same failure would disagree.
+#[test]
+fn prompt_handle_invalid_utf8_is_refused_by_name() {
+    let home = HomeSandbox::new();
+    let path = home.home().join("bad.txt");
+    let mut bytes = "valid préfix ☃".as_bytes().to_vec();
+    bytes.push(0xFF);
+    let expected_offset = bytes
+        .iter()
+        .position(|&b| b == 0xFF)
+        .expect("bad byte present");
+    std::fs::write(&path, &bytes).expect("write bad.txt");
+    let file = std::fs::File::open(&path).expect("open bad.txt");
+
+    let reason = super::read_prompt_handle(file, "bad.txt")
+        .expect_err("an invalid UTF-8 prompt is refused, not decoded");
+    for needle in [
+        "prompt_file `bad.txt`",
+        "invalid UTF-8",
+        &format!("byte offset {expected_offset}"),
+    ] {
+        assert!(
+            reason.contains(needle),
+            "the reason names {needle:?}: {reason}"
+        );
+    }
+}
+
+/// Valid multi-byte UTF-8 reads unchanged: the strict decode refuses only what
+/// is not UTF-8.
+#[test]
+fn prompt_handle_multibyte_utf8_is_accepted() {
+    let home = HomeSandbox::new();
+    let path = home.home().join("utf8.txt");
+    std::fs::write(&path, "héllo ☃ £").expect("write utf8.txt");
+    let file = std::fs::File::open(&path).expect("open utf8.txt");
+
+    let text = super::read_prompt_handle(file, "utf8.txt").expect("valid UTF-8 is read");
+    assert_eq!(text, "héllo ☃ £", "the prompt is read unchanged");
+}
+
 // ── profiles fan-out guards ──────────────────────────────────────────────────
 
 #[test]

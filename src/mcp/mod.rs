@@ -642,7 +642,7 @@ under that account's credentials. It SPENDS that account's window or money, so p
 from `list_profiles`. It sees only the `prompt` you pass and has no view of this conversation, so \
 state the whole task there.\n\n\
 Give exactly one prompt source: `prompt` inline, or `prompt_file` — a path relative to `cwd` \
-whose contents are the prompt. `prompt_file` is read once (validated against `cwd`, size-capped) \
+whose contents are the prompt. `prompt_file` is read once (validated against `cwd`, size-capped, refused when not UTF-8) \
 so a long reusable prompt costs your context nothing to pass, and a `profiles` fan-out reuses \
 that one read across every account. Exactly one target too: `profile` for one account, or \
 `profiles` for a background-only fan-out that spawns one delegate per named account and spends \
@@ -2239,7 +2239,8 @@ fn read_prompt_file(cwd: Option<&str>, rel: &str) -> std::result::Result<String,
 /// Read the validated prompt handle with a hard byte ceiling. A file can grow
 /// past the cap between the size check above and the read; `take` bounds the
 /// read to cap + 1, and a read that actually hit the bound is refused by name
-/// instead of silently truncating the prompt.
+/// instead of silently truncating the prompt. Invalid UTF-8 is refused by name
+/// at the byte offset, never lossily decoded.
 fn read_prompt_handle(file: std::fs::File, rel: &str) -> std::result::Result<String, String> {
     let mut reader = file.take(PROMPT_FILE_CAP + 1);
     let mut buf = Vec::new();
@@ -2250,7 +2251,13 @@ fn read_prompt_handle(file: std::fs::File, rel: &str) -> std::result::Result<Str
             "prompt_file `{rel}` refused: grew past the {PROMPT_FILE_CAP} byte cap during the read"
         ));
     }
-    Ok(String::from_utf8_lossy(&buf).into_owned())
+    let text = std::str::from_utf8(&buf).map_err(|e| {
+        format!(
+            "prompt_file `{rel}` refused: invalid UTF-8 at byte offset {}",
+            e.valid_up_to()
+        )
+    })?;
+    Ok(text.to_string())
 }
 
 /// Record ONE background job's `running` file and return its `(job_id,

@@ -2331,6 +2331,8 @@ fn the_delegate_description_keeps_its_load_bearing_warnings() {
         "Prefer `background` for a slow or third-party endpoint",
         // a self-report is not a verified result
         "spot-verify it like any subagent",
+        // a mis-encoded prompt file is refused, not silently mangled
+        "refused when not UTF-8",
     ] {
         assert!(
             text.contains(phrase),

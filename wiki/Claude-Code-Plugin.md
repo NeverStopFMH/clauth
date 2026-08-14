@@ -69,7 +69,7 @@ Runs a headless `claude -p` under another profile and returns what it produced.
 
 **What it sees.** Only the prompt you pass. It has no view of the calling conversation, so the prompt has to carry the whole task.
 
-**Prompt file.** `prompt_file` reads the prompt from a path relative to the delegate's `cwd` instead of passing it inline, so a long reusable prompt costs your context nothing to hand over. It is validated against `cwd` and refused by name when it is absolute, escapes `cwd`, resolves through a symlink outside `cwd`, is not a regular file, or is over 64 KiB. Give exactly one of `prompt` / `prompt_file`.
+**Prompt file.** `prompt_file` reads the prompt from a path relative to the delegate's `cwd` instead of passing it inline, so a long reusable prompt costs your context nothing to hand over. It is validated against `cwd` and refused by name when it is absolute, escapes `cwd`, resolves through a symlink outside `cwd`, is not a regular file, is not valid UTF-8, or is over 64 KiB. Give exactly one of `prompt` / `prompt_file`.
 
 **Fan-out.** `profiles` spawns one delegate per named account, background-only, and spends one real usage window per account. It returns one `job_id` per account and echoes the resolved target list. Duplicate names (case-insensitive), unknown names, a disabled member, a member with no inference auth (no usable api key and no `ANTHROPIC_AUTH_TOKEN`/`ANTHROPIC_API_KEY` in its `[env]`), an empty list, and a blocking call are refused before any spawn. Give exactly one of `profile` / `profiles`.
 

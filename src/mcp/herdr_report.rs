@@ -163,12 +163,16 @@ impl PaneReporter {
     /// spawn, which is orders of magnitude wider than the window a seq minted
     /// off the decision would invert in, so a fixture that reports cannot
     /// observe the ordering these two promise.
-    #[cfg(test)]
+    ///
+    /// `unix` tracks the gate on the only suite that calls them: its shim herdr
+    /// is POSIX shell, so the whole module compiles out on the Windows leg and
+    /// an ungated helper reds that leg alone under `-D warnings`.
+    #[cfg(all(test, unix))]
     pub(super) fn enter_for_test(&self) -> Option<u64> {
         self.enter()
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(super) fn leave_for_test(&self) -> Option<u64> {
         self.leave()
     }

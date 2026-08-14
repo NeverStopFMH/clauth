@@ -249,7 +249,10 @@ fn list_profiles_carries_no_digest_and_consumes_nothing() {
 }
 
 /// Seed two cleanly-linked registered profiles, active + target, the shape a
-/// successful switch needs (mirrors the switch-tool suite's fixture).
+/// successful switch needs (mirrors the switch-tool suite's fixture). Gated
+/// with its only caller below: ungated it is dead code on the Windows leg,
+/// which lints at `-D warnings`.
+#[cfg(unix)]
 fn seed_switchable_pair() {
     use crate::claude::force_link_profile_credentials;
     use crate::profile::{ClaudeCredentials, OAuthToken, Profile, save_profile};

@@ -54,7 +54,7 @@ Alibaba is the one provider whose api key cannot read its own quota: every quota
 
 The 48-hour clock runs from your aliyun console sign-in, so it is already ticking by the time `clauth login` captures the session. Running the login again inherits whatever is left of that window, which can be minutes; sign in to the Alibaba console afresh first if you want a full one. Once it lapses, clauth stops polling that account: the Usage tab reads `console login expired, run clauth login` and `clauth list` marks it `(login expired)`. Polling resumes the moment a new session lands on disk, with no restart.
 
-An account with no api key at all still gets its usage panel, since the quota rides the console session. It just cannot run Claude Code until you add a key.
+An account with no api key at all still gets its usage panel, since the quota rides the console session. It just cannot run Claude Code until you add a key (or an auth token in its `[env]`).
 
 The Setup tab's `re-login` row runs this same console flow on a Model Studio account, so the shell is no longer the only route to it. Starting one from nothing is still two steps, because the console a session comes from is read off the endpoint: give the account a Qwen preset first, then log in.
 

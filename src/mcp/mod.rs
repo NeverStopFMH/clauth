@@ -1106,8 +1106,9 @@ as something moves. The digest watches three local-disk observables — the conf
 profile, that profile's usage cache, and `~/.claude/.credentials.json` — so this costs no network \
 and no quota. `wait_secs` (0..=60, default 0) bounds the wait: 0 samples once, and a wait that \
 elapses with nothing moved returns `status: \"unchanged\"` with `waited_secs`. A first digest \
-call has no earlier state to compare against, so it sets the baseline and returns \
-`status: \"armed\"`. Pass `kinds` (subset of `active_profile`, `usage_cache`, `credentials`; \
+call has no earlier state to compare against, so it sets the baseline: with no wait it returns \
+`status: \"armed\"` at once, and with a wait it polls on against the baseline it just set. \
+Pass `kinds` (subset of `active_profile`, `usage_cache`, `credentials`; \
 default all three) to wait on less: a filtered wait leaves the unwatched observables' changes for \
 the next digest-bearing reply to report. Prose by default; pass `format: \"json\"` for the \
 structured payload."

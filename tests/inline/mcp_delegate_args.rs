@@ -531,7 +531,9 @@ fn profiles_blocking_is_refused_by_name() {
 #[test]
 fn fanout_reserve_failure_is_refused_by_name() {
     let home = HomeSandbox::new();
-    seed_profiles(&["solo", "vendor"], true);
+    // Enabled members: a disabled one would refuse at the pre-flight before
+    // the reserve this test pins.
+    seed_profiles(&["solo", "vendor"], false);
     let jobs = home.home().join(".clauth").join("jobs");
     std::fs::create_dir_all(jobs.parent().unwrap()).expect("clauth dir");
     std::fs::write(&jobs, b"not a dir").expect("jobs path is a file");
@@ -545,17 +547,147 @@ fn fanout_reserve_failure_is_refused_by_name() {
     assert_refusal(&result, &["failed to record job"]);
 }
 
+// ── background pre-flight guards ─────────────────────────────────────────────
+
+/// Seed `name` as a keyless third-party profile: a real DeepSeek endpoint with
+/// no api key, so the pre-flight refuses it before any job is reserved.
+fn seed_keyless_third_party(name: &str) {
+    let mut config = AppConfig {
+        state: AppState::default(),
+        profiles: Vec::new(),
+    };
+    crate::actions::create_blank_profile(
+        &mut config,
+        name.to_string(),
+        Some("https://api.deepseek.com".to_string()),
+        None,
+        None,
+    )
+    .expect("create profile");
+}
+
+/// The refusal envelope carries no job handle: no `job_id` key on a
+/// single-target refusal, no `jobs` key on a fan-out refusal.
+fn assert_no_job_keys(result: &CallToolResult) {
+    let body: serde_json::Value =
+        serde_json::from_str(&first_text(result)).expect("refusal is JSON");
+    assert!(body.get("job_id").is_none(), "no job_id in the refusal");
+    assert!(body.get("jobs").is_none(), "no jobs key in the refusal");
+}
+
+/// Nothing was reserved: the sandbox jobs dir is absent or empty.
+fn assert_no_job_files() {
+    // `HomeSandbox` holds the home override for the caller's whole body, so a
+    // resolution failure here is a harness break, not an absent reservation.
+    let dir = jobs::jobs_dir().expect("jobs dir resolvable");
+    if !dir.exists() {
+        return;
+    }
+    let entries: Vec<_> = std::fs::read_dir(&dir)
+        .expect("jobs dir readable")
+        .flatten()
+        .collect();
+    assert!(
+        entries.is_empty(),
+        "a refused delegate reserves no job file"
+    );
+}
+
+/// A background single delegate to a keyless third-party profile refuses
+/// synchronously, before a job file exists: the caller must not get a
+/// `running` job whose collected result later carries the refusal.
+#[test]
+fn background_single_keyless_third_party_refuses_before_reserving_a_job() {
+    let _home = HomeSandbox::new();
+    seed_keyless_third_party("zzbg-ds");
+
+    let result = call_delegate(DelegateArgs {
+        profile: Some("zzbg-ds".to_string()),
+        prompt: Some("hi".to_string()),
+        background: Some(true),
+        ..base()
+    });
+    assert_refusal(&result, &["profile has no api key: zzbg-ds"]);
+    assert_no_job_keys(&result);
+    assert_no_job_files();
+}
+
+/// The disabled sibling: a background single delegate to a disabled profile
+/// refuses synchronously too, before a job file exists.
+#[test]
+fn background_single_disabled_target_refuses_before_reserving_a_job() {
+    let _home = HomeSandbox::new();
+    seed_profiles(&["zzbg-off"], true);
+
+    let result = call_delegate(DelegateArgs {
+        profile: Some("zzbg-off".to_string()),
+        prompt: Some("hi".to_string()),
+        background: Some(true),
+        ..base()
+    });
+    assert_refusal(&result, &["profile is disabled: zzbg-off"]);
+    assert_no_job_keys(&result);
+    assert_no_job_files();
+}
+
+/// A disabled fan-out member refuses the whole list synchronously, by name,
+/// before the first job file is reserved. Same pre-flight as the
+/// single-background arm, closing the fan-out's disabled gap.
+#[test]
+fn background_fanout_with_a_disabled_member_refuses_before_writing_jobs() {
+    let _home = HomeSandbox::new();
+    // One config for both members: `load_config` reads the roster from the app
+    // state, so a second fresh config would overwrite the first member.
+    let mut config = AppConfig {
+        state: AppState::default(),
+        profiles: Vec::new(),
+    };
+    crate::actions::create_blank_profile(&mut config, "zzbg-off".to_string(), None, None, None)
+        .expect("create profile");
+    crate::actions::disable_profile(&mut config, "zzbg-off").expect("disable profile");
+    crate::actions::create_blank_profile(
+        &mut config,
+        "zzbg-ds".to_string(),
+        Some("https://api.deepseek.com".to_string()),
+        None,
+        None,
+    )
+    .expect("create profile");
+
+    // The disabled member comes FIRST: the pre-flight walks members in order,
+    // so the refusal names it, not the keyless member behind it.
+    let result = call_delegate(DelegateArgs {
+        profiles: Some(vec!["zzbg-off".to_string(), "zzbg-ds".to_string()]),
+        prompt: Some("hi".to_string()),
+        background: Some(true),
+        ..base()
+    });
+    assert_refusal(&result, &["profile is disabled: zzbg-off"]);
+    assert_no_job_keys(&result);
+    assert_no_job_files();
+}
+
 // ── happy path + format honouring ────────────────────────────────────────────
 
 #[test]
 fn a_valid_fanout_returns_one_job_per_account() {
-    let _home = HomeSandbox::new();
-    seed_profiles(&["solo", "vendor"], true);
+    let home = HomeSandbox::new();
+    seed_profiles(&["solo", "vendor"], false);
 
+    // The members are enabled (a disabled member now refuses the fan-out at
+    // the pre-flight); a nonexistent cwd stops each detached task at the cwd
+    // gate so no stray claude spawns on the blank enabled profiles.
     let result = call_delegate(DelegateArgs {
         profiles: Some(vec!["solo".to_string(), "VENDOR".to_string()]),
         prompt: Some("hi".to_string()),
         background: Some(true),
+        cwd: Some(
+            home.home()
+                .join("does-not-exist")
+                .to_str()
+                .unwrap()
+                .to_string(),
+        ),
         ..base()
     });
     assert_ne!(
@@ -627,13 +759,22 @@ fn prose_refusals_read_as_a_sentence_and_stay_one_block() {
 
 #[test]
 fn fanout_prose_names_each_target_with_its_job() {
-    let _home = HomeSandbox::new();
-    seed_profiles(&["solo", "vendor"], true);
+    let home = HomeSandbox::new();
+    seed_profiles(&["solo", "vendor"], false);
 
+    // Enabled members plus a nonexistent cwd: same stray-spawn guard as the
+    // JSON fan-out test above.
     let result = call_delegate(DelegateArgs {
         profiles: Some(vec!["solo".to_string(), "vendor".to_string()]),
         prompt: Some("hi".to_string()),
         background: Some(true),
+        cwd: Some(
+            home.home()
+                .join("does-not-exist")
+                .to_str()
+                .unwrap()
+                .to_string(),
+        ),
         format: None,
         ..base()
     });

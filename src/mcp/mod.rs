@@ -31,7 +31,7 @@ use serde::Deserialize;
 
 use crate::logline::logline;
 use crate::out::outln;
-use crate::profile::{AppConfig, load_config};
+use crate::profile::{AppConfig, Profile, load_config};
 use crate::profile_cache::{THIRD_PARTY_CACHE_FILE, USAGE_CACHE_FILE, load_profile_cache};
 use crate::profile_json::{provider_label, tier_label, windows_json};
 use crate::providers::ThirdPartyStats;
@@ -779,6 +779,21 @@ Prose by default; pass `format: \"json\"` for the structured envelope."
         if background.unwrap_or(false) {
             match target {
                 Target::One(name) => {
+                    // Refuse a disabled or keyless third-party target BEFORE the
+                    // job file is reserved: the caller gets the refusal
+                    // synchronously, never a running job whose collected result
+                    // carries it. The blocking path refuses the same pair inside
+                    // `run_delegate`; `resolve_fanout` runs the same pre-flight
+                    // per fan-out member.
+                    let target = config.find(&name).ok_or_else(|| {
+                        ErrorData::internal_error(
+                            "resolved target missing from config".to_string(),
+                            None,
+                        )
+                    })?;
+                    if let Err(reason) = preflight_target(target, &name) {
+                        return Ok(delegate_refusal(format, &reason));
+                    }
                     let opts = BackgroundOpts {
                         prompt,
                         model,
@@ -821,10 +836,11 @@ Prose by default; pass `format: \"json\"` for the structured envelope."
                     };
                     let monitor = monitor.unwrap_or(false);
                     // Reserve every job file BEFORE the first spawn: the reserve
-                    // is the only fallible step (ENOSPC / perms on the jobs dir),
-                    // so a failure here spends no window and loses no job id. The
-                    // ids already reserved exist nowhere else; drop them and keep
-                    // the all-or-nothing contract.
+                    // is the only fallible step left here (ENOSPC / perms on the
+                    // jobs dir; the target pre-flight already ran in
+                    // `resolve_fanout`), so a failure spends no window and loses
+                    // no job id. The ids already reserved exist nowhere else;
+                    // drop them and keep the all-or-nothing contract.
                     let mut handles = Vec::with_capacity(names.len());
                     for name in &names {
                         match reserve_background_job(name, monitor) {
@@ -1802,22 +1818,10 @@ fn run_delegate(opts: DelegateOpts<'_>) -> std::result::Result<serde_json::Value
         .ok_or_else(|| format!("profile not found: {}", opts.profile))?;
     // Mirrors `disable_profile`'s own live-session refusal from the other
     // direction: that guard stops disabling a profile mid-session, this one
-    // stops opening a brand-new session on one already disabled.
-    if target.is_disabled() {
-        return Err(format!("profile is disabled: {}", opts.profile));
-    }
-    // A recognised third-party profile whose inference has nothing to
-    // authenticate with would spawn a `claude` that dies on an empty envelope,
-    // so refuse by name instead of spending a window on a run that cannot work.
-    // The test is `has_inference_auth`, the predicate derived from
-    // `build_claude_settings_json` (a validated api key, or a profile `env`
-    // entry carrying `ANTHROPIC_AUTH_TOKEN` / `ANTHROPIC_API_KEY`) — NOT the
-    // usage predicate `third_party_credentialed`, whose Alibaba exemption
-    // reads the console session that authenticates the quota gateway only.
-    // `is_third_party` scopes the check: an OAuth account has no provider.
-    if target.is_third_party() && !crate::claude::has_inference_auth(target) {
-        return Err(format!("profile has no api key: {}", opts.profile));
-    }
+    // stops opening a brand-new session on one already disabled. Also the
+    // backstop for a background job whose target changed after its pre-flight,
+    // since the config is re-loaded here. Guard rationale: `preflight_target`.
+    preflight_target(target, opts.profile)?;
 
     if let Some(dir) = opts.cwd
         && !std::path::Path::new(dir).is_dir()
@@ -2042,11 +2046,34 @@ fn run_delegate(opts: DelegateOpts<'_>) -> std::result::Result<serde_json::Value
     Ok(envelope)
 }
 
+/// Refuse a resolved target that `delegate` must not spend on: a profile the
+/// operator disabled, or a recognised third-party profile whose inference has
+/// nothing to authenticate with (which would spawn a `claude` that dies on an
+/// empty envelope). The keyless test is `has_inference_auth`, the predicate
+/// derived from `build_claude_settings_json` (a validated api key, or a
+/// profile `env` entry carrying `ANTHROPIC_AUTH_TOKEN` / `ANTHROPIC_API_KEY`)
+/// — NOT the usage predicate `third_party_credentialed`, whose Alibaba
+/// exemption reads the console session that authenticates the quota gateway
+/// only. `is_third_party` scopes the check: an OAuth account has no provider.
+/// Called from every path that refuses before a spawn: the single-background
+/// arm and `resolve_fanout` up front, and `run_delegate` as the blocking
+/// path's own check plus the backstop for a target that changed after its
+/// pre-flight (the config is re-loaded there).
+fn preflight_target(profile: &Profile, name: &str) -> std::result::Result<(), String> {
+    if profile.is_disabled() {
+        return Err(format!("profile is disabled: {name}"));
+    }
+    if profile.is_third_party() && !crate::claude::has_inference_auth(profile) {
+        return Err(format!("profile has no api key: {name}"));
+    }
+    Ok(())
+}
+
 /// Resolve a `profiles` fan-out list to canonical target names. Refuses by name:
 /// a list over [`MAX_FANOUT`], a duplicate (case-insensitive, the same rule a
-/// single `profile` resolves under), a name resolving to no account, or a
-/// recognised third-party member with no inference auth source. Runs before
-/// any spawn: N delegates is N real usage windows with no undo.
+/// single `profile` resolves under), a name resolving to no account, a disabled
+/// member, or a recognised third-party member with no inference auth source.
+/// Runs before any spawn: N delegates is N real usage windows with no undo.
 fn resolve_fanout(config: &AppConfig, raw: &[String]) -> std::result::Result<Vec<String>, String> {
     // An empty list passes every check below vacuously and would return a
     // success-shaped `{"jobs": []}` that spent nothing and spawned nothing.
@@ -2078,20 +2105,16 @@ fn resolve_fanout(config: &AppConfig, raw: &[String]) -> std::result::Result<Vec
     if !missing.is_empty() {
         return Err(format!("profile not found: {}", missing.join(", ")));
     }
-    // A member with nothing to authenticate inference refuses the whole
-    // fan-out before the first spawn, like an unknown name does: the spend has
-    // no undo. Same predicate as `run_delegate`'s guard (`has_inference_auth`,
-    // derived from `build_claude_settings_json`): Alibaba's console session
-    // does NOT count (it authenticates the quota gateway only), and an OAuth
-    // account stays outside the check (`is_third_party` scopes it to
-    // providers).
+    // A member that cannot be spent on refuses the whole fan-out before the
+    // first spawn, like an unknown name does: the spend has no undo. Same
+    // pre-flight as the single-background arm (`preflight_target`, rationale
+    // there): disabled by the operator, or a recognised third-party profile
+    // with nothing to authenticate inference.
     for name in &resolved {
         let profile = config
             .find(name)
             .ok_or_else(|| format!("profile not found: {name}"))?;
-        if profile.is_third_party() && !crate::claude::has_inference_auth(profile) {
-            return Err(format!("profile has no api key: {name}"));
-        }
+        preflight_target(profile, name)?;
     }
     Ok(resolved)
 }
@@ -2207,9 +2230,9 @@ fn read_prompt_handle(file: std::fs::File, rel: &str) -> std::result::Result<Str
 }
 
 /// Record ONE background job's `running` file and return its `(job_id,
-/// started_at)` handle. This is the only fallible step of a background
-/// delegate; the spawn that follows cannot fail, so a fan-out reserves every
-/// job before launching any.
+/// started_at)` handle. This is the only fallible step left after the
+/// pre-flight refusal; the spawn that follows cannot fail, so a fan-out
+/// reserves every job before launching any.
 fn reserve_background_job(
     profile: &str,
     monitor: bool,

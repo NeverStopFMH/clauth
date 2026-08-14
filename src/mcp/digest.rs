@@ -14,9 +14,10 @@
 //!
 //! - the config's `active_profile` VALUE (content, not mtime — a rewrite that
 //!   keeps the name is not news);
-//! - the ACTIVE profile's usage-cache mtime (the file the scheduler/daemon
-//!   refreshes; it follows the active profile, so a switch moves both it and
-//!   the first observable);
+//! - the ACTIVE profile's usage-cache mtime, KEYED on the profile it was read
+//!   from (the file the scheduler/daemon refreshes). Two profiles' caches are
+//!   different files, so across a profile change the two mtimes are not
+//!   comparable and there is no usage-cache event to report;
 //! - `~/.claude/.credentials.json`'s mtime, read FOLLOWING symlinks: that
 //!   reads the bytes' write time, which moves on both a rotation rewrite and a
 //!   `switch` repoint (a different target file carries a different mtime),
@@ -34,13 +35,15 @@
 //!   reported. A filtered `watch` therefore never swallows what it declined to
 //!   name, and neither does a surface that carries no digest at all
 //!   (`list_profiles`: its roster is already a fresh read of the same state).
+//!   The usage cache re-keys silently alongside a reported profile change,
+//!   because what it held is no longer comparable to anything.
 //! - **`switch` never reports its own write.** Its post-mutation arms reseed
 //!   the baseline silently (the reply's `previous`/`active` IS the report); an
 //!   arm that refused before any mutation reports like `which` does, because
 //!   nothing of ours moved.
 
 use std::sync::Arc;
-use std::time::{Duration, Instant, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime};
 
 use crate::lockorder::RankedMutex;
 use crate::lockorder::rank::McpDigest;
@@ -120,8 +123,10 @@ impl WatchSet {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct DigestSample {
     active_profile: Option<String>,
-    usage_cache_mtime_ms: Option<u64>,
-    credentials_mtime_ms: Option<u64>,
+    /// The usage cache of `active_profile` at sample time — that field is its
+    /// key, and two profiles' caches are different files.
+    usage_cache_mtime: Option<SystemTime>,
+    credentials_mtime: Option<SystemTime>,
 }
 
 /// What moved between two samples, restricted to the watched set. Each field
@@ -166,28 +171,29 @@ impl DigestSample {
     /// The watched-set delta from `self` (the stored baseline) to `next` (the
     /// fresh sample). Pure: the caller decides what to store.
     fn delta(&self, next: &DigestSample, watched: WatchSet) -> DigestDelta {
+        // Across a profile change the two cache mtimes belong to different
+        // files, so there is no refresh to report — including when the profile
+        // change itself is unwatched, where reporting the incomparable pair
+        // would put a false lesser event in its place.
+        let same_profile = self.active_profile == next.active_profile;
         DigestDelta {
-            active_profile: (watched.active_profile && self.active_profile != next.active_profile)
+            active_profile: (watched.active_profile && !same_profile)
                 .then(|| (self.active_profile.clone(), next.active_profile.clone())),
             usage_cache: watched.usage_cache
-                && self.usage_cache_mtime_ms != next.usage_cache_mtime_ms,
-            credentials: watched.credentials
-                && self.credentials_mtime_ms != next.credentials_mtime_ms,
+                && same_profile
+                && self.usage_cache_mtime != next.usage_cache_mtime,
+            credentials: watched.credentials && self.credentials_mtime != next.credentials_mtime,
         }
     }
 }
 
-/// Epoch-ms of a file's last write, following symlinks (`std::fs::metadata`):
-/// for the credentials link that is the write time of the BYTES, which moves
-/// on both a rotation rewrite and a repoint.
-fn file_mtime_ms(path: &std::path::Path) -> Option<u64> {
-    std::fs::metadata(path)
-        .ok()?
-        .modified()
-        .ok()?
-        .duration_since(UNIX_EPOCH)
-        .ok()
-        .map(|d| d.as_millis() as u64)
+/// A file's last write, following symlinks (`std::fs::metadata`): for the
+/// credentials link that is the write time of the BYTES, which moves on both a
+/// rotation rewrite and a repoint. Kept at whatever resolution the platform
+/// reports (nanoseconds on Linux) — truncating to milliseconds would fold two
+/// writes inside one millisecond into one and lose the second.
+fn file_mtime(path: &std::path::Path) -> Option<SystemTime> {
+    std::fs::metadata(path).ok()?.modified().ok()
 }
 
 /// Read the three observables off local disk. The reads are not one atomic
@@ -196,16 +202,17 @@ fn file_mtime_ms(path: &std::path::Path) -> Option<u64> {
 /// digest-bearing call reports.
 fn sample_digest() -> DigestSample {
     let active = crate::profile::active_profile_name();
-    let usage_cache_mtime_ms = active
+    let usage_cache_mtime = active
         .as_deref()
-        .and_then(|name| crate::profile_cache::profile_cache_mtime_ms(name, USAGE_CACHE_FILE));
-    let credentials_mtime_ms = crate::claude::claude_credentials_path()
+        .and_then(|name| crate::profile_cache::profile_cache_path(name, USAGE_CACHE_FILE))
+        .and_then(|path| file_mtime(&path));
+    let credentials_mtime = crate::claude::claude_credentials_path()
         .ok()
-        .and_then(|path| file_mtime_ms(&path));
+        .and_then(|path| file_mtime(&path));
     DigestSample {
         active_profile: active.map(|n| n.to_string()),
-        usage_cache_mtime_ms,
-        credentials_mtime_ms,
+        usage_cache_mtime,
+        credentials_mtime,
     }
 }
 
@@ -269,12 +276,17 @@ impl DigestTracker {
         if let Some(slot) = baseline.as_mut() {
             if delta.active_profile.is_some() {
                 slot.active_profile = sample.active_profile.clone();
+                // Re-key the cache baseline in the same step, silently: left on
+                // the old profile's file it would read as a refresh on the next
+                // call, which is the false report this consume step exists to
+                // avoid. Nothing comparable survives the profile move anyway.
+                slot.usage_cache_mtime = sample.usage_cache_mtime;
             }
             if delta.usage_cache {
-                slot.usage_cache_mtime_ms = sample.usage_cache_mtime_ms;
+                slot.usage_cache_mtime = sample.usage_cache_mtime;
             }
             if delta.credentials {
-                slot.credentials_mtime_ms = sample.credentials_mtime_ms;
+                slot.credentials_mtime = sample.credentials_mtime;
             }
         }
         DigestVerdict::Changed(delta)
@@ -294,7 +306,10 @@ impl DigestTracker {
     /// [`WATCH_POLL_INTERVAL`] slice, repeat, until something moves or
     /// `wait_secs` elapses. Mirrors `delegate_result`'s `wait_for_done`
     /// cadence; the baseline lock is taken and dropped inside [`report`],
-    /// never held across a sleep. `wait_secs` 0 samples exactly once.
+    /// never held across a sleep. `wait_secs` 0 samples exactly once. Each
+    /// slice re-reads `profiles.toml` and two file stats: small local reads
+    /// whose total is bounded by `wait_secs`, and a cached value could not see
+    /// the writer this loop exists to catch.
     pub(super) fn watch(&self, watched: WatchSet, wait_secs: u64) -> WatchOutcome {
         let start = Instant::now();
         let deadline = Duration::from_secs(wait_secs);
@@ -345,6 +360,11 @@ pub(super) enum DigestMode<'a> {
     /// reply's own `previous`/`active` (or `reason`) is the report of what it
     /// did, and its write must not echo back as news from elsewhere.
     Reseed(&'a DigestTracker),
+    /// Neither report nor touch the baseline — the `delegate_result` batch's
+    /// per-result folds. A batch is one call, so its reply carries one digest
+    /// beside `results`; a per-result fold would report one job's news into a
+    /// place the batch prose never renders.
+    Skip,
 }
 
 impl DigestMode<'_> {
@@ -356,6 +376,7 @@ impl DigestMode<'_> {
                 tracker.reseed();
                 None
             }
+            Self::Skip => None,
         }
     }
 

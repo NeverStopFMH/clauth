@@ -553,9 +553,8 @@ pub(crate) fn which_prose(p: &Value) -> String {
     out
 }
 
-/// Prose for `switch`: the outcome, then the active profile's live usage. The
-/// digest clause rides only the pre-mutation refusal arm — a switch that ran
-/// never carries one (its own write is its report).
+/// Prose for `switch`: the outcome, then the active profile's live usage, then
+/// the digest clause when the payload carries one.
 pub(crate) fn switch_prose(p: &Value) -> String {
     let live = live_usage_prose(&p["live_usage"], "active profile");
     let digest = digest_prose(&p["since_your_last_call"]);
@@ -807,7 +806,8 @@ fn running_status_prose(p: &Value) -> String {
 }
 
 /// Prose for a `delegate_result` batch: one line per requested id, naming its
-/// id and state. A done line reuses the envelope spelling, a running line the
+/// id and state, then the batch's own digest clause on a last line when it
+/// carries one. A done line reuses the envelope spelling, a running line the
 /// shared running spelling, an absent id reads `unknown`. Live usage stays in
 /// the JSON spelling only so the lines stay short.
 pub(crate) fn delegate_result_batch_prose(p: &Value) -> String {
@@ -816,7 +816,7 @@ pub(crate) fn delegate_result_batch_prose(p: &Value) -> String {
         .and_then(Value::as_array)
         .map(Vec::as_slice)
         .unwrap_or(&[]);
-    results
+    let mut out = results
         .iter()
         .map(|r| {
             let job_id = r.get("job_id").and_then(Value::as_str).unwrap_or("unknown");
@@ -827,7 +827,13 @@ pub(crate) fn delegate_result_batch_prose(p: &Value) -> String {
             }
         })
         .collect::<Vec<_>>()
-        .join("\n")
+        .join("\n");
+    let digest = digest_prose(&p["since_your_last_call"]);
+    if !digest.is_empty() {
+        out.push('\n');
+        out.push_str(&digest);
+    }
+    out
 }
 
 #[cfg(test)]

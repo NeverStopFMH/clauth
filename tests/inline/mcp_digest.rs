@@ -12,7 +12,11 @@
 //! - `switch` never reports its own write (it reseeds), but an arm that
 //!   refused before any mutation reports like `which` does;
 //! - `watch` returns as soon as something moves, never sleeps holding the
-//!   baseline lock, and honors its `kinds` filter.
+//!   baseline lock, and honors its `kinds` filter;
+//! - the usage cache is keyed on the profile it was read from, so a profile
+//!   change is never dressed up as a refresh of a file nobody refreshed;
+//! - a batch is one call: one digest, top-level, rendered in the prose that is
+//!   the default format.
 
 use super::*;
 use crate::profile::{AppState, ProfileName, save_app_state};
@@ -71,14 +75,17 @@ where
         .expect("tool returns a tool result, never a transport error")
 }
 
-fn json_payload(result: &CallToolResult) -> serde_json::Value {
-    let text = result
+fn block_text(result: &CallToolResult) -> String {
+    result
         .content
         .first()
         .and_then(|c| c.as_text())
         .map(|t| t.text.clone())
-        .expect("payload text");
-    serde_json::from_str(&text).expect("parse json payload")
+        .expect("payload text")
+}
+
+fn json_payload(result: &CallToolResult) -> serde_json::Value {
+    serde_json::from_str(&block_text(result)).expect("parse json payload")
 }
 
 fn call_which(server: &ClauthServer) -> serde_json::Value {
@@ -92,6 +99,15 @@ fn call_switch(server: &ClauthServer, name: &str) -> serde_json::Value {
         name: name.to_string(),
         format: Some("json".to_string()),
     }))))
+}
+
+fn call_batch(server: &ClauthServer, job_ids: &[&str], format: &str) -> CallToolResult {
+    drive(server.delegate_result(Parameters(DelegateResultArgs {
+        job_id: None,
+        job_ids: Some(job_ids.iter().map(|s| (*s).to_string()).collect()),
+        wait_secs: Some(0),
+        format: Some(format.to_string()),
+    })))
 }
 
 fn call_watch(
@@ -171,6 +187,37 @@ fn reporting_consumes_the_delta() {
     assert!(
         third.get("since_your_last_call").is_none(),
         "a reported change is consumed: the third call must not re-report it: {third}",
+    );
+}
+
+/// Linux reports mtimes in nanoseconds. Truncated to milliseconds, two writes
+/// landing inside one millisecond read as one and the second is lost — the
+/// mtime-as-change-detector trap this project has paid for before.
+#[test]
+fn a_sub_millisecond_mtime_move_is_still_a_change() {
+    let _home = HomeSandbox::new();
+    seeded_world();
+    let server = ClauthServer::new();
+    let _ = call_which(&server);
+
+    let bumped = t0() + Duration::from_micros(500);
+    set_mtime(&credentials_path(), bumped);
+    // Fixture control: a filesystem that rounds the stamp away leaves no
+    // sub-millisecond move to catch, and the assertion below would then pass
+    // for the wrong reason.
+    assert_eq!(
+        std::fs::metadata(credentials_path())
+            .expect("credentials metadata")
+            .modified()
+            .expect("credentials mtime"),
+        bumped,
+        "the sandbox filesystem must keep the sub-millisecond stamp",
+    );
+
+    let payload = call_which(&server);
+    assert_eq!(
+        payload["since_your_last_call"]["credentials"], true,
+        "a write 500µs after the baseline is a write: {payload}",
     );
 }
 
@@ -367,6 +414,51 @@ fn watch_kinds_filter_reports_watched_only_and_never_swallows_the_rest() {
     assert_eq!(again["status"], "unchanged");
 }
 
+/// The usage-cache observable is KEYED on the profile it was read from: two
+/// profiles' caches are different files, so a profile change is no
+/// `usage_cache` event. A `kinds: ["usage_cache"]` watch hides the profile
+/// change, so reporting the incomparable pair as a refresh puts a false lesser
+/// event in its place — a statement to the model that nothing made true.
+#[test]
+fn a_profile_change_is_never_reported_as_a_usage_cache_refresh() {
+    let _home = HomeSandbox::new();
+    seeded_world();
+    let server = ClauthServer::new();
+    let _ = call_which(&server);
+
+    // Another profile, carrying its own cache at its own stamp.
+    seed_state("other", t1());
+    let filtered = watch_json(&server, Some(0), Some(vec!["usage_cache"]));
+    assert_eq!(
+        filtered["status"], "unchanged",
+        "the compared mtime came from a different profile's file, so nothing \
+         refreshed: {filtered}",
+    );
+
+    // The profile change itself survives for the surface that watches it, and
+    // still drags no refresh along with it.
+    let reported = call_which(&server);
+    assert_eq!(
+        reported["since_your_last_call"]["active_profile"],
+        serde_json::json!({ "from": "work", "to": "other" }),
+        "the filtered watch left the profile change for the next reporter: {reported}",
+    );
+    assert!(
+        reported["since_your_last_call"]
+            .get("usage_cache")
+            .is_none(),
+        "two profiles' caches are not comparable: {reported}",
+    );
+
+    // Consuming the profile change re-keys the cache baseline, so the false
+    // refresh cannot land one call later either.
+    let next = call_which(&server);
+    assert!(
+        next.get("since_your_last_call").is_none(),
+        "the re-key onto the new profile's cache is silent: {next}",
+    );
+}
+
 #[test]
 fn watch_timeout_reports_unchanged_with_waited_secs() {
     let _home = HomeSandbox::new();
@@ -523,5 +615,77 @@ fn delegate_result_done_envelope_reports_the_digest() {
     assert_eq!(
         second["since_your_last_call"]["credentials"], true,
         "the done envelope reports what moved since the first call: {second}",
+    );
+}
+
+/// Seed one finished job whose envelope reads `all done`.
+fn seed_done_job(id: &str) {
+    jobs::write_done(
+        id,
+        "work",
+        1,
+        serde_json::json!({ "profile": "work", "is_error": false, "result": "all done" }),
+    )
+    .expect("write job");
+}
+
+/// A batch is ONE call, so its digest rides the reply once, top-level beside
+/// `results` like every other surface. Folded into each done result instead, it
+/// is reported (and consumed) per job, and nests where no other surface puts
+/// it.
+#[test]
+fn delegate_result_batch_carries_one_top_level_digest() {
+    let _home = HomeSandbox::new();
+    seeded_world();
+    let server = ClauthServer::new();
+
+    seed_done_job("d-batch-0");
+    seed_done_job("d-batch-1");
+    let first = json_payload(&call_batch(&server, &["d-batch-0", "d-batch-1"], "json"));
+    assert!(
+        first.get("since_your_last_call").is_none(),
+        "the first digest call seeds, through a batch like anywhere else: {first}",
+    );
+
+    set_mtime(&credentials_path(), t1());
+    seed_done_job("d-batch-2");
+    seed_done_job("d-batch-3");
+    let second = json_payload(&call_batch(&server, &["d-batch-2", "d-batch-3"], "json"));
+    assert_eq!(
+        second["since_your_last_call"]["credentials"], true,
+        "the batch reply carries the digest beside `results`: {second}",
+    );
+    for entry in second["results"].as_array().expect("results is an array") {
+        assert!(
+            entry.get("since_your_last_call").is_none(),
+            "a per-result copy would nest the digest where no reader looks for \
+             it, on the first done job alone: {entry}",
+        );
+    }
+
+    let after = call_which(&server);
+    assert!(
+        after.get("since_your_last_call").is_none(),
+        "the batch reported the change, so the batch consumed it: {after}",
+    );
+}
+
+/// Prose is the default format and `single_block` emits prose ALONE, so a
+/// digest the batch consumes but never renders is lost for good.
+#[test]
+fn delegate_result_batch_prose_renders_the_digest() {
+    let _home = HomeSandbox::new();
+    seeded_world();
+    let server = ClauthServer::new();
+
+    seed_done_job("d-bprose-0");
+    let _ = call_batch(&server, &["d-bprose-0"], "json");
+
+    set_mtime(&credentials_path(), t1());
+    seed_done_job("d-bprose-1");
+    assert_eq!(
+        block_text(&call_batch(&server, &["d-bprose-1"], "prose")),
+        "job `d-bprose-1` finished: all done\n\
+         since your last call: credentials file rewritten",
     );
 }

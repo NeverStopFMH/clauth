@@ -184,8 +184,10 @@ pub(crate) mod rank {
         /// since-your-last-call baseline every clone of the stdio server shares.
         /// A true leaf — each acquisition wraps one sample-compare-store step
         /// over three small local-disk stats, and `watch`'s poll loop drops it
-        /// before every sleep slice, so nothing is ever acquired while it is
-        /// held and no HTTP, subprocess, or sleep runs under it.
+        /// before every sleep slice, so no RANKED lock, HTTP, subprocess, or
+        /// sleep runs under it. Under `cfg(test)` the sample does nest one
+        /// unranked mutex, `profile::HOME_OVERRIDE`, which every `home_dir()`
+        /// takes and releases with nothing under it.
         McpDigest = 1800;
     }
 }

@@ -1287,7 +1287,8 @@ async fn delegate_result_batch(
                 payload
             }
             WaitOutcome::Done(record) => {
-                let (mut payload, is_error) = fold_done_envelope(&record, digest);
+                // No per-result digest: one rides the whole reply below.
+                let (mut payload, is_error) = fold_done_envelope(&record, DigestMode::Skip);
                 any_error |= is_error;
                 // The folded envelope is always an object (a non-object
                 // self-report is wrapped under `result` first), so the caller's
@@ -1312,7 +1313,14 @@ async fn delegate_result_batch(
         };
         results.push(entry);
     }
-    let payload = serde_json::json!({ "results": results });
+    let mut payload = serde_json::json!({ "results": results });
+    // One digest for the whole call, top-level beside `results` where every
+    // other surface carries it: a batch IS one call, and a copy folded into
+    // each done result would consume the change into a place the prose
+    // spelling — the default one — never renders.
+    if let Some(delta) = DigestMode::Report(digest).folded() {
+        payload["since_your_last_call"] = delta;
+    }
     let prose = render::delegate_result_batch_prose(&payload);
     let blocks = single_block(payload, format, prose);
     for id in delivered {
@@ -1334,7 +1342,7 @@ async fn delegate_result_batch(
 /// recoverable copy of the delegate's result.
 fn fold_done_envelope(
     record: &jobs::JobRecord,
-    digest: &DigestTracker,
+    digest: DigestMode<'_>,
 ) -> (serde_json::Value, bool) {
     let payload = fold_delegate_live_usage(
         record.envelope.clone().unwrap_or_else(|| {
@@ -1346,7 +1354,7 @@ fn fold_done_envelope(
         }),
         &record.profile,
         now_epoch_secs(),
-        DigestMode::Report(digest),
+        digest,
     );
     let is_error = payload
         .get("is_error")
@@ -1361,7 +1369,7 @@ fn render_done_envelope(
     format: Format,
     digest: &DigestTracker,
 ) -> (Vec<ContentBlock>, bool) {
-    let (payload, is_error) = fold_done_envelope(&record, digest);
+    let (payload, is_error) = fold_done_envelope(&record, DigestMode::Report(digest));
     let prose = render::delegate_result_prose(&payload);
     (single_block(payload, format, prose), is_error)
 }

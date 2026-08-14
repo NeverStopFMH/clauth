@@ -134,6 +134,7 @@ clauth ships a plugin that exposes your profiles to a live Claude Code session v
 | `switch` | relink the global active profile | zero |
 | `delegate` | hand a headless prompt to another account and return the answer (or a `job_id`) | **real usage window on the target account** |
 | `delegate_result` | fetch a backgrounded delegate's result | zero (filesystem) |
+| `watch` | block until clauth's state moves: the active profile, its usage cache, or the credentials file | zero (filesystem) |
 
 `delegate` fields, kill and resume rules, the manual `mcpServers` entry: [Claude Code plugin](https://github.com/uwuclxdy/clauth/wiki/Claude-Code-Plugin).
 

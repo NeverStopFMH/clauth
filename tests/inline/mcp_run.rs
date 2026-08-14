@@ -206,13 +206,13 @@ fn run_delegate_refuses_a_disabled_target_before_acquiring_a_runtime() {
     );
 }
 
-// ── keyless third-party guard ───────────────────────────────────────────────
+// ── third-party auth guard ──────────────────────────────────────────────────
 
 /// Mirrors the disabled-target test above: a recognised third-party profile
-/// with no api key is refused before `ProfileRuntime::acquire`, because the
-/// spawned `claude` has nothing to authenticate with and dies on an empty
-/// envelope. The keyed / OAuth / Alibaba tests below are the canaries that the
-/// guard does not over-fire.
+/// with nothing to authenticate inference (no usable api key, no auth env
+/// entry) is refused before `ProfileRuntime::acquire`, because the spawned
+/// `claude` dies on an empty envelope. The keyed / OAuth / env-authed tests
+/// below are the canaries that the guard does not over-fire.
 #[test]
 fn run_delegate_refuses_a_keyless_third_party_target_before_acquiring_a_runtime() {
     let home = HomeSandbox::new();
@@ -352,6 +352,54 @@ fn run_delegate_refuses_a_whitespace_api_key_third_party_target() {
     );
 }
 
+/// An interior control char survives `trim` + non-empty but fails
+/// `validate_api_key` (CC forwards the minted key verbatim as `X-Api-Key` /
+/// `Authorization: Bearer`, so a CRLF would inject a header). Only a guard
+/// predicate that includes the validation refuses it.
+#[test]
+fn run_delegate_refuses_a_control_char_api_key_third_party_target() {
+    let home = HomeSandbox::new();
+    let mut config = crate::profile::AppConfig {
+        state: crate::profile::AppState::default(),
+        profiles: Vec::new(),
+    };
+    crate::actions::create_blank_profile(
+        &mut config,
+        "ds-ctrl".to_string(),
+        Some("https://api.deepseek.com".to_string()),
+        Some("sk-test\r\nInjected: x".to_string()),
+        None,
+    )
+    .expect("create profile");
+
+    let err = run_delegate(DelegateOpts {
+        profile: "ds-ctrl",
+        prompt: "hello",
+        model: None,
+        cwd: None,
+        env: HashMap::new(),
+        extra_args: Vec::new(),
+        timeout_secs: Some(30),
+        idle_secs: None,
+        resume: None,
+        isolation: Isolation::Shared,
+        depth: 0,
+    })
+    .expect_err("a control-char key third-party target must be refused");
+    assert_eq!(err, "profile has no api key: ds-ctrl");
+
+    assert!(
+        !home
+            .home()
+            .join(".clauth")
+            .join("profiles")
+            .join("ds-ctrl")
+            .join("runtime")
+            .exists(),
+        "the refusal must happen before any runtime is acquired"
+    );
+}
+
 /// Drive `run_delegate` for `profile` with a `cwd` that does not exist. The
 /// cwd check is the first gate AFTER the credential guard, so reaching it
 /// proves the guard let the profile through while the run still stops before
@@ -423,8 +471,12 @@ fn run_delegate_does_not_refuse_an_oauth_profile() {
     );
 }
 
+/// The console session authenticates the QUOTA gateway only
+/// (`docs/providers.md`): inference on a keyless Alibaba profile needs the api
+/// key like every other provider. The guard refuses it rather than spending a
+/// window on a run that cannot authenticate.
 #[test]
-fn run_delegate_does_not_refuse_a_keyless_alibaba_profile() {
+fn run_delegate_refuses_a_keyless_alibaba_profile() {
     let home = HomeSandbox::new();
     let mut config = crate::profile::AppConfig {
         state: crate::profile::AppState::default(),
@@ -439,15 +491,69 @@ fn run_delegate_does_not_refuse_a_keyless_alibaba_profile() {
     )
     .expect("create profile");
 
+    let err = run_delegate(DelegateOpts {
+        profile: "qwen",
+        prompt: "hello",
+        model: None,
+        cwd: None,
+        env: HashMap::new(),
+        extra_args: Vec::new(),
+        timeout_secs: Some(30),
+        idle_secs: None,
+        resume: None,
+        isolation: Isolation::Shared,
+        depth: 0,
+    })
+    .expect_err("a keyless Alibaba profile must be refused");
+    assert_eq!(err, "profile has no api key: qwen");
+
+    assert!(
+        !home
+            .home()
+            .join(".clauth")
+            .join("profiles")
+            .join("qwen")
+            .join("runtime")
+            .exists(),
+        "the refusal must happen before any runtime is acquired"
+    );
+}
+
+/// An `[env]`-authenticated third-party profile passes the guard: with no
+/// `api_key` field, `build_claude_settings_json` applies `profile.env` LAST, so
+/// an explicit `ANTHROPIC_AUTH_TOKEN` entry is what the spawned `claude`
+/// authenticates with. Refusing this profile was the `7de66d7` regression.
+#[test]
+fn run_delegate_does_not_refuse_an_env_authenticated_third_party_profile() {
+    let home = HomeSandbox::new();
+    let mut config = crate::profile::AppConfig {
+        state: crate::profile::AppState::default(),
+        profiles: Vec::new(),
+    };
+    crate::actions::create_blank_profile(
+        &mut config,
+        "ds-env".to_string(),
+        Some("https://api.deepseek.com".to_string()),
+        None,
+        None,
+    )
+    .expect("create profile");
+    let profile = config.find_mut("ds-env").expect("profile created");
+    profile.env.insert(
+        "ANTHROPIC_AUTH_TOKEN".to_string(),
+        "sk-env-test".to_string(),
+    );
+    crate::profile::save_profile(profile).expect("persist the env entry");
+
     let bad_cwd = home.home().join("does-not-exist");
-    let err = delegate_stops_at_the_cwd_gate("qwen", &bad_cwd);
+    let err = delegate_stops_at_the_cwd_gate("ds-env", &bad_cwd);
     assert_eq!(
         err,
         format!(
             "cwd does not exist or is not a directory: {}",
             bad_cwd.display()
         ),
-        "an Alibaba profile passes the guard and stops at the cwd gate"
+        "an env-authenticated profile passes the guard and stops at the cwd gate"
     );
 }
 
@@ -485,16 +591,17 @@ fn resolve_fanout_refuses_a_keyless_third_party_member_by_name() {
     )
     .expect("create profile");
 
-    // The keyed, OAuth, and Alibaba members come FIRST on purpose: if the
-    // guard over-fired on any of them the refusal would name that name and
-    // this assertion would red.
+    // The keyed and OAuth members come FIRST on purpose: if the guard
+    // over-fired on either the refusal would name that name and this
+    // assertion would red. `qwen` is the first refuser now — its console
+    // session does not authenticate inference — and `ds-nokey` sits behind it.
     let raw: Vec<String> = ["ds-key", "oauth1", "qwen", "ds-nokey"]
         .iter()
         .map(|n| (*n).to_string())
         .collect();
     let err =
         resolve_fanout(&config, &raw).expect_err("a keyless member refuses the whole fan-out");
-    assert_eq!(err, "profile has no api key: ds-nokey");
+    assert_eq!(err, "profile has no api key: qwen");
 }
 
 /// The fan-out sibling of the empty-key single-profile test: an empty (or
@@ -519,14 +626,6 @@ fn resolve_fanout_refuses_an_empty_key_member_by_name() {
         .expect("create profile");
     crate::actions::create_blank_profile(
         &mut config,
-        "qwen".to_string(),
-        Some("https://token-plan.ap-southeast-1.maas.aliyuncs.com".to_string()),
-        None,
-        None,
-    )
-    .expect("create profile");
-    crate::actions::create_blank_profile(
-        &mut config,
         "ds-empty".to_string(),
         Some("https://api.deepseek.com".to_string()),
         Some(String::new()),
@@ -542,10 +641,10 @@ fn resolve_fanout_refuses_an_empty_key_member_by_name() {
     )
     .expect("create profile");
 
-    // The keyed, OAuth, and Alibaba members come FIRST on purpose: if the
-    // guard over-fired on any of them the refusal would name that name and
-    // this assertion would red.
-    let raw: Vec<String> = ["ds-key", "oauth1", "qwen", "ds-empty", "ds-space"]
+    // The keyed and OAuth members come FIRST on purpose: if the guard
+    // over-fired on either the refusal would name that name and this
+    // assertion would red.
+    let raw: Vec<String> = ["ds-key", "oauth1", "ds-empty", "ds-space"]
         .iter()
         .map(|n| (*n).to_string())
         .collect();
@@ -571,11 +670,13 @@ fn resolve_fanout_passes_when_every_member_is_delegable() {
     .expect("create profile");
     crate::actions::create_blank_profile(&mut config, "oauth1".to_string(), None, None, None)
         .expect("create profile");
+    // A keyless Alibaba member would now refuse the fan-out; a keyed one is
+    // delegable like any other provider.
     crate::actions::create_blank_profile(
         &mut config,
         "qwen".to_string(),
         Some("https://token-plan.ap-southeast-1.maas.aliyuncs.com".to_string()),
-        None,
+        Some("sk-test".to_string()),
         None,
     )
     .expect("create profile");

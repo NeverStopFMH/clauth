@@ -1784,13 +1784,16 @@ fn run_delegate(opts: DelegateOpts<'_>) -> std::result::Result<serde_json::Value
     if target.is_disabled() {
         return Err(format!("profile is disabled: {}", opts.profile));
     }
-    // A recognised third-party profile with no api key would spawn a `claude`
-    // that has nothing to authenticate with, so refuse by name instead of
-    // spending a window on a run that cannot work. `is_third_party` scopes the
-    // check: an OAuth account correctly has no key, and Alibaba is exempt
-    // inside `third_party_credentialed` (its quota surface reads the console
-    // session, not the key).
-    if target.is_third_party() && !crate::usage::third_party_credentialed(target) {
+    // A recognised third-party profile whose inference has nothing to
+    // authenticate with would spawn a `claude` that dies on an empty envelope,
+    // so refuse by name instead of spending a window on a run that cannot work.
+    // The test is `has_inference_auth`, the predicate derived from
+    // `build_claude_settings_json` (a validated api key, or a profile `env`
+    // entry carrying `ANTHROPIC_AUTH_TOKEN` / `ANTHROPIC_API_KEY`) — NOT the
+    // usage predicate `third_party_credentialed`, whose Alibaba exemption
+    // reads the console session that authenticates the quota gateway only.
+    // `is_third_party` scopes the check: an OAuth account has no provider.
+    if target.is_third_party() && !crate::claude::has_inference_auth(target) {
         return Err(format!("profile has no api key: {}", opts.profile));
     }
 
@@ -2020,8 +2023,8 @@ fn run_delegate(opts: DelegateOpts<'_>) -> std::result::Result<serde_json::Value
 /// Resolve a `profiles` fan-out list to canonical target names. Refuses by name:
 /// a list over [`MAX_FANOUT`], a duplicate (case-insensitive, the same rule a
 /// single `profile` resolves under), a name resolving to no account, or a
-/// recognised third-party member with no api key. Runs before any spawn: N
-/// delegates is N real usage windows with no undo.
+/// recognised third-party member with no inference auth source. Runs before
+/// any spawn: N delegates is N real usage windows with no undo.
 fn resolve_fanout(config: &AppConfig, raw: &[String]) -> std::result::Result<Vec<String>, String> {
     // An empty list passes every check below vacuously and would return a
     // success-shaped `{"jobs": []}` that spent nothing and spawned nothing.
@@ -2053,15 +2056,18 @@ fn resolve_fanout(config: &AppConfig, raw: &[String]) -> std::result::Result<Vec
     if !missing.is_empty() {
         return Err(format!("profile not found: {}", missing.join(", ")));
     }
-    // A keyless third-party member refuses the whole fan-out before the first
-    // spawn, like an unknown name does: the spend has no undo. Alibaba is
-    // exempt (`third_party_credentialed` reads its console session) and so is
-    // an OAuth account (`is_third_party` scopes the check to providers).
+    // A member with nothing to authenticate inference refuses the whole
+    // fan-out before the first spawn, like an unknown name does: the spend has
+    // no undo. Same predicate as `run_delegate`'s guard (`has_inference_auth`,
+    // derived from `build_claude_settings_json`): Alibaba's console session
+    // does NOT count (it authenticates the quota gateway only), and an OAuth
+    // account stays outside the check (`is_third_party` scopes it to
+    // providers).
     for name in &resolved {
         let profile = config
             .find(name)
             .ok_or_else(|| format!("profile not found: {name}"))?;
-        if profile.is_third_party() && !crate::usage::third_party_credentialed(profile) {
+        if profile.is_third_party() && !crate::claude::has_inference_auth(profile) {
             return Err(format!("profile has no api key: {name}"));
         }
     }

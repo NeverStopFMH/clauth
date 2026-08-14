@@ -1737,6 +1737,39 @@ fn shell_quote(s: &str) -> String {
     }
 }
 
+/// Whether `profile` carries a usable api key: trimmed, non-empty, and free of
+/// whitespace/control chars. Hoisted from [`build_claude_settings_json`], which
+/// gates its `apiKeyHelper` wiring on exactly this test — sharing the function
+/// keeps the delegate guard from drifting from the real wiring.
+fn has_usable_api_key(profile: &Profile) -> bool {
+    profile
+        .api_key
+        .as_deref()
+        .map(str::trim)
+        .filter(|k| !k.is_empty())
+        .is_some_and(|k| validate_api_key(k).is_ok())
+}
+
+/// Whether [`build_claude_settings_json`] wires an inference auth source into
+/// the spawned `claude`: a usable api key (minted per request via the
+/// `apiKeyHelper` it writes) or a profile `env` entry carrying
+/// `ANTHROPIC_AUTH_TOKEN` / `ANTHROPIC_API_KEY` (it clears the former from the
+/// settings env block, then applies `profile.env` LAST, so an explicit entry is
+/// what the spawned process sees). The delegate and fan-out guards refuse a
+/// recognised third-party profile this returns `false` for.
+///
+/// Deliberately NOT [`crate::usage::third_party_credentialed`], the usage
+/// fetch predicate: that one treats Alibaba's console session as a credential,
+/// and the console session authenticates the quota gateway only, never
+/// inference. A keyless Alibaba profile fails THIS test.
+pub(crate) fn has_inference_auth(profile: &Profile) -> bool {
+    has_usable_api_key(profile)
+        || profile.env.iter().any(|(k, v)| {
+            matches!(k.as_str(), "ANTHROPIC_AUTH_TOKEN" | "ANTHROPIC_API_KEY")
+                && !v.trim().is_empty()
+        })
+}
+
 /// Build the merged settings.json content. `prev_env_keys` are stripped before
 /// the new profile's env is applied; pass `&[]` on start to leave existing keys.
 /// Also writes the profile's model config — the top-level `model` setting and
@@ -1836,12 +1869,7 @@ pub(crate) fn build_claude_settings_json(
     // and `validate_api_key` also refuse to mint) removes any stale helper so a
     // switch can't inherit it, and never wires a helper that would only fail at
     // mint — symmetric with the fail-closed behavior at the other end.
-    let has_api_key = profile
-        .api_key
-        .as_deref()
-        .map(str::trim)
-        .filter(|k| !k.is_empty())
-        .is_some_and(|k| validate_api_key(k).is_ok());
+    let has_api_key = has_usable_api_key(profile);
     if has_api_key {
         let exe = env::current_exe().context("resolving current_exe for apiKeyHelper")?;
         obj.insert(

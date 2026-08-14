@@ -180,6 +180,13 @@ pub(crate) mod rank {
         RollingPacing = 1400;
         PendingSwitch = 1500;
         PendingSwitchOff = 1700;
+        /// MCP reply-digest snapshot (`mcp::digest::DigestTracker`): the
+        /// since-your-last-call baseline every clone of the stdio server shares.
+        /// A true leaf — each acquisition wraps one sample-compare-store step
+        /// over three small local-disk stats, and `watch`'s poll loop drops it
+        /// before every sleep slice, so nothing is ever acquired while it is
+        /// held and no HTTP, subprocess, or sleep runs under it.
+        McpDigest = 1800;
     }
 }
 

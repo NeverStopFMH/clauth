@@ -240,6 +240,7 @@ fn tools_list_returns_the_whole_tool_surface() {
             "delegate_result",
             "list_profiles",
             "switch",
+            "watch",
             "which"
         ]
     );

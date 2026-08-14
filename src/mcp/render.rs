@@ -259,7 +259,8 @@ the active account, or delegate a task to another account without spending this 
 window.\n\n\
 Tools: `list_profiles` (roster + cached usage, zero quota), `which` (this session's own profile), \
 `switch` (relink the global active profile), `delegate` (run a task on another account), \
-`delegate_result` (collect a backgrounded delegate).\n\n\
+`delegate_result` (collect a backgrounded delegate), `watch` (long-poll until clauth's state \
+moves; zero quota).\n\n\
 switch & this session: ",
     );
     out.push_str(&switch_effect(auth));
@@ -321,6 +322,61 @@ pub(crate) fn live_usage_prose(lu: &Value, lead: &str) -> String {
         out.push_str(w);
     }
     out
+}
+
+/// One profile name in the digest's from/to pair: backticked for a name,
+/// `none` for a null (no active profile configured — the same read
+/// [`live_usage_prose`] gives a null profile).
+fn digest_name(v: Option<&Value>) -> String {
+    v.and_then(Value::as_str)
+        .map_or_else(|| "none".to_string(), |n| format!("`{n}`"))
+}
+
+/// The folded-in `since_your_last_call` object as a sentence clause: one part
+/// per observable that carries news, exactly the keys the JSON spelling kept.
+/// The two mtime observables have no figure a reader acts on, so their part
+/// names what happened (`refreshed` / `rewritten`), never the timestamp.
+pub(crate) fn digest_prose(d: &Value) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(ap) = d.get("active_profile") {
+        parts.push(format!(
+            "active profile {} → {}",
+            digest_name(ap.get("from")),
+            digest_name(ap.get("to"))
+        ));
+    }
+    if d.get("usage_cache")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        parts.push("usage cache refreshed".to_string());
+    }
+    if d.get("credentials")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        parts.push("credentials file rewritten".to_string());
+    }
+    if parts.is_empty() {
+        return String::new();
+    }
+    format!("since your last call: {}", parts.join("; "))
+}
+
+/// The `watch` tool's reply: the change it caught, the baseline it armed, or
+/// the wait that found nothing.
+pub(crate) fn watch_prose(p: &Value) -> String {
+    match p.get("status").and_then(Value::as_str) {
+        Some("changed") => format!("watch: {}", digest_prose(&p["since_your_last_call"])),
+        Some("armed") => {
+            "watch armed: baseline set on this first digest call, nothing to compare against yet"
+                .to_string()
+        }
+        _ => {
+            let waited = p.get("waited_secs").and_then(Value::as_u64).unwrap_or(0);
+            format!("watch: no change after {waited}s")
+        }
+    }
 }
 
 /// The `windows` array (or `quota` array) as one clause. Empty array is `usage
@@ -465,7 +521,8 @@ pub(crate) fn list_profiles_prose(p: &Value) -> String {
 }
 
 /// Prose for `which`: session identity, throughput when observed, then the
-/// active profile's live usage.
+/// active profile's live usage, then what moved since the last digest-bearing
+/// reply when something did.
 pub(crate) fn which_prose(p: &Value) -> String {
     let profile = p
         .get("profile")
@@ -488,12 +545,25 @@ pub(crate) fn which_prose(p: &Value) -> String {
     }
     out.push_str("; ");
     out.push_str(&live_usage_prose(&p["live_usage"], "active profile"));
+    let digest = digest_prose(&p["since_your_last_call"]);
+    if !digest.is_empty() {
+        out.push_str("; ");
+        out.push_str(&digest);
+    }
     out
 }
 
-/// Prose for `switch`: the outcome, then the active profile's live usage.
+/// Prose for `switch`: the outcome, then the active profile's live usage. The
+/// digest clause rides only the pre-mutation refusal arm — a switch that ran
+/// never carries one (its own write is its report).
 pub(crate) fn switch_prose(p: &Value) -> String {
     let live = live_usage_prose(&p["live_usage"], "active profile");
+    let digest = digest_prose(&p["since_your_last_call"]);
+    let digest = if digest.is_empty() {
+        String::new()
+    } else {
+        format!("; {digest}")
+    };
     match p.get("ok").and_then(Value::as_bool) {
         Some(true) => {
             // A null `previous` is the logged-out state the switch started from
@@ -506,11 +576,13 @@ pub(crate) fn switch_prose(p: &Value) -> String {
                 .get("active")
                 .and_then(Value::as_str)
                 .map_or_else(|| "unknown".to_string(), |v| format!("`{v}`"));
-            format!("switched the global active profile from {previous} to {active}; {live}")
+            format!(
+                "switched the global active profile from {previous} to {active}; {live}{digest}"
+            )
         }
         _ => {
             let reason = p.get("reason").and_then(Value::as_str).unwrap_or("unknown");
-            format!("switch failed: {reason}; {live}")
+            format!("switch failed: {reason}; {live}{digest}")
         }
     }
 }
@@ -629,6 +701,11 @@ pub(crate) fn delegate_prose(p: &Value) -> String {
         out.push_str("; ");
         out.push_str(&live_usage_prose(lu, "target"));
     }
+    let digest = digest_prose(&p["since_your_last_call"]);
+    if !digest.is_empty() {
+        out.push_str("; ");
+        out.push_str(&digest);
+    }
     out
 }
 
@@ -698,6 +775,11 @@ pub(crate) fn delegate_result_prose(p: &Value) -> String {
         let mut out = format!("delegate to `{target}` {}", envelope_prose(p));
         out.push_str("; ");
         out.push_str(&live_usage_prose(lu, "target"));
+        let digest = digest_prose(&p["since_your_last_call"]);
+        if !digest.is_empty() {
+            out.push_str("; ");
+            out.push_str(&digest);
+        }
         return out;
     }
     let result = p.get("result").and_then(Value::as_str).unwrap_or("unknown");

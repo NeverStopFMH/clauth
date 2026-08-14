@@ -111,6 +111,14 @@ fn every_tool_refuses_an_unrecognised_format_by_name() {
         }))),
         "yaml",
     );
+    assert_refusal(
+        &drive(server.watch(Parameters(WatchArgs {
+            wait_secs: None,
+            kinds: None,
+            format: Some("yaml".to_string()),
+        }))),
+        "yaml",
+    );
 }
 
 #[test]

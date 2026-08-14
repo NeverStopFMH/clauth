@@ -127,11 +127,21 @@ fn instructions_block_emits_stable_roster_cost_model_and_safety_prose() {
 
     // the tool router survives, because it is the ONLY clauth text a session is
     // guaranteed to hold: some harnesses defer tool schemas, so a description is
-    // unloaded until something searches for it.
-    assert!(
-        out.contains("Tools: `list_profiles`") && out.contains("`delegate_result`"),
-        "the tool router must name every tool: {out}",
-    );
+    // unloaded until something searches for it. Every tool by name, so a sixth
+    // tool that forgets the router reds here.
+    for tool in [
+        "list_profiles",
+        "which",
+        "switch",
+        "delegate",
+        "delegate_result",
+        "watch",
+    ] {
+        assert!(
+            out.contains(&format!("`{tool}`")),
+            "the tool router must name every tool, `{tool}` included: {out}",
+        );
+    }
     // ...but per-tool mechanics belong in that tool's own description, which is
     // loaded by the time anyone can call it. Restating them here is the
     // duplication the router replaced.
@@ -434,6 +444,68 @@ fn which_prose_names_identity_and_usage() {
     assert_eq!(
         which_prose(&p),
         "session profile `kerry`, source `session_dir`, tier `Free`; active profile `kerry`: 5h 12% used, 7d unknown"
+    );
+
+    // The digest clause rides only when something moved, after the live-usage
+    // clause; a null from/to reads `none`, never a dropped half.
+    let moved = serde_json::json!({
+        "profile": "kerry",
+        "source": "session_dir",
+        "tier": "Free",
+        "throughput": [],
+        "live_usage": {"profile": "kerry", "5h_used_pct": 12.0, "7d_used_pct": null},
+        "since_your_last_call": {
+            "active_profile": {"from": null, "to": "kerry"},
+            "usage_cache": true
+        }
+    });
+    assert_eq!(
+        which_prose(&moved),
+        "session profile `kerry`, source `session_dir`, tier `Free`; active profile `kerry`: 5h 12% used, 7d unknown; \
+         since your last call: active profile none → `kerry`; usage cache refreshed"
+    );
+}
+
+/// The digest prose spells only what carries news: one part per moved
+/// observable, no timestamps (an mtime is not a figure a reader acts on), and
+/// nothing at all for an absent object.
+#[test]
+fn digest_prose_names_only_moved_observables() {
+    assert_eq!(
+        digest_prose(&serde_json::json!({
+            "active_profile": {"from": "a", "to": "b"},
+            "usage_cache": true,
+            "credentials": true
+        })),
+        "since your last call: active profile `a` → `b`; usage cache refreshed; credentials file rewritten"
+    );
+    assert_eq!(
+        digest_prose(&serde_json::json!({"credentials": true})),
+        "since your last call: credentials file rewritten"
+    );
+    assert_eq!(
+        digest_prose(&serde_json::Value::Null),
+        "",
+        "an absent digest renders nothing, so folded prose stays unchanged"
+    );
+}
+
+#[test]
+fn watch_prose_renders_armed_changed_and_unchanged() {
+    assert_eq!(
+        watch_prose(&serde_json::json!({"status": "armed"})),
+        "watch armed: baseline set on this first digest call, nothing to compare against yet"
+    );
+    assert_eq!(
+        watch_prose(&serde_json::json!({
+            "status": "changed",
+            "since_your_last_call": {"usage_cache": true}
+        })),
+        "watch: since your last call: usage cache refreshed"
+    );
+    assert_eq!(
+        watch_prose(&serde_json::json!({"status": "unchanged", "waited_secs": 60})),
+        "watch: no change after 60s"
     );
 }
 

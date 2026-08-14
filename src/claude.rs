@@ -10,7 +10,7 @@ use crate::profile::{
     read_json_file, save_profile,
 };
 
-fn claude_credentials_path() -> Result<PathBuf> {
+pub(crate) fn claude_credentials_path() -> Result<PathBuf> {
     Ok(claude_dir()?.join(".credentials.json"))
 }
 

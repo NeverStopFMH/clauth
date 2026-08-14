@@ -6,6 +6,7 @@
 //!
 //! All logging MUST go to stderr — stdout carries the JSON-RPC frame.
 
+mod digest;
 mod herdr_report;
 mod jobs;
 mod render;
@@ -38,6 +39,7 @@ use crate::profile_json::{provider_label, tier_label, windows_json};
 use crate::providers::ThirdPartyStats;
 use crate::runtime::{Isolation, ProfileRuntime};
 use crate::usage::{UsageInfo, UsageWindow, now_epoch_secs, now_ms};
+use digest::{DigestMode, DigestTracker, WatchOutcome, WatchSet};
 use render::{ProfileSnapshot, RosterRank};
 
 /// Marks the `clauth mcp` child that [`crate::plugin_probe::mcp_boots`] spawns
@@ -189,9 +191,9 @@ impl Format {
     }
 }
 
-/// Refuse an unrecognised `format` value. There is no format to honour yet, so
-/// the refusal is a JSON text block like every other error envelope.
-fn format_refusal(reason: String) -> CallToolResult {
+/// Refuse an argument value by name (`format`, `watch`'s `kinds`): a
+/// `{ok: false, reason}` JSON text block, the shape every such refusal uses.
+fn arg_refusal(reason: String) -> CallToolResult {
     CallToolResult::error(vec![ContentBlock::text(
         serde_json::json!({ "ok": false, "reason": reason }).to_string(),
     )])
@@ -235,7 +237,17 @@ fn single_block(payload: serde_json::Value, format: Format, prose: String) -> Ve
 /// the same shape `fold_delegate_live_usage` uses: `serde_json`'s string-key
 /// `IndexMut` auto-vivifies only `Null` and panics on every other non-object,
 /// and the caller's payload must survive the fold.
-fn fold_active_live_usage(payload: serde_json::Value, config: &AppConfig) -> serde_json::Value {
+///
+/// The same fold is where the since-your-last-call digest belongs: beside
+/// `live_usage`, under `since_your_last_call`, present only when something
+/// moved since the last reply that reported one. `digest` decides whether this
+/// reply reports (consuming the delta) or silently reseeds (`switch`'s own
+/// write must not echo as news).
+fn fold_active_live_usage(
+    payload: serde_json::Value,
+    config: &AppConfig,
+    digest: DigestMode<'_>,
+) -> serde_json::Value {
     let mut map = match payload {
         serde_json::Value::Object(map) => map,
         other => {
@@ -253,6 +265,9 @@ fn fold_active_live_usage(payload: serde_json::Value, config: &AppConfig) -> ser
         "live_usage".to_string(),
         live_usage_json(active, five_h.as_ref(), seven_d.as_ref()),
     );
+    if let Some(delta) = digest.folded() {
+        map.insert("since_your_last_call".to_string(), delta);
+    }
     serde_json::Value::Object(map)
 }
 
@@ -267,6 +282,7 @@ fn fold_delegate_live_usage(
     payload: serde_json::Value,
     profile: &str,
     now: i64,
+    digest: DigestMode<'_>,
 ) -> serde_json::Value {
     let mut map = match payload {
         serde_json::Value::Object(map) => map,
@@ -282,6 +298,9 @@ fn fold_delegate_live_usage(
         live["throughput_warning"] = serde_json::Value::String(note);
     }
     map.insert("live_usage".to_string(), live);
+    if let Some(delta) = digest.folded() {
+        map.insert("since_your_last_call".to_string(), delta);
+    }
     serde_json::Value::Object(map)
 }
 
@@ -292,6 +311,10 @@ pub(crate) struct ClauthServer {
     /// reports `working`/`idle` to herdr's agents panel. A server built
     /// without it is a silent no-op.
     herdr_pane: Option<herdr_report::PaneReporter>,
+    /// The since-your-last-call baseline every clone shares (rmcp clones the
+    /// handler per request; a per-clone baseline would report nothing
+    /// forever). See `digest`.
+    digest: DigestTracker,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -397,12 +420,27 @@ pub(crate) struct WhichArgs {
     format: Option<String>,
 }
 
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub(crate) struct WatchArgs {
+    /// Seconds to long-poll for a change before returning (0..=60, default 0 =
+    /// sample once and answer immediately).
+    wait_secs: Option<u64>,
+    /// Which observables to watch: a subset of `active_profile`,
+    /// `usage_cache`, `credentials`. Omit it, or pass an empty list, for all
+    /// three. Changes to observables outside the set are left for the next
+    /// digest-bearing reply to report.
+    kinds: Option<Vec<String>>,
+    /// Output format: `prose` (default) or `json`.
+    format: Option<String>,
+}
+
 #[tool_router]
 impl ClauthServer {
     pub(crate) fn new() -> Self {
         Self {
             tool_router: Self::tool_router(),
             herdr_pane: None,
+            digest: DigestTracker::new(),
         }
     }
 
@@ -438,7 +476,7 @@ Replies in prose by default; pass `format: \"json\"` for the structured roster."
     ) -> Result<CallToolResult, ErrorData> {
         let format = match Format::parse(format.as_deref()) {
             Ok(f) => f,
-            Err(reason) => return Ok(format_refusal(reason)),
+            Err(reason) => return Ok(arg_refusal(reason)),
         };
         let config = load_config().map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
         let now = now_epoch_secs();
@@ -541,8 +579,9 @@ Replies in prose by default; pass `format: \"json\"` for the structured roster."
 always the active one. `source` says how it resolved: `refresh_match` / `session_token_match` (a \
 profile's stored credential matches the live one), `session_dir` (this session's runtime dir pins \
 the profile), `credential_less_active` (the configured active profile, nothing on disk to match). \
-The reply carries the active profile's live 5h/7d usage. Prose by default; pass `format: \
-\"json\"` for the structured payload."
+The reply carries the active profile's live 5h/7d usage, plus `since_your_last_call` when \
+clauth's state moved since the last reply that reported it (see `watch`). Prose by default; pass \
+`format: \"json\"` for the structured payload."
     )]
     async fn which(
         &self,
@@ -550,7 +589,7 @@ The reply carries the active profile's live 5h/7d usage. Prose by default; pass 
     ) -> Result<CallToolResult, ErrorData> {
         let format = match Format::parse(format.as_deref()) {
             Ok(f) => f,
-            Err(reason) => return Ok(format_refusal(reason)),
+            Err(reason) => return Ok(arg_refusal(reason)),
         };
         let config = load_config().map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
         let resolved = crate::which::resolve_active(&config);
@@ -573,6 +612,7 @@ The reply carries the active profile's live 5h/7d usage. Prose by default; pass 
                 "throughput": throughput,
             }),
             &config,
+            DigestMode::Report(&self.digest),
         );
         let prose = render::which_prose(&payload);
         Ok(CallToolResult::success(single_block(
@@ -591,7 +631,7 @@ this session is in. Prose by default; pass `format: \"json\"` for the structured
     ) -> Result<CallToolResult, ErrorData> {
         let format = match Format::parse(format.as_deref()) {
             Ok(f) => f,
-            Err(reason) => return Ok(format_refusal(reason)),
+            Err(reason) => return Ok(arg_refusal(reason)),
         };
         let config = load_config().map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
 
@@ -603,7 +643,11 @@ this session is in. Prose by default; pass `format: \"json\"` for the structured
         let Some(name) = config.canonical_name(&name) else {
             let payload =
                 serde_json::json!({ "ok": false, "reason": format!("profile not found: {name}") });
-            let payload = fold_active_live_usage(payload, &config);
+            // Refused before any mutation ran, so nothing of ours moved: this
+            // arm reports like `which` does. The post-mutation arms below
+            // reseed instead.
+            let payload =
+                fold_active_live_usage(payload, &config, DigestMode::Report(&self.digest));
             let prose = render::switch_prose(&payload);
             return Ok(CallToolResult::error(single_block(payload, format, prose)));
         };
@@ -631,6 +675,11 @@ this session is in. Prose by default; pass `format: \"json\"` for the structured
 
         match outcome {
             Ok((previous, active)) => {
+                // The mutation ran: reseed silently. The reply's own
+                // `previous`/`active` is the report of what this switch did —
+                // reporting its write as `since_your_last_call` news from
+                // elsewhere would be a false attribution, and leaving the
+                // baseline stale would echo it on the next call instead.
                 let payload = fold_active_live_usage(
                     serde_json::json!({
                         "ok": true,
@@ -638,6 +687,7 @@ this session is in. Prose by default; pass `format: \"json\"` for the structured
                         "active": active,
                     }),
                     &config,
+                    DigestMode::Reseed(&self.digest),
                 );
                 let prose = render::switch_prose(&payload);
                 Ok(CallToolResult::success(single_block(
@@ -645,9 +695,13 @@ this session is in. Prose by default; pass `format: \"json\"` for the structured
                 )))
             }
             Err(e) => {
+                // Failed AFTER the mutation ran, so it may have written on the
+                // way out (a stripped or repointed link): same reseed, so a
+                // partial write of ours never surfaces as external news.
                 let payload = fold_active_live_usage(
                     serde_json::json!({ "ok": false, "reason": e.to_string() }),
                     &config,
+                    DigestMode::Reseed(&self.digest),
                 );
                 let prose = render::switch_prose(&payload);
                 Ok(CallToolResult::error(single_block(payload, format, prose)))
@@ -712,7 +766,7 @@ Prose by default; pass `format: \"json\"` for the structured envelope."
     ) -> Result<CallToolResult, ErrorData> {
         let format = match Format::parse(format.as_deref()) {
             Ok(f) => f,
-            Err(reason) => return Ok(format_refusal(reason)),
+            Err(reason) => return Ok(arg_refusal(reason)),
         };
         // Fail closed: a present-but-unparseable value is treated as max depth
         // (refuse), so a corrupt env can never re-enable delegation. Only a truly
@@ -981,7 +1035,12 @@ Prose by default; pass `format: \"json\"` for the structured envelope."
             }),
         };
 
-        let payload = fold_delegate_live_usage(envelope, &target, now_epoch_secs());
+        let payload = fold_delegate_live_usage(
+            envelope,
+            &target,
+            now_epoch_secs(),
+            DigestMode::Report(&self.digest),
+        );
         let is_error = payload
             .get("is_error")
             .and_then(|v| v.as_bool())
@@ -1017,7 +1076,7 @@ default (a batch reads as one line per job); pass `format: \"json\"` for the str
     ) -> Result<CallToolResult, ErrorData> {
         let format = match Format::parse(format.as_deref()) {
             Ok(f) => f,
-            Err(reason) => return Ok(format_refusal(reason)),
+            Err(reason) => return Ok(arg_refusal(reason)),
         };
         // Exactly one id source, mirrored from `delegate`'s target pair: a
         // call that named both, or neither, is a caller mistake refused by
@@ -1034,10 +1093,63 @@ default (a batch reads as one line per job); pass `format: \"json\"` for the str
         }
         let wait = wait_secs.unwrap_or(0).min(MAX_RESULT_WAIT_SECS);
         if let Some(jid) = job_id {
-            delegate_result_one(jid, wait, format).await
+            delegate_result_one(jid, wait, format, &self.digest).await
         } else {
-            delegate_result_batch(job_ids.unwrap_or_default(), wait, format).await
+            delegate_result_batch(job_ids.unwrap_or_default(), wait, format, &self.digest).await
         }
+    }
+
+    #[tool(
+        description = "Wait for clauth's state to move and report what did: long-polls the same \
+change digest the other tools fold into their replies (`since_your_last_call`), returning as soon \
+as something moves. The digest watches three local-disk observables — the configured active \
+profile, that profile's usage cache, and `~/.claude/.credentials.json` — so this costs no network \
+and no quota. `wait_secs` (0..=60, default 0) bounds the wait: 0 samples once, and a wait that \
+elapses with nothing moved returns `status: \"unchanged\"` with `waited_secs`. A first digest \
+call has no earlier state to compare against, so it sets the baseline and returns \
+`status: \"armed\"`. Pass `kinds` (subset of `active_profile`, `usage_cache`, `credentials`; \
+default all three) to wait on less: a filtered wait leaves the unwatched observables' changes for \
+the next digest-bearing reply to report. Prose by default; pass `format: \"json\"` for the \
+structured payload."
+    )]
+    async fn watch(
+        &self,
+        Parameters(WatchArgs {
+            wait_secs,
+            kinds,
+            format,
+        }): Parameters<WatchArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let format = match Format::parse(format.as_deref()) {
+            Ok(f) => f,
+            Err(reason) => return Ok(arg_refusal(reason)),
+        };
+        let watched = match WatchSet::parse(kinds.as_deref().unwrap_or_default()) {
+            Ok(set) => set,
+            Err(reason) => return Ok(arg_refusal(reason)),
+        };
+        let wait = wait_secs.unwrap_or(0).min(MAX_WATCH_WAIT_SECS);
+        // The poll loop sleeps inside its own request on the blocking pool,
+        // mirroring `delegate_result`'s `wait_for_done` wrap, so the stdio
+        // reactor stays responsive for the whole wait.
+        let tracker = self.digest.clone();
+        let outcome = tokio::task::spawn_blocking(move || tracker.watch(watched, wait))
+            .await
+            .map_err(|e| ErrorData::internal_error(format!("watch task panicked: {e}"), None))?;
+        let payload = match outcome {
+            WatchOutcome::Armed => serde_json::json!({ "status": "armed" }),
+            WatchOutcome::Unchanged { waited_secs } => {
+                serde_json::json!({ "status": "unchanged", "waited_secs": waited_secs })
+            }
+            WatchOutcome::Changed(delta) => serde_json::json!({
+                "status": "changed",
+                "since_your_last_call": delta.to_json(),
+            }),
+        };
+        let prose = render::watch_prose(&payload);
+        Ok(CallToolResult::success(single_block(
+            payload, format, prose,
+        )))
     }
 }
 
@@ -1050,6 +1162,9 @@ const RUN_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 /// Ceiling on `delegate_result`'s long-poll wait (seconds).
 const MAX_RESULT_WAIT_SECS: u64 = 60;
+/// Ceiling on `watch`'s long-poll wait (seconds). Separate from
+/// [`MAX_RESULT_WAIT_SECS`] so the two tools' limits can move independently.
+const MAX_WATCH_WAIT_SECS: u64 = 60;
 /// Poll cadence for both `delegate_result` and the `mcp-await-job` hook.
 const JOB_POLL_INTERVAL: Duration = Duration::from_millis(200);
 /// Self-deadline for the `mcp-await-job` hook: outlast the max delegate timeout
@@ -1063,6 +1178,7 @@ async fn delegate_result_one(
     job_id: String,
     wait: u64,
     format: Format,
+    digest: &DigestTracker,
 ) -> Result<CallToolResult, ErrorData> {
     if !jobs::is_safe_job_id(&job_id) {
         let payload = serde_json::json!({ "is_error": true, "result": "invalid job_id" });
@@ -1098,7 +1214,7 @@ async fn delegate_result_one(
             )))
         }
         WaitOutcome::Done(record) => {
-            let (blocks, is_error) = render_done_envelope(record, format);
+            let (blocks, is_error) = render_done_envelope(record, format, digest);
             // Fallback path delivered it — evict only now that the envelope
             // is safely rendered, so the file doesn't linger past its
             // purpose (GC also reaps it on a TTL) while a panic inside
@@ -1124,6 +1240,7 @@ async fn delegate_result_batch(
     job_ids: Vec<String>,
     wait: u64,
     format: Format,
+    digest: &DigestTracker,
 ) -> Result<CallToolResult, ErrorData> {
     // The cap mirrors the job store's own retention: GC keeps at most
     // `MAX_RETAINED` files, so a longer list could not resolve more ids, and
@@ -1170,7 +1287,7 @@ async fn delegate_result_batch(
                 payload
             }
             WaitOutcome::Done(record) => {
-                let (mut payload, is_error) = fold_done_envelope(&record);
+                let (mut payload, is_error) = fold_done_envelope(&record, digest);
                 any_error |= is_error;
                 // The folded envelope is always an object (a non-object
                 // self-report is wrapped under `result` first), so the caller's
@@ -1215,7 +1332,10 @@ async fn delegate_result_batch(
 /// the payload and its error flag. Pure of the job store: the caller evicts the
 /// file only after its render, so a panic inside leaves the job file as the
 /// recoverable copy of the delegate's result.
-fn fold_done_envelope(record: &jobs::JobRecord) -> (serde_json::Value, bool) {
+fn fold_done_envelope(
+    record: &jobs::JobRecord,
+    digest: &DigestTracker,
+) -> (serde_json::Value, bool) {
     let payload = fold_delegate_live_usage(
         record.envelope.clone().unwrap_or_else(|| {
             serde_json::json!({
@@ -1226,6 +1346,7 @@ fn fold_done_envelope(record: &jobs::JobRecord) -> (serde_json::Value, bool) {
         }),
         &record.profile,
         now_epoch_secs(),
+        DigestMode::Report(digest),
     );
     let is_error = payload
         .get("is_error")
@@ -1235,8 +1356,12 @@ fn fold_done_envelope(record: &jobs::JobRecord) -> (serde_json::Value, bool) {
 }
 
 /// Render a finished job's envelope into its response blocks and error flag.
-fn render_done_envelope(record: jobs::JobRecord, format: Format) -> (Vec<ContentBlock>, bool) {
-    let (payload, is_error) = fold_done_envelope(&record);
+fn render_done_envelope(
+    record: jobs::JobRecord,
+    format: Format,
+    digest: &DigestTracker,
+) -> (Vec<ContentBlock>, bool) {
+    let (payload, is_error) = fold_done_envelope(&record, digest);
     let prose = render::delegate_result_prose(&payload);
     (single_block(payload, format, prose), is_error)
 }
@@ -2698,3 +2823,7 @@ mod delegate_args_tests;
 #[cfg(test)]
 #[path = "../../tests/inline/mcp_herdr_report.rs"]
 mod herdr_report_tests;
+
+#[cfg(test)]
+#[path = "../../tests/inline/mcp_digest.rs"]
+mod digest_tests;

@@ -1457,6 +1457,14 @@ pub(crate) fn read_toml_file<T: DeserializeOwned>(path: &Path) -> Result<T> {
     toml::from_str(&content).with_context(|| format!("failed to parse {}", path.display()))
 }
 
+/// The configured active profile, read from `profiles.toml` alone. For callers
+/// that need only this one field on a poll loop (the MCP digest samples at
+/// 200ms while waiting): a full `load_config` there reads every profile's
+/// config and credentials for one string.
+pub(crate) fn active_profile_name() -> Option<ProfileName> {
+    load_app_state().ok().and_then(|s| s.active_profile)
+}
+
 fn load_app_state() -> Result<AppState> {
     let path = app_state_path()?;
     if !path.exists() {

@@ -1101,7 +1101,7 @@ fn render_done_envelope_leaves_the_job_until_the_caller_evicts() {
     jobs::write_done("d-render-0", "work", 1, serde_json::json!("unauthorized")).unwrap();
     let record = jobs::read("d-render-0").expect("seeded job");
 
-    let (blocks, is_error) = render_done_envelope(record, Format::Json);
+    let (blocks, is_error) = render_done_envelope(record, Format::Json, &DigestTracker::new());
 
     assert!(
         !is_error,
@@ -1554,13 +1554,15 @@ fn delegate_result_single_spelling_is_byte_identical_to_pre_batch() {
 #[test]
 fn fold_delegate_live_usage_wraps_non_objects_and_folds_objects() {
     let _home = HomeSandbox::new();
+    let digest = DigestTracker::new();
     for scalar in [
         serde_json::json!("unauthorized"),
         serde_json::json!(42),
         serde_json::json!(true),
         serde_json::json!([1, 2]),
     ] {
-        let folded = fold_delegate_live_usage(scalar.clone(), "work", 0);
+        let folded =
+            fold_delegate_live_usage(scalar.clone(), "work", 0, DigestMode::Report(&digest));
         let obj = folded.as_object().expect("a folded envelope is an object");
         assert_eq!(
             obj.get("result"),
@@ -1575,6 +1577,7 @@ fn fold_delegate_live_usage_wraps_non_objects_and_folds_objects() {
         serde_json::json!({"profile": "work", "is_error": false, "result": "all done"}),
         "work",
         0,
+        DigestMode::Report(&digest),
     );
     assert_eq!(folded["result"], "all done");
     assert_eq!(folded["live_usage"]["profile"], "work");
@@ -1593,12 +1596,13 @@ fn fold_active_live_usage_wraps_non_objects_and_folds_objects() {
         state: crate::profile::AppState::default(),
         profiles: Vec::new(),
     };
+    let digest = DigestTracker::new();
     for scalar in [
         serde_json::json!("oops"),
         serde_json::json!(42),
         serde_json::json!([1, 2]),
     ] {
-        let folded = fold_active_live_usage(scalar.clone(), &config);
+        let folded = fold_active_live_usage(scalar.clone(), &config, DigestMode::Report(&digest));
         let obj = folded.as_object().expect("a folded payload is an object");
         assert_eq!(
             obj.get("result"),
@@ -1612,6 +1616,7 @@ fn fold_active_live_usage_wraps_non_objects_and_folds_objects() {
     let folded = fold_active_live_usage(
         serde_json::json!({"ok": true, "previous": "a", "active": "b"}),
         &config,
+        DigestMode::Report(&digest),
     );
     assert_eq!(folded["ok"], true);
     assert_eq!(folded["previous"], "a");

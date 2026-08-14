@@ -23,8 +23,10 @@ const DONE_TTL_MS: u64 = 60 * 60 * 1000; // 1h
 /// A `running` file older than this is orphaned (its server died mid-job); reap
 /// it. Sits above the max delegate timeout plus slack.
 const RUNNING_TTL_MS: u64 = (3600 + 600) * 1000;
-/// Hard cap on retained job files; newest kept, older reaped.
-const MAX_RETAINED: usize = 256;
+/// Hard cap on retained job files; newest kept, older reaped. Also the cap on
+/// one `delegate_result` `job_ids` list: the store holds at most this many
+/// files, so a longer list could not resolve more ids.
+pub(crate) const MAX_RETAINED: usize = 256;
 
 /// Per-process counter making two job ids minted in the same millisecond differ.
 static JOB_COUNTER: AtomicU64 = AtomicU64::new(0);

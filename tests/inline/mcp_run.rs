@@ -811,7 +811,32 @@ fn call_delegate_result(
     rt.block_on(async {
         server
             .delegate_result(Parameters(DelegateResultArgs {
-                job_id: job_id.to_string(),
+                job_id: Some(job_id.to_string()),
+                job_ids: None,
+                wait_secs,
+                format: format.map(str::to_string),
+            }))
+            .await
+    })
+    .expect("delegate_result returns a tool result, never a transport error")
+}
+
+/// Drive a `delegate_result` batch on a current-thread runtime under a home
+/// sandbox the caller has already entered.
+fn call_delegate_result_batch(
+    job_ids: Vec<&str>,
+    wait_secs: Option<u64>,
+    format: Option<&str>,
+) -> CallToolResult {
+    let server = ClauthServer::new();
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .expect("runtime");
+    rt.block_on(async {
+        server
+            .delegate_result(Parameters(DelegateResultArgs {
+                job_id: None,
+                job_ids: Some(job_ids.into_iter().map(str::to_string).collect()),
                 wait_secs,
                 format: format.map(str::to_string),
             }))
@@ -994,6 +1019,263 @@ fn render_done_envelope_leaves_the_job_until_the_caller_evicts() {
     assert_eq!(
         body["result"], "unauthorized",
         "the delegate's own output survives the fold"
+    );
+}
+
+/// Drive `delegate_result` with a raw args struct on a current-thread runtime,
+/// for the argument-shape refusals no job file can seed.
+fn call_delegate_result_args(args: DelegateResultArgs) -> CallToolResult {
+    let server = ClauthServer::new();
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .expect("runtime");
+    rt.block_on(async { server.delegate_result(Parameters(args)).await })
+        .expect("delegate_result returns a tool result, never a transport error")
+}
+
+#[test]
+fn delegate_result_batch_returns_one_result_per_id_in_order() {
+    let _home = HomeSandbox::new();
+    jobs::write_done(
+        "d-b1-0",
+        "work",
+        1,
+        serde_json::json!({"profile": "work", "is_error": false, "result": "all done"}),
+    )
+    .unwrap();
+    jobs::write_running("d-b2-0", "work", 1, false).unwrap();
+
+    let result =
+        call_delegate_result_batch(vec!["d-b1-0", "d-b2-0", "d-b3-0"], Some(0), Some("json"));
+    assert_ne!(
+        result.is_error,
+        Some(true),
+        "a batch with an absent id is not an error"
+    );
+    assert_eq!(result.content.len(), 1, "json is a single content block");
+    let text = result
+        .content
+        .first()
+        .and_then(|c| c.as_text())
+        .map(|t| t.text.clone())
+        .expect("results text");
+    let body: serde_json::Value = serde_json::from_str(&text).expect("results parses as JSON");
+    let results = body["results"].as_array().expect("results is an array");
+    assert_eq!(results.len(), 3, "one result per requested id");
+
+    assert_eq!(
+        results[0]["job_id"], "d-b1-0",
+        "results follow the order given"
+    );
+    assert_eq!(results[0]["status"], "done");
+    assert_eq!(
+        results[0]["result"], "all done",
+        "a done id carries its envelope"
+    );
+    assert!(
+        results[0].get("live_usage").is_some(),
+        "the done envelope folds in live usage like the single spelling"
+    );
+    assert!(
+        jobs::read("d-b1-0").is_none(),
+        "a done job is evicted on batch fetch"
+    );
+
+    assert_eq!(results[1]["job_id"], "d-b2-0");
+    assert_eq!(results[1]["status"], "running");
+    assert!(
+        results[1].get("elapsed_secs").is_some(),
+        "running reports elapsed"
+    );
+    assert!(
+        jobs::read("d-b2-0").is_some(),
+        "a running job is not evicted"
+    );
+
+    assert_eq!(results[2]["job_id"], "d-b3-0");
+    assert_eq!(
+        results[2]["status"], "unknown",
+        "an absent id is reported per-id, never dropped"
+    );
+    assert_eq!(
+        results[2].as_object().map(|o| o.len()),
+        Some(2),
+        "an absent result carries only its id and status"
+    );
+}
+
+#[test]
+fn delegate_result_batch_prose_is_one_block_with_one_line_per_job() {
+    let _home = HomeSandbox::new();
+    jobs::write_done(
+        "d-b1-0",
+        "work",
+        1,
+        serde_json::json!({"profile": "work", "is_error": false, "result": "all done"}),
+    )
+    .unwrap();
+    jobs::write_running("d-b2-0", "work", 1, false).unwrap();
+
+    let result = call_delegate_result_batch(vec!["d-b1-0", "d-b2-0", "d-b3-0"], Some(0), None);
+    assert_ne!(result.is_error, Some(true));
+    assert_eq!(result.content.len(), 1, "prose is a single content block");
+    let text = result
+        .content
+        .first()
+        .and_then(|c| c.as_text())
+        .map(|t| t.text.clone())
+        .expect("prose text");
+    assert!(
+        serde_json::from_str::<serde_json::Value>(&text).is_err(),
+        "the prose default must not be a JSON blob"
+    );
+    let lines: Vec<&str> = text.split('\n').collect();
+    assert_eq!(lines.len(), 3, "one line per job");
+    assert_eq!(lines[0], "job `d-b1-0` finished: all done");
+    assert!(
+        lines[1].starts_with("job `d-b2-0` running, elapsed"),
+        "a running line names its id and state: {lines:?}"
+    );
+    assert_eq!(lines[2], "job `d-b3-0` unknown");
+}
+
+#[test]
+fn delegate_result_batch_refuses_both_and_neither_job_id() {
+    let _home = HomeSandbox::new();
+    let both = call_delegate_result_args(DelegateResultArgs {
+        job_id: Some("d-1".to_string()),
+        job_ids: Some(vec!["d-1".to_string()]),
+        wait_secs: None,
+        format: None,
+    });
+    assert_eq!(both.is_error, Some(true), "both spellings is refused");
+    assert_eq!(
+        both.content
+            .first()
+            .and_then(|c| c.as_text())
+            .map(|t| t.text.clone())
+            .expect("refusal text"),
+        "error: exactly one of `job_id` or `job_ids` must be given; both were"
+    );
+
+    let neither = call_delegate_result_args(DelegateResultArgs {
+        job_id: None,
+        job_ids: None,
+        wait_secs: None,
+        format: None,
+    });
+    assert_eq!(neither.is_error, Some(true), "neither spelling is refused");
+    assert_eq!(
+        neither
+            .content
+            .first()
+            .and_then(|c| c.as_text())
+            .map(|t| t.text.clone())
+            .expect("refusal text"),
+        "error: exactly one of `job_id` or `job_ids` must be given; neither was"
+    );
+}
+
+#[test]
+fn delegate_result_batch_refuses_over_cap_and_empty_list() {
+    let _home = HomeSandbox::new();
+    let over = call_delegate_result_args(DelegateResultArgs {
+        job_id: None,
+        job_ids: Some((0..257).map(|i| format!("d-{i}")).collect()),
+        wait_secs: None,
+        format: None,
+    });
+    assert_eq!(over.is_error, Some(true), "a list over the cap is refused");
+    assert_eq!(
+        over.content
+            .first()
+            .and_then(|c| c.as_text())
+            .map(|t| t.text.clone())
+            .expect("refusal text"),
+        "error: `job_ids` capped at 256 ids; got 257"
+    );
+
+    let empty = call_delegate_result_args(DelegateResultArgs {
+        job_id: None,
+        job_ids: Some(Vec::new()),
+        wait_secs: None,
+        format: None,
+    });
+    assert_eq!(empty.is_error, Some(true), "an empty list is refused");
+    assert_eq!(
+        empty
+            .content
+            .first()
+            .and_then(|c| c.as_text())
+            .map(|t| t.text.clone())
+            .expect("refusal text"),
+        "error: `job_ids` is empty: name at least one job_id"
+    );
+}
+
+/// The single-`job_id` spelling's exact bytes, pinned against the pre-batch
+/// tool: a batch caller must never change what an existing single-id caller
+/// sees, so the time-independent shapes are asserted verbatim.
+#[test]
+fn delegate_result_single_spelling_is_byte_identical_to_pre_batch() {
+    let _home = HomeSandbox::new();
+
+    let unknown_json = call_delegate_result("d-pin-unknown-0", Some(0), Some("json"));
+    assert_eq!(unknown_json.is_error, Some(true));
+    assert_eq!(
+        unknown_json
+            .content
+            .first()
+            .and_then(|c| c.as_text())
+            .map(|t| t.text.clone())
+            .expect("json text"),
+        r#"{"is_error":true,"result":"unknown job_id: d-pin-unknown-0"}"#
+    );
+    let unknown_prose = call_delegate_result("d-pin-unknown-0", Some(0), None);
+    assert_eq!(
+        unknown_prose
+            .content
+            .first()
+            .and_then(|c| c.as_text())
+            .map(|t| t.text.clone())
+            .expect("prose text"),
+        "error: unknown job_id: d-pin-unknown-0"
+    );
+
+    jobs::write_done(
+        "d-pin-done-0",
+        "work",
+        1,
+        serde_json::json!({"profile": "work", "is_error": false, "result": "all done"}),
+    )
+    .unwrap();
+    let done_json = call_delegate_result("d-pin-done-0", Some(0), Some("json"));
+    assert_eq!(
+        done_json
+            .content
+            .first()
+            .and_then(|c| c.as_text())
+            .map(|t| t.text.clone())
+            .expect("json text"),
+        r#"{"profile":"work","is_error":false,"result":"all done","live_usage":{"profile":"work","5h_used_pct":null,"7d_used_pct":null}}"#
+    );
+
+    jobs::write_done(
+        "d-pin-done-0",
+        "work",
+        1,
+        serde_json::json!({"profile": "work", "is_error": false, "result": "all done"}),
+    )
+    .unwrap();
+    let done_prose = call_delegate_result("d-pin-done-0", Some(0), None);
+    assert_eq!(
+        done_prose
+            .content
+            .first()
+            .and_then(|c| c.as_text())
+            .map(|t| t.text.clone())
+            .expect("prose text"),
+        "delegate to `work` finished: all done; target `work`: 5h unknown, 7d unknown"
     );
 }
 

@@ -104,7 +104,8 @@ fn every_tool_refuses_an_unrecognised_format_by_name() {
     );
     assert_refusal(
         &drive(server.delegate_result(Parameters(DelegateResultArgs {
-            job_id: "d-1".to_string(),
+            job_id: Some("d-1".to_string()),
+            job_ids: None,
             wait_secs: None,
             format: Some("yaml".to_string()),
         }))),
@@ -264,7 +265,8 @@ fn delegate_depth_prose_default_and_json_keys() {
 fn delegate_result_invalid_prose_default_and_json_keys() {
     let prose = drive(
         ClauthServer::new().delegate_result(Parameters(DelegateResultArgs {
-            job_id: "../evil".to_string(),
+            job_id: Some("../evil".to_string()),
+            job_ids: None,
             wait_secs: None,
             format: None,
         })),
@@ -275,7 +277,8 @@ fn delegate_result_invalid_prose_default_and_json_keys() {
 
     let json = drive(
         ClauthServer::new().delegate_result(Parameters(DelegateResultArgs {
-            job_id: "../evil".to_string(),
+            job_id: Some("../evil".to_string()),
+            job_ids: None,
             wait_secs: None,
             format: Some("json".to_string()),
         })),

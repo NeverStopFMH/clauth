@@ -357,7 +357,14 @@ pub(crate) struct DelegateArgs {
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub(crate) struct DelegateResultArgs {
     /// Job id returned by a `delegate` call made with `background: true`.
-    job_id: String,
+    /// Exactly one of `job_id` or `job_ids`.
+    job_id: Option<String>,
+    /// Collect several backgrounded jobs in one call: one result per id, in the
+    /// order given (the done envelope, a running status, or `unknown` for an
+    /// absent id). Capped at 256 ids: the job store keeps at most that many
+    /// files, so a longer list buys nothing. Exactly one of `job_id` or
+    /// `job_ids`.
+    job_ids: Option<Vec<String>>,
     /// Seconds to long-poll for completion before returning (0..=60, default 0 =
     /// reply instantly with the current state).
     wait_secs: Option<u64>,
@@ -910,13 +917,16 @@ Prose by default; pass `format: \"json\"` for the structured envelope."
 clauth's PostToolUse hook delivers the result on its own. Use it when hooks are off, or to check \
 progress; `wait_secs` (0..=60) long-polls. Returns the delegate envelope when done, else \
 `{status:\"running\", elapsed_secs, quota?}` (`quota` only when that `delegate` call set \
-`monitor: true`), or an error for an unknown `job_id`. Prose by default; pass `format: \"json\"` \
-for the structured payload."
+`monitor: true`), or an error for an unknown `job_id`. A `job_ids` list collects several jobs in \
+one call instead: one result per id, in the order given (the done envelope, a running status, or \
+`unknown` for an absent id), capped at 256. Exactly one of `job_id` or `job_ids`. Prose by \
+default (a batch reads as one line per job); pass `format: \"json\"` for the structured payload."
     )]
     async fn delegate_result(
         &self,
         Parameters(DelegateResultArgs {
             job_id,
+            job_ids,
             wait_secs,
             format,
         }): Parameters<DelegateResultArgs>,
@@ -925,54 +935,24 @@ for the structured payload."
             Ok(f) => f,
             Err(reason) => return Ok(format_refusal(reason)),
         };
-        if !jobs::is_safe_job_id(&job_id) {
-            let payload = serde_json::json!({ "is_error": true, "result": "invalid job_id" });
+        // Exactly one id source, mirrored from `delegate`'s target pair: a
+        // call that named both, or neither, is a caller mistake refused by
+        // name before any job store touch.
+        if job_id.is_some() == job_ids.is_some() {
+            let reason = if job_id.is_some() {
+                "exactly one of `job_id` or `job_ids` must be given; both were"
+            } else {
+                "exactly one of `job_id` or `job_ids` must be given; neither was"
+            };
+            let payload = serde_json::json!({ "is_error": true, "result": reason });
             let prose = render::delegate_result_prose(&payload);
             return Ok(CallToolResult::error(single_block(payload, format, prose)));
         }
         let wait = wait_secs.unwrap_or(0).min(MAX_RESULT_WAIT_SECS);
-        let jid = job_id.clone();
-        let outcome = tokio::task::spawn_blocking(move || wait_for_done(&jid, wait))
-            .await
-            .map_err(|e| ErrorData::internal_error(format!("wait task panicked: {e}"), None))?;
-
-        match outcome {
-            WaitOutcome::Unknown => {
-                let payload = serde_json::json!({ "is_error": true, "result": format!("unknown job_id: {job_id}") });
-                let prose = render::delegate_result_prose(&payload);
-                Ok(CallToolResult::error(single_block(payload, format, prose)))
-            }
-            WaitOutcome::Running(record) => {
-                let elapsed_secs = now_ms().saturating_sub(record.started_at) / 1000;
-                let mut payload = serde_json::json!({
-                    "job_id": job_id,
-                    "status": "running",
-                    "elapsed_secs": elapsed_secs,
-                });
-                // `monitor`-gated: attach the target's live usage windows so the
-                // poller sees remaining headroom without a separate list_profiles.
-                if record.monitor {
-                    payload["quota"] = windows_json(&record.profile);
-                }
-                let prose = render::delegate_result_prose(&payload);
-                Ok(CallToolResult::success(single_block(
-                    payload, format, prose,
-                )))
-            }
-            WaitOutcome::Done(record) => {
-                let (blocks, is_error) = render_done_envelope(record, format);
-                // Fallback path delivered it — evict only now that the envelope
-                // is safely rendered, so the file doesn't linger past its
-                // purpose (GC also reaps it on a TTL) while a panic inside
-                // `render_done_envelope` still leaves the job file as the
-                // recoverable copy.
-                jobs::remove(&job_id);
-                if is_error {
-                    Ok(CallToolResult::error(blocks))
-                } else {
-                    Ok(CallToolResult::success(blocks))
-                }
-            }
+        if let Some(jid) = job_id {
+            delegate_result_one(jid, wait, format).await
+        } else {
+            delegate_result_batch(job_ids.unwrap_or_default(), wait, format).await
         }
     }
 }
@@ -992,13 +972,150 @@ const JOB_POLL_INTERVAL: Duration = Duration::from_millis(200);
 /// plus slack so it never gives up before a legitimately long delegate finishes.
 const AWAIT_JOB_DEADLINE_SECS: u64 = MAX_RUN_TIMEOUT_SECS + 600;
 
-/// Render a finished job's envelope into its response blocks and error flag.
-/// Pure of the job store: the caller evicts the file only after this returns,
-/// so a panic inside leaves the job file as the recoverable copy of the
-/// delegate's result.
-fn render_done_envelope(record: jobs::JobRecord, format: Format) -> (Vec<ContentBlock>, bool) {
+/// The single-`job_id` half of `delegate_result`, byte-compatible with the
+/// pre-batch tool: one envelope/status/error in one block, an unknown or unsafe
+/// id refused by name.
+async fn delegate_result_one(
+    job_id: String,
+    wait: u64,
+    format: Format,
+) -> Result<CallToolResult, ErrorData> {
+    if !jobs::is_safe_job_id(&job_id) {
+        let payload = serde_json::json!({ "is_error": true, "result": "invalid job_id" });
+        let prose = render::delegate_result_prose(&payload);
+        return Ok(CallToolResult::error(single_block(payload, format, prose)));
+    }
+    let jid = job_id.clone();
+    let outcome = tokio::task::spawn_blocking(move || wait_for_done(&jid, wait))
+        .await
+        .map_err(|e| ErrorData::internal_error(format!("wait task panicked: {e}"), None))?;
+
+    match outcome {
+        WaitOutcome::Unknown => {
+            let payload = serde_json::json!({ "is_error": true, "result": format!("unknown job_id: {job_id}") });
+            let prose = render::delegate_result_prose(&payload);
+            Ok(CallToolResult::error(single_block(payload, format, prose)))
+        }
+        WaitOutcome::Running(record) => {
+            let elapsed_secs = now_ms().saturating_sub(record.started_at) / 1000;
+            let mut payload = serde_json::json!({
+                "job_id": job_id,
+                "status": "running",
+                "elapsed_secs": elapsed_secs,
+            });
+            // `monitor`-gated: attach the target's live usage windows so the
+            // poller sees remaining headroom without a separate list_profiles.
+            if record.monitor {
+                payload["quota"] = windows_json(&record.profile);
+            }
+            let prose = render::delegate_result_prose(&payload);
+            Ok(CallToolResult::success(single_block(
+                payload, format, prose,
+            )))
+        }
+        WaitOutcome::Done(record) => {
+            let (blocks, is_error) = render_done_envelope(record, format);
+            // Fallback path delivered it — evict only now that the envelope
+            // is safely rendered, so the file doesn't linger past its
+            // purpose (GC also reaps it on a TTL) while a panic inside
+            // `render_done_envelope` still leaves the job file as the
+            // recoverable copy.
+            jobs::remove(&job_id);
+            if is_error {
+                Ok(CallToolResult::error(blocks))
+            } else {
+                Ok(CallToolResult::success(blocks))
+            }
+        }
+    }
+}
+
+/// The `job_ids` half of `delegate_result`: one result per requested id in the
+/// order given. An absent id is its own `unknown` result, never a batch-level
+/// failure; a done id is evicted only after the whole batch rendered, so a
+/// mid-fold panic leaves every done file as its recoverable copy.
+async fn delegate_result_batch(
+    job_ids: Vec<String>,
+    wait: u64,
+    format: Format,
+) -> Result<CallToolResult, ErrorData> {
+    // The cap mirrors the job store's own retention: GC keeps at most
+    // `MAX_RETAINED` files, so a longer list could not resolve more ids, and
+    // the bound keeps one response from growing without limit.
+    if job_ids.len() > jobs::MAX_RETAINED {
+        let reason = format!(
+            "`job_ids` capped at {} ids; got {}",
+            jobs::MAX_RETAINED,
+            job_ids.len()
+        );
+        let payload = serde_json::json!({ "is_error": true, "result": reason });
+        let prose = render::delegate_result_prose(&payload);
+        return Ok(CallToolResult::error(single_block(payload, format, prose)));
+    }
+    // An empty list passes every per-id check vacuously and would return a
+    // success-shaped `{"results": []}` that collected nothing.
+    if job_ids.is_empty() {
+        let reason = "`job_ids` is empty: name at least one job_id";
+        let payload = serde_json::json!({ "is_error": true, "result": reason });
+        let prose = render::delegate_result_prose(&payload);
+        return Ok(CallToolResult::error(single_block(payload, format, prose)));
+    }
+
+    let outcomes = tokio::task::spawn_blocking(move || wait_for_batch(&job_ids, wait))
+        .await
+        .map_err(|e| ErrorData::internal_error(format!("wait task panicked: {e}"), None))?;
+
+    let mut results = Vec::with_capacity(outcomes.len());
+    let mut delivered = Vec::new();
+    for (id, outcome) in outcomes {
+        let entry = match outcome {
+            WaitOutcome::Unknown => serde_json::json!({ "job_id": id, "status": "unknown" }),
+            WaitOutcome::Running(record) => {
+                let elapsed_secs = now_ms().saturating_sub(record.started_at) / 1000;
+                let mut payload = serde_json::json!({
+                    "job_id": id,
+                    "status": "running",
+                    "elapsed_secs": elapsed_secs,
+                });
+                if record.monitor {
+                    payload["quota"] = windows_json(&record.profile);
+                }
+                payload
+            }
+            WaitOutcome::Done(record) => {
+                let (mut payload, _) = fold_done_envelope(&record);
+                // The folded envelope is always an object (a non-object
+                // self-report is wrapped under `result` first), so the caller's
+                // per-id markers cannot collide with delegate output.
+                if let serde_json::Value::Object(map) = &mut payload {
+                    map.insert("job_id".to_string(), serde_json::Value::String(id));
+                    map.insert(
+                        "status".to_string(),
+                        serde_json::Value::String("done".to_string()),
+                    );
+                }
+                delivered.push(record.job_id);
+                payload
+            }
+        };
+        results.push(entry);
+    }
+    let payload = serde_json::json!({ "results": results });
+    let prose = render::delegate_result_batch_prose(&payload);
+    let blocks = single_block(payload, format, prose);
+    for id in delivered {
+        jobs::remove(&id);
+    }
+    Ok(CallToolResult::success(blocks))
+}
+
+/// Fold a finished job's envelope the way every delivery path does, returning
+/// the payload and its error flag. Pure of the job store: the caller evicts the
+/// file only after its render, so a panic inside leaves the job file as the
+/// recoverable copy of the delegate's result.
+fn fold_done_envelope(record: &jobs::JobRecord) -> (serde_json::Value, bool) {
     let payload = fold_delegate_live_usage(
-        record.envelope.unwrap_or_else(|| {
+        record.envelope.clone().unwrap_or_else(|| {
             serde_json::json!({
                 "profile": record.profile,
                 "is_error": true,
@@ -1012,6 +1129,12 @@ fn render_done_envelope(record: jobs::JobRecord, format: Format) -> (Vec<Content
         .get("is_error")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
+    (payload, is_error)
+}
+
+/// Render a finished job's envelope into its response blocks and error flag.
+fn render_done_envelope(record: jobs::JobRecord, format: Format) -> (Vec<ContentBlock>, bool) {
+    let (payload, is_error) = fold_done_envelope(&record);
     let prose = render::delegate_result_prose(&payload);
     (single_block(payload, format, prose), is_error)
 }
@@ -1041,6 +1164,46 @@ fn wait_for_done(job_id: &str, deadline_secs: u64) -> WaitOutcome {
         }
         std::thread::sleep(JOB_POLL_INTERVAL);
     }
+}
+
+/// Poll every id until each resolves or `deadline_secs` elapses, mirroring
+/// `await_job_outcomes`'s semantics: a done file resolves at once, an absent
+/// file resolves at once (it never appears for a caller-supplied id), and a
+/// running file holds until the deadline. One outcome per id, in the order
+/// given. Blocking; callers wrap it in `spawn_blocking`.
+fn wait_for_batch(job_ids: &[String], deadline_secs: u64) -> Vec<(String, WaitOutcome)> {
+    let start = Instant::now();
+    let deadline = Duration::from_secs(deadline_secs);
+    // `None` = unresolved. An unsafe id can never name a job file
+    // (`new_job_id` mints only safe ids), so it resolves to `Unknown` upfront
+    // and never reaches the path join.
+    let mut outcomes: Vec<Option<WaitOutcome>> = job_ids
+        .iter()
+        .map(|id| (!jobs::is_safe_job_id(id)).then_some(WaitOutcome::Unknown))
+        .collect();
+    loop {
+        let mut unresolved = false;
+        for (id, slot) in job_ids.iter().zip(&mut outcomes) {
+            if slot.is_some() {
+                continue;
+            }
+            match jobs::read(id) {
+                Some(r) if r.state == jobs::JobState::Done => *slot = Some(WaitOutcome::Done(r)),
+                Some(r) if start.elapsed() >= deadline => *slot = Some(WaitOutcome::Running(r)),
+                Some(_) => unresolved = true,
+                None => *slot = Some(WaitOutcome::Unknown),
+            }
+        }
+        if !unresolved || start.elapsed() >= deadline {
+            break;
+        }
+        std::thread::sleep(JOB_POLL_INTERVAL);
+    }
+    job_ids
+        .iter()
+        .zip(outcomes)
+        .map(|(id, slot)| (id.clone(), slot.unwrap_or(WaitOutcome::Unknown)))
+        .collect()
 }
 
 /// `clauth mcp-await-job` — the body of the bundled PostToolUse `asyncRewake`

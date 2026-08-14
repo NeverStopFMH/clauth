@@ -677,17 +677,7 @@ pub(crate) fn delegate_result_prose(p: &Value) -> String {
     if p.get("job_id").and_then(Value::as_str).is_some()
         && p.get("status").and_then(Value::as_str).is_some()
     {
-        let job_id = p.get("job_id").and_then(Value::as_str).unwrap_or("unknown");
-        let status = p.get("status").and_then(Value::as_str).unwrap_or("unknown");
-        let elapsed = p
-            .get("elapsed_secs")
-            .and_then(Value::as_u64)
-            .map_or_else(|| "unknown".to_string(), |v| format!("{v}s"));
-        let mut out = format!("job `{job_id}` {status}, elapsed {elapsed}");
-        if let Some(q) = p.get("quota") {
-            out.push_str(&format!("; quota: {}", windows_prose(q)));
-        }
-        return out;
+        return running_status_prose(p);
     }
     if let Some(lu) = p.get("live_usage") {
         let target = lu
@@ -705,6 +695,46 @@ pub(crate) fn delegate_result_prose(p: &Value) -> String {
     } else {
         result.to_string()
     }
+}
+
+/// The `job_id` + `status` line shared by the single `delegate_result` running
+/// status and each running line of a batch.
+fn running_status_prose(p: &Value) -> String {
+    let job_id = p.get("job_id").and_then(Value::as_str).unwrap_or("unknown");
+    let status = p.get("status").and_then(Value::as_str).unwrap_or("unknown");
+    let elapsed = p
+        .get("elapsed_secs")
+        .and_then(Value::as_u64)
+        .map_or_else(|| "unknown".to_string(), |v| format!("{v}s"));
+    let mut out = format!("job `{job_id}` {status}, elapsed {elapsed}");
+    if let Some(q) = p.get("quota") {
+        out.push_str(&format!("; quota: {}", windows_prose(q)));
+    }
+    out
+}
+
+/// Prose for a `delegate_result` batch: one line per requested id, naming its
+/// id and state. A done line reuses the envelope spelling, a running line the
+/// shared running spelling, an absent id reads `unknown`. Live usage stays in
+/// the JSON spelling only so the lines stay short.
+pub(crate) fn delegate_result_batch_prose(p: &Value) -> String {
+    let results = p
+        .get("results")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
+    results
+        .iter()
+        .map(|r| {
+            let job_id = r.get("job_id").and_then(Value::as_str).unwrap_or("unknown");
+            match r.get("status").and_then(Value::as_str) {
+                Some("done") => format!("job `{job_id}` {}", envelope_prose(r)),
+                Some("running") => running_status_prose(r),
+                _ => format!("job `{job_id}` unknown"),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 #[cfg(test)]

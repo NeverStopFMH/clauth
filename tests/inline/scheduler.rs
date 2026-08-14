@@ -169,6 +169,43 @@ fn collect_third_party_entries_excludes_disabled_profiles_includes_enabled_sibli
     );
 }
 
+/// The same credential test, tightened: an EMPTY or whitespace-only api key is
+/// no credential, so the profile never enters the poll work list. A keyed
+/// sibling still does.
+#[test]
+fn collect_third_party_entries_skips_an_empty_key_profile() {
+    let keyed = crate::profile::Profile::new(
+        "keyed".to_string(),
+        Some("https://api.deepseek.com/anthropic".to_string()),
+        Some("sk-fixture".to_string()),
+    );
+    let empty = crate::profile::Profile::new(
+        "empty".to_string(),
+        Some("https://api.deepseek.com/anthropic".to_string()),
+        Some(String::new()),
+    );
+    let space = crate::profile::Profile::new(
+        "space".to_string(),
+        Some("https://api.deepseek.com/anthropic".to_string()),
+        Some("  \t ".to_string()),
+    );
+
+    let collected = collect_third_party_entries(&[keyed, empty, space]);
+    let names: Vec<&str> = collected.iter().map(|e| e.name.as_str()).collect();
+    assert!(
+        names.contains(&"keyed"),
+        "a keyed third-party account is still collected"
+    );
+    assert!(
+        !names.contains(&"empty"),
+        "an empty-key account must never enter the poll work list: {names:?}"
+    );
+    assert!(
+        !names.contains(&"space"),
+        "a whitespace-key account must never enter the poll work list: {names:?}"
+    );
+}
+
 /// Every profile uses the same fixed `REFRESH_INTERVAL_MS` cadence: a
 /// never-fetched profile is due once `now` reaches the interval, a just-fetched
 /// one is not due until exactly one interval has elapsed, and the published

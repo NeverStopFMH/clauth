@@ -305,6 +305,32 @@ fn tp_rows_uncredentialed_profile_is_terminal() {
     );
 }
 
+/// An EMPTY or whitespace-only api key is the same never-scheduled state: the
+/// render layer must read it through the shared credential test and say so
+/// instead of spinning "loading" for a fetch no leg will run.
+#[test]
+fn tp_rows_empty_key_profile_is_terminal() {
+    for key in [String::new(), "  \t ".to_string()] {
+        let mut profile = crate::testutil::blank_profile("ds");
+        profile.base_url = Some("https://api.deepseek.com/anthropic".to_string());
+        profile.provider =
+            crate::providers::Provider::from_base_url("https://api.deepseek.com/anthropic");
+        profile.api_key = Some(key);
+        let rendered: Vec<String> = build_tp_rows(&profile, 52, false, false, ResetFmt::default())
+            .iter()
+            .map(|l| l.spans.iter().map(|s| s.content.clone()).collect())
+            .collect();
+        assert!(
+            !rendered.iter().any(|l| l.contains("loading")),
+            "a profile no leg will fetch must not spin loading, got {rendered:?}"
+        );
+        assert!(
+            rendered.iter().any(|l| l.contains("no api key")),
+            "and it must name the fix, got {rendered:?}"
+        );
+    }
+}
+
 /// An Alibaba profile with a console session but NO api key is the inverse: it
 /// IS scheduled (its quota runs on the console session), so it must keep
 /// loading rather than claim a missing key.

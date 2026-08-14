@@ -1843,7 +1843,14 @@ pub(crate) fn third_party_credentialed(p: &crate::profile::Profile) -> bool {
         // scheduled — its fetch reports the missing session as `AuthExpired`,
         // which is an answer, where being dropped is a permanent "loading".
         Some(crate::providers::Provider::Alibaba) => true,
-        _ => p.api_key.is_some(),
+        // An empty or whitespace-only key is no credential (matches the load
+        // boundary's `has_usable_key`): it authenticates nothing, so treating it
+        // as `Some` would schedule a run that cannot work.
+        _ => p
+            .api_key
+            .as_deref()
+            .map(str::trim)
+            .is_some_and(|k| !k.is_empty()),
     }
 }
 

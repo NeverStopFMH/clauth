@@ -257,6 +257,101 @@ fn run_delegate_refuses_a_keyless_third_party_target_before_acquiring_a_runtime(
     );
 }
 
+/// An EMPTY api key is no credential: a `config.toml` with `api_key = ""` used
+/// to pass the guard's old `is_some()` test and spawned a `claude` that
+/// authenticates with an empty token and dies. Same refusal, same
+/// before-acquire guarantee, as the keyless test above.
+#[test]
+fn run_delegate_refuses_an_empty_api_key_third_party_target() {
+    let home = HomeSandbox::new();
+    let mut config = crate::profile::AppConfig {
+        state: crate::profile::AppState::default(),
+        profiles: Vec::new(),
+    };
+    crate::actions::create_blank_profile(
+        &mut config,
+        "ds-empty".to_string(),
+        Some("https://api.deepseek.com".to_string()),
+        Some(String::new()),
+        None,
+    )
+    .expect("create profile");
+
+    let err = run_delegate(DelegateOpts {
+        profile: "ds-empty",
+        prompt: "hello",
+        model: None,
+        cwd: None,
+        env: HashMap::new(),
+        extra_args: Vec::new(),
+        timeout_secs: Some(30),
+        idle_secs: None,
+        resume: None,
+        isolation: Isolation::Shared,
+        depth: 0,
+    })
+    .expect_err("an empty-key third-party target must be refused");
+    assert_eq!(err, "profile has no api key: ds-empty");
+
+    assert!(
+        !home
+            .home()
+            .join(".clauth")
+            .join("profiles")
+            .join("ds-empty")
+            .join("runtime")
+            .exists(),
+        "the refusal must happen before any runtime is acquired"
+    );
+}
+
+/// The whitespace sibling: a key of only spaces authenticates nothing either,
+/// and the load boundary's `has_usable_key` already trims before testing, so
+/// the guard must read it as absent too.
+#[test]
+fn run_delegate_refuses_a_whitespace_api_key_third_party_target() {
+    let home = HomeSandbox::new();
+    let mut config = crate::profile::AppConfig {
+        state: crate::profile::AppState::default(),
+        profiles: Vec::new(),
+    };
+    crate::actions::create_blank_profile(
+        &mut config,
+        "ds-space".to_string(),
+        Some("https://api.deepseek.com".to_string()),
+        Some("   ".to_string()),
+        None,
+    )
+    .expect("create profile");
+
+    let err = run_delegate(DelegateOpts {
+        profile: "ds-space",
+        prompt: "hello",
+        model: None,
+        cwd: None,
+        env: HashMap::new(),
+        extra_args: Vec::new(),
+        timeout_secs: Some(30),
+        idle_secs: None,
+        resume: None,
+        isolation: Isolation::Shared,
+        depth: 0,
+    })
+    .expect_err("a whitespace-key third-party target must be refused");
+    assert_eq!(err, "profile has no api key: ds-space");
+
+    assert!(
+        !home
+            .home()
+            .join(".clauth")
+            .join("profiles")
+            .join("ds-space")
+            .join("runtime")
+            .exists(),
+        "the refusal must happen before any runtime is acquired"
+    );
+}
+
 /// Drive `run_delegate` for `profile` with a `cwd` that does not exist. The
 /// cwd check is the first gate AFTER the credential guard, so reaching it
 /// proves the guard let the profile through while the run still stops before
@@ -400,6 +495,63 @@ fn resolve_fanout_refuses_a_keyless_third_party_member_by_name() {
     let err =
         resolve_fanout(&config, &raw).expect_err("a keyless member refuses the whole fan-out");
     assert_eq!(err, "profile has no api key: ds-nokey");
+}
+
+/// The fan-out sibling of the empty-key single-profile test: an empty (or
+/// whitespace-only) api key on any member refuses the whole list by name,
+/// before the first spawn.
+#[test]
+fn resolve_fanout_refuses_an_empty_key_member_by_name() {
+    let _home = HomeSandbox::new();
+    let mut config = crate::profile::AppConfig {
+        state: crate::profile::AppState::default(),
+        profiles: Vec::new(),
+    };
+    crate::actions::create_blank_profile(
+        &mut config,
+        "ds-key".to_string(),
+        Some("https://api.deepseek.com".to_string()),
+        Some("sk-test".to_string()),
+        None,
+    )
+    .expect("create profile");
+    crate::actions::create_blank_profile(&mut config, "oauth1".to_string(), None, None, None)
+        .expect("create profile");
+    crate::actions::create_blank_profile(
+        &mut config,
+        "qwen".to_string(),
+        Some("https://token-plan.ap-southeast-1.maas.aliyuncs.com".to_string()),
+        None,
+        None,
+    )
+    .expect("create profile");
+    crate::actions::create_blank_profile(
+        &mut config,
+        "ds-empty".to_string(),
+        Some("https://api.deepseek.com".to_string()),
+        Some(String::new()),
+        None,
+    )
+    .expect("create profile");
+    crate::actions::create_blank_profile(
+        &mut config,
+        "ds-space".to_string(),
+        Some("https://api.deepseek.com".to_string()),
+        Some(" \t ".to_string()),
+        None,
+    )
+    .expect("create profile");
+
+    // The keyed, OAuth, and Alibaba members come FIRST on purpose: if the
+    // guard over-fired on any of them the refusal would name that name and
+    // this assertion would red.
+    let raw: Vec<String> = ["ds-key", "oauth1", "qwen", "ds-empty", "ds-space"]
+        .iter()
+        .map(|n| (*n).to_string())
+        .collect();
+    let err =
+        resolve_fanout(&config, &raw).expect_err("an empty-key member refuses the whole fan-out");
+    assert_eq!(err, "profile has no api key: ds-empty");
 }
 
 #[test]

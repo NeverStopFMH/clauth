@@ -129,7 +129,7 @@ clauth ships a plugin that exposes your profiles to a live Claude Code session v
 
 | Tool | What it does | Quota |
 |------|--------------|-------|
-| `list_profiles` | every profile with cached 5h/7d usage, provider, tier, live-session flag, observed throughput | zero (disk cache) |
+| `list_profiles` | every profile with cached 5h/7d usage, provider, tier, live-session flag, observed throughput, keyless flag | zero (disk cache) |
 | `which` | which profile owns the current session | zero (filesystem) |
 | `switch` | relink the global active profile | zero |
 | `delegate` | hand a headless prompt to another account and return the answer (or a `job_id`) | **real usage window on the target account** |

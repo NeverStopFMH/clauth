@@ -230,15 +230,29 @@ fn single_block(payload: serde_json::Value, format: Format, prose: String) -> Ve
 }
 
 /// Fold the active profile's live usage into a payload, replacing the old
-/// second-block footer.
-fn fold_active_live_usage(mut payload: serde_json::Value, config: &AppConfig) -> serde_json::Value {
+/// second-block footer. A non-object payload is wrapped under `result` first,
+/// the same shape `fold_delegate_live_usage` uses: `serde_json`'s string-key
+/// `IndexMut` auto-vivifies only `Null` and panics on every other non-object,
+/// and the caller's payload must survive the fold.
+fn fold_active_live_usage(payload: serde_json::Value, config: &AppConfig) -> serde_json::Value {
+    let mut map = match payload {
+        serde_json::Value::Object(map) => map,
+        other => {
+            let mut map = serde_json::Map::new();
+            map.insert("result".to_string(), other);
+            map
+        }
+    };
     let active = config.state.active_profile.as_deref();
     let (five_h, seven_d) = match active {
         Some(name) => load_windows(name),
         None => (None, None),
     };
-    payload["live_usage"] = live_usage_json(active, five_h.as_ref(), seven_d.as_ref());
-    payload
+    map.insert(
+        "live_usage".to_string(),
+        live_usage_json(active, five_h.as_ref(), seven_d.as_ref()),
+    );
+    serde_json::Value::Object(map)
 }
 
 /// Fold the target profile's live usage into a delegate envelope (the sync

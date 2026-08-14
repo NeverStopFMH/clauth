@@ -1584,6 +1584,43 @@ fn fold_delegate_live_usage_wraps_non_objects_and_folds_objects() {
     );
 }
 
+/// Every non-object payload folds without panicking and keeps the caller's
+/// payload verbatim under `result`.
+#[test]
+fn fold_active_live_usage_wraps_non_objects_and_folds_objects() {
+    let _home = HomeSandbox::new();
+    let config = crate::profile::AppConfig {
+        state: crate::profile::AppState::default(),
+        profiles: Vec::new(),
+    };
+    for scalar in [
+        serde_json::json!("oops"),
+        serde_json::json!(42),
+        serde_json::json!([1, 2]),
+    ] {
+        let folded = fold_active_live_usage(scalar.clone(), &config);
+        let obj = folded.as_object().expect("a folded payload is an object");
+        assert_eq!(
+            obj.get("result"),
+            Some(&scalar),
+            "the caller's payload survives the fold verbatim"
+        );
+        assert!(obj.get("live_usage").is_some(), "live usage folds in");
+    }
+
+    // An object payload folds in place and keeps its own fields.
+    let folded = fold_active_live_usage(
+        serde_json::json!({"ok": true, "previous": "a", "active": "b"}),
+        &config,
+    );
+    assert_eq!(folded["ok"], true);
+    assert_eq!(folded["previous"], "a");
+    assert!(
+        folded.get("live_usage").is_some(),
+        "the payload's own fields survive"
+    );
+}
+
 #[test]
 fn background_depth_guard_refuses_without_writing_job() {
     let _home = HomeSandbox::new();

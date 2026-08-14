@@ -45,6 +45,15 @@
 //! check on `recent_agent_process_exit`, `route_full_lifecycle_hook_report`
 //! answering `Ignore`, and `known_agent_label_conflicts_with_detected_agent`
 //! each drop a report ahead of it, so an unclaimed pane can still swallow one.
+//!
+//! That limit is permanent, so this whole module is on a dead path. herdr keeps
+//! one lifecycle authority per pane by design and closed the ask to loosen it
+//! (`herdrdev/herdr#2824`, NOT_PLANNED), directing a hook that runs beside its
+//! own integration to report METADATA instead. `pane report-metadata` was
+//! measured applying on an anchored pane the same day, and it carries a
+//! `--ttl-ms` that would also retire the mid-delegate-death ceiling above.
+//! Moving onto it is tracked in `docs/todo.md`; until then the icon never moves
+//! on a pane an operator actually works in.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};

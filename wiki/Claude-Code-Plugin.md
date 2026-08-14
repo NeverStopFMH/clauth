@@ -19,7 +19,7 @@ To wire the server by hand instead, add this to `mcpServers` in `~/.claude.json`
 "clauth": { "type": "stdio", "command": "clauth", "args": ["mcp"] }
 ```
 
-The TUI's Plugin tab writes exactly that entry for you with <kbd>f</kbd>. The manual route gives you the same five tools, minus the bundled hook that delivers backgrounded `delegate` results on its own: without the plugin, the session has to poll `delegate_result`.
+The TUI's Plugin tab writes exactly that entry for you with <kbd>f</kbd>. The manual route gives you the same six tools, minus the bundled hook that delivers backgrounded `delegate` results on its own: without the plugin, the session has to poll `delegate_result`.
 
 ## Tools
 
@@ -30,8 +30,17 @@ The TUI's Plugin tab writes exactly that entry for you with <kbd>f</kbd>. The ma
 | `switch` | `name`, `format` | relinks the global active profile | none |
 | `delegate` | see below | the target account's answer, or a `job_id` | **a real usage window on the target account** |
 | `delegate_result` | exactly one of `job_id` / `job_ids` (a list is capped at 256), `wait_secs` (0-60, default 0), `format` | a backgrounded job's envelope, or its running status; a batch returns one result per id | none |
+| `watch` | `wait_secs` (0-60, default 0), `kinds` (optional subset of `active_profile`, `usage_cache`, `credentials`), `format` | what changed in clauth's state, as soon as it changes | none, reads local disk only |
 
 Every tool takes `format` and answers in prose by default; pass `format: "json"` for the structured payload. An unrecognized value is refused by name, never treated as prose.
+
+## Hearing about changes: `since_your_last_call` and `watch`
+
+clauth's state can move under a live session: the active profile switches, the background scheduler refreshes usage figures, a rotation rewrites the credentials file. Replies that carry live usage (`which`, `delegate`, `delegate_result`) carry a `since_your_last_call` object too, naming what moved since the last reply that reported one, and only when something did.
+
+`watch` blocks until that same state moves. It polls three things: the configured active profile, that profile's usage cache, and `~/.claude/.credentials.json`. Every read is local disk, so it costs no network, no quota, and runs no background thread. `wait_secs` (0-60) bounds the wait; on timeout it returns `status: "unchanged"` with how long it waited. A first digest call has nothing to compare against, so it sets the baseline and answers `status: "armed"`. Pass `kinds` to wait on a subset; changes to the rest stay queued for the next report.
+
+A `switch` reply never carries the digest for its own switch: the reply itself already says what it did. It refreshes the baseline instead, so the switch is not reported twice.
 
 `which` is the authority on which account owns the current session. `list_profiles` reads a cache and can lag it.
 
@@ -91,7 +100,7 @@ Runs a headless `claude -p` under another profile and returns what it produced.
 
 ## What the server tells the model
 
-On connect it sends a short brief: a one-line index of the five tools, their cost model, what `switch` would do to this specific session, and a roster of your profiles as of session start. A `clauth start` session gets one more note: its runtime directory mirrors your real `~/.claude`, so an edit there reaches the global file. On a symlink host it lands directly. On a host that copies the tree (no symlink privilege), clauth's background sync lands it at sync cadence.
+On connect it sends a short brief: a one-line index of the six tools, their cost model, what `switch` would do to this specific session, and a roster of your profiles as of session start. A `clauth start` session gets one more note: its runtime directory mirrors your real `~/.claude`, so an edit there reaches the global file. On a symlink host it lands directly. On a host that copies the tree (no symlink privilege), clauth's background sync lands it at sync cadence.
 
 The roster groups profiles that share a provider, tier and endpoint host onto one line, and leads with the account that has the most window left. Live usage numbers are deliberately left out of that snapshot, since they go stale immediately; only the ordering reflects them. `list_profiles` is the live read.
 

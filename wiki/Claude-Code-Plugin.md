@@ -29,7 +29,7 @@ The TUI's Plugin tab writes exactly that entry for you with <kbd>f</kbd>. The ma
 | `which` | `format` | the profile owning this session's credentials, its plan, its throughput | none |
 | `switch` | `name`, `format` | relinks the global active profile | none |
 | `delegate` | see below | the target account's answer, or a `job_id` | **a real usage window on the target account** |
-| `delegate_result` | `job_id`, `wait_secs` (0-60, default 0), `format` | a backgrounded job's envelope, or its running status | none |
+| `delegate_result` | exactly one of `job_id` / `job_ids` (a list is capped at 256), `wait_secs` (0-60, default 0), `format` | a backgrounded job's envelope, or its running status; a batch returns one result per id | none |
 
 Every tool takes `format` and answers in prose by default; pass `format: "json"` for the structured payload. An unrecognized value is refused by name, never treated as prose.
 
@@ -81,7 +81,7 @@ Runs a headless `claude -p` under another profile and returns what it produced.
 
 **Isolated.** `isolated: true` drops your operator memory, plugins, hooks, and every MCP server, keeping the account's auth. Good for blind runs and evals.
 
-**Background.** `background: true` returns a `job_id` immediately so the session keeps working. With the plugin installed, a bundled `PostToolUse` hook delivers the result as soon as the job finishes. A fan-out is delivered the same way: the hook waits on every job and prints each finished envelope together. A job still running at the hook's deadline is named, so collect it with `delegate_result`. Otherwise call `delegate_result` with each `job_id`, optionally long-polling up to 60 s. Jobs live in `~/.clauth/jobs/`, swept an hour after they finish.
+**Background.** `background: true` returns a `job_id` immediately so the session keeps working. With the plugin installed, a bundled `PostToolUse` hook delivers the result as soon as the job finishes. A fan-out is delivered the same way: the hook waits on every job and prints each finished envelope together. A job still running at the hook's deadline is named, so collect it with `delegate_result`. Otherwise call `delegate_result` with each `job_id`, or pass them all as `job_ids` (capped at 256) for one result per id: the done envelope, a running status, or `unknown` for an absent id. Either spelling long-polls up to 60 s. Jobs live in `~/.clauth/jobs/`, swept an hour after they finish.
 
 **Permissions.** A delegate spawns with Claude Code's permission gate armed and nobody to answer it, so a task that writes files fails on a denial rather than doing the work. Pass the permission flag through `args` when the delegate is meant to edit anything, and add `--add-dir` for reads outside `cwd`. Denials come back in a `permission_denials` array, so check that field rather than the prose result.
 

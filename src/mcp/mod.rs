@@ -1906,8 +1906,16 @@ fn normalize_join(
                 }
             }
             std::path::Component::Normal(part) => parts.push(part.to_os_string()),
-            // Unreachable: the absolute check above refuses anything with a root.
-            std::path::Component::RootDir | std::path::Component::Prefix(_) => {}
+            // On Windows `is_absolute()` needs BOTH a prefix and a root, so a
+            // drive-relative `C:foo` and a root-relative `\foo` both pass the
+            // check above and arrive here. Dropping either component silently
+            // re-roots the path under `base` and reads a different file than
+            // the caller named, so refuse by name.
+            std::path::Component::RootDir | std::path::Component::Prefix(_) => {
+                return Err(format!(
+                    "prompt_file `{rel}` refused: absolute path (must be relative to `cwd`)"
+                ));
+            }
         }
     }
     let mut out = base.to_path_buf();

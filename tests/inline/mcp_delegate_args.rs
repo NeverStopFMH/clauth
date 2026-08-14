@@ -233,13 +233,45 @@ fn prompt_file_absolute_path_is_refused_by_name() {
     let home = HomeSandbox::new();
     seed_profiles(&["solo"], true);
     let cwd = work_dir(home.home());
+    // The sandbox home is already absolute, so this is absolute on every
+    // platform. A literal like `/etc/passwd` is not: on Windows it has a root
+    // but no drive prefix, so `is_absolute()` is false there and the path
+    // falls through to a file-not-found instead of the refusal under test.
+    let abs = std::path::absolute(home.home().join("passwd"))
+        .expect("absolute path")
+        .to_str()
+        .expect("sandbox path is UTF-8")
+        .to_string();
     let result = call_delegate(DelegateArgs {
         profile: Some("solo".to_string()),
-        prompt_file: Some("/etc/passwd".to_string()),
+        prompt_file: Some(abs.clone()),
         cwd: Some(cwd.to_str().unwrap().to_string()),
         ..base()
     });
-    assert_refusal(&result, &["prompt_file `/etc/passwd`", "absolute path"]);
+    assert_refusal(&result, &[&format!("prompt_file `{abs}`"), "absolute path"]);
+}
+
+/// On Windows `is_absolute()` needs BOTH a prefix and a root, so a
+/// drive-relative (`C:foo`) and a root-relative (`\etc\passwd`) spelling pass
+/// the check at the top of the join and arrive at the component loop. The
+/// `RootDir | Prefix` arm must refuse each by name: dropping the component
+/// re-roots the path under `cwd` and reads a different file than the caller
+/// named.
+#[cfg(windows)]
+#[test]
+fn prompt_file_drive_relative_path_is_refused_by_name() {
+    let home = HomeSandbox::new();
+    seed_profiles(&["solo"], true);
+    let cwd = work_dir(home.home());
+    for rel in ["C:foo", r"\etc\passwd"] {
+        let result = call_delegate(DelegateArgs {
+            profile: Some("solo".to_string()),
+            prompt_file: Some(rel.to_string()),
+            cwd: Some(cwd.to_str().unwrap().to_string()),
+            ..base()
+        });
+        assert_refusal(&result, &[&format!("prompt_file `{rel}`"), "absolute path"]);
+    }
 }
 
 #[test]

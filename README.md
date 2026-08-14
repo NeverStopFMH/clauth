@@ -47,15 +47,6 @@ Full reference: **[the wiki](https://github.com/uwuclxdy/clauth/wiki)**.
 
 Claude Code stores its session in `~/.claude/.credentials.json` (OAuth tokens) and the `env` block of `~/.claude/settings.json` (base URL, API key). clauth keeps a per-profile snapshot of both. A switch swaps those two in place and leaves the rest of `~/.claude/` untouched. `clauth start` takes a different route: it launches `claude` against a temporary `~/.claude` mirror, so several accounts run at once.
 
-```mermaid
-flowchart LR
-    P["profiles in<br/>~/.clauth"]
-    P -->|"clauth work"| S["swap ~/.claude<br/>credentials + env, in place"]
-    P -->|"clauth start work"| I["launch claude in an<br/>isolated config dir"]
-    ANT["Anthropic<br/>(api + platform)"] -. "poll usage, refresh tokens" .-> P
-    P -. "auto-switch at your limit" .-> P
-```
-
 ## Install
 
 Linux, macOS, Windows (Git Bash / MSYS2).

@@ -35,7 +35,9 @@ use crate::logline::logline;
 use crate::out::outln;
 use crate::profile::{AppConfig, Profile, load_config};
 use crate::profile_cache::{THIRD_PARTY_CACHE_FILE, USAGE_CACHE_FILE, load_profile_cache};
-use crate::profile_json::{provider_label, tier_label, windows_json};
+use crate::profile_json::{
+    ProfileWindows, oauth_windows, profile_windows, profile_windows_for, provider_label, tier_label,
+};
 use crate::providers::ThirdPartyStats;
 use crate::runtime::{Isolation, ProfileRuntime};
 use crate::usage::{UsageInfo, UsageWindow, now_epoch_secs, now_ms};
@@ -111,7 +113,9 @@ fn throughput_warnings(profile: &str, now: i64) -> Vec<serde_json::Value> {
 }
 
 /// Fresh-from-cache 5h/7d windows for a profile. Each call re-reads the disk
-/// cache (no caching across tool calls per the design).
+/// cache (no caching across tool calls per the design). The roster's own rank
+/// reads this: it asks for the two figures it sorts on, and consults the
+/// third-party cache itself for an account that has no such window.
 fn load_windows(name: &str) -> (Option<UsageWindow>, Option<UsageWindow>) {
     match load_profile_cache::<UsageInfo>(name, USAGE_CACHE_FILE) {
         Some(u) => (u.five_hour, u.seven_day),
@@ -119,25 +123,77 @@ fn load_windows(name: &str) -> (Option<UsageWindow>, Option<UsageWindow>) {
     }
 }
 
+/// The discriminated headroom payload every MCP surface renders through
+/// [`render::windows_prose`]: which cache answered and the figures it holds.
+/// ONE carrier per account — an OAuth account's windows, or the balance/bars a
+/// third-party account publishes in place of a window it does not have — so no
+/// reply can print one account's figure twice or date it in a second place.
+fn windows_payload(windows: &ProfileWindows) -> serde_json::Value {
+    match windows {
+        // An empty array is a missing FIGURE, the one case the prose reads as
+        // `unknown`.
+        ProfileWindows::Oauth { usage, .. } => serde_json::json!({
+            "kind": "oauth",
+            "windows": usage.as_deref().map(oauth_windows).unwrap_or_default(),
+        }),
+        ProfileWindows::ThirdParty { stats, .. } => serde_json::json!({
+            "kind": "third_party",
+            "balance": stats.as_ref().map(render::third_party_headline),
+        }),
+    }
+}
+
+/// [`windows_payload`] plus the age of the cache its figures came from, for a
+/// reply carrying no other freshness cue — a running check's `quota`, a folded
+/// live-usage clause — on a server that refreshes no cache of its own. Each
+/// field is omitted when it carries no news, so an absent `stale` means false.
+fn dated_windows_payload(windows: &ProfileWindows) -> serde_json::Value {
+    let mut payload = windows_payload(windows);
+    if let Some(age) = windows.age_secs() {
+        payload["fetched_secs_ago"] = serde_json::json!(age);
+    }
+    if windows.stale() {
+        payload["stale"] = serde_json::json!(true);
+    }
+    payload
+}
+
+/// [`windows_payload`] for a ROSTER row: undated, because 27 rows read one cache
+/// generation and this is the reply whose own description asks the model to call
+/// it before every delegate. `stale` still rides — a stale row costs a wrong
+/// routing decision rather than a slow one — and because the figure it dates
+/// lives in this same object, it renders beside that figure rather than beside a
+/// structural none.
+fn row_windows_payload(windows: &ProfileWindows) -> serde_json::Value {
+    let mut payload = windows_payload(windows);
+    if windows.stale() {
+        payload["stale"] = serde_json::json!(true);
+    }
+    payload
+}
+
+/// The headroom payload for a running check's `quota`: whichever cache the
+/// target's own fetch leg writes, so a third-party target answers with its own
+/// figures instead of the `usage unknown` an OAuth-only read can only ever
+/// produce for it.
+fn quota_payload(name: &str) -> serde_json::Value {
+    dated_windows_payload(&profile_windows_for(name))
+}
+
 /// One roster row for `p`, the shape both `profiles` scopes render through
 /// `profile_line`. The one builder keeps the all-scope roster and the
 /// session-scope row from disagreeing about what a profile is called.
 fn profile_row(p: &Profile, config: &AppConfig, now: i64) -> serde_json::Value {
     let name = p.name.as_str();
-    let third_party = if p.is_third_party() {
-        load_profile_cache::<ThirdPartyStats>(name, THIRD_PARTY_CACHE_FILE)
-            .as_ref()
-            .map(render::third_party_headline)
-    } else {
-        None
-    };
+    // One read of this account's own cache, feeding the one carrier its figures
+    // ride in. Reading it twice (once to date the row, once for the headline)
+    // cost a second parse of the same file on every row of the roster.
     let mut row = serde_json::json!({
         "name": name,
         "active": config.is_active(name),
         "provider": provider_label(p),
         "tier": tier_label(p),
-        "windows": windows_json(name),
-        "third_party": third_party,
+        "windows": row_windows_payload(&profile_windows(p)),
     });
     // Host, not the full endpoint: every profile of one provider repeats the
     // same path, and the cost model only ever asks whether the host is
@@ -227,18 +283,36 @@ fn delegate_refusal(reason: &str) -> CallToolResult {
 }
 
 /// The live-usage footer folded into a payload as data: which profile the
-/// percentages describe, and the 5h/7d share used (null when uncached). The
-/// throughput warning is added by the caller when the tool has one.
-fn live_usage_json(
-    profile: Option<&str>,
-    five_h: Option<&UsageWindow>,
-    seven_d: Option<&UsageWindow>,
-) -> serde_json::Value {
-    serde_json::json!({
-        "profile": profile,
-        "5h_used_pct": five_h.map(|w| w.utilization),
-        "7d_used_pct": seven_d.map(|w| w.utilization),
-    })
+/// figures describe, and that profile's own headroom — an OAuth account's 5h/7d
+/// share (null when uncached), or the balance a third-party account publishes in
+/// place of a window it does not have — dated off the cache it was read from.
+/// The throughput warning is added by the caller when the tool has one.
+///
+/// `windows` is `None` only when there is no profile to report on, which the
+/// prose renders as a `none` rather than as a lost figure.
+fn live_usage_json(profile: Option<&str>, windows: Option<&ProfileWindows>) -> serde_json::Value {
+    let Some(windows) = windows else {
+        return serde_json::json!({ "profile": profile });
+    };
+    let mut payload = dated_windows_payload(windows);
+    payload["profile"] = serde_json::json!(profile);
+    // The two shares an OAuth reader acts on directly, beside the window array
+    // they were read from: this clause is a footer rather than a table, and 5h/7d
+    // are the pools every other such figure in clauth refers to.
+    if let ProfileWindows::Oauth { usage, .. } = windows {
+        let usage = usage.as_deref();
+        payload["5h_used_pct"] = serde_json::json!(
+            usage
+                .and_then(|u| u.five_hour.as_ref())
+                .map(|w| w.utilization)
+        );
+        payload["7d_used_pct"] = serde_json::json!(
+            usage
+                .and_then(|u| u.seven_day.as_ref())
+                .map(|w| w.utilization)
+        );
+    }
+    payload
 }
 
 /// Collapse one reply to exactly one content block. The JSON payload is
@@ -273,13 +347,10 @@ fn fold_active_live_usage(
         }
     };
     let active = config.state.active_profile.as_deref();
-    let (five_h, seven_d) = match active {
-        Some(name) => load_windows(name),
-        None => (None, None),
-    };
+    let windows = active.map(profile_windows_for);
     map.insert(
         "live_usage".to_string(),
-        live_usage_json(active, five_h.as_ref(), seven_d.as_ref()),
+        live_usage_json(active, windows.as_ref()),
     );
     if let Some(delta) = digest.folded() {
         map.insert("since_your_last_call".to_string(), delta);
@@ -308,8 +379,8 @@ fn fold_delegate_live_usage(
             map
         }
     };
-    let (five_h, seven_d) = load_windows(profile);
-    let mut live = live_usage_json(Some(profile), five_h.as_ref(), seven_d.as_ref());
+    let windows = profile_windows_for(profile);
+    let mut live = live_usage_json(Some(profile), Some(&windows));
     if let Some(note) = throughput_note(profile, now) {
         live["throughput_warning"] = serde_json::Value::String(note);
     }
@@ -1437,7 +1508,7 @@ fn running_payload(job_id: &str, record: &jobs::JobRecord, now: u64) -> serde_js
         "status": "running",
         "profile": record.profile,
         "elapsed_secs": elapsed_secs,
-        "quota": windows_json(&record.profile),
+        "quota": quota_payload(&record.profile),
     });
     if record.timeout_secs == 0 {
         return payload;

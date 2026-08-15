@@ -15,7 +15,8 @@
 //! - the config's `active_profile` VALUE (content, not mtime — a rewrite that
 //!   keeps the name is not news);
 //! - the ACTIVE profile's usage-cache mtime, KEYED on the profile it was read
-//!   from (the file the scheduler/daemon refreshes). Two profiles' caches are
+//!   from and read from whichever cache that profile's OWN fetch leg writes
+//!   (`crate::profile_json::usage_cache_file_for`). Two profiles' caches are
 //!   different files, so across a profile change the two mtimes are not
 //!   comparable and there is no usage-cache event to report;
 //! - `~/.claude/.credentials.json`'s mtime, read FOLLOWING symlinks: that
@@ -46,7 +47,6 @@ use std::time::{Duration, Instant, SystemTime};
 
 use crate::lockorder::RankedMutex;
 use crate::lockorder::rank::McpDigest;
-use crate::profile_cache::USAGE_CACHE_FILE;
 
 /// Poll cadence for `monitor`'s state-waiting long-poll, mirroring the job
 /// mode's `JOB_POLL_INTERVAL` so both modes answer on the same rhythm.
@@ -155,9 +155,20 @@ fn file_mtime(path: &std::path::Path) -> Option<SystemTime> {
 /// digest-bearing call reports.
 fn sample_digest() -> DigestSample {
     let active = crate::profile::active_profile_name();
+    // Whichever cache the ACTIVE profile's own fetch leg writes: the
+    // third-party leg never touches `usage_cache.json`, so keying an api-key
+    // profile on it renders a healthy hourly-refreshed account as never
+    // refreshed. Resolving the profile costs one config read per sample, which
+    // the state-wait loop pays 5x a second — the same order as the
+    // `profiles.toml` read above it, and the price of naming the right file.
     let usage_cache_mtime = active
         .as_deref()
-        .and_then(|name| crate::profile_cache::profile_cache_path(name, USAGE_CACHE_FILE))
+        .and_then(|name| {
+            crate::profile_cache::profile_cache_path(
+                name,
+                crate::profile_json::usage_cache_file_for(name),
+            )
+        })
         .and_then(|path| file_mtime(&path));
     let credentials_mtime = crate::claude::claude_credentials_path()
         .ok()

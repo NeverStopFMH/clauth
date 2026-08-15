@@ -7,6 +7,7 @@ use serde_json::Value;
 
 use crate::format::format_pct;
 use crate::providers::ThirdPartyStats;
+use crate::usage::humanize_duration;
 use crate::which::SessionAuth;
 
 /// Per-profile snapshot fed to [`instructions_block`]: stable identity only (name,
@@ -309,21 +310,38 @@ fn pct_clause(v: Option<f64>) -> String {
 
 /// The folded-in `live_usage` object as a sentence clause. `lead` is the noun
 /// for the profile it names: `active profile` for the session-scope roster and
-/// `switch_profile`, `target` for `delegate`. A null profile name reads `none`
-/// (no active profile is configured — a state clauth knows, not a missing
-/// figure); a null window reads `unknown`.
+/// `switch_profile`, `target` for `delegate`.
+///
+/// Three readings the clause keeps apart, because collapsing any two of them
+/// tells the reader clauth lost something it holds: no profile at all reads
+/// `none` and names no window (there is no account whose windows could be
+/// reported); a third-party account has no 5h/7d pool to report, so it reads as
+/// the structural none [`windows_prose`] spells; only an OAuth window with
+/// nothing cached reads `unknown`.
 pub(crate) fn live_usage_prose(lu: &Value, lead: &str) -> String {
-    let name = lu
-        .get("profile")
-        .and_then(Value::as_str)
-        .map_or_else(|| "none".to_string(), |n| format!("`{n}`"));
-    let five = lu.get("5h_used_pct").and_then(Value::as_f64);
-    let seven = lu.get("7d_used_pct").and_then(Value::as_f64);
-    let mut out = format!(
-        "{lead} {name}: 5h {}, 7d {}",
-        pct_clause(five),
-        pct_clause(seven)
-    );
+    let Some(name) = lu.get("profile").and_then(Value::as_str) else {
+        return format!("{lead} none");
+    };
+    let mut out = format!("{lead} `{name}`: ");
+    if lu.get("kind").and_then(Value::as_str) == Some("third_party") {
+        // Same payload keys `windows_prose` reads, so the two surfaces cannot
+        // spell one account's headroom two ways.
+        out.push_str(&windows_prose(lu));
+    } else {
+        let five = lu.get("5h_used_pct").and_then(Value::as_f64);
+        let seven = lu.get("7d_used_pct").and_then(Value::as_f64);
+        out.push_str(&format!(
+            "5h {}, 7d {}",
+            pct_clause(five),
+            pct_clause(seven)
+        ));
+        // An age dates a FIGURE. With neither window cached there is no figure
+        // to date, and stamping the cache's age onto two `unknown`s would read
+        // as a measurement clauth does not have.
+        if five.is_some() || seven.is_some() {
+            out.push_str(&freshness_clause(lu));
+        }
+    }
     if let Some(w) = lu.get("throughput_warning").and_then(Value::as_str) {
         out.push_str("; ");
         out.push_str(w);
@@ -388,27 +406,110 @@ pub(crate) fn watch_prose(p: &Value) -> String {
     }
 }
 
-/// The `windows` array (or `quota` array) as one clause. Empty array is `usage
-/// unknown`: no cache is not a zero.
-fn windows_prose(windows: &Value) -> String {
-    let Some(ws) = windows.as_array() else {
-        return "usage unknown".to_string();
+/// How old the figures in a headroom payload are, and whether that is past
+/// anything a live scheduler produces. Dating a figure is what lets a reader
+/// discount it; suppressing a stale one would turn a known-old number into no
+/// number, which reads as clauth having lost track of the account. A payload
+/// carrying no age at all (the roster, which spends no tokens dating rows that
+/// are current) still says `stale` when it is.
+fn freshness_clause(v: &Value) -> String {
+    let stale = v.get("stale").and_then(Value::as_bool).unwrap_or(false);
+    let Some(secs) = v.get("fetched_secs_ago").and_then(Value::as_u64) else {
+        return if stale {
+            " (stale)".to_string()
+        } else {
+            String::new()
+        };
     };
-    if ws.is_empty() {
-        return "usage unknown".to_string();
+    let when = if secs == 0 {
+        "just now".to_string()
+    } else {
+        format!("{} ago", humanize_duration(secs as i64))
+    };
+    if stale {
+        format!(" (cached {when}, stale)")
+    } else {
+        format!(" (cached {when})")
     }
-    ws.iter()
-        .map(|w| {
-            let label = w.get("label").and_then(Value::as_str).unwrap_or("unknown");
-            let pct = w.get("utilization_pct").and_then(Value::as_f64);
-            let mut s = format!("{label} {}", pct_clause(pct));
-            if let Some(r) = w.get("resets_at").and_then(Value::as_str) {
-                s.push_str(&format!(" (resets at {r})"));
+}
+
+/// The age half of [`freshness_clause`] alone, for a line whose `stale` marker
+/// already renders beside the figure it dates: the age rides, the stale word
+/// does not repeat.
+fn age_clause(v: &Value) -> String {
+    let Some(secs) = v.get("fetched_secs_ago").and_then(Value::as_u64) else {
+        return String::new();
+    };
+    let when = if secs == 0 {
+        "just now".to_string()
+    } else {
+        format!("{} ago", humanize_duration(secs as i64))
+    };
+    format!(" (cached {when})")
+}
+
+/// The headroom clause, off the discriminated payload
+/// [`crate::profile_json::ProfileWindows`] produces: an OAuth account's windows,
+/// or a third-party account's own figures in place of a pool it does not draw
+/// on. An OAuth account with nothing cached is the ONE case that reads
+/// `unknown` — no cache is not a zero, and it is also not a window that cannot
+/// exist.
+///
+/// The denial names ANTHROPIC's pool rather than `5h/7d` bare, because a
+/// provider publishes windows under those same labels (z.ai reports `5h`, `7d`
+/// and `30d`; Alibaba reports `7d`), and a clause that denies a `5h/7d` window
+/// and prints one in the same breath is a contradiction the reader has to
+/// resolve. `provider reports` then names whose account every following number
+/// belongs to: the denial is about the Anthropic subscription pool every other
+/// 5h/7d figure in clauth refers to, and the rest is this endpoint's own.
+///
+/// A freshness clause rides the FIGURE it dates and nothing else, on both arms:
+/// stamping a cache's age onto `unknown` — or onto a structural none — asserts a
+/// measurement clauth does not have.
+fn windows_prose(windows: &Value) -> String {
+    match windows.get("kind").and_then(Value::as_str) {
+        Some("third_party") => {
+            let mut out = "no Anthropic 5h/7d window".to_string();
+            match windows
+                .get("balance")
+                .and_then(Value::as_str)
+                .filter(|b| !b.is_empty())
+            {
+                Some(figure) => {
+                    out.push_str(&format!("; provider reports {figure}"));
+                    out.push_str(&freshness_clause(windows));
+                }
+                None => out.push_str("; provider usage unknown"),
             }
-            s
-        })
-        .collect::<Vec<_>>()
-        .join(", ")
+            out
+        }
+        Some("oauth") => {
+            let ws = windows
+                .get("windows")
+                .and_then(Value::as_array)
+                .map(Vec::as_slice)
+                .unwrap_or_default();
+            if ws.is_empty() {
+                return "usage unknown".to_string();
+            }
+            let mut out = ws
+                .iter()
+                .map(|w| {
+                    let label = w.get("label").and_then(Value::as_str).unwrap_or("unknown");
+                    let pct = w.get("utilization_pct").and_then(Value::as_f64);
+                    let mut s = format!("{label} {}", pct_clause(pct));
+                    if let Some(r) = w.get("resets_at").and_then(Value::as_str) {
+                        s.push_str(&format!(" (resets at {r})"));
+                    }
+                    s
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            out.push_str(&freshness_clause(windows));
+            out
+        }
+        _ => "usage unknown".to_string(),
+    }
 }
 
 /// Per-model throughput rows (`which`'s full summary or a roster's warnings).
@@ -448,9 +549,15 @@ fn throughput_prose(rows: &[Value]) -> String {
 }
 
 /// One roster row as a prose line: name + active marker, the
-/// `[provider, tier, host]` bracket, the live windows, the third-party
-/// headline, then the quiet flags. A null tier on an anthropic account and a
-/// missing third-party balance both read `unknown` rather than dropping out.
+/// `[provider, tier, host]` bracket, this account's own headroom, then the quiet
+/// flags. A null tier reads `unknown` on an account that HAS a plan tier and
+/// drops out on one that structurally has none.
+///
+/// The tier guard asks the headroom payload's `kind`, never the display
+/// `provider`: [`crate::profile_json::provider_label`] renders every
+/// unrecognised endpoint as `anthropic`, so a generic api-key account (a local
+/// llama, an aggregator) would be told its Anthropic plan tier is unknown when
+/// it has no Anthropic plan at all.
 fn profile_line(row: &Value) -> String {
     let name = row.get("name").and_then(Value::as_str).unwrap_or("unknown");
     let active = row.get("active").and_then(Value::as_bool).unwrap_or(false);
@@ -477,20 +584,10 @@ fn profile_line(row: &Value) -> String {
         windows_prose(&row["windows"]),
     );
 
-    // `third_party` is null for every anthropic profile (not third-party at all)
-    // AND for a third-party profile with no cache yet; `provider` disambiguates.
-    let third = row.get("third_party").and_then(Value::as_str);
-    match (provider, third) {
-        (_, Some(t)) if !t.is_empty() => {
-            out.push_str(&format!("; {t}"));
-        }
-        ("anthropic", _) => {}
-        (_, _) => out.push_str("; balance unknown"),
-    }
-
-    // A null tier is structural for third-party accounts, but on an anthropic
-    // account it means the plan is unknown.
-    if tier.is_none() && provider == "anthropic" {
+    // A null tier is structural for an account whose usage lives in the
+    // third-party cache; on a subscription account it means the plan is unknown.
+    let api_key_account = row["windows"].get("kind").and_then(Value::as_str) == Some("third_party");
+    if tier.is_none() && !api_key_account {
         out.push_str("; tier unknown");
     }
     if row
@@ -530,19 +627,40 @@ pub(crate) fn list_profiles_prose(p: &Value) -> String {
     if p.get("scope").and_then(Value::as_str) == Some("session") {
         // One row at most, with how it resolved, then the folded live usage
         // and digest (the roster arm carries neither).
-        let mut out = match rows.first() {
+        let row = rows.first();
+        let (mut out, source) = match row {
             Some(row) => {
-                let mut line = profile_line(row);
-                if let Some(source) = row.get("source").and_then(Value::as_str) {
-                    line.push_str(&format!("; source `{source}`"));
-                }
-                line
+                let line = profile_line(row);
+                let source = row.get("source").and_then(Value::as_str);
+                (line, source)
             }
             // No row: `resolve_active` found nothing, which is an unresolved
             // session rather than an empty roster.
-            None => "session profile unknown, source unknown".to_string(),
+            None => ("session profile unknown, source unknown".to_string(), None),
         };
-        if let Some(lu) = p.get("live_usage") {
+        // The live-usage fold names the CONFIGURED active profile, which this
+        // scope's row need not be. When they are the same account the clause
+        // restates the row's own headroom word for word, and the row already
+        // marks it `(active)`, so the second copy is dropped rather than
+        // rendered twice on one line. What must not drop with it is the age:
+        // the row's figures are the ones the clause would date, and the row
+        // renders `stale` itself, so the age rides the row BEFORE the source
+        // clause, whose text it would otherwise read as dating.
+        let lu = p.get("live_usage");
+        let same_account = matches!(
+            (
+                row.and_then(|r| r.get("name")).and_then(Value::as_str),
+                lu.and_then(|lu| lu.get("profile")).and_then(Value::as_str),
+            ),
+            (Some(row_name), Some(active)) if row_name == active
+        );
+        if same_account && let Some(lu) = lu {
+            out.push_str(&age_clause(lu));
+        }
+        if let Some(source) = source {
+            out.push_str(&format!("; source `{source}`"));
+        }
+        if let Some(lu) = lu.filter(|_| !same_account) {
             out.push_str("; ");
             out.push_str(&live_usage_prose(lu, "active profile"));
         }

@@ -16,7 +16,7 @@ use crate::profile::{AppConfig, Profile};
 use crate::profile_cache::{
     THIRD_PARTY_CACHE_FILE, USAGE_CACHE_FILE, load_profile_cache, profile_cache_mtime_ms,
 };
-use crate::profile_json::{provider_label, tier_label, windows_json};
+use crate::profile_json::{provider_label, tier_label, usage_cache_file, windows_json};
 use crate::providers::ThirdPartyStats;
 use crate::usage::{
     FetchStatus, UsageInfo, epoch_secs_to_iso, is_stuck_rate_limited, now_ms, windows_maxed,
@@ -130,15 +130,9 @@ pub(crate) fn build_status(
         .filter(|p| include_disabled || !p.is_disabled() || config.is_active(p.name.as_str()))
         .map(|p| {
             let name = p.name.as_str();
-            // Freshness reads each profile's OWN cache: the third-party leg
-            // never touches USAGE_CACHE_FILE, so keying api-key profiles on it
-            // rendered a healthy hourly-refreshed account as never-fetched.
-            let cache_file = if p.is_third_party() {
-                THIRD_PARTY_CACHE_FILE
-            } else {
-                USAGE_CACHE_FILE
-            };
-            let mtime_ms = profile_cache_mtime_ms(name, cache_file);
+            // Freshness reads each profile's OWN cache, through the one
+            // selector every reader shares (`usage_cache_file` carries why).
+            let mtime_ms = profile_cache_mtime_ms(name, usage_cache_file(p));
 
             // fetch_status: the live stores when a daemon is running, else
             // derive from cache freshness (Fresh within one interval, else
@@ -227,7 +221,13 @@ pub(crate) fn build_status(
             // Structured third-party balance isn't carried by ThirdPartyStats
             // (it lives in free-text `rows`); expose only the availability flag
             // for now — enough for a reader's red/green reachability dot.
-            let third_party = if p.is_third_party() {
+            //
+            // Same question the freshness above asks — where do this account's
+            // figures live — so it takes the same predicate. Keyed on
+            // `is_third_party` it published a null dot for every generic api-key
+            // endpoint while `fetched_at` beside it dated that account's provider
+            // cache: one object, two answers about the same file.
+            let third_party = if p.usage_cache_is_third_party() {
                 load_profile_cache::<ThirdPartyStats>(name, THIRD_PARTY_CACHE_FILE)
                     .map(|s| serde_json::json!({ "available": s.is_available }))
             } else {

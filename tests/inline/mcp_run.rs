@@ -990,6 +990,101 @@ fn monitor_running_reports_status() {
     );
 }
 
+/// Finding 3/10: a running check's `quota` used to read `usage_cache.json` and
+/// nothing else, so for the 17-of-29 accounts whose fetch leg writes the OTHER
+/// cache the answer was `usage unknown` by construction — on the reply whose one
+/// job is to say whether the account being spent still has headroom.
+#[test]
+fn a_running_check_on_a_third_party_target_reports_that_accounts_own_figures() {
+    let _home = HomeSandbox::new();
+    crate::profile::save_profile(&crate::profile::Profile::new(
+        "vendor".to_string(),
+        Some("https://api.deepseek.com/anthropic".to_string()),
+        Some("sk-fixture".to_string()),
+    ))
+    .expect("save third-party profile");
+    // Shaped-from-a-capture provider-cache bytes through the production reader:
+    // the consumer must parse the shape the fetch leg actually writes.
+    let cache = crate::profile_cache::profile_cache_path("vendor", THIRD_PARTY_CACHE_FILE).unwrap();
+    std::fs::write(&cache, crate::testutil::THIRD_PARTY_CACHE_BYTES).expect("provider cache");
+    seed_running("d-vendor-0", "vendor", now_ms());
+
+    let text = monitor_text("d-vendor-0");
+    assert!(
+        text.contains("; quota: no Anthropic 5h/7d window; provider reports total: 31.45 CNY"),
+        "the target's own cache answers, and the 5h/7d window it cannot have reads as none: {text}",
+    );
+    assert!(
+        !text.contains("quota: usage unknown"),
+        "clauth holds this account's figures, so nothing here is unknown: {text}",
+    );
+}
+
+/// The half a selector keyed on `is_third_party` still answers wrong: a GENERIC
+/// api-key endpoint has no typed integration, so `provider` is `None`, while the
+/// same scheduler leg fetches and caches it (`ThirdPartyTarget::Generic`). Its
+/// figures are on disk and every MCP surface must read them — the check's quota
+/// and the folded live-usage clause both.
+#[test]
+fn a_generic_api_key_target_answers_with_the_figures_clauth_holds() {
+    let _home = HomeSandbox::new();
+    crate::profile::save_profile(&crate::profile::Profile::new(
+        "litellm".to_string(),
+        Some("http://127.0.0.1:4000".to_string()),
+        Some("sk-fixture".to_string()),
+    ))
+    .expect("save generic api-key profile");
+    let cache =
+        crate::profile_cache::profile_cache_path("litellm", THIRD_PARTY_CACHE_FILE).unwrap();
+    std::fs::write(&cache, crate::testutil::THIRD_PARTY_CACHE_BYTES).expect("provider cache");
+    seed_running("d-generic-0", "litellm", now_ms());
+
+    let text = monitor_text("d-generic-0");
+    assert!(
+        text.contains("; quota: no Anthropic 5h/7d window; provider reports total: 31.45 CNY"),
+        "a generic endpoint's own cache answers its quota: {text}",
+    );
+
+    let folded = render::delegate_prose(&fold_delegate_live_usage(
+        serde_json::json!({"is_error": false, "result": "ok"}),
+        "litellm",
+        0,
+        DigestMode::Skip,
+    ));
+    assert!(
+        folded.contains(
+            "target `litellm`: no Anthropic 5h/7d window; provider reports total: 31.45 CNY"
+        ),
+        "and the same figures ride the delegate footer: {folded}",
+    );
+}
+
+/// The same check against the OTHER shape a provider cache really takes: bars
+/// and a plan label instead of balance rows (a wallet provider writes no `bars`
+/// and no `plan` at all). Both are real captures, so a reader that assumed one
+/// shape reds here rather than in front of a model.
+#[test]
+fn a_running_check_renders_a_bar_shaped_provider_cache_too() {
+    let _home = HomeSandbox::new();
+    crate::profile::save_profile(&crate::profile::Profile::new(
+        "bars".to_string(),
+        Some("https://api.z.ai/anthropic".to_string()),
+        Some("sk-fixture".to_string()),
+    ))
+    .expect("save third-party profile");
+    let cache = crate::profile_cache::profile_cache_path("bars", THIRD_PARTY_CACHE_FILE).unwrap();
+    std::fs::write(&cache, crate::testutil::THIRD_PARTY_BARS_CACHE_BYTES).expect("provider cache");
+    seed_running("d-bars-0", "bars", now_ms());
+
+    let text = monitor_text("d-bars-0");
+    assert!(
+        text.contains(
+            "; quota: no Anthropic 5h/7d window; provider reports pro: 5h 12.5%, 7d 48%, 30d 3%"
+        ),
+        "the provider's own bars and plan reach the check: {text}",
+    );
+}
+
 /// Finding 1: `StreamCapture` held the delegate's live text and the progress
 /// stamp, both died with the detached task, and a poll read only the disk file.
 /// A heartbeat is what carries them across, so a check must show them.
@@ -1970,6 +2065,59 @@ fn fold_delegate_live_usage_wraps_non_objects_and_folds_objects() {
     assert!(
         folded.get("is_error").is_some(),
         "the envelope's own fields survive"
+    );
+}
+
+/// Finding 9: the MCP server runs no scheduler, so with no daemon its cache is
+/// arbitrarily old — and every figure it reported was undated, which is a
+/// routing decision made on a number of unknown age. A folded figure now carries
+/// how old it is, and one past any refresh cadence still carries its number
+/// rather than being dropped for a `unknown` that reads as a lost account.
+#[test]
+fn a_folded_live_usage_clause_dates_the_figure_it_carries() {
+    let _home = HomeSandbox::new();
+    let usage = UsageInfo {
+        five_hour: Some(crate::usage::UsageWindow {
+            utilization: 12.0,
+            resets_at: None,
+        }),
+        ..Default::default()
+    };
+    let cache_path =
+        crate::profile_cache::profile_cache_path("work", USAGE_CACHE_FILE).expect("cache path");
+
+    crate::profile_cache::write_profile_cache("work", USAGE_CACHE_FILE, &usage);
+    crate::testutil::set_mtime(
+        &cache_path,
+        std::time::SystemTime::now() - Duration::from_secs(240),
+    );
+    let fresh = render::delegate_prose(&fold_delegate_live_usage(
+        serde_json::json!({"is_error": false, "result": "ok"}),
+        "work",
+        0,
+        DigestMode::Skip,
+    ));
+    assert!(
+        fresh.contains("target `work`: 5h 12% used, 7d unknown (cached 4m ago)"),
+        "the figure names the age of the cache it came from: {fresh}",
+    );
+
+    // Past the longest gap a live scheduler can leave (interval ceiling plus the
+    // widen-only backoff ceiling, doubled for the fetch's own latency), so
+    // nothing is maintaining this figure — and it still carries its number.
+    crate::testutil::set_mtime(
+        &cache_path,
+        std::time::SystemTime::now() - Duration::from_secs(3 * 60 * 60),
+    );
+    let stale = render::delegate_prose(&fold_delegate_live_usage(
+        serde_json::json!({"is_error": false, "result": "ok"}),
+        "work",
+        0,
+        DigestMode::Skip,
+    ));
+    assert!(
+        stale.contains("5h 12% used, 7d unknown (cached 3h 0m ago, stale)"),
+        "a stale figure is dated and marked, never suppressed: {stale}",
     );
 }
 

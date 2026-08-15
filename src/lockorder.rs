@@ -183,9 +183,13 @@ pub(crate) mod rank {
         /// MCP reply-digest snapshot (`mcp::digest::DigestTracker`): the
         /// since-your-last-call baseline every clone of the stdio server shares.
         /// A true leaf — each acquisition wraps one sample-compare-store step
-        /// over three small local-disk stats, and `watch`'s poll loop drops it
-        /// before every sleep slice, so no RANKED lock, HTTP, subprocess, or
-        /// sleep runs under it. Under `cfg(test)` the sample does nest one
+        /// over a handful of small local-disk reads (the active profile's name
+        /// and its stored endpoint, plus two stats), and `watch`'s poll loop
+        /// drops it before every sleep slice, so no RANKED lock, HTTP,
+        /// subprocess, or sleep runs under it. That endpoint read is why the
+        /// sample calls `profile::stored_usage_cache_is_third_party` and never
+        /// `load_profile`, whose staged-rotation recovery takes `State` (500)
+        /// and would invert this order. Under `cfg(test)` the sample does nest one
         /// unranked mutex, `profile::HOME_OVERRIDE`, which every `home_dir()`
         /// takes and releases with nothing under it.
         McpDigest = 1800;

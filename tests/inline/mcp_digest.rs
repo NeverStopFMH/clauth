@@ -23,7 +23,7 @@
 
 use super::*;
 use crate::profile::{AppState, ProfileName, save_app_state};
-use crate::profile_cache::USAGE_CACHE_FILE;
+use crate::profile_cache::{THIRD_PARTY_CACHE_FILE, USAGE_CACHE_FILE};
 use crate::testutil::{HomeSandbox, set_mtime};
 use crate::usage::UsageInfo;
 
@@ -65,6 +65,39 @@ fn seed_state(active: &str, at: SystemTime) {
     let cache = crate::profile_cache::profile_cache_path(active, USAGE_CACHE_FILE)
         .expect("usage cache path");
     set_mtime(&cache, at);
+}
+
+fn third_party_cache_path(name: &str) -> std::path::PathBuf {
+    crate::profile_cache::profile_cache_path(name, THIRD_PARTY_CACHE_FILE)
+        .expect("third-party cache path")
+}
+
+/// A saved api-key profile as the active one, with the provider cache its own
+/// fetch leg writes stamped at `at` — bytes in the shape that leg writes, driven
+/// through the production reader like every other consumer. No
+/// `usage_cache.json`: that leg never writes one, which is the whole point of
+/// the selection under test.
+///
+/// `base_url` decides which HALF of the api-key set this is: a recognised
+/// provider host, or a generic endpoint clauth has no typed integration for.
+/// Both are fetched and cached the same way, and only the latter can catch a
+/// selector keyed on `is_third_party`.
+fn seed_api_key_state(name: &str, base_url: &str, at: SystemTime) {
+    crate::profile::save_profile(&crate::profile::Profile::new(
+        name.to_string(),
+        Some(base_url.to_string()),
+        Some("sk-fixture".to_string()),
+    ))
+    .expect("save api-key profile");
+    save_app_state(&AppState {
+        active_profile: Some(ProfileName::from(name)),
+        profiles: vec![ProfileName::from(name)],
+        ..Default::default()
+    })
+    .expect("save state");
+    let path = third_party_cache_path(name);
+    std::fs::write(&path, crate::testutil::THIRD_PARTY_CACHE_BYTES).expect("provider cache");
+    set_mtime(&path, at);
 }
 
 fn drive<F>(fut: F) -> CallToolResult
@@ -411,6 +444,84 @@ fn a_profile_change_is_never_reported_as_a_usage_cache_refresh() {
     assert!(
         !next.contains("since your last call"),
         "the re-key onto the new profile's cache is silent: {next}",
+    );
+}
+
+/// Finding 8, the replication defect: the third-party fetch leg never writes
+/// `usage_cache.json`, so keying a third-party active profile's refresh
+/// observable on that file means the event can never fire — an account the
+/// scheduler refreshes hourly reads as frozen forever. `daemon/status_json.rs`
+/// was already fixed for this exact defect; the digest re-introduced it.
+#[test]
+fn a_third_party_profiles_refresh_fires_off_the_cache_its_own_leg_writes() {
+    let _home = HomeSandbox::new();
+    seed_api_key_state("vendor", "https://api.deepseek.com/anthropic", t0());
+    seed_credentials_file(t0());
+    let server = ClauthServer::new();
+    let _ = call_session(&server);
+
+    set_mtime(&third_party_cache_path("vendor"), t1());
+    let text = call_session(&server);
+    assert!(
+        text.contains("since your last call: usage cache refreshed"),
+        "the file this account's own leg refreshes is the one the event watches: {text}",
+    );
+}
+
+/// The half a selector keyed on `is_third_party` still gets wrong: a GENERIC
+/// api-key endpoint (no typed integration, so `provider` is `None`) is fetched
+/// and cached by the same leg — `third_party_entry_for` builds a
+/// `ThirdPartyTarget::Generic` for it — so its refresh lives in the same file.
+/// Keying on "is this a recognised provider" answers a different question and
+/// leaves every local llama, aggregator and self-hosted endpoint watching a file
+/// nothing writes.
+#[test]
+fn a_generic_api_key_profiles_refresh_fires_off_the_cache_its_own_leg_writes() {
+    let _home = HomeSandbox::new();
+    seed_api_key_state("litellm", "http://127.0.0.1:4000", t0());
+    seed_credentials_file(t0());
+    let server = ClauthServer::new();
+    let _ = call_session(&server);
+
+    set_mtime(&third_party_cache_path("litellm"), t1());
+    let text = call_session(&server);
+    assert!(
+        text.contains("since your last call: usage cache refreshed"),
+        "a generic api-key account's own cache is the one the event watches: {text}",
+    );
+}
+
+/// The other half of the same selection, and the one a "watch both files"
+/// shortcut would fail: a third-party profile can carry a LEFTOVER
+/// `usage_cache.json` from an earlier OAuth life (one operator profile holds a
+/// 42-byte one beside a current provider cache). Nothing refreshes it, so a
+/// touch of it is not news about this account.
+#[test]
+fn a_third_party_profiles_leftover_oauth_cache_is_not_the_file_watched() {
+    let _home = HomeSandbox::new();
+    seed_api_key_state("vendor", "https://api.deepseek.com/anthropic", t0());
+    seed_credentials_file(t0());
+    let stale_oauth_cache =
+        crate::profile_cache::profile_cache_path("vendor", USAGE_CACHE_FILE).expect("cache path");
+    std::fs::write(&stale_oauth_cache, b"{}").expect("leftover oauth cache");
+    set_mtime(&stale_oauth_cache, t0());
+    let server = ClauthServer::new();
+    let _ = call_session(&server);
+
+    set_mtime(&stale_oauth_cache, t1());
+    let text = call_session(&server);
+    assert!(
+        !text.contains("usage cache refreshed"),
+        "a file nothing refreshes carries no news about this account: {text}",
+    );
+
+    // Positive control on the same fixture, so the silence above is the
+    // selection and not a digest that reports nothing at all.
+    set_mtime(&third_party_cache_path("vendor"), t1());
+    let moved = call_session(&server);
+    assert!(
+        moved.contains("since your last call: usage cache refreshed"),
+        "the account's own cache still fires: {moved}",
     );
 }
 

@@ -29,8 +29,11 @@ const TICK_INTERVAL: Duration = Duration::from_secs(1);
 const HISTORY_PRUNE_INTERVAL_MS: u64 = 6 * 60 * 60 * 1000;
 
 /// Hard ceiling on a server-provided `retry-after` so a bogus huge value
-/// can't starve a profile's refresh slot.
-const MAX_RETRY_AFTER_MS: u64 = 15 * 60 * 1000;
+/// can't starve a profile's refresh slot. Also the ceiling on the widen-only
+/// poll backoff `partition_due` adds on top of the interval, which is what
+/// bounds the longest gap a live scheduler can leave between two cache writes
+/// (`profile_json::MAX_LIVE_REFRESH_GAP_MS` reads it for exactly that).
+pub(crate) const MAX_RETRY_AFTER_MS: u64 = 15 * 60 * 1000;
 
 /// Widen-only poll deferral for an `auth_broken` profile. Each quarantined
 /// poll spends a guaranteed-dead 401 → refresh → 400 pair against the token

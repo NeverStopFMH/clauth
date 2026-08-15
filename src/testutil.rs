@@ -470,6 +470,28 @@ pub(crate) fn blank_profile(name: &str) -> crate::profile::Profile {
     }
 }
 
+// ── provider-cache fixtures ──────────────────────────────────────────────────
+//
+// A `third_party_cache.json` in each of the two SHAPES the provider legs really
+// write. Both carry the complete key set, row set and row `kind`s read off an
+// operator's own caches on 2026-08-15 (a DeepSeek balance profile and a z.ai bar
+// profile, `serde_json` key-shape only); every number, amount and reset stamp is
+// substituted, so these are shaped-from-a-capture rather than captured bytes,
+// and no account figure is committed.
+//
+// Kept as BYTES rather than a serialized `ThirdPartyStats`: a struct built in
+// Rust agrees with whatever the reader guessed, while these go through the
+// production reader like every real consumer does.
+
+/// The balance shape: `rows` only, no `bars`, and no `plan` key at all.
+pub(crate) const THIRD_PARTY_CACHE_BYTES: &str = r#"{"is_available":true,"rows":[{"label":"CNY balance","value":"","kind":"heading"},{"label":"total","value":"31.45 CNY","kind":"body"},{"label":"granted","value":"0.00 CNY","kind":"body"},{"label":"topped up","value":"31.45 CNY","kind":"body"}],"bars":[],"best_effort":false}"#;
+
+/// The bar shape: three `bars` under a `plan` label, of which only the longest
+/// window carries `used`/`total`, plus the section-headed row set a token
+/// provider writes. The mixed bar keys are the point — a reader that assumed
+/// every bar carries the same five fields parses this one wrong.
+pub(crate) const THIRD_PARTY_BARS_CACHE_BYTES: &str = r#"{"is_available":true,"rows":[{"label":"30d","value":"","kind":"heading"},{"label":"search-prime","value":"12 / 100","kind":"body"},{"label":"web-reader","value":"3 / 100","kind":"body"},{"label":"zread","value":"0 / 50","kind":"body"},{"label":"7d tokens","value":"","kind":"heading"},{"label":"GLM-5.3","value":"80.1M","kind":"body"},{"label":"GLM-5.2","value":"40.2M","kind":"body"},{"label":"GLM-4.7","value":"3.1M","kind":"body"},{"label":"total","value":"123.4M  (1.2k calls)","kind":"faint"}],"bars":[{"label":"5h","pct":12.5,"resets_at":"2026-08-15T12:00:00Z"},{"label":"7d","pct":48.0,"resets_at":"2026-08-20T00:00:00Z"},{"label":"30d","pct":3.0,"resets_at":"2026-09-01T00:00:00Z","used":123.4,"total":4000.0}],"plan":"pro","best_effort":false}"#;
+
 /// Overwrite a file's modification time — for cache-staleness / tie-break tests.
 pub(crate) fn set_mtime(path: &Path, when: SystemTime) {
     let file = std::fs::OpenOptions::new()

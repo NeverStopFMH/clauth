@@ -79,9 +79,7 @@ fn switch_profile_refusal_answers_prose_in_one_block() {
     let text = assert_one_prose_block(&prose);
     assert_eq!(
         text.lines().next(),
-        Some(
-            "switch failed: profile not found: ghost; active profile none: 5h unknown, 7d unknown"
-        ),
+        Some("switch failed: profile not found: ghost; active profile none"),
     );
     // The session-effect note rides every arm of the reply, in the same shape
     // the init block carries it. Which variant this process earns depends on

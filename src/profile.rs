@@ -320,8 +320,32 @@ impl Profile {
         self.credentials.is_some() || self.is_oauth()
     }
 
+    /// Whether this account's endpoint is one clauth has a TYPED integration
+    /// for. Answers "is this a recognised provider", nothing else — a generic
+    /// api-key endpoint is `false` here while still being an api-key account in
+    /// every other sense. For "where do this account's usage figures live", ask
+    /// [`Profile::usage_cache_is_third_party`], which is a wider set.
     pub(crate) fn is_third_party(&self) -> bool {
         self.provider.is_some()
+    }
+
+    /// Whether this account's usage figures live in `third_party_cache.json`
+    /// rather than the OAuth `usage_cache.json` — the question every reader of a
+    /// cached figure asks, and the one the scheduler answers by writing.
+    ///
+    /// True for a recognised provider AND for a generic api-key endpoint, whose
+    /// discovered usage is cached the same way: `third_party_entry_for` builds a
+    /// `ThirdPartyTarget::Generic` whenever `provider` is `None` and a
+    /// `base_url` is set, so that leg genuinely fetches and caches for it.
+    /// Keying a reader on [`Profile::is_third_party`] instead answers a
+    /// DIFFERENT question and renders a generic account, refreshed hourly, as
+    /// never fetched.
+    pub(crate) fn usage_cache_is_third_party(&self) -> bool {
+        usage_cache_is_third_party(
+            self.provider,
+            self.base_url.as_deref(),
+            self.api_key.as_deref(),
+        )
     }
 
     /// The vendor console page where this account's api key is minted, for a
@@ -1552,6 +1576,95 @@ fn console_config(cred: Option<&ConsoleCredential>) -> ConsoleConfig {
     }
 }
 
+/// The managed endpoint a profile actually routes to, given what its
+/// `config.toml` stores and whether it holds an OAuth pair.
+///
+/// The OAuth-bearer leak needs BOTH a stored pair AND no api key: CC would send
+/// that bearer to the third-party base_url. Gate on the pair so a PURE api
+/// account (no pair) with a cleared key keeps its base_url shell and stays
+/// re-loginable (`clear_profile_api_key`). Normalized at the LOAD boundary, same
+/// discipline as the `max_auto_spend` case. This governs the managed base_url
+/// FIELD only: clauth never copies `ANTHROPIC_BASE_URL` into `profile.env`, so an
+/// env override is always operator-authored and is left untouched — normalize
+/// the state clauth authors, not an explicit one.
+///
+/// One rule, two readers: [`load_profile`] and
+/// [`stored_usage_cache_is_third_party`], which answers the same question
+/// without the side effects.
+fn effective_base_url(
+    configured: Option<String>,
+    has_credentials: bool,
+    api_key: Option<&str>,
+) -> Option<String> {
+    let has_usable_key = api_key.map(str::trim).is_some_and(|k| !k.is_empty());
+    match configured {
+        Some(_) if has_credentials && !has_usable_key => None,
+        other => other,
+    }
+}
+
+/// Whether an account's usage figures live in `third_party_cache.json` rather
+/// than the OAuth `usage_cache.json`, given the three stored fields that decide
+/// it. THE answer to "which cache holds this account's figures": every reader of
+/// a cached figure asks this, and [`load_profile`]'s own seeding branch — the
+/// step that decides whether a `Profile` carries `third_party_usage` at all — is
+/// the producer, so it calls this rather than spelling the rule again.
+///
+/// A recognised provider, or a generic api-key endpoint whose discovered usage
+/// the same leg caches. `api_key.is_some()` rather than a trimmed-non-empty
+/// test, deliberately: whether a blank key can AUTHENTICATE a fetch
+/// (`third_party_credentialed`) is a different question from where the figures
+/// would be written.
+fn usage_cache_is_third_party(
+    provider: Option<Provider>,
+    base_url: Option<&str>,
+    api_key: Option<&str>,
+) -> bool {
+    provider.is_some() || (base_url.is_some() && api_key.is_some())
+}
+
+/// [`Profile::usage_cache_is_third_party`] for a caller holding only a name,
+/// read from `config.toml` plus one stat. A config clauth cannot read or parse
+/// proves no endpoint, so it answers `false` and its reader falls back to the
+/// OAuth cache, whose absence renders `unknown` — the honest reading when clauth
+/// cannot classify.
+///
+/// Deliberately NOT `load_profile(name)`: that path recovers a staged rotation,
+/// which takes the cross-process state flock and rewrites `credentials.json`. A
+/// caller holding a leaf lock (the MCP digest samples at 5 Hz under
+/// `rank::McpDigest`) would invert the lock order, and no caller asking a
+/// read-only question should mutate a credential store.
+///
+/// **The divergence that buys, named in its direction**: this reads the
+/// COMMITTED `credentials.json` only, so a profile whose pair exists solely as a
+/// staged `credentials.pending` sidecar reads here as having NO credentials.
+/// [`effective_base_url`] then KEEPS a `base_url` that a full load would drop
+/// (the pair would reach the endpoint), so this answers `true` where
+/// `load_profile` answers `false`, and a reader watches
+/// `third_party_cache.json` for what is really an OAuth account. Only
+/// [`crate::mcp::digest`]'s sample can observe it — every other caller runs
+/// `load_config` first, and `recover_pending_credentials` consumes the sidecar —
+/// and it costs at most one digest call reporting no refresh. Pinned, in that
+/// direction, by `the_lock_free_third_party_read_agrees_with_a_full_load`.
+pub(crate) fn stored_usage_cache_is_third_party(name: &str) -> bool {
+    let Ok(config_path) = profile_config_path(name) else {
+        return false;
+    };
+    let Ok(raw) = std::fs::read_to_string(&config_path) else {
+        return false;
+    };
+    let Ok(config) = toml::from_str::<ProfileConfig>(&raw) else {
+        return false;
+    };
+    let has_credentials = profile_credentials_path(name).is_ok_and(|p| p.exists());
+    let base_url = effective_base_url(config.base_url, has_credentials, config.api_key.as_deref());
+    usage_cache_is_third_party(
+        base_url.as_deref().and_then(Provider::from_base_url),
+        base_url.as_deref(),
+        config.api_key.as_deref(),
+    )
+}
+
 pub(crate) fn load_profile(name: &str) -> Result<Profile> {
     let config_path = profile_config_path(name)?;
     let raw_config = match std::fs::read_to_string(&config_path) {
@@ -1575,29 +1688,17 @@ pub(crate) fn load_profile(name: &str) -> Result<Profile> {
     // Adopt a staged rotation that never committed (crash/failed write between OAuth response and save).
     let credentials = recover_pending_credentials(name, credentials);
 
-    // The OAuth-bearer leak needs BOTH a stored pair AND no api key: CC would
-    // send that bearer to the third-party base_url. Gate on the pair so a PURE
-    // api account (no pair) with a cleared key keeps its base_url shell and
-    // stays re-loginable (`clear_profile_api_key`). Normalize at the LOAD
-    // boundary, same discipline as the `max_auto_spend` case below. This governs
-    // the managed base_url FIELD only: clauth never copies `ANTHROPIC_BASE_URL`
-    // into `profile.env`, so an env override is always operator-authored and is
-    // left untouched — normalize the state clauth authors, not an explicit one.
-    let has_usable_key = config
-        .api_key
-        .as_deref()
-        .map(str::trim)
-        .is_some_and(|k| !k.is_empty());
-    let base_url = match config.base_url {
-        Some(_) if credentials.is_some() && !has_usable_key => None,
-        other => other,
-    };
+    let base_url = effective_base_url(
+        config.base_url,
+        credentials.is_some(),
+        config.api_key.as_deref(),
+    );
 
     let provider = base_url.as_deref().and_then(Provider::from_base_url);
-    // Seed third-party usage from disk for recognised providers AND generic
-    // api-key endpoints (whose discovered usage is cached the same way).
+    // Seed third-party usage from disk for every account whose figures live in
+    // that cache — the predicate is named there so no reader has to restate it.
     let third_party_usage =
-        if provider.is_some() || (base_url.is_some() && config.api_key.is_some()) {
+        if usage_cache_is_third_party(provider, base_url.as_deref(), config.api_key.as_deref()) {
             crate::profile_cache::load_profile_cache::<crate::providers::ThirdPartyStats>(
                 name,
                 crate::profile_cache::THIRD_PARTY_CACHE_FILE,

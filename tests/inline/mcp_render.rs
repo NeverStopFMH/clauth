@@ -353,13 +353,28 @@ fn live_usage_prose_names_every_window_and_warns() {
     );
     assert_eq!(full, "target `work`: 5h 12.3% used, 7d 45.6% used");
 
-    // A null window reads `unknown` (never drops out as if it were zero); a null
-    // profile name reads `none` (no active profile configured, not a lost figure).
-    let nulls = live_usage_prose(
-        &serde_json::json!({"profile": null, "5h_used_pct": null, "7d_used_pct": null}),
+    // A null window reads `unknown` (never drops out as if it were zero), and
+    // carries no age even when a cache file exists to take one from: an age
+    // dates a figure, and stamping one onto two `unknown`s would assert a
+    // measurement clauth never made.
+    let uncached = live_usage_prose(
+        &serde_json::json!({
+            "profile": "work",
+            "kind": "oauth",
+            "5h_used_pct": null,
+            "7d_used_pct": null,
+            "fetched_secs_ago": 240,
+            "stale": true,
+        }),
         "active profile",
     );
-    assert_eq!(nulls, "active profile none: 5h unknown, 7d unknown");
+    assert_eq!(uncached, "active profile `work`: 5h unknown, 7d unknown");
+
+    // ...and a null profile name reads `none` and names no window at all: with
+    // no account configured there is nothing whose windows could be reported,
+    // which is a state clauth knows rather than a figure it lost.
+    let nulls = live_usage_prose(&serde_json::json!({"profile": null}), "active profile");
+    assert_eq!(nulls, "active profile none");
 
     let warned = live_usage_prose(
         &serde_json::json!({
@@ -376,15 +391,92 @@ fn live_usage_prose_names_every_window_and_warns() {
     );
 }
 
+/// The none-vs-unknown ruling, on the headroom clause. A third-party account
+/// has no 5h/7d pool at all — clauth knows that exactly — while an OAuth
+/// account with nothing cached is the one case it genuinely does not know.
+/// Rendering both as `unknown` told the reader clauth had lost track of a state
+/// it knew.
+#[test]
+fn windows_prose_separates_a_window_that_cannot_exist_from_one_never_fetched() {
+    // The denial names ANTHROPIC's pool, and the figure names whose account it
+    // belongs to: a provider publishes windows under the same `5h`/`7d` labels
+    // (z.ai reports 5h, 7d and 30d), so a bare `no 5h/7d window` beside them
+    // denies a window and prints one in the same clause.
+    assert_eq!(
+        windows_prose(&serde_json::json!({
+            "kind": "third_party",
+            "balance": "pro: 5h 12.5%, 7d 48%",
+        })),
+        "no Anthropic 5h/7d window; provider reports pro: 5h 12.5%, 7d 48%",
+    );
+    assert_eq!(
+        windows_prose(&serde_json::json!({
+            "kind": "third_party",
+            "balance": "total: 31.45 CNY",
+        })),
+        "no Anthropic 5h/7d window; provider reports total: 31.45 CNY",
+    );
+    assert_eq!(
+        windows_prose(&serde_json::json!({"kind": "third_party", "balance": null})),
+        "no Anthropic 5h/7d window; provider usage unknown",
+        "the Anthropic window is none, the provider's figure is genuinely unknown, \
+         and they are different facts",
+    );
+    assert_eq!(
+        windows_prose(&serde_json::json!({"kind": "oauth", "windows": []})),
+        "usage unknown",
+        "an OAuth account with no cache is the one clauth cannot answer for",
+    );
+}
+
+/// A freshness clause dates a FIGURE. With nothing to date — no provider figure
+/// yet, no window cached — an age would assert a measurement clauth does not
+/// have, and `(stale)` would land on the structural none instead of on the
+/// number it describes.
+#[test]
+fn windows_prose_never_dates_a_figure_it_did_not_print() {
+    assert_eq!(
+        windows_prose(&serde_json::json!({
+            "kind": "third_party",
+            "balance": null,
+            "fetched_secs_ago": 120,
+            "stale": true,
+        })),
+        "no Anthropic 5h/7d window; provider usage unknown",
+    );
+    assert_eq!(
+        windows_prose(&serde_json::json!({
+            "kind": "oauth",
+            "windows": [],
+            "fetched_secs_ago": 120,
+            "stale": true,
+        })),
+        "usage unknown",
+    );
+    // And it DOES ride the figure when there is one, which is what keeps the
+    // suppression above from reading as "the flag never renders".
+    assert_eq!(
+        windows_prose(&serde_json::json!({
+            "kind": "third_party",
+            "balance": "total: 31.45 CNY",
+            "stale": true,
+        })),
+        "no Anthropic 5h/7d window; provider reports total: 31.45 CNY (stale)",
+    );
+}
+
 #[test]
 fn list_profiles_prose_renders_each_row_with_unknown_for_null_fields() {
+    // One carrier per row: the third-party account's figures ride its `windows`
+    // object, and the quiet flags follow. The vendor row is the third-party
+    // shape, so its window clause denies Anthropic's pool and reports the
+    // provider's own.
     let solo = serde_json::json!({
         "name": "solo",
         "active": true,
         "provider": "anthropic",
         "tier": null,
-        "windows": [],
-        "third_party": null
+        "windows": {"kind": "oauth", "windows": []},
     });
     let vendor = serde_json::json!({
         "name": "vendor",
@@ -392,11 +484,7 @@ fn list_profiles_prose_renders_each_row_with_unknown_for_null_fields() {
         "provider": "DeepSeek",
         "tier": null,
         "host": "api.deepseek.com",
-        "windows": [
-            {"label": "5h", "utilization_pct": 12.3, "resets_at": null},
-            {"label": "7d", "utilization_pct": 45.0, "resets_at": "2026-08-13T00:00:00Z"}
-        ],
-        "third_party": "pro: 5h 50% used",
+        "windows": {"kind": "third_party", "balance": "pro: 5h 50% used"},
         "has_live_session": true,
         "throughput": [{
             "model": "deepseek-chat",
@@ -411,7 +499,8 @@ fn list_profiles_prose_renders_each_row_with_unknown_for_null_fields() {
     assert_eq!(
         text,
         "- solo (active) [anthropic]: usage unknown; tier unknown\n\
-         - vendor [DeepSeek, api.deepseek.com]: 5h 12.3% used, 7d 45% used (resets at 2026-08-13T00:00:00Z); pro: 5h 50% used; live session; throughput: `deepseek-chat` 12.3 tok/s (degraded)"
+         - vendor [DeepSeek, api.deepseek.com]: no Anthropic 5h/7d window; provider reports \
+         pro: 5h 50% used; live session; throughput: `deepseek-chat` 12.3 tok/s (degraded)"
     );
 }
 
@@ -429,40 +518,121 @@ fn list_profiles_prose_handles_empty_roster_and_error_envelope() {
     );
 }
 
+/// The same ruling on the folded live-usage clause: a delegate to an api-key
+/// account reports that account's own figures, denies the pool it cannot draw
+/// on by name, and dates the figure off its own cache.
+#[test]
+fn live_usage_prose_answers_for_a_third_party_target() {
+    assert_eq!(
+        live_usage_prose(
+            &serde_json::json!({
+                "profile": "vendor",
+                "kind": "third_party",
+                "balance": "total: 31.45 CNY",
+                "fetched_secs_ago": 30,
+            }),
+            "target",
+        ),
+        "target `vendor`: no Anthropic 5h/7d window; provider reports total: 31.45 CNY \
+         (cached 30s ago)",
+    );
+    assert_eq!(
+        live_usage_prose(
+            &serde_json::json!({
+                "profile": "vendor",
+                "kind": "third_party",
+                "balance": null,
+            }),
+            "target",
+        ),
+        "target `vendor`: no Anthropic 5h/7d window; provider usage unknown",
+    );
+}
+
+/// Finding 9: an undated figure is a routing decision made on an unknown-age
+/// number, and the MCP server refreshes no cache of its own. So a figure names
+/// its age, and one past any refresh cadence still renders — dated and marked,
+/// never suppressed.
+#[test]
+fn windows_prose_dates_its_figures_and_marks_a_stale_one() {
+    let windows = serde_json::json!([{"label": "5h", "utilization_pct": 12.0}]);
+    assert_eq!(
+        windows_prose(&serde_json::json!({
+            "kind": "oauth",
+            "windows": windows,
+            "fetched_secs_ago": 240,
+        })),
+        "5h 12% used (cached 4m ago)",
+    );
+    assert_eq!(
+        windows_prose(&serde_json::json!({
+            "kind": "oauth",
+            "windows": windows,
+            "fetched_secs_ago": 7500,
+            "stale": true,
+        })),
+        "5h 12% used (cached 2h 5m ago, stale)",
+        "a stale figure keeps its number: dropping it reads as clauth losing the account",
+    );
+    // The roster spends no tokens dating rows that are current, and still says
+    // so when one is not.
+    assert_eq!(
+        windows_prose(&serde_json::json!({
+            "kind": "oauth",
+            "windows": windows,
+            "stale": true,
+        })),
+        "5h 12% used (stale)",
+    );
+}
+
+/// The session arm renders its row through `profile_line` (so it inherits the
+/// roster's own guards), names how it resolved, then folds live usage and the
+/// digest. The live-usage clause is dropped when it would restate the row's
+/// own headroom — the session runs on the configured active account — but its
+/// age rides the row, since that is the one freshness cue the row omits.
 #[test]
 fn session_scope_prose_names_the_row_its_source_and_usage() {
-    // The session row is a roster row plus `source`, so it renders through
-    // `profile_line` — which is what carries the anthropic tier guard.
-    let p = serde_json::json!({
+    let row = serde_json::json!({
+        "name": "kerry",
+        "active": true,
+        "provider": "anthropic",
+        "tier": "Free",
+        "windows": {"kind": "oauth", "windows": [{"label": "5h", "utilization_pct": 12.0}]},
+        "source": "session_dir"
+    });
+    let same_account = serde_json::json!({
         "scope": "session",
-        "profiles": [{
-            "name": "kerry",
-            "active": true,
-            "provider": "anthropic",
-            "tier": "Free",
-            "windows": [],
-            "third_party": null,
-            "source": "session_dir"
-        }],
-        "live_usage": {"profile": "kerry", "5h_used_pct": 12.0, "7d_used_pct": null}
+        "profiles": [row],
+        "live_usage": {"profile": "kerry", "kind": "oauth", "5h_used_pct": 12.0, "7d_used_pct": null, "fetched_secs_ago": 240}
     });
     assert_eq!(
-        list_profiles_prose(&p),
-        "- kerry (active) [anthropic, Free]: usage unknown; source `session_dir`; \
-         active profile `kerry`: 5h 12% used, 7d unknown"
+        list_profiles_prose(&same_account),
+        "- kerry (active) [anthropic, Free]: 5h 12% used (cached 4m ago); source `session_dir`",
+        "one account, one headroom clause: the row already marks it `(active)`, its age rides the row",
     );
 
-    // The digest clause rides only when something moved, after the live-usage
-    // clause; a null from/to reads `none`, never a dropped half.
-    let mut moved = p.clone();
+    // A session pinned to a profile the config is NOT active on: two accounts,
+    // so both clauses carry news and both are rendered.
+    let mut split = same_account.clone();
+    split["profiles"][0]["active"] = serde_json::json!(false);
+    split["live_usage"] = serde_json::json!({"profile": "work", "kind": "oauth", "5h_used_pct": 40.0, "7d_used_pct": null});
+    assert_eq!(
+        list_profiles_prose(&split),
+        "- kerry [anthropic, Free]: 5h 12% used; source `session_dir`; \
+         active profile `work`: 5h 40% used, 7d unknown",
+    );
+
+    // The digest clause rides only when something moved, after whatever
+    // precedes it; a null from/to reads `none`, never a dropped half.
+    let mut moved = same_account.clone();
     moved["since_your_last_call"] = serde_json::json!({
         "active_profile": {"from": null, "to": "kerry"},
         "usage_cache": true
     });
     assert_eq!(
         list_profiles_prose(&moved),
-        "- kerry (active) [anthropic, Free]: usage unknown; source `session_dir`; \
-         active profile `kerry`: 5h 12% used, 7d unknown; \
+        "- kerry (active) [anthropic, Free]: 5h 12% used (cached 4m ago); source `session_dir`; \
          since your last call: active profile none → `kerry`; usage cache refreshed"
     );
 }
@@ -517,11 +687,11 @@ fn session_scope_prose_says_unknown_when_unresolved() {
     let p = serde_json::json!({
         "scope": "session",
         "profiles": [],
-        "live_usage": {"profile": null, "5h_used_pct": null, "7d_used_pct": null}
+        "live_usage": {"profile": null}
     });
     assert_eq!(
         list_profiles_prose(&p),
-        "session profile unknown, source unknown; active profile none: 5h unknown, 7d unknown"
+        "session profile unknown, source unknown; active profile none"
     );
 }
 
@@ -606,7 +776,7 @@ fn switch_prose_renders_success_and_failure() {
         "ok": true,
         "previous": null,
         "active": "work",
-        "live_usage": {"profile": "work", "5h_used_pct": 12.0, "7d_used_pct": null}
+        "live_usage": {"profile": "work", "kind": "oauth", "5h_used_pct": 12.0, "7d_used_pct": null}
     });
     assert_eq!(
         switch_prose(&ok),
@@ -616,11 +786,11 @@ fn switch_prose_renders_success_and_failure() {
     let err = serde_json::json!({
         "ok": false,
         "reason": "profile not found: ghost",
-        "live_usage": {"profile": null, "5h_used_pct": null, "7d_used_pct": null}
+        "live_usage": {"profile": null}
     });
     assert_eq!(
         switch_prose(&err),
-        "switch failed: profile not found: ghost; active profile none: 5h unknown, 7d unknown"
+        "switch failed: profile not found: ghost; active profile none"
     );
 }
 
@@ -696,7 +866,7 @@ fn delegate_result_prose_renders_running_invalid_and_done() {
         "idle_kill_in_secs": 296,
         "wall_kill_in_secs": 2867,
         "tail": "…clippy clean, 0 warnings. moving to the fallback tests",
-        "quota": [{"label": "5h", "utilization_pct": 12.0, "resets_at": null}]
+        "quota": {"kind": "oauth", "windows": [{"label": "5h", "utilization_pct": 12.0, "resets_at": null}]}
     });
     assert_eq!(
         delegate_result_prose(&running),
@@ -713,7 +883,7 @@ fn delegate_result_prose_renders_running_invalid_and_done() {
         "profile": "work",
         "elapsed_secs": 12,
         "wall_kill_in_secs": 288,
-        "quota": [],
+        "quota": {"kind": "oauth", "windows": []},
     });
     assert_eq!(
         delegate_result_prose(&no_idle),
@@ -726,7 +896,7 @@ fn delegate_result_prose_renders_running_invalid_and_done() {
         "status": "running",
         "profile": "work",
         "elapsed_secs": 12,
-        "quota": [],
+        "quota": {"kind": "oauth", "windows": []},
     });
     assert_eq!(
         delegate_result_prose(&legacy),
@@ -744,7 +914,7 @@ fn delegate_result_prose_renders_running_invalid_and_done() {
         "profile": "work",
         "elapsed_secs": 3,
         "wall_kill_in_secs": 60,
-        "quota": [],
+        "quota": {"kind": "oauth", "windows": []},
         "tail": r#"he said "hi" then; quota: 0% used \ done"#,
     });
     assert_eq!(

@@ -79,7 +79,7 @@ fn names_filter_selects_one_profile_case_insensitively() {
         lines(&call_profiles(None, None)),
         vec![
             "- solo (active) [anthropic]: usage unknown; tier unknown",
-            "- vendor [DeepSeek, api.deepseek.com]: usage unknown; balance unknown; no api key",
+            "- vendor [DeepSeek, api.deepseek.com]: no Anthropic 5h/7d window; provider usage unknown; no api key",
         ],
         "fixture control: both profiles are visible unfiltered",
     );
@@ -88,7 +88,9 @@ fn names_filter_selects_one_profile_case_insensitively() {
     // casing.
     assert_eq!(
         lines(&call_profiles(Some(vec!["VENDOR"]), None)),
-        vec!["- vendor [DeepSeek, api.deepseek.com]: usage unknown; balance unknown; no api key"],
+        vec![
+            "- vendor [DeepSeek, api.deepseek.com]: no Anthropic 5h/7d window; provider usage unknown; no api key"
+        ],
     );
     // An empty list is the same ask as no list at all, never "nothing".
     assert_eq!(
@@ -215,12 +217,12 @@ fn keyless_flag_names_only_the_keyless_third_party_profile() {
         "an OAuth profile never carries the keyless clause",
     );
     assert!(
-        !text.contains("keyed [DeepSeek, api.deepseek.com]: usage unknown; balance unknown; no"),
+        !text.contains("keyed [DeepSeek, api.deepseek.com]: no Anthropic 5h/7d window; provider usage unknown; no"),
         "a keyed third-party profile must not carry the keyless clause",
     );
     assert!(
         text.contains(
-            "- keyless [DeepSeek, api.deepseek.com]: usage unknown; balance unknown; no api key"
+            "- keyless [DeepSeek, api.deepseek.com]: no Anthropic 5h/7d window; provider usage unknown; no api key"
         ),
         "the keyless profile names its missing api key in words: {text}",
     );
@@ -239,8 +241,8 @@ fn prose_names_the_keyless_profile_and_leaves_the_others_unchanged() {
         lines,
         vec![
             "- solo (active) [anthropic]: usage unknown; tier unknown".to_string(),
-            "- keyed [DeepSeek, api.deepseek.com]: usage unknown; balance unknown".to_string(),
-            "- keyless [DeepSeek, api.deepseek.com]: usage unknown; balance unknown; no api key"
+            "- keyed [DeepSeek, api.deepseek.com]: no Anthropic 5h/7d window; provider usage unknown".to_string(),
+            "- keyless [DeepSeek, api.deepseek.com]: no Anthropic 5h/7d window; provider usage unknown; no api key"
                 .to_string(),
         ],
         "three lines: the OAuth and keyed lines render as before, the keyless          one names its missing api key in words",
@@ -311,10 +313,92 @@ fn session_scope_resolves_the_tier_through_the_which_tiers() {
         row.contains("source `session_dir`"),
         "the row names how it resolved: {row}",
     );
-    // Live usage rides the session reply like it rode `which`'s.
+    // The live-usage fold names the CONFIGURED active profile. Here that is the
+    // same account the row resolved to, so its clause would restate the row's
+    // own headroom word for word and is dropped — the row's `(active)` marker
+    // already says the two are one account.
     assert!(
-        text.contains("; active profile `kerry`: 5h unknown, 7d unknown"),
-        "the active profile's live usage follows the row: {text}",
+        !text.contains("active profile `kerry`"),
+        "one account must not spell its headroom twice on one line: {text}",
+    );
+    assert!(
+        row.contains("(active)"),
+        "and what the dropped clause said is still on the row: {row}",
+    );
+}
+
+/// A GENERIC api-key endpoint — no typed integration, so `provider` is `None`
+/// and `provider_label` renders it `anthropic` — is still an api-key account:
+/// the same scheduler leg caches its usage, it has no Anthropic pool, and it has
+/// no Anthropic plan tier. A roster keyed on the display label or on
+/// `is_third_party` tells the picker both of those are unknown while holding the
+/// figures on disk.
+#[test]
+fn a_generic_api_key_row_reports_its_own_figures_and_claims_no_anthropic_plan() {
+    let _home = HomeSandbox::new();
+    save_profile(&Profile::new(
+        "litellm".to_string(),
+        Some("http://127.0.0.1:4000".to_string()),
+        Some("sk-fixture".to_string()),
+    ))
+    .expect("save generic api-key profile");
+    save_app_state(&AppState {
+        active_profile: Some("litellm".into()),
+        profiles: vec!["litellm".into()],
+        ..Default::default()
+    })
+    .expect("save state");
+    let cache =
+        crate::profile_cache::profile_cache_path("litellm", THIRD_PARTY_CACHE_FILE).unwrap();
+    std::fs::write(&cache, crate::testutil::THIRD_PARTY_CACHE_BYTES).expect("provider cache");
+
+    let row = lines(&call_profiles(None, None)).remove(0);
+    assert_eq!(
+        row,
+        "- litellm (active) [anthropic, 127.0.0.1:4000]: no Anthropic 5h/7d window; \
+         provider reports total: 31.45 CNY",
+        "the account's own cached figures, and no claim about a plan it cannot have",
+    );
+}
+
+/// Finding 11: the retired `which` prose mapped a null tier to `unknown`
+/// unconditionally, while `profile_line` guards the same null on
+/// `provider == "anthropic"` — a third-party account has no plan tier to lose.
+/// The session row inherits that guard by being rendered through `profile_line`,
+/// and this is what holds the inheritance: a row built any other way says
+/// `tier unknown` about an account that structurally has none.
+#[test]
+fn a_third_party_session_row_claims_no_unknown_it_structurally_has_none_of() {
+    let home = HomeSandbox::new();
+    save_profile(&Profile::new(
+        "vendor".to_string(),
+        Some("https://api.deepseek.com/anthropic".to_string()),
+        Some("sk-fixture".to_string()),
+    ))
+    .expect("save third-party profile");
+    save_app_state(&AppState {
+        active_profile: Some("vendor".into()),
+        profiles: vec!["vendor".into()],
+        ..Default::default()
+    })
+    .expect("save state");
+    let runtime = home.home().join(".clauth/profiles/vendor/runtime-4242-1");
+    std::fs::create_dir_all(&runtime).expect("runtime dir");
+    let _dir = ConfigDirSandbox::new(&home, &runtime);
+
+    let text = first_text(&call_profiles(None, Some("session")));
+    let row = text.lines().next().expect("the session row");
+    assert!(
+        row.starts_with("- vendor (active) [DeepSeek, api.deepseek.com]"),
+        "the session resolves to the third-party account: {row}",
+    );
+    assert!(
+        !row.contains("tier unknown"),
+        "a third-party account has no plan tier, so none is missing: {row}",
+    );
+    assert!(
+        row.contains("no Anthropic 5h/7d window"),
+        "and no Anthropic pool either, which is a none rather than an unknown: {row}",
     );
 }
 

@@ -710,6 +710,128 @@ fn base_url_dropped_only_when_a_stored_pair_could_leak() {
     );
 }
 
+/// `stored_usage_cache_is_third_party` answers the question
+/// `load_profile(…).usage_cache_is_third_party()` answers, without recovering a
+/// staged rotation — that recovery takes the state flock and rewrites
+/// `credentials.json`, which a caller under a leaf lock (the MCP digest's 5 Hz
+/// sample) can never do.
+///
+/// Two readers of one rule, so they are pinned to agree across every state the
+/// rule branches on: both disjuncts (a recognised provider, and a generic
+/// endpoint with a key) and both answers, or a reader stuck on either constant
+/// passes. The ONE state where they legitimately disagree is pinned separately
+/// below, in its direction, rather than left out of a docstring claiming
+/// agreement everywhere.
+#[test]
+fn the_lock_free_third_party_read_agrees_with_a_full_load() {
+    let _home = HomeSandbox::new();
+    let name = "endpoint-agreement";
+    save_profile(&crate::testutil::blank_profile(name)).expect("save_profile");
+    let config_path = profile_subpath(name, "config.toml").expect("config path");
+    let cred_path = profile_subpath(name, "credentials.json").expect("cred path");
+    let known = "https://api.z.ai/anthropic";
+    // No typed integration claims this one, so it exercises the second disjunct
+    // (`base_url` + `api_key`) that `provider.is_some()` alone never reaches.
+    let generic = "http://127.0.0.1:4000";
+    let creds = serde_json::to_string(&oauth_credentials()).expect("ser creds");
+
+    let mut seen = Vec::new();
+    for (label, config, pair) in [
+        ("no endpoint at all", String::new(), false),
+        (
+            "recognised endpoint, no pair, no key",
+            format!("base_url = \"{known}\"\n"),
+            false,
+        ),
+        (
+            "recognised endpoint + pair, no usable key",
+            format!("base_url = \"{known}\"\napi_key = \"   \"\n"),
+            true,
+        ),
+        (
+            "recognised endpoint + pair + real key",
+            format!("base_url = \"{known}\"\napi_key = \"sk-real\"\n"),
+            true,
+        ),
+        (
+            "generic endpoint + key",
+            format!("base_url = \"{generic}\"\napi_key = \"sk-real\"\n"),
+            false,
+        ),
+        (
+            "generic endpoint, no key",
+            format!("base_url = \"{generic}\"\n"),
+            false,
+        ),
+    ] {
+        std::fs::write(&config_path, &config).expect("write config");
+        if pair {
+            std::fs::write(&cred_path, &creds).expect("write credentials.json");
+        } else {
+            let _ = std::fs::remove_file(&cred_path);
+        }
+        let full = load_profile(name)
+            .expect("load_profile")
+            .usage_cache_is_third_party();
+        assert_eq!(
+            stored_usage_cache_is_third_party(name),
+            full,
+            "the lock-free read disagrees with the load boundary on: {label}",
+        );
+        seen.push(full);
+    }
+    assert!(
+        seen.contains(&true) && seen.contains(&false),
+        "the fixture must exercise both answers, or a constant reader passes: {seen:?}",
+    );
+    assert!(
+        seen[4],
+        "a generic api-key endpoint's usage lives in the third-party cache too, \
+         which is the half `provider.is_some()` answers wrong: {seen:?}",
+    );
+}
+
+/// The one state the two readers do NOT agree on, pinned in its direction so it
+/// stays a known cost rather than a surprise: a pair staged as
+/// `credentials.json.pending` and never committed. The lock-free read stats the
+/// COMMITTED file only, so it sees no credentials, keeps the `base_url` that a
+/// full load would drop (the pair would otherwise reach the endpoint), and
+/// answers `true` where `load_profile` answers `false`.
+///
+/// Only the MCP digest's sample can observe it — every other caller runs
+/// `load_config` first, and `recover_pending_credentials` consumes the sidecar —
+/// and the cost is one digest call watching the wrong cache, so no refresh is
+/// reported for it.
+#[test]
+fn a_staged_pair_is_the_one_state_the_lock_free_read_reads_differently() {
+    let _home = HomeSandbox::new();
+    let name = "endpoint-staged";
+    save_profile(&crate::testutil::blank_profile(name)).expect("save_profile");
+    let config_path = profile_subpath(name, "config.toml").expect("config path");
+    let endpoint = "https://api.z.ai/anthropic";
+    std::fs::write(&config_path, format!("base_url = \"{endpoint}\"\n")).expect("write config");
+    // Staged but never committed: no `credentials.json` on disk.
+    let pending = profile_subpath(name, "credentials.json.pending").expect("pending path");
+    std::fs::write(
+        &pending,
+        serde_json::to_string(&oauth_credentials()).expect("ser creds"),
+    )
+    .expect("write pending sidecar");
+
+    // The lock-free read FIRST: `load_profile` consumes the sidecar, and after
+    // that there is nothing left to disagree about.
+    assert!(
+        stored_usage_cache_is_third_party(name),
+        "the committed file is empty, so this read keeps the endpoint",
+    );
+    assert!(
+        !load_profile(name)
+            .expect("load_profile")
+            .usage_cache_is_third_party(),
+        "the full load adopts the staged pair and drops the endpoint with it",
+    );
+}
+
 // ── crash-durable rotation: the pending sidecar's adopt/discard decision ─────
 //
 // `stage_rotated_credentials` writes a rotated pair to `credentials.json.pending`

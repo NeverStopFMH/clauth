@@ -151,29 +151,21 @@ clauth is the only one of these that pairs account switching with a live usage m
 
 ## FAQ
 
-**How do I switch between multiple Claude Code accounts without logging out?**
-Install clauth, save each logged-in session as a profile once, then switch with `clauth <name>` or a single keypress in the TUI. No browser, no re-login.
+**How do I switch between multiple Claude Code accounts without logging out?** Install clauth, save each logged-in session as a profile once, then switch with `clauth <name>` or a single keypress in the TUI. No browser, no re-login.
 
-**Can I run Claude Code with multiple accounts at the same time?**
-Yes. `clauth start <profile>` launches `claude` in an isolated `CLAUDE_CONFIG_DIR`, so parallel sessions don't share identity, settings, or billing caches.
+**Can I run Claude Code with multiple accounts at the same time?** Yes. `clauth start <profile>` launches `claude` in an isolated `CLAUDE_CONFIG_DIR`, so parallel sessions don't share identity, settings, or billing caches.
 
-**How do I run Claude Code without my global `CLAUDE.md`, plugins, or hooks?**
-`clauth start --isolated <profile>` keeps the account's auth but drops your operator memory, plugins, and hooks, leaving a clean session for headless work or blind evals. The MCP `delegate` tool takes `isolated: true` for the same thing.
+**How do I run Claude Code without my global `CLAUDE.md`, plugins, or hooks?** `clauth start --isolated <profile>` keeps the account's auth but drops your operator memory, plugins, and hooks, leaving a clean session for headless work or blind evals. The MCP `delegate` tool takes `isolated: true` for the same thing.
 
-**Can Claude Code switch accounts automatically when I hit the 5-hour limit?**
-Yes: put accounts in the fallback chain and clauth switches to the next member with headroom the moment the active one crosses its threshold. It runs in the TUI or headless via `clauth daemon`.
+**Can Claude Code switch accounts automatically when I hit the 5-hour limit?** Yes: put accounts in the fallback chain and clauth switches to the next member with headroom the moment the active one crosses its threshold. It runs in the TUI or headless via `clauth daemon`.
 
-**Is there a Claude Code MCP server / plugin to switch accounts from inside a chat?**
-Yes. clauth ships a plugin that runs as an MCP server (`clauth mcp`), so a live session can list accounts, `switch_profile`, or `delegate` a headless prompt to another account without leaving the chat.
+**Is there a Claude Code MCP server / plugin to switch accounts from inside a chat?** Yes. clauth ships a plugin that runs as an MCP server (`clauth mcp`), so a live session can list accounts, `switch_profile`, or `delegate` a headless prompt to another account without leaving the chat.
 
-**How do I monitor Claude Code usage and rate limits?**
-The Overview tab shows color-coded 5h (and 7-day) bars per account with reset times; the Usage tab breaks down every rate-limit window the API reports; the Tokens tab adds a global token dashboard with API-equivalent cost.
+**How do I monitor Claude Code usage and rate limits?** The Overview tab shows color-coded 5h (and 7-day) bars per account with reset times; the Usage tab breaks down every rate-limit window the API reports; the Tokens tab adds a global token dashboard with API-equivalent cost.
 
-**Does it work with Claude Pro, Max, Team, and Enterprise?**
-Yes. OAuth profiles cover all paid tiers (plan auto-detected, including Max 5x / 20x). API-endpoint profiles cover the Anthropic API or any compatible proxy.
+**Does it work with Claude Pro, Max, Team, and Enterprise?** Yes. OAuth profiles cover all paid tiers (plan auto-detected, including Max 5x / 20x). API-endpoint profiles cover the Anthropic API or any compatible proxy.
 
-**Where does clauth store my Claude Code credentials?**
-Locally under `~/.clauth/`, with `0600` permissions on Unix. Tokens only ever go to Anthropic. See [SECURITY.md](SECURITY.md).
+**Where does clauth store my Claude Code credentials?** Locally under `~/.clauth/`, with `0600` permissions on Unix. Tokens only ever go to Anthropic. See [SECURITY.md](SECURITY.md).
 
 More, including what to check when something misbehaves: [FAQ](https://github.com/uwuclxdy/clauth/wiki/FAQ).
 
@@ -200,8 +192,7 @@ cargo clippy --all-targets   # CI gates clippy -D warnings + fmt --check + test 
 cargo test
 ```
 
-> [!TIP]
-> `cargo test showcase -- --ignored --nocapture` drives the real interactive TUI on fake data against a throwaway home dir (no network, never compiled into the binary). Handy for screenshots.
+> [!TIP] `cargo test showcase -- --ignored --nocapture` drives the real interactive TUI on fake data against a throwaway home dir (no network, never compiled into the binary). Handy for screenshots.
 
 ## Security
 

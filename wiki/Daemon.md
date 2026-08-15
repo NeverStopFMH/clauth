@@ -1,101 +1,23 @@
 # `clauth daemon`: headless scheduler + status feed
 
-`clauth daemon` runs the same background refresher the TUI runs
-(`spawn_refresher`) with no UI: refresh usage, rotate expiring tokens, run
-the fallback chain's auto-switches, and publish `~/.clauth/status.json` for
-external readers. `clauth status --json` prints the same shape single-shot,
-no daemon required. This document is the read contract for both.
+`clauth daemon` runs the same background refresher the TUI runs (`spawn_refresher`) with no UI: refresh usage, rotate expiring tokens, run the fallback chain's auto-switches, and publish `~/.clauth/status.json` for external readers. `clauth status --json` prints the same shape single-shot, no daemon required. This document is the read contract for both.
 
-Scope note: the daemon carries **no external mutation surface**: no socket,
-no config endpoint. Anything that needs eyes (a diverged live login, a manual
-Claude Code `/login`, an unprovable identity) is refused and logged; the TUI
-stays the only resolution surface.
+Scope note: the daemon carries **no external mutation surface**: no socket, no config endpoint. Anything that needs eyes (a diverged live login, a manual Claude Code `/login`, an unprovable identity) is refused and logged; the TUI stays the only resolution surface.
 
 ## Process model
 
-- **Singleton**: one advisory lock (`~/.clauth/clauthd.lock`) held for the
-  process lifetime, with the holder's pid written to an unlocked sidecar
-  (`~/.clauth/clauthd.pid`) for `ps`-level diagnosis (informational: the flock,
-  never the number, is what proves presence). The pid stays out of the lock file
-  because Windows locks are mandatory, so a `--status` reader in another process
-  couldn't read bytes held inside the daemon's exclusive lock. A second `clauth daemon` exits 0 by
-  default (`already running (pid <n>)`), so a spawner that fires repeatedly
-  can't pile up idle daemons (#57). `--standby` opts into the take-over
-  behaviour: it parks and takes over the moment the holder exits, for a
-  supervisor's instance queueing behind a manually run one under launchd
-  `KeepAlive{SuccessfulExit=false}` (which never restarts a clean exit). That
-  standby queue is **one deep**: a second flock (`clauthd-standby.lock`) holds
-  the slot, any further instance exits. `--no-standby` is the default's explicit
-  spelling, kept for callers already passing it. A dead holder's flock auto-releases, so a
-  supervisor with restart-on-crash keeps exactly one scheduler alive without
-  pidfile bookkeeping. The TUI header's `● daemon` dot reads this lock
-  (presence) plus `status.json` freshness (green = fresh feed, amber = stalling,
-  hidden = no daemon) to show whether one is running.
-- **Asking before spawning**: `clauth daemon --status` prints
-  `running (pid <n>, feed fresh|stale[, standby waiting])` and exits 0 when a
-  daemon is up. No daemon: exit 1, nothing on stdout. It creates nothing, so a
-  menu-bar app or a wrapper script can gate its spawn on the exit code instead
-  of starting a process to find out. A lock file it cannot test at all (no
-  working `flock`, e.g. some NFS/CIFS mounts) is its own failure with the io
-  error attached, never an exit 1 that reads as "none running" and sends a
-  supervisor into a respawn loop. The header dot answers the same question by
-  hiding instead, which is why the two read the lock through different paths.
-  The default already exits the moment it loses the race, which suits the same
-  callers. `--standby` is the one to keep out of a pure supervisor unit: the
-  supervisor is the sole starter and wins the race alone, so a standby only earns
-  its keep when a manual run and a unit coexist.
-- **Replacing for an upgrade**: `clauth daemon --replace` terminates the running
-  daemon and takes over. It reads the holder's pid sidecar and confirms the pid
-  is still a running `clauth daemon` by its argv, so another clauth subcommand
-  sharing the binary name is never signalled. It SIGTERMs the holder and waits
-  for the flock to auto-release on death; on a timeout it escalates to SIGKILL,
-  then claims. A pid it can't confirm bails rather than signal blind.
-- **Probes take the lock they read**, briefly: both the header dot's
-  `daemon_health` and `--status` try-lock a free file and release it. A starting
-  daemon therefore re-tries a lost race (3 attempts, 100 ms apart) before it
-  accepts that another instance is up. A real holder keeps its lock for life, so
-  anything that clears on a retry was a reader.
-- **Watchdog**: a wedged tick can freeze the single-threaded loop. The
-  cross-process state flock a tick may block on is capped at 25 s, so a
-  flock-blocked tick times out and retries rather than hanging; if no tick
-  completes in 30 s at all, the daemon `abort()`s for a clean supervisor
-  restart, freeing the usage lease (below). A legit keychain switch sits inside
-  both margins: on macOS it reads the Keychain item and writes it back, each of
-  those killed at 10 s, and everything one flock hold spends in `security`
-  capped at 20 s no matter how many reads and writes it makes.
-- **Log hygiene**: every daemon-visible stderr line carries an ISO-8601 UTC
-  prefix, enabled only in daemon mode. An interactive terminal instead diverts
-  its lines to `~/.clauth/clauth.log` so a background thread never paints over
-  the TUI; a redirected or piped stderr keeps the bare line. `~/.clauth/daemon.log`
-  is size-capped in place when a supervisor points stderr at it. The in-place trim is only sound for an APPEND-mode fd: use
-  launchd `StandardErrorPath` or systemd `StandardError=append:...`. A
-  non-append redirect (`file:`, a plain `>`) keeps its own offset, so the
-  next write after a trim leaves a sparse NUL hole and the size cap is
-  defeated. The daemon checks its own stderr at boot and warns loudly when it
-  is a non-append file, so a defeated cap shows up in the log instead of only
-  in this page.
-- **Usage-history samples**: the lease holder appends every live `/usage` reading
-  to `~/.clauth/profiles/<name>/usage_history.jsonl`, the series the burn rate and
-  burn-aware switching read. Headless counts: the daemon keeps it advancing with no
-  TUI open. Retention is 2 days, re-trimmed on a 6-hour cadence rather than only at
-  startup, so a long-lived daemon bounds the file without a restart.
-- **Single usage fetcher (`usage-fetch.lock` lease)**: every instance (the
-  daemon and each open TUI) runs the same refresher, but only the one holding
-  the `usage-fetch.lock` flock fetches usage, rotates tokens, and decides
-  switches. The rest hydrate from the shared disk caches instead of double-polling
-  the usage API, double-rotating the single-use refresh chain, or re-deciding
-  switches. The lease is first-come and held for the process lifetime; no
-  preemption, so the switch-decider never thrashes between processes; a waiter
-  takes it over within one tick of the holder exiting (flock auto-release). The
-  daemon normally boots first and holds it, but a TUI already fetching keeps the
-  lease until it closes, and the daemon then hydrates while still publishing
-  `status.json` every tick.
+- **Singleton**: one advisory lock (`~/.clauth/clauthd.lock`) held for the process lifetime, with the holder's pid written to an unlocked sidecar (`~/.clauth/clauthd.pid`) for `ps`-level diagnosis (informational: the flock, never the number, is what proves presence). The pid stays out of the lock file because Windows locks are mandatory, so a `--status` reader in another process couldn't read bytes held inside the daemon's exclusive lock. A second `clauth daemon` exits 0 by default (`already running (pid <n>)`), so a spawner that fires repeatedly can't pile up idle daemons (#57). `--standby` opts into the take-over behaviour: it parks and takes over the moment the holder exits, for a supervisor's instance queueing behind a manually run one under launchd `KeepAlive{SuccessfulExit=false}` (which never restarts a clean exit). That standby queue is **one deep**: a second flock (`clauthd-standby.lock`) holds the slot, any further instance exits. `--no-standby` is the default's explicit spelling, kept for callers already passing it. A dead holder's flock auto-releases, so a supervisor with restart-on-crash keeps exactly one scheduler alive without pidfile bookkeeping. The TUI header's `● daemon` dot reads this lock (presence) plus `status.json` freshness (green = fresh feed, amber = stalling, hidden = no daemon) to show whether one is running.
+- **Asking before spawning**: `clauth daemon --status` prints `running (pid <n>, feed fresh|stale[, standby waiting])` and exits 0 when a daemon is up. No daemon: exit 1, nothing on stdout. It creates nothing, so a menu-bar app or a wrapper script can gate its spawn on the exit code instead of starting a process to find out. A lock file it cannot test at all (no working `flock`, e.g. some NFS/CIFS mounts) is its own failure with the io error attached, never an exit 1 that reads as "none running" and sends a supervisor into a respawn loop. The header dot answers the same question by hiding instead, which is why the two read the lock through different paths. The default already exits the moment it loses the race, which suits the same callers. `--standby` is the one to keep out of a pure supervisor unit: the supervisor is the sole starter and wins the race alone, so a standby only earns its keep when a manual run and a unit coexist.
+- **Replacing for an upgrade**: `clauth daemon --replace` terminates the running daemon and takes over. It reads the holder's pid sidecar and confirms the pid is still a running `clauth daemon` by its argv, so another clauth subcommand sharing the binary name is never signalled. It SIGTERMs the holder and waits for the flock to auto-release on death; on a timeout it escalates to SIGKILL, then claims. A pid it can't confirm bails rather than signal blind.
+- **Probes take the lock they read**, briefly: both the header dot's `daemon_health` and `--status` try-lock a free file and release it. A starting daemon therefore re-tries a lost race (3 attempts, 100 ms apart) before it accepts that another instance is up. A real holder keeps its lock for life, so anything that clears on a retry was a reader.
+- **Watchdog**: a wedged tick can freeze the single-threaded loop. The cross-process state flock a tick may block on is capped at 25 s, so a flock-blocked tick times out and retries rather than hanging; if no tick completes in 30 s at all, the daemon `abort()`s for a clean supervisor restart, freeing the usage lease (below). A legit keychain switch sits inside both margins: on macOS it reads the Keychain item and writes it back, each of those killed at 10 s, and everything one flock hold spends in `security` capped at 20 s no matter how many reads and writes it makes.
+- **Log hygiene**: every daemon-visible stderr line carries an ISO-8601 UTC prefix, enabled only in daemon mode. An interactive terminal instead diverts its lines to `~/.clauth/clauth.log` so a background thread never paints over the TUI; a redirected or piped stderr keeps the bare line. `~/.clauth/daemon.log` is size-capped in place when a supervisor points stderr at it. The in-place trim is only sound for an APPEND-mode fd: use launchd `StandardErrorPath` or systemd `StandardError=append:...`. A non-append redirect (`file:`, a plain `>`) keeps its own offset, so the next write after a trim leaves a sparse NUL hole and the size cap is defeated. The daemon checks its own stderr at boot and warns loudly when it is a non-append file, so a defeated cap shows up in the log instead of only in this page.
+- **Usage-history samples**: the lease holder appends every live `/usage` reading to `~/.clauth/profiles/<name>/usage_history.jsonl`, the series the burn rate and burn-aware switching read. Headless counts: the daemon keeps it advancing with no TUI open. Retention is 2 days, re-trimmed on a 6-hour cadence rather than only at startup, so a long-lived daemon bounds the file without a restart.
+- **Single usage fetcher (`usage-fetch.lock` lease)**: every instance (the daemon and each open TUI) runs the same refresher, but only the one holding the `usage-fetch.lock` flock fetches usage, rotates tokens, and decides switches. The rest hydrate from the shared disk caches instead of double-polling the usage API, double-rotating the single-use refresh chain, or re-deciding switches. The lease is first-come and held for the process lifetime; no preemption, so the switch-decider never thrashes between processes; a waiter takes it over within one tick of the holder exiting (flock auto-release). The daemon normally boots first and holds it, but a TUI already fetching keeps the lease until it closes, and the daemon then hydrates while still publishing `status.json` every tick.
 
 ## `~/.clauth/status.json`
 
-Written each scheduler tick and immediately after a switch lands. Atomic
-(`tmp` + rename into place), `0600`. **Never carries a token, secret, or
-key**: names, tiers, percentages, timestamps only.
+Written each scheduler tick and immediately after a switch lands. Atomic (`tmp` + rename into place), `0600`. **Never carries a token, secret, or key**: names, tiers, percentages, timestamps only.
 
 ```json
 {
@@ -155,24 +77,13 @@ key**: names, tiers, percentages, timestamps only.
 
 ### Evolution rule (the load-bearing part)
 
-- **Writers**: additive only under the same `schema`: new fields may appear,
-  existing fields never change type/meaning. A breaking change bumps `schema`.
-- **Readers**: ignore unknown fields; default absent optional fields (absent
-  `auth_status` ⇒ `"ok"`); refuse only on `schema` greater than what they
-  know, showing "daemon newer than me" rather than garbage.
+- **Writers**: additive only under the same `schema`: new fields may appear, existing fields never change type/meaning. A breaking change bumps `schema`.
+- **Readers**: ignore unknown fields; default absent optional fields (absent `auth_status` ⇒ `"ok"`); refuse only on `schema` greater than what they know, showing "daemon newer than me" rather than garbage.
 
 ## `clauth status --json`
 
-Same schema, produced single-shot from the on-disk caches with no daemon and
-no network fetch: `pending_switch` is always `null`, `generated_at` is the
-print stamp, and freshness/next-refresh derive from each profile's usage-cache
-mtime. One code path builds both (`daemon::status_json::build_status`), so the
-key SHAPE cannot drift between the daemon feed and the CLI snapshot. Values can: the single-shot form derives `fetch_status` from cache mtimes, so a profile the live daemon shows as `Failed` or `RateLimited` reads as `Cached` here at the same instant. Poll the feed, not the CLI, when the fetch outcome matters.
+Same schema, produced single-shot from the on-disk caches with no daemon and no network fetch: `pending_switch` is always `null`, `generated_at` is the print stamp, and freshness/next-refresh derive from each profile's usage-cache mtime. One code path builds both (`daemon::status_json::build_status`), so the key SHAPE cannot drift between the daemon feed and the CLI snapshot. Values can: the single-shot form derives `fetch_status` from cache mtimes, so a profile the live daemon shows as `Failed` or `RateLimited` reads as `Cached` here at the same instant. Poll the feed, not the CLI, when the fetch outcome matters.
 
 `"AuthExpired"` is the one exception, exact on both paths. Single-shot it comes from a durable per-profile record written when a fetch died on a credential that cannot self-heal. That record applies only as long as the credential recorded with it still matches the one on disk, so a re-login retires it with no daemon and no timer involved. A profile the daemon has never fetched carries no record and reads `null`.
 
-`clauth status --json --all` (or its `--disabled` spelling, equivalent) is the
-one way to reveal disabled accounts in `profiles[]`; the running daemon's own
-published `~/.clauth/status.json` file always hides them (every daemon-side
-`build_status` call passes `include_disabled: false`), so a reader that needs
-the disabled roster must shell out to the single-shot form, never poll the feed file for it.
+`clauth status --json --all` (or its `--disabled` spelling, equivalent) is the one way to reveal disabled accounts in `profiles[]`; the running daemon's own published `~/.clauth/status.json` file always hides them (every daemon-side `build_status` call passes `include_disabled: false`), so a reader that needs the disabled roster must shell out to the single-shot form, never poll the feed file for it.

@@ -1,26 +1,18 @@
 # Security
 
-clauth keeps live Claude Code OAuth tokens on disk and replaces its own binary over
-the network. Both are worth scrutiny, so this doc spells out what it stores, what it
-talks to, what can touch your account, how releases get verified, and how to switch
-each thing off.
+clauth keeps live Claude Code OAuth tokens on disk and replaces its own binary over the network. Both are worth scrutiny, so this doc spells out what it stores, what it talks to, what can touch your account, how releases get verified, and how to switch each thing off.
 
 ## Reporting a vulnerability
 
-Report privately through GitHub: open the repo's **Security** tab and pick **Report a
-vulnerability**. Please don't file a public issue for anything exploitable. A
-description, the affected version, and repro steps are enough to get started.
+Report privately through GitHub: open the repo's **Security** tab and pick **Report a vulnerability**. Please don't file a public issue for anything exploitable. A description, the affected version, and repro steps are enough to get started.
 
 ## Supported versions
 
-Only the latest release. Binary installs stay current through the verified
-auto-updater below; `cargo` installs update with `cargo install clauth`.
+Only the latest release. Binary installs stay current through the verified auto-updater below; `cargo` installs update with `cargo install clauth`.
 
 ## Data at rest
 
-Per-profile state lives under `~/.clauth/`. On Unix the whole tree is owner-only: every
-clauth-owned file is `0600`, every directory `0700`. No exceptions list to drift out of
-date. The one copy that lives elsewhere is the macOS Keychain item below.
+Per-profile state lives under `~/.clauth/`. On Unix the whole tree is owner-only: every clauth-owned file is `0600`, every directory `0700`. No exceptions list to drift out of date. The one copy that lives elsewhere is the macOS Keychain item below.
 
 | Path | Contents | Unix mode |
 |------|----------|-----------|
@@ -35,33 +27,17 @@ date. The one copy that lives elsewhere is the macOS Keychain item below.
 | `~/.clauth/live_sessions/<sid>.json`, `~/.clauth/live_bare/<pid>` | liveness markers for running sessions: pid, profile name, working directory, flags. No credentials | file `0600`, dir `0700` |
 | usage and price caches, session history, logs, lock files (`~/.clauth/`) | last-known usage, third-party state, burn samples, event log, advisory locks | file `0600`, dir `0700` |
 
-On macOS a second copy of the active login lives outside this tree, in the login
-Keychain, because that is where Claude Code reads it from:
+On macOS a second copy of the active login lives outside this tree, in the login Keychain, because that is where Claude Code reads it from:
 
 | Item | Contents | Written by |
 |------|----------|------------|
 | generic password `Claude Code-credentials`, account `$USER` | the OAuth pair for whichever profile is linked | `/usr/bin/security`, one item per `CLAUDE_CONFIG_DIR` |
 
-clauth writes and clears that item; it never reads it back during normal
-operation. The command line goes to `security -i` over stdin rather than argv,
-so the token never appears in the process table. Access is whatever the login
-Keychain grants, not `0600`.
+clauth writes and clears that item; it never reads it back during normal operation. The command line goes to `security -i` over stdin rather than argv, so the token never appears in the process table. Access is whatever the login Keychain grants, not `0600`.
 
-- Writes are atomic. The temp file gets mode `0600` at creation, not a chmod
-  afterward, so a loose umask never leaves a readable window; it's fsynced, then
-  renamed into place. A rotation caught mid-write lands as `credentials.json.pending`
-  and is promoted only once it's durable.
-- Modes are enforced on Unix two ways. Each writer creates its file owner-only. Every
-  launch re-tightens the whole tree, so a store from an older build (or a loose umask)
-  is repaired the next time clauth runs. The repair never follows a symlink out of the
-  tree, so it can't touch a file clauth doesn't own. On Windows, access falls to the
-  default user-profile ACLs, which clauth does not loosen.
-- A switch rewrites three files: `~/.claude/.credentials.json`, parts of
-  `~/.claude/settings.json` (the `env` block, the top-level `model` key, `apiKeyHelper`),
-  and `~/.claude.json`, where the stale account-identity block is dropped so Claude Code
-  re-derives identity from the new token. The rest of `~/.claude/` is left alone. On
-  macOS it writes the Keychain item above as well, because Claude Code reads the
-  Keychain before the file there.
+- Writes are atomic. The temp file gets mode `0600` at creation, not a chmod afterward, so a loose umask never leaves a readable window; it's fsynced, then renamed into place. A rotation caught mid-write lands as `credentials.json.pending` and is promoted only once it's durable.
+- Modes are enforced on Unix two ways. Each writer creates its file owner-only. Every launch re-tightens the whole tree, so a store from an older build (or a loose umask) is repaired the next time clauth runs. The repair never follows a symlink out of the tree, so it can't touch a file clauth doesn't own. On Windows, access falls to the default user-profile ACLs, which clauth does not loosen.
+- A switch rewrites three files: `~/.claude/.credentials.json`, parts of `~/.claude/settings.json` (the `env` block, the top-level `model` key, `apiKeyHelper`), and `~/.claude.json`, where the stale account-identity block is dropped so Claude Code re-derives identity from the new token. The rest of `~/.claude/` is left alone. On macOS it writes the Keychain item above as well, because Claude Code reads the Keychain before the file there.
 
 ## Network activity
 
@@ -82,12 +58,7 @@ Every request clauth makes, and what rides along with it:
 | `api.z.ai/api/monitor/usage/...` | only for profiles whose base URL is Z.ai | that provider's API key |
 | a custom base URL you set | requests against an API-endpoint profile, plus a best-effort usage probe against that same origin | whatever you configured |
 
-Your stored access tokens go to `api.anthropic.com` and nowhere else. Your refresh token
-goes to `platform.claude.com`, which is the token endpoint Claude Code's own client
-refreshes against: every pair is minted there, whether from a refresh or from the
-interactive `clauth login`, which follows Claude Code's OAuth flow by opening `claude.com`
-in your browser to authorize and posting the one-time code back to `platform.claude.com`.
-clauth runs no telemetry or analytics; it talks to the hosts above and no others.
+Your stored access tokens go to `api.anthropic.com` and nowhere else. Your refresh token goes to `platform.claude.com`, which is the token endpoint Claude Code's own client refreshes against: every pair is minted there, whether from a refresh or from the interactive `clauth login`, which follows Claude Code's OAuth flow by opening `claude.com` in your browser to authorize and posting the one-time code back to `platform.claude.com`. clauth runs no telemetry or analytics; it talks to the hosts above and no others.
 
 ## What acts on your behalf
 
@@ -95,107 +66,46 @@ A few code paths can change account state. All are narrow and all are documented
 
 Background, automatic:
 
-- **Auto-start kick.** A real, billed `/v1/messages` call (`max_tokens = 1`, a
-  fraction of a cent) under your own OAuth token, with the Claude Code client
-  identity. It's the same request Claude Code makes on startup, and it exists to arm
-  the 5-hour usage window. Off by default, OAuth profiles only; enable it per profile
-  on the Setup tab or with `auto_start = true`.
-- **Auto-switch.** When the fallback chain is armed, clauth relinks the global
-  credentials to another account on its own once the active one runs out of
-  headroom, from the TUI or from `clauth daemon`. It sends no inference itself.
-  The chain is empty by default, and an account outside it is never switched to.
-- **Pay-as-you-go spend.** With extra usage enabled, an auto-switch can land on
-  an account that bills real money. Three things must all be true first: the
-  chain-wide `allow extra usage` toggle is on, that account carries a `max spend`
-  ceiling above $0, and billing is enabled on the account at Anthropic. All three
-  are off or zero by default, and an account with subscription quota left always
-  wins over one that costs money. Once the ceiling is spent, clauth stops using
-  that account.
-- **Token refresh.** Anthropic refresh tokens are single-use, so refreshing spends
-  the stored token for a fresh pair. By default it fires ahead of expiry, early enough
-  that a running `claude` never reaches its own refresh threshold. Set the Config tab's
-  `rotation` row to `lazy` to refresh only after a request is rejected. Pressing `t`
-  forces a rotation either way.
+- **Auto-start kick.** A real, billed `/v1/messages` call (`max_tokens = 1`, a fraction of a cent) under your own OAuth token, with the Claude Code client identity. It's the same request Claude Code makes on startup, and it exists to arm the 5-hour usage window. Off by default, OAuth profiles only; enable it per profile on the Setup tab or with `auto_start = true`.
+- **Auto-switch.** When the fallback chain is armed, clauth relinks the global credentials to another account on its own once the active one runs out of headroom, from the TUI or from `clauth daemon`. It sends no inference itself. The chain is empty by default, and an account outside it is never switched to.
+- **Pay-as-you-go spend.** With extra usage enabled, an auto-switch can land on an account that bills real money. Three things must all be true first: the chain-wide `allow extra usage` toggle is on, that account carries a `max spend` ceiling above $0, and billing is enabled on the account at Anthropic. All three are off or zero by default, and an account with subscription quota left always wins over one that costs money. Once the ceiling is spent, clauth stops using that account.
+- **Token refresh.** Anthropic refresh tokens are single-use, so refreshing spends the stored token for a fresh pair. By default it fires ahead of expiry, early enough that a running `claude` never reaches its own refresh threshold. Set the Config tab's `rotation` row to `lazy` to refresh only after a request is rejected. Pressing `t` forces a rotation either way.
 
 User-invoked, only when you run the command:
 
-- **Interactive login (`clauth login <profile>`).** Opens your browser to Claude's
-  OAuth authorize page and binds a loopback listener on `127.0.0.1:<random port>` to
-  catch the redirect, then exchanges the returned code for a fresh token pair written
-  into the new profile. It reproduces Claude Code's own PKCE flow, touches no other
-  account, and never opens a usage window. On macOS this is why `clauth login` works at
-  all: Claude Code's own `/login` under a custom config dir writes only a per-config-dir
-  Keychain item, never the profile's credentials file.
-- **`clauth start` / `clauth resume`.** Spawns `claude` against the profile you named,
-  so everything that session sends bills to that account. clauth forwards your args and
-  sends nothing of its own.
+- **Interactive login (`clauth login <profile>`).** Opens your browser to Claude's OAuth authorize page and binds a loopback listener on `127.0.0.1:<random port>` to catch the redirect, then exchanges the returned code for a fresh token pair written into the new profile. It reproduces Claude Code's own PKCE flow, touches no other account, and never opens a usage window. On macOS this is why `clauth login` works at all: Claude Code's own `/login` under a custom config dir writes only a per-config-dir Keychain item, never the profile's credentials file.
+- **`clauth start` / `clauth resume`.** Spawns `claude` against the profile you named, so everything that session sends bills to that account. clauth forwards your args and sends nothing of its own.
 
-- **Rolling session token (`clauth rolling-token <profile>`).** Points the
-  profile's `session-token.json` at that profile's own OAuth usage chain: the
-  daemon re-stamps the file with the chain's current access token, minus the
-  refresh token, so sessions still hold nothing rotatable. It also **widens what
-  that credential can reach**. A `claude setup-token` mint carries two scopes,
-  `user:inference` and `user:sessions:claude_code`. The rolling bearer carries
-  the chain's full granted set. The browser login requests six scopes
-  (`org:create_api_key`, `user:profile`, `user:inference`,
-  `user:sessions:claude_code`, `user:mcp_servers`, `user:file_upload`); every
-  real Pro/Max login observed so far grants the five without
-  `org:create_api_key`, and the bearer carries whatever the account's grant
-  actually was. Anything that can read the sidecar, or the live
-  `~/.claude/.credentials.json` a switch installs it into, can use every one of
-  those scopes until the token expires — which is hours rather than the mint's
-  year. The command prints the scope list when it arms, so the widening is
-  stated where the decision is made. `clauth static-token <profile>` restores
-  the narrower mint; a terminally dead chain does the same automatically.
+- **Rolling session token (`clauth rolling-token <profile>`).** Points the profile's `session-token.json` at that profile's own OAuth usage chain: the daemon re-stamps the file with the chain's current access token, minus the refresh token, so sessions still hold nothing rotatable. It also **widens what that credential can reach**. A `claude setup-token` mint carries two scopes, `user:inference` and `user:sessions:claude_code`. The rolling bearer carries the chain's full granted set. The browser login requests six scopes (`org:create_api_key`, `user:profile`, `user:inference`, `user:sessions:claude_code`, `user:mcp_servers`, `user:file_upload`); every real Pro/Max login observed so far grants the five without `org:create_api_key`, and the bearer carries whatever the account's grant actually was. Anything that can read the sidecar, or the live `~/.claude/.credentials.json` a switch installs it into, can use every one of those scopes until the token expires — which is hours rather than the mint's year. The command prints the scope list when it arms, so the widening is stated where the decision is made. `clauth static-token <profile>` restores the narrower mint; a terminally dead chain does the same automatically.
 
 Agent-invoked, only when the Claude Code plugin is installed:
 
-- **`delegate` (MCP tool).** Sends a real, billed `/v1/messages` request on a target
-  profile under its own OAuth token, opening a full 5-hour usage window on that
-  account. It fires only when an agent calls the tool, and is hard-capped at
-  recursion depth 1 (a delegated session cannot call `delegate` again).
-- **`switch` (MCP tool).** Relinks the global `~/.claude` credentials to another
-  profile, the same write `clauth switch` performs. It changes which account the
-  global session refreshes onto; it sends no inference itself.
+- **`delegate` (MCP tool).** Sends a real, billed `/v1/messages` request on a target profile under its own OAuth token, opening a full 5-hour usage window on that account. It fires only when an agent calls the tool, and is hard-capped at recursion depth 1 (a delegated session cannot call `delegate` again).
+- **`switch` (MCP tool).** Relinks the global `~/.claude` credentials to another profile, the same write `clauth switch` performs. It changes which account the global session refreshes onto; it sends no inference itself.
 
 Nothing else sends inference or writes to your account.
 
 ## Auto-update verification
 
-Binary installs check for a newer release in the background on launch. Every step
-fails closed, so if any of them errors the update is skipped and the running binary
-stays put:
+Binary installs check for a newer release in the background on launch. Every step fails closed, so if any of them errors the update is skipped and the running binary stays put:
 
 1. Ask the GitHub releases API for the latest tag; stop if it isn't newer.
 2. Download `sha256sums.txt`. A fetch error stops here (no integrity, no update).
-3. Download `sha256sums.txt.minisig` and check it against a minisign public key
-   pinned at compile time. A missing or bad signature stops the update. The key is a
-   constant, so nothing at runtime can swap it out.
-4. Download the platform asset (10 MB ceiling) and check its SHA-256 against the
-   now-trusted sums file. A mismatch stops the update.
-5. Write to a temp file, fsync, then self-replace atomically. The new binary takes
-   over on the next launch.
+3. Download `sha256sums.txt.minisig` and check it against a minisign public key pinned at compile time. A missing or bad signature stops the update. The key is a constant, so nothing at runtime can swap it out.
+4. Download the platform asset (10 MB ceiling) and check its SHA-256 against the now-trusted sums file. A mismatch stops the update.
+5. Write to a temp file, fsync, then self-replace atomically. The new binary takes over on the next launch.
 
-`cargo` installs (binary under `~/.cargo/bin`) are told an update exists but never
-replaced. `CLAUTH_NO_UPDATE=1` turns the whole thing off.
+`cargo` installs (binary under `~/.cargo/bin`) are told an update exists but never replaced. `CLAUTH_NO_UPDATE=1` turns the whole thing off.
 
-Releases are signed in CI with a passwordless minisign key kept as a GitHub Actions
-secret; the signing step writes the key to disk and deletes it on exit. The public
-half is pinned in `src/update.rs`.
+Releases are signed in CI with a passwordless minisign key kept as a GitHub Actions secret; the signing step writes the key to disk and deletes it on exit. The public half is pinned in `src/update.rs`.
 
 ## Install-script verification
 
-`install.sh` (the `curl | bash` path) uses `cargo` when it's available. When it pulls
-a prebuilt binary instead, it downloads `sha256sums.txt` from the same release and
-checks the binary against it before installing, failing closed on a download or
-checksum error. It writes nothing to your shell profile and only prints a `PATH` hint
-when the install dir isn't already on it. If piping a script to a shell isn't your
-thing, `cargo install clauth` does the same job.
+`install.sh` (the `curl | bash` path) uses `cargo` when it's available. When it pulls a prebuilt binary instead, it downloads `sha256sums.txt` from the same release and checks the binary against it before installing, failing closed on a download or checksum error. It writes nothing to your shell profile and only prints a `PATH` hint when the install dir isn't already on it. If piping a script to a shell isn't your thing, `cargo install clauth` does the same job.
 
 ## Process execution
 
-Every command below goes through an argument vector, never a shell, so there is
-no shell-injection path.
+Every command below goes through an argument vector, never a shell, so there is no shell-injection path.
 
 | Command | When |
 |---------|------|
@@ -209,20 +119,13 @@ clauth runs no other external commands.
 
 ## First-run shell completions
 
-On the first TUI launch clauth offers to install shell completions. For bash and zsh
-it asks before adding a `source` line to your rc file (`[Y/n]`, interactive sessions
-only); fish gets its own completions dir. The answer is saved to
-`~/.clauth/.completions_installed` so the prompt doesn't come back.
-`CLAUTH_NO_COMPLETIONS=1` skips it.
+On the first TUI launch clauth offers to install shell completions. For bash and zsh it asks before adding a `source` line to your rc file (`[Y/n]`, interactive sessions only); fish gets its own completions dir. The answer is saved to `~/.clauth/.completions_installed` so the prompt doesn't come back. `CLAUTH_NO_COMPLETIONS=1` skips it.
 
 ## Build and supply chain
 
-- `unsafe` is denied across the crate (`unsafe_code = "deny"`,
-  `unsafe_op_in_unsafe_fn = "deny"`).
-- CI runs `cargo fmt --check`, `cargo clippy --all-targets --all-features -D warnings`,
-  and the test suite (`--all-features`) on Linux, macOS, Windows for every push and PR.
-- `cargo-deny` (advisories denied by default, license allowlist, sources locked to
-  crates.io, `openssl` banned in favor of rustls) and `cargo-audit` both run in CI.
+- `unsafe` is denied across the crate (`unsafe_code = "deny"`, `unsafe_op_in_unsafe_fn = "deny"`).
+- CI runs `cargo fmt --check`, `cargo clippy --all-targets --all-features -D warnings`, and the test suite (`--all-features`) on Linux, macOS, Windows for every push and PR.
+- `cargo-deny` (advisories denied by default, license allowlist, sources locked to crates.io, `openssl` banned in favor of rustls) and `cargo-audit` both run in CI.
 - `Cargo.lock` is committed and dependency versions are pinned.
 
 ## Switching behaviors off

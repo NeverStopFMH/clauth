@@ -2298,7 +2298,19 @@ fn launch_background_delegate(
 ) {
     let job_id_task = job_id;
     let profile_task = profile;
+    // Registered so a test's `HomeSandbox::drop` can block on this task BEFORE
+    // it clears the home override: `spawn_blocking` detaches with no handle
+    // kept below, so nothing else here is joinable by a sandbox teardown. A
+    // task still running when the override clears resolves the operator's
+    // REAL `$HOME` (filed 2026-08-14, F1).
+    #[cfg(test)]
+    let done_tx = crate::testutil::register_background_task();
     tokio::task::spawn_blocking(move || {
+        // Test-only: block here if a test armed the start gate, forcing this
+        // task to still be in flight at the moment its `HomeSandbox` drops
+        // instead of racing tokio's blocking-pool scheduler for that timing.
+        #[cfg(test)]
+        detach_test_gate();
         // Decrements the pane's in-flight count on every exit path, panic
         // included; the drop reports `idle` once nothing is left in flight.
         // Created first so no early return can skip it.
@@ -2348,7 +2360,53 @@ fn launch_background_delegate(
             }),
         };
         let _ = jobs::write_done(&job_id_task, &profile_task, started_at, envelope);
+        // Dropped explicitly so the completion signal below is genuinely this
+        // task's last action. A guard bound in the closure drops in reverse
+        // declaration order, i.e. AFTER the send, which would let a test's
+        // teardown clear the home override while this one still runs. Harmless
+        // for THIS guard, whose report shells out and reads the process env
+        // rather than clauth's override — but the registry's contract is that
+        // nothing touching `$HOME` outlives the send, and a guard that silently
+        // sits outside it is how that contract goes false later.
+        drop(_pane_end);
+        #[cfg(test)]
+        let _ = done_tx.send(());
     });
+}
+
+/// Test-only start gate for the NEXT detached background task: once armed,
+/// blocks that task at the top of its closure until the test releases it.
+/// The only way to prove `HomeSandbox` teardown ordering without racing
+/// tokio's blocking-pool scheduler — an unforced test is green by luck, since
+/// the task usually hasn't even started by the time a sandbox drops. Never
+/// compiled into the binary.
+#[cfg(test)]
+static DETACH_START_GATE: std::sync::Mutex<Option<std::sync::mpsc::Receiver<()>>> =
+    std::sync::Mutex::new(None);
+
+/// Arm the gate; returns the sender the test releases it with. A single
+/// global slot shared by every test, so callers must hold
+/// `profile::HOME_TEST_LOCK` (via a live `HomeSandbox`) for as long as it
+/// stays armed — otherwise an unrelated test's own background task could be
+/// the one that gets gated.
+#[cfg(test)]
+fn arm_detach_gate() -> std::sync::mpsc::Sender<()> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    *DETACH_START_GATE.lock().unwrap_or_else(|e| e.into_inner()) = Some(rx);
+    tx
+}
+
+/// Block if a test armed [`arm_detach_gate`]; a no-op otherwise (production,
+/// or a test that never arms it).
+#[cfg(test)]
+fn detach_test_gate() {
+    let armed = DETACH_START_GATE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .take();
+    if let Some(rx) = armed {
+        let _ = rx.recv();
+    }
 }
 
 /// Reduce `claude`'s captured stdout to its single terminal `type:"result"`
@@ -2664,3 +2722,7 @@ mod herdr_report_tests;
 #[cfg(test)]
 #[path = "../../tests/inline/mcp_digest.rs"]
 mod digest_tests;
+
+#[cfg(test)]
+#[path = "../../tests/inline/mcp_background_sandbox.rs"]
+mod background_sandbox_tests;

@@ -46,14 +46,58 @@ impl HomeSandbox {
 impl Drop for HomeSandbox {
     fn drop(&mut self) {
         // Join BEFORE clearing the override, not after and not per-test. A
-        // detached `spawn_worker` still running when `HOME_OVERRIDE` clears
-        // resolves the operator's REAL `$HOME` and takes real locks under
-        // `~/.clauth` (`RotationGuard::acquire` alone does `mkdir_700` + a
-        // blocking flock). Doing it here rather than asking each test to call
-        // `join_test_workers` covers the tests that never thought about it —
-        // which is every test that will ever be added.
+        // detached worker still running when `HOME_OVERRIDE` clears resolves
+        // the operator's REAL `$HOME` and takes real locks under `~/.clauth`
+        // (`RotationGuard::acquire` alone does `mkdir_700` + a blocking
+        // flock). Doing it here rather than asking each test to call the join
+        // fns covers the tests that never thought about it — which is every
+        // test that will ever be added. Two registries: the TUI's own
+        // `spawn_worker` handles (joinable OS threads) and
+        // [`join_background_tasks`] for detach mechanisms that hand back no
+        // joinable handle at all (e.g. `tokio::task::spawn_blocking`).
         crate::tui::join_test_workers();
+        join_background_tasks();
         crate::profile::clear_home_override();
+    }
+}
+
+/// Completion signals for detached background tasks that have no joinable
+/// handle of their own — e.g. the MCP background delegate, which detaches via
+/// `tokio::task::spawn_blocking` and drops the returned task handle
+/// immediately (see `mcp::launch_background_delegate`). Hoisted here rather
+/// than living beside `tui::TEST_WORKERS` because a second subsystem now
+/// needs the same join: this is the shared test-helper home, not
+/// TUI-specific. Never compiled into the binary.
+#[cfg(test)]
+static BACKGROUND_TASK_DONE: std::sync::Mutex<Vec<std::sync::mpsc::Receiver<()>>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// Register a detached task's completion receiver so [`HomeSandbox::drop`]
+/// can block on it before it clears the home override. The returned sender is
+/// the task's contract: send on it as the LAST action, after every
+/// `$HOME`-touching step (config load, disk write) is done. A guard bound
+/// inside the task drops in reverse declaration order and therefore lands
+/// AFTER the send, so any guard whose `Drop` reaches `$HOME` has to be dropped
+/// explicitly before it.
+#[cfg(test)]
+pub(crate) fn register_background_task() -> std::sync::mpsc::Sender<()> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    if let Ok(mut done) = BACKGROUND_TASK_DONE.lock() {
+        done.push(rx);
+    }
+    tx
+}
+
+/// Block until every task registered via [`register_background_task`] has
+/// signaled completion.
+#[cfg(test)]
+fn join_background_tasks() {
+    let pending: Vec<_> = BACKGROUND_TASK_DONE
+        .lock()
+        .map(|mut d| std::mem::take(&mut *d))
+        .unwrap_or_default();
+    for rx in pending {
+        let _ = rx.recv();
     }
 }
 

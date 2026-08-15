@@ -24,7 +24,7 @@ Under `~/.clauth/`, owner-only on Unix. Tokens go to Anthropic and nowhere else.
 `clauth login <name>` opens a browser, runs Claude Code's OAuth flow, and writes the tokens into a new profile. The session you are in is untouched.
 
 **Is there an MCP server for switching accounts from inside a chat?**
-Yes. Install the plugin, then a live session can call `list_profiles`, `which`, `switch`, or `delegate` a whole prompt to another account. [Claude Code plugin](Claude-Code-Plugin).
+Yes. Install the plugin, then a live session can call `profiles`, `switch_profile`, or `delegate` a whole prompt to another account. [Claude Code plugin](Claude-Code-Plugin).
 
 **How do I stop clauth updating itself?**
 `CLAUTH_NO_UPDATE=1`. A cargo install never self-replaces anyway.

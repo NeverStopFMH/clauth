@@ -129,12 +129,10 @@ clauth ships a plugin that exposes your profiles to a live Claude Code session v
 
 | Tool | What it does | Quota |
 |------|--------------|-------|
-| `list_profiles` | every profile with cached 5h/7d usage, provider, tier, live-session flag, observed throughput, keyless flag | zero (disk cache) |
-| `which` | which profile owns the current session | zero (filesystem) |
-| `switch` | relink the global active profile | zero |
+| `profiles` | every account with cached 5h/7d usage, provider, tier, live-session flag, observed throughput, keyless flag; `scope: "session"` names the account this session runs on | zero (disk cache) |
+| `switch_profile` | relink the global active profile; the reply says what it does to this session | zero |
 | `delegate` | hand a headless prompt to another account and return the answer (or a `job_id`) | **real usage window on the target account** |
-| `delegate_result` | fetch a backgrounded delegate's result | zero (filesystem) |
-| `watch` | report what moved in clauth's state (active profile, its usage cache, the credentials file), waiting up to `wait_secs` for it | zero (filesystem) |
+| `monitor` | check, collect or wait on backgrounded delegates' results, or wait on clauth's state (active profile, its usage cache, the credentials file) | zero (filesystem) |
 
 `delegate` fields, kill and resume rules, the manual `mcpServers` entry: [Claude Code plugin](https://github.com/uwuclxdy/clauth/wiki/Claude-Code-Plugin).
 
@@ -166,7 +164,7 @@ Yes. `clauth start <profile>` launches `claude` in an isolated `CLAUDE_CONFIG_DI
 Yes: put accounts in the fallback chain and clauth switches to the next member with headroom the moment the active one crosses its threshold. It runs in the TUI or headless via `clauth daemon`.
 
 **Is there a Claude Code MCP server / plugin to switch accounts from inside a chat?**
-Yes. clauth ships a plugin that runs as an MCP server (`clauth mcp`), so a live session can `list_profiles`, `which`, `switch`, or `delegate` a headless prompt to another account without leaving the chat.
+Yes. clauth ships a plugin that runs as an MCP server (`clauth mcp`), so a live session can list accounts, `switch_profile`, or `delegate` a headless prompt to another account without leaving the chat.
 
 **How do I monitor Claude Code usage and rate limits?**
 The Overview tab shows color-coded 5h (and 7-day) bars per account with reset times; the Usage tab breaks down every rate-limit window the API reports; the Tokens tab adds a global token dashboard with API-equivalent cost.

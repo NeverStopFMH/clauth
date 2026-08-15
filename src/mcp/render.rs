@@ -11,7 +11,7 @@ use crate::which::SessionAuth;
 
 /// Per-profile snapshot fed to [`instructions_block`]: stable identity only (name,
 /// provider, tier, base url). Volatile usage figures rot within a turn, so they are
-/// served fresh per call by `list_profiles`, never baked into the boot-time block.
+/// served fresh per call by `profiles`, never baked into the boot-time block.
 pub(crate) struct ProfileSnapshot {
     pub(crate) name: String,
     pub(crate) active: bool,
@@ -40,7 +40,7 @@ pub(crate) enum RosterRank {
 }
 
 /// Host (and port) of a base url. Every profile of one provider carries the same
-/// endpoint path, so both the roster and `list_profiles` print the identifying
+/// endpoint path, so both the roster and `profiles` print the identifying
 /// half only. Shared so the two can never disagree on what a profile's endpoint
 /// is called.
 pub(super) fn base_url_host(url: &str) -> &str {
@@ -180,27 +180,37 @@ pub(crate) fn third_party_headline(s: &ThirdPartyStats) -> String {
     }
 }
 
-/// What a `switch` does to *this* session, keyed on how it reads its credentials.
-/// A global session reads the exact file `switch` repoints; an isolated session
-/// (a `clauth start` runtime or a custom `CLAUDE_CONFIG_DIR`) reads its own, so a
-/// switch can't disturb it. Pure mapping — the caller resolves the [`SessionAuth`].
+/// What a `switch_profile` does to *this* session, keyed on how it reads its
+/// credentials. A global session reads the exact file `switch_profile`
+/// repoints; an isolated session (a `clauth start` runtime or a custom
+/// `CLAUDE_CONFIG_DIR`) reads its own, so a switch can't disturb it. The
+/// subject is the lead-in [`switch_effect_note`] adds — a client that shows
+/// tool names only never sees a bare `switch`. Pure mapping — the caller
+/// resolves the [`SessionAuth`].
 pub(crate) fn switch_effect(auth: &SessionAuth) -> String {
     match auth {
-        SessionAuth::Global => "`switch` repoints the global `~/.claude` credentials THIS \
+        SessionAuth::Global => "repoints the global `~/.claude` credentials THIS \
 session reads; Claude Code reloads them on its next token refresh, so this session would \
 start acting as the switched profile mid-task. To use another account \
 without disturbing this one, use the `delegate` tool."
             .to_string(),
         SessionAuth::IsolatedRuntime(name) => format!(
-            "`switch` repoints the global `~/.claude` credentials, but THIS session runs in an \
+            "repoints the global `~/.claude` credentials, but THIS session runs in an \
 isolated `clauth start` runtime pinned to `{name}` and is unaffected. Only a later session on \
 the global credentials adopts the change."
         ),
-        SessionAuth::IsolatedCustom => "`switch` repoints the global `~/.claude` credentials, but \
+        SessionAuth::IsolatedCustom => "repoints the global `~/.claude` credentials, but \
 THIS session uses a custom `CLAUDE_CONFIG_DIR` and reads its own credentials, so it is \
 unaffected. Only a later session on the global credentials adopts the change."
             .to_string(),
     }
+}
+
+/// [`switch_effect`] with its lead, in the exact shape both carriers hold it:
+/// the init `instructions` block and the `switch_profile` / session-scope
+/// replies (placement rule 3: one renderer, two carriers, no drift).
+pub(crate) fn switch_effect_note(auth: &SessionAuth) -> String {
+    format!("switch_profile & this session: {}", switch_effect(auth))
 }
 
 /// How this session's runtime tree maps onto the real global one, for the only
@@ -242,14 +252,14 @@ lands via the watchdog's newer-mtime mirror, at its sync cadence."
 }
 
 /// Init-time `instructions` block: identity intro, a one-line tool router, a
-/// session-aware `switch` note, the runtime-path note that tier earns, the
-/// `delegate` cost model, then the grouped roster. This block is the only clauth
-/// text a session is guaranteed to hold: tool descriptions are deferred in some
-/// harnesses and unloaded until searched for, so the router line stays even
-/// though every tool carries its own description. Per-tool mechanics do NOT stay
-/// — they live in that tool's description, which is loaded by the time anyone
-/// can call it. No usage percentage or reset timer is baked in; those rot within
-/// a turn, so they live in `list_profiles`.
+/// session-aware `switch_profile` note, the runtime-path note that tier earns,
+/// then the grouped roster. This block is the only clauth text a session is
+/// guaranteed to hold: tool descriptions are deferred in some harnesses and
+/// unloaded until searched for, so the router line stays even though every tool
+/// carries its own description. Per-tool mechanics do NOT stay — they live in
+/// that tool's description, which is loaded by the time anyone can call it, and
+/// so does the `delegate` cost model. No usage percentage or reset timer is
+/// baked in; those rot within a turn, so they live in `profiles`.
 pub(crate) fn instructions_block(profiles: &[ProfileSnapshot], auth: &SessionAuth) -> String {
     let mut out = String::new();
     out.push_str(
@@ -257,23 +267,20 @@ pub(crate) fn instructions_block(profiles: &[ProfileSnapshot], auth: &SessionAut
 credential set / subscription. Use its tools to compare usage headroom across accounts, relink \
 the active account, or delegate a task to another account without spending this session's \
 window.\n\n\
-Tools: `list_profiles` (roster + cached usage, zero quota), `which` (this session's own profile), \
-`switch` (relink the global active profile), `delegate` (run a task on another account), \
-`delegate_result` (collect a backgrounded delegate), `watch` (long-poll until clauth's state \
-moves; zero quota).\n\n\
-switch & this session: ",
+Tools: `profiles` (accounts + cached usage, zero quota; `scope:\"session\"` for this session's \
+own), `switch_profile` (relink the global active account), `delegate` (run a task on another \
+account; the only tool that spends), `monitor` (check, collect or stop a backgrounded delegate, \
+or wait on clauth's state).\n\n\
+",
     );
-    out.push_str(&switch_effect(auth));
+    out.push_str(&switch_effect_note(auth));
     if let Some(note) = runtime_paths_note(auth) {
         out.push_str("\n\n");
         out.push_str(&note);
     }
     out.push_str(
-        "\n\nCost: a `delegate` to a profile with no endpoint host burns that subscription's \
-rate-limited window; to DeepSeek or Z.ai it bills real money; to Alibaba Model Studio it draws \
-down a prepaid plan quota; to a loopback or LAN host it is free. Call `list_profiles` for live \
-windows and third-party balances.\n\n\
-Profiles, most headroom first (session-start snapshot; call `list_profiles` for live usage and \
+        "\n\n\
+Profiles, most headroom first (session-start snapshot; call `profiles` for live usage and \
 anything added since):\n",
     );
     out.push_str(&roster_lines(profiles));
@@ -301,10 +308,10 @@ fn pct_clause(v: Option<f64>) -> String {
 }
 
 /// The folded-in `live_usage` object as a sentence clause. `lead` is the noun
-/// for the profile it names: `active profile` for `which`/`switch`, `target` for
-/// `delegate`. A null profile name reads `none` (no active profile is
-/// configured — a state clauth knows, not a missing figure); a null window
-/// reads `unknown`.
+/// for the profile it names: `active profile` for the session-scope roster and
+/// `switch_profile`, `target` for `delegate`. A null profile name reads `none`
+/// (no active profile is configured — a state clauth knows, not a missing
+/// figure); a null window reads `unknown`.
 pub(crate) fn live_usage_prose(lu: &Value, lead: &str) -> String {
     let name = lu
         .get("profile")
@@ -363,18 +370,20 @@ pub(crate) fn digest_prose(d: &Value) -> String {
     format!("since your last call: {}", parts.join("; "))
 }
 
-/// The `watch` tool's reply: the change it caught, the baseline it armed, or
-/// the wait that found nothing.
+/// The state-waiting mode's reply: the change it caught, the baseline it
+/// armed, or the wait that found nothing. Self-labels `monitor` — the reply
+/// names the tool that can be called again, and a label naming a tool the
+/// handshake does not list sends the model searching for one.
 pub(crate) fn watch_prose(p: &Value) -> String {
     match p.get("status").and_then(Value::as_str) {
-        Some("changed") => format!("watch: {}", digest_prose(&p["since_your_last_call"])),
+        Some("changed") => format!("monitor: {}", digest_prose(&p["since_your_last_call"])),
         Some("armed") => {
-            "watch armed: baseline set on this first digest call, nothing to compare against yet"
+            "monitor armed: baseline set on this first digest call, nothing to compare against yet"
                 .to_string()
         }
         _ => {
             let waited = p.get("waited_secs").and_then(Value::as_u64).unwrap_or(0);
-            format!("watch: no change after {waited}s")
+            format!("monitor: no change after {waited}s")
         }
     }
 }
@@ -503,7 +512,11 @@ fn profile_line(row: &Value) -> String {
     out
 }
 
-/// Prose for `list_profiles`: its error envelope, or one line per profile.
+/// Prose for `profiles`. The all-scope roster is one `profile_line` per
+/// profile; the session-scope arm is the folded-in former `which`: the one row
+/// THIS session resolves to, rendered through the same `profile_line` (so it
+/// inherits the roster's own guards), then how it resolved, then live usage and
+/// the digest.
 pub(crate) fn list_profiles_prose(p: &Value) -> String {
     if p.get("ok").and_then(Value::as_bool) == Some(false) {
         return format!(
@@ -514,43 +527,36 @@ pub(crate) fn list_profiles_prose(p: &Value) -> String {
     let Some(rows) = p.get("profiles").and_then(Value::as_array) else {
         return "unknown".to_string();
     };
+    if p.get("scope").and_then(Value::as_str) == Some("session") {
+        // One row at most, with how it resolved, then the folded live usage
+        // and digest (the roster arm carries neither).
+        let mut out = match rows.first() {
+            Some(row) => {
+                let mut line = profile_line(row);
+                if let Some(source) = row.get("source").and_then(Value::as_str) {
+                    line.push_str(&format!("; source `{source}`"));
+                }
+                line
+            }
+            // No row: `resolve_active` found nothing, which is an unresolved
+            // session rather than an empty roster.
+            None => "session profile unknown, source unknown".to_string(),
+        };
+        if let Some(lu) = p.get("live_usage") {
+            out.push_str("; ");
+            out.push_str(&live_usage_prose(lu, "active profile"));
+        }
+        let digest = digest_prose(&p["since_your_last_call"]);
+        if !digest.is_empty() {
+            out.push_str("; ");
+            out.push_str(&digest);
+        }
+        return out;
+    }
     if rows.is_empty() {
         return "no profiles".to_string();
     }
     rows.iter().map(profile_line).collect::<Vec<_>>().join("\n")
-}
-
-/// Prose for `which`: session identity, throughput when observed, then the
-/// active profile's live usage, then what moved since the last digest-bearing
-/// reply when something did.
-pub(crate) fn which_prose(p: &Value) -> String {
-    let profile = p
-        .get("profile")
-        .and_then(Value::as_str)
-        .map_or_else(|| "unknown".to_string(), |v| format!("`{v}`"));
-    let source = p
-        .get("source")
-        .and_then(Value::as_str)
-        .map_or_else(|| "unknown".to_string(), |v| format!("`{v}`"));
-    let tier = p
-        .get("tier")
-        .and_then(Value::as_str)
-        .map_or_else(|| "unknown".to_string(), |v| format!("`{v}`"));
-    let mut out = format!("session profile {profile}, source {source}, tier {tier}");
-    if let Some(rows) = p.get("throughput").and_then(Value::as_array)
-        && !rows.is_empty()
-    {
-        out.push_str("; throughput: ");
-        out.push_str(&throughput_prose(rows));
-    }
-    out.push_str("; ");
-    out.push_str(&live_usage_prose(&p["live_usage"], "active profile"));
-    let digest = digest_prose(&p["since_your_last_call"]);
-    if !digest.is_empty() {
-        out.push_str("; ");
-        out.push_str(&digest);
-    }
-    out
 }
 
 /// Prose for `switch`: the outcome, then the active profile's live usage, then
@@ -709,17 +715,13 @@ pub(crate) fn delegate_prose(p: &Value) -> String {
 }
 
 /// Prose for a `delegate` argument/validation refusal. A refusal that fired
-/// before target resolution carries the target the caller spelled, so the
-/// sentence names it; an envelope with neither `profile` nor `profiles` (a
-/// refusal before any target was named) reads plainly.
+/// before target resolution carries the targets the caller spelled, so the
+/// sentence names them; an envelope with no `profiles` (a refusal before any
+/// target was named) reads plainly.
 pub(crate) fn delegate_refusal_prose(p: &Value) -> String {
     let reason = p.get("result").and_then(Value::as_str).unwrap_or("unknown");
-    match (
-        p.get("profile").and_then(Value::as_str),
-        p.get("profiles").and_then(Value::as_array),
-    ) {
-        (Some(t), _) => format!("delegate to `{t}` failed: {reason}"),
-        (None, Some(names)) => {
+    match p.get("profiles").and_then(Value::as_array) {
+        Some(names) => {
             let list = names
                 .iter()
                 .filter_map(Value::as_str)
@@ -728,7 +730,7 @@ pub(crate) fn delegate_refusal_prose(p: &Value) -> String {
                 .join(", ");
             format!("delegate to {list} failed: {reason}")
         }
-        (None, None) => format!("delegate failed: {reason}"),
+        None => format!("delegate failed: {reason}"),
     }
 }
 
@@ -758,8 +760,8 @@ pub(crate) fn delegate_fanout_prose(p: &Value) -> String {
     out
 }
 
-/// Prose for `delegate_result`: the running status (with optional `quota`), the
-/// done envelope, or an invalid/unknown job_id refusal.
+/// Prose for `monitor`'s one-id mode: the running status, the done envelope, or
+/// an invalid/unknown job_id refusal.
 pub(crate) fn delegate_result_prose(p: &Value) -> String {
     if p.get("job_id").and_then(Value::as_str).is_some()
         && p.get("status").and_then(Value::as_str).is_some()
@@ -789,8 +791,8 @@ pub(crate) fn delegate_result_prose(p: &Value) -> String {
     }
 }
 
-/// The `job_id` + `status` line shared by the single `delegate_result` running
-/// status and each running line of a batch.
+/// The `job_id` + `status` line shared by `monitor`'s one-id running status and
+/// each running line of its several-ids reply.
 fn running_status_prose(p: &Value) -> String {
     let job_id = p.get("job_id").and_then(Value::as_str).unwrap_or("unknown");
     let status = p.get("status").and_then(Value::as_str).unwrap_or("unknown");
@@ -805,7 +807,7 @@ fn running_status_prose(p: &Value) -> String {
     out
 }
 
-/// Prose for a `delegate_result` batch: one line per requested id, naming its
+/// Prose for a `monitor` several-ids reply: one line per requested id, naming its
 /// id and state, then the batch's own digest clause on a last line when it
 /// carries one. A done line reuses the envelope spelling, a running line the
 /// shared running spelling, an absent id reads `unknown`. Live usage stays in

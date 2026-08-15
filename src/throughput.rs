@@ -56,7 +56,8 @@ struct Sample {
     tok_s: f64,
 }
 
-/// Per-model throughput readout for display in `list_profiles` / `which`.
+/// Per-model throughput readout for display in `profiles` (roster rows and
+/// the `scope: "session"` row).
 #[derive(Debug, Clone)]
 pub(crate) struct ModelSummary {
     pub(crate) model: String,

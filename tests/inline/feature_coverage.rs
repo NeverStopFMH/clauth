@@ -111,7 +111,7 @@ const FEATURE_MAP: &[(&str, &[&str])] = &[
             "manual_mcp_wiring",
             "wire_mcp_server",
             "global_entry_drifted",
-            "which_tool_reports_the_cached_tier_not_the_login_claim",
+            "session_scope_resolves_the_tier_through_the_which_tiers",
             "valid_switch_repoints_active_through_the_blocking_task",
             "unknown_target_is_rejected_without_stripping_live_creds",
             "divergence_overwrite_captures_relogin_into_outgoing",

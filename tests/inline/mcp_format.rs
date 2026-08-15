@@ -1,9 +1,10 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 #![allow(unsafe_code)]
 
-//! Coverage for the `format` argument every tool now takes: prose by default,
-//! JSON by opt-in, an unrecognised value refused by name, and exactly one
-//! content block in either spelling (the old live-usage footer is folded in).
+//! One content block per reply, every tool, refusals included. The old
+//! `format` parameter's JSON arm is gone (prose is the only spelling a caller
+//! sees; the JSON payload stays internal to the renderers), so what this file
+//! still pins is the shape that survived: exactly one block, carrying prose.
 
 use super::*;
 use crate::testutil::HomeSandbox;
@@ -28,194 +29,68 @@ fn first_text(result: &CallToolResult) -> String {
         .expect("first content block is text")
 }
 
-fn key_set(body: &serde_json::Value) -> std::collections::BTreeSet<&str> {
-    body.as_object()
-        .expect("object")
-        .keys()
-        .map(String::as_str)
-        .collect()
-}
-
-fn assert_refusal(result: &CallToolResult, bad: &str) {
-    assert_eq!(
-        result.is_error,
-        Some(true),
-        "an unrecognised format is a tool error"
-    );
-    assert_eq!(
-        result.content.len(),
-        1,
-        "the refusal is a single content block"
-    );
-    let body: serde_json::Value =
-        serde_json::from_str(&first_text(result)).expect("refusal is JSON");
-    assert_eq!(body["ok"], serde_json::Value::Bool(false));
-    assert_eq!(
-        body["reason"],
-        serde_json::Value::String(format!(
-            "unrecognized format \"{bad}\": accepted \"prose\" and \"json\""
-        ))
-    );
-}
-
-#[test]
-fn every_tool_refuses_an_unrecognised_format_by_name() {
-    let server = ClauthServer::new();
-
-    assert_refusal(
-        &drive(server.list_profiles(Parameters(ListProfilesArgs {
-            names: None,
-            format: Some("yaml".to_string()),
-        }))),
-        "yaml",
-    );
-    assert_refusal(
-        &drive(server.which(Parameters(WhichArgs {
-            format: Some("yaml".to_string()),
-        }))),
-        "yaml",
-    );
-    assert_refusal(
-        &drive(server.switch(Parameters(SwitchArgs {
-            name: "any".to_string(),
-            format: Some("yaml".to_string()),
-        }))),
-        "yaml",
-    );
-    assert_refusal(
-        &drive(server.delegate(Parameters(DelegateArgs {
-            profile: Some("any".to_string()),
-            profiles: None,
-            prompt: Some("hi".to_string()),
-            prompt_file: None,
-            model: None,
-            cwd: None,
-            env: None,
-            args: None,
-            timeout_secs: None,
-            idle_secs: None,
-            resume: None,
-            isolated: None,
-            background: None,
-            monitor: None,
-            format: Some("yaml".to_string()),
-        }))),
-        "yaml",
-    );
-    assert_refusal(
-        &drive(server.delegate_result(Parameters(DelegateResultArgs {
-            job_id: Some("d-1".to_string()),
-            job_ids: None,
-            wait_secs: None,
-            format: Some("yaml".to_string()),
-        }))),
-        "yaml",
-    );
-    assert_refusal(
-        &drive(server.watch(Parameters(WatchArgs {
-            wait_secs: None,
-            kinds: None,
-            format: Some("yaml".to_string()),
-        }))),
-        "yaml",
-    );
-}
-
-#[test]
-fn which_prose_default_is_one_block_and_json_keeps_the_old_keys() {
-    let _home = HomeSandbox::new();
-
-    let prose = drive(ClauthServer::new().which(Parameters(WhichArgs { format: None })));
-    assert_eq!(prose.content.len(), 1, "prose is a single content block");
-    let text = first_text(&prose);
+fn assert_one_prose_block(result: &CallToolResult) -> String {
+    assert_eq!(result.content.len(), 1, "a reply is a single content block");
+    let text = first_text(result);
     assert!(
         serde_json::from_str::<serde_json::Value>(&text).is_err(),
-        "the prose default must not be JSON"
+        "the reply must be prose, not a JSON blob: {text}",
     );
-    assert_eq!(
-        text,
-        "session profile unknown, source unknown, tier unknown; active profile none: 5h unknown, 7d unknown"
-    );
+    text
+}
 
-    let json = drive(ClauthServer::new().which(Parameters(WhichArgs {
-        format: Some("json".to_string()),
+#[test]
+fn profiles_answers_prose_in_one_block() {
+    let _home = HomeSandbox::new();
+
+    let prose = drive(ClauthServer::new().profiles(Parameters(ProfilesArgs {
+        names: None,
+        scope: None,
     })));
-    assert_eq!(json.content.len(), 1, "json is a single content block");
-    let body: serde_json::Value = serde_json::from_str(&first_text(&json)).expect("json payload");
-    assert_eq!(
-        key_set(&body),
-        ["live_usage", "profile", "source", "throughput", "tier"]
-            .into_iter()
-            .collect(),
-        "the JSON spelling is the old payload plus the folded-in live_usage, nothing else"
-    );
-    assert_eq!(
-        key_set(&body["live_usage"]),
-        ["5h_used_pct", "7d_used_pct", "profile"]
-            .into_iter()
-            .collect(),
-        "the footer folds in as the three live_usage fields"
+    assert_eq!(assert_one_prose_block(&prose), "no profiles");
+}
+
+#[test]
+fn session_scope_answers_prose_in_one_block() {
+    let _home = HomeSandbox::new();
+
+    let prose = drive(ClauthServer::new().profiles(Parameters(ProfilesArgs {
+        names: None,
+        scope: Some("session".to_string()),
+    })));
+    let text = assert_one_prose_block(&prose);
+    assert!(
+        text.starts_with("session profile unknown, source unknown"),
+        "an unresolved session says so in prose: {text}",
     );
 }
 
 #[test]
-fn list_profiles_prose_default_and_json_shape() {
+fn switch_profile_refusal_answers_prose_in_one_block() {
     let _home = HomeSandbox::new();
 
-    let prose = drive(
-        ClauthServer::new().list_profiles(Parameters(ListProfilesArgs {
-            names: None,
-            format: None,
-        })),
-    );
-    assert_eq!(prose.content.len(), 1, "prose is a single content block");
-    assert_eq!(first_text(&prose), "no profiles");
-
-    let json = drive(
-        ClauthServer::new().list_profiles(Parameters(ListProfilesArgs {
-            names: None,
-            format: Some("json".to_string()),
-        })),
-    );
-    assert_eq!(json.content.len(), 1, "json is a single content block");
-    let body: serde_json::Value = serde_json::from_str(&first_text(&json)).expect("json payload");
-    assert_eq!(
-        key_set(&body),
-        ["profiles"].into_iter().collect(),
-        "list_profiles has no live-usage footer, so its top level stays exactly `profiles`"
-    );
-}
-
-#[test]
-fn switch_prose_default_and_json_error_keys() {
-    let _home = HomeSandbox::new();
-
-    let prose = drive(ClauthServer::new().switch(Parameters(SwitchArgs {
+    let prose = drive(ClauthServer::new().switch_profile(Parameters(SwitchArgs {
         name: "ghost".to_string(),
-        format: None,
     })));
     assert_eq!(prose.is_error, Some(true));
-    assert_eq!(prose.content.len(), 1, "prose is a single content block");
+    let text = assert_one_prose_block(&prose);
     assert_eq!(
-        first_text(&prose),
-        "switch failed: profile not found: ghost; active profile none: 5h unknown, 7d unknown"
+        text.lines().next(),
+        Some(
+            "switch failed: profile not found: ghost; active profile none: 5h unknown, 7d unknown"
+        ),
     );
-
-    let json = drive(ClauthServer::new().switch(Parameters(SwitchArgs {
-        name: "ghost".to_string(),
-        format: Some("json".to_string()),
-    })));
-    assert_eq!(json.content.len(), 1, "json is a single content block");
-    let body: serde_json::Value = serde_json::from_str(&first_text(&json)).expect("json payload");
-    assert_eq!(
-        key_set(&body),
-        ["live_usage", "ok", "reason"].into_iter().collect(),
-        "the switch error envelope keeps its two keys and folds in live_usage"
+    // The session-effect note rides every arm of the reply, in the same shape
+    // the init block carries it. Which variant this process earns depends on
+    // the runner's own `CLAUDE_CONFIG_DIR`, so pin the lead, not the body.
+    assert!(
+        text.contains("\n\nswitch_profile & this session: "),
+        "the reply names what a switch does to THIS session: {text}",
     );
 }
 
 #[test]
-fn delegate_depth_prose_default_and_json_keys() {
+fn delegate_depth_refusal_answers_prose_in_one_block() {
     let _guard = crate::profile::HOME_TEST_LOCK
         .lock()
         .unwrap_or_else(|e| e.into_inner());
@@ -223,41 +98,24 @@ fn delegate_depth_prose_default_and_json_keys() {
     // SAFETY: test-only, serialized by the lock above, restored unconditionally.
     unsafe { std::env::set_var(MCP_DEPTH_ENV, "1") };
 
-    let args = |format| {
-        Parameters(DelegateArgs {
-            profile: Some("any".to_string()),
-            profiles: None,
-            prompt: Some("hi".to_string()),
-            prompt_file: None,
-            model: None,
-            cwd: None,
-            env: None,
-            args: None,
-            timeout_secs: None,
-            idle_secs: None,
-            resume: None,
-            isolated: None,
-            background: None,
-            monitor: None,
-            format,
-        })
-    };
-
-    let prose = drive(ClauthServer::new().delegate(args(None)));
+    let prose = drive(ClauthServer::new().delegate(Parameters(DelegateArgs {
+        profiles: Some(vec!["any".to_string()]),
+        prompt: Some("hi".to_string()),
+        prompt_file: None,
+        model: None,
+        cwd: None,
+        env: None,
+        args: None,
+        timeout_secs: None,
+        idle_secs: None,
+        resume: None,
+        isolated: None,
+        background: None,
+    })));
     assert_eq!(prose.is_error, Some(true));
-    assert_eq!(prose.content.len(), 1, "prose is a single content block");
     assert_eq!(
-        first_text(&prose),
+        assert_one_prose_block(&prose),
         "delegate to `any` failed: delegation depth exceeded (max 1)"
-    );
-
-    let json = drive(ClauthServer::new().delegate(args(Some("json".to_string()))));
-    assert_eq!(json.content.len(), 1, "json is a single content block");
-    let body: serde_json::Value = serde_json::from_str(&first_text(&json)).expect("json payload");
-    assert_eq!(
-        key_set(&body),
-        ["is_error", "profile", "result"].into_iter().collect(),
-        "the depth refusal has no live usage to fold in, so it keeps its three keys"
     );
 
     // SAFETY: same as above — restore the prior value.
@@ -270,32 +128,11 @@ fn delegate_depth_prose_default_and_json_keys() {
 }
 
 #[test]
-fn delegate_result_invalid_prose_default_and_json_keys() {
-    let prose = drive(
-        ClauthServer::new().delegate_result(Parameters(DelegateResultArgs {
-            job_id: Some("../evil".to_string()),
-            job_ids: None,
-            wait_secs: None,
-            format: None,
-        })),
-    );
+fn monitor_invalid_job_id_answers_prose_in_one_block() {
+    let prose = drive(ClauthServer::new().monitor(Parameters(MonitorArgs {
+        job_ids: Some(vec!["../evil".to_string()]),
+        wait_secs: None,
+    })));
     assert_eq!(prose.is_error, Some(true));
-    assert_eq!(prose.content.len(), 1, "prose is a single content block");
-    assert_eq!(first_text(&prose), "error: invalid job_id");
-
-    let json = drive(
-        ClauthServer::new().delegate_result(Parameters(DelegateResultArgs {
-            job_id: Some("../evil".to_string()),
-            job_ids: None,
-            wait_secs: None,
-            format: Some("json".to_string()),
-        })),
-    );
-    assert_eq!(json.content.len(), 1, "json is a single content block");
-    let body: serde_json::Value = serde_json::from_str(&first_text(&json)).expect("json payload");
-    assert_eq!(
-        key_set(&body),
-        ["is_error", "result"].into_iter().collect(),
-        "the invalid-job_id envelope keeps its two keys"
-    );
+    assert_eq!(assert_one_prose_block(&prose), "error: invalid job_id");
 }

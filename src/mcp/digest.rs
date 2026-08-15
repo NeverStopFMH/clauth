@@ -4,13 +4,13 @@
 //! A live Claude Code session has no push channel from clauth — MCP
 //! `2026-07-28` defines no custom notifications and a server cannot send a
 //! request between calls — so this is the pull-shaped answer: every reply that
-//! already carries a live-usage footer (`which`, `switch`, `delegate`,
-//! `delegate_result`) names what moved since the last digest-bearing reply,
-//! and the `watch` tool long-polls the same comparison for a caller that wants
-//! to block until something moves.
+//! already carries a live-usage footer (`profiles({scope:"session"})`,
+//! `switch_profile`, `delegate`, `monitor`) names what moved since the last
+//! digest-bearing reply, and `monitor` with no `job_ids` long-polls the same
+//! comparison for a caller that wants to block until something moves.
 //!
 //! Three observables, all local disk, zero network and zero quota on every
-//! path including `watch`'s loop:
+//! path including the state-waiting loop:
 //!
 //! - the config's `active_profile` VALUE (content, not mtime — a rewrite that
 //!   keeps the name is not news);
@@ -32,15 +32,14 @@
 //!   "nothing changed" would assert a comparison the server never made.
 //! - **Reporting consumes; not reporting must not.** A call that reports a
 //!   moved observable advances the baseline for exactly the observables it
-//!   reported. A filtered `watch` therefore never swallows what it declined to
-//!   name, and neither does a surface that carries no digest at all
-//!   (`list_profiles`: its roster is already a fresh read of the same state).
-//!   The usage cache re-keys silently alongside a reported profile change,
-//!   because what it held is no longer comparable to anything.
-//! - **`switch` never reports its own write.** Its post-mutation arms reseed
-//!   the baseline silently (the reply's `previous`/`active` IS the report); an
-//!   arm that refused before any mutation reports like `which` does, because
-//!   nothing of ours moved.
+//!   reported, and a surface that carries no digest at all never touches it
+//!   (`profiles`' all-scope roster: it is already a fresh read of the same
+//!   state). The usage cache re-keys silently alongside a reported profile
+//!   change, because what it held is no longer comparable to anything.
+//! - **`switch_profile` never reports its own write.** Its post-mutation arms
+//!   reseed the baseline silently (the reply's `previous`/`active` IS the
+//!   report); an arm that refused before any mutation reports like the
+//!   session-scope roster does, because nothing of ours moved.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
@@ -49,36 +48,13 @@ use crate::lockorder::RankedMutex;
 use crate::lockorder::rank::McpDigest;
 use crate::profile_cache::USAGE_CACHE_FILE;
 
-/// Poll cadence for `watch`'s long-poll, mirroring `delegate_result`'s
-/// `JOB_POLL_INTERVAL` so the two waiting tools answer on the same rhythm.
+/// Poll cadence for `monitor`'s state-waiting long-poll, mirroring the job
+/// mode's `JOB_POLL_INTERVAL` so both modes answer on the same rhythm.
 const WATCH_POLL_INTERVAL: Duration = Duration::from_millis(200);
 
-/// One observable the digest watches, by its `kinds` spelling.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum WatchKind {
-    ActiveProfile,
-    UsageCache,
-    Credentials,
-}
-
-impl WatchKind {
-    /// Resolve a `kinds` entry. An unrecognised value is refused by name so a
-    /// typo cannot silently narrow the watch to nothing.
-    fn parse(raw: &str) -> Result<Self, String> {
-        match raw {
-            "active_profile" => Ok(Self::ActiveProfile),
-            "usage_cache" => Ok(Self::UsageCache),
-            "credentials" => Ok(Self::Credentials),
-            other => Err(format!(
-                "unrecognized kind \"{other}\": accepted \"active_profile\", \"usage_cache\", \
-                 \"credentials\""
-            )),
-        }
-    }
-}
-
-/// Which observables one call watches. Unset means all three — the default
-/// digest every folded reply reports.
+/// Which observables one call watches. There is no filtered subset anymore:
+/// `monitor`'s state mode and every folded reply watch all three, so this is a
+/// set type only because the delta computation branches per observable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct WatchSet {
     active_profile: bool,
@@ -92,29 +68,6 @@ impl WatchSet {
         usage_cache: true,
         credentials: true,
     };
-
-    /// Resolve the `watch` tool's `kinds` argument. Omitted or empty means all
-    /// three (the same convention `list_profiles`' `names` filter uses, so an
-    /// empty list cannot degenerate into watching nothing). Duplicates are
-    /// harmless: the set unions them.
-    pub(super) fn parse(raw: &[String]) -> Result<Self, String> {
-        if raw.is_empty() {
-            return Ok(Self::ALL);
-        }
-        let mut set = Self {
-            active_profile: false,
-            usage_cache: false,
-            credentials: false,
-        };
-        for kind in raw {
-            match WatchKind::parse(kind)? {
-                WatchKind::ActiveProfile => set.active_profile = true,
-                WatchKind::UsageCache => set.usage_cache = true,
-                WatchKind::Credentials => set.credentials = true,
-            }
-        }
-        Ok(set)
-    }
 }
 
 /// One read of the three observables. An absent file is `None` on that
@@ -256,9 +209,9 @@ impl DigestTracker {
     /// Sample, compare against the baseline, and consume what this call
     /// reports. The disk sampling runs under the leaf lock so two concurrent
     /// calls cannot interleave sample and compare (and double-report); the
-    /// lock never outlives the method, so `watch`'s sleep slices run outside
-    /// it. A poisoned lock keeps digesting: nothing under it can panic, and a
-    /// lost baseline costs one silent reseed, not a dead tool.
+    /// lock never outlives the method, so the state-wait loop's sleep slices
+    /// run outside it. A poisoned lock keeps digesting: nothing under it can
+    /// panic, and a lost baseline costs one silent reseed, not a dead tool.
     pub(super) fn report(&self, watched: WatchSet) -> DigestVerdict {
         let mut baseline = self.lock();
         let sample = sample_digest();
@@ -293,8 +246,8 @@ impl DigestTracker {
     }
 
     /// Replace the baseline with the current state without reporting anything:
-    /// `switch`'s post-mutation arms, whose own write must never echo as news
-    /// from elsewhere. The whole sample is stored — a switch watches all
+    /// `switch_profile`'s post-mutation arms, whose own write must never echo
+    /// as news from elsewhere. The whole sample is stored — a switch watches all
     /// three, so nothing it moved survives as a later delta. The accepted cost
     /// is that an external change landing inside the switch window is swallowed
     /// with it; the alternative is the switch reporting its own write.
@@ -304,12 +257,12 @@ impl DigestTracker {
 
     /// Long-poll for a change in the watched set: check, sleep one
     /// [`WATCH_POLL_INTERVAL`] slice, repeat, until something moves or
-    /// `wait_secs` elapses. Mirrors `delegate_result`'s `wait_for_done`
-    /// cadence; the baseline lock is taken and dropped inside [`report`],
-    /// never held across a sleep. `wait_secs` 0 samples exactly once. Each
-    /// slice re-reads `profiles.toml` and two file stats: small local reads
-    /// whose total is bounded by `wait_secs`, and a cached value could not see
-    /// the writer this loop exists to catch.
+    /// `wait_secs` elapses. Mirrors the job mode's `wait_for_done` cadence;
+    /// the baseline lock is taken and dropped inside [`report`], never held
+    /// across a sleep. `wait_secs` 0 samples exactly once. Each slice re-reads
+    /// `profiles.toml` and two file stats: small local reads whose total is
+    /// bounded by `wait_secs`, and a cached value could not see the writer
+    /// this loop exists to catch.
     pub(super) fn watch(&self, watched: WatchSet, wait_secs: u64) -> WatchOutcome {
         let start = Instant::now();
         let deadline = Duration::from_secs(wait_secs);
@@ -338,7 +291,7 @@ impl DigestTracker {
     }
 }
 
-/// Result of the `watch` tool's long-poll.
+/// Result of `monitor`'s state-waiting long-poll.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum WatchOutcome {
     /// No baseline existed and there was no wait: this call set it.
@@ -354,16 +307,16 @@ pub(super) enum WatchOutcome {
 /// payload.
 pub(super) enum DigestMode<'a> {
     /// Report (and consume) the delta over all three observables — every
-    /// folded reply except `switch`'s post-mutation arms.
+    /// folded reply except `switch_profile`'s post-mutation arms.
     Report(&'a DigestTracker),
-    /// Reseed the baseline silently — `switch` after its mutation ran: the
-    /// reply's own `previous`/`active` (or `reason`) is the report of what it
-    /// did, and its write must not echo back as news from elsewhere.
+    /// Reseed the baseline silently — `switch_profile` after its mutation ran:
+    /// the reply's own `previous`/`active` (or `reason`) is the report of what
+    /// it did, and its write must not echo back as news from elsewhere.
     Reseed(&'a DigestTracker),
-    /// Neither report nor touch the baseline — the `delegate_result` batch's
-    /// per-result folds. A batch is one call, so its reply carries one digest
-    /// beside `results`; a per-result fold would report one job's news into a
-    /// place the batch prose never renders.
+    /// Neither report nor touch the baseline — `monitor`'s per-result folds in
+    /// the several-ids mode. A batch is one call, so its reply carries one
+    /// digest beside `results`; a per-result fold would report one job's news
+    /// into a place the batch prose never renders.
     Skip,
 }
 

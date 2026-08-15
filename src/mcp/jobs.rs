@@ -24,8 +24,8 @@ const DONE_TTL_MS: u64 = 60 * 60 * 1000; // 1h
 /// it. Sits above the max delegate timeout plus slack.
 const RUNNING_TTL_MS: u64 = (3600 + 600) * 1000;
 /// Hard cap on retained job files; newest kept, older reaped. Also the cap on
-/// one `delegate_result` `job_ids` list: the store holds at most this many
-/// files, so a longer list could not resolve more ids.
+/// one `monitor` `job_ids` list: the store holds at most this many files, so a
+/// longer list could not resolve more ids.
 pub(crate) const MAX_RETAINED: usize = 256;
 
 /// Per-process counter making two job ids minted in the same millisecond differ.
@@ -44,11 +44,6 @@ pub(crate) struct JobRecord {
     pub(crate) profile: String,
     pub(crate) state: JobState,
     pub(crate) started_at: u64,
-    /// Caller opted into progress reporting (`delegate({monitor: true})`): a
-    /// running `delegate_result` poll attaches the profile's live usage windows.
-    /// `#[serde(default)]` so pre-`monitor` job files still deserialize.
-    #[serde(default)]
-    pub(crate) monitor: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) envelope: Option<serde_json::Value>,
 }
@@ -65,7 +60,7 @@ pub(crate) fn new_job_id(started_at: u64) -> String {
 }
 
 /// True iff `id` is safe as a single path component (no separators, no
-/// traversal). Job ids reaching `delegate_result` / `mcp-await-job` come from
+/// traversal). Job ids reaching `monitor` / `mcp-await-job` come from
 /// tool input, so this guards the path join.
 pub(crate) fn is_safe_job_id(id: &str) -> bool {
     !id.is_empty()
@@ -90,18 +85,14 @@ fn write_atomic(record: &JobRecord) -> Result<()> {
 }
 
 /// Write the initial `running` record for a freshly-started background job.
-pub(crate) fn write_running(
-    job_id: &str,
-    profile: &str,
-    started_at: u64,
-    monitor: bool,
-) -> Result<()> {
+/// `#[serde(default)]` on every later `JobRecord` field is what lets a job file
+/// written by an older server still parse here.
+pub(crate) fn write_running(job_id: &str, profile: &str, started_at: u64) -> Result<()> {
     write_atomic(&JobRecord {
         job_id: job_id.to_string(),
         profile: profile.to_string(),
         state: JobState::Running,
         started_at,
-        monitor,
         envelope: None,
     })
 }
@@ -118,7 +109,6 @@ pub(crate) fn write_done(
         profile: profile.to_string(),
         state: JobState::Done,
         started_at,
-        monitor: false,
         envelope: Some(envelope),
     })
 }
@@ -129,7 +119,7 @@ pub(crate) fn read(job_id: &str) -> Option<JobRecord> {
     serde_json::from_slice(&bytes).ok()
 }
 
-/// Delete a job file (best-effort). Called after a fallback `delegate_result`
+/// Delete a job file (best-effort). Called after a fallback `monitor` collect
 /// hands the envelope back.
 pub(crate) fn remove(job_id: &str) {
     if let Ok(path) = job_path(job_id) {

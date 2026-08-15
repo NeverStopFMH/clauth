@@ -8,15 +8,18 @@
 //! - a first call reports nothing (there was no earlier state to compare
 //!   against, and claiming "nothing changed" would assert otherwise);
 //! - reporting consumes the delta, and a surface that does not report must not
-//!   swallow it (`list_profiles`, a filtered `watch`);
-//! - `switch` never reports its own write (it reseeds), but an arm that
-//!   refused before any mutation reports like `which` does;
-//! - `watch` returns as soon as something moves, never sleeps holding the
-//!   baseline lock, and honors its `kinds` filter;
+//!   swallow it (the all-scope roster);
+//! - `switch_profile` never reports its own write (it reseeds), but an arm
+//!   that refused before any mutation reports like the session-scope roster
+//!   does;
+//! - `monitor` with no `job_ids` returns as soon as something moves, never
+//!   sleeps holding the baseline lock;
 //! - the usage cache is keyed on the profile it was read from, so a profile
 //!   change is never dressed up as a refresh of a file nobody refreshed;
-//! - a batch is one call: one digest, top-level, rendered in the prose that is
-//!   the default format.
+//! - a batch is one call: one digest, top-level, rendered in the prose reply.
+//!
+//! Replies are prose now (the JSON payload is internal to the renderers), so
+//! the digest assertions read the prose clause: "since your last call: ...".
 
 use super::*;
 use crate::profile::{AppState, ProfileName, save_app_state};
@@ -84,51 +87,44 @@ fn block_text(result: &CallToolResult) -> String {
         .expect("payload text")
 }
 
-fn json_payload(result: &CallToolResult) -> serde_json::Value {
-    serde_json::from_str(&block_text(result)).expect("parse json payload")
-}
-
-fn call_which(server: &ClauthServer) -> serde_json::Value {
-    json_payload(&drive(server.which(Parameters(WhichArgs {
-        format: Some("json".to_string()),
+/// The digest-bearing session read: `profiles({scope: "session"})`, the
+/// folded-in former `which` tool. Returns the reply's prose.
+fn call_session(server: &ClauthServer) -> String {
+    block_text(&drive(server.profiles(Parameters(ProfilesArgs {
+        names: None,
+        scope: Some("session".to_string()),
     }))))
 }
 
-fn call_switch(server: &ClauthServer, name: &str) -> serde_json::Value {
-    json_payload(&drive(server.switch(Parameters(SwitchArgs {
+/// The all-scope roster, which deliberately carries no digest.
+fn call_roster(server: &ClauthServer) -> String {
+    block_text(&drive(server.profiles(Parameters(ProfilesArgs {
+        names: None,
+        scope: None,
+    }))))
+}
+
+fn call_switch(server: &ClauthServer, name: &str) -> String {
+    block_text(&drive(server.switch_profile(Parameters(SwitchArgs {
         name: name.to_string(),
-        format: Some("json".to_string()),
     }))))
 }
 
-fn call_batch(server: &ClauthServer, job_ids: &[&str], format: &str) -> CallToolResult {
-    drive(server.delegate_result(Parameters(DelegateResultArgs {
-        job_id: None,
+/// `monitor` on named jobs (its job mode).
+fn call_monitor_ids(server: &ClauthServer, job_ids: &[&str], wait_secs: u64) -> String {
+    block_text(&drive(server.monitor(Parameters(MonitorArgs {
         job_ids: Some(job_ids.iter().map(|s| (*s).to_string()).collect()),
-        wait_secs: Some(0),
-        format: Some(format.to_string()),
-    })))
+        wait_secs: Some(wait_secs),
+    }))))
 }
 
-fn call_watch(
-    server: &ClauthServer,
-    wait_secs: Option<u64>,
-    kinds: Option<Vec<&str>>,
-    format: Option<&str>,
-) -> CallToolResult {
-    drive(server.watch(Parameters(WatchArgs {
-        wait_secs,
-        kinds: kinds.map(|k| k.iter().map(|s| s.to_string()).collect()),
-        format: format.map(str::to_string),
-    })))
-}
-
-fn watch_json(
-    server: &ClauthServer,
-    wait_secs: Option<u64>,
-    kinds: Option<Vec<&str>>,
-) -> serde_json::Value {
-    json_payload(&call_watch(server, wait_secs, kinds, Some("json")))
+/// `monitor` with no `job_ids` — the state-waiting mode absorbed from the old
+/// `watch` tool.
+fn call_monitor_state(server: &ClauthServer, wait_secs: u64) -> String {
+    block_text(&drive(server.monitor(Parameters(MonitorArgs {
+        job_ids: None,
+        wait_secs: Some(wait_secs),
+    }))))
 }
 
 /// The full fresh-server fixture every test starts from: one active profile,
@@ -144,11 +140,11 @@ fn a_first_digest_call_reports_nothing() {
     seeded_world();
     let server = ClauthServer::new();
 
-    let payload = call_which(&server);
+    let text = call_session(&server);
     assert!(
-        payload.get("since_your_last_call").is_none(),
+        !text.contains("since your last call"),
         "the first digest call establishes the baseline and must not claim a \
-         comparison it never made: {payload}",
+         comparison it never made: {text}",
     );
 }
 
@@ -160,15 +156,14 @@ fn a_server_clone_shares_the_digest_baseline() {
     let _home = HomeSandbox::new();
     seeded_world();
     let server = ClauthServer::new();
-    let _ = call_which(&server);
+    let _ = call_session(&server);
 
     seed_state("other", t0());
     let clone = server.clone();
-    let payload = call_which(&clone);
-    assert_eq!(
-        payload["since_your_last_call"]["active_profile"],
-        serde_json::json!({ "from": "work", "to": "other" }),
-        "a clone must see the original's baseline and report what moved: {payload}",
+    let text = call_session(&clone);
+    assert!(
+        text.contains("since your last call: active profile `work` → `other`"),
+        "a clone must see the original's baseline and report what moved: {text}",
     );
 }
 
@@ -177,15 +172,18 @@ fn reporting_consumes_the_delta() {
     let _home = HomeSandbox::new();
     seeded_world();
     let server = ClauthServer::new();
-    let _ = call_which(&server);
+    let _ = call_session(&server);
 
     set_mtime(&credentials_path(), t1());
-    let second = call_which(&server);
-    assert_eq!(second["since_your_last_call"]["credentials"], true);
-
-    let third = call_which(&server);
+    let second = call_session(&server);
     assert!(
-        third.get("since_your_last_call").is_none(),
+        second.contains("since your last call: credentials file rewritten"),
+        "the moved observable is reported: {second}",
+    );
+
+    let third = call_session(&server);
+    assert!(
+        !third.contains("since your last call"),
         "a reported change is consumed: the third call must not re-report it: {third}",
     );
 }
@@ -198,7 +196,7 @@ fn a_sub_millisecond_mtime_move_is_still_a_change() {
     let _home = HomeSandbox::new();
     seeded_world();
     let server = ClauthServer::new();
-    let _ = call_which(&server);
+    let _ = call_session(&server);
 
     let bumped = t0() + Duration::from_micros(500);
     set_mtime(&credentials_path(), bumped);
@@ -214,37 +212,36 @@ fn a_sub_millisecond_mtime_move_is_still_a_change() {
         "the sandbox filesystem must keep the sub-millisecond stamp",
     );
 
-    let payload = call_which(&server);
-    assert_eq!(
-        payload["since_your_last_call"]["credentials"], true,
-        "a write 500µs after the baseline is a write: {payload}",
+    let text = call_session(&server);
+    assert!(
+        text.contains("since your last call: credentials file rewritten"),
+        "a write 500µs after the baseline is a write: {text}",
     );
 }
 
-/// `list_profiles` neither carries nor consumes the digest: its roster is
-/// already a fresh read of the same state, so a delta beside it buys nothing —
-/// and swallowing the delta there would mute it for every later reporter.
+/// The all-scope roster neither carries nor consumes the digest: it is already
+/// a fresh read of the same state, so a delta beside it buys nothing — and
+/// swallowing the delta there would mute it for every later reporter. (The
+/// session-scope arm DOES carry one; it inherited the folded-in `which`'s
+/// role.)
 #[test]
-fn list_profiles_carries_no_digest_and_consumes_nothing() {
+fn the_all_scope_roster_carries_no_digest_and_consumes_nothing() {
     let _home = HomeSandbox::new();
     seeded_world();
     let server = ClauthServer::new();
-    let _ = call_which(&server);
+    let _ = call_session(&server);
 
     set_mtime(&credentials_path(), t1());
-    let roster = json_payload(&drive(server.list_profiles(Parameters(ListProfilesArgs {
-        names: None,
-        format: Some("json".to_string()),
-    }))));
+    let roster = call_roster(&server);
     assert!(
-        roster.get("since_your_last_call").is_none(),
-        "list_profiles has no live footer and no digest: {roster}",
+        !roster.contains("since your last call"),
+        "the all-scope roster has no live footer and no digest: {roster}",
     );
 
-    let payload = call_which(&server);
-    assert_eq!(
-        payload["since_your_last_call"]["credentials"], true,
-        "a list_profiles call between the change and the report must not swallow it",
+    let text = call_session(&server);
+    assert!(
+        text.contains("since your last call: credentials file rewritten"),
+        "a roster call between the change and the report must not swallow it",
     );
 }
 
@@ -290,52 +287,55 @@ fn a_successful_switch_reseeds_rather_than_reporting_its_own_write() {
     let _home = HomeSandbox::new();
     seed_switchable_pair();
     let server = ClauthServer::new();
-    let _ = call_which(&server);
+    let _ = call_session(&server);
 
     let switched = call_switch(&server, "target");
-    assert_eq!(switched["ok"], true, "fixture control: the switch ran");
-    assert_eq!(switched["active"], "target");
     assert!(
-        switched.get("since_your_last_call").is_none(),
+        switched.contains("switched the global active profile from `active` to `target`"),
+        "fixture control: the switch ran",
+    );
+    assert!(
+        !switched.contains("since your last call"),
         "a switch reply must not report its own write as external news: {switched}",
     );
 
-    let after = call_which(&server);
+    let after = call_session(&server);
     assert!(
-        after.get("since_your_last_call").is_none(),
+        !after.contains("since your last call"),
         "the reseed consumed the switch's write; the next reply must stay silent: {after}",
     );
 }
 
 /// A switch that refused BEFORE any mutation ran wrote nothing, so any delta
-/// it sees is external news and reports exactly like `which` does.
+/// it sees is external news and reports exactly like the session read does.
 #[test]
 fn a_refused_switch_reports_external_changes() {
     let _home = HomeSandbox::new();
     seeded_world();
     let server = ClauthServer::new();
-    let _ = call_which(&server);
+    let _ = call_session(&server);
 
     seed_state("other", t0());
     let refused = call_switch(&server, "ghost");
-    assert_eq!(refused["ok"], false, "fixture control: it refused");
-    assert_eq!(
-        refused["since_your_last_call"]["active_profile"],
-        serde_json::json!({ "from": "work", "to": "other" }),
-        "a pre-mutation refusal carries the digest like `which` does: {refused}",
+    assert!(
+        refused.contains("switch failed"),
+        "fixture control: it refused",
+    );
+    assert!(
+        refused.contains("since your last call: active profile `work` → `other`"),
+        "a pre-mutation refusal carries the digest like the session read does: {refused}",
     );
 }
 
 #[test]
-fn watch_first_call_arms_the_baseline() {
+fn state_wait_first_call_arms_the_baseline() {
     let _home = HomeSandbox::new();
     seeded_world();
     let server = ClauthServer::new();
 
-    let armed = watch_json(&server, Some(0), None);
-    assert_eq!(armed["status"], "armed");
+    let armed = call_monitor_state(&server, 0);
     assert!(
-        armed.get("since_your_last_call").is_none(),
+        armed.contains("monitor armed"),
         "arming is not a comparison: {armed}",
     );
 }
@@ -343,11 +343,11 @@ fn watch_first_call_arms_the_baseline() {
 /// The long-poll half of the contract: a change landing mid-wait wakes the
 /// call at the next poll slice, not at the deadline.
 #[test]
-fn watch_returns_as_soon_as_something_moves() {
+fn state_wait_returns_as_soon_as_something_moves() {
     let _home = HomeSandbox::new();
     seeded_world();
     let server = ClauthServer::new();
-    let _ = call_which(&server);
+    let _ = call_session(&server);
 
     let path = credentials_path();
     let mover = std::thread::spawn(move || {
@@ -355,13 +355,12 @@ fn watch_returns_as_soon_as_something_moves() {
         set_mtime(&path, t1());
     });
     let start = Instant::now();
-    let payload = watch_json(&server, Some(60), None);
+    let text = call_monitor_state(&server, 60);
     let elapsed = start.elapsed();
-    assert_eq!(
-        payload["status"], "changed",
-        "the mid-wait change must be caught: {payload}",
+    assert!(
+        text.contains("monitor: since your last call: credentials file rewritten"),
+        "the mid-wait change must be caught: {text}",
     );
-    assert_eq!(payload["since_your_last_call"]["credentials"], true);
     assert!(
         elapsed < Duration::from_secs(10),
         "a change 300ms in must return at the next poll slice, not the 60s \
@@ -370,166 +369,72 @@ fn watch_returns_as_soon_as_something_moves() {
     mover.join().expect("mover thread");
 }
 
-/// The `kinds` filter reports only what it watched AND leaves the unwatched
-/// observables' changes intact for the next reporter: a filtered watch that
-/// stored its whole sample — on its CHANGED arm or its unchanged one — would
-/// swallow them. Both arms need a leg of their own.
-#[test]
-fn watch_kinds_filter_reports_watched_only_and_never_swallows_the_rest() {
-    let _home = HomeSandbox::new();
-    seeded_world();
-    let server = ClauthServer::new();
-    let _ = call_which(&server);
-    let cache = crate::profile_cache::profile_cache_path("work", USAGE_CACHE_FILE)
-        .expect("usage cache path");
-
-    // The UNCHANGED arm: a filtered watch that saw nothing in its own set
-    // still must not store the fresh sample, or the usage-cache move dies with
-    // its reply.
-    set_mtime(&cache, t1());
-    let blind = watch_json(&server, Some(0), Some(vec!["credentials"]));
-    assert_eq!(blind["status"], "unchanged");
-
-    // The CHANGED arm: a credentials-only watch must consume credentials only,
-    // leaving the usage-cache move pending.
-    set_mtime(&credentials_path(), t1());
-    let credentials_only = watch_json(&server, Some(0), Some(vec!["credentials"]));
-    assert_eq!(credentials_only["status"], "changed");
-    assert_eq!(
-        credentials_only["since_your_last_call"]["credentials"],
-        true
-    );
-    assert!(
-        credentials_only["since_your_last_call"]
-            .get("usage_cache")
-            .is_none(),
-        "an unwatched observable carries no news: {credentials_only}",
-    );
-
-    let usage_only = watch_json(&server, Some(0), Some(vec!["usage_cache"]));
-    assert_eq!(
-        usage_only["since_your_last_call"]["usage_cache"], true,
-        "neither filtered watch may swallow the usage-cache move",
-    );
-
-    // And the filter consumes what it reported.
-    let again = watch_json(&server, Some(0), Some(vec!["usage_cache"]));
-    assert_eq!(again["status"], "unchanged");
-}
-
 /// The usage-cache observable is KEYED on the profile it was read from: two
 /// profiles' caches are different files, so a profile change is no
-/// `usage_cache` event. A `kinds: ["usage_cache"]` watch hides the profile
-/// change, so reporting the incomparable pair as a refresh puts a false lesser
-/// event in its place — a statement to the model that nothing made true.
+/// `usage_cache` event. Reporting the incomparable pair as a refresh would be
+/// a statement to the model that nothing made true.
 #[test]
 fn a_profile_change_is_never_reported_as_a_usage_cache_refresh() {
     let _home = HomeSandbox::new();
     seeded_world();
     let server = ClauthServer::new();
-    let _ = call_which(&server);
+    let _ = call_session(&server);
 
     // Another profile, carrying its own cache at its own stamp.
     seed_state("other", t1());
-    let filtered = watch_json(&server, Some(0), Some(vec!["usage_cache"]));
-    assert_eq!(
-        filtered["status"], "unchanged",
-        "the compared mtime came from a different profile's file, so nothing \
-         refreshed: {filtered}",
-    );
-
-    // The profile change itself survives for the surface that watches it, and
-    // still drags no refresh along with it.
-    let reported = call_which(&server);
-    assert_eq!(
-        reported["since_your_last_call"]["active_profile"],
-        serde_json::json!({ "from": "work", "to": "other" }),
-        "the filtered watch left the profile change for the next reporter: {reported}",
+    let reported = call_monitor_state(&server, 0);
+    assert!(
+        reported.contains("since your last call: active profile `work` → `other`"),
+        "the profile change is the news: {reported}",
     );
     assert!(
-        reported["since_your_last_call"]
-            .get("usage_cache")
-            .is_none(),
-        "two profiles' caches are not comparable: {reported}",
+        !reported.contains("usage cache refreshed"),
+        "two profiles' caches are not comparable, so no refresh may be claimed: {reported}",
     );
 
     // Consuming the profile change re-keys the cache baseline, so the false
     // refresh cannot land one call later either.
-    let next = call_which(&server);
+    let next = call_session(&server);
     assert!(
-        next.get("since_your_last_call").is_none(),
+        !next.contains("since your last call"),
         "the re-key onto the new profile's cache is silent: {next}",
     );
 }
 
 #[test]
-fn watch_timeout_reports_unchanged_with_waited_secs() {
+fn state_wait_timeout_reports_unchanged_with_waited_secs() {
     let _home = HomeSandbox::new();
     seeded_world();
     let server = ClauthServer::new();
-    let _ = call_which(&server);
+    let _ = call_session(&server);
 
     let start = Instant::now();
-    let payload = watch_json(&server, Some(1), None);
-    assert_eq!(payload["status"], "unchanged");
-    let waited = payload["waited_secs"].as_u64().expect("waited_secs");
+    let text = call_monitor_state(&server, 1);
     assert!(
-        waited >= 1 && start.elapsed() >= Duration::from_secs(1),
-        "the wait must actually elapse before the unchanged answer: {payload}",
+        text.contains("monitor: no change after"),
+        "timeout says so: {text}"
+    );
+    assert!(
+        start.elapsed() >= Duration::from_secs(1),
+        "the wait must actually elapse before the unchanged answer: {text}",
     );
 }
 
 #[test]
-fn watch_refuses_an_unknown_kind_by_name() {
-    let _home = HomeSandbox::new();
-    let server = ClauthServer::new();
-
-    let result = call_watch(&server, None, Some(vec!["credentials", "bogus"]), None);
-    assert_eq!(result.is_error, Some(true));
-    assert_eq!(
-        result
-            .content
-            .first()
-            .and_then(|c| c.as_text())
-            .map(|t| t.text.clone())
-            .expect("refusal text"),
-        r#"{"ok":false,"reason":"unrecognized kind \"bogus\": accepted \"active_profile\", \"usage_cache\", \"credentials\""}"#
-    );
-}
-
-#[test]
-fn watch_answers_prose_by_default() {
+fn state_wait_answers_prose() {
     let _home = HomeSandbox::new();
     seeded_world();
     let server = ClauthServer::new();
 
-    let armed = call_watch(&server, Some(0), None, None);
-    assert_eq!(
-        armed
-            .content
-            .first()
-            .and_then(|c| c.as_text())
-            .map(|t| t.text.clone())
-            .expect("armed prose"),
-        "watch armed: baseline set on this first digest call, nothing to compare against yet",
-    );
-
-    let _ = call_which(&server);
-    set_mtime(&credentials_path(), t1());
-    let changed = call_watch(&server, Some(0), None, None);
-    assert_eq!(
-        changed
-            .content
-            .first()
-            .and_then(|c| c.as_text())
-            .map(|t| t.text.clone())
-            .expect("changed prose"),
-        "watch: since your last call: credentials file rewritten",
+    let changed = call_monitor_state(&server, 0);
+    assert!(
+        serde_json::from_str::<serde_json::Value>(&changed).is_err(),
+        "the state-wait reply must be prose, not a JSON blob: {changed}",
     );
 }
 
-/// No lock may span a sleep in the digest machinery: `watch` runs up to 60s,
-/// and a baseline lock held across its slices would stall every other
+/// No lock may span a sleep in the digest machinery: the state wait runs up
+/// to 60s, and a baseline lock held across its slices would stall every other
 /// digest-bearing reply on the server. The shape is what's checkable — a
 /// timing probe stays green under a slice-wise violation, because the mutex
 /// futex hands the lock to a parked waiter inside one 200ms slice — so this is
@@ -578,10 +483,10 @@ fn the_sleeping_function_never_locks_and_the_locking_functions_never_sleep() {
     }
 }
 
-/// The `delegate_result` done envelope is a digest-bearing reply too (it folds
-/// `live_usage`), so it reports and consumes like `which` does.
+/// The done envelope of a collected job is a digest-bearing reply too (it
+/// folds `live_usage`), so it reports and consumes like the session read does.
 #[test]
-fn delegate_result_done_envelope_reports_the_digest() {
+fn monitor_done_envelope_reports_the_digest() {
     let _home = HomeSandbox::new();
     seeded_world();
     let server = ClauthServer::new();
@@ -592,31 +497,17 @@ fn delegate_result_done_envelope_reports_the_digest() {
         "result": "all done",
     });
     jobs::write_done("d-digest-0", "work", 1, envelope.clone()).expect("write job");
-    let first = json_payload(&drive(server.delegate_result(Parameters(
-        DelegateResultArgs {
-            job_id: Some("d-digest-0".to_string()),
-            job_ids: None,
-            wait_secs: Some(0),
-            format: Some("json".to_string()),
-        },
-    ))));
+    let first = call_monitor_ids(&server, &["d-digest-0"], 0);
     assert!(
-        first.get("since_your_last_call").is_none(),
-        "first digest call seeds, even through delegate_result: {first}",
+        !first.contains("since your last call"),
+        "first digest call seeds, even through a collected job: {first}",
     );
 
     jobs::write_done("d-digest-1", "work", 1, envelope).expect("write job");
     set_mtime(&credentials_path(), t1());
-    let second = json_payload(&drive(server.delegate_result(Parameters(
-        DelegateResultArgs {
-            job_id: Some("d-digest-1".to_string()),
-            job_ids: None,
-            wait_secs: Some(0),
-            format: Some("json".to_string()),
-        },
-    ))));
-    assert_eq!(
-        second["since_your_last_call"]["credentials"], true,
+    let second = call_monitor_ids(&server, &["d-digest-1"], 0);
+    assert!(
+        second.contains("since your last call: credentials file rewritten"),
         "the done envelope reports what moved since the first call: {second}",
     );
 }
@@ -633,62 +524,60 @@ fn seed_done_job(id: &str) {
 }
 
 /// A batch is ONE call, so its digest rides the reply once, top-level beside
-/// `results` like every other surface. Folded into each done result instead, it
-/// is reported (and consumed) per job, and nests where no other surface puts
-/// it.
+/// the job lines, and is consumed by that one report.
 #[test]
-fn delegate_result_batch_carries_one_top_level_digest() {
+fn monitor_batch_carries_one_top_level_digest() {
     let _home = HomeSandbox::new();
     seeded_world();
     let server = ClauthServer::new();
 
     seed_done_job("d-batch-0");
     seed_done_job("d-batch-1");
-    let first = json_payload(&call_batch(&server, &["d-batch-0", "d-batch-1"], "json"));
-    assert!(
-        first.get("since_your_last_call").is_none(),
+    let first = call_monitor_ids(&server, &["d-batch-0", "d-batch-1"], 0);
+    assert_eq!(
+        first.matches("since your last call").count(),
+        0,
         "the first digest call seeds, through a batch like anywhere else: {first}",
     );
 
     set_mtime(&credentials_path(), t1());
     seed_done_job("d-batch-2");
     seed_done_job("d-batch-3");
-    let second = json_payload(&call_batch(&server, &["d-batch-2", "d-batch-3"], "json"));
+    let second = call_monitor_ids(&server, &["d-batch-2", "d-batch-3"], 0);
     assert_eq!(
-        second["since_your_last_call"]["credentials"], true,
-        "the batch reply carries the digest beside `results`: {second}",
+        second.matches("since your last call").count(),
+        1,
+        "the digest rides the batch reply exactly once, on its own last line: {second}",
     );
-    for entry in second["results"].as_array().expect("results is an array") {
-        assert!(
-            entry.get("since_your_last_call").is_none(),
-            "a per-result copy would nest the digest where no reader looks for \
-             it, on the first done job alone: {entry}",
-        );
-    }
-
-    let after = call_which(&server);
     assert!(
-        after.get("since_your_last_call").is_none(),
+        second.contains("since your last call: credentials file rewritten"),
+        "and it names what moved: {second}",
+    );
+
+    let after = call_session(&server);
+    assert!(
+        !after.contains("since your last call"),
         "the batch reported the change, so the batch consumed it: {after}",
     );
 }
 
-/// Prose is the default format and `single_block` emits prose ALONE, so a
-/// digest the batch consumes but never renders is lost for good.
+/// The digest a batch consumes must also be RENDERED, or it is lost for good.
 #[test]
-fn delegate_result_batch_prose_renders_the_digest() {
+fn monitor_batch_prose_renders_the_digest() {
     let _home = HomeSandbox::new();
     seeded_world();
     let server = ClauthServer::new();
 
     seed_done_job("d-bprose-0");
-    let _ = call_batch(&server, &["d-bprose-0"], "json");
+    let _ = call_monitor_ids(&server, &["d-bprose-0"], 0);
 
     set_mtime(&credentials_path(), t1());
     seed_done_job("d-bprose-1");
+    // One id renders through the single-job spelling, which carries live
+    // usage inline (the several-ids lines stay short instead).
     assert_eq!(
-        block_text(&call_batch(&server, &["d-bprose-1"], "prose")),
-        "job `d-bprose-1` finished: all done\n\
+        call_monitor_ids(&server, &["d-bprose-1"], 0),
+        "delegate to `work` finished: all done; target `work`: 5h unknown, 7d unknown; \
          since your last call: credentials file rewritten",
     );
 }

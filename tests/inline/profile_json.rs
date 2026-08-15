@@ -5,7 +5,7 @@ use crate::profile_cache::write_profile_cache;
 use crate::testutil::{HomeSandbox, blank_profile};
 use crate::usage::{PlanInfo, PlanTier};
 
-/// `tier_label` feeds both the MCP `list_profiles` and `which` tier fields, and
+/// `tier_label` feeds the MCP `profiles` rows (roster and session scope), and
 /// reads straight off `usage_cache.json` — never a live fetch. A canceled
 /// subscription reports its TIER here like every other account: the org drops to
 /// `claude_free` on cancellation, so `Free` already carries the fact, and the

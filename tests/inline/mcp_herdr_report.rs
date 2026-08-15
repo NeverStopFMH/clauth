@@ -185,7 +185,6 @@ fn assert_report_shape(line: &str, pane_id: &str, state: &str) -> u64 {
 /// A `DelegateArgs` with every optional field unset and JSON format.
 fn base() -> DelegateArgs {
     DelegateArgs {
-        profile: None,
         profiles: None,
         prompt: None,
         prompt_file: None,
@@ -198,8 +197,6 @@ fn base() -> DelegateArgs {
         resume: None,
         isolated: None,
         background: None,
-        monitor: None,
-        format: Some("json".to_string()),
     }
 }
 
@@ -359,7 +356,7 @@ fn sync_delegate_reports_working_then_idle() {
     let result = drive(
         &server,
         DelegateArgs {
-            profile: Some("sad".into()),
+            profiles: Some(vec!["sad".to_string()]),
             prompt: Some("hi".into()),
             ..base()
         },
@@ -388,7 +385,7 @@ fn refusal_before_commit_reports_nothing() {
     let result = drive(
         &server,
         DelegateArgs {
-            profile: Some("nope".into()),
+            profiles: Some(vec!["nope".to_string()]),
             prompt: Some("hi".into()),
             ..base()
         },
@@ -410,7 +407,7 @@ fn failing_herdr_does_not_fail_the_delegate() {
     let result = drive(
         &server,
         DelegateArgs {
-            profile: Some("sad".into()),
+            profiles: Some(vec!["sad".to_string()]),
             prompt: Some("hi".into()),
             ..base()
         },
@@ -438,7 +435,7 @@ fn hanging_herdr_does_not_block_the_delegate() {
     let result = drive(
         &server,
         DelegateArgs {
-            profile: Some("sad".into()),
+            profiles: Some(vec!["sad".to_string()]),
             prompt: Some("hi".into()),
             ..base()
         },
@@ -474,7 +471,7 @@ fn background_delegate_reports_working_then_idle() {
     let result = drive(
         &server,
         DelegateArgs {
-            profile: Some("bee".into()),
+            profiles: Some(vec!["bee".to_string()]),
             prompt: Some("hi".into()),
             background: Some(true),
             // Nonexistent: stops the detached task at the cwd gate, before
@@ -775,7 +772,7 @@ fn server_without_pane_env_spawns_nothing() {
     let result = drive(
         &server,
         DelegateArgs {
-            profile: Some("sad".into()),
+            profiles: Some(vec!["sad".to_string()]),
             prompt: Some("hi".into()),
             ..base()
         },
@@ -800,7 +797,7 @@ fn server_without_reporter_spawns_nothing_even_with_pane_env() {
     let result = drive(
         &server,
         DelegateArgs {
-            profile: Some("sad".into()),
+            profiles: Some(vec!["sad".to_string()]),
             prompt: Some("hi".into()),
             ..base()
         },

@@ -74,18 +74,8 @@ const PROMPT_FILE_CAP: u64 = 64 * 1024;
 /// undo, so a runaway list is bounded here.
 const MAX_FANOUT: usize = 8;
 
-/// Compact per-model throughput rows for a profile (observed tok/s, degraded /
-/// rate-limited flags). Empty array when clauth has launched no runs for it.
-fn throughput_json(profile: &str, now: i64) -> serde_json::Value {
-    let rows: Vec<serde_json::Value> = crate::throughput::summary(profile, now)
-        .into_iter()
-        .map(throughput_row)
-        .collect();
-    serde_json::Value::Array(rows)
-}
-
-/// One row of [`throughput_json`], shared with [`throughput_warnings`] so the
-/// two surfaces cannot drift into describing a model differently.
+/// One roster throughput row, shared by [`throughput_warnings`] so every
+/// surface describes a model the same way.
 fn throughput_row(m: crate::throughput::ModelSummary) -> serde_json::Value {
     serde_json::json!({
         "model": m.model,
@@ -97,10 +87,10 @@ fn throughput_row(m: crate::throughput::ModelSummary) -> serde_json::Value {
     })
 }
 
-/// The subset of [`throughput_json`] a roster is worth spending tokens on: only
-/// models a past `delegate` found degraded or recently rate-limited. A healthy
-/// row tells a picker nothing it would act on, and one operator's 19 healthy
-/// rows measured 31% of the whole `list_profiles` response.
+/// The subset of the per-model summary a roster is worth spending tokens on:
+/// only models a past `delegate` found degraded or recently rate-limited. A
+/// healthy row tells a picker nothing it would act on, and one operator's 19
+/// healthy rows measured 31% of the whole `profiles` response.
 fn throughput_warnings(profile: &str, now: i64) -> Vec<serde_json::Value> {
     crate::throughput::summary(profile, now)
         .into_iter()
@@ -116,6 +106,53 @@ fn load_windows(name: &str) -> (Option<UsageWindow>, Option<UsageWindow>) {
         Some(u) => (u.five_hour, u.seven_day),
         None => (None, None),
     }
+}
+
+/// One roster row for `p`, the shape both `profiles` scopes render through
+/// `profile_line`. The one builder keeps the all-scope roster and the
+/// session-scope row from disagreeing about what a profile is called.
+fn profile_row(p: &Profile, config: &AppConfig, now: i64) -> serde_json::Value {
+    let name = p.name.as_str();
+    let third_party = if p.is_third_party() {
+        load_profile_cache::<ThirdPartyStats>(name, THIRD_PARTY_CACHE_FILE)
+            .as_ref()
+            .map(render::third_party_headline)
+    } else {
+        None
+    };
+    let mut row = serde_json::json!({
+        "name": name,
+        "active": config.is_active(name),
+        "provider": provider_label(p),
+        "tier": tier_label(p),
+        "windows": windows_json(name),
+        "third_party": third_party,
+    });
+    // Host, not the full endpoint: every profile of one provider repeats the
+    // same path, and the cost model only ever asks whether the host is
+    // loopback or LAN.
+    if let Some(url) = &p.base_url {
+        row["host"] = serde_json::json!(render::base_url_host(url));
+    }
+    // Both of these are absent unless they say something. Emitted
+    // unconditionally they were 39% of a 27-profile response, nearly all of it
+    // `false` and rows carrying no warning.
+    if crate::runtime::has_live_session(name) {
+        row["has_live_session"] = serde_json::json!(true);
+    }
+    let warnings = throughput_warnings(name, now);
+    if !warnings.is_empty() {
+        row["throughput"] = serde_json::Value::Array(warnings);
+    }
+    // A third-party profile with no inference auth source is a delegate target
+    // that refuses at the spawn gate, so this flags it before the picker spends
+    // the call. `has_inference_auth` is the delegate guard's own predicate,
+    // not the usage predicate `third_party_credentialed` (which wrongly
+    // exempts Alibaba's console session).
+    if p.is_third_party() && !crate::claude::has_inference_auth(p) {
+        row["keyless"] = serde_json::json!(true);
+    }
+    row
 }
 
 /// The roster's sort key for one profile. A real window first (5h, the pool a
@@ -169,43 +206,13 @@ fn parse_balance(value: &str) -> Option<(String, f64)> {
     Some((currency.to_string(), amount))
 }
 
-/// Output format for every tool. `prose` is the default; `json` is the opt-in a
-/// caller must name.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Format {
-    Prose,
-    Json,
-}
-
-impl Format {
-    /// Resolve the tool's `format` argument. Unset means prose. An unrecognised
-    /// value is refused by name so a typo cannot silently degrade to prose.
-    fn parse(raw: Option<&str>) -> std::result::Result<Self, String> {
-        match raw {
-            None | Some("prose") => Ok(Format::Prose),
-            Some("json") => Ok(Format::Json),
-            Some(other) => Err(format!(
-                "unrecognized format \"{other}\": accepted \"prose\" and \"json\""
-            )),
-        }
-    }
-}
-
-/// Refuse an argument value by name (`format`, `watch`'s `kinds`): a
-/// `{ok: false, reason}` JSON text block, the shape every such refusal uses.
-fn arg_refusal(reason: String) -> CallToolResult {
-    CallToolResult::error(vec![ContentBlock::text(
-        serde_json::json!({ "ok": false, "reason": reason }).to_string(),
-    )])
-}
-
-/// A `delegate` argument/validation refusal: one `{is_error, result}` envelope in
-/// one content block, honouring the caller's `format`. Prose reads as a sentence;
-/// JSON keeps the same keys as every other delegate refusal.
-fn delegate_refusal(format: Format, reason: &str) -> CallToolResult {
+/// A `delegate` argument/validation refusal: one `{is_error, result}` envelope
+/// in one content block. Prose reads as a sentence; the payload keeps the same
+/// keys as every other delegate refusal.
+fn delegate_refusal(reason: &str) -> CallToolResult {
     let payload = serde_json::json!({ "is_error": true, "result": reason });
     let prose = render::delegate_refusal_prose(&payload);
-    CallToolResult::error(single_block(payload, format, prose))
+    CallToolResult::error(single_block(prose))
 }
 
 /// The live-usage footer folded into a payload as data: which profile the
@@ -223,13 +230,11 @@ fn live_usage_json(
     })
 }
 
-/// Collapse one payload to exactly one content block in the requested format.
-/// `prose` is the payload's prose spelling (already computed).
-fn single_block(payload: serde_json::Value, format: Format, prose: String) -> Vec<ContentBlock> {
-    vec![ContentBlock::text(match format {
-        Format::Json => payload.to_string(),
-        Format::Prose => prose,
-    })]
+/// Collapse one reply to exactly one content block. The JSON payload is
+/// internal — every renderer in `render.rs` reads it — and prose is the only
+/// spelling a caller sees.
+fn single_block(prose: String) -> Vec<ContentBlock> {
+    vec![ContentBlock::text(prose)]
 }
 
 /// Fold the active profile's live usage into a payload, replacing the old
@@ -272,7 +277,7 @@ fn fold_active_live_usage(
 }
 
 /// Fold the target profile's live usage into a delegate envelope (the sync
-/// `delegate` and `delegate_result` done-handoff paths share this). The
+/// `delegate` and `monitor` done-handoff paths share this). The
 /// envelope is whatever `claude` printed, so it may be ANY json shape:
 /// `parse_delegate_envelope` returns non-objects verbatim. A non-object is
 /// wrapped under `result` (the documented self-report key) first — `serde_json`'s
@@ -321,33 +326,33 @@ pub(crate) struct ClauthServer {
 pub(crate) struct SwitchArgs {
     /// Profile name to relink the global active credentials to.
     name: String,
-    /// Output format: `prose` (default) or `json`.
-    format: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
-pub(crate) struct ListProfilesArgs {
+pub(crate) struct ProfilesArgs {
     /// Restrict the roster to these profiles (case-insensitive). Omit it, or
     /// pass an empty list, for every profile.
     names: Option<Vec<String>>,
-    /// Output format: `prose` (default) or `json`.
-    format: Option<String>,
+    /// `all` (default): every profile. `session`: the one account this
+    /// session's own credentials belong to, with `source` saying how that
+    /// resolved — not always the configured active one. `names` filters the
+    /// `all` scope only: it cannot combine with `session` (refused by name).
+    scope: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub(crate) struct DelegateArgs {
-    /// Profile name to run the headless delegate session under. Exactly one of
-    /// `profile` or `profiles`.
-    profile: Option<String>,
-    /// Fan out one delegate per named account, background-only. Exactly one of
-    /// `profile` or `profiles`; a fan-out spends one usage window per account.
+    /// Which account(s) to run on, in canonical-resolved spelling: one name is
+    /// a single delegate (blocking unless `background` is set); two or more is
+    /// a background-only fan-out spending one usage window per account.
     profiles: Option<Vec<String>>,
-    /// Prompt passed to the delegated `claude -p` session. Exactly one of
-    /// `prompt` or `prompt_file`.
+    /// Prompt passed to the delegated `claude -p` session.
     prompt: Option<String>,
-    /// Path (relative to `cwd`) of a file whose contents are the prompt. Read
-    /// once and reused across a fan-out. Exactly one of `prompt` or
-    /// `prompt_file`.
+    /// Path (relative to `cwd`) of a file whose contents are the prompt, read
+    /// once and reused across a fan-out so a long reusable prompt costs the
+    /// calling model's context nothing. Exactly one of `prompt` or this one,
+    /// never both and never neither: a call naming both (or neither) is refused
+    /// by name.
     prompt_file: Option<String>,
     /// Optional model override for the delegated session.
     model: Option<String>,
@@ -384,54 +389,23 @@ pub(crate) struct DelegateArgs {
     /// blind session). Defaults to false.
     isolated: Option<bool>,
     /// Return a `{job_id}` immediately instead of blocking for the result. The
-    /// delegate runs on a detached task; collect the result via the auto-delivery
-    /// hook or `delegate_result({job_id})`. Defaults to false.
+    /// delegate runs on a detached task; the result arrives on its own via
+    /// clauth's PostToolUse hook, and `monitor` checks, collects or stops it.
+    /// Defaults to false.
     background: Option<bool>,
-    /// Opt into progress reporting for a `background` run: a `delegate_result`
-    /// poll on the still-running job then also reports the target profile's live
-    /// usage windows (`quota`) alongside `elapsed_secs`. No effect on a blocking
-    /// call. Defaults to false.
-    monitor: Option<bool>,
-    /// Output format: `prose` (default) or `json`.
-    format: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
-pub(crate) struct DelegateResultArgs {
-    /// Job id returned by a `delegate` call made with `background: true`.
-    /// Exactly one of `job_id` or `job_ids`.
-    job_id: Option<String>,
-    /// Collect several backgrounded jobs in one call: one result per id, in the
-    /// order given (the done envelope, a running status, or `unknown` for an
-    /// absent id). Capped at 256 ids: the job store keeps at most that many
-    /// files, so a longer list buys nothing. Exactly one of `job_id` or
-    /// `job_ids`.
+pub(crate) struct MonitorArgs {
+    /// Job ids returned by `delegate({background: true})`: one id checks or
+    /// collects that job, several collect in one call (one result per id, in
+    /// the order given, capped at 256).
     job_ids: Option<Vec<String>>,
-    /// Seconds to long-poll for completion before returning (0..=60, default 0 =
-    /// reply instantly with the current state).
+    /// Seconds to long-poll before returning (0..=60, default 0 = reply
+    /// instantly). Exactly one mode per call: with `job_ids` this bounds the
+    /// wait for a job to finish; with none it bounds the wait on clauth's own
+    /// state, which is the mode `job_ids` cannot name.
     wait_secs: Option<u64>,
-    /// Output format: `prose` (default) or `json`.
-    format: Option<String>,
-}
-
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
-pub(crate) struct WhichArgs {
-    /// Output format: `prose` (default) or `json`.
-    format: Option<String>,
-}
-
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
-pub(crate) struct WatchArgs {
-    /// Seconds to long-poll for a change before returning (0..=60, default 0 =
-    /// sample once and answer immediately).
-    wait_secs: Option<u64>,
-    /// Which observables to watch: a subset of `active_profile`,
-    /// `usage_cache`, `credentials`. Omit it, or pass an empty list, for all
-    /// three. Changes to observables outside the set are left for the next
-    /// digest-bearing reply to report.
-    kinds: Option<Vec<String>>,
-    /// Output format: `prose` (default) or `json`.
-    format: Option<String>,
 }
 
 #[tool_router]
@@ -458,27 +432,51 @@ impl ClauthServer {
     }
 
     #[tool(
-        description = "Every clauth profile from disk cache; zero quota, no network. Call it at \
-session start, and pass `names` to re-check one profile instead of pulling the whole roster. \
-Reading the JSON: `utilization_pct` in `windows[]` is the percent of that window already USED, so \
-higher means less headroom. `tier` is the plan label; a canceled subscription reports the org's \
-post-cancellation tier (`Free`), never the word `canceled`. `host` is the endpoint's host, absent \
-for a default OAuth profile. `third_party` is a cached balance or quota headline for provider-key \
-profiles. Three fields appear only when they carry news: `has_live_session` when a clauth-managed \
-session already owns the profile, `throughput[]` (observed tok/s from past `delegate` calls) only \
-for a model that is `degraded` or `rate_limited_recent` (either makes it a bad pick), and `keyless` \
-when a third-party profile has no inference auth source (a `delegate` there refuses). \
-Replies in prose by default; pass `format: \"json\"` for the structured roster."
+        description = "Every clauth account, from disk cache: zero quota, no network. Call it \
+before picking a `delegate` target, and pass `names` to re-check one account instead of the whole \
+roster. `scope: \"session\"` answers which account THIS session's own credentials belong to, with \
+`source` saying how that resolved; the configured active account can differ. In a row, higher \
+`utilization_pct` means less headroom, and `keyless`, `disabled` or `auth_broken` appear only when \
+true; each means `delegate` refuses that target."
     )]
-    async fn list_profiles(
+    async fn profiles(
         &self,
-        Parameters(ListProfilesArgs { names, format }): Parameters<ListProfilesArgs>,
+        Parameters(ProfilesArgs { names, scope }): Parameters<ProfilesArgs>,
     ) -> Result<CallToolResult, ErrorData> {
-        let format = match Format::parse(format.as_deref()) {
-            Ok(f) => f,
-            Err(reason) => return Ok(arg_refusal(reason)),
-        };
         let config = load_config().map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+        if let Some(raw) = scope.as_deref()
+            && !matches!(raw, "all" | "session")
+        {
+            // An unrecognised scope is refused by name so a typo cannot
+            // silently answer the wrong question.
+            let payload = serde_json::json!({
+                "ok": false,
+                "reason": format!(
+                    "unrecognized scope \"{raw}\": accepted \"all\" and \"session\""
+                ),
+            });
+            let prose = render::list_profiles_prose(&payload);
+            return Ok(CallToolResult::error(single_block(prose)));
+        }
+        if scope.as_deref() == Some("session") {
+            // Cross-mode refusal, the same boundary rule as `monitor`'s
+            // job/state seam: the session scope answers one account and cannot
+            // be narrowed further, so a `names` list is a mistake worth naming
+            // rather than silently ignoring — the all-scope arm would have
+            // refused an unknown member by name.
+            if let Some(names) = names.as_deref()
+                && !names.is_empty()
+            {
+                let payload = serde_json::json!({
+                    "ok": false,
+                    "reason": "`names` cannot combine with `scope: \"session\"`: the session \
+                               scope answers the one account this session runs on; drop `names`",
+                });
+                let prose = render::list_profiles_prose(&payload);
+                return Ok(CallToolResult::error(single_block(prose)));
+            }
+            return self.profiles_session(&config);
+        }
         let now = now_epoch_secs();
 
         // Resolve the filter before rendering anything. A name matching nothing
@@ -502,7 +500,7 @@ Replies in prose by default; pass `format: \"json\"` for the structured roster."
                         ),
                     });
                     let prose = render::list_profiles_prose(&payload);
-                    return Ok(CallToolResult::error(single_block(payload, format, prose)));
+                    return Ok(CallToolResult::error(single_block(prose)));
                 }
                 Some(
                     found
@@ -521,119 +519,61 @@ Replies in prose by default; pass `format: \"json\"` for the structured roster."
                     .as_ref()
                     .is_none_or(|w| w.iter().any(|n| n == p.name.as_str()))
             })
-            .map(|p| {
-                let name = p.name.as_str();
-                let third_party = if p.is_third_party() {
-                    load_profile_cache::<ThirdPartyStats>(name, THIRD_PARTY_CACHE_FILE)
-                        .as_ref()
-                        .map(render::third_party_headline)
-                } else {
-                    None
-                };
-                let mut row = serde_json::json!({
-                    "name": name,
-                    "active": config.is_active(name),
-                    "provider": provider_label(p),
-                    "tier": tier_label(p),
-                    "windows": windows_json(name),
-                    "third_party": third_party,
-                });
-                // Host, not the full endpoint: every profile of one provider
-                // repeats the same path, and the cost model only ever asks
-                // whether the host is loopback or LAN.
-                if let Some(url) = &p.base_url {
-                    row["host"] = serde_json::json!(render::base_url_host(url));
-                }
-                // Both of these are absent unless they say something. Emitted
-                // unconditionally they were 39% of a 27-profile response, nearly
-                // all of it `false` and rows carrying no warning.
-                if crate::runtime::has_live_session(name) {
-                    row["has_live_session"] = serde_json::json!(true);
-                }
-                let warnings = throughput_warnings(name, now);
-                if !warnings.is_empty() {
-                    row["throughput"] = serde_json::Value::Array(warnings);
-                }
-                // A third-party profile with no inference auth source is a
-                // delegate target that refuses at the spawn gate, so this flags
-                // it before the picker spends the call. `has_inference_auth` is
-                // the delegate guard's own predicate, not the usage predicate
-                // `third_party_credentialed` (which wrongly exempts Alibaba's
-                // console session).
-                if p.is_third_party() && !crate::claude::has_inference_auth(p) {
-                    row["keyless"] = serde_json::json!(true);
-                }
-                row
-            })
+            .map(|p| profile_row(p, &config, now))
             .collect();
 
         let payload = serde_json::json!({ "profiles": profiles });
         let prose = render::list_profiles_prose(&payload);
-        Ok(CallToolResult::success(single_block(
-            payload, format, prose,
-        )))
+        Ok(CallToolResult::success(single_block(prose)))
     }
 
-    #[tool(
-        description = "Which profile owns the credentials THIS session loaded, which is not \
-always the active one. `source` says how it resolved: `refresh_match` / `session_token_match` (a \
-profile's stored credential matches the live one), `session_dir` (this session's runtime dir pins \
-the profile), `credential_less_active` (the configured active profile, nothing on disk to match). \
-The reply carries the active profile's live 5h/7d usage, plus `since_your_last_call` when \
-clauth's state moved since the last reply that reported it (see `watch`). Prose by default; pass \
-`format: \"json\"` for the structured payload."
-    )]
-    async fn which(
-        &self,
-        Parameters(WhichArgs { format }): Parameters<WhichArgs>,
-    ) -> Result<CallToolResult, ErrorData> {
-        let format = match Format::parse(format.as_deref()) {
-            Ok(f) => f,
-            Err(reason) => return Ok(arg_refusal(reason)),
-        };
-        let config = load_config().map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
-        let resolved = crate::which::resolve_active(&config);
-        let throughput = resolved
-            .as_ref()
-            .map(|(name, _)| throughput_json(name, now_epoch_secs()))
-            .unwrap_or_else(|| serde_json::Value::Array(Vec::new()));
-        let tier = resolved.as_ref().and_then(|(name, _)| {
-            config
-                .profiles
-                .iter()
-                .find(|p| p.name.as_str() == name.as_str())
-                .and_then(tier_label)
-        });
+    /// The `scope: "session"` arm: the one row the account THIS session runs on
+    /// resolves to, through the same `which::resolve_active` tiers the session
+    /// itself resolves by, plus `source`. Rendered through `profile_line` so the
+    /// row carries the roster's own guards (the anthropic tier guard included).
+    fn profiles_session(&self, config: &AppConfig) -> Result<CallToolResult, ErrorData> {
+        let resolved = crate::which::resolve_active(config);
+        let mut rows = Vec::with_capacity(1);
+        if let Some((name, source)) = resolved.as_ref()
+            && let Some(p) = config.find(name)
+        {
+            let mut row = profile_row(p, config, now_epoch_secs());
+            row["source"] = serde_json::json!(source.as_str());
+            rows.push(row);
+        }
         let payload = fold_active_live_usage(
-            serde_json::json!({
-                "profile": resolved.as_ref().map(|(name, _)| name),
-                "source": resolved.as_ref().map(|(_, source)| source.as_str()),
-                "tier": tier,
-                "throughput": throughput,
-            }),
-            &config,
+            serde_json::json!({ "scope": "session", "profiles": rows }),
+            config,
             DigestMode::Report(&self.digest),
         );
-        let prose = render::which_prose(&payload);
-        Ok(CallToolResult::success(single_block(
-            payload, format, prose,
-        )))
+        let mut prose = render::list_profiles_prose(&payload);
+        // Session facts ride this reply through the same renderers the
+        // instructions block uses (placement rule 3: one renderer, two
+        // carriers), so a client that drops the block still sees them.
+        let auth = crate::which::session_auth();
+        prose.push_str("\n\n");
+        prose.push_str(&render::switch_effect_note(&auth));
+        if let Some(note) = render::runtime_paths_note(&auth) {
+            prose.push_str("\n\n");
+            prose.push_str(&note);
+        }
+        Ok(CallToolResult::success(single_block(prose)))
     }
 
     #[tool(
-        description = "Relink the global `~/.claude` credentials to another profile. What that \
-does to THIS session depends on how it reads credentials; the server instructions say which case \
-this session is in. Prose by default; pass `format: \"json\"` for the structured payload."
+        description = "Relink the global `~/.claude` credentials to another account. Whether THIS \
+session follows depends on how it reads credentials: the reply says which case it is in, and \
+`profiles({scope:\"session\"})` says so before you commit. To use another account without \
+disturbing this session, use `delegate`."
     )]
-    async fn switch(
+    async fn switch_profile(
         &self,
-        Parameters(SwitchArgs { name, format }): Parameters<SwitchArgs>,
+        Parameters(SwitchArgs { name }): Parameters<SwitchArgs>,
     ) -> Result<CallToolResult, ErrorData> {
-        let format = match Format::parse(format.as_deref()) {
-            Ok(f) => f,
-            Err(reason) => return Ok(arg_refusal(reason)),
-        };
         let config = load_config().map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+        // The reply's session-effect note, resolved once: `session_auth` reads
+        // the env this server was launched with, which no arm below can move.
+        let session_note = render::switch_effect_note(&crate::which::session_auth());
 
         // Resolve the raw tool argument to a stored profile (case-insensitive)
         // BEFORE any mutation — the same guard the CLI applies. Skipping it lets an
@@ -644,12 +584,14 @@ this session is in. Prose by default; pass `format: \"json\"` for the structured
             let payload =
                 serde_json::json!({ "ok": false, "reason": format!("profile not found: {name}") });
             // Refused before any mutation ran, so nothing of ours moved: this
-            // arm reports like `which` does. The post-mutation arms below
-            // reseed instead.
+            // arm reports like the session-scope roster does. The
+            // post-mutation arms below reseed instead.
             let payload =
                 fold_active_live_usage(payload, &config, DigestMode::Report(&self.digest));
-            let prose = render::switch_prose(&payload);
-            return Ok(CallToolResult::error(single_block(payload, format, prose)));
+            let mut prose = render::switch_prose(&payload);
+            prose.push_str("\n\n");
+            prose.push_str(&session_note);
+            return Ok(CallToolResult::error(single_block(prose)));
         };
         let on_divergence = config.state.default_divergence;
 
@@ -689,10 +631,10 @@ this session is in. Prose by default; pass `format: \"json\"` for the structured
                     &config,
                     DigestMode::Reseed(&self.digest),
                 );
-                let prose = render::switch_prose(&payload);
-                Ok(CallToolResult::success(single_block(
-                    payload, format, prose,
-                )))
+                let mut prose = render::switch_prose(&payload);
+                prose.push_str("\n\n");
+                prose.push_str(&session_note);
+                Ok(CallToolResult::success(single_block(prose)))
             }
             Err(e) => {
                 // Failed AFTER the mutation ran, so it may have written on the
@@ -703,51 +645,35 @@ this session is in. Prose by default; pass `format: \"json\"` for the structured
                     &config,
                     DigestMode::Reseed(&self.digest),
                 );
-                let prose = render::switch_prose(&payload);
-                Ok(CallToolResult::error(single_block(payload, format, prose)))
+                let mut prose = render::switch_prose(&payload);
+                prose.push_str("\n\n");
+                prose.push_str(&session_note);
+                Ok(CallToolResult::error(single_block(prose)))
             }
         }
     }
 
     #[tool(
-        description = "Run a task on another clauth profile: a fresh headless `claude` session \
-under that account's credentials. It SPENDS that account's window or money, so pick the target \
-from `list_profiles`. It sees only the `prompt` you pass and has no view of this conversation, so \
-state the whole task there.\n\n\
-Give exactly one prompt source: `prompt` inline, or `prompt_file` — a path relative to `cwd` \
-whose contents are the prompt. `prompt_file` is read once (validated against `cwd`, size-capped, refused when not UTF-8) \
-so a long reusable prompt costs your context nothing to pass, and a `profiles` fan-out reuses \
-that one read across every account. Exactly one target too: `profile` for one account, or \
-`profiles` for a background-only fan-out that spawns one delegate per named account and spends \
-one usage window per account, returning one `job_id` per account.\n\n\
-Blocking by default. Pass `background: true` for a `{job_id}` now; the result auto-arrives via \
-clauth's PostToolUse hook, and `delegate_result({job_id})` is the fallback when hooks are off. \
-A fan-out's every envelope auto-arrives that way too; with hooks off, poll each id with \
-`delegate_result`. Prefer `background` for a slow or third-party endpoint, where a blocking call \
-ties up this turn. \
-Add `monitor: true` so a `delegate_result` poll reports `elapsed_secs` + the target's live \
-`quota`.\n\n\
-`isolated: true` for a one-shot: a clean session with no operator `CLAUDE.md`, plugins, hooks, \
-skills or MCP servers, so it is cheaper and bills fewer tokens. Leave it false only when the task \
-needs this repo's tools, and scope those with \
-`args:[\"--mcp-config\",\"<json|path>\",\"--strict-mcp-config\"]`. Either way the delegate loads \
-the project `CLAUDE.md` of its `cwd` (defaults to this server's cwd), so point `cwd` at a clean \
-dir for an unrelated one-shot.\n\n\
-Depth-capped at 1: a delegate cannot call `delegate` again. Its own subagents do run, under the \
-SAME profile.\n\n\
-Killed after `idle_secs` of total silence or the `timeout_secs` wall clock; a run that keeps \
-streaming is never cut off. A kill returns `timed_out`, whatever text it had in `partial_result` \
-(the window is spent either way), and a `session_id` when the run is resumable — pass it as \
-`resume` with a new `prompt` instead of paying for the work twice. An `isolated` run is resumable \
-only with clauth's auto-rescue on, and the killed envelope says which case it is.\n\n\
-Returns the envelope (`result`, `is_error`, `total_cost_usd`, token usage). `result` is the \
-delegate's own self-report, so spot-verify it like any subagent.\n\n\
-Prose by default; pass `format: \"json\"` for the structured envelope."
+        description = "Run a task on another clauth account: a fresh headless `claude` session \
+under that account's credentials. It spends that account's window or money, so pick the target \
+from `profiles`. The delegate sees only `prompt` and nothing of this conversation, so state the \
+whole task there, and spot-verify its `result` like any subagent's.\n\n\
+Cost by target: an account with no `host` burns that subscription's 5h window; DeepSeek or Z.ai \
+bills real money; Alibaba Model Studio draws down a prepaid plan; a loopback or LAN host is \
+free.\n\n\
+`background: true` returns a `{job_id}` now and the result arrives on its own; prefer it for a \
+slow or third-party target. Two or more `profiles` always run background, one window spent per \
+account. Check, collect or stop a job with `monitor`.\n\n\
+`isolated: true` for a one-shot: no operator `CLAUDE.md`, plugins, hooks, skills or MCP servers, \
+so it bills fewer tokens. Leave it false when the task needs this repo's tools. Either way the \
+delegate loads the project `CLAUDE.md` of `cwd`, so point `cwd` at a clean dir for an unrelated \
+one-shot.\n\n\
+A run silent for `idle_secs`, or past the `timeout_secs` wall clock, is killed and hands back the \
+text it had plus a `session_id` to `resume`, rather than paying for that work twice."
     )]
     async fn delegate(
         &self,
         Parameters(DelegateArgs {
-            profile,
             profiles,
             prompt,
             prompt_file,
@@ -760,14 +686,8 @@ Prose by default; pass `format: \"json\"` for the structured envelope."
             resume,
             isolated,
             background,
-            monitor,
-            format,
         }): Parameters<DelegateArgs>,
     ) -> Result<CallToolResult, ErrorData> {
-        let format = match Format::parse(format.as_deref()) {
-            Ok(f) => f,
-            Err(reason) => return Ok(arg_refusal(reason)),
-        };
         // Fail closed: a present-but-unparseable value is treated as max depth
         // (refuse), so a corrupt env can never re-enable delegation. Only a truly
         // absent var is depth 0.
@@ -777,27 +697,21 @@ Prose by default; pass `format: \"json\"` for the structured envelope."
         };
         if depth >= 1 {
             // The refusal fires before target validation, but the caller's own
-            // spelling is known here: name the target it asked for instead of a
-            // `null` profile. `profile` / `profiles` are optional keys, present
-            // only when the caller named that spelling.
-            let payload = match (&profile, &profiles) {
-                (Some(t), _) => serde_json::json!({
-                    "profile": t,
-                    "is_error": true,
-                    "result": "delegation depth exceeded (max 1)",
-                }),
-                (None, Some(names)) => serde_json::json!({
+            // spelling is known here: name the targets it asked for. `profiles`
+            // is an optional key, present only when the caller named one.
+            let payload = match &profiles {
+                Some(names) => serde_json::json!({
                     "profiles": names,
                     "is_error": true,
                     "result": "delegation depth exceeded (max 1)",
                 }),
-                (None, None) => serde_json::json!({
+                None => serde_json::json!({
                     "is_error": true,
                     "result": "delegation depth exceeded (max 1)",
                 }),
             };
             let prose = render::delegate_refusal_prose(&payload);
-            return Ok(CallToolResult::error(single_block(payload, format, prose)));
+            return Ok(CallToolResult::error(single_block(prose)));
         }
 
         // Exactly one prompt source. A prompt read from a file still costs the
@@ -809,49 +723,38 @@ Prose by default; pass `format: \"json\"` for the structured envelope."
             } else {
                 "exactly one of `prompt` or `prompt_file` must be given; neither was"
             };
-            return Ok(delegate_refusal(format, reason));
-        }
-
-        // Exactly one target: a single account, or a `profiles` fan-out.
-        if profile.is_some() == profiles.is_some() {
-            let reason = if profile.is_some() {
-                "exactly one of `profile` or `profiles` must be given; both were"
-            } else {
-                "exactly one of `profile` or `profiles` must be given; neither was"
-            };
-            return Ok(delegate_refusal(format, reason));
+            return Ok(delegate_refusal(reason));
         }
 
         let config = load_config().map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
 
         // Which accounts to spend, in canonical spelling, resolved BEFORE any
-        // spawn or read. A fan-out is background-only: blocking N accounts has no
-        // sensible timeout story, so it is refused by name here.
+        // spawn or read. One name is one target (blocking unless `background`);
+        // a fan-out is background-only — blocking N accounts has no sensible
+        // timeout story, so it is refused by name here.
         enum Target {
             One(String),
             Many(Vec<String>),
         }
-        let target = if let Some(raw) = profiles.as_deref() {
-            if !background.unwrap_or(false) {
-                return Ok(delegate_refusal(
-                    format,
-                    "`profiles` requires `background: true`",
-                ));
-            }
-            match resolve_fanout(&config, raw) {
-                Ok(names) => Target::Many(names),
-                Err(reason) => return Ok(delegate_refusal(format, &reason)),
-            }
-        } else {
-            // `profile` is Some here: the exactly-one guard above just proved it.
-            let raw = profile.as_deref().unwrap_or_default();
-            let Some(name) = config.canonical_name(raw) else {
-                return Ok(delegate_refusal(
-                    format,
-                    &format!("profile not found: {raw}"),
-                ));
+        let raw: Vec<String> = profiles.unwrap_or_default();
+        let target = if raw.len() == 1 {
+            let Some(name) = config.canonical_name(&raw[0]) else {
+                return Ok(delegate_refusal(&format!("profile not found: {}", raw[0])));
             };
             Target::One(name)
+        } else if raw.is_empty() {
+            return Ok(delegate_refusal(
+                "`profiles` is empty: name at least one profile",
+            ));
+        } else if !background.unwrap_or(false) {
+            return Ok(delegate_refusal(
+                "`profiles` requires `background: true` for a fan-out",
+            ));
+        } else {
+            match resolve_fanout(&config, &raw) {
+                Ok(names) => Target::Many(names),
+                Err(reason) => return Ok(delegate_refusal(&reason)),
+            }
         };
 
         // Resolve the prompt text once, before any spawn, so a fan-out reuses one
@@ -859,7 +762,7 @@ Prose by default; pass `format: \"json\"` for the structured envelope."
         let prompt: std::sync::Arc<str> = match prompt_file.as_deref() {
             Some(rel) => match read_prompt_file(cwd.as_deref(), rel) {
                 Ok(text) => text.into(),
-                Err(reason) => return Ok(delegate_refusal(format, &reason)),
+                Err(reason) => return Ok(delegate_refusal(&reason)),
             },
             None => prompt.as_deref().unwrap_or_default().to_string().into(),
         };
@@ -889,7 +792,7 @@ Prose by default; pass `format: \"json\"` for the structured envelope."
                         )
                     })?;
                     if let Err(reason) = preflight_target(target, &name) {
-                        return Ok(delegate_refusal(format, &reason));
+                        return Ok(delegate_refusal(&reason));
                     }
                     let opts = BackgroundOpts {
                         prompt,
@@ -903,9 +806,8 @@ Prose by default; pass `format: \"json\"` for the structured envelope."
                         isolation,
                         depth,
                     };
-                    let (job_id, started_at) =
-                        reserve_background_job(&name, monitor.unwrap_or(false))
-                            .map_err(|e| ErrorData::internal_error(e, None))?;
+                    let (job_id, started_at) = reserve_background_job(&name)
+                        .map_err(|e| ErrorData::internal_error(e, None))?;
                     // Commits to launch: the job file is reserved and the task
                     // spawns next. `begin` reports `working` on the 0→1
                     // transition; each task's end-guard decrements, and the
@@ -927,9 +829,7 @@ Prose by default; pass `format: \"json\"` for the structured envelope."
                         "status": "running",
                     });
                     let prose = render::delegate_prose(&payload);
-                    return Ok(CallToolResult::success(single_block(
-                        payload, format, prose,
-                    )));
+                    return Ok(CallToolResult::success(single_block(prose)));
                 }
                 Target::Many(names) => {
                     let opts = BackgroundOpts {
@@ -944,7 +844,6 @@ Prose by default; pass `format: \"json\"` for the structured envelope."
                         isolation,
                         depth,
                     };
-                    let monitor = monitor.unwrap_or(false);
                     // Reserve every job file BEFORE the first spawn: the reserve
                     // is the only fallible step left here (ENOSPC / perms on the
                     // jobs dir; the target pre-flight already ran in
@@ -953,13 +852,13 @@ Prose by default; pass `format: \"json\"` for the structured envelope."
                     // drop them and keep the all-or-nothing contract.
                     let mut handles = Vec::with_capacity(names.len());
                     for name in &names {
-                        match reserve_background_job(name, monitor) {
+                        match reserve_background_job(name) {
                             Ok(handle) => handles.push(handle),
                             Err(reason) => {
                                 for (job_id, _) in &handles {
                                     jobs::remove(job_id);
                                 }
-                                return Ok(delegate_refusal(format, &reason));
+                                return Ok(delegate_refusal(&reason));
                             }
                         }
                     }
@@ -984,9 +883,7 @@ Prose by default; pass `format: \"json\"` for the structured envelope."
                     }
                     let payload = serde_json::json!({ "jobs": jobs });
                     let prose = render::delegate_fanout_prose(&payload);
-                    return Ok(CallToolResult::success(single_block(
-                        payload, format, prose,
-                    )));
+                    return Ok(CallToolResult::success(single_block(prose)));
                 }
             }
         }
@@ -1047,110 +944,64 @@ Prose by default; pass `format: \"json\"` for the structured envelope."
             .unwrap_or(false);
         let prose = render::delegate_prose(&payload);
         if is_error {
-            Ok(CallToolResult::error(single_block(payload, format, prose)))
+            Ok(CallToolResult::error(single_block(prose)))
         } else {
-            Ok(CallToolResult::success(single_block(
-                payload, format, prose,
-            )))
+            Ok(CallToolResult::success(single_block(prose)))
         }
     }
 
     #[tool(
-        description = "Collect a backgrounded `delegate` by `job_id`. Normally unnecessary: \
-clauth's PostToolUse hook delivers the result on its own. Use it when hooks are off, or to check \
-progress; `wait_secs` (0..=60) long-polls. Returns the delegate envelope when done, else \
-`{status:\"running\", elapsed_secs, quota?}` (`quota` only when that `delegate` call set \
-`monitor: true`), or an error for an unknown `job_id`. A `job_ids` list collects several jobs in \
-one call instead: one result per id, in the order given (the done envelope, a running status, or \
-`unknown` for an absent id), capped at 256. Exactly one of `job_id` or `job_ids`. Prose by \
-default (a batch reads as one line per job); pass `format: \"json\"` for the structured payload."
+        description = "Check, collect or stop a backgrounded `delegate`, or wait on clauth's own \
+state. A running job reports its account, elapsed time, how long until each deadline kills it, and \
+its latest output, so a check is worth the turn it costs; a finished one returns the delegate \
+envelope. `wait_secs` blocks until one named job finishes, or until clauth's state moves when you \
+name none. `return_on: \"all\"` waits for the slowest job instead of the first. `cancel: true` \
+stops the named jobs and keeps whatever they produced."
     )]
-    async fn delegate_result(
+    async fn monitor(
         &self,
-        Parameters(DelegateResultArgs {
-            job_id,
-            job_ids,
-            wait_secs,
-            format,
-        }): Parameters<DelegateResultArgs>,
+        Parameters(MonitorArgs { job_ids, wait_secs }): Parameters<MonitorArgs>,
     ) -> Result<CallToolResult, ErrorData> {
-        let format = match Format::parse(format.as_deref()) {
-            Ok(f) => f,
-            Err(reason) => return Ok(arg_refusal(reason)),
-        };
-        // Exactly one id source, mirrored from `delegate`'s target pair: a
-        // call that named both, or neither, is a caller mistake refused by
-        // name before any job store touch.
-        if job_id.is_some() == job_ids.is_some() {
-            let reason = if job_id.is_some() {
-                "exactly one of `job_id` or `job_ids` must be given; both were"
-            } else {
-                "exactly one of `job_id` or `job_ids` must be given; neither was"
-            };
-            let payload = serde_json::json!({ "is_error": true, "result": reason });
-            let prose = render::delegate_result_prose(&payload);
-            return Ok(CallToolResult::error(single_block(payload, format, prose)));
-        }
-        let wait = wait_secs.unwrap_or(0).min(MAX_RESULT_WAIT_SECS);
-        if let Some(jid) = job_id {
-            delegate_result_one(jid, wait, format, &self.digest).await
-        } else {
-            delegate_result_batch(job_ids.unwrap_or_default(), wait, format, &self.digest).await
-        }
-    }
-
-    #[tool(
-        description = "Wait for clauth's state to move and report what did: long-polls the same \
-change digest the other tools fold into their replies (`since_your_last_call`), returning as soon \
-as something moves. The digest watches three local-disk observables — the configured active \
-profile, that profile's usage cache, and `~/.claude/.credentials.json` — so this costs no network \
-and no quota. `wait_secs` (0..=60, default 0) bounds the wait: 0 samples once, and a wait that \
-elapses with nothing moved returns `status: \"unchanged\"` with `waited_secs`. A first digest \
-call has no earlier state to compare against, so it sets the baseline: with no wait it returns \
-`status: \"armed\"` at once, and with a wait it polls on against the baseline it just set. \
-Pass `kinds` (subset of `active_profile`, `usage_cache`, `credentials`; \
-default all three) to wait on less: a filtered wait leaves the unwatched observables' changes for \
-the next digest-bearing reply to report. Prose by default; pass `format: \"json\"` for the \
-structured payload."
-    )]
-    async fn watch(
-        &self,
-        Parameters(WatchArgs {
-            wait_secs,
-            kinds,
-            format,
-        }): Parameters<WatchArgs>,
-    ) -> Result<CallToolResult, ErrorData> {
-        let format = match Format::parse(format.as_deref()) {
-            Ok(f) => f,
-            Err(reason) => return Ok(arg_refusal(reason)),
-        };
-        let watched = match WatchSet::parse(kinds.as_deref().unwrap_or_default()) {
-            Ok(set) => set,
-            Err(reason) => return Ok(arg_refusal(reason)),
-        };
-        let wait = wait_secs.unwrap_or(0).min(MAX_WATCH_WAIT_SECS);
-        // The poll loop sleeps inside its own request on the blocking pool,
-        // mirroring `delegate_result`'s `wait_for_done` wrap, so the stdio
-        // reactor stays responsive for the whole wait.
-        let tracker = self.digest.clone();
-        let outcome = tokio::task::spawn_blocking(move || tracker.watch(watched, wait))
-            .await
-            .map_err(|e| ErrorData::internal_error(format!("watch task panicked: {e}"), None))?;
-        let payload = match outcome {
-            WatchOutcome::Armed => serde_json::json!({ "status": "armed" }),
-            WatchOutcome::Unchanged { waited_secs } => {
-                serde_json::json!({ "status": "unchanged", "waited_secs": waited_secs })
+        let wait = wait_secs.unwrap_or(0).min(MAX_WAIT_SECS);
+        match job_ids {
+            // One id keeps the single-job reply shape; several collect as a
+            // batch. An empty list is job mode with no ids, refused below.
+            Some(ids) if ids.len() == 1 => {
+                monitor_one(
+                    ids.into_iter().next().unwrap_or_default(),
+                    wait,
+                    &self.digest,
+                )
+                .await
             }
-            WatchOutcome::Changed(delta) => serde_json::json!({
-                "status": "changed",
-                "since_your_last_call": delta.to_json(),
-            }),
-        };
-        let prose = render::watch_prose(&payload);
-        Ok(CallToolResult::success(single_block(
-            payload, format, prose,
-        )))
+            Some(ids) => monitor_batch(ids, wait, &self.digest).await,
+            // No ids: the state-waiting mode absorbed from the old `watch`
+            // tool — the same digest, all three observables, no filter.
+            None => {
+                // The poll loop sleeps inside its own request on the blocking
+                // pool, mirroring the job mode's `wait_for_done` wrap, so the
+                // stdio reactor stays responsive for the whole wait.
+                let tracker = self.digest.clone();
+                let outcome =
+                    tokio::task::spawn_blocking(move || tracker.watch(WatchSet::ALL, wait))
+                        .await
+                        .map_err(|e| {
+                            ErrorData::internal_error(format!("watch task panicked: {e}"), None)
+                        })?;
+                let payload = match outcome {
+                    WatchOutcome::Armed => serde_json::json!({ "status": "armed" }),
+                    WatchOutcome::Unchanged { waited_secs } => {
+                        serde_json::json!({ "status": "unchanged", "waited_secs": waited_secs })
+                    }
+                    WatchOutcome::Changed(delta) => serde_json::json!({
+                        "status": "changed",
+                        "since_your_last_call": delta.to_json(),
+                    }),
+                };
+                let prose = render::watch_prose(&payload);
+                Ok(CallToolResult::success(single_block(prose)))
+            }
+        }
     }
 }
 
@@ -1161,30 +1012,28 @@ const MCP_DEPTH_ENV: &str = "CLAUTH_MCP_DEPTH";
 /// Poll interval mirroring `start.rs`'s `wait_for_child` cadence.
 const RUN_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
-/// Ceiling on `delegate_result`'s long-poll wait (seconds).
-const MAX_RESULT_WAIT_SECS: u64 = 60;
-/// Ceiling on `watch`'s long-poll wait (seconds). Separate from
-/// [`MAX_RESULT_WAIT_SECS`] so the two tools' limits can move independently.
-const MAX_WATCH_WAIT_SECS: u64 = 60;
-/// Poll cadence for both `delegate_result` and the `mcp-await-job` hook.
+/// Ceiling on `monitor`'s long-poll wait (seconds). One tool, one `wait_secs`
+/// parameter, so both waiting modes share one ceiling: a tool cannot carry two
+/// limits on one parameter name.
+const MAX_WAIT_SECS: u64 = 60;
+/// Poll cadence for both `monitor` modes and the `mcp-await-job` hook.
 const JOB_POLL_INTERVAL: Duration = Duration::from_millis(200);
 /// Self-deadline for the `mcp-await-job` hook: outlast the max delegate timeout
 /// plus slack so it never gives up before a legitimately long delegate finishes.
 const AWAIT_JOB_DEADLINE_SECS: u64 = MAX_RUN_TIMEOUT_SECS + 600;
 
-/// The single-`job_id` half of `delegate_result`, byte-compatible with the
-/// pre-batch tool: one envelope/status/error in one block, an unknown or unsafe
-/// id refused by name.
-async fn delegate_result_one(
+/// The one-id half of `monitor`'s job mode, byte-compatible with the
+/// pre-merge single-`job_id` spelling: one envelope/status/error in one block,
+/// an unknown or unsafe id refused by name.
+async fn monitor_one(
     job_id: String,
     wait: u64,
-    format: Format,
     digest: &DigestTracker,
 ) -> Result<CallToolResult, ErrorData> {
     if !jobs::is_safe_job_id(&job_id) {
         let payload = serde_json::json!({ "is_error": true, "result": "invalid job_id" });
         let prose = render::delegate_result_prose(&payload);
-        return Ok(CallToolResult::error(single_block(payload, format, prose)));
+        return Ok(CallToolResult::error(single_block(prose)));
     }
     let jid = job_id.clone();
     let outcome = tokio::task::spawn_blocking(move || wait_for_done(&jid, wait))
@@ -1195,27 +1044,20 @@ async fn delegate_result_one(
         WaitOutcome::Unknown => {
             let payload = serde_json::json!({ "is_error": true, "result": format!("unknown job_id: {job_id}") });
             let prose = render::delegate_result_prose(&payload);
-            Ok(CallToolResult::error(single_block(payload, format, prose)))
+            Ok(CallToolResult::error(single_block(prose)))
         }
         WaitOutcome::Running(record) => {
             let elapsed_secs = now_ms().saturating_sub(record.started_at) / 1000;
-            let mut payload = serde_json::json!({
+            let payload = serde_json::json!({
                 "job_id": job_id,
                 "status": "running",
                 "elapsed_secs": elapsed_secs,
             });
-            // `monitor`-gated: attach the target's live usage windows so the
-            // poller sees remaining headroom without a separate list_profiles.
-            if record.monitor {
-                payload["quota"] = windows_json(&record.profile);
-            }
             let prose = render::delegate_result_prose(&payload);
-            Ok(CallToolResult::success(single_block(
-                payload, format, prose,
-            )))
+            Ok(CallToolResult::success(single_block(prose)))
         }
         WaitOutcome::Done(record) => {
-            let (blocks, is_error) = render_done_envelope(record, format, digest);
+            let (blocks, is_error) = render_done_envelope(record, digest);
             // Fallback path delivered it — evict only now that the envelope
             // is safely rendered, so the file doesn't linger past its
             // purpose (GC also reaps it on a TTL) while a panic inside
@@ -1231,16 +1073,15 @@ async fn delegate_result_one(
     }
 }
 
-/// The `job_ids` half of `delegate_result`: one result per requested id in the
-/// order given. An absent id is its own `unknown` result, never a batch-level
-/// failure; a done id is evicted only after the whole batch rendered, so a
-/// mid-fold panic leaves every done file as its recoverable copy. The
-/// protocol-level error flag mirrors the per-result flags: any failed done
-/// envelope makes the whole batch an error.
-async fn delegate_result_batch(
+/// The several-ids half of `monitor`'s job mode: one result per requested id
+/// in the order given. An absent id is its own `unknown` result, never a
+/// batch-level failure; a done id is evicted only after the whole batch
+/// rendered, so a mid-fold panic leaves every done file as its recoverable
+/// copy. The protocol-level error flag mirrors the per-result flags: any failed
+/// done envelope makes the whole batch an error.
+async fn monitor_batch(
     job_ids: Vec<String>,
     wait: u64,
-    format: Format,
     digest: &DigestTracker,
 ) -> Result<CallToolResult, ErrorData> {
     // The cap mirrors the job store's own retention: GC keeps at most
@@ -1254,7 +1095,7 @@ async fn delegate_result_batch(
         );
         let payload = serde_json::json!({ "is_error": true, "result": reason });
         let prose = render::delegate_result_prose(&payload);
-        return Ok(CallToolResult::error(single_block(payload, format, prose)));
+        return Ok(CallToolResult::error(single_block(prose)));
     }
     // An empty list passes every per-id check vacuously and would return a
     // success-shaped `{"results": []}` that collected nothing.
@@ -1262,7 +1103,7 @@ async fn delegate_result_batch(
         let reason = "`job_ids` is empty: name at least one job_id";
         let payload = serde_json::json!({ "is_error": true, "result": reason });
         let prose = render::delegate_result_prose(&payload);
-        return Ok(CallToolResult::error(single_block(payload, format, prose)));
+        return Ok(CallToolResult::error(single_block(prose)));
     }
 
     let outcomes = tokio::task::spawn_blocking(move || wait_for_batch(&job_ids, wait))
@@ -1277,15 +1118,11 @@ async fn delegate_result_batch(
             WaitOutcome::Unknown => serde_json::json!({ "job_id": id, "status": "unknown" }),
             WaitOutcome::Running(record) => {
                 let elapsed_secs = now_ms().saturating_sub(record.started_at) / 1000;
-                let mut payload = serde_json::json!({
+                serde_json::json!({
                     "job_id": id,
                     "status": "running",
                     "elapsed_secs": elapsed_secs,
-                });
-                if record.monitor {
-                    payload["quota"] = windows_json(&record.profile);
-                }
-                payload
+                })
             }
             WaitOutcome::Done(record) => {
                 // No per-result digest: one rides the whole reply below.
@@ -1323,7 +1160,7 @@ async fn delegate_result_batch(
         payload["since_your_last_call"] = delta;
     }
     let prose = render::delegate_result_batch_prose(&payload);
-    let blocks = single_block(payload, format, prose);
+    let blocks = single_block(prose);
     for id in delivered {
         jobs::remove(&id);
     }
@@ -1367,19 +1204,18 @@ fn fold_done_envelope(
 /// Render a finished job's envelope into its response blocks and error flag.
 fn render_done_envelope(
     record: jobs::JobRecord,
-    format: Format,
     digest: &DigestTracker,
 ) -> (Vec<ContentBlock>, bool) {
     let (payload, is_error) = fold_done_envelope(&record, DigestMode::Report(digest));
     let prose = render::delegate_result_prose(&payload);
-    (single_block(payload, format, prose), is_error)
+    (single_block(prose), is_error)
 }
 
 /// Result of polling a background job file.
 enum WaitOutcome {
     Done(jobs::JobRecord),
     /// Present but not yet finished (the wait deadline elapsed first). Carries the
-    /// record so the caller can report `elapsed_secs` / monitored `quota`.
+    /// record so the caller can report `elapsed_secs`.
     Running(jobs::JobRecord),
     /// No such job file (never created or already evicted).
     Unknown,
@@ -1450,8 +1286,7 @@ fn wait_for_batch(job_ids: &[String], deadline_secs: u64) -> Vec<(String, WaitOu
 /// hook. Reads the hook payload on stdin, finds every background `job_id` in it,
 /// waits for each, prints the delivered envelopes to stdout, and exits 2 to wake
 /// the model. A sync `delegate` (no `job_id` in the payload) is a no-op (exit 0).
-/// On its own deadline it exits 2 with a nudge to call `delegate_result`
-/// instead.
+/// On its own deadline it exits 2 with a nudge to call `monitor` instead.
 pub(crate) fn await_job() -> ! {
     use std::io::Read;
     let mut input = String::new();
@@ -1481,7 +1316,7 @@ pub(crate) fn await_job() -> ! {
     }
     let noun = if pending.len() == 1 { "job" } else { "jobs" };
     outln!(
-        "delegate {noun} `{}` still running; call `delegate_result` to retrieve {}",
+        "delegate {noun} `{}` still running; call `monitor` to retrieve {}",
         pending.join("`, `"),
         if pending.len() == 1 { "it" } else { "them" }
     );
@@ -2212,9 +2047,9 @@ fn run_delegate(opts: DelegateOpts<'_>) -> std::result::Result<serde_json::Value
     let now = now_epoch_secs();
     if !status.success() {
         let stderr = String::from_utf8_lossy(&stderr_bytes);
-        // A non-zero exit can be a throttle; record it so `which`/`list_profiles`
-        // can flag the model as rate-limited (clauth never sees inference 429s
-        // any other way).
+        // A non-zero exit can be a throttle; record it so `profiles` can flag
+        // the model as rate-limited (clauth never sees inference 429s any
+        // other way).
         let throttle_scan = format!(
             "{stderr}{stdout}{}",
             capture.rate_limit_line.as_deref().unwrap_or_default()
@@ -2442,13 +2277,10 @@ fn read_prompt_handle(file: std::fs::File, rel: &str) -> std::result::Result<Str
 /// started_at)` handle. This is the only fallible step left after the
 /// pre-flight refusal; the spawn that follows cannot fail, so a fan-out
 /// reserves every job before launching any.
-fn reserve_background_job(
-    profile: &str,
-    monitor: bool,
-) -> std::result::Result<(String, u64), String> {
+fn reserve_background_job(profile: &str) -> std::result::Result<(String, u64), String> {
     let started_at = now_ms();
     let job_id = jobs::new_job_id(started_at);
-    jobs::write_running(&job_id, profile, started_at, monitor)
+    jobs::write_running(&job_id, profile, started_at)
         .map_err(|e| format!("failed to record job: {e}"))?;
     Ok((job_id, started_at))
 }
@@ -2726,7 +2558,7 @@ impl ServerHandler for ClauthServer {
 fn build_instructions() -> String {
     let Ok(config) = load_config() else {
         return "clauth manages multiple Claude Code accounts (\"profiles\"). \
-            Call `list_profiles` for live usage figures."
+            Call `profiles` for live usage figures."
             .to_string();
     };
     let snapshots: Vec<ProfileSnapshot> = config
@@ -2814,12 +2646,8 @@ mod tests;
 mod switch_tool_tests;
 
 #[cfg(test)]
-#[path = "../../tests/inline/mcp_which_tool.rs"]
-mod which_tool_tests;
-
-#[cfg(test)]
-#[path = "../../tests/inline/mcp_list_profiles_tool.rs"]
-mod list_profiles_tool_tests;
+#[path = "../../tests/inline/mcp_profiles_tool.rs"]
+mod profiles_tool_tests;
 
 #[cfg(test)]
 #[path = "../../tests/inline/mcp_format.rs"]

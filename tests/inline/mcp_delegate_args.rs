@@ -17,7 +17,6 @@ use std::io::{Seek, SeekFrom, Write};
 /// test overrides only what it exercises.
 fn base() -> DelegateArgs {
     DelegateArgs {
-        profile: None,
         profiles: None,
         prompt: None,
         prompt_file: None,
@@ -30,8 +29,6 @@ fn base() -> DelegateArgs {
         resume: None,
         isolated: None,
         background: None,
-        monitor: None,
-        format: Some("json".to_string()),
     }
 }
 
@@ -91,7 +88,8 @@ fn first_text(result: &CallToolResult) -> String {
         .expect("first content block is text")
 }
 
-/// A JSON-format refusal: one block, `is_error`, and every needle in the reason.
+/// A refusal: one prose block naming every needle. The reason is what carries
+/// the needles; a target-spelled refusal prefixes its sentence with them.
 fn assert_refusal(result: &CallToolResult, needles: &[&str]) {
     assert_eq!(result.is_error, Some(true), "the refusal is a tool error");
     assert_eq!(
@@ -99,14 +97,11 @@ fn assert_refusal(result: &CallToolResult, needles: &[&str]) {
         1,
         "the refusal is a single content block"
     );
-    let body: serde_json::Value =
-        serde_json::from_str(&first_text(result)).expect("refusal is JSON");
-    assert_eq!(body["is_error"], serde_json::Value::Bool(true));
-    let reason = body["result"].as_str().expect("reason is a string");
+    let text = first_text(result);
     for needle in needles {
         assert!(
-            reason.contains(needle),
-            "the reason names {needle:?}: {reason}"
+            text.contains(needle),
+            "the refusal names {needle:?}: {text}"
         );
     }
 }
@@ -174,7 +169,7 @@ fn both_prompt_sources_are_refused_by_name() {
     let result = call_delegate(DelegateArgs {
         prompt: Some("hi".to_string()),
         prompt_file: Some("p.txt".to_string()),
-        profile: Some("solo".to_string()),
+        profiles: Some(vec!["solo".to_string()]),
         ..base()
     });
     assert_refusal(
@@ -187,7 +182,7 @@ fn both_prompt_sources_are_refused_by_name() {
 fn neither_prompt_source_is_refused_by_name() {
     let _home = HomeSandbox::new();
     let result = call_delegate(DelegateArgs {
-        profile: Some("solo".to_string()),
+        profiles: Some(vec!["solo".to_string()]),
         ..base()
     });
     assert_refusal(
@@ -196,34 +191,19 @@ fn neither_prompt_source_is_refused_by_name() {
     );
 }
 
-// ── target: exactly one of `profile` / `profiles` ────────────────────────────
+// ── target: `profiles` is the one field ──────────────────────────────────────
 
+/// The `profile`/`profiles` pair collapsed onto `profiles: string[]`, so the
+/// exactly-one-of-two guard went with it. What stays refusable is naming no
+/// target at all.
 #[test]
-fn both_targets_are_refused_by_name() {
-    let _home = HomeSandbox::new();
-    let result = call_delegate(DelegateArgs {
-        profile: Some("solo".to_string()),
-        profiles: Some(vec!["vendor".to_string()]),
-        prompt: Some("hi".to_string()),
-        ..base()
-    });
-    assert_refusal(
-        &result,
-        &["exactly one of `profile` or `profiles` must be given; both were"],
-    );
-}
-
-#[test]
-fn neither_target_is_refused_by_name() {
+fn an_absent_target_is_refused_by_name() {
     let _home = HomeSandbox::new();
     let result = call_delegate(DelegateArgs {
         prompt: Some("hi".to_string()),
         ..base()
     });
-    assert_refusal(
-        &result,
-        &["exactly one of `profile` or `profiles` must be given; neither was"],
-    );
+    assert_refusal(&result, &["`profiles` is empty: name at least one profile"]);
 }
 
 // ── prompt_file boundary validation ──────────────────────────────────────────
@@ -243,7 +223,7 @@ fn prompt_file_absolute_path_is_refused_by_name() {
         .expect("sandbox path is UTF-8")
         .to_string();
     let result = call_delegate(DelegateArgs {
-        profile: Some("solo".to_string()),
+        profiles: Some(vec!["solo".to_string()]),
         prompt_file: Some(abs.clone()),
         cwd: Some(cwd.to_str().unwrap().to_string()),
         ..base()
@@ -265,7 +245,7 @@ fn prompt_file_drive_relative_path_is_refused_by_name() {
     let cwd = work_dir(home.home());
     for rel in ["C:foo", r"\etc\passwd"] {
         let result = call_delegate(DelegateArgs {
-            profile: Some("solo".to_string()),
+            profiles: Some(vec!["solo".to_string()]),
             prompt_file: Some(rel.to_string()),
             cwd: Some(cwd.to_str().unwrap().to_string()),
             ..base()
@@ -280,7 +260,7 @@ fn prompt_file_dotdot_escape_is_refused_by_name() {
     seed_profiles(&["solo"], true);
     let cwd = work_dir(home.home());
     let result = call_delegate(DelegateArgs {
-        profile: Some("solo".to_string()),
+        profiles: Some(vec!["solo".to_string()]),
         prompt_file: Some("../secret.txt".to_string()),
         cwd: Some(cwd.to_str().unwrap().to_string()),
         ..base()
@@ -299,7 +279,7 @@ fn prompt_file_symlink_escape_is_refused_by_name() {
     std::os::unix::fs::symlink(&outside, cwd.join("link.txt")).expect("symlink");
 
     let result = call_delegate(DelegateArgs {
-        profile: Some("solo".to_string()),
+        profiles: Some(vec!["solo".to_string()]),
         prompt_file: Some("link.txt".to_string()),
         cwd: Some(cwd.to_str().unwrap().to_string()),
         ..base()
@@ -325,7 +305,7 @@ fn prompt_file_oversize_is_refused_by_name() {
     .expect("oversize file");
 
     let result = call_delegate(DelegateArgs {
-        profile: Some("solo".to_string()),
+        profiles: Some(vec!["solo".to_string()]),
         prompt_file: Some("big.txt".to_string()),
         cwd: Some(cwd.to_str().unwrap().to_string()),
         ..base()
@@ -345,7 +325,7 @@ fn prompt_file_directory_is_refused_by_name() {
     let cwd = work_dir(home.home());
 
     let result = call_delegate(DelegateArgs {
-        profile: Some("solo".to_string()),
+        profiles: Some(vec!["solo".to_string()]),
         prompt_file: Some(".".to_string()),
         cwd: Some(cwd.to_str().unwrap().to_string()),
         ..base()
@@ -557,16 +537,37 @@ fn profiles_unknown_is_refused_by_name() {
     assert_refusal(&result, &["profile not found: ghost"]);
 }
 
+/// A fan-out (two or more names) is background-only: blocking N accounts has
+/// no sensible timeout story. ONE name without `background` is the ordinary
+/// blocking single delegate and must not refuse — that arm moved here from the
+/// deleted `profile` field.
 #[test]
-fn profiles_blocking_is_refused_by_name() {
+fn a_blocking_fanout_is_refused_but_one_name_is_not() {
     let _home = HomeSandbox::new();
-    let result = call_delegate(DelegateArgs {
+    seed_profiles(&["solo"], false);
+
+    // One name, blocking: reaches the prompt/target validation, so it must
+    // NOT refuse with the fan-out guard. `solo` is real, so the refusal-free
+    // path runs straight to the cwd gate.
+    let single = call_delegate(DelegateArgs {
         profiles: Some(vec!["solo".to_string()]),
+        prompt: Some("hi".to_string()),
+        cwd: Some("/nonexistent-dir-for-the-cwd-gate".to_string()),
+        ..base()
+    });
+    assert_refusal(&single, &["cwd does not exist or is not a directory"]);
+
+    // Two names, blocking: the fan-out guard refuses before any resolution.
+    let fanout = call_delegate(DelegateArgs {
+        profiles: Some(vec!["solo".to_string(), "vendor".to_string()]),
         prompt: Some("hi".to_string()),
         background: None,
         ..base()
     });
-    assert_refusal(&result, &["`profiles` requires `background: true`"]);
+    assert_refusal(
+        &fanout,
+        &["`profiles` requires `background: true` for a fan-out"],
+    );
 }
 
 /// A reserve failure refuses before any spawn: with the jobs dir replaced by a
@@ -611,13 +612,14 @@ fn seed_keyless_third_party(name: &str) {
     .expect("create profile");
 }
 
-/// The refusal envelope carries no job handle: no `job_id` key on a
-/// single-target refusal, no `jobs` key on a fan-out refusal.
+/// A refusal never carries a job handle: nothing was reserved, so nothing may
+/// read like one did.
 fn assert_no_job_keys(result: &CallToolResult) {
-    let body: serde_json::Value =
-        serde_json::from_str(&first_text(result)).expect("refusal is JSON");
-    assert!(body.get("job_id").is_none(), "no job_id in the refusal");
-    assert!(body.get("jobs").is_none(), "no jobs key in the refusal");
+    let text = first_text(result);
+    assert!(
+        !text.contains("job"),
+        "no job handle in the refusal: {text}"
+    );
 }
 
 /// Nothing was reserved: the sandbox jobs dir is absent or empty.
@@ -647,7 +649,7 @@ fn background_single_keyless_third_party_refuses_before_reserving_a_job() {
     seed_keyless_third_party("zzbg-ds");
 
     let result = call_delegate(DelegateArgs {
-        profile: Some("zzbg-ds".to_string()),
+        profiles: Some(vec!["zzbg-ds".to_string()]),
         prompt: Some("hi".to_string()),
         background: Some(true),
         ..base()
@@ -665,7 +667,7 @@ fn background_single_disabled_target_refuses_before_reserving_a_job() {
     seed_profiles(&["zzbg-off"], true);
 
     let result = call_delegate(DelegateArgs {
-        profile: Some("zzbg-off".to_string()),
+        profiles: Some(vec!["zzbg-off".to_string()]),
         prompt: Some("hi".to_string()),
         background: Some(true),
         ..base()
@@ -745,26 +747,22 @@ fn a_valid_fanout_returns_one_job_per_account() {
         1,
         "the fan-out reply is a single content block"
     );
-    let body: serde_json::Value =
-        serde_json::from_str(&first_text(&result)).expect("fan-out reply is JSON");
-    let jobs = body["jobs"].as_array().expect("jobs array");
-    assert_eq!(jobs.len(), 2, "one job per named account");
-
-    let mut profiles: Vec<&str> = jobs
-        .iter()
-        .map(|j| j["profile"].as_str().expect("profile"))
-        .collect();
-    profiles.sort_unstable();
-    assert_eq!(
-        profiles,
-        vec!["solo", "vendor"],
-        "resolved target list echoed, wrong case canonicalised"
+    let text = first_text(&result);
+    // The fan-out prose names each target with its job id — which is also the
+    // echo of the resolved target list, wrong case canonicalised.
+    assert!(
+        text.starts_with("delegated to "),
+        "the fan-out reply reads as a sentence: {text}",
     );
-
-    let ids: Vec<&str> = jobs
-        .iter()
-        .map(|j| j["job_id"].as_str().expect("job_id"))
-        .collect();
+    assert!(
+        text.contains("`solo` (job `d-") && text.contains("`vendor` (job `d-"),
+        "one job per named account, each named with its id: {text}",
+    );
+    let ids = text
+        .split("job `")
+        .skip(1)
+        .map(|rest| rest.split('`').next().unwrap_or_default().to_string())
+        .collect::<Vec<_>>();
     assert_eq!(ids.len(), 2, "one job id per account");
     assert_ne!(ids[0], ids[1], "job ids are distinct");
 
@@ -780,8 +778,7 @@ fn prose_refusals_read_as_a_sentence_and_stay_one_block() {
     let both = call_delegate(DelegateArgs {
         prompt: Some("hi".to_string()),
         prompt_file: Some("p.txt".to_string()),
-        profile: Some("solo".to_string()),
-        format: None,
+        profiles: Some(vec!["solo".to_string()]),
         ..base()
     });
     assert_prose_refusal(
@@ -790,15 +787,14 @@ fn prose_refusals_read_as_a_sentence_and_stay_one_block() {
     );
 
     let blocking = call_delegate(DelegateArgs {
-        profiles: Some(vec!["solo".to_string()]),
+        profiles: Some(vec!["solo".to_string(), "vendor".to_string()]),
         prompt: Some("hi".to_string()),
         background: None,
-        format: None,
         ..base()
     });
     assert_prose_refusal(
         &blocking,
-        &["delegate failed: `profiles` requires `background: true`"],
+        &["delegate failed: `profiles` requires `background: true` for a fan-out"],
     );
 }
 
@@ -820,7 +816,6 @@ fn fanout_prose_names_each_target_with_its_job() {
                 .unwrap()
                 .to_string(),
         ),
-        format: None,
         ..base()
     });
     assert_ne!(result.is_error, Some(true));

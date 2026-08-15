@@ -114,7 +114,7 @@ fn third_party_headline_unavailable_when_empty() {
 }
 
 #[test]
-fn instructions_block_emits_stable_roster_cost_model_and_safety_prose() {
+fn instructions_block_emits_stable_roster_router_and_safety_prose() {
     let profiles = vec![snapshot("work", true), snapshot("personal", false)];
     let out = instructions_block(&profiles, &SessionAuth::Global);
 
@@ -123,65 +123,62 @@ fn instructions_block_emits_stable_roster_cost_model_and_safety_prose() {
 
     // the roster is labelled a session-start snapshot with a live-refresh pointer.
     assert!(out.contains("Profiles, most headroom first (session-start snapshot"));
-    assert!(out.contains("call `list_profiles`"));
+    assert!(out.contains("call `profiles`"));
 
     // the tool router survives, because it is the ONLY clauth text a session is
     // guaranteed to hold: some harnesses defer tool schemas, so a description is
-    // unloaded until something searches for it. Every tool by name, so a sixth
+    // unloaded until something searches for it. Every tool by name, so a fifth
     // tool that forgets the router reds here.
-    for tool in [
-        "list_profiles",
-        "which",
-        "switch",
-        "delegate",
-        "delegate_result",
-        "watch",
-    ] {
+    for tool in ["profiles", "switch_profile", "delegate", "monitor"] {
         assert!(
             out.contains(&format!("`{tool}`")),
             "the tool router must name every tool, `{tool}` included: {out}",
         );
     }
-    // ...but per-tool mechanics belong in that tool's own description, which is
-    // loaded by the time anyone can call it. Restating them here is the
-    // duplication the router replaced.
+    // ...and no retired name survives anywhere in the block. `switch` needs the
+    // closing backtick: it is a prefix of `switch_profile`.
+    for retired in [
+        "`list_profiles`",
+        "`which`",
+        "`switch`",
+        "`delegate_result`",
+        "`watch`",
+    ] {
+        assert!(
+            !out.contains(retired),
+            "the block still names the retired tool {retired}: {out}",
+        );
+    }
+    // per-tool mechanics belong in that tool's own description, which is loaded
+    // by the time anyone can call it. Restating them here is the duplication
+    // the router replaced.
     assert!(
         !out.contains("depth 1") && !out.contains("`job_id`"),
         "per-tool mechanics must not creep back into the router line: {out}",
     );
 
-    // cost model is spelled out so delegate routing can account for money. All
-    // three paid shapes are named: collapsing "api key" to one billing story
-    // told the model an Alibaba plan profile costs per token, when its quota is
-    // bought up front and a delegate there spends nothing extra.
-    assert!(out.contains("Cost:"));
-    assert!(
-        out.contains("bills real money"),
-        "billing must not name one currency: this operator holds DeepSeek \
-         balances in both USD and CNY",
-    );
-    assert!(
-        out.contains("prepaid plan quota"),
-        "a prepaid plan must not read as pay-as-you-go: {out}",
-    );
-
-    // cheapest-target pointer must survive a prose edit.
-    assert!(
-        out.contains("`list_profiles` for live windows"),
-        "the cheapest-target routing pointer must survive a prose edit",
-    );
+    // the cost model moved into `delegate`'s description (placement rule 1: a
+    // description is the only channel loaded on every client before the call),
+    // so none of its phrases may survive here.
+    for phrase in ["Cost:", "bills real money", "prepaid plan"] {
+        assert!(
+            !out.contains(phrase),
+            "the cost model now lives in `delegate`'s description, not here: {out}",
+        );
+    }
 
     // volatile figures are NOT baked in — they rot within a turn, so they must
-    // stay on the per-call `list_profiles` path, never here.
+    // stay on the per-call `profiles` path, never here.
     assert!(
         !out.contains("% used"),
         "no usage percentages in the boot block"
     );
 
-    // the session-aware switch note must survive a prose edit (Global variant here).
+    // the session-aware switch note must survive a prose edit (Global variant
+    // here), under the same lead the `switch_profile` reply carries.
     assert!(
-        out.contains("switch & this session:"),
-        "the `switch` effect note must survive a prose edit",
+        out.contains("switch_profile & this session:"),
+        "the `switch_profile` effect note must survive a prose edit",
     );
     assert!(
         out.contains("its next token refresh"),
@@ -433,35 +430,39 @@ fn list_profiles_prose_handles_empty_roster_and_error_envelope() {
 }
 
 #[test]
-fn which_prose_names_identity_and_usage() {
+fn session_scope_prose_names_the_row_its_source_and_usage() {
+    // The session row is a roster row plus `source`, so it renders through
+    // `profile_line` — which is what carries the anthropic tier guard.
     let p = serde_json::json!({
-        "profile": "kerry",
-        "source": "session_dir",
-        "tier": "Free",
-        "throughput": [],
+        "scope": "session",
+        "profiles": [{
+            "name": "kerry",
+            "active": true,
+            "provider": "anthropic",
+            "tier": "Free",
+            "windows": [],
+            "third_party": null,
+            "source": "session_dir"
+        }],
         "live_usage": {"profile": "kerry", "5h_used_pct": 12.0, "7d_used_pct": null}
     });
     assert_eq!(
-        which_prose(&p),
-        "session profile `kerry`, source `session_dir`, tier `Free`; active profile `kerry`: 5h 12% used, 7d unknown"
+        list_profiles_prose(&p),
+        "- kerry (active) [anthropic, Free]: usage unknown; source `session_dir`; \
+         active profile `kerry`: 5h 12% used, 7d unknown"
     );
 
     // The digest clause rides only when something moved, after the live-usage
     // clause; a null from/to reads `none`, never a dropped half.
-    let moved = serde_json::json!({
-        "profile": "kerry",
-        "source": "session_dir",
-        "tier": "Free",
-        "throughput": [],
-        "live_usage": {"profile": "kerry", "5h_used_pct": 12.0, "7d_used_pct": null},
-        "since_your_last_call": {
-            "active_profile": {"from": null, "to": "kerry"},
-            "usage_cache": true
-        }
+    let mut moved = p.clone();
+    moved["since_your_last_call"] = serde_json::json!({
+        "active_profile": {"from": null, "to": "kerry"},
+        "usage_cache": true
     });
     assert_eq!(
-        which_prose(&moved),
-        "session profile `kerry`, source `session_dir`, tier `Free`; active profile `kerry`: 5h 12% used, 7d unknown; \
+        list_profiles_prose(&moved),
+        "- kerry (active) [anthropic, Free]: usage unknown; source `session_dir`; \
+         active profile `kerry`: 5h 12% used, 7d unknown; \
          since your last call: active profile none → `kerry`; usage cache refreshed"
     );
 }
@@ -492,35 +493,35 @@ fn digest_prose_names_only_moved_observables() {
 
 #[test]
 fn watch_prose_renders_armed_changed_and_unchanged() {
+    // Every arm self-labels `monitor`, the tool the reply belongs to (the old
+    // `watch` label named a tool the handshake no longer lists).
     assert_eq!(
         watch_prose(&serde_json::json!({"status": "armed"})),
-        "watch armed: baseline set on this first digest call, nothing to compare against yet"
+        "monitor armed: baseline set on this first digest call, nothing to compare against yet"
     );
     assert_eq!(
         watch_prose(&serde_json::json!({
             "status": "changed",
             "since_your_last_call": {"usage_cache": true}
         })),
-        "watch: since your last call: usage cache refreshed"
+        "monitor: since your last call: usage cache refreshed"
     );
     assert_eq!(
         watch_prose(&serde_json::json!({"status": "unchanged", "waited_secs": 60})),
-        "watch: no change after 60s"
+        "monitor: no change after 60s"
     );
 }
 
 #[test]
-fn which_prose_says_unknown_when_unresolved() {
+fn session_scope_prose_says_unknown_when_unresolved() {
     let p = serde_json::json!({
-        "profile": null,
-        "source": null,
-        "tier": null,
-        "throughput": [],
+        "scope": "session",
+        "profiles": [],
         "live_usage": {"profile": null, "5h_used_pct": null, "7d_used_pct": null}
     });
     assert_eq!(
-        which_prose(&p),
-        "session profile unknown, source unknown, tier unknown; active profile none: 5h unknown, 7d unknown"
+        list_profiles_prose(&p),
+        "session profile unknown, source unknown; active profile none: 5h unknown, 7d unknown"
     );
 }
 
@@ -599,35 +600,6 @@ fn usage_prose_documented_fields_read_english_and_unknown_keys_survive() {
     );
 }
 
-/// `which` keeps its throughput clause (one profile's rows, and the rate itself
-/// is news), but a healthy row reads as name + rate with no false flags.
-#[test]
-fn which_prose_throughput_names_healthy_rows_without_false_flags() {
-    let p = serde_json::json!({
-        "profile": "kerry",
-        "source": "refresh_match",
-        "tier": "Max 20x",
-        "throughput": [{
-            "model": "default",
-            "tok_s": 64.5,
-            "samples": 4,
-            "degraded": false,
-            "rate_limited_recent": false,
-            "retry_after_s": null
-        }],
-        "live_usage": {"profile": "kerry", "5h_used_pct": 19.0, "7d_used_pct": 95.0}
-    });
-    let out = which_prose(&p);
-    assert!(
-        out.contains("throughput: `default` 64.5 tok/s"),
-        "which keeps the rate for a healthy model: {out}",
-    );
-    assert!(
-        !out.contains("degraded") && !out.contains("rate_limited") && !out.contains("samples"),
-        "no false flags or sample counts in which prose: {out}",
-    );
-}
-
 #[test]
 fn switch_prose_renders_success_and_failure() {
     let ok = serde_json::json!({
@@ -680,11 +652,11 @@ fn delegate_prose_renders_background_and_sync_envelope() {
 }
 
 #[test]
-fn delegate_refusal_prose_names_the_spelled_target() {
+fn delegate_refusal_prose_names_the_spelled_targets() {
     // A depth refusal fires before target resolution; the envelope carries the
     // caller's own spelling, and the sentence names it rather than `unknown`.
     let depth_one = serde_json::json!({
-        "profile": "any",
+        "profiles": ["any"],
         "is_error": true,
         "result": "delegation depth exceeded (max 1)"
     });

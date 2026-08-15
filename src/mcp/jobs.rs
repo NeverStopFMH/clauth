@@ -17,9 +17,13 @@ use serde::{Deserialize, Serialize};
 
 use crate::profile::clauth_dir;
 
-/// Retain a `done` file this long before GC reaps it; long enough that a slow
-/// poller can still collect a result the auto-delivery hook already delivered.
-const DONE_TTL_MS: u64 = 60 * 60 * 1000; // 1h
+/// Retain a `done` file this long AFTER IT FINISHES before GC reaps it; long
+/// enough that a slow poller can still collect a result the auto-delivery hook
+/// already delivered. Measured from `done_at`, not from the mint: a delegate
+/// killed at the default 3600 s wall clock is already an hour old the instant it
+/// finalizes, so a mint-anchored TTL would expire every long run's salvage
+/// envelope before anyone could read it.
+pub(super) const DONE_TTL_MS: u64 = 60 * 60 * 1000; // 1h
 /// A `running` file older than this is orphaned (its server died mid-job); reap
 /// it. Sits above the max delegate timeout plus slack.
 const RUNNING_TTL_MS: u64 = (3600 + 600) * 1000;
@@ -38,6 +42,11 @@ pub(crate) enum JobState {
     Done,
 }
 
+/// `#[serde(skip_serializing_if)]` predicate for a numeric field at its default.
+fn is_zero(v: &u64) -> bool {
+    *v == 0
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct JobRecord {
     pub(crate) job_id: String,
@@ -46,6 +55,45 @@ pub(crate) struct JobRecord {
     pub(crate) started_at: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) envelope: Option<serde_json::Value>,
+    /// The wall-clock ceiling this run actually launched under, resolved once by
+    /// `resolve_deadlines`. `0` means no server recorded one, which is not the
+    /// same as a run about to be killed.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub(crate) timeout_secs: u64,
+    /// The idle ceiling, `None` when the idle leg is off entirely (a
+    /// caller-pinned `--output-format` leaves silence carrying no information).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) idle_secs: Option<u64>,
+    /// Epoch ms of the most recent stdout line — the same anchor `started_at`
+    /// uses, so a reader subtracts them with no error term. `0` = nothing has
+    /// arrived yet. (A run-relative stamp would be anchored at the child's
+    /// spawn, which trails the mint by the config load, the pre-flight and the
+    /// runtime acquire.)
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub(crate) last_output_at: u64,
+    /// A bounded single-line tail of the delegate's assistant text.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub(crate) tail: String,
+    /// Epoch ms the job finalized, which is what [`DONE_TTL_MS`] retains from.
+    /// `0` on a `running` record and on a `done` file an older server wrote,
+    /// where [`gc`] falls back to the mint and so keeps exactly its old
+    /// behaviour.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub(crate) done_at: u64,
+}
+
+/// What a background job's `running` record carries from its reserve through
+/// every heartbeat: identity plus the deadlines the run launched under. Grouped
+/// so the reserve resolves them once and the heartbeat cannot re-derive them
+/// differently — `resolve_deadlines` applies defaults, clamps and a streaming
+/// fork, and a second derivation goes wrong the first time that fork changes.
+#[derive(Debug, Clone)]
+pub(crate) struct RunningSpec {
+    pub(crate) job_id: String,
+    pub(crate) profile: String,
+    pub(crate) started_at: u64,
+    pub(crate) timeout_secs: u64,
+    pub(crate) idle_secs: Option<u64>,
 }
 
 pub(crate) fn jobs_dir() -> Result<PathBuf> {
@@ -84,20 +132,43 @@ fn write_atomic(record: &JobRecord) -> Result<()> {
     Ok(())
 }
 
-/// Write the initial `running` record for a freshly-started background job.
+/// Write the initial `running` record for a freshly-started background job:
+/// the reserved spec with nothing observed yet.
 /// `#[serde(default)]` on every later `JobRecord` field is what lets a job file
 /// written by an older server still parse here.
-pub(crate) fn write_running(job_id: &str, profile: &str, started_at: u64) -> Result<()> {
+pub(crate) fn write_running(spec: &RunningSpec) -> Result<()> {
+    write_heartbeat(spec, 0, "")
+}
+
+/// Rewrite a running job's record with its freshest liveness: the epoch ms of
+/// its last stdout line, and the bounded tail of what it has said.
+///
+/// Lock-free against [`write_done`] because the two cannot interleave: the
+/// stdout reader thread is this function's only caller, and `run_delegate` joins
+/// that thread on every exit path before it builds any envelope, while
+/// `launch_background_delegate` calls `write_done` only after `run_delegate`
+/// returns. `run_delegate_never_returns_between_spawning_the_reader_and_joining_it`
+/// is what holds the single-exit half of that up, since a `return` in between
+/// would orphan a thread that then overwrites the finalized record.
+pub(crate) fn write_heartbeat(spec: &RunningSpec, last_output_at: u64, tail: &str) -> Result<()> {
     write_atomic(&JobRecord {
-        job_id: job_id.to_string(),
-        profile: profile.to_string(),
+        job_id: spec.job_id.clone(),
+        profile: spec.profile.clone(),
         state: JobState::Running,
-        started_at,
+        started_at: spec.started_at,
         envelope: None,
+        timeout_secs: spec.timeout_secs,
+        idle_secs: spec.idle_secs,
+        last_output_at,
+        tail: tail.to_string(),
+        done_at: 0,
     })
 }
 
-/// Finalize a job: overwrite its file with the completed envelope.
+/// Finalize a job: overwrite its file with the completed envelope, stamped with
+/// the moment it finished — which is what [`DONE_TTL_MS`] retains from. The
+/// running-only fields default away: a finished job has no deadline left to
+/// count down to and no tail worth keeping beside its whole result.
 pub(crate) fn write_done(
     job_id: &str,
     profile: &str,
@@ -110,6 +181,11 @@ pub(crate) fn write_done(
         state: JobState::Done,
         started_at,
         envelope: Some(envelope),
+        timeout_secs: 0,
+        idle_secs: None,
+        last_output_at: 0,
+        tail: String::new(),
+        done_at: crate::usage::now_ms(),
     })
 }
 
@@ -132,6 +208,47 @@ pub(crate) fn remove(job_id: &str) {
 /// server), sweep stray `.tmp` from a crash mid-write, then cap the retained
 /// count to the newest [`MAX_RETAINED`].
 pub(crate) fn gc(now: u64) {
+    sweep(now, Scope::Everything);
+}
+
+/// The narrower sweep a `monitor` collect runs: `running` files a dead server
+/// orphaned, and nothing else.
+///
+/// A reader must never destroy what it came for. The Done TTL, the `.tmp` sweep
+/// and the retention cap all buy nothing before a read and can only delete a
+/// result the caller is asking for, so they stay at startup. What DOES belong
+/// here is the corpse: [`RUNNING_TTL_MS`] already knows a file whose server died
+/// mid-job is dead, and until now `serve()` was the only place that knowledge
+/// was ever applied, so a corpse polled `running` forever.
+pub(crate) fn gc_running_corpses(now: u64) {
+    sweep(now, Scope::RunningCorpses);
+}
+
+/// How much of the store one sweep is allowed to touch.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Scope {
+    Everything,
+    RunningCorpses,
+}
+
+/// The stamp both retention rules read: when this record last mattered. A `done`
+/// record's finish, falling back to its mint for a file written before `done_at`
+/// existed; a `running` record has only its mint.
+///
+/// One anchor for the TTL and the cap together, because they answer the same
+/// question — which records are the stale ones — and mixing stamps is what the
+/// TTL itself got wrong: sorted on the mint, the cap evicts a long delegate's
+/// fresh, never-read result ahead of a short run's older one.
+fn retention_anchor(record: &JobRecord) -> u64 {
+    if record.done_at > 0 {
+        record.done_at
+    } else {
+        record.started_at
+    }
+}
+
+fn sweep(now: u64, scope: Scope) {
+    let full = scope == Scope::Everything;
     let Ok(dir) = jobs_dir() else {
         return;
     };
@@ -142,29 +259,38 @@ pub(crate) fn gc(now: u64) {
     for entry in entries.flatten() {
         let path = entry.path();
         if path.extension().and_then(|e| e.to_str()) != Some("json") {
-            let _ = std::fs::remove_file(&path); // stray tmp / foreign file
+            if full {
+                let _ = std::fs::remove_file(&path); // stray tmp / foreign file
+            }
             continue;
         }
         let record = std::fs::read(&path)
             .ok()
             .and_then(|b| serde_json::from_slice::<JobRecord>(&b).ok());
         let Some(record) = record else {
-            let _ = std::fs::remove_file(&path);
+            // A file this sweep cannot read might still be a result: only the
+            // startup sweep, which owns the store, discards one.
+            if full {
+                let _ = std::fs::remove_file(&path);
+            }
             continue;
         };
-        let age = now.saturating_sub(record.started_at);
+        let anchor = retention_anchor(&record);
         let expired = match record.state {
-            JobState::Done => age > DONE_TTL_MS,
-            JobState::Running => age > RUNNING_TTL_MS,
+            JobState::Done => full && now.saturating_sub(anchor) > DONE_TTL_MS,
+            JobState::Running => now.saturating_sub(anchor) > RUNNING_TTL_MS,
         };
         if expired {
             let _ = std::fs::remove_file(&path);
         } else {
-            kept.push((record.started_at, path));
+            kept.push((anchor, path));
         }
     }
-    if kept.len() > MAX_RETAINED {
-        kept.sort_by_key(|k| std::cmp::Reverse(k.0)); // newest first
+    if full && kept.len() > MAX_RETAINED {
+        // Sorted on the SAME anchor the TTL above reads: newest-mattering
+        // kept, so a long delegate's fresh result is not evicted ahead of a
+        // short run's older one just because it started earlier.
+        kept.sort_by_key(|k| std::cmp::Reverse(k.0));
         for (_, path) in kept.into_iter().skip(MAX_RETAINED) {
             let _ = std::fs::remove_file(path);
         }

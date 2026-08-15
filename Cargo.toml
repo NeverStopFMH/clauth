@@ -49,6 +49,13 @@ crossbeam-channel = "0.5"
 # reaches the graph transitively via rmcp → tokio-util today; pinned here so a
 # dependency dropping it fails the build instead of the stdio session.
 tokio = { version = "1.52.3", features = ["rt", "io-std", "time"] }
+# `CancellationToken` — the type rmcp puts on `RequestContext.ct` and fires when
+# a client sends `notifications/cancelled`. rmcp awaits the tool handler bare
+# rather than racing it against that token, so `monitor`'s wait loops have to
+# read it themselves or an abandoned call runs out its full hour. Already in the
+# tree via rmcp → tokio-util; named here because the type is now in clauth's own
+# signatures. No default features: `sync` is unconditional.
+tokio-util = { version = "0.7.18", default-features = false }
 regex = "1.13.1"
 # CLI grammar + generated help. `wrap_help` is what keeps the command table and
 # the per-subcommand prose wrapping to the real terminal width instead of the

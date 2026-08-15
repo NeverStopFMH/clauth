@@ -13,7 +13,10 @@ fn drive<F>(fut: F) -> CallToolResult
 where
     F: std::future::Future<Output = Result<CallToolResult, ErrorData>>,
 {
+    // `monitor`'s wait loops sleep on tokio timers, which a bare current-thread
+    // runtime does not arm.
     let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
         .build()
         .expect("runtime");
     rt.block_on(fut)
@@ -129,10 +132,15 @@ fn delegate_depth_refusal_answers_prose_in_one_block() {
 
 #[test]
 fn monitor_invalid_job_id_answers_prose_in_one_block() {
-    let prose = drive(ClauthServer::new().monitor(Parameters(MonitorArgs {
-        job_ids: Some(vec!["../evil".to_string()]),
-        wait_secs: None,
-    })));
+    let prose = drive(ClauthServer::new().monitor_with(
+        MonitorArgs {
+            job_ids: Some(vec!["../evil".to_string()]),
+            wait_secs: None,
+            return_on: None,
+            cancel: None,
+        },
+        ProgressSink::none(),
+    ));
     assert_eq!(prose.is_error, Some(true));
     assert_eq!(assert_one_prose_block(&prose), "error: invalid job_id");
 }

@@ -791,27 +791,81 @@ pub(crate) fn delegate_result_prose(p: &Value) -> String {
     }
 }
 
-/// The `job_id` + `status` line shared by `monitor`'s one-id running status and
-/// each running line of its several-ids reply.
-fn running_status_prose(p: &Value) -> String {
+/// The running-check line shared by `monitor`'s one-id status and each running
+/// line of its several-ids reply, so the two spellings cannot drift: the job,
+/// the account it spends, how long it has run, when it last said anything, how
+/// far each deadline still is, that account's headroom, and — on its own
+/// indented line — the newest thing the delegate wrote.
+///
+/// Every liveness field is recorded together at reserve time, so a missing wall
+/// deadline means the whole set is missing: that job was started by a clauth
+/// that did not record them, which is a different statement from clauth having
+/// lost track of a job it is watching. An absent idle deadline under a recorded
+/// wall one is the third case: the idle leg is OFF (a caller-pinned
+/// `--output-format` leaves silence carrying no information), so clauth knows
+/// there is none.
+pub(super) fn running_status_prose(p: &Value) -> String {
     let job_id = p.get("job_id").and_then(Value::as_str).unwrap_or("unknown");
     let status = p.get("status").and_then(Value::as_str).unwrap_or("unknown");
     let elapsed = p
         .get("elapsed_secs")
         .and_then(Value::as_u64)
         .map_or_else(|| "unknown".to_string(), |v| format!("{v}s"));
-    let mut out = format!("job `{job_id}` {status}, elapsed {elapsed}");
+    let mut out = format!("job `{job_id}` {status}");
+    if let Some(profile) = p.get("profile").and_then(Value::as_str) {
+        out.push_str(&format!(" on `{profile}`"));
+    }
+    out.push_str(&format!(", elapsed {elapsed}"));
+    match p.get("wall_kill_in_secs").and_then(Value::as_u64) {
+        None => out.push_str(", liveness not recorded (started under an older clauth)"),
+        Some(wall) => {
+            match p.get("last_output_secs_ago").and_then(Value::as_u64) {
+                Some(secs) => out.push_str(&format!(", last output {secs}s ago")),
+                None => out.push_str(", no output yet"),
+            }
+            match p.get("idle_kill_in_secs").and_then(Value::as_u64) {
+                Some(secs) => out.push_str(&format!(", idle-kill in {secs}s")),
+                None => out.push_str(", no idle deadline"),
+            }
+            out.push_str(&format!(", wall-kill in {wall}s"));
+        }
+    }
     if let Some(q) = p.get("quota") {
         out.push_str(&format!("; quota: {}", windows_prose(q)));
+    }
+    // Its own line, quoted: this is the delegate's words rather than clauth's
+    // report about it. Escaped, because those words are ANOTHER account's model
+    // output arriving verbatim in a model-facing reply, and a bare `"` in them
+    // would close the span early and let the rest read as clauth's own prose.
+    if let Some(tail) = p.get("tail").and_then(Value::as_str) {
+        out.push_str(&format!("\n    \"{}\"", escape_quoted(tail)));
     }
     out
 }
 
-/// Prose for a `monitor` several-ids reply: one line per requested id, naming its
-/// id and state, then the batch's own digest clause on a last line when it
+/// Escape a delegate's own text for the quoted span it lands in: backslashes
+/// first, so an escape already in the text cannot consume the one added after
+/// it, then the delimiter. `tail_line` has already collapsed every whitespace
+/// run, so no newline can break the block shape either.
+fn escape_quoted(s: &str) -> String {
+    s.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+/// Prose for a `monitor` several-ids reply: one BLOCK per requested id, naming
+/// its id and state, then the batch's own digest clause on a last line when it
 /// carries one. A done line reuses the envelope spelling, a running line the
-/// shared running spelling, an absent id reads `unknown`. Live usage stays in
-/// the JSON spelling only so the lines stay short.
+/// shared running spelling, an absent id reads `unknown`.
+///
+/// A block is usually one line but is not guaranteed to be: a done envelope's
+/// `result` carries the delegate's own newlines, and a running job with a tail
+/// puts that tail on its own indented line. What every block does guarantee is
+/// that it OPENS with ``job `<id>` ``, which is what maps a wrapped line back to
+/// the id that produced it.
+///
+/// The per-result live-usage fold stays out of the prose, so a batch of many
+/// jobs does not repeat one account's percentages per line. The running blocks
+/// do carry a quota clause, because a running check's whole job is to say
+/// whether the account it is spending still has headroom.
 pub(crate) fn delegate_result_batch_prose(p: &Value) -> String {
     let results = p
         .get("results")

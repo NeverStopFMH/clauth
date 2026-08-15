@@ -301,6 +301,7 @@ dependencies = [
  "signal-hook 0.4.4",
  "tempfile",
  "tokio",
+ "tokio-util",
  "toml",
  "ureq",
  "which",

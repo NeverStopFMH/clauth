@@ -7,11 +7,23 @@
 use super::*;
 use crate::testutil::HomeSandbox;
 
+/// The running spec every test writes through, so one signature change lands in
+/// one place.
+fn spec(job_id: &str, profile: &str, started_at: u64) -> RunningSpec {
+    RunningSpec {
+        job_id: job_id.to_string(),
+        profile: profile.to_string(),
+        started_at,
+        timeout_secs: 3600,
+        idle_secs: Some(300),
+    }
+}
+
 #[test]
 fn write_read_roundtrip_running_then_done() {
     let _home = HomeSandbox::new();
     let id = new_job_id(1000);
-    write_running(&id, "work", 1000).unwrap();
+    write_running(&spec(&id, "work", 1000)).unwrap();
 
     let r = read(&id).expect("running record");
     assert_eq!(r.state, JobState::Running);
@@ -33,6 +45,59 @@ fn write_read_roundtrip_running_then_done() {
 
     remove(&id);
     assert!(read(&id).is_none(), "removed job is gone");
+}
+
+/// A running job file is written by the server that spawned it and read by a
+/// possibly newer one PLUS the separate `mcp-await-job` hook process, so every
+/// field added after the first release has to default. Pinned against the real
+/// bytes an older server wrote, not a hand-built `JobRecord`: a struct literal
+/// would compile against whatever the fields are today and prove nothing about
+/// the wire. `read` swallows a parse failure as `None`, which reaches the caller
+/// as `unknown job_id` on a job that is running fine.
+#[test]
+fn a_job_file_from_an_older_server_still_parses() {
+    let _home = HomeSandbox::new();
+    let dir = jobs_dir().unwrap();
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("d-legacy-0.json"),
+        br#"{"job_id":"d-legacy-0","profile":"work","state":"running","started_at":1000}"#,
+    )
+    .unwrap();
+
+    let r = read("d-legacy-0").expect("a pre-slice-2 running file still parses");
+    assert_eq!(r.state, JobState::Running);
+    assert_eq!(r.timeout_secs, 0, "no deadline recorded by that server");
+    assert_eq!(r.idle_secs, None);
+    assert_eq!(r.last_output_at, 0);
+    assert_eq!(r.tail, "");
+    assert_eq!(r.done_at, 0, "no finish stamp either");
+}
+
+/// A heartbeat rewrites the SAME running record: the identity and both
+/// deadlines survive it, and only the liveness fields move.
+#[test]
+fn a_heartbeat_rewrites_the_running_record_in_place() {
+    let _home = HomeSandbox::new();
+    let spec = spec("d-beat-0", "work", 1000);
+    write_running(&spec).unwrap();
+    let fresh = read("d-beat-0").expect("running record");
+    assert_eq!(fresh.last_output_at, 0, "nothing has arrived yet");
+    assert_eq!(fresh.tail, "");
+
+    // Epoch ms, the same anchor `started_at` uses — a run-relative stamp would
+    // silently disagree with it by the acquire+spawn latency.
+    write_heartbeat(&spec, 41_000, "moving to the fallback tests").unwrap();
+    let beaten = read("d-beat-0").expect("heartbeat record");
+    assert_eq!(beaten.state, JobState::Running, "still the same job");
+    assert_eq!(beaten.job_id, "d-beat-0");
+    assert_eq!(beaten.profile, "work");
+    assert_eq!(beaten.started_at, 1000);
+    assert_eq!(beaten.timeout_secs, 3600);
+    assert_eq!(beaten.idle_secs, Some(300));
+    assert_eq!(beaten.last_output_at, 41_000);
+    assert_eq!(beaten.tail, "moving to the fallback tests");
+    assert!(beaten.envelope.is_none());
 }
 
 #[test]
@@ -60,21 +125,42 @@ fn new_job_id_is_unique_and_safe() {
     assert!(is_safe_job_id(&a) && is_safe_job_id(&b));
 }
 
+/// Write a `done` file with an explicit `done_at`, as raw bytes: `write_done`
+/// stamps the real clock, and the retention rule under test is about a stamp a
+/// test has to choose. Omitting `done_at` writes the pre-`done_at` shape.
+fn seed_done_at(job_id: &str, started_at: u64, done_at: Option<u64>) {
+    let dir = jobs_dir().unwrap();
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut record = serde_json::json!({
+        "job_id": job_id,
+        "profile": "p",
+        "state": "done",
+        "started_at": started_at,
+        "envelope": { "result": "kept" },
+    });
+    if let Some(at) = done_at {
+        record["done_at"] = serde_json::json!(at);
+    }
+    std::fs::write(
+        dir.join(format!("{job_id}.json")),
+        serde_json::to_vec(&record).unwrap(),
+    )
+    .unwrap();
+}
+
 #[test]
 fn gc_reaps_expired_running_and_done_keeps_fresh() {
     let _home = HomeSandbox::new();
     let now = 10_000_000_000u64; // far-future ms so "fresh" entries read as recent
 
-    write_done("d-fresh-done", "p", now, serde_json::json!({ "ok": true })).unwrap();
-    write_running("d-fresh-run", "p", now).unwrap();
-    write_done(
+    seed_done_at("d-fresh-done", now, Some(now));
+    write_running(&spec("d-fresh-run", "p", now)).unwrap();
+    seed_done_at(
         "d-old-done",
-        "p",
         now - DONE_TTL_MS - 1,
-        serde_json::json!({}),
-    )
-    .unwrap();
-    write_running("d-old-run", "p", now - RUNNING_TTL_MS - 1).unwrap();
+        Some(now - DONE_TTL_MS - 1),
+    );
+    write_running(&spec("d-old-run", "p", now - RUNNING_TTL_MS - 1)).unwrap();
 
     gc(now);
 
@@ -82,6 +168,73 @@ fn gc_reaps_expired_running_and_done_keeps_fresh() {
     assert!(read("d-fresh-run").is_some());
     assert!(read("d-old-done").is_none(), "expired done reaped");
     assert!(read("d-old-run").is_none(), "orphaned running reaped");
+}
+
+/// The Done TTL retains a file for an hour after it FINISHES, which is what its
+/// own doc promises a slow poller. Measured from the mint instead, a delegate
+/// killed at the default 3600 s wall clock is already expired the instant it
+/// finalizes, and the next sweep destroys the salvage envelope.
+#[test]
+fn the_done_ttl_measures_from_the_finish_not_the_mint() {
+    let _home = HomeSandbox::new();
+    let now = 10_000_000_000u64;
+
+    // Minted two hours ago, finished a moment ago: a run killed at its wall
+    // clock, or any long delegate.
+    seed_done_at("d-long-run", now - 2 * DONE_TTL_MS, Some(now - 1000));
+    // Minted a moment ago, finished over an hour ago — impossible in practice,
+    // but it pins that the FINISH is what the rule reads.
+    seed_done_at("d-stale-finish", now - 1000, Some(now - DONE_TTL_MS - 1));
+    // No `done_at` at all: a file an older server wrote, which must keep
+    // exactly the mint-anchored behaviour rather than becoming immortal.
+    seed_done_at("d-legacy-done", now - DONE_TTL_MS - 1, None);
+    seed_done_at("d-legacy-fresh", now - 1000, None);
+
+    gc(now);
+
+    assert!(
+        read("d-long-run").is_some(),
+        "a long run's envelope survives its own length"
+    );
+    assert!(read("d-stale-finish").is_none(), "an hour past the finish");
+    assert!(read("d-legacy-done").is_none(), "old file, old rule");
+    assert!(read("d-legacy-fresh").is_some(), "old file, still fresh");
+}
+
+/// The collect path runs a NARROWER sweep than startup: it reaps only the
+/// `running` corpses a dead server orphaned, which is the whole reason finding 6
+/// wanted a sweep there. Reaping `done` before a read destroys the envelope the
+/// call came for, and the `.tmp` sweep and retention cap buy nothing at all.
+#[test]
+fn the_corpse_sweep_touches_only_orphaned_running_files() {
+    let _home = HomeSandbox::new();
+    let now = 10_000_000_000u64;
+
+    seed_done_at(
+        "d-expired-done",
+        now - 2 * DONE_TTL_MS,
+        Some(now - 2 * DONE_TTL_MS),
+    );
+    write_running(&spec("d-live-run", "p", now)).unwrap();
+    write_running(&spec("d-corpse-run", "p", now - RUNNING_TTL_MS - 1)).unwrap();
+    let dir = jobs_dir().unwrap();
+    std::fs::write(dir.join("d-9-9.json.tmp"), b"partial").unwrap();
+
+    gc_running_corpses(now);
+
+    assert!(
+        read("d-corpse-run").is_none(),
+        "a dead server's file is a corpse"
+    );
+    assert!(read("d-live-run").is_some(), "a live job is untouched");
+    assert!(
+        read("d-expired-done").is_some(),
+        "a collect must never destroy a result, whatever its age"
+    );
+    assert!(
+        dir.join("d-9-9.json.tmp").exists(),
+        "the tmp sweep is startup's job, not a reader's"
+    );
 }
 
 #[test]
@@ -100,9 +253,12 @@ fn gc_caps_retained_to_newest() {
     let now = 10_000_000_000u64;
     let total = MAX_RETAINED + 5;
     for i in 0..total {
-        // started_at rises with i, so low i are the oldest.
-        let started = now - (total as u64 - i as u64);
-        write_done(&format!("d-cap-{i}"), "p", started, serde_json::json!({})).unwrap();
+        // Both stamps rise with i, so low i are the oldest either way and the
+        // cap's ordering is the only thing under test here. `write_done` would
+        // stamp every finish at the real clock, which leaves 261 records the
+        // cap cannot order at all.
+        let age = total as u64 - i as u64;
+        seed_done_at(&format!("d-cap-{i}"), now - age, Some(now - age));
     }
     gc(now);
 
@@ -115,6 +271,42 @@ fn gc_caps_retained_to_newest() {
     assert!(
         read(&format!("d-cap-{}", total - 1)).is_some(),
         "newest kept"
+    );
+}
+
+/// The cap keeps the newest jobs by the same stamp the TTL retains from: a long
+/// delegate's fresh, never-read result must not be evicted ahead of a short
+/// run's older one just because it was minted earlier.
+#[test]
+fn the_retention_cap_keeps_the_newest_finish_not_the_newest_mint() {
+    let _home = HomeSandbox::new();
+    let now = 10_000_000_000u64;
+
+    // The long run: minted an hour before the rest, finished most recently.
+    seed_done_at("d-long", now - 3_600_000, Some(now - 60_000));
+    // The short runs: all minted in the last 30s, all finished before it.
+    for i in 0..MAX_RETAINED {
+        seed_done_at(
+            &format!("d-short-{i}"),
+            now - 30_000 + i as u64,
+            Some(now - 300_000 + i as u64),
+        );
+    }
+
+    gc(now); // MAX_RETAINED + 1 files: exactly one is evicted
+
+    assert!(
+        read("d-long").is_some(),
+        "the newest RESULT survives the cap, whatever its mint"
+    );
+    assert!(
+        read("d-short-0").is_none(),
+        "the oldest result is the one evicted"
+    );
+    assert_eq!(
+        std::fs::read_dir(jobs_dir().unwrap()).unwrap().count(),
+        MAX_RETAINED,
+        "capped to MAX_RETAINED"
     );
 }
 

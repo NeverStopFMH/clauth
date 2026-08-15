@@ -71,7 +71,10 @@ fn drive<F>(fut: F) -> CallToolResult
 where
     F: std::future::Future<Output = Result<CallToolResult, ErrorData>>,
 {
+    // `monitor`'s wait loops sleep on tokio timers, which a bare current-thread
+    // runtime does not arm.
     let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
         .build()
         .expect("runtime");
     rt.block_on(fut)
@@ -112,19 +115,29 @@ fn call_switch(server: &ClauthServer, name: &str) -> String {
 
 /// `monitor` on named jobs (its job mode).
 fn call_monitor_ids(server: &ClauthServer, job_ids: &[&str], wait_secs: u64) -> String {
-    block_text(&drive(server.monitor(Parameters(MonitorArgs {
-        job_ids: Some(job_ids.iter().map(|s| (*s).to_string()).collect()),
-        wait_secs: Some(wait_secs),
-    }))))
+    block_text(&drive(server.monitor_with(
+        MonitorArgs {
+            job_ids: Some(job_ids.iter().map(|s| (*s).to_string()).collect()),
+            wait_secs: Some(wait_secs),
+            return_on: None,
+            cancel: None,
+        },
+        ProgressSink::none(),
+    )))
 }
 
 /// `monitor` with no `job_ids` — the state-waiting mode absorbed from the old
 /// `watch` tool.
 fn call_monitor_state(server: &ClauthServer, wait_secs: u64) -> String {
-    block_text(&drive(server.monitor(Parameters(MonitorArgs {
-        job_ids: None,
-        wait_secs: Some(wait_secs),
-    }))))
+    block_text(&drive(server.monitor_with(
+        MonitorArgs {
+            job_ids: None,
+            wait_secs: Some(wait_secs),
+            return_on: None,
+            cancel: None,
+        },
+        ProgressSink::none(),
+    )))
 }
 
 /// The full fresh-server fixture every test starts from: one active profile,
@@ -434,7 +447,7 @@ fn state_wait_answers_prose() {
 }
 
 /// No lock may span a sleep in the digest machinery: the state wait runs up
-/// to 60s, and a baseline lock held across its slices would stall every other
+/// to 3600s, and a baseline lock held across its slices would stall every other
 /// digest-bearing reply on the server. The shape is what's checkable — a
 /// timing probe stays green under a slice-wise violation, because the mutex
 /// futex hands the lock to a parked waiter inside one 200ms slice — so this is
@@ -452,13 +465,20 @@ fn the_sleeping_function_never_locks_and_the_locking_functions_never_sleep() {
         let start = src
             .find(&format!("fn {name}("))
             .unwrap_or_else(|| panic!("{name} not found"));
-        // To the next method at the same indent, private or `pub(super)`.
+        // To the next method at the same indent, private or `pub(super)`,
+        // sync or async — an async spelling left off this list silently folds
+        // the NEXT method's body into this one's and inverts the assertions.
         let rest = &src[start..];
-        let end = ["\n    fn ", "\n    pub(super) fn "]
-            .iter()
-            .filter_map(|pat| rest.find(pat))
-            .min()
-            .unwrap_or(rest.len());
+        let end = [
+            "\n    fn ",
+            "\n    pub(super) fn ",
+            "\n    async fn ",
+            "\n    pub(super) async fn ",
+        ]
+        .iter()
+        .filter_map(|pat| rest.find(pat))
+        .min()
+        .unwrap_or(rest.len());
         // Comment lines out: the scanned contract is about CODE, and the doc
         // comments around these methods name `sleep` and `lock` in prose.
         rest[..end]
@@ -473,6 +493,17 @@ fn the_sleeping_function_never_locks_and_the_locking_functions_never_sleep() {
         !watch.contains(".lock()") && !watch.contains("lock("),
         "watch sleeps, so it must not hold the baseline lock anywhere in its \
          body: {watch}",
+    );
+    // The new spelling, since slice 2 turned the wait loops async so they can
+    // await a progress notification: a blocking sleep here would park the
+    // reactor thread for the whole wait, and no guard may straddle the await.
+    // The slice itself is the sink's shared `sleep_or_cancelled`, which is also
+    // what makes an abandoned call end here instead of running out its hour, so
+    // a raw sleep back in this body would silently drop cancellation too.
+    assert!(
+        watch.contains("sleep_or_cancelled") && !watch.contains("std::thread::sleep"),
+        "watch sleeps through the shared cancel-aware slice, never by blocking \
+         its thread: {watch}",
     );
     for locker in ["report", "reseed"] {
         let body = body(src, locker);

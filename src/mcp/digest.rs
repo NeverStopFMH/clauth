@@ -259,13 +259,25 @@ impl DigestTracker {
     /// [`WATCH_POLL_INTERVAL`] slice, repeat, until something moves or
     /// `wait_secs` elapses. Mirrors the job mode's `wait_for_done` cadence;
     /// the baseline lock is taken and dropped inside [`report`], never held
-    /// across a sleep. `wait_secs` 0 samples exactly once. Each slice re-reads
-    /// `profiles.toml` and two file stats: small local reads whose total is
-    /// bounded by `wait_secs`, and a cached value could not see the writer
-    /// this loop exists to catch.
-    pub(super) fn watch(&self, watched: WatchSet, wait_secs: u64) -> WatchOutcome {
+    /// across a sleep OR an await. `wait_secs` 0 samples exactly once. Each
+    /// slice re-reads `profiles.toml` and two file stats: small local reads
+    /// whose total is bounded by `wait_secs`, and a cached value could not see
+    /// the writer this loop exists to catch.
+    ///
+    /// It ticks the same progress sink the job mode does, on the same throttle:
+    /// one tool cannot hold two ceilings, and the raised ceiling is only safe on
+    /// a peer that receives progress. It races the same cancellation token too,
+    /// so a client abandoning the call ends the loop instead of leaving it to
+    /// run out an hour against a request id that no longer exists.
+    pub(super) async fn watch(
+        &self,
+        watched: WatchSet,
+        wait_secs: u64,
+        progress: &mut super::ProgressSink,
+    ) -> WatchOutcome {
         let start = Instant::now();
         let deadline = Duration::from_secs(wait_secs);
+        let mut cancelled = false;
         loop {
             match self.report(watched) {
                 DigestVerdict::Changed(delta) => return WatchOutcome::Changed(delta),
@@ -273,14 +285,24 @@ impl DigestTracker {
                 // once; with a wait it keeps polling against the baseline it
                 // just established, which is a real comparison from here on.
                 DigestVerdict::Seeded if wait_secs == 0 => return WatchOutcome::Armed,
-                DigestVerdict::Seeded | DigestVerdict::Unchanged if start.elapsed() >= deadline => {
+                DigestVerdict::Seeded | DigestVerdict::Unchanged
+                    if cancelled || start.elapsed() >= deadline =>
+                {
                     return WatchOutcome::Unchanged {
                         waited_secs: start.elapsed().as_secs(),
                     };
                 }
                 DigestVerdict::Seeded | DigestVerdict::Unchanged => {}
             }
-            std::thread::sleep(WATCH_POLL_INTERVAL);
+            progress
+                .tick(|| {
+                    format!(
+                        "waiting on clauth's state, {}s of {wait_secs}s",
+                        start.elapsed().as_secs()
+                    )
+                })
+                .await;
+            cancelled = progress.sleep_or_cancelled(WATCH_POLL_INTERVAL).await;
         }
     }
 

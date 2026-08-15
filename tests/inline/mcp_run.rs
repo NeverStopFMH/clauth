@@ -149,6 +149,7 @@ fn run_delegate_refuses_a_disabled_target_before_acquiring_a_runtime() {
         resume: None,
         isolation: Isolation::Shared,
         depth: 0,
+        job: None,
     })
     .expect_err("a disabled target must be refused");
     assert_eq!(err, "profile is disabled: off");
@@ -200,6 +201,7 @@ fn run_delegate_refuses_a_keyless_third_party_target_before_acquiring_a_runtime(
         resume: None,
         isolation: Isolation::Shared,
         depth: 0,
+        job: None,
     })
     .expect_err("a keyless third-party target must be refused");
     assert_eq!(err, "profile has no api key: ds-nokey");
@@ -248,6 +250,7 @@ fn run_delegate_refuses_an_empty_api_key_third_party_target() {
         resume: None,
         isolation: Isolation::Shared,
         depth: 0,
+        job: None,
     })
     .expect_err("an empty-key third-party target must be refused");
     assert_eq!(err, "profile has no api key: ds-empty");
@@ -295,6 +298,7 @@ fn run_delegate_refuses_a_whitespace_api_key_third_party_target() {
         resume: None,
         isolation: Isolation::Shared,
         depth: 0,
+        job: None,
     })
     .expect_err("a whitespace-key third-party target must be refused");
     assert_eq!(err, "profile has no api key: ds-space");
@@ -343,6 +347,7 @@ fn run_delegate_refuses_a_control_char_api_key_third_party_target() {
         resume: None,
         isolation: Isolation::Shared,
         depth: 0,
+        job: None,
     })
     .expect_err("a control-char key third-party target must be refused");
     assert_eq!(err, "profile has no api key: ds-ctrl");
@@ -376,6 +381,7 @@ fn delegate_stops_at_the_cwd_gate(profile: &str, cwd: &std::path::Path) -> Strin
         resume: None,
         isolation: Isolation::Shared,
         depth: 0,
+        job: None,
     })
     .expect_err("the cwd gate must refuse the run")
 }
@@ -462,6 +468,7 @@ fn run_delegate_refuses_a_keyless_alibaba_profile() {
         resume: None,
         isolation: Isolation::Shared,
         depth: 0,
+        job: None,
     })
     .expect_err("a keyless Alibaba profile must be refused");
     assert_eq!(err, "profile has no api key: qwen");
@@ -851,51 +858,64 @@ fn delegate_env_caller_reauthority_and_clauth_keys_win() {
 
 // ---- background delegation + monitor ----
 
-/// Drive `monitor` on one job id (the single-job shape) on a current-thread
-/// runtime under a home sandbox the caller has already entered.
-fn call_monitor(job_id: &str, wait_secs: Option<u64>) -> CallToolResult {
-    let server = ClauthServer::new();
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .build()
-        .expect("runtime");
-    rt.block_on(async {
-        server
-            .monitor(Parameters(MonitorArgs {
-                job_ids: Some(vec![job_id.to_string()]),
-                wait_secs,
-            }))
-            .await
-    })
-    .expect("monitor returns a tool result, never a transport error")
+/// The reserved running record a test seeds a job from, carrying both deadlines
+/// the way a real reserve does.
+fn running_spec(job_id: &str, profile: &str, started_at: u64) -> jobs::RunningSpec {
+    jobs::RunningSpec {
+        job_id: job_id.to_string(),
+        profile: profile.to_string(),
+        started_at,
+        timeout_secs: 3600,
+        idle_secs: Some(300),
+    }
 }
 
-/// Drive `monitor` on several job ids (the batch shape) on a current-thread
-/// runtime under a home sandbox the caller has already entered.
-fn call_monitor_batch(job_ids: Vec<&str>, wait_secs: Option<u64>) -> CallToolResult {
-    let server = ClauthServer::new();
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .build()
-        .expect("runtime");
-    rt.block_on(async {
-        server
-            .monitor(Parameters(MonitorArgs {
-                job_ids: Some(job_ids.into_iter().map(str::to_string).collect()),
-                wait_secs,
-            }))
-            .await
-    })
-    .expect("monitor returns a tool result, never a transport error")
+/// Seed one `running` job file the way `reserve_background_job` would.
+///
+/// Every caller passes a real `now_ms()`, and that is not decoration: a `running`
+/// record is reaped once it outlives the max delegate lifetime, so one stamped at
+/// epoch 1 IS an orphaned corpse and the collect path is right to sweep it. A
+/// `done` fixture has no such constraint — its retention runs from `done_at`,
+/// and a reader never sweeps one — so those keep their arbitrary stamps.
+fn seed_running(job_id: &str, profile: &str, started_at: u64) {
+    jobs::write_running(&running_spec(job_id, profile, started_at)).unwrap();
 }
 
-/// Drive `monitor` with raw args, for the argument-shape refusals no job file
-/// can seed.
+/// Drive `monitor` with raw args on a current-thread runtime under a home
+/// sandbox the caller has already entered. Enters through `monitor_with`, the
+/// inner entry, because an in-process test cannot construct a
+/// `Peer<RoleServer>`; `ProgressSink::none()` is also exactly what a peer that
+/// sent no `progressToken` gets, so the path is a real one.
 fn call_monitor_args(args: MonitorArgs) -> CallToolResult {
     let server = ClauthServer::new();
+    // The wait loops sleep on tokio timers, which a bare current-thread runtime
+    // does not arm.
     let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
         .build()
         .expect("runtime");
-    rt.block_on(async { server.monitor(Parameters(args)).await })
+    rt.block_on(async { server.monitor_with(args, ProgressSink::none()).await })
         .expect("monitor returns a tool result, never a transport error")
+}
+
+/// Drive `monitor` on one job id (the single-job shape).
+fn call_monitor(job_id: &str, wait_secs: Option<u64>) -> CallToolResult {
+    call_monitor_args(MonitorArgs {
+        job_ids: Some(vec![job_id.to_string()]),
+        wait_secs,
+        return_on: None,
+        cancel: None,
+    })
+}
+
+/// Drive `monitor` on several job ids (the batch shape).
+fn call_monitor_batch(job_ids: Vec<&str>, wait_secs: Option<u64>) -> CallToolResult {
+    call_monitor_args(MonitorArgs {
+        job_ids: Some(job_ids.into_iter().map(str::to_string).collect()),
+        wait_secs,
+        return_on: None,
+        cancel: None,
+    })
 }
 
 #[test]
@@ -916,10 +936,40 @@ fn monitor_invalid_job_id_is_error() {
     assert_eq!(result.is_error, Some(true), "path-unsafe job_id refused");
 }
 
+/// The whole-second figure a running check rendered after `label`, e.g.
+/// `"wall-kill in "` -> `2900`.
+///
+/// Every one of these is a floor-divided second computed from a stamp written at
+/// one instant and read at another, so the rendered value is only ever pinned as
+/// a RANGE: pinning the exact second makes the test hold on the gap between
+/// those two instants staying under a millisecond boundary, which is a property
+/// of the machine rather than of the code.
+fn rendered_secs(text: &str, label: &str) -> u64 {
+    let rest = text
+        .split_once(label)
+        .unwrap_or_else(|| panic!("{label:?} missing from: {text}"))
+        .1;
+    rest.chars()
+        .take_while(char::is_ascii_digit)
+        .collect::<String>()
+        .parse()
+        .unwrap_or_else(|_| panic!("no figure after {label:?} in: {text}"))
+}
+
+/// The prose of a running check, for the tests that read it.
+fn monitor_text(job_id: &str) -> String {
+    call_monitor(job_id, Some(0))
+        .content
+        .first()
+        .and_then(|c| c.as_text())
+        .map(|t| t.text.clone())
+        .expect("status text")
+}
+
 #[test]
 fn monitor_running_reports_status() {
     let _home = HomeSandbox::new();
-    jobs::write_running("d-run-0", "work", 1).unwrap();
+    seed_running("d-run-0", "work", now_ms());
     let result = call_monitor("d-run-0", Some(0));
     assert_ne!(result.is_error, Some(true), "a running job is not an error");
     let text = result
@@ -929,14 +979,370 @@ fn monitor_running_reports_status() {
         .map(|t| t.text.clone())
         .expect("status text");
     assert!(
-        text.starts_with("job `d-run-0` running, elapsed "),
-        "running status with its id and elapsed time: {text}",
+        text.starts_with("job `d-run-0` running on `work`, elapsed "),
+        "running status with its id, account and elapsed time: {text}",
     );
-    // The `monitor`-gated quota attach died with the parameter; nothing may
-    // resurrect the field under a different gate.
+    // The quota clause is unconditional now: the `monitor: true` flag that used
+    // to gate it bought one free cache read and nothing else.
     assert!(
-        !text.contains("quota"),
-        "no quota clause on a running check"
+        text.contains("; quota: "),
+        "a running check names the account's headroom: {text}",
+    );
+}
+
+/// Finding 1: `StreamCapture` held the delegate's live text and the progress
+/// stamp, both died with the detached task, and a poll read only the disk file.
+/// A heartbeat is what carries them across, so a check must show them.
+#[test]
+fn a_heartbeat_reaches_a_running_check() {
+    let _home = HomeSandbox::new();
+    let started_at = now_ms() - 733_000;
+    let spec = jobs::RunningSpec {
+        started_at,
+        ..running_spec("d-beat-0", "DS0", started_at)
+    };
+    jobs::write_running(&spec).unwrap();
+    assert!(
+        monitor_text("d-beat-0").contains("no output yet"),
+        "before any line arrives the check says so, rather than inventing an age",
+    );
+
+    // An EPOCH stamp, the same anchor `started_at` carries: 4s ago.
+    jobs::write_heartbeat(
+        &spec,
+        now_ms() - 4000,
+        "clippy clean, 0 warnings. moving on",
+    )
+    .unwrap();
+    let text = monitor_text("d-beat-0");
+    let ago = rendered_secs(&text, "last output ");
+    assert!(
+        (4..=5).contains(&ago),
+        "the heartbeat's stamp reaches the check: 4s at the write, so 4 or 5 by \
+         the read: {text}",
+    );
+    assert!(
+        text.contains("\"clippy clean, 0 warnings. moving on\""),
+        "the heartbeat's tail reaches the check, quoted on its own line: {text}",
+    );
+}
+
+/// Finding 4: `JobRecord` stored neither deadline, so a poll could not say how
+/// close the run sat to either kill. Both are recorded at reserve time now — and
+/// a run with the idle leg off must read as HAVING no idle deadline, never as
+/// clauth having lost the figure.
+#[test]
+fn both_deadlines_reach_a_running_check() {
+    let _home = HomeSandbox::new();
+    let started_at = now_ms() - 700_000;
+    jobs::write_running(&jobs::RunningSpec {
+        started_at,
+        timeout_secs: 3600,
+        idle_secs: Some(300),
+        ..running_spec("d-dl-0", "work", started_at)
+    })
+    .unwrap();
+    let text = monitor_text("d-dl-0");
+    let wall = rendered_secs(&text, "wall-kill in ");
+    assert!(
+        (2899..=2900).contains(&wall),
+        "the wall clock counts down from the recorded 3600s ceiling, 700s in: {text}",
+    );
+    assert!(
+        text.contains("idle-kill in 0s"),
+        "with no output yet the idle clock has run since the start: {text}",
+    );
+
+    // A caller-pinned `--output-format` turns the idle leg off, so clauth knows
+    // there IS no such deadline.
+    jobs::write_running(&jobs::RunningSpec {
+        started_at,
+        timeout_secs: 900,
+        idle_secs: None,
+        ..running_spec("d-dl-1", "work", started_at)
+    })
+    .unwrap();
+    let text = monitor_text("d-dl-1");
+    assert!(
+        text.contains("no idle deadline") && !text.contains("idle-kill"),
+        "a structurally-absent idle deadline reads as none, never unknown: {text}",
+    );
+    let wall = rendered_secs(&text, "wall-kill in ");
+    assert!(
+        (199..=200).contains(&wall),
+        "the wall clock is still recorded, counting down from 900s: {text}",
+    );
+
+    // A job file from a server that recorded neither says so, rather than
+    // rendering a zero countdown off a defaulted field.
+    let dir = jobs::jobs_dir().unwrap();
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("d-dl-2.json"),
+        format!(
+            r#"{{"job_id":"d-dl-2","profile":"work","state":"running","started_at":{}}}"#,
+            now_ms()
+        ),
+    )
+    .unwrap();
+    let text = monitor_text("d-dl-2");
+    assert!(
+        text.contains("liveness not recorded"),
+        "a pre-slice-2 record names the gap instead of counting down from zero: {text}",
+    );
+    assert!(
+        !text.contains("wall-kill") && !text.contains("idle-kill"),
+        "no deadline is invented for a record that carries none: {text}",
+    );
+}
+
+/// `all` is what makes `any` mean anything, and no test made it wait: a batch
+/// with nothing done cannot tell the two modes apart, because the early break
+/// never arms. Seed one landed lane and one live one, and the modes diverge.
+#[test]
+fn return_on_all_waits_for_the_slowest_lane_and_any_does_not() {
+    let _home = HomeSandbox::new();
+    jobs::write_done(
+        "d-mode-done-0",
+        "work",
+        1,
+        serde_json::json!({"profile": "work", "is_error": false, "result": "first"}),
+    )
+    .unwrap();
+    seed_running("d-mode-slow-0", "work", now_ms());
+    let ids = ["d-mode-done-0".to_string(), "d-mode-slow-0".to_string()];
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .build()
+        .expect("runtime");
+
+    let start = std::time::Instant::now();
+    let any = rt.block_on(async {
+        wait_for_batch(&ids, 3, ReturnOn::Any, &mut ProgressSink::none()).await
+    });
+    let any_elapsed = start.elapsed();
+    assert!(
+        any_elapsed < std::time::Duration::from_secs(2),
+        "`any` returns on the landed lane, not the deadline: {any_elapsed:?}",
+    );
+    assert!(matches!(&any[1].1, WaitOutcome::Running(_)));
+
+    let start = std::time::Instant::now();
+    let all = rt.block_on(async {
+        wait_for_batch(&ids, 3, ReturnOn::All, &mut ProgressSink::none()).await
+    });
+    let all_elapsed = start.elapsed();
+    assert!(
+        all_elapsed >= std::time::Duration::from_secs(3),
+        "`all` waits out the slow lane's deadline: {all_elapsed:?}",
+    );
+    assert!(matches!(&all[0].1, WaitOutcome::Done(_)));
+    assert!(matches!(&all[1].1, WaitOutcome::Running(_)));
+}
+
+/// A client that abandons a call sends `notifications/cancelled`, and rmcp
+/// cancels `RequestContext.ct` — it does NOT abort the handler future, which it
+/// awaits bare (rmcp 3.1.2 `service.rs`). So every wait loop has to race its own
+/// sleep against the token, or an abandoned `monitor` leaks for the full ceiling
+/// this slice raised to an hour, emitting notifications at a torn-down request
+/// id the whole time.
+#[test]
+fn a_cancelled_request_ends_every_wait_loop_early() {
+    let _home = HomeSandbox::new();
+    seed_running("d-cancel-0", "work", now_ms());
+    let ids = ["d-cancel-0".to_string()];
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .build()
+        .expect("runtime");
+
+    // The cancel lands from OUTSIDE, part-way into a wait that is already
+    // running, which is both the real sequence (the client abandons a call in
+    // flight) and the only shape that reds in bounded time. Pre-cancelling and
+    // leaning on an outer `tokio::time::timeout` cannot work: with the guards
+    // removed, an already-cancelled token makes `sleep_or_cancelled` return on
+    // first poll, `tick` returns before its only await with no channel, and
+    // `jobs::read` is sync — so the mutated body has no `Pending` point at all,
+    // nothing can preempt a future that never yields, and the regression hangs
+    // rather than failing. Measured: 30s wall at ~100% of one core, on a
+    // multi-thread runtime too. Cancelled mid-sleep instead, the mutated loop
+    // just keeps taking its normal 200ms slices to the deadline below, and the
+    // elapsed assertion reds there.
+    let deadline_secs = 10;
+    let bound = std::time::Duration::from_secs(3);
+    let cancel_soon = |sink: &ProgressSink| {
+        let ct = sink.cancel_token();
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            ct.cancel();
+        })
+    };
+
+    let mut sink = ProgressSink::none();
+    let canceller = cancel_soon(&sink);
+    let start = std::time::Instant::now();
+    let one = rt.block_on(wait_for_done("d-cancel-0", deadline_secs, &mut sink));
+    let elapsed = start.elapsed();
+    canceller.join().expect("canceller thread");
+    assert!(
+        elapsed < bound,
+        "wait_for_done must end on the cancel, not its {deadline_secs}s deadline: {elapsed:?}",
+    );
+    assert!(
+        matches!(one, WaitOutcome::Running(_)),
+        "a cancel reads as the deadline arriving: the job is still running",
+    );
+
+    let mut sink = ProgressSink::none();
+    let canceller = cancel_soon(&sink);
+    let start = std::time::Instant::now();
+    let batch = rt.block_on(wait_for_batch(
+        &ids,
+        deadline_secs,
+        ReturnOn::All,
+        &mut sink,
+    ));
+    let elapsed = start.elapsed();
+    canceller.join().expect("canceller thread");
+    assert!(
+        elapsed < bound,
+        "wait_for_batch must end on the cancel, not its {deadline_secs}s deadline: {elapsed:?}",
+    );
+    assert!(matches!(&batch[0].1, WaitOutcome::Running(_)));
+
+    let mut sink = ProgressSink::none();
+    let canceller = cancel_soon(&sink);
+    let tracker = DigestTracker::new();
+    // Seed the baseline so the loop is in its comparing state, not its arming
+    // one — the arming shortcut would end the wait for the wrong reason.
+    let _ = tracker.report(WatchSet::ALL);
+    let start = std::time::Instant::now();
+    let watched = rt.block_on(tracker.watch(WatchSet::ALL, deadline_secs, &mut sink));
+    let elapsed = start.elapsed();
+    canceller.join().expect("canceller thread");
+    assert!(
+        elapsed < bound,
+        "DigestTracker::watch must end on the cancel, not its {deadline_secs}s deadline: \
+         {elapsed:?}",
+    );
+    assert!(matches!(watched, WatchOutcome::Unchanged { .. }));
+}
+
+/// `write_heartbeat`'s lock-free safety rests on the stdout reader thread being
+/// JOINED before any envelope is built, so the last heartbeat strictly precedes
+/// `write_done`. An early `return` between the spawn and the join orphans the
+/// thread: the child keeps writing (`Child::drop` does not kill), the orphan
+/// keeps heartbeating, and it overwrites the finalized record with
+/// `state: running, envelope: None` — a job that polls running for 70 minutes
+/// and an `mcp-await-job` blocked on a terminal state that never arrives.
+///
+/// The precondition is a `waitpid` failure, which has no practical repro, so the
+/// guarantee is structural: there is exactly one exit between those two points.
+/// A doc comment asserting it would be a convention, not a guarantee.
+///
+/// It rejects a bare `?` rather than only `?;`, because `?` early-returns in
+/// every spelling it takes (`foo()?;`, `let x = foo()?.bar()`, `Some(foo()?)`)
+/// and this guard is the only thing carrying the invariant. A `?` local to a
+/// closure in that window would be a false positive; there is none today, and
+/// the right answer to one is to restructure it rather than to loosen this,
+/// since a reader cannot tell the two apart at a glance either.
+#[test]
+fn run_delegate_never_returns_between_spawning_the_reader_and_joining_it() {
+    let src = include_str!("../../src/mcp/mod.rs");
+    let body = src
+        .split_once("fn run_delegate(")
+        .expect("run_delegate is defined")
+        .1;
+    let spawn = body
+        .find("let stdout_reader = child.stdout.take()")
+        .expect("the reader thread is spawned");
+    let join = body
+        .find("let capture = stdout_reader")
+        .expect("the reader thread is joined");
+    assert!(spawn < join, "the join follows the spawn");
+    let window: String = body[spawn..join]
+        .lines()
+        .filter(|l| !l.trim_start().starts_with("//"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    for shape in ["return ", "return;", "?"] {
+        assert!(
+            !window.contains(shape),
+            "an early exit ({shape:?}) between the reader spawn and its join orphans \
+             the thread, and the orphan then overwrites the finalized job file: {window}",
+        );
+    }
+}
+
+/// The mode seam the `watch` fold created is refused by name at the boundary,
+/// per placement rule 4 — a rule the server refuses does not have to be taught
+/// in the description. `cancel` is here only so the shipped description's
+/// `cancel: true` stops being silently dropped: rmcp deserializes tool args
+/// with a plain `from_value` and no `deny_unknown_fields`.
+#[test]
+fn monitor_refuses_cancel_and_a_cross_mode_return_on() {
+    let _home = HomeSandbox::new();
+    let refusal = |args: MonitorArgs| {
+        let result = call_monitor_args(args);
+        assert_eq!(result.is_error, Some(true), "a cross-mode call is refused");
+        result
+            .content
+            .first()
+            .and_then(|c| c.as_text())
+            .map(|t| t.text.clone())
+            .expect("refusal text")
+    };
+
+    let text = refusal(MonitorArgs {
+        job_ids: Some(vec!["d-1-0".to_string()]),
+        wait_secs: None,
+        return_on: None,
+        cancel: Some(true),
+    });
+    assert!(
+        text.contains("`cancel`") && text.contains("not available yet"),
+        "cancel is refused by name, not silently dropped: {text}",
+    );
+
+    let text = refusal(MonitorArgs {
+        job_ids: None,
+        wait_secs: None,
+        return_on: Some("any".to_string()),
+        cancel: None,
+    });
+    assert!(
+        text.contains("`return_on`") && text.contains("`job_ids`"),
+        "return_on without job_ids names both halves of the seam: {text}",
+    );
+
+    let text = refusal(MonitorArgs {
+        job_ids: Some(vec!["d-1-0".to_string()]),
+        wait_secs: None,
+        return_on: Some("first".to_string()),
+        cancel: None,
+    });
+    assert_eq!(
+        text, "error: unrecognized return_on \"first\": accepted \"any\" and \"all\"",
+        "a typo names the accepted values, mirroring the `scope` refusal",
+    );
+
+    // `cancel: false` is what an absent parameter means, so it changes nothing.
+    let ok = call_monitor_args(MonitorArgs {
+        job_ids: Some(vec!["d-1-0".to_string()]),
+        wait_secs: None,
+        return_on: Some("all".to_string()),
+        cancel: Some(false),
+    });
+    let text = ok
+        .content
+        .first()
+        .and_then(|c| c.as_text())
+        .map(|t| t.text.clone())
+        .expect("text");
+    assert!(
+        text.starts_with("error: unknown job_id"),
+        "an explicit `cancel: false` behaves as today: {text}",
     );
 }
 
@@ -1072,7 +1478,7 @@ fn monitor_batch_returns_one_result_per_id_in_order() {
         serde_json::json!({"profile": "work", "is_error": false, "result": "all done"}),
     )
     .unwrap();
-    jobs::write_running("d-b2-0", "work", 1).unwrap();
+    seed_running("d-b2-0", "work", now_ms());
 
     let result = call_monitor_batch(vec!["d-b1-0", "d-b2-0", "d-b3-0"], Some(0));
     assert_ne!(
@@ -1104,7 +1510,7 @@ fn monitor_batch_returns_one_result_per_id_in_order() {
     );
 
     assert!(
-        lines[1].starts_with("job `d-b2-0` running, elapsed"),
+        lines[1].starts_with("job `d-b2-0` running on `work`, elapsed"),
         "a running line names its id, state and elapsed: {text}",
     );
     assert!(
@@ -1131,7 +1537,12 @@ fn monitor_batch_prose_is_one_block_with_one_line_per_job() {
         serde_json::json!({"profile": "work", "is_error": false, "result": "line one\nline two"}),
     )
     .unwrap();
-    jobs::write_running("d-b2-0", "work", 1).unwrap();
+    // The running job carries a tail: it is the one thing in the running line
+    // that adds a line of its own, so a tail-less fixture would pin the count
+    // against the only shape that cannot break it.
+    let spec = running_spec("d-b2-0", "work", now_ms());
+    jobs::write_running(&spec).unwrap();
+    jobs::write_heartbeat(&spec, now_ms(), "still compiling").unwrap();
 
     let result = call_monitor_batch(vec!["d-b1-0", "d-b2-0", "d-b3-0"], Some(0));
     assert_ne!(result.is_error, Some(true));
@@ -1154,8 +1565,13 @@ fn monitor_batch_prose_is_one_block_with_one_line_per_job() {
         .collect();
     assert_eq!(
         lines.len(),
-        4,
-        "three named job lines plus one wrapped line of the multi-line result"
+        5,
+        "three named job lines, one wrapped line of the multi-line result, and \
+         the running job's own quoted tail line"
+    );
+    assert_eq!(
+        lines[3], "    \"still compiling\"",
+        "a tail rides its own indented line under its job",
     );
     assert_eq!(named.len(), 3, "one named line per job");
     assert_eq!(named[0], "job `d-b1-0` finished: line one");
@@ -1164,7 +1580,7 @@ fn monitor_batch_prose_is_one_block_with_one_line_per_job() {
         "a multi-line result wraps inside its own job line"
     );
     assert!(
-        named[1].starts_with("job `d-b2-0` running, elapsed"),
+        named[1].starts_with("job `d-b2-0` running on `work`, elapsed"),
         "a running line names its id and state: {lines:?}"
     );
     assert_eq!(named[2], "job `d-b3-0` unknown");
@@ -1177,24 +1593,147 @@ fn monitor_batch_prose_is_one_block_with_one_line_per_job() {
 /// and enough absent ids trail it that one pass of the loop outlasts the
 /// deadline, so the crossing lands between the running id's check and the
 /// loop-bottom deadline test. CPU contention only lengthens the pass.
+///
+/// Both `return_on` modes are driven: `any` gained an early break, which is
+/// exactly the shape that could drop an unresolved slot out as `unknown`.
 #[test]
 fn wait_for_batch_running_id_never_falls_out_as_unknown_at_deadline() {
     let _home = HomeSandbox::new();
-    jobs::write_running("d-race-0", "work", 1).unwrap();
+    seed_running("d-race-0", "work", now_ms());
 
     let trailing = 1_000_000;
     let mut ids = Vec::with_capacity(trailing + 1);
     ids.push("d-race-0".to_string());
     ids.extend((1..=trailing).map(|i| format!("d-race-{i}")));
 
-    let outcomes = wait_for_batch(&ids, 1);
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .build()
+        .expect("runtime");
+    for mode in [ReturnOn::Any, ReturnOn::All] {
+        let outcomes =
+            rt.block_on(async { wait_for_batch(&ids, 1, mode, &mut ProgressSink::none()).await });
+        assert!(
+            matches!(&outcomes[0].1, WaitOutcome::Running(_)),
+            "a still-running id at the deadline resolves running, never unknown ({mode:?})"
+        );
+        assert!(
+            matches!(&outcomes[1].1, WaitOutcome::Unknown),
+            "an absent id resolves unknown, so the scan really read the list ({mode:?})"
+        );
+    }
+}
+
+/// A collect must never destroy what it came for. The Done TTL is measured from
+/// the FINISH, and the sweep a collect runs reaps only orphaned `running` files
+/// — a mint-anchored done sweep here deletes the salvage envelope of every
+/// delegate killed at the default 3600 s wall clock, on the very next check,
+/// and tells the caller to spend another window.
+#[test]
+fn a_collect_never_sweeps_the_envelope_it_came_for() {
+    let _home = HomeSandbox::new();
+    // Minted two hours ago, finalized a moment ago: the shape of any long run.
+    let minted = now_ms() - 2 * 60 * 60 * 1000;
+    jobs::write_done(
+        "d-salvage-0",
+        "work",
+        minted,
+        serde_json::json!({
+            "profile": "work",
+            "is_error": true,
+            "timed_out": "wall_clock",
+            "result": "delegate killed at its 3600s wall-clock ceiling",
+            "partial_result": "the answer it had already written",
+        }),
+    )
+    .unwrap();
+    jobs::write_done(
+        "d-bystander-0",
+        "work",
+        minted,
+        serde_json::json!({"profile": "work", "is_error": false, "result": "someone else's answer"}),
+    )
+    .unwrap();
+
+    // A result that finished over the retention TTL ago is the case the two
+    // sweeps disagree on: startup is entitled to reap it, a reader never is.
+    let dir = jobs::jobs_dir().unwrap();
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("d-late-0.json"),
+        format!(
+            r#"{{"job_id":"d-late-0","profile":"work","state":"done","started_at":{minted},
+               "done_at":{minted},"envelope":{{"result":"collected late"}}}}"#
+        ),
+    )
+    .unwrap();
+
+    // A check on an unrelated, absent id must not reap a bystander's result
+    // either — the sweep runs before the read on every job-mode call.
+    let _ = call_monitor("d-1-0", Some(0));
     assert!(
-        matches!(&outcomes[0].1, WaitOutcome::Running(_)),
-        "a still-running id at the deadline resolves running, never unknown"
+        jobs::read("d-bystander-0").is_some(),
+        "a check on one id must not destroy another job's result",
     );
     assert!(
-        matches!(&outcomes[1].1, WaitOutcome::Unknown),
-        "an absent id resolves unknown, so the scan really read the list"
+        jobs::read("d-late-0").is_some(),
+        "a reader never applies the done TTL: that is startup's call, and here it \
+         would delete a result nobody has read yet",
+    );
+
+    let text = call_monitor("d-salvage-0", Some(0))
+        .content
+        .first()
+        .and_then(|c| c.as_text())
+        .map(|t| t.text.clone())
+        .expect("envelope text");
+    assert!(
+        text.contains("the answer it had already written"),
+        "the salvage envelope is delivered, not swept: {text}",
+    );
+}
+
+/// `return_on: "any"` exists so a fan-out poll reacts to whichever lane lands
+/// first instead of paying the slowest lane's wait. The slow lane must still
+/// resolve by its own state — an early break is the shape that could drop it
+/// out as `unknown`.
+#[test]
+fn return_on_any_returns_before_the_slowest_lane() {
+    let _home = HomeSandbox::new();
+    jobs::write_done(
+        "d-fast-0",
+        "work",
+        1,
+        serde_json::json!({"profile": "work", "is_error": false, "result": "first"}),
+    )
+    .unwrap();
+    seed_running("d-slow-0", "work", now_ms());
+
+    let start = std::time::Instant::now();
+    let result = call_monitor_args(MonitorArgs {
+        job_ids: Some(vec!["d-fast-0".to_string(), "d-slow-0".to_string()]),
+        wait_secs: Some(30),
+        return_on: Some("any".to_string()),
+        cancel: None,
+    });
+    let elapsed = start.elapsed();
+    assert!(
+        elapsed < std::time::Duration::from_secs(5),
+        "one landed lane ends the wait; took {elapsed:?} of a 30s budget",
+    );
+    let text = result
+        .content
+        .first()
+        .and_then(|c| c.as_text())
+        .map(|t| t.text.clone())
+        .expect("results text");
+    assert!(
+        text.contains("job `d-fast-0` finished: first"),
+        "the landed lane carries its envelope: {text}",
+    );
+    assert!(
+        text.contains("job `d-slow-0` running"),
+        "the lane still in flight reads running, never unknown: {text}",
     );
 }
 
@@ -1321,6 +1860,8 @@ fn monitor_batch_refuses_over_cap_and_empty_list() {
     let over = call_monitor_args(MonitorArgs {
         job_ids: Some((0..257).map(|i| format!("d-{i}")).collect()),
         wait_secs: None,
+        return_on: None,
+        cancel: None,
     });
     assert_eq!(over.is_error, Some(true), "a list over the cap is refused");
     assert_eq!(
@@ -1337,6 +1878,8 @@ fn monitor_batch_refuses_over_cap_and_empty_list() {
     let empty = call_monitor_args(MonitorArgs {
         job_ids: Some(Vec::new()),
         wait_secs: None,
+        return_on: None,
+        cancel: None,
     });
     assert_eq!(empty.is_error, Some(true), "an empty list is refused");
     assert_eq!(
@@ -1350,15 +1893,19 @@ fn monitor_batch_refuses_over_cap_and_empty_list() {
     );
 }
 
-/// The one-id spelling's exact bytes, pinned against the pre-merge tool: a
-/// several-ids caller must never change what an existing one-id caller sees,
-/// so the time-independent shapes are asserted verbatim.
+/// The one-id spelling, pinned verbatim: a several-ids caller must never change
+/// what an existing one-id caller sees. The done arm is byte-identical to the
+/// pre-merge tool; the unknown arm deliberately is not — it keeps the pre-merge
+/// lead and id and appends the cause, which `unknown job_id` alone never
+/// carried.
 #[test]
-fn monitor_single_spelling_is_byte_identical_to_pre_merge() {
+fn monitor_single_spelling_keeps_the_pre_merge_done_bytes_and_names_its_unknown_cause() {
     let _home = HomeSandbox::new();
 
     let unknown = call_monitor("d-pin-unknown-0", Some(0));
     assert_eq!(unknown.is_error, Some(true));
+    // The lead and the id are the pre-merge bytes; what follows is the named
+    // cause, which `unknown job_id` alone never carried.
     assert_eq!(
         unknown
             .content
@@ -1366,7 +1913,8 @@ fn monitor_single_spelling_is_byte_identical_to_pre_merge() {
             .and_then(|c| c.as_text())
             .map(|t| t.text.clone())
             .expect("refusal text"),
-        "error: unknown job_id: d-pin-unknown-0"
+        "error: unknown job_id: d-pin-unknown-0 — clauth never minted it (a real one reads \
+         `d-<epoch_ms>-<counter>`); check the id `delegate` handed back"
     );
 
     jobs::write_done(
@@ -1607,8 +2155,8 @@ fn find_job_ids_scans_fanout_prose() {
 #[test]
 fn await_job_outcomes_delivers_each_and_drops_absent() {
     let _home = HomeSandbox::new();
-    jobs::write_running("d-multi-0", "solo", 1).unwrap();
-    jobs::write_running("d-multi-1", "vendor", 1).unwrap();
+    seed_running("d-multi-0", "solo", now_ms());
+    seed_running("d-multi-1", "vendor", now_ms());
     jobs::write_done(
         "d-multi-0",
         "solo",
@@ -1650,7 +2198,7 @@ fn await_job_outcomes_delivers_each_and_drops_absent() {
 #[test]
 fn await_job_outcomes_reports_still_running_at_deadline() {
     let _home = HomeSandbox::new();
-    jobs::write_running("d-stuck-0", "solo", 1).unwrap();
+    seed_running("d-stuck-0", "solo", now_ms());
 
     let (delivered, pending) = await_job_outcomes(
         &["d-stuck-0".to_string()],
@@ -1663,7 +2211,7 @@ fn await_job_outcomes_reports_still_running_at_deadline() {
 #[test]
 fn monitor_long_poll_sees_completion() {
     let _home = HomeSandbox::new();
-    jobs::write_running("d-poll-0", "work", 1).unwrap();
+    seed_running("d-poll-0", "work", now_ms());
     // Finalize the job shortly after the long-poll starts, from another thread.
     // The home override is process-global (set by HomeSandbox), so the writer
     // resolves the same sandbox jobs dir.
@@ -2089,6 +2637,7 @@ fn the_stdout_reader_stamps_progress_and_keeps_the_result() {
         true,
         std::time::Instant::now(),
         &progress,
+        None,
     );
     assert_ne!(
         progress.load(super::Ordering::Relaxed),
@@ -2097,6 +2646,211 @@ fn the_stdout_reader_stamps_progress_and_keeps_the_result() {
     );
     assert!(capture.envelope_src().contains("final report"));
     assert_eq!(capture.partial_text(), "alpha");
+}
+
+/// A reader that hands back one line per `read` call, sleeping the matching gap
+/// first, so a throttle test drives a real clock instead of a fake one.
+struct PacedReader {
+    lines: std::collections::VecDeque<(std::time::Duration, &'static str)>,
+}
+
+impl std::io::Read for PacedReader {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let Some((gap, line)) = self.lines.pop_front() else {
+            return Ok(0);
+        };
+        std::thread::sleep(gap);
+        let bytes = line.as_bytes();
+        assert!(bytes.len() <= buf.len(), "fixture line fits one read");
+        buf[..bytes.len()].copy_from_slice(bytes);
+        Ok(bytes.len())
+    }
+}
+
+/// The heartbeat throttle lives in `read_stdout` so it is testable in one place
+/// and the sink stays a pure "write this now" callback. Every job write is an
+/// atomic tmp+rename and token deltas arrive at tens per second, so a burst
+/// inside one interval must cost exactly one write.
+#[test]
+fn the_stdout_reader_throttles_the_heartbeat_sink() {
+    let delta = |text: &str| {
+        format!(
+            r#"{{"type":"stream_event","event":{{"delta":{{"type":"text_delta","text":"{text}"}}}}}}"#
+        )
+    };
+    // Leaked so the fixture lines outlive the reader without a lifetime param;
+    // four in one burst, then one past the interval.
+    let burst: &'static str = Box::leak(format!("{}\n", delta("a")).into_boxed_str());
+    let late: &'static str = Box::leak(format!("{}\n", delta("b")).into_boxed_str());
+    let zero = std::time::Duration::ZERO;
+    let past = super::HEARTBEAT_INTERVAL + std::time::Duration::from_millis(100);
+    let reader = PacedReader {
+        lines: [
+            (zero, burst),
+            (zero, burst),
+            (zero, burst),
+            (zero, burst),
+            (past, late),
+        ]
+        .into_iter()
+        .collect(),
+    };
+
+    let progress = super::AtomicU64::new(0);
+    let mut beats: Vec<String> = Vec::new();
+    let mut sink = |capture: &super::StreamCapture| {
+        beats.push(super::tail_line(capture));
+    };
+    super::read_stdout(
+        reader,
+        true,
+        std::time::Instant::now(),
+        &progress,
+        Some(&mut sink),
+    );
+
+    assert_eq!(
+        beats.len(),
+        2,
+        "four lines inside one interval cost one write, the line past it a second: {beats:?}",
+    );
+    assert_eq!(beats[0], "a", "the first line beats immediately");
+    assert_eq!(
+        beats[1], "aaaab",
+        "the second beat carries everything read since"
+    );
+}
+
+/// A blocking `delegate` has no job file, so it passes no sink at all: that
+/// keeps `read_stdout` pure under test and makes "heartbeats are
+/// background-only" structural rather than a runtime branch.
+#[test]
+fn a_sinkless_reader_never_beats() {
+    let progress = super::AtomicU64::new(0);
+    let capture = super::read_stdout(
+        std::io::Cursor::new(STREAM.as_bytes()),
+        true,
+        std::time::Instant::now(),
+        &progress,
+        None,
+    );
+    assert_eq!(capture.partial_text(), "alpha");
+}
+
+/// The tail rides a reply a model may fetch repeatedly, so it is bounded far
+/// under the 8 KiB salvage that rides one terminal envelope, and it is one line:
+/// a delegate's answer is full of newlines, and a running status is a status.
+#[test]
+fn tail_line_collapses_whitespace_and_bounds_its_length() {
+    let capture = super::StreamCapture {
+        text: "  clippy   clean,\n0 warnings.\n\n  moving on \t".to_string(),
+        ..Default::default()
+    };
+    assert_eq!(
+        super::tail_line(&capture),
+        "clippy clean, 0 warnings. moving on",
+        "every whitespace run collapses to one space, and the ends are trimmed",
+    );
+
+    // A multi-byte char straddling the cap must not be split. The cap is even,
+    // so a 3-byte char is what actually lands the clip mid-codepoint and makes
+    // `keep_tail` walk forward to the next boundary.
+    // 3 bytes per char.
+    let capture = super::StreamCapture {
+        text: "€".repeat(super::TAIL_CAP),
+        ..Default::default()
+    };
+    let line = super::tail_line(&capture);
+    assert!(
+        line.len() <= super::TAIL_CAP,
+        "bounded: {} bytes",
+        line.len()
+    );
+    assert!(
+        line.chars().all(|c| c == '€'),
+        "no replacement char crept in"
+    );
+    assert_eq!(
+        line.chars().count(),
+        super::TAIL_CAP / 3,
+        "clipped to whole chars under the cap"
+    );
+}
+
+/// The 3600 s cap rests on progress notifications re-anchoring Claude Code's
+/// 30-minute stdio idle abort. A peer that sent no `progressToken` cannot
+/// receive them, so the unclamped cap would turn every long wait into a hard
+/// abort. The token IS the capability probe, and the clamp is a pure function
+/// because the sink itself is not constructible in a test.
+#[test]
+fn the_wait_cap_clamps_without_a_progress_token() {
+    assert_eq!(
+        clamp_wait(Some(3600), true),
+        3600,
+        "the full cap with progress"
+    );
+    assert_eq!(
+        clamp_wait(Some(9999), true),
+        MAX_WAIT_SECS,
+        "clamped to the cap"
+    );
+    assert_eq!(
+        clamp_wait(Some(3600), false),
+        MAX_WAIT_SECS_NO_PROGRESS,
+        "a peer that cannot receive progress waits under its idle abort",
+    );
+    const {
+        assert!(
+            MAX_WAIT_SECS_NO_PROGRESS < 1800,
+            "the clamp must sit under Claude Code's 30-minute stdio idle abort",
+        );
+    }
+    assert_eq!(
+        clamp_wait(None, true),
+        0,
+        "an unset wait still replies instantly"
+    );
+    assert_eq!(clamp_wait(Some(30), false), 30, "a short wait is untouched");
+}
+
+/// `unknown job_id` conflated five causes and named none. Each branch says what
+/// the caller can do about it; (2) already collected and (4) dropped past the
+/// retention cap leave nothing on disk to tell them apart, so they share a
+/// branch rather than inventing a distinction.
+#[test]
+fn an_unknown_job_id_names_which_cause_it_was() {
+    let now = 4_000_000_000_000u64;
+
+    let never = unknown_job_reason("not-a-job", now);
+    assert!(
+        never.contains("never minted") && never.contains("d-<epoch_ms>-<counter>"),
+        "an id off the mint shape says so and names the shape: {never}",
+    );
+
+    let swept = unknown_job_reason(&format!("d-{}-0", now - 2 * 60 * 60 * 1000), now);
+    assert!(
+        swept.contains("swept") && swept.contains("re-run"),
+        "an id older than the done TTL names the sweep and the fix: {swept}",
+    );
+    // Collection leads even on the aged branch: every collect evicts, while the
+    // hour-after-finish sweep runs at startup alone, so on a session that has
+    // been up a while the sweep is the rarer cause of the two.
+    assert!(
+        swept.find("already collected") < swept.find("swept"),
+        "the likelier cause leads: {swept}",
+    );
+
+    let collected = unknown_job_reason(&format!("d-{}-3", now - 1000), now);
+    assert!(
+        collected.contains("already collected") && collected.contains("256"),
+        "a fresh id names collection and the retention cap together: {collected}",
+    );
+    for reason in [&never, &swept, &collected] {
+        assert!(
+            reason.starts_with("unknown job_id: "),
+            "every cause keeps the lead the caller greps for: {reason}"
+        );
+    }
 }
 
 /// A caller-pinned format is read whole: it is one JSON document, and splitting
@@ -2110,6 +2864,7 @@ fn a_pinned_output_format_is_captured_as_one_document() {
         false,
         std::time::Instant::now(),
         &progress,
+        None,
     );
     let envelope = super::parse_delegate_envelope(capture.envelope_src().trim())
         .expect("whole document parses");

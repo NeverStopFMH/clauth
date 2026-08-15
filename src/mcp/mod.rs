@@ -63,6 +63,17 @@ const DEFAULT_IDLE_SECS: u64 = 300;
 /// Cap on the salvaged assistant text carried back by a killed delegate. The
 /// tail is kept: it is the part closest to a usable answer.
 const PARTIAL_TEXT_CAP: usize = 8 * 1024;
+/// Cap on the tail a RUNNING check carries. Far under [`PARTIAL_TEXT_CAP`]
+/// because this rides a reply a model may fetch repeatedly, where the 8 KiB
+/// salvage rides one terminal envelope.
+const TAIL_CAP: usize = 400;
+/// Throttle shared by the background heartbeat and `monitor`'s progress
+/// notifications. Each heartbeat is an atomic tmp+rename (create, write,
+/// rename) and token deltas arrive at tens per second, so 2 s bounds the store
+/// to 0.5 writes/second/job — an order of magnitude inside a reader's own
+/// cadence. Claude Code renders progress on a 700 ms throttle, so nothing
+/// faster would be visible anyway.
+const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(2);
 /// Raise the delegate's max output budget above CC's default so a long headless
 /// build doesn't die on the 32k cap. Overridable via the `env` arg.
 const DEFAULT_MAX_OUTPUT_TOKENS: &str = "64000";
@@ -401,11 +412,31 @@ pub(crate) struct MonitorArgs {
     /// collects that job, several collect in one call (one result per id, in
     /// the order given, capped at 256).
     job_ids: Option<Vec<String>>,
-    /// Seconds to long-poll before returning (0..=60, default 0 = reply
-    /// instantly). Exactly one mode per call: with `job_ids` this bounds the
+    /// Seconds to long-poll before returning (0..=3600, default 0 = reply
+    /// instantly), clamped to 1500 on a client that cannot receive progress
+    /// notifications. Exactly one mode per call: with `job_ids` this bounds the
     /// wait for a job to finish; with none it bounds the wait on clauth's own
     /// state, which is the mode `job_ids` cannot name.
     wait_secs: Option<u64>,
+    /// `any` (the default) returns as soon as one named job finishes; `all`
+    /// waits for the slowest. Needs `job_ids` — it orders a set of jobs, so
+    /// naming it without them is refused.
+    return_on: Option<String>,
+    /// Stop the named jobs, keeping whatever they produced. Not available yet;
+    /// passing `true` is refused rather than silently ignored.
+    cancel: Option<bool>,
+}
+
+/// Which lane ends a several-ids wait.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReturnOn {
+    /// The first job to finish. An orchestrator polls a fan-out to react to
+    /// whichever lane lands first, and waiting for the slowest makes every
+    /// reply as slow as it.
+    Any,
+    /// Every job, which is what a caller collecting an already-finished set
+    /// wants.
+    All,
 }
 
 #[tool_router]
@@ -794,20 +825,24 @@ text it had plus a `session_id` to `resume`, rather than paying for that work tw
                     if let Err(reason) = preflight_target(target, &name) {
                         return Ok(delegate_refusal(&reason));
                     }
+                    let extra_args = args.unwrap_or_default();
+                    let streaming = !sets_output_format(&extra_args);
                     let opts = BackgroundOpts {
                         prompt,
                         model,
                         cwd,
                         env: env.unwrap_or_default(),
-                        extra_args: args.unwrap_or_default(),
+                        extra_args,
                         timeout_secs,
                         idle_secs,
                         resume,
                         isolation,
                         depth,
                     };
-                    let (job_id, started_at) = reserve_background_job(&name)
+                    let spec = reserve_background_job(&name, timeout_secs, idle_secs, streaming)
                         .map_err(|e| ErrorData::internal_error(e, None))?;
+                    let job_id = spec.job_id.clone();
+                    let started_at = spec.started_at;
                     // Commits to launch: the job file is reserved and the task
                     // spawns next. `begin` reports `working` on the 0→1
                     // transition; each task's end-guard decrements, and the
@@ -815,13 +850,7 @@ text it had plus a `session_id` to `resume`, rather than paying for that work tw
                     if let Some(pane) = &self.herdr_pane {
                         pane.begin();
                     }
-                    launch_background_delegate(
-                        name.clone(),
-                        opts,
-                        job_id.clone(),
-                        started_at,
-                        self.herdr_pane.clone(),
-                    );
+                    launch_background_delegate(name.clone(), opts, spec, self.herdr_pane.clone());
                     let payload = serde_json::json!({
                         "job_id": job_id,
                         "profile": name,
@@ -832,12 +861,14 @@ text it had plus a `session_id` to `resume`, rather than paying for that work tw
                     return Ok(CallToolResult::success(single_block(prose)));
                 }
                 Target::Many(names) => {
+                    let extra_args = args.unwrap_or_default();
+                    let streaming = !sets_output_format(&extra_args);
                     let opts = BackgroundOpts {
                         prompt,
                         model,
                         cwd,
                         env: env.unwrap_or_default(),
-                        extra_args: args.unwrap_or_default(),
+                        extra_args,
                         timeout_secs,
                         idle_secs,
                         resume,
@@ -850,28 +881,29 @@ text it had plus a `session_id` to `resume`, rather than paying for that work tw
                     // `resolve_fanout`), so a failure spends no window and loses
                     // no job id. The ids already reserved exist nowhere else;
                     // drop them and keep the all-or-nothing contract.
-                    let mut handles = Vec::with_capacity(names.len());
+                    let mut specs = Vec::with_capacity(names.len());
                     for name in &names {
-                        match reserve_background_job(name) {
-                            Ok(handle) => handles.push(handle),
+                        match reserve_background_job(name, timeout_secs, idle_secs, streaming) {
+                            Ok(spec) => specs.push(spec),
                             Err(reason) => {
-                                for (job_id, _) in &handles {
-                                    jobs::remove(job_id);
+                                for spec in &specs {
+                                    jobs::remove(&spec.job_id);
                                 }
                                 return Ok(delegate_refusal(&reason));
                             }
                         }
                     }
                     let mut jobs = Vec::with_capacity(names.len());
-                    for (name, (job_id, started_at)) in names.iter().zip(handles) {
+                    for (name, spec) in names.iter().zip(specs) {
                         if let Some(pane) = &self.herdr_pane {
                             pane.begin();
                         }
+                        let job_id = spec.job_id.clone();
+                        let started_at = spec.started_at;
                         launch_background_delegate(
                             name.clone(),
                             opts.clone(),
-                            job_id.clone(),
-                            started_at,
+                            spec,
                             self.herdr_pane.clone(),
                         );
                         jobs.push(serde_json::json!({
@@ -918,6 +950,8 @@ text it had plus a `session_id` to `resume`, rather than paying for that work tw
                 resume: resume.as_deref(),
                 isolation,
                 depth,
+                // A blocking delegate has no job file, so it never heartbeats.
+                job: None,
             })
         })
         .await
@@ -960,9 +994,66 @@ stops the named jobs and keeps whatever they produced."
     )]
     async fn monitor(
         &self,
-        Parameters(MonitorArgs { job_ids, wait_secs }): Parameters<MonitorArgs>,
+        Parameters(args): Parameters<MonitorArgs>,
+        ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
-        let wait = wait_secs.unwrap_or(0).min(MAX_WAIT_SECS);
+        self.monitor_with(args, ProgressSink::from_context(&ctx))
+            .await
+    }
+
+    /// The whole of `monitor`, minus the peer. Split out because an in-process
+    /// caller cannot construct a `Peer<RoleServer>` — that is every test call
+    /// site — and because [`ProgressSink::none`] is also exactly what a peer
+    /// that sent no `progressToken` gets, so the split is a real path rather
+    /// than a test-only one.
+    async fn monitor_with(
+        &self,
+        args: MonitorArgs,
+        mut progress: ProgressSink,
+    ) -> Result<CallToolResult, ErrorData> {
+        let MonitorArgs {
+            job_ids,
+            wait_secs,
+            return_on,
+            cancel,
+        } = args;
+        // Cross-mode and bad-value refusals, by name and before any waiting: a
+        // rule the server refuses by name is one the description does not have
+        // to teach (placement rule 4). Same shape as the `profiles` handler's
+        // `scope` refusal.
+        let refuse = |reason: &str| {
+            let payload = serde_json::json!({ "is_error": true, "result": reason });
+            Ok(CallToolResult::error(single_block(
+                render::delegate_result_prose(&payload),
+            )))
+        };
+        if cancel == Some(true) {
+            // rmcp deserializes tool args with a plain `from_value` and no
+            // `deny_unknown_fields`, so before this parameter existed a
+            // `cancel: true` the description itself teaches was dropped and the
+            // call answered as a plain check.
+            return refuse(
+                "`cancel` is not available yet: stopping a running delegate ships in a later \
+                 release; drop it to check or collect the named jobs",
+            );
+        }
+        let return_on = match (return_on.as_deref(), job_ids.is_some()) {
+            (None, _) => ReturnOn::Any,
+            (Some(_), false) => {
+                return refuse(
+                    "`return_on` cannot combine with the state-waiting mode: it orders a set of \
+                     jobs, so name `job_ids` or drop it",
+                );
+            }
+            (Some("any"), true) => ReturnOn::Any,
+            (Some("all"), true) => ReturnOn::All,
+            (Some(raw), true) => {
+                return refuse(&format!(
+                    "unrecognized return_on \"{raw}\": accepted \"any\" and \"all\""
+                ));
+            }
+        };
+        let wait = clamp_wait(wait_secs, progress.can_receive_progress());
         match job_ids {
             // One id keeps the single-job reply shape; several collect as a
             // batch. An empty list is job mode with no ids, refused below.
@@ -971,23 +1062,15 @@ stops the named jobs and keeps whatever they produced."
                     ids.into_iter().next().unwrap_or_default(),
                     wait,
                     &self.digest,
+                    &mut progress,
                 )
                 .await
             }
-            Some(ids) => monitor_batch(ids, wait, &self.digest).await,
+            Some(ids) => monitor_batch(ids, wait, return_on, &self.digest, &mut progress).await,
             // No ids: the state-waiting mode absorbed from the old `watch`
             // tool — the same digest, all three observables, no filter.
             None => {
-                // The poll loop sleeps inside its own request on the blocking
-                // pool, mirroring the job mode's `wait_for_done` wrap, so the
-                // stdio reactor stays responsive for the whole wait.
-                let tracker = self.digest.clone();
-                let outcome =
-                    tokio::task::spawn_blocking(move || tracker.watch(WatchSet::ALL, wait))
-                        .await
-                        .map_err(|e| {
-                            ErrorData::internal_error(format!("watch task panicked: {e}"), None)
-                        })?;
+                let outcome = self.digest.watch(WatchSet::ALL, wait, &mut progress).await;
                 let payload = match outcome {
                     WatchOutcome::Armed => serde_json::json!({ "status": "armed" }),
                     WatchOutcome::Unchanged { waited_secs } => {
@@ -1012,10 +1095,123 @@ const MCP_DEPTH_ENV: &str = "CLAUTH_MCP_DEPTH";
 /// Poll interval mirroring `start.rs`'s `wait_for_child` cadence.
 const RUN_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
-/// Ceiling on `monitor`'s long-poll wait (seconds). One tool, one `wait_secs`
-/// parameter, so both waiting modes share one ceiling: a tool cannot carry two
-/// limits on one parameter name.
-const MAX_WAIT_SECS: u64 = 60;
+/// Ceiling on `monitor`'s long-poll wait (seconds), matching
+/// [`MAX_RUN_TIMEOUT_SECS`] so one call can cover any delegate. One tool, one
+/// `wait_secs` parameter, so both waiting modes share one ceiling: a tool cannot
+/// carry two limits on one parameter name.
+const MAX_WAIT_SECS: u64 = MAX_RUN_TIMEOUT_SECS;
+/// Ceiling for a peer that supplied no `progressToken`. The 3600 s cap above
+/// depends on progress notifications re-anchoring Claude Code's 30-minute stdio
+/// idle abort; a peer that sent no token cannot receive them, and the unclamped
+/// cap would turn every long wait into a hard abort. The token IS the capability
+/// probe — a config key would ask the operator to know their client's
+/// idle-timeout behaviour, which is precisely the thing they cannot observe.
+const MAX_WAIT_SECS_NO_PROGRESS: u64 = 1500;
+
+/// The wait this call actually gets: the requested seconds under whichever
+/// ceiling this peer can survive.
+fn clamp_wait(wait_secs: Option<u64>, can_receive_progress: bool) -> u64 {
+    let cap = if can_receive_progress {
+        MAX_WAIT_SECS
+    } else {
+        MAX_WAIT_SECS_NO_PROGRESS
+    };
+    wait_secs.unwrap_or(0).min(cap)
+}
+
+/// Everything one `monitor` call needs from its own request: the peer plus the
+/// progress token it supplied, the throttle clock and monotonic counter those
+/// need (rmcp's `progress` field must strictly increase across one request's
+/// notifications), and the cancellation token every wait loop races its sleep
+/// against.
+///
+/// The cancel token lives here because this is already the one value threaded
+/// through all three loops, and because it is the half of `RequestContext` a
+/// test can construct — a `Peer<RoleServer>` is not.
+///
+/// A notification is best-effort. A dropped transport ends the request anyway,
+/// and a failed one must never fail the wait it was describing.
+pub(crate) struct ProgressSink {
+    channel: Option<(rmcp::Peer<RoleServer>, rmcp::model::ProgressToken)>,
+    /// Fired when the client sends `notifications/cancelled` for this request.
+    /// rmcp cancels it but awaits the handler future bare, so nothing ends the
+    /// call unless a loop reads this.
+    ct: tokio_util::sync::CancellationToken,
+    sent: f64,
+    last: Option<Instant>,
+}
+
+impl ProgressSink {
+    /// A sink with no channel — the same state [`Self::from_context`] builds
+    /// for a peer that sent no `progressToken`, reachable directly so an
+    /// in-process caller, which cannot construct a `Peer<RoleServer>`, still
+    /// drives the real handler.
+    #[cfg(test)]
+    pub(crate) fn none() -> Self {
+        Self {
+            channel: None,
+            ct: tokio_util::sync::CancellationToken::new(),
+            sent: 0.0,
+            last: None,
+        }
+    }
+
+    /// This call's cancellation token, for a test that needs to fire it. The
+    /// real one arrives on the request.
+    #[cfg(test)]
+    pub(crate) fn cancel_token(&self) -> tokio_util::sync::CancellationToken {
+        self.ct.clone()
+    }
+
+    fn from_context(ctx: &RequestContext<RoleServer>) -> Self {
+        Self {
+            channel: ctx
+                .meta
+                .get_progress_token()
+                .map(|token| (ctx.peer.clone(), token)),
+            ct: ctx.ct.clone(),
+            sent: 0.0,
+            last: None,
+        }
+    }
+
+    /// Sleep one poll slice, or wake the moment the client abandons the call.
+    /// `true` = cancelled, which every loop treats as its deadline arriving:
+    /// the response is discarded either way, so the cheapest correct thing is
+    /// to stop reading disk and stop notifying a request id that is gone.
+    async fn sleep_or_cancelled(&self, slice: Duration) -> bool {
+        tokio::select! {
+            () = tokio::time::sleep(slice) => false,
+            () = self.ct.cancelled() => true,
+        }
+    }
+
+    /// Whether this peer can receive progress at all, which is what decides the
+    /// wait ceiling ([`clamp_wait`]).
+    fn can_receive_progress(&self) -> bool {
+        self.channel.is_some()
+    }
+
+    /// Send one progress line, at most once per [`HEARTBEAT_INTERVAL`]. The
+    /// message is built lazily so a throttled tick costs nothing.
+    async fn tick(&mut self, message: impl FnOnce() -> String) {
+        let now = Instant::now();
+        if self.channel.is_none()
+            || self
+                .last
+                .is_some_and(|t| now.duration_since(t) < HEARTBEAT_INTERVAL)
+        {
+            return;
+        }
+        self.last = Some(now);
+        self.sent += 1.0;
+        if let Some((peer, token)) = self.channel.as_ref() {
+            let param = rmcp::model::ProgressNotificationParam::new(token.clone(), self.sent)
+                .with_message(message());
+            let _ = peer.notify_progress(param).await;
+        }
+    }
+}
 /// Poll cadence for both `monitor` modes and the `mcp-await-job` hook.
 const JOB_POLL_INTERVAL: Duration = Duration::from_millis(200);
 /// Self-deadline for the `mcp-await-job` hook: outlast the max delegate timeout
@@ -1029,30 +1225,31 @@ async fn monitor_one(
     job_id: String,
     wait: u64,
     digest: &DigestTracker,
+    progress: &mut ProgressSink,
 ) -> Result<CallToolResult, ErrorData> {
     if !jobs::is_safe_job_id(&job_id) {
         let payload = serde_json::json!({ "is_error": true, "result": "invalid job_id" });
         let prose = render::delegate_result_prose(&payload);
         return Ok(CallToolResult::error(single_block(prose)));
     }
-    let jid = job_id.clone();
-    let outcome = tokio::task::spawn_blocking(move || wait_for_done(&jid, wait))
-        .await
-        .map_err(|e| ErrorData::internal_error(format!("wait task panicked: {e}"), None))?;
+    // A collect is the other moment a corpse matters: a server that died
+    // mid-job leaves a file polling `running` forever, and `RUNNING_TTL_MS`
+    // already knows it is one. Corpses only — a reader that swept `done` files
+    // would delete the very envelope this call came for.
+    jobs::gc_running_corpses(now_ms());
+    let outcome = wait_for_done(&job_id, wait, progress).await;
 
     match outcome {
         WaitOutcome::Unknown => {
-            let payload = serde_json::json!({ "is_error": true, "result": format!("unknown job_id: {job_id}") });
+            let payload = serde_json::json!({
+                "is_error": true,
+                "result": unknown_job_reason(&job_id, now_ms()),
+            });
             let prose = render::delegate_result_prose(&payload);
             Ok(CallToolResult::error(single_block(prose)))
         }
         WaitOutcome::Running(record) => {
-            let elapsed_secs = now_ms().saturating_sub(record.started_at) / 1000;
-            let payload = serde_json::json!({
-                "job_id": job_id,
-                "status": "running",
-                "elapsed_secs": elapsed_secs,
-            });
+            let payload = running_payload(&job_id, &record, now_ms());
             let prose = render::delegate_result_prose(&payload);
             Ok(CallToolResult::success(single_block(prose)))
         }
@@ -1082,7 +1279,9 @@ async fn monitor_one(
 async fn monitor_batch(
     job_ids: Vec<String>,
     wait: u64,
+    return_on: ReturnOn,
     digest: &DigestTracker,
+    progress: &mut ProgressSink,
 ) -> Result<CallToolResult, ErrorData> {
     // The cap mirrors the job store's own retention: GC keeps at most
     // `MAX_RETAINED` files, so a longer list could not resolve more ids, and
@@ -1106,9 +1305,9 @@ async fn monitor_batch(
         return Ok(CallToolResult::error(single_block(prose)));
     }
 
-    let outcomes = tokio::task::spawn_blocking(move || wait_for_batch(&job_ids, wait))
-        .await
-        .map_err(|e| ErrorData::internal_error(format!("wait task panicked: {e}"), None))?;
+    // Same reason as the one-id arm, and the same narrow scope.
+    jobs::gc_running_corpses(now_ms());
+    let outcomes = wait_for_batch(&job_ids, wait, return_on, progress).await;
 
     let mut results = Vec::with_capacity(outcomes.len());
     let mut delivered = Vec::new();
@@ -1116,14 +1315,7 @@ async fn monitor_batch(
     for (id, outcome) in outcomes {
         let entry = match outcome {
             WaitOutcome::Unknown => serde_json::json!({ "job_id": id, "status": "unknown" }),
-            WaitOutcome::Running(record) => {
-                let elapsed_secs = now_ms().saturating_sub(record.started_at) / 1000;
-                serde_json::json!({
-                    "job_id": id,
-                    "status": "running",
-                    "elapsed_secs": elapsed_secs,
-                })
-            }
+            WaitOutcome::Running(record) => running_payload(&id, &record, now_ms()),
             WaitOutcome::Done(record) => {
                 // No per-result digest: one rides the whole reply below.
                 let (mut payload, is_error) = fold_done_envelope(&record, DigestMode::Skip);
@@ -1221,29 +1413,147 @@ enum WaitOutcome {
     Unknown,
 }
 
-/// Poll a job file until it reports `done` or `deadline_secs` elapses. `Unknown`
-/// when the file is absent (distinct from `Running` for a present-but-incomplete
-/// job). Blocking; callers wrap it in `spawn_blocking`.
-fn wait_for_done(job_id: &str, deadline_secs: u64) -> WaitOutcome {
+/// The running-check payload both `monitor` arms render, so the one-id and
+/// several-ids spellings cannot drift. `now` is epoch ms.
+///
+/// A field clauth structurally cannot have is ABSENT rather than `unknown`: no
+/// `last_output_secs_ago` before the first line arrives, no `idle_kill_in_secs`
+/// when the idle leg is off, no tail when there is none. A record carrying no
+/// `timeout_secs` predates the fields entirely (`resolve_deadlines` clamps a
+/// real one to 1..=3600), so the whole liveness set is dropped rather than
+/// counted down from a defaulted zero.
+///
+/// Every figure here is one epoch-ms subtraction, and the only inaccuracy is the
+/// heartbeat throttle: the file is rewritten at most once per
+/// [`HEARTBEAT_INTERVAL`], so `last_output_secs_ago` can over-report silence by
+/// up to that interval and each countdown under-report by the same. The kill
+/// path itself does not read this file — it reads the in-process `progress`
+/// atomic — so the two never have to agree exactly.
+fn running_payload(job_id: &str, record: &jobs::JobRecord, now: u64) -> serde_json::Value {
+    let elapsed_ms = now.saturating_sub(record.started_at);
+    let elapsed_secs = elapsed_ms / 1000;
+    let mut payload = serde_json::json!({
+        "job_id": job_id,
+        "status": "running",
+        "profile": record.profile,
+        "elapsed_secs": elapsed_secs,
+        "quota": windows_json(&record.profile),
+    });
+    if record.timeout_secs == 0 {
+        return payload;
+    }
+    payload["wall_kill_in_secs"] =
+        serde_json::json!(record.timeout_secs.saturating_sub(elapsed_secs));
+    // A run that has said nothing has been idle for its whole life, which is
+    // also how the kill path counts it.
+    let idle_for_secs = if record.last_output_at == 0 {
+        elapsed_secs
+    } else {
+        now.saturating_sub(record.last_output_at) / 1000
+    };
+    if record.last_output_at > 0 {
+        payload["last_output_secs_ago"] = serde_json::json!(idle_for_secs);
+    }
+    if let Some(idle) = record.idle_secs {
+        payload["idle_kill_in_secs"] = serde_json::json!(idle.saturating_sub(idle_for_secs));
+    }
+    if !record.tail.is_empty() {
+        payload["tail"] = serde_json::json!(record.tail);
+    }
+    payload
+}
+
+/// The epoch-ms a job id carries in its own mint shape, `None` for a token
+/// clauth never minted.
+fn job_id_minted_at(token: &str) -> Option<u64> {
+    token_is_job_id(token)
+        .then(|| token.split('-').nth(1))
+        .flatten()
+        .and_then(|ms| ms.parse().ok())
+}
+
+/// Why an id names no job file, and what the caller can do about it.
+///
+/// Only the FIRST branch is a derivation: a token off the mint shape was never a
+/// clauth job at all. The mint stamp the id carries bounds a job's age and
+/// nothing more — it cannot say which of the other three causes fired, since a
+/// job minted two hours ago may equally have been collected five minutes ago —
+/// so the age branch names the sweep as the likeliest cause and hedges like the
+/// branch below it, rather than asserting a cause and telling the caller to
+/// spend another window on it. Already-collected and dropped-past-the-cap share
+/// one branch because nothing on disk survives either.
+fn unknown_job_reason(job_id: &str, now: u64) -> String {
+    let Some(minted_at) = job_id_minted_at(job_id) else {
+        return format!(
+            "unknown job_id: {job_id} — clauth never minted it (a real one reads \
+             `d-<epoch_ms>-<counter>`); check the id `delegate` handed back"
+        );
+    };
+    let collected = "already collected by an earlier `monitor` call or delivered by clauth's \
+                     auto-delivery hook";
+    if now.saturating_sub(minted_at) > jobs::DONE_TTL_MS {
+        // Collection leads even here. Every collect evicts through
+        // `jobs::remove`, while the hour-after-finish sweep runs at startup
+        // alone, so on a session that has been up a while the sweep is the
+        // rarer of the two rather than the likelier.
+        return format!(
+            "unknown job_id: {job_id} — most likely {collected}; minted over an hour ago, so \
+             it may also have been swept an hour after it finished. check this session's \
+             earlier replies before re-running the delegate"
+        );
+    }
+    format!(
+        "unknown job_id: {job_id} — {collected}, or dropped once the store passed its {} \
+         newest jobs; check this session's earlier replies for the result",
+        jobs::MAX_RETAINED
+    )
+}
+
+/// Poll a job file until it reports `done`, `deadline_secs` elapses, or the
+/// client abandons the call, ticking progress each slice off the freshest
+/// running record. `Unknown` when the file is absent (distinct from `Running`
+/// for a present-but-incomplete job).
+async fn wait_for_done(
+    job_id: &str,
+    deadline_secs: u64,
+    progress: &mut ProgressSink,
+) -> WaitOutcome {
     let start = Instant::now();
     let deadline = Duration::from_secs(deadline_secs);
+    let mut cancelled = false;
     loop {
         match jobs::read(job_id) {
             Some(r) if r.state == jobs::JobState::Done => return WaitOutcome::Done(r),
-            Some(r) if start.elapsed() >= deadline => return WaitOutcome::Running(r),
-            Some(_) => {}
+            Some(r) if cancelled || start.elapsed() >= deadline => {
+                return WaitOutcome::Running(r);
+            }
+            Some(r) => {
+                progress
+                    .tick(|| render::running_status_prose(&running_payload(job_id, &r, now_ms())))
+                    .await;
+            }
             None => return WaitOutcome::Unknown,
         }
-        std::thread::sleep(JOB_POLL_INTERVAL);
+        cancelled = progress.sleep_or_cancelled(JOB_POLL_INTERVAL).await;
     }
 }
 
-/// Poll every id until each resolves or `deadline_secs` elapses, mirroring
-/// `await_job_outcomes`'s semantics: a done file resolves at once, an absent
-/// file resolves at once (it never appears for a caller-supplied id), and a
-/// running file holds until the deadline. One outcome per id, in the order
-/// given. Blocking; callers wrap it in `spawn_blocking`.
-fn wait_for_batch(job_ids: &[String], deadline_secs: u64) -> Vec<(String, WaitOutcome)> {
+/// Poll every id until the wait ends, mirroring `await_job_outcomes`'s
+/// semantics: a done file resolves at once, an absent file resolves at once (it
+/// never appears for a caller-supplied id), and a running file holds. One
+/// outcome per id, in the order given.
+///
+/// `ReturnOn::Any` ends the wait on the first job to finish, so the reply is not
+/// paced by the slowest lane. That break leaves slots unresolved, and the
+/// deadline can cross mid-pass under either mode, so a final pass resolves every
+/// remaining slot by its own state. The invariant it protects: `Unknown` belongs
+/// to a MISSING file only — a running id must never fall out as one.
+async fn wait_for_batch(
+    job_ids: &[String],
+    deadline_secs: u64,
+    return_on: ReturnOn,
+    progress: &mut ProgressSink,
+) -> Vec<(String, WaitOutcome)> {
     let start = Instant::now();
     let deadline = Duration::from_secs(deadline_secs);
     // `None` = unresolved. An unsafe id can never name a job file
@@ -1253,32 +1563,53 @@ fn wait_for_batch(job_ids: &[String], deadline_secs: u64) -> Vec<(String, WaitOu
         .iter()
         .map(|id| (!jobs::is_safe_job_id(id)).then_some(WaitOutcome::Unknown))
         .collect();
+    let mut any_done = false;
+    let mut cancelled = false;
     loop {
         let mut unresolved = false;
+        let mut newest: Option<jobs::JobRecord> = None;
         for (id, slot) in job_ids.iter().zip(&mut outcomes) {
             if slot.is_some() {
                 continue;
             }
             match jobs::read(id) {
-                Some(r) if r.state == jobs::JobState::Done => *slot = Some(WaitOutcome::Done(r)),
-                Some(r) if start.elapsed() >= deadline => *slot = Some(WaitOutcome::Running(r)),
-                Some(_) => unresolved = true,
+                Some(r) if r.state == jobs::JobState::Done => {
+                    any_done = true;
+                    *slot = Some(WaitOutcome::Done(r));
+                }
+                Some(r) if cancelled || start.elapsed() >= deadline => {
+                    *slot = Some(WaitOutcome::Running(r));
+                }
+                Some(r) => {
+                    unresolved = true;
+                    newest = Some(r);
+                }
                 None => *slot = Some(WaitOutcome::Unknown),
             }
         }
-        // The deadline is not a break condition: when it passes mid-pass,
-        // the next pass resolves every still-running slot through the
-        // `Running` arm above, so a running id never falls out of the map
-        // below as `Unknown` (that verdict belongs to a missing file only).
-        if !unresolved {
+        if !unresolved || (return_on == ReturnOn::Any && any_done) {
             break;
         }
-        std::thread::sleep(JOB_POLL_INTERVAL);
+        if let Some(record) = &newest {
+            progress
+                .tick(|| {
+                    render::running_status_prose(&running_payload(&record.job_id, record, now_ms()))
+                })
+                .await;
+        }
+        cancelled = progress.sleep_or_cancelled(JOB_POLL_INTERVAL).await;
     }
     job_ids
         .iter()
         .zip(outcomes)
-        .map(|(id, slot)| (id.clone(), slot.unwrap_or(WaitOutcome::Unknown)))
+        .map(|(id, slot)| {
+            let outcome = slot.unwrap_or_else(|| match jobs::read(id) {
+                Some(r) if r.state == jobs::JobState::Done => WaitOutcome::Done(r),
+                Some(r) => WaitOutcome::Running(r),
+                None => WaitOutcome::Unknown,
+            });
+            (id.clone(), outcome)
+        })
         .collect()
 }
 
@@ -1463,6 +1794,9 @@ struct DelegateOpts<'a> {
     resume: Option<&'a str>,
     isolation: Isolation,
     depth: u32,
+    /// The reserved running record this run heartbeats into. `None` for a
+    /// blocking delegate, which has no job file to write.
+    job: Option<jobs::RunningSpec>,
 }
 
 /// Owned twin of [`DelegateOpts`] for a background launch: the detached task is
@@ -1481,6 +1815,16 @@ struct BackgroundOpts {
     resume: Option<String>,
     isolation: Isolation,
     depth: u32,
+}
+
+/// Why the supervision loop stopped waiting on the child, when it was not the
+/// child exiting. Both arms leave the loop rather than returning, so the stdout
+/// reader thread is joined on every path out of `run_delegate`.
+enum WaitEnd {
+    /// A deadline fired; the child was killed and hands back what it wrote.
+    Expired(Expiry),
+    /// `try_wait` itself failed, so clauth no longer knows the child's state.
+    Failed(String),
 }
 
 /// Which deadline killed a delegate.
@@ -1657,15 +2001,43 @@ fn keep_tail(s: &mut String, cap: usize) {
     s.replace_range(..start, "");
 }
 
+/// The delegate's newest assistant text as one bounded display line: the last
+/// [`TAIL_CAP`] bytes (on a char boundary), every whitespace run collapsed to a
+/// single space and the ends trimmed. A running status is a status, and a
+/// delegate's answer is full of newlines.
+fn tail_line(capture: &StreamCapture) -> String {
+    let mut text = capture.partial_text();
+    keep_tail(&mut text, TAIL_CAP);
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// The background run's "write this now" callback. It is handed the capture and
+/// nothing else: the run-relative clock `read_stdout` keeps is anchored at the
+/// child's spawn while the job file's `started_at` is anchored at the reserve,
+/// and passing one where the other is meant is the skew this signature removes.
+type HeartbeatSink<'a> = &'a mut dyn FnMut(&StreamCapture);
+
 /// Read the child's stdout to EOF, stamping `progress` with the elapsed
 /// milliseconds at every line so the wait loop can tell a working delegate from
 /// a stalled one. Non-streaming mode drains the pipe whole (there is nothing to
-/// stamp until the child exits).
+/// stamp until the child exits, and so nothing to heartbeat either).
+///
+/// `heartbeat` is the background run's "write this now" callback, called at most
+/// once per [`HEARTBEAT_INTERVAL`]. The throttle lives HERE rather than in the
+/// sink so it is testable in one place and every sink stays pure. The sink is a
+/// closure on this thread rather than a read from the supervision loop because
+/// the tail text lives inside `StreamCapture`, which this thread owns
+/// exclusively: handing it over would mean a `Mutex<String>` written once per
+/// token delta on the hottest path in the run, which is a lock the MCP layer is
+/// not allowed to add and buys nothing. `None` is a blocking `delegate`, which
+/// has no job file to write — which keeps this function pure under test and
+/// makes "heartbeats are background-only" structural.
 fn read_stdout<R: std::io::Read>(
     reader: R,
     streaming: bool,
     start: Instant,
     progress: &AtomicU64,
+    mut heartbeat: Option<HeartbeatSink<'_>>,
 ) -> StreamCapture {
     let mut reader = reader;
     if !streaming {
@@ -1674,6 +2046,7 @@ fn read_stdout<R: std::io::Read>(
     let mut buffered = std::io::BufReader::new(reader);
     let mut capture = StreamCapture::default();
     let mut raw = Vec::new();
+    let mut last_beat: Option<Instant> = None;
     loop {
         raw.clear();
         // read_until over lines(): a single event can carry a multi-megabyte tool
@@ -1682,8 +2055,16 @@ fn read_stdout<R: std::io::Read>(
             Ok(0) | Err(_) => break,
             Ok(_) => {}
         }
-        progress.store(elapsed_ms(start), Ordering::Relaxed);
+        let stamp = elapsed_ms(start);
+        progress.store(stamp, Ordering::Relaxed);
         capture.push_line(String::from_utf8_lossy(&raw).trim());
+        if let Some(sink) = heartbeat.as_mut() {
+            let now = Instant::now();
+            if last_beat.is_none_or(|t| now.duration_since(t) >= HEARTBEAT_INTERVAL) {
+                last_beat = Some(now);
+                sink(&capture);
+            }
+        }
     }
     capture
 }
@@ -1965,9 +2346,22 @@ fn run_delegate(opts: DelegateOpts<'_>) -> std::result::Result<serde_json::Value
     // the child closes the write ends, the readers hit EOF, and the joins return.
     let start = Instant::now();
     let progress = std::sync::Arc::new(AtomicU64::new(0));
+    let job = opts.job.clone();
     let stdout_reader = child.stdout.take().map(|h| {
         let progress = std::sync::Arc::clone(&progress);
-        std::thread::spawn(move || read_stdout(h, streaming, start, &progress))
+        std::thread::spawn(move || match job {
+            // A background run rewrites its own job file as it reads, so a
+            // `monitor` check sees liveness that would otherwise die with this
+            // task. Best-effort: a failed heartbeat costs one stale check, and
+            // must never end the capture.
+            Some(spec) => {
+                let mut beat = |capture: &StreamCapture| {
+                    let _ = jobs::write_heartbeat(&spec, now_ms(), &tail_line(capture));
+                };
+                read_stdout(h, streaming, start, &progress, Some(&mut beat))
+            }
+            None => read_stdout(h, streaming, start, &progress, None),
+        })
     });
     let stderr_reader = child
         .stderr
@@ -1976,6 +2370,15 @@ fn run_delegate(opts: DelegateOpts<'_>) -> std::result::Result<serde_json::Value
 
     let (wall, idle) = resolve_deadlines(opts.timeout_secs, opts.idle_secs, streaming);
 
+    // Nothing between the spawn above and the join below may return: the reader
+    // thread would outlive this call, the child would keep writing into it
+    // (`Child::drop` does not kill), and its heartbeats would overwrite the
+    // `write_done` the caller makes next — leaving a finished job polling
+    // `running` until GC and an `mcp-await-job` blocked on a terminal state that
+    // never arrives. So a supervision failure kills and falls through to the
+    // same join every other path takes, carrying its reason.
+    // `run_delegate_never_returns_between_spawning_the_reader_and_joining_it`
+    // is the guard; this comment only says why it is there.
     let outcome = loop {
         match child.try_wait() {
             Ok(Some(status)) => break Ok(status),
@@ -1985,11 +2388,15 @@ fn run_delegate(opts: DelegateOpts<'_>) -> std::result::Result<serde_json::Value
                 {
                     let _ = child.kill();
                     let _ = child.wait();
-                    break Err(expiry);
+                    break Err(WaitEnd::Expired(expiry));
                 }
                 std::thread::sleep(RUN_POLL_INTERVAL);
             }
-            Err(e) => return Err(format!("failed to wait for claude: {e}")),
+            Err(e) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                break Err(WaitEnd::Failed(format!("failed to wait for claude: {e}")));
+            }
         }
     };
 
@@ -2028,7 +2435,8 @@ fn run_delegate(opts: DelegateOpts<'_>) -> std::result::Result<serde_json::Value
 
     let status = match outcome {
         Ok(status) => status,
-        Err(expiry) => {
+        Err(WaitEnd::Failed(reason)) => return Err(reason),
+        Err(WaitEnd::Expired(expiry)) => {
             let limit = match expiry {
                 Expiry::Idle => idle,
                 Expiry::Wall => wall,
@@ -2273,30 +2681,44 @@ fn read_prompt_handle(file: std::fs::File, rel: &str) -> std::result::Result<Str
     Ok(text.to_string())
 }
 
-/// Record ONE background job's `running` file and return its `(job_id,
-/// started_at)` handle. This is the only fallible step left after the
+/// Record ONE background job's `running` file and return the spec every later
+/// write of it goes through. This is the only fallible step left after the
 /// pre-flight refusal; the spawn that follows cannot fail, so a fan-out
 /// reserves every job before launching any.
-fn reserve_background_job(profile: &str) -> std::result::Result<(String, u64), String> {
+///
+/// The deadlines are resolved HERE so the first running record already carries
+/// them and `resolve_deadlines`' streaming fork is applied exactly once.
+fn reserve_background_job(
+    profile: &str,
+    timeout_secs: Option<u64>,
+    idle_secs: Option<u64>,
+    streaming: bool,
+) -> std::result::Result<jobs::RunningSpec, String> {
     let started_at = now_ms();
-    let job_id = jobs::new_job_id(started_at);
-    jobs::write_running(&job_id, profile, started_at)
-        .map_err(|e| format!("failed to record job: {e}"))?;
-    Ok((job_id, started_at))
+    let (wall, idle) = resolve_deadlines(timeout_secs, idle_secs, streaming);
+    let spec = jobs::RunningSpec {
+        job_id: jobs::new_job_id(started_at),
+        profile: profile.to_string(),
+        started_at,
+        timeout_secs: wall.as_secs(),
+        // Without the event stream the idle leg is off entirely, so there is no
+        // such deadline to count down to rather than an unknown one.
+        idle_secs: streaming.then_some(idle.as_secs()),
+    };
+    jobs::write_running(&spec).map_err(|e| format!("failed to record job: {e}"))?;
+    Ok(spec)
 }
 
-/// Launch ONE background delegate on the blocking pool for the reserved
-/// `(job_id, started_at)` handle. Infallible: `spawn_blocking` cannot fail, so
-/// every failure path lives in [`reserve_background_job`]. `opts.prompt` is an
-/// `Arc<str>` so a fan-out reads the prompt once and reuses it across N accounts.
+/// Launch ONE background delegate on the blocking pool for the reserved `spec`.
+/// Infallible: `spawn_blocking` cannot fail, so every failure path lives in
+/// [`reserve_background_job`]. `opts.prompt` is an `Arc<str>` so a fan-out reads
+/// the prompt once and reuses it across N accounts.
 fn launch_background_delegate(
     profile: String,
     opts: BackgroundOpts,
-    job_id: String,
-    started_at: u64,
+    spec: jobs::RunningSpec,
     herdr_pane: Option<herdr_report::PaneReporter>,
 ) {
-    let job_id_task = job_id;
     let profile_task = profile;
     // Registered so a test's `HomeSandbox::drop` can block on this task BEFORE
     // it clears the home override: `spawn_blocking` detaches with no handle
@@ -2344,6 +2766,7 @@ fn launch_background_delegate(
                 resume: resume.as_deref(),
                 isolation,
                 depth,
+                job: Some(spec.clone()),
             })
         }));
         let envelope = match outcome {
@@ -2359,7 +2782,9 @@ fn launch_background_delegate(
                 "result": "delegate task panicked",
             }),
         };
-        let _ = jobs::write_done(&job_id_task, &profile_task, started_at, envelope);
+        // `run_delegate` has returned, so it has already joined the reader
+        // thread: the last heartbeat strictly precedes this finalize.
+        let _ = jobs::write_done(&spec.job_id, &profile_task, spec.started_at, envelope);
         // Dropped explicitly so the completion signal below is genuinely this
         // task's last action. A guard bound in the closure drops in reverse
         // declaration order, i.e. AFTER the send, which would let a test's

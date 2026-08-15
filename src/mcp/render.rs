@@ -597,8 +597,33 @@ fn profile_line(row: &Value) -> String {
     {
         out.push_str("; live session");
     }
+    // The three states `delegate` refuses on render as one contiguous run, so a
+    // reader meets one refusal group rather than three markers scattered
+    // through the line. `canceled` follows them because clauth has no cancel
+    // gate: it informs the pick, it does not block it.
+    if row
+        .get("disabled")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        out.push_str("; disabled");
+    }
+    if row
+        .get("auth_broken")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        out.push_str("; login expired");
+    }
     if row.get("keyless").and_then(Value::as_bool).unwrap_or(false) {
         out.push_str("; no api key");
+    }
+    if row
+        .get("canceled")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        out.push_str("; subscription canceled");
     }
     if let Some(rows) = row.get("throughput").and_then(Value::as_array)
         && !rows.is_empty()
@@ -772,7 +797,25 @@ fn envelope_prose(e: &Value) -> String {
     });
 
     if let Some(cost) = e.get("total_cost_usd").and_then(Value::as_f64) {
-        out.push_str(&format!(" (cost ${cost})"));
+        // `total_cost_usd` is the CHILD CLI's own figure, priced against
+        // Anthropic's card whatever endpoint served the call, so a DeepSeek or
+        // z.ai target's number is a wrong-basis figure a caller reads as the
+        // bill. The bare clause needs a POSITIVE `anthropic`: an unfolded
+        // envelope, or a target clauth could not classify, must not read as
+        // Anthropic-priced. The endpoint arrives as data through the fold —
+        // this file derives no figure the JSON did not carry.
+        let anthropic = e
+            .get("live_usage")
+            .and_then(|lu| lu.get("endpoint"))
+            .and_then(Value::as_str)
+            == Some("anthropic");
+        if anthropic {
+            out.push_str(&format!(" (cost ${cost})"));
+        } else {
+            out.push_str(&format!(
+                " (cost ${cost} at Anthropic rates, not this endpoint's)"
+            ));
+        }
     }
     if let Some(u) = e.get("usage") {
         let tokens = usage_prose(u);
@@ -794,7 +837,10 @@ fn envelope_prose(e: &Value) -> String {
     out
 }
 
-/// Prose for `delegate`: the background handle or the sync envelope.
+/// Prose for `delegate`: the background handle or the sync envelope. Both carry
+/// the folded live-usage footer and the digest — a handle is a reply about a
+/// spend that just started, and the caller's next routing decision needs the
+/// same headroom the blocking reply hands back.
 pub(crate) fn delegate_prose(p: &Value) -> String {
     if let Some(job_id) = p.get("job_id").and_then(Value::as_str) {
         let profile = p
@@ -803,8 +849,19 @@ pub(crate) fn delegate_prose(p: &Value) -> String {
             .unwrap_or("unknown");
         let status = p.get("status").and_then(Value::as_str).unwrap_or("unknown");
         // A raw start epoch carries no news a reader acts on; the JSON spelling
-        // keeps it.
-        return format!("delegate to `{profile}` {status}, job `{job_id}`");
+        // keeps it. The handle's own spelling is unchanged: the bundled
+        // `asyncRewake` hook scans this prose for `d-<ms>-<n>` tokens.
+        let mut out = format!("delegate to `{profile}` {status}, job `{job_id}`");
+        if let Some(lu) = p.get("live_usage") {
+            out.push_str("; ");
+            out.push_str(&live_usage_prose(lu, "target"));
+        }
+        let digest = digest_prose(&p["since_your_last_call"]);
+        if !digest.is_empty() {
+            out.push_str("; ");
+            out.push_str(&digest);
+        }
+        return out;
     }
     let target = p
         .get("live_usage")
@@ -853,7 +910,14 @@ pub(crate) fn delegate_refusal_prose(p: &Value) -> String {
 }
 
 /// Prose for a `delegate` `profiles` fan-out: one job per named account, echoing
-/// the resolved target list so the caller sees what it just spent.
+/// the resolved target list so the caller sees what it just spent, then each
+/// target's own headroom.
+///
+/// The headroom clauses follow the id list rather than sitting inside each
+/// parenthesis: the ids and the account names are what the caller (and the
+/// `asyncRewake` hook) reads first, and a footer spliced between them would
+/// bury the handles. The digest is the reply's, not a row's — it is folded once
+/// at the top level, because reporting consumes the delta.
 pub(crate) fn delegate_fanout_prose(p: &Value) -> String {
     let jobs = p
         .get("jobs")
@@ -874,6 +938,17 @@ pub(crate) fn delegate_fanout_prose(p: &Value) -> String {
             .and_then(Value::as_str)
             .unwrap_or("unknown");
         out.push_str(&format!("`{profile}` (job `{job_id}`)"));
+    }
+    for job in jobs {
+        if let Some(lu) = job.get("live_usage") {
+            out.push_str("; ");
+            out.push_str(&live_usage_prose(lu, "target"));
+        }
+    }
+    let digest = digest_prose(&p["since_your_last_call"]);
+    if !digest.is_empty() {
+        out.push_str("; ");
+        out.push_str(&digest);
     }
     out
 }

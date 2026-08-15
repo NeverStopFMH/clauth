@@ -219,6 +219,25 @@ fn profile_row(p: &Profile, config: &AppConfig, now: i64) -> serde_json::Value {
     if p.is_third_party() && !crate::claude::has_inference_auth(p) {
         row["keyless"] = serde_json::json!(true);
     }
+    // The other two states `preflight_target` refuses on, marked rather than
+    // filtered: a silently missing row reads exactly like "that profile is
+    // gone", which the unknown-`names` refusal already rejects.
+    if p.is_disabled() {
+        row["disabled"] = serde_json::json!(true);
+    }
+    if config.is_auth_broken(name) {
+        row["auth_broken"] = serde_json::json!(true);
+    }
+    // Informational, not a refusal: clauth has no cancel gate, and a canceled
+    // account still delegates on whatever the org's post-cancellation plan
+    // allows. It rides here because the picker is choosing where to spend.
+    // `is_canceled_cached` is the one cancellation predicate every surface
+    // asks; re-deriving it off this row's own cache read would save a parse
+    // and fork the answer, which is the trade the `list` table already made
+    // the other way.
+    if crate::profile_json::is_canceled_cached(name) {
+        row["canceled"] = serde_json::json!(true);
+    }
     row
 }
 
@@ -358,6 +377,32 @@ fn fold_active_live_usage(
     serde_json::Value::Object(map)
 }
 
+/// Which endpoint a delegate's requests actually WENT to, as the roster's own
+/// host spelling — `anthropic` for an account with no effective `base_url`.
+/// `None` when clauth cannot read that account's config, which the renderer
+/// treats as "cannot say" rather than as Anthropic.
+///
+/// The question is "where did this request go", so it reads the stored endpoint
+/// and not `is_third_party` (which answers "is the provider one clauth has a
+/// typed integration for") and not `usage_cache_is_third_party` (which answers
+/// "which cache holds this account's figures"). All three disagree on a generic
+/// api-key endpoint, and only this one bounds what `total_cost_usd` may claim.
+///
+/// Name-keyed rather than threaded from a resolved `Profile`, because
+/// `fold_done_envelope` holds only the job record's name and `load_profile`
+/// there would take the state flock on a read-only collect path. One spelling
+/// for every fold site is what keeps the blocking and collect replies from
+/// disagreeing about one account.
+fn target_endpoint(name: &str) -> Option<String> {
+    match crate::profile::stored_endpoint(name) {
+        crate::profile::StoredEndpoint::Anthropic => Some("anthropic".to_string()),
+        crate::profile::StoredEndpoint::Custom(url) => {
+            Some(render::base_url_host(&url).to_string())
+        }
+        crate::profile::StoredEndpoint::Unknown => None,
+    }
+}
+
 /// Fold the target profile's live usage into a delegate envelope (the sync
 /// `delegate` and `monitor` done-handoff paths share this). The
 /// envelope is whatever `claude` printed, so it may be ANY json shape:
@@ -381,6 +426,9 @@ fn fold_delegate_live_usage(
     };
     let windows = profile_windows_for(profile);
     let mut live = live_usage_json(Some(profile), Some(&windows));
+    if let Some(endpoint) = target_endpoint(profile) {
+        live["endpoint"] = serde_json::Value::String(endpoint);
+    }
     if let Some(note) = throughput_note(profile, now) {
         live["throughput_warning"] = serde_json::Value::String(note);
     }
@@ -893,7 +941,7 @@ text it had plus a `session_id` to `resume`, rather than paying for that work tw
                             None,
                         )
                     })?;
-                    if let Err(reason) = preflight_target(target, &name) {
+                    if let Err(reason) = preflight_target(target, &config, &name) {
                         return Ok(delegate_refusal(&reason));
                     }
                     let extra_args = args.unwrap_or_default();
@@ -922,12 +970,21 @@ text it had plus a `session_id` to `resume`, rather than paying for that work tw
                         pane.begin();
                     }
                     launch_background_delegate(name.clone(), opts, spec, self.herdr_pane.clone());
-                    let payload = serde_json::json!({
-                        "job_id": job_id,
-                        "profile": name,
-                        "started_at": started_at,
-                        "status": "running",
-                    });
+                    // The handle carries the same footer the blocking reply
+                    // does: the tool description steers a slow or third-party
+                    // target here, so the recommended path must not be the one
+                    // that never hears what it just spent.
+                    let payload = fold_delegate_live_usage(
+                        serde_json::json!({
+                            "job_id": job_id,
+                            "profile": name,
+                            "started_at": started_at,
+                            "status": "running",
+                        }),
+                        &name,
+                        now_epoch_secs(),
+                        DigestMode::Report(&self.digest),
+                    );
                     let prose = render::delegate_prose(&payload);
                     return Ok(CallToolResult::success(single_block(prose)));
                 }
@@ -964,6 +1021,7 @@ text it had plus a `session_id` to `resume`, rather than paying for that work tw
                             }
                         }
                     }
+                    let now = now_epoch_secs();
                     let mut jobs = Vec::with_capacity(names.len());
                     for (name, spec) in names.iter().zip(specs) {
                         if let Some(pane) = &self.herdr_pane {
@@ -977,14 +1035,29 @@ text it had plus a `session_id` to `resume`, rather than paying for that work tw
                             spec,
                             self.herdr_pane.clone(),
                         );
-                        jobs.push(serde_json::json!({
-                            "job_id": job_id,
-                            "profile": name,
-                            "started_at": started_at,
-                            "status": "running",
-                        }));
+                        // Each row carries its OWN target's headroom: the
+                        // caller just spent one window per account and decides
+                        // per account. `Skip`, never `Report` — reporting
+                        // CONSUMES the delta, so a per-row digest would spend
+                        // it N times and echo it N times.
+                        jobs.push(fold_delegate_live_usage(
+                            serde_json::json!({
+                                "job_id": job_id,
+                                "profile": name,
+                                "started_at": started_at,
+                                "status": "running",
+                            }),
+                            name,
+                            now,
+                            DigestMode::Skip,
+                        ));
                     }
-                    let payload = serde_json::json!({ "jobs": jobs });
+                    let mut payload = serde_json::json!({ "jobs": jobs });
+                    // One digest for the whole call, top-level beside `jobs`,
+                    // exactly where the batch collect path carries its own.
+                    if let Some(delta) = DigestMode::Report(&self.digest).folded() {
+                        payload["since_your_last_call"] = delta;
+                    }
                     let prose = render::delegate_fanout_prose(&payload);
                     return Ok(CallToolResult::success(single_block(prose)));
                 }
@@ -2310,7 +2383,7 @@ fn run_delegate(opts: DelegateOpts<'_>) -> std::result::Result<serde_json::Value
     // stops opening a brand-new session on one already disabled. Also the
     // backstop for a background job whose target changed after its pre-flight,
     // since the config is re-loaded here. Guard rationale: `preflight_target`.
-    preflight_target(target, opts.profile)?;
+    preflight_target(target, &config, opts.profile)?;
 
     if let Some(dir) = opts.cwd
         && !std::path::Path::new(dir).is_dir()
@@ -2563,24 +2636,51 @@ fn run_delegate(opts: DelegateOpts<'_>) -> std::result::Result<serde_json::Value
 }
 
 /// Refuse a resolved target that `delegate` must not spend on: a profile the
-/// operator disabled, or a recognised third-party profile whose inference has
-/// nothing to authenticate with (which would spawn a `claude` that dies on an
-/// empty envelope). The keyless test is `has_inference_auth`, the predicate
-/// derived from `build_claude_settings_json` (a validated api key, or a
-/// profile `env` entry carrying `ANTHROPIC_AUTH_TOKEN` / `ANTHROPIC_API_KEY`)
-/// — NOT the usage predicate `third_party_credentialed`, whose Alibaba
-/// exemption reads the console session that authenticates the quota gateway
-/// only. `is_third_party` scopes the check: an OAuth account has no provider.
+/// operator disabled, one whose OAuth chain is quarantined, or a recognised
+/// third-party profile whose inference has nothing to authenticate with (which
+/// would spawn a `claude` that dies on an empty envelope). The keyless test is
+/// `has_inference_auth`, the predicate derived from
+/// `build_claude_settings_json` (a validated api key, or a profile `env` entry
+/// carrying `ANTHROPIC_AUTH_TOKEN` / `ANTHROPIC_API_KEY`) — NOT the usage
+/// predicate `third_party_credentialed`, whose Alibaba exemption reads the
+/// console session that authenticates the quota gateway only. `is_third_party`
+/// scopes the check: an OAuth account has no provider.
+///
+/// Every refusal names its fix, because the reader is a model that can run the
+/// command: an unnamed one costs a turn to look up.
+///
+/// The quarantine gate is `config.is_auth_broken`, a pure in-memory read of
+/// `AppState::auth_broken`, and it is deliberately NOT a refresh attempt: the
+/// MCP layer takes no rotation lock. It sits AFTER the disabled bail for the
+/// reason `switch` orders them the same way — a disabled, clock-expired target
+/// must be refused before anything can rotate its single-use refresh token.
+///
 /// Called from every path that refuses before a spawn: the single-background
 /// arm and `resolve_fanout` up front, and `run_delegate` as the blocking
 /// path's own check plus the backstop for a target that changed after its
 /// pre-flight (the config is re-loaded there).
-fn preflight_target(profile: &Profile, name: &str) -> std::result::Result<(), String> {
+fn preflight_target(
+    profile: &Profile,
+    config: &AppConfig,
+    name: &str,
+) -> std::result::Result<(), String> {
     if profile.is_disabled() {
-        return Err(format!("profile is disabled: {name}"));
+        return Err(format!(
+            "profile is disabled: {name} (run `clauth enable {name}`)"
+        ));
+    }
+    // Verbatim `switch`'s own refusal (`actions.rs`, its AUTH-1 arm), so the two
+    // surfaces cannot spell one quarantine two ways. It already names the fix.
+    if config.is_auth_broken(name) {
+        return Err(crate::format::login_expired(name).line());
     }
     if profile.is_third_party() && !crate::claude::has_inference_auth(profile) {
-        return Err(format!("profile has no api key: {name}"));
+        // `--api-key` is what selects api-key mode; a bare `clauth login` on a
+        // third-party profile runs the browser OAuth flow instead and leaves
+        // the missing key missing.
+        return Err(format!(
+            "profile has no api key: {name} (run `clauth login {name} --api-key <key>`)"
+        ));
     }
     Ok(())
 }
@@ -2630,7 +2730,7 @@ fn resolve_fanout(config: &AppConfig, raw: &[String]) -> std::result::Result<Vec
         let profile = config
             .find(name)
             .ok_or_else(|| format!("profile not found: {name}"))?;
-        preflight_target(profile, name)?;
+        preflight_target(profile, config, name)?;
     }
     Ok(resolved)
 }

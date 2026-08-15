@@ -1665,6 +1665,55 @@ pub(crate) fn stored_usage_cache_is_third_party(name: &str) -> bool {
     )
 }
 
+/// Where an account's requests actually GO, for a caller holding only a name.
+///
+/// The question is "which endpoint served this call", the one
+/// [`Profile::is_oauth`] answers for a caller holding a loaded profile — never
+/// "is this a recognised provider" ([`Profile::is_third_party`]) and never
+/// "which cache holds this account's figures"
+/// ([`Profile::usage_cache_is_third_party`]). The three disagree on a generic
+/// api-key endpoint and on a hybrid, so a reader that borrows the wrong one
+/// inherits its question rather than its answer.
+pub(crate) enum StoredEndpoint {
+    /// No effective `base_url`: requests go to Anthropic's own endpoint.
+    Anthropic,
+    /// Requests go to this endpoint.
+    Custom(String),
+    /// The stored config could not be read or parsed, so clauth cannot say.
+    /// A distinct arm rather than a fallback to [`Self::Anthropic`], because
+    /// every caller so far is deciding whether a figure may be presented as
+    /// Anthropic's, and guessing that on an unreadable config asserts the one
+    /// thing it has no evidence for.
+    Unknown,
+}
+
+/// [`StoredEndpoint`] for `name`, read lock-free the same way
+/// [`stored_usage_cache_is_third_party`] reads its own answer — deliberately
+/// NOT through [`load_profile`], whose staged-rotation recovery takes the
+/// state flock and would invert the lock order under the MCP layer's leaves.
+///
+/// It carries that read's documented divergence too, in the direction that
+/// fails safe: a profile whose OAuth pair exists only as a staged
+/// `credentials.pending` sidecar reads here as having none, so
+/// [`effective_base_url`] KEEPS a `base_url` a full load would drop and the
+/// caller qualifies a figure it need not have.
+pub(crate) fn stored_endpoint(name: &str) -> StoredEndpoint {
+    let Ok(config_path) = profile_config_path(name) else {
+        return StoredEndpoint::Unknown;
+    };
+    let Ok(raw) = std::fs::read_to_string(&config_path) else {
+        return StoredEndpoint::Unknown;
+    };
+    let Ok(config) = toml::from_str::<ProfileConfig>(&raw) else {
+        return StoredEndpoint::Unknown;
+    };
+    let has_credentials = profile_credentials_path(name).is_ok_and(|p| p.exists());
+    match effective_base_url(config.base_url, has_credentials, config.api_key.as_deref()) {
+        Some(url) => StoredEndpoint::Custom(url),
+        None => StoredEndpoint::Anthropic,
+    }
+}
+
 pub(crate) fn load_profile(name: &str) -> Result<Profile> {
     let config_path = profile_config_path(name)?;
     let raw_config = match std::fs::read_to_string(&config_path) {

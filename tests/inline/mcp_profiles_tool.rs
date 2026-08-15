@@ -249,6 +249,87 @@ fn prose_names_the_keyless_profile_and_leaves_the_others_unchanged() {
     );
 }
 
+/// Four accounts, one per state the picker has to see before it spends: a
+/// plain OAuth control, an operator-disabled one, a quarantined one
+/// (`AppState::auth_broken`), and one whose subscription was canceled.
+fn seed_flag_states() {
+    save_profile(&Profile::new("solo".to_string(), None, None)).expect("save solo");
+    let mut off = Profile::new("off".to_string(), None, None);
+    off.disabled = true;
+    save_profile(&off).expect("save off");
+    save_profile(&Profile::new("dead".to_string(), None, None)).expect("save dead");
+    save_profile(&Profile::new("gone".to_string(), None, None)).expect("save gone");
+    save_app_state(&AppState {
+        active_profile: Some("solo".into()),
+        profiles: vec!["solo".into(), "off".into(), "dead".into(), "gone".into()],
+        auth_broken: vec!["dead".into()],
+        ..Default::default()
+    })
+    .expect("save state");
+    // The org drops to `claude_free` when a subscription is canceled, so the
+    // cached `/profile` plan is where cancellation is readable at all.
+    write_profile_cache(
+        "gone",
+        USAGE_CACHE_FILE,
+        &UsageInfo {
+            plan: Some(PlanInfo {
+                tier: PlanTier::Free,
+                subscription_status: Some("canceled".to_string()),
+            }),
+            ..Default::default()
+        },
+    );
+}
+
+/// The three states that make `delegate` refuse a target render adjacent, so a
+/// reader sees one refusal group, and `canceled` follows them as the
+/// informational marker it is — clauth has no cancel gate. Each is absent
+/// (never `false`) on an account it does not describe, the rule `keyless`
+/// already ships, and a row in none of the states is byte-unchanged.
+#[test]
+fn roster_flags_name_each_state_and_leave_a_clean_row_unchanged() {
+    let _home = HomeSandbox::new();
+    seed_flag_states();
+
+    assert_eq!(
+        lines(&call_profiles(None, None)),
+        vec![
+            "- solo (active) [anthropic]: usage unknown; tier unknown".to_string(),
+            "- off [anthropic]: usage unknown; tier unknown; disabled".to_string(),
+            "- dead [anthropic]: usage unknown; tier unknown; login expired".to_string(),
+            "- gone [anthropic, Free]: usage unknown; subscription canceled".to_string(),
+        ],
+        "one marker per row, and the unaffected row renders exactly as before",
+    );
+}
+
+/// The refusal group is contiguous: a profile in all three states spells them
+/// in one run, ahead of the informational `canceled`, rather than scattering
+/// them through the line.
+#[test]
+fn the_three_refusal_markers_render_as_one_group() {
+    let line = render::list_profiles_prose(&serde_json::json!({
+        "profiles": [{
+            "name": "wreck",
+            "active": false,
+            "provider": "DeepSeek",
+            "tier": null,
+            "host": "api.deepseek.com",
+            "windows": {"kind": "third_party"},
+            "has_live_session": true,
+            "disabled": true,
+            "auth_broken": true,
+            "keyless": true,
+            "canceled": true,
+        }]
+    }));
+    assert_eq!(
+        line,
+        "- wreck [DeepSeek, api.deepseek.com]: no Anthropic 5h/7d window; provider usage \
+         unknown; live session; disabled; login expired; no api key; subscription canceled",
+    );
+}
+
 // ── scope: "session" (the folded-in former `which` tool) ─────────────────────
 
 /// Seed one account in the canceled-after-login shape: its stored token still

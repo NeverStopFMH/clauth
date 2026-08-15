@@ -813,11 +813,146 @@ fn delegate_prose_renders_background_and_sync_envelope() {
         "result": "all done",
         "total_cost_usd": 0.5,
         "usage": {"input_tokens": 100, "output_tokens": 50},
-        "live_usage": {"profile": "work", "5h_used_pct": 12.0, "7d_used_pct": 45.6}
+        "live_usage": {
+            "profile": "work",
+            "endpoint": "anthropic",
+            "5h_used_pct": 12.0,
+            "7d_used_pct": 45.6
+        }
     });
     assert_eq!(
         delegate_prose(&sync),
         "delegate to `work` finished: all done (cost $0.5), usage: input 100 tokens, output 50 tokens; target `work`: 5h 12% used, 7d 45.6% used"
+    );
+}
+
+/// A background handle is a reply about a spend that just started, so it
+/// carries the same footer the sync envelope does: which account is being
+/// spent, what it has left, and whatever moved since the last call. The handle
+/// spelling itself is unchanged — the bundled hook scans this prose for ids.
+#[test]
+fn delegate_prose_background_handle_carries_the_footer_and_the_digest() {
+    let bg = serde_json::json!({
+        "job_id": "d-42-0",
+        "profile": "work",
+        "status": "running",
+        "started_at": 123,
+        "live_usage": {
+            "profile": "work",
+            "endpoint": "anthropic",
+            "5h_used_pct": 12.0,
+            "7d_used_pct": 45.6,
+            "fetched_secs_ago": 60
+        },
+        "since_your_last_call": {"usage_cache": true}
+    });
+    assert_eq!(
+        delegate_prose(&bg),
+        "delegate to `work` running, job `d-42-0`; target `work`: 5h 12% used, 7d 45.6% used \
+         (cached 1m ago); since your last call: usage cache refreshed"
+    );
+}
+
+/// Each fan-out row reports its OWN target's headroom — the caller just spent
+/// one window per account and the next routing decision is per account. The
+/// digest rides the reply once, not once per row: reporting consumes the delta,
+/// so N copies would spend it N times.
+#[test]
+fn delegate_fanout_prose_carries_headroom_per_target_and_one_digest() {
+    let fanout = serde_json::json!({
+        "jobs": [
+            {
+                "job_id": "d-7-0",
+                "profile": "solo",
+                "status": "running",
+                "live_usage": {
+                    "profile": "solo",
+                    "endpoint": "anthropic",
+                    "5h_used_pct": 12.0,
+                    "7d_used_pct": 45.6
+                }
+            },
+            {
+                "job_id": "d-7-1",
+                "profile": "vendor",
+                "status": "running",
+                "live_usage": {
+                    "profile": "vendor",
+                    "endpoint": "api.deepseek.com",
+                    "kind": "third_party",
+                    "balance": "total: 31.45 USD"
+                }
+            },
+        ],
+        "since_your_last_call": {"credentials": true}
+    });
+    assert_eq!(
+        delegate_fanout_prose(&fanout),
+        "delegated to `solo` (job `d-7-0`), `vendor` (job `d-7-1`); \
+         target `solo`: 5h 12% used, 7d 45.6% used; \
+         target `vendor`: no Anthropic 5h/7d window; provider reports total: 31.45 USD; \
+         since your last call: credentials file rewritten",
+    );
+}
+
+/// `total_cost_usd` is the child CLI's own figure, priced against Anthropic's
+/// rate card whatever endpoint served the call. So the bare clause is gated on
+/// where the request actually WENT — the target's own endpoint, threaded
+/// through the fold as data — and a third-party target's number says what it is
+/// priced at instead of reading as the bill.
+#[test]
+fn the_cost_clause_is_bare_only_for_an_anthropic_target() {
+    let envelope = |endpoint: &str| {
+        serde_json::json!({
+            "profile": "t",
+            "is_error": false,
+            "result": "ok",
+            "total_cost_usd": 2.06,
+            "live_usage": {"profile": "t", "endpoint": endpoint}
+        })
+    };
+    // A minimal pair: the endpoint is the only field that moves.
+    assert_eq!(
+        delegate_prose(&envelope("anthropic")),
+        "delegate to `t` finished: ok (cost $2.06); target `t`: 5h unknown, 7d unknown",
+        "an OAuth target's cost is the real one, so it reads bare",
+    );
+    assert_eq!(
+        delegate_prose(&envelope("api.deepseek.com")),
+        "delegate to `t` finished: ok (cost $2.06 at Anthropic rates, not this endpoint's); \
+         target `t`: 5h unknown, 7d unknown",
+        "a base_url target's cost names its basis",
+    );
+}
+
+/// The gate's direction, pinned on its own: only a POSITIVE `anthropic` earns
+/// the bare clause. An unfolded envelope, or one whose target clauth could not
+/// classify, must not read as Anthropic-priced.
+#[test]
+fn a_cost_with_no_endpoint_to_read_is_qualified_never_bare() {
+    let unfolded = serde_json::json!({
+        "profile": "t",
+        "is_error": false,
+        "result": "ok",
+        "total_cost_usd": 2.06,
+    });
+    assert!(
+        delegate_prose(&unfolded)
+            .contains("finished: ok (cost $2.06 at Anthropic rates, not this endpoint's)"),
+        "no `live_usage` at all still qualifies the figure",
+    );
+
+    let unclassified = serde_json::json!({
+        "profile": "t",
+        "is_error": false,
+        "result": "ok",
+        "total_cost_usd": 2.06,
+        "live_usage": {"profile": "t"}
+    });
+    assert!(
+        delegate_prose(&unclassified)
+            .contains("finished: ok (cost $2.06 at Anthropic rates, not this endpoint's)"),
+        "a folded payload with no endpoint key qualifies too",
     );
 }
 
@@ -932,7 +1067,12 @@ fn delegate_result_prose_renders_running_invalid_and_done() {
         "is_error": false,
         "result": "done",
         "total_cost_usd": 1.25,
-        "live_usage": {"profile": "work", "5h_used_pct": 12.0, "7d_used_pct": 45.6}
+        "live_usage": {
+            "profile": "work",
+            "endpoint": "anthropic",
+            "5h_used_pct": 12.0,
+            "7d_used_pct": 45.6
+        }
     });
     assert_eq!(
         delegate_result_prose(&done),

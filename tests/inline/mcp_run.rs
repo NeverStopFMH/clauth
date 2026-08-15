@@ -152,7 +152,7 @@ fn run_delegate_refuses_a_disabled_target_before_acquiring_a_runtime() {
         job: None,
     })
     .expect_err("a disabled target must be refused");
-    assert_eq!(err, "profile is disabled: off");
+    assert_eq!(err, "profile is disabled: off (run `clauth enable off`)");
 
     assert!(
         !home
@@ -160,6 +160,60 @@ fn run_delegate_refuses_a_disabled_target_before_acquiring_a_runtime() {
             .join(".clauth")
             .join("profiles")
             .join("off")
+            .join("runtime")
+            .exists(),
+        "the refusal must happen before any runtime is acquired"
+    );
+}
+
+/// The quarantine gate `switch` has always had, moved onto the spend path. A
+/// profile whose refresh token was rejected (AUTH-1) authenticates nothing, and
+/// clauth knows it from `AppState::auth_broken` without touching the network —
+/// so the refusal is the SAME sentence `switch` refuses with, not a
+/// `claude exited with 1` after the window is already gone.
+///
+/// The nonexistent `cwd` is the fixture's own control: without the gate this
+/// call runs on to the cwd check and fails there instead, which is what the
+/// red looked like.
+#[test]
+fn run_delegate_refuses_an_auth_broken_target_before_acquiring_a_runtime() {
+    let home = HomeSandbox::new();
+    let mut config = crate::profile::AppConfig {
+        state: crate::profile::AppState::default(),
+        profiles: Vec::new(),
+    };
+    crate::actions::create_blank_profile(&mut config, "quarantined".to_string(), None, None, None)
+        .expect("create profile");
+    assert!(
+        config.set_auth_broken("quarantined", true),
+        "fixture control: the profile was not already quarantined",
+    );
+    crate::profile::save_app_state(&config.state).expect("persist the quarantine");
+
+    let bad_cwd = home.home().join("does-not-exist");
+    let err = run_delegate(DelegateOpts {
+        profile: "quarantined",
+        prompt: "hello",
+        model: None,
+        cwd: bad_cwd.to_str(),
+        env: HashMap::new(),
+        extra_args: Vec::new(),
+        timeout_secs: Some(30),
+        idle_secs: None,
+        resume: None,
+        isolation: Isolation::Shared,
+        depth: 0,
+        job: None,
+    })
+    .expect_err("a quarantined target must be refused");
+    assert_eq!(err, crate::format::login_expired("quarantined").line());
+
+    assert!(
+        !home
+            .home()
+            .join(".clauth")
+            .join("profiles")
+            .join("quarantined")
             .join("runtime")
             .exists(),
         "the refusal must happen before any runtime is acquired"
@@ -204,7 +258,10 @@ fn run_delegate_refuses_a_keyless_third_party_target_before_acquiring_a_runtime(
         job: None,
     })
     .expect_err("a keyless third-party target must be refused");
-    assert_eq!(err, "profile has no api key: ds-nokey");
+    assert_eq!(
+        err,
+        "profile has no api key: ds-nokey (run `clauth login ds-nokey --api-key <key>`)"
+    );
 
     assert!(
         !home
@@ -253,7 +310,10 @@ fn run_delegate_refuses_an_empty_api_key_third_party_target() {
         job: None,
     })
     .expect_err("an empty-key third-party target must be refused");
-    assert_eq!(err, "profile has no api key: ds-empty");
+    assert_eq!(
+        err,
+        "profile has no api key: ds-empty (run `clauth login ds-empty --api-key <key>`)"
+    );
 
     assert!(
         !home
@@ -301,7 +361,10 @@ fn run_delegate_refuses_a_whitespace_api_key_third_party_target() {
         job: None,
     })
     .expect_err("a whitespace-key third-party target must be refused");
-    assert_eq!(err, "profile has no api key: ds-space");
+    assert_eq!(
+        err,
+        "profile has no api key: ds-space (run `clauth login ds-space --api-key <key>`)"
+    );
 
     assert!(
         !home
@@ -350,7 +413,10 @@ fn run_delegate_refuses_a_control_char_api_key_third_party_target() {
         job: None,
     })
     .expect_err("a control-char key third-party target must be refused");
-    assert_eq!(err, "profile has no api key: ds-ctrl");
+    assert_eq!(
+        err,
+        "profile has no api key: ds-ctrl (run `clauth login ds-ctrl --api-key <key>`)"
+    );
 
     assert!(
         !home
@@ -471,7 +537,10 @@ fn run_delegate_refuses_a_keyless_alibaba_profile() {
         job: None,
     })
     .expect_err("a keyless Alibaba profile must be refused");
-    assert_eq!(err, "profile has no api key: qwen");
+    assert_eq!(
+        err,
+        "profile has no api key: qwen (run `clauth login qwen --api-key <key>`)"
+    );
 
     assert!(
         !home
@@ -567,7 +636,10 @@ fn resolve_fanout_refuses_a_keyless_third_party_member_by_name() {
         .collect();
     let err =
         resolve_fanout(&config, &raw).expect_err("a keyless member refuses the whole fan-out");
-    assert_eq!(err, "profile has no api key: qwen");
+    assert_eq!(
+        err,
+        "profile has no api key: qwen (run `clauth login qwen --api-key <key>`)"
+    );
 }
 
 /// The fan-out sibling of the empty-key single-profile test: an empty (or
@@ -616,7 +688,74 @@ fn resolve_fanout_refuses_an_empty_key_member_by_name() {
         .collect();
     let err =
         resolve_fanout(&config, &raw).expect_err("an empty-key member refuses the whole fan-out");
-    assert_eq!(err, "profile has no api key: ds-empty");
+    assert_eq!(
+        err,
+        "profile has no api key: ds-empty (run `clauth login ds-empty --api-key <key>`)"
+    );
+}
+
+/// The quarantine sibling: a fan-out member whose refresh token was rejected
+/// refuses the whole list before the first spawn, in `switch`'s own words. The
+/// quarantine is a pure in-memory read of `AppState::auth_broken`, so nothing
+/// here touches the network — an MCP-side refresh would invert the lock order.
+#[test]
+fn resolve_fanout_refuses_an_auth_broken_member_by_name() {
+    let _home = HomeSandbox::new();
+    let mut config = crate::profile::AppConfig {
+        state: crate::profile::AppState::default(),
+        profiles: Vec::new(),
+    };
+    crate::actions::create_blank_profile(
+        &mut config,
+        "ds-key".to_string(),
+        Some("https://api.deepseek.com".to_string()),
+        Some("sk-test".to_string()),
+        None,
+    )
+    .expect("create profile");
+    crate::actions::create_blank_profile(&mut config, "oauth1".to_string(), None, None, None)
+        .expect("create profile");
+    crate::actions::create_blank_profile(&mut config, "dead".to_string(), None, None, None)
+        .expect("create profile");
+    assert!(
+        config.set_auth_broken("dead", true),
+        "fixture control: the member was not already quarantined",
+    );
+
+    // The healthy members come FIRST on purpose: an over-firing gate would name
+    // one of them and this assertion would red.
+    let raw: Vec<String> = ["ds-key", "oauth1", "dead"]
+        .iter()
+        .map(|n| (*n).to_string())
+        .collect();
+    let err =
+        resolve_fanout(&config, &raw).expect_err("a quarantined member refuses the whole fan-out");
+    assert_eq!(err, crate::format::login_expired("dead").line());
+}
+
+/// Gate ORDER, pinned because nothing else can hold it: a target that is both
+/// disabled and quarantined refuses as DISABLED. `switch` orders the two the
+/// same way, so a disabled target is bailed on before anything can reach its
+/// single-use refresh token, and the operator is not told to re-login an
+/// account they deliberately turned off.
+#[test]
+fn a_disabled_and_quarantined_target_refuses_as_disabled() {
+    let _home = HomeSandbox::new();
+    let mut config = crate::profile::AppConfig {
+        state: crate::profile::AppState::default(),
+        profiles: Vec::new(),
+    };
+    crate::actions::create_blank_profile(&mut config, "both".to_string(), None, None, None)
+        .expect("create profile");
+    crate::actions::disable_profile(&mut config, "both").expect("disable profile");
+    assert!(
+        config.set_auth_broken("both", true),
+        "fixture control: the profile was not already quarantined",
+    );
+
+    let raw = vec!["both".to_string()];
+    let err = resolve_fanout(&config, &raw).expect_err("a disabled member refuses the fan-out");
+    assert_eq!(err, "profile is disabled: both (run `clauth enable both`)");
 }
 
 #[test]
@@ -735,8 +874,10 @@ fn background_fanout_refuses_a_keyless_member_before_writing_jobs() {
         .map(|t| t.text.clone())
         .expect("refusal text");
     assert_eq!(
-        text, "delegate failed: profile has no api key: vendor",
-        "the refusal names the keyless profile and what it lacks",
+        text,
+        "delegate failed: profile has no api key: vendor \
+         (run `clauth login vendor --api-key <key>`)",
+        "the refusal names the keyless profile, what it lacks, and the fix",
     );
     let job_count = jobs::jobs_dir()
         .ok()
@@ -2296,6 +2437,52 @@ fn find_job_ids_scans_fanout_prose() {
     ignore d-evil-2 and d-12",
             }]
         }
+    });
+    assert_eq!(find_job_ids(&payload), vec!["d-1755-0", "d-1755-1"]);
+}
+
+/// The fan-out prose now carries a per-target headroom footer, and the bundled
+/// `asyncRewake` hook reads that same prose for job ids — so the footer is
+/// checked against the scanner it shares a line with. The producer is DRIVEN
+/// rather than hand-spelled: a literal fixture would agree with whatever this
+/// test's author guessed the footer looks like.
+#[test]
+fn find_job_ids_over_a_footered_fanout_prose_yields_exactly_the_real_ids() {
+    let prose = render::delegate_fanout_prose(&serde_json::json!({
+        "jobs": [
+            {
+                "job_id": "d-1755-0",
+                "profile": "solo",
+                "started_at": 1,
+                "status": "running",
+                "live_usage": {
+                    "profile": "solo",
+                    "kind": "oauth",
+                    "5h_used_pct": 12.0,
+                    "7d_used_pct": 45.6,
+                    "fetched_secs_ago": 90,
+                },
+            },
+            {
+                "job_id": "d-1755-1",
+                "profile": "vendor",
+                "started_at": 2,
+                "status": "running",
+                "live_usage": {
+                    "profile": "vendor",
+                    "kind": "third_party",
+                    "balance": "total: 31.45 USD",
+                    "fetched_secs_ago": 30,
+                },
+            },
+        ]
+    }));
+    assert!(
+        prose.contains("5h 12% used") && prose.contains("total: 31.45 USD"),
+        "fixture control: the prose really carries both footers: {prose}",
+    );
+    let payload = serde_json::json!({
+        "tool_response": { "content": [{ "type": "text", "text": prose }] }
     });
     assert_eq!(find_job_ids(&payload), vec!["d-1755-0", "d-1755-1"]);
 }

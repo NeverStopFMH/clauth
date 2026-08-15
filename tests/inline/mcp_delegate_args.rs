@@ -654,7 +654,10 @@ fn background_single_keyless_third_party_refuses_before_reserving_a_job() {
         background: Some(true),
         ..base()
     });
-    assert_refusal(&result, &["profile has no api key: zzbg-ds"]);
+    assert_refusal(
+        &result,
+        &["profile has no api key: zzbg-ds (run `clauth login zzbg-ds --api-key <key>`)"],
+    );
     assert_no_job_keys(&result);
     assert_no_job_files();
 }
@@ -672,7 +675,51 @@ fn background_single_disabled_target_refuses_before_reserving_a_job() {
         background: Some(true),
         ..base()
     });
-    assert_refusal(&result, &["profile is disabled: zzbg-off"]);
+    assert_refusal(
+        &result,
+        &["profile is disabled: zzbg-off (run `clauth enable zzbg-off`)"],
+    );
+    assert_no_job_keys(&result);
+    assert_no_job_files();
+}
+
+/// The quarantine sibling: a background single delegate to a profile whose
+/// refresh token was rejected refuses synchronously, in `switch`'s own words,
+/// before a job file exists. The nonexistent `cwd` is the fixture's control —
+/// without the gate the job is reserved and its detached task stops at the cwd
+/// check, which is what the red looked like.
+#[test]
+fn background_single_auth_broken_target_refuses_before_reserving_a_job() {
+    let home = HomeSandbox::new();
+    let mut config = AppConfig {
+        state: AppState::default(),
+        profiles: Vec::new(),
+    };
+    crate::actions::create_blank_profile(&mut config, "zzbg-dead".to_string(), None, None, None)
+        .expect("create profile");
+    assert!(
+        config.set_auth_broken("zzbg-dead", true),
+        "fixture control: the profile was not already quarantined",
+    );
+    crate::profile::save_app_state(&config.state).expect("persist the quarantine");
+
+    let result = call_delegate(DelegateArgs {
+        profiles: Some(vec!["zzbg-dead".to_string()]),
+        prompt: Some("hi".to_string()),
+        background: Some(true),
+        cwd: Some(
+            home.home()
+                .join("does-not-exist")
+                .to_str()
+                .unwrap()
+                .to_string(),
+        ),
+        ..base()
+    });
+    assert_refusal(
+        &result,
+        &[&crate::format::login_expired("zzbg-dead").line()],
+    );
     assert_no_job_keys(&result);
     assert_no_job_files();
 }
@@ -709,7 +756,10 @@ fn background_fanout_with_a_disabled_member_refuses_before_writing_jobs() {
         background: Some(true),
         ..base()
     });
-    assert_refusal(&result, &["profile is disabled: zzbg-off"]);
+    assert_refusal(
+        &result,
+        &["profile is disabled: zzbg-off (run `clauth enable zzbg-off`)"],
+    );
     assert_no_job_keys(&result);
     assert_no_job_files();
 }
@@ -768,6 +818,93 @@ fn a_valid_fanout_returns_one_job_per_account() {
 
     // Hold the sandbox until both detached tasks finish, so their `write_done`
     // lands under the sandbox and never the real `~/.clauth`.
+    wait_for_jobs_done(2);
+}
+
+/// The tool description steers a slow or third-party target to `background`,
+/// and two doc lines promise `delegate` carries live usage — so the recommended
+/// path must not be the uninformed one. The handle reply carries the target's
+/// own headroom footer, and still exactly one content block.
+#[test]
+fn a_background_handle_carries_the_targets_live_usage_footer() {
+    let home = HomeSandbox::new();
+    seed_profiles(&["solo"], false);
+
+    let result = call_delegate(DelegateArgs {
+        profiles: Some(vec!["solo".to_string()]),
+        prompt: Some("hi".to_string()),
+        background: Some(true),
+        // Stops the detached task at the cwd gate, so no `claude` spawns on a
+        // blank profile.
+        cwd: Some(
+            home.home()
+                .join("does-not-exist")
+                .to_str()
+                .unwrap()
+                .to_string(),
+        ),
+        ..base()
+    });
+    assert_ne!(
+        result.is_error,
+        Some(true),
+        "a valid handle is not an error"
+    );
+    assert_eq!(
+        result.content.len(),
+        1,
+        "the footer rides the same content block, never a second one"
+    );
+    let text = first_text(&result);
+    assert!(
+        text.starts_with("delegate to `solo` running, job `d-"),
+        "the handle keeps its spelling: {text}",
+    );
+    assert!(
+        text.contains("; target `solo`: 5h unknown, 7d unknown"),
+        "the handle names the target's headroom: {text}",
+    );
+
+    wait_for_jobs_done(1);
+}
+
+/// The fan-out sibling: every job row carries its OWN target's headroom, so a
+/// caller that just spent N windows can see what is left on each.
+#[test]
+fn a_fanout_reply_carries_headroom_for_every_target() {
+    let home = HomeSandbox::new();
+    seed_profiles(&["solo", "vendor"], false);
+
+    let result = call_delegate(DelegateArgs {
+        profiles: Some(vec!["solo".to_string(), "vendor".to_string()]),
+        prompt: Some("hi".to_string()),
+        background: Some(true),
+        cwd: Some(
+            home.home()
+                .join("does-not-exist")
+                .to_str()
+                .unwrap()
+                .to_string(),
+        ),
+        ..base()
+    });
+    assert_eq!(
+        result.content.len(),
+        1,
+        "the fan-out reply stays a single content block"
+    );
+    let text = first_text(&result);
+    assert!(
+        text.contains("target `solo`: 5h unknown, 7d unknown")
+            && text.contains("target `vendor`: 5h unknown, 7d unknown"),
+        "each target's own headroom rides the reply: {text}",
+    );
+    assert_eq!(
+        text.lines().count(),
+        1,
+        "the fan-out reply is still one line: {text}",
+    );
+
     wait_for_jobs_done(2);
 }
 

@@ -48,9 +48,10 @@ fn run_with_depth_args(depth: &str, args: DelegateArgs) -> CallToolResult {
 
     let server = ClauthServer::new();
     let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
         .build()
         .expect("runtime");
-    let result = rt.block_on(async { server.delegate(Parameters(args)).await });
+    let result = rt.block_on(async { server.delegate_with(args, ProgressSink::none()).await });
 
     // SAFETY: same as above — restore the prior value.
     unsafe {
@@ -839,25 +840,29 @@ fn background_fanout_refuses_a_keyless_member_before_writing_jobs() {
 
     let server = ClauthServer::new();
     let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
         .build()
         .expect("runtime");
     let result = rt
         .block_on(async {
             server
-                .delegate(Parameters(DelegateArgs {
-                    profiles: Some(vec!["solo".to_string(), "vendor".to_string()]),
-                    prompt: Some("hello".to_string()),
-                    prompt_file: None,
-                    model: None,
-                    cwd: None,
-                    env: None,
-                    args: None,
-                    timeout_secs: None,
-                    idle_secs: None,
-                    resume: None,
-                    isolated: None,
-                    background: Some(true),
-                }))
+                .delegate_with(
+                    DelegateArgs {
+                        profiles: Some(vec!["solo".to_string(), "vendor".to_string()]),
+                        prompt: Some("hello".to_string()),
+                        prompt_file: None,
+                        model: None,
+                        cwd: None,
+                        env: None,
+                        args: None,
+                        timeout_secs: None,
+                        idle_secs: None,
+                        resume: None,
+                        isolated: None,
+                        background: Some(true),
+                    },
+                    ProgressSink::none(),
+                )
                 .await
         })
         .expect("delegate returns a tool result, never a transport error");
@@ -1007,14 +1012,16 @@ fn delegate_env_caller_reauthority_and_clauth_keys_win() {
 
 // ---- background delegation + monitor ----
 
-/// The reserved running record a test seeds a job from, carrying both deadlines
-/// the way a real reserve does.
+/// The reserved running record a test seeds a job from, in the shape a real
+/// reserve writes for a default `delegate({background: true})`: streaming, so no
+/// wall clock and an idle guard at the default. A test that needs the other
+/// producible shape overrides both fields together, never one of them.
 fn running_spec(job_id: &str, profile: &str, started_at: u64) -> jobs::RunningSpec {
     jobs::RunningSpec {
         job_id: job_id.to_string(),
         profile: profile.to_string(),
         started_at,
-        timeout_secs: 3600,
+        timeout_secs: 0,
         idle_secs: Some(300),
     }
 }
@@ -1022,10 +1029,11 @@ fn running_spec(job_id: &str, profile: &str, started_at: u64) -> jobs::RunningSp
 /// Seed one `running` job file the way `reserve_background_job` would.
 ///
 /// Every caller passes a real `now_ms()`, and that is not decoration: a `running`
-/// record is reaped once it outlives the max delegate lifetime, so one stamped at
-/// epoch 1 IS an orphaned corpse and the collect path is right to sweep it. A
-/// `done` fixture has no such constraint — its retention runs from `done_at`,
-/// and a reader never sweeps one — so those keep their arbitrary stamps.
+/// record is reaped once it has been SILENT past the corpse window, and one
+/// stamped at epoch 1 has never said anything, so it IS an orphan and the
+/// collect path is right to sweep it. A `done` fixture has no such constraint —
+/// its retention runs from `done_at`, and a reader never sweeps one — so those
+/// keep their arbitrary stamps.
 fn seed_running(job_id: &str, profile: &str, started_at: u64) {
     jobs::write_running(&running_spec(job_id, profile, started_at)).unwrap();
 }
@@ -1341,6 +1349,17 @@ fn a_heartbeat_reaches_a_running_check() {
 /// close the run sat to either kill. Both are recorded at reserve time now — and
 /// a run with the idle leg off must read as HAVING no idle deadline, never as
 /// clauth having lost the figure.
+///
+/// The first arm is the only CROSS-VERSION pin in this file, and it is not a
+/// hypothetical: `(3600, Some(300))` is exactly what every clauth before the
+/// wall clock came out wrote for a default `delegate({background: true})` —
+/// `resolve_deadlines` defaulted a streaming run to 3600 and
+/// `reserve_background_job` stored it beside `idle_secs: Some(300)`. Those files
+/// sit in `~/.clauth/jobs/` on any box that ran one, and a post-update server
+/// reads and renders them, so the pair has to keep rendering both countdowns.
+/// Today's reserve cannot emit it — that shape is
+/// `a_run_with_no_wall_clock_still_reports_its_idle_countdown_and_tail` — so do
+/// not delete this arm as an impossible fixture.
 #[test]
 fn both_deadlines_reach_a_running_check() {
     let _home = HomeSandbox::new();
@@ -1403,6 +1422,51 @@ fn both_deadlines_reach_a_running_check() {
     assert!(
         !text.contains("wall-kill") && !text.contains("idle-kill"),
         "no deadline is invented for a record that carries none: {text}",
+    );
+}
+
+/// A streaming delegate has NO wall clock, so its record carries
+/// `timeout_secs: 0` — the same value a record written before the liveness
+/// fields existed carries. Reading that zero alone dropped the whole liveness
+/// set on a healthy streaming job, losing exactly the tail and idle countdown
+/// the heartbeat exists to deliver. `idle_secs` tells the two apart: a streaming
+/// run records one, a pre-fields record records nothing at all.
+#[test]
+fn a_run_with_no_wall_clock_still_reports_its_idle_countdown_and_tail() {
+    let _home = HomeSandbox::new();
+    // Over an hour in, and healthy: the case that has no wall clock to hit.
+    let started_at = now_ms() - 4_000_000;
+    let spec = jobs::RunningSpec {
+        started_at,
+        timeout_secs: 0,
+        idle_secs: Some(300),
+        ..running_spec("d-nowall-0", "DS0", started_at)
+    };
+    jobs::write_heartbeat(&spec, now_ms() - 4000, "moving to the fallback tests").unwrap();
+
+    let text = monitor_text("d-nowall-0");
+    assert!(
+        !text.contains("liveness not recorded"),
+        "no wall clock is a deadline clauth knows it does not have, not a record from an \
+         older clauth: {text}",
+    );
+    let idle = rendered_secs(&text, "idle-kill in ");
+    assert!(
+        (295..=296).contains(&idle),
+        "the idle guard is the only deadline left, and it still counts down: {text}",
+    );
+    let ago = rendered_secs(&text, "last output ");
+    assert!(
+        (4..=5).contains(&ago),
+        "the heartbeat's stamp still reaches the check: {text}",
+    );
+    assert!(
+        text.contains("\"moving to the fallback tests\""),
+        "and so does its tail: {text}",
+    );
+    assert!(
+        !text.contains("wall-kill"),
+        "a run with no wall clock must not count one down from zero: {text}",
     );
 }
 
@@ -2376,24 +2440,28 @@ fn background_depth_guard_refuses_without_writing_job() {
 
     let server = ClauthServer::new();
     let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
         .build()
         .expect("runtime");
     let result = rt.block_on(async {
         server
-            .delegate(Parameters(DelegateArgs {
-                profiles: Some(vec!["any".to_string()]),
-                prompt: Some("hello".to_string()),
-                prompt_file: None,
-                model: None,
-                cwd: None,
-                env: None,
-                args: None,
-                timeout_secs: None,
-                idle_secs: None,
-                resume: None,
-                isolated: None,
-                background: Some(true),
-            }))
+            .delegate_with(
+                DelegateArgs {
+                    profiles: Some(vec!["any".to_string()]),
+                    prompt: Some("hello".to_string()),
+                    prompt_file: None,
+                    model: None,
+                    cwd: None,
+                    env: None,
+                    args: None,
+                    timeout_secs: None,
+                    idle_secs: None,
+                    resume: None,
+                    isolated: None,
+                    background: Some(true),
+                },
+                ProgressSink::none(),
+            )
             .await
     });
 
@@ -2700,7 +2768,7 @@ fn a_delegate_still_streaming_outlives_the_old_wall_clock() {
         super::expiry(
             Duration::from_secs(3000),
             Duration::from_secs(2999),
-            Duration::from_secs(3600),
+            None,
             Duration::from_secs(300),
             true,
         ),
@@ -2714,7 +2782,36 @@ fn silence_past_the_idle_window_kills_the_delegate() {
         super::expiry(
             Duration::from_secs(400),
             Duration::from_secs(50),
-            Duration::from_secs(3600),
+            None,
+            Duration::from_secs(300),
+            true,
+        ),
+        Some(super::Expiry::Idle)
+    );
+}
+
+/// A streaming run has no wall clock, so however long it runs, the ONLY thing
+/// that may end it is silence. A wall clock there could only ever kill a
+/// delegate that was still working, at a cost the target account has paid.
+#[test]
+fn a_streaming_delegate_runs_as_long_as_it_keeps_talking() {
+    // Ten hours in, chatting the whole way: nothing fires.
+    assert_eq!(
+        super::expiry(
+            Duration::from_secs(36_000),
+            Duration::from_secs(35_999),
+            None,
+            Duration::from_secs(300),
+            true,
+        ),
+        None
+    );
+    // Same run, gone quiet: the idle guard still ends it.
+    assert_eq!(
+        super::expiry(
+            Duration::from_secs(36_000),
+            Duration::from_secs(35_000),
+            None,
             Duration::from_secs(300),
             true,
         ),
@@ -2724,23 +2821,27 @@ fn silence_past_the_idle_window_kills_the_delegate() {
 
 #[test]
 fn the_wall_clock_still_bounds_a_delegate_that_never_goes_quiet() {
+    // Only a run that pinned its own `--output-format` has one, and there the
+    // idle leg is off, so the wall clock is all that is left.
     assert_eq!(
         super::expiry(
             Duration::from_secs(3600),
             Duration::from_secs(3599),
-            Duration::from_secs(3600),
+            Some(Duration::from_secs(3600)),
             Duration::from_secs(300),
-            true,
+            false,
         ),
         Some(super::Expiry::Wall)
     );
-    // Stalled AT the ceiling trips both legs in one poll. The wall clock is the
-    // outer bound, so that is the reason reported.
+    // Both legs live at once is a combination `resolve_deadlines` no longer
+    // produces — a streaming run has no wall clock, a pinned-format one has no
+    // idle guard — but `expiry` still accepts it, so its precedence stays
+    // pinned: the wall clock is the outer bound, so it is the reason reported.
     assert_eq!(
         super::expiry(
             Duration::from_secs(3600),
             Duration::from_secs(100),
-            Duration::from_secs(3600),
+            Some(Duration::from_secs(3600)),
             Duration::from_secs(300),
             true,
         ),
@@ -2758,7 +2859,7 @@ fn without_the_stream_silence_never_kills() {
         super::expiry(
             Duration::from_secs(elapsed),
             Duration::from_secs(0),
-            Duration::from_secs(1800),
+            Some(Duration::from_secs(1800)),
             Duration::from_secs(300),
             false,
         )
@@ -2769,24 +2870,100 @@ fn without_the_stream_silence_never_kills() {
 
 #[test]
 fn deadline_defaults_follow_whether_the_child_streams() {
-    // Streaming: the idle deadline governs, the wall clock is the hour backstop.
+    // Streaming: the idle guard is the only deadline, and there is no wall clock
+    // at all for it to be a backstop to.
     assert_eq!(
         super::resolve_deadlines(None, None, true),
-        (Duration::from_secs(3600), Duration::from_secs(300))
+        (None, Duration::from_secs(300))
     );
-    // Not streaming: an unset wall clock drops to the idle default so a hung
-    // child never sits for the full hour unwatched.
+    // Not streaming: the idle leg is off, so an unset wall clock drops to the
+    // idle default rather than leaving a hung child to sit unwatched.
     assert_eq!(
         super::resolve_deadlines(None, None, false),
-        (Duration::from_secs(300), Duration::from_secs(300))
+        (Some(Duration::from_secs(300)), Duration::from_secs(300))
     );
 }
 
 #[test]
 fn caller_deadlines_clamp_to_the_supported_range() {
+    // Streaming: `timeout_secs` is ignored outright, whatever it says.
     let (wall, idle) = super::resolve_deadlines(Some(99_999), Some(0), true);
-    assert_eq!(wall, Duration::from_secs(3600));
+    assert_eq!(wall, None);
     assert_eq!(idle, Duration::from_secs(1));
+    // Not streaming: the caller's wall clock stands, clamped to the ceiling.
+    let (wall, idle) = super::resolve_deadlines(Some(99_999), Some(0), false);
+    assert_eq!(wall, Some(Duration::from_secs(3600)));
+    assert_eq!(idle, Duration::from_secs(1));
+    assert_eq!(
+        super::resolve_deadlines(Some(0), None, false).0,
+        Some(Duration::from_secs(1)),
+        "and it still floors at one second"
+    );
+}
+
+/// `timeout_secs` binds a streaming run in NO amount, which is the half of
+/// decision 28 a clamp test cannot see: a value inside the accepted range is
+/// exactly as ignored as one outside it.
+/// With a pinned `--output-format` and no `timeout_secs`, `idle_secs` is not
+/// ignored — it IS the wall clock, and it hard-kills the child at that figure
+/// under a `timed_out` envelope naming the OTHER field. Two parameters
+/// describing one number, which is why both their schema entries have to agree
+/// with this one function.
+#[test]
+fn a_pinned_output_format_turns_idle_secs_into_the_wall_clock() {
+    assert_eq!(
+        super::resolve_deadlines(None, Some(30), false),
+        (Some(Duration::from_secs(30)), Duration::from_secs(30)),
+        "no `timeout_secs`, so the caller's idle figure is what bounds the whole run",
+    );
+    assert_eq!(
+        super::resolve_deadlines(Some(900), Some(30), false),
+        (Some(Duration::from_secs(900)), Duration::from_secs(30)),
+        "a `timeout_secs` of its own still wins",
+    );
+    assert_eq!(
+        super::resolve_deadlines(None, Some(30), true),
+        (None, Duration::from_secs(30)),
+        "and on a streaming run the same figure bounds silence only",
+    );
+}
+
+/// The prose half of the finding above, which no behavioural test can reach:
+/// `idle_secs`'s entry read "Ignored when `args` pins its own `--output-format`"
+/// while that is the one shape where it decides when the child dies. Pinned as a
+/// STRUCTURAL claim rather than a wording one — under a pinned format the two
+/// fields describe a single number, so any honest description of either has to
+/// name the other — so a rewrite is free and dropping the relationship is not.
+#[test]
+fn the_two_deadline_parameters_each_disclose_the_other() {
+    let tools = ClauthServer::new().tool_router.list_all();
+    let delegate = tools
+        .iter()
+        .find(|t| t.name == "delegate")
+        .expect("delegate tool is registered");
+    let props = delegate.input_schema["properties"]
+        .as_object()
+        .expect("the schema carries its parameters");
+    for (field, other) in [("idle_secs", "timeout_secs"), ("timeout_secs", "idle_secs")] {
+        let text = props[field]["description"]
+            .as_str()
+            .expect("every parameter carries a description");
+        assert!(
+            text.contains(other),
+            "`{field}` must say how it relates to `{other}`: {text}",
+        );
+    }
+}
+
+#[test]
+fn a_streaming_delegate_ignores_every_timeout_secs_it_is_given() {
+    for secs in [1, 60, 900, 3600, 99_999] {
+        assert_eq!(
+            super::resolve_deadlines(Some(secs), None, true),
+            (None, Duration::from_secs(300)),
+            "timeout_secs {secs} must not put a wall clock on a streaming run",
+        );
+    }
 }
 
 #[test]
@@ -3137,6 +3314,247 @@ fn a_sinkless_reader_never_beats() {
     assert_eq!(capture.partial_text(), "alpha");
 }
 
+/// A current-thread runtime with a PAUSED clock: both the ticker's sleep and the
+/// stand-in delegate's are tokio timers, so the runtime advances to each in turn
+/// and the schedule is exact rather than raced against a real one.
+fn paused_rt() -> tokio::runtime::Runtime {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .start_paused(true)
+        .build()
+        .expect("runtime")
+}
+
+/// A blocking `delegate` sent no progress at all, which only survived because a
+/// wall clock capped every run under Claude Code's 30-minute stdio idle abort.
+/// With a streaming run given no wall clock, a run past that abort is expected,
+/// and the call would die while the child kept spending the target's window. So
+/// the wait re-anchors the client's idle clock itself, on the same throttle
+/// `monitor`'s waits use.
+#[test]
+fn a_blocking_delegate_ticks_progress_on_the_heartbeat_throttle() {
+    let rt = paused_rt();
+    let ticks = rt.block_on(async {
+        let handle = tokio::spawn(async {
+            tokio::time::sleep(super::HEARTBEAT_INTERVAL * 3 + Duration::from_secs(1)).await;
+            "envelope"
+        });
+        let ct = tokio_util::sync::CancellationToken::new();
+        let mut ticks: Vec<u64> = Vec::new();
+        let joined = super::join_ticking(handle, &ct, async |elapsed: Duration| {
+            ticks.push(elapsed.as_secs());
+        })
+        .await
+        .expect("the delegate task joins");
+        assert_eq!(joined, "envelope", "the run's own result still comes back");
+        ticks
+    });
+    assert_eq!(
+        ticks,
+        vec![2, 4, 6],
+        "one tick per HEARTBEAT_INTERVAL for as long as the run takes, and none after it lands",
+    );
+}
+
+/// A cancelled request stops the ticking — nothing is listening on a request id
+/// the client has abandoned — and STILL awaits the join: the child is spending
+/// the target's window either way, and handing an in-flight run off to a job
+/// file is not this change's job.
+#[test]
+fn a_cancelled_blocking_delegate_stops_ticking_and_still_waits_for_its_child() {
+    let rt = paused_rt();
+    let ticks = rt.block_on(async {
+        let handle = tokio::spawn(async {
+            tokio::time::sleep(Duration::from_secs(11)).await;
+            "envelope"
+        });
+        let ct = tokio_util::sync::CancellationToken::new();
+        let firing = ct.clone();
+        tokio::spawn(async move {
+            // Off the throttle's own beat, so the two cannot tie.
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            firing.cancel();
+        });
+        let mut ticks: Vec<u64> = Vec::new();
+        let joined = super::join_ticking(handle, &ct, async |elapsed: Duration| {
+            ticks.push(elapsed.as_secs());
+        })
+        .await
+        .expect("a cancelled call still joins its task rather than aborting it");
+        assert_eq!(
+            joined, "envelope",
+            "the run is awaited to completion, not dropped at the cancel",
+        );
+        ticks
+    });
+    assert_eq!(
+        ticks,
+        vec![2, 4],
+        "every beat before the cancel fires, and none after",
+    );
+}
+
+/// The token-less peer degrades exactly the way `monitor`'s waits do: nothing is
+/// sent, and the wait itself is untouched. `ProgressSink::none()` is that peer,
+/// not test scaffolding, which is why every blocking-`delegate` test in this
+/// file enters through the same door the real handler does.
+#[test]
+fn a_peer_that_sent_no_progress_token_still_gets_its_delegate_awaited() {
+    let rt = paused_rt();
+    let joined = rt.block_on(async {
+        let mut sink = ProgressSink::none();
+        assert!(
+            !sink.can_receive_progress(),
+            "no channel, so every tick is a no-op",
+        );
+        let ct = sink.cancel_token();
+        let handle = tokio::spawn(async {
+            tokio::time::sleep(super::HEARTBEAT_INTERVAL * 3).await;
+            "envelope"
+        });
+        super::join_ticking(handle, &ct, async |elapsed: Duration| {
+            sink.tick(|| format!("{}s", elapsed.as_secs())).await;
+        })
+        .await
+        .expect("the delegate task joins")
+    });
+    assert_eq!(joined, "envelope");
+}
+
+/// `tick` is the only thing that ever reaches `notify_progress`, and until the
+/// recording sink existed nothing in the suite executed a single line of it: a
+/// channel-less sink returns on its first branch, so the throttle, the counter
+/// and the message were all dead under test while reading as covered.
+#[test]
+fn a_tick_sends_one_message_per_throttle_window_and_nothing_inside_it() {
+    let rt = paused_rt();
+    let sink = rt.block_on(async {
+        let mut sink = ProgressSink::recording();
+        sink.tick(|| "first".to_string()).await;
+        // Same window: the burst a fast wait loop produces between two beats.
+        sink.tick(|| "swallowed".to_string()).await;
+        tokio::time::sleep(super::HEARTBEAT_INTERVAL - Duration::from_millis(1)).await;
+        sink.tick(|| "still inside".to_string()).await;
+        // One millisecond past it.
+        tokio::time::sleep(Duration::from_millis(2)).await;
+        sink.tick(|| "second".to_string()).await;
+        sink
+    });
+    assert_eq!(
+        sink.recorded(),
+        ["first", "second"],
+        "one message per window, and each carries exactly what its caller built",
+    );
+}
+
+/// A peer that sent no `progressToken` cannot be notified, so `tick` must stop
+/// before it builds anything — and must not burn the throttle window either, or
+/// a sink that later gained a channel would sit out its first beat.
+#[test]
+fn a_tick_on_a_token_less_peer_builds_nothing_and_sends_nothing() {
+    let rt = paused_rt();
+    rt.block_on(async {
+        let mut sink = ProgressSink::none();
+        let mut built = 0_u32;
+        for _ in 0..3 {
+            sink.tick(|| {
+                built += 1;
+                "never".to_string()
+            })
+            .await;
+        }
+        assert_eq!(built, 0, "the message is not even built");
+        // NOT `recorded().is_empty()`: a `none()` sink's `recorded` is `None`,
+        // so that reads `&[]` whatever `tick` does and would pass with the
+        // guard deleted. `last` is the state the guard actually protects.
+        assert!(
+            sink.last.is_none(),
+            "and the throttle window is not burned: a sink that cannot send must \
+             not leave the next tick sitting out its first beat",
+        );
+    });
+}
+
+/// The three tests above drive [`super::join_ticking`] directly, which leaves
+/// one link they cannot see: whether the handler's blocking path still goes
+/// through it. Reaching that behaviourally needs a `claude` child that outlives
+/// one throttle window, and this crate deliberately never fakes a child, so the
+/// link is pinned structurally instead — the same posture, and the same
+/// justification, as `run_delegate_never_returns_between_spawning_the_reader…`.
+///
+/// Three assertions over the blocking wait's source: the `join_ticking` call is
+/// present, the argument list it is given names `progress.tick(`, and nothing
+/// awaits the join bare beside it. Each covers a shape the other two admit — the
+/// call can be deleted, a `handle.await` can be added next to it (what a refactor
+/// reaching for "just await the join" produces), or the closure can be emptied,
+/// which satisfies the call's shape, keeps the whole suite green and ships the
+/// pre-change defect exactly.
+///
+/// What it does NOT decide, stated because a scan reads as stronger than it is:
+/// whether that `tick` is REACHABLE at runtime. `if false { progress.tick(…) }`
+/// inside the closure passes here, and no text scan can settle it — this repo
+/// has already shipped an `if false && …` past a scan that only checked a
+/// literal appeared. The runtime half is covered behaviourally instead, by
+/// `a_blocking_delegate_ticks_progress_on_the_heartbeat_throttle` over the loop
+/// and `a_tick_sends_one_message_per_throttle_window_and_nothing_inside_it` over
+/// the sink; this test only carries the link between them, which needs a child
+/// process to reach and this crate never fakes one.
+#[test]
+fn the_blocking_delegate_awaits_its_task_through_the_progress_ticker() {
+    let src = include_str!("../../src/mcp/mod.rs");
+    let body = src
+        .split_once("async fn delegate_with(")
+        .expect("delegate_with is defined")
+        .1;
+    let spawn = body
+        .find("let handle = tokio::task::spawn_blocking(")
+        .expect("the blocking delegate is spawned");
+    let collect = body[spawn..]
+        .find("let envelope = match outcome")
+        .expect("its outcome is folded into an envelope");
+    // Whitespace-free, so the needles do not have to track how rustfmt broke
+    // the call across lines this week.
+    let window: String = body[spawn..spawn + collect]
+        .lines()
+        .filter(|l| !l.trim_start().starts_with("//"))
+        .flat_map(str::chars)
+        .filter(|c| !c.is_whitespace())
+        .collect();
+    let needle = "join_ticking(handle,&ct,";
+    let at = window
+        .find(needle)
+        .unwrap_or_else(|| panic!("the blocking wait must route through the ticker: {window}"));
+    // To the BALANCED close of `join_ticking(`, not to the end of the window: a
+    // `progress.tick(` on any later statement would otherwise satisfy the
+    // assertion below while the closure itself stayed empty — and a tick that
+    // fires after the join has landed resets no idle clock. Counting parens
+    // over source text would miscount one inside a string literal; that can
+    // only cut the slice SHORT, which reds this test rather than passing it.
+    let open = at + "join_ticking".len(); // the `(` itself
+    let mut depth = 0_i32;
+    let end = window[open..]
+        .char_indices()
+        .find_map(|(i, c)| {
+            match c {
+                '(' => depth += 1,
+                ')' => depth -= 1,
+                _ => {}
+            }
+            (depth == 0).then_some(open + i)
+        })
+        .expect("the ticker call closes inside the blocking window");
+    let call = &window[at..=end];
+    assert!(
+        call.contains("progress.tick("),
+        "and the closure it hands over must be the one that notifies the caller, \
+         not an empty body that satisfies the call shape: {call}",
+    );
+    assert!(
+        !window.contains("handle.await"),
+        "and nothing may await the join bare beside it: {window}",
+    );
+}
+
 /// The tail rides a reply a model may fetch repeatedly, so it is bounded far
 /// under the 8 KiB salvage that rides one terminal envelope, and it is one line:
 /// a delegate's answer is full of newlines, and a running status is a status.
@@ -3333,6 +3751,11 @@ fn the_delegate_description_keeps_its_load_bearing_warnings() {
         "point `cwd` at a clean dir",
         // a self-report is not a verified result
         "spot-verify its `result` like any subagent",
+        // which deadline actually binds: a streaming run has no wall clock, so a
+        // caller reading `timeout_secs` as one would size a run against a limit
+        // that is not applied
+        "That is its only deadline",
+        "`timeout_secs` binds only a run whose `args` pin their own `--output-format`",
     ] {
         assert!(
             text.contains(phrase),
@@ -3710,26 +4133,33 @@ fn the_stop_decision_reads_the_cancel_flag_beside_both_deadlines() {
     let far = Duration::from_secs(3600);
     let tick = Duration::from_secs(1);
     assert_eq!(
-        super::stop_reason(false, tick, tick, far, far, true),
+        super::stop_reason(false, tick, tick, Some(far), far, true),
         None,
         "nothing fired, so the run continues"
     );
     assert_eq!(
-        super::stop_reason(true, tick, tick, far, far, true),
+        super::stop_reason(true, tick, tick, Some(far), far, true),
         Some(super::StopReason::Cancelled),
         "the caller's stop does not wait for a deadline"
     );
     assert_eq!(
-        super::stop_reason(false, far, tick, far, far, true),
+        super::stop_reason(false, far, tick, Some(far), far, true),
         Some(super::StopReason::Expired(super::Expiry::Wall)),
         "a deadline still fires on its own"
     );
     // The case the ordering exists for. With the two checks the other way round
     // this tick reports the clock, telling a caller their cancel did nothing.
     assert_eq!(
-        super::stop_reason(true, far, tick, far, far, true),
+        super::stop_reason(true, far, tick, Some(far), far, true),
         Some(super::StopReason::Cancelled),
         "a cancel and a deadline landing in the same tick is a cancel"
+    );
+    // A streaming run has no wall clock, so a cancel is the only thing that can
+    // stop it short of the idle guard.
+    assert_eq!(
+        super::stop_reason(true, far, tick, None, far, true),
+        Some(super::StopReason::Cancelled),
+        "a cancel still lands on a run with no wall clock"
     );
 }
 
@@ -4005,6 +4435,36 @@ fn a_reserved_job_is_cancellable_before_its_task_starts() {
         !super::cancel_job(&job_id),
         "and the entry goes with the reservation"
     );
+}
+
+/// The reserve is where a running record's three-way liveness shape is minted,
+/// so it is where the shape has to hold: a streaming run records no wall clock
+/// and an idle guard, a pinned-`--output-format` run records the reverse, and a
+/// reader tells either from a record an older server wrote (neither) by the pair.
+/// Reading `timeout_secs` alone cannot, which is what dropped a healthy
+/// streaming job's whole liveness set from every check.
+#[test]
+fn a_reserved_job_records_a_deadline_pair_a_reader_can_tell_apart() {
+    let _home = HomeSandbox::new();
+    let streaming = reserve_background_job("work", Some(1800), None, true).expect("reserve");
+    let record = jobs::read(&streaming.spec.job_id).expect("running record");
+    assert_eq!(
+        record.timeout_secs, 0,
+        "a streaming run has no wall clock, and `timeout_secs` does not give it one",
+    );
+    assert_eq!(
+        record.idle_secs,
+        Some(300),
+        "the idle guard is what it does have, so the zero above is not a missing field",
+    );
+
+    let pinned = reserve_background_job("work", Some(1800), None, false).expect("reserve");
+    let record = jobs::read(&pinned.spec.job_id).expect("running record");
+    assert_eq!(
+        record.timeout_secs, 1800,
+        "without the stream the caller's wall clock is the only deadline left",
+    );
+    assert_eq!(record.idle_secs, None, "and the idle leg is off");
 }
 
 /// `(None, false)` used to land in the isolated-transcript arm and tell a run

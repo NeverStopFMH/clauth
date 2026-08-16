@@ -20,12 +20,40 @@ use crate::profile::clauth_dir;
 /// Retain a `done` file this long AFTER IT FINISHES before GC reaps it; long
 /// enough that a slow poller can still collect a result the auto-delivery hook
 /// already delivered. Measured from `done_at`, not from the mint: a delegate
-/// killed at the default 3600 s wall clock is already an hour old the instant it
-/// finalizes, so a mint-anchored TTL would expire every long run's salvage
-/// envelope before anyone could read it.
+/// that ran for hours is already hours old the instant it finalizes, so a
+/// mint-anchored TTL would expire every long run's salvage envelope before
+/// anyone could read it.
 pub(super) const DONE_TTL_MS: u64 = 60 * 60 * 1000; // 1h
-/// A `running` file older than this is orphaned (its server died mid-job); reap
-/// it. Sits above the max delegate timeout plus slack.
+/// A `running` file SILENT this long is orphaned (its server died mid-job); reap
+/// it.
+///
+/// Silence rather than age, because a streaming delegate has no wall clock and
+/// so no maximum lifetime to sit above: a run still healthy at any age would
+/// have had its file deleted under it, and answered `unknown job_id` while its
+/// child kept spending the account.
+///
+/// The two background shapes reach 3600 + 600 s by different routes, and only
+/// the first one heartbeats:
+///
+/// - **Streaming.** `read_stdout` rewrites this file on every line it consumes,
+///   so the record's own stamp tracks the run, and the supervision loop kills it
+///   once it has been quiet for `idle_secs` — caller-set, clamped to
+///   `MAX_RUN_TIMEOUT_SECS` (3600 s). 600 s of slack covers the heartbeat
+///   throttle, the kill and the teardown before `write_done` lands.
+/// - **Pinned `--output-format`.** `read_stdout` drains the pipe whole and never
+///   consults the heartbeat sink, so `last_output_at` stays `0` for this run's
+///   entire life and the anchor is its mint. What bounds it is the wall clock it
+///   always has (also ≤ 3600 s), not any liveness it emits.
+///
+/// So the silent window this must cover is the pre-spawn delay for a streaming
+/// run, and the pre-spawn delay PLUS the whole run for a pinned-format one. Both
+/// can overrun it, from the same cause — `ProfileRuntime::acquire` blocks behind
+/// a `clauth start` session on the same profile, for as long as that session
+/// lasts — and they differ in what is alive when the reap lands: a streaming run
+/// is still inside that acquire with no child, while a pinned-format one can be
+/// well past it, since a 700 s block plus its 3600 s wall already puts the record
+/// 4300 s silent-since-mint with the child 3600 s in and still spending. Both
+/// exposures are exactly what the age rule carried, and neither is widened here.
 const RUNNING_TTL_MS: u64 = (3600 + 600) * 1000;
 /// Hard cap on retained job files; newest kept, older reaped. Also the cap on
 /// one `monitor` `job_ids` list: the store holds at most this many files, so a
@@ -56,8 +84,10 @@ pub(crate) struct JobRecord {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) envelope: Option<serde_json::Value>,
     /// The wall-clock ceiling this run actually launched under, resolved once by
-    /// `resolve_deadlines`. `0` means no server recorded one, which is not the
-    /// same as a run about to be killed.
+    /// `resolve_deadlines`. `0` is never a run about to be killed: it means this
+    /// run HAS no wall clock, which is the normal streaming case, or — paired
+    /// with an absent `idle_secs` — that the server which wrote the record
+    /// predates these fields. `idle_secs` is what tells those two apart.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub(crate) timeout_secs: u64,
     /// The idle ceiling, `None` when the idle leg is off entirely (a
@@ -204,9 +234,9 @@ pub(crate) fn remove(job_id: &str) {
 }
 
 /// Best-effort GC at server startup: drop `done` files past their TTL and
-/// `running` files older than the max delegate lifetime (orphaned by a dead
-/// server), sweep stray `.tmp` from a crash mid-write, then cap the retained
-/// count to the newest [`MAX_RETAINED`].
+/// `running` files silent past [`RUNNING_TTL_MS`] (orphaned by a dead server),
+/// sweep stray `.tmp` from a crash mid-write, then cap the retained count to the
+/// newest [`MAX_RETAINED`].
 pub(crate) fn gc(now: u64) {
     sweep(now, Scope::Everything);
 }
@@ -233,17 +263,24 @@ enum Scope {
 
 /// The stamp both retention rules read: when this record last mattered. A `done`
 /// record's finish, falling back to its mint for a file written before `done_at`
-/// existed; a `running` record has only its mint.
+/// existed; a `running` record's freshest heartbeat, falling back to its mint
+/// before the first line of output arrives.
 ///
 /// One anchor for the TTL and the cap together, because they answer the same
 /// question — which records are the stale ones — and mixing stamps is what the
-/// TTL itself got wrong: sorted on the mint, the cap evicts a long delegate's
-/// fresh, never-read result ahead of a short run's older one.
+/// TTL itself got wrong twice: sorted on the mint, the cap evicts a long
+/// delegate's fresh, never-read result ahead of a short run's older one, and
+/// [`RUNNING_TTL_MS`] reaped a live long run for having started a while ago.
 fn retention_anchor(record: &JobRecord) -> u64 {
-    if record.done_at > 0 {
-        record.done_at
-    } else {
-        record.started_at
+    match record.state {
+        JobState::Done => {
+            if record.done_at > 0 {
+                record.done_at
+            } else {
+                record.started_at
+            }
+        }
+        JobState::Running => record.last_output_at.max(record.started_at),
     }
 }
 

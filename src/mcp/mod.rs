@@ -49,18 +49,16 @@ use render::{ProfileSnapshot, RosterRank};
 /// an env marker beats inferring it from the client identity in a request.
 pub(crate) const MCP_PROBE_ENV: &str = "CLAUTH_MCP_PROBE";
 
-/// Default wall-clock ceiling (seconds) on one delegate. A wall clock cannot see
-/// whether the child is producing anything, so it kills a delegate mid-answer
-/// exactly like a hung one; it is the backstop and [`DEFAULT_IDLE_SECS`] is what
-/// normally ends a stuck run.
-const DEFAULT_RUN_TIMEOUT_SECS: u64 = MAX_RUN_TIMEOUT_SECS;
-/// Hard ceiling on a caller-supplied delegate timeout (seconds).
+/// Hard ceiling (seconds) on either caller-supplied delegate deadline, and on
+/// one `monitor` wait ([`MAX_WAIT_SECS`]). A wall clock cannot see whether the
+/// child is producing anything, so a streaming run is given none at all and this
+/// bounds only the two places a caller names a number.
 const MAX_RUN_TIMEOUT_SECS: u64 = 3600;
 /// Default idle deadline (seconds): kill only once the delegate has emitted
 /// NOTHING for this long. Every streamed event resets it, so a working delegate
-/// runs to the wall clock no matter how long it takes. It must stay above the
-/// longest single blocking tool call a delegate makes (a release build), since
-/// no event arrives while one runs.
+/// runs for as long as it keeps talking — this is a streaming run's ONLY
+/// deadline. It must stay above the longest single blocking tool call a delegate
+/// makes (a release build), since no event arrives while one runs.
 const DEFAULT_IDLE_SECS: u64 = 300;
 /// Cap on the salvaged assistant text carried back by a killed delegate. The
 /// tail is kept: it is the part closest to a usable answer.
@@ -500,18 +498,23 @@ pub(crate) struct DelegateArgs {
     /// Extra arguments appended to the `claude` invocation (after clauth's own
     /// `-p` and streaming flags, the isolated-only `--strict-mcp-config`, and
     /// `--model <model>` when `model` is set). Pinning `--output-format` here
-    /// replaces clauth's, which also turns the idle deadline off.
+    /// replaces clauth's, which turns the idle deadline off and leaves the wall
+    /// clock as the only one.
     args: Option<Vec<String>>,
-    /// Wall-clock ceiling in seconds (1..=3600). Backstop only; `idle_secs` is
-    /// what normally ends a stuck delegate. Defaults to 3600 while the event
-    /// stream is on; with a caller-pinned `--output-format` there is no liveness
-    /// signal, so an unset wall clock falls back to `idle_secs` instead.
+    /// Wall-clock ceiling in seconds (1..=3600), binding ONLY a run whose `args`
+    /// pin their own `--output-format`: there is no event stream then, so
+    /// silence carries no information and this is the only deadline left (unset,
+    /// it falls back to `idle_secs`). IGNORED on any other run — a streaming
+    /// delegate has no wall clock, because one can only ever kill a delegate
+    /// that is still working.
     timeout_secs: Option<u64>,
     /// Kill the delegate after this many seconds with NO output at all
-    /// (1..=3600). Defaults to 300. A delegate that keeps streaming is never cut
-    /// off, so raise this only when the task makes one blocking tool call longer
-    /// than the default (a long build). Ignored when `args` pins its own
-    /// `--output-format`, which turns the event stream off.
+    /// (1..=3600). Defaults to 300, and it is a streaming run's ONLY deadline:
+    /// one that keeps streaming is never cut off however long it takes, so raise
+    /// this only when the task makes one blocking tool call longer than the
+    /// default (a long build). When `args` pins its own `--output-format` it
+    /// stops killing on silence and becomes the default for `timeout_secs`
+    /// instead, so it still bounds that run.
     idle_secs: Option<u64>,
     /// Continue an earlier delegate instead of starting fresh: the `session_id`
     /// a killed run handed back. `prompt` becomes the next turn of that
@@ -822,12 +825,30 @@ account. Check, collect or stop a job with `monitor`.\n\n\
 so it bills fewer tokens. Leave it false when the task needs this repo's tools. Either way the \
 delegate loads the project `CLAUDE.md` of `cwd`, so point `cwd` at a clean dir for an unrelated \
 one-shot.\n\n\
-A run silent for `idle_secs`, or past the `timeout_secs` wall clock, is killed and hands back the \
-text it had plus a `session_id` to `resume`, rather than paying for that work twice."
+A run silent for `idle_secs` is killed and hands back the text it had plus a `session_id` to \
+`resume`, rather than paying for that work twice. That is its only deadline: one that keeps \
+talking runs as long as it needs, and `timeout_secs` binds only a run whose `args` pin their own \
+`--output-format`."
     )]
     async fn delegate(
         &self,
-        Parameters(DelegateArgs {
+        Parameters(args): Parameters<DelegateArgs>,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.delegate_with(args, ProgressSink::from_context(&ctx))
+            .await
+    }
+
+    /// The whole of `delegate`, minus the peer — the split `monitor_with` made,
+    /// for the same two reasons: an in-process caller cannot construct a
+    /// `Peer<RoleServer>`, and [`ProgressSink::none`] is exactly what a peer
+    /// that sent no `progressToken` gets, so the inner entry is a real path.
+    async fn delegate_with(
+        &self,
+        args: DelegateArgs,
+        mut progress: ProgressSink,
+    ) -> Result<CallToolResult, ErrorData> {
+        let DelegateArgs {
             profiles,
             prompt,
             prompt_file,
@@ -840,8 +861,7 @@ text it had plus a `session_id` to `resume`, rather than paying for that work tw
             resume,
             isolated,
             background,
-        }): Parameters<DelegateArgs>,
-    ) -> Result<CallToolResult, ErrorData> {
+        } = args;
         // Fail closed: a present-but-unparseable value is treated as max depth
         // (refuse), so a corrupt env can never re-enable delegation. Only a truly
         // absent var is depth 0.
@@ -921,9 +941,9 @@ text it had plus a `session_id` to `resume`, rather than paying for that work tw
             None => prompt.as_deref().unwrap_or_default().to_string().into(),
         };
 
-        // Both deadlines resolve inside `run_delegate`: the wall clock's fallback
-        // depends on whether the child ends up streaming, which only the composed
-        // arg list knows.
+        // Both deadlines resolve inside `run_delegate`: whether there is a wall
+        // clock at all depends on whether the child ends up streaming, which
+        // only the composed arg list knows.
         let isolation = if isolated.unwrap_or(false) {
             Isolation::Isolated
         } else {
@@ -1091,7 +1111,7 @@ text it had plus a `session_id` to `resume`, rather than paying for that work tw
             .herdr_pane
             .as_ref()
             .map(herdr_report::InFlightGuard::begin);
-        let outcome = tokio::task::spawn_blocking(move || {
+        let handle = tokio::task::spawn_blocking(move || {
             run_delegate(DelegateOpts {
                 profile: &target_for_task,
                 prompt: prompt.as_ref(),
@@ -1108,6 +1128,13 @@ text it had plus a `session_id` to `resume`, rather than paying for that work tw
                 job: None,
                 cancel: None,
             })
+        });
+        let ct = progress.cancel_token();
+        let label = target.clone();
+        let outcome = join_ticking(handle, &ct, async move |elapsed: Duration| {
+            progress
+                .tick(|| format!("delegate on `{label}` · {}s", elapsed.as_secs()))
+                .await;
         })
         .await
         .map_err(|e| ErrorData::internal_error(format!("delegate task panicked: {e}"), None))?;
@@ -1261,10 +1288,12 @@ const MCP_DEPTH_ENV: &str = "CLAUTH_MCP_DEPTH";
 /// Poll interval mirroring `start.rs`'s `wait_for_child` cadence.
 const RUN_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
-/// Ceiling on `monitor`'s long-poll wait (seconds), matching
-/// [`MAX_RUN_TIMEOUT_SECS`] so one call can cover any delegate. One tool, one
-/// `wait_secs` parameter, so both waiting modes share one ceiling: a tool cannot
-/// carry two limits on one parameter name.
+/// Ceiling on `monitor`'s long-poll wait (seconds), sharing
+/// [`MAX_RUN_TIMEOUT_SECS`] as the one number a caller may name for a duration.
+/// It does not bound a delegate — a streaming run has no wall clock — so a wait
+/// that ends at this ceiling is a wait to repeat, not a run that must be over.
+/// One tool, one `wait_secs` parameter, so both waiting modes share one ceiling:
+/// a tool cannot carry two limits on one parameter name.
 const MAX_WAIT_SECS: u64 = MAX_RUN_TIMEOUT_SECS;
 /// Ceiling for a peer that supplied no `progressToken`. The 3600 s cap above
 /// depends on progress notifications re-anchoring Claude Code's 30-minute stdio
@@ -1345,7 +1374,16 @@ pub(crate) struct ProgressSink {
     /// call unless a loop reads this.
     ct: tokio_util::sync::CancellationToken,
     sent: f64,
-    last: Option<Instant>,
+    /// Tokio's clock, not the std one. Identical outside a paused runtime —
+    /// every tick happens inside a wait loop tokio is already driving — and it
+    /// is what lets a test advance the throttle window instead of sleeping
+    /// through it.
+    last: Option<tokio::time::Instant>,
+    /// Test-only stand-in for the peer: what a tick would have put on the wire.
+    /// `None` on every sink a real request builds, so the shipped shape is the
+    /// two-field one above.
+    #[cfg(test)]
+    recorded: Option<Vec<String>>,
 }
 
 impl ProgressSink {
@@ -1360,12 +1398,49 @@ impl ProgressSink {
             ct: tokio_util::sync::CancellationToken::new(),
             sent: 0.0,
             last: None,
+            recorded: None,
         }
     }
 
-    /// This call's cancellation token, for a test that needs to fire it. The
-    /// real one arrives on the request.
+    /// A sink that RECORDS what it would have sent instead of holding a peer.
+    ///
+    /// Without it, [`Self::tick`]'s throttle and the message it builds are both
+    /// unreachable under test: `Peer<RoleServer>` cannot be constructed
+    /// in-process, and a channel-less sink returns before either one runs. So
+    /// this is not scaffolding around a tested path — it is the only way that
+    /// path is executed at all.
     #[cfg(test)]
+    pub(crate) fn recording() -> Self {
+        Self {
+            recorded: Some(Vec::new()),
+            ..Self::none()
+        }
+    }
+
+    /// Every message this sink has taken, in order.
+    #[cfg(test)]
+    pub(crate) fn recorded(&self) -> &[String] {
+        self.recorded.as_deref().unwrap_or_default()
+    }
+
+    /// Whether anything is listening. Deliberately NOT
+    /// [`Self::can_receive_progress`]: that one answers "did the peer supply a
+    /// `progressToken`", which decides the wait ceiling and which a recording
+    /// sink genuinely did not.
+    fn has_destination(&self) -> bool {
+        #[cfg(test)]
+        {
+            self.channel.is_some() || self.recorded.is_some()
+        }
+        #[cfg(not(test))]
+        {
+            self.channel.is_some()
+        }
+    }
+
+    /// This call's cancellation token, for a loop that races something other
+    /// than [`Self::sleep_or_cancelled`]'s sleep against it — and for a test
+    /// that needs to fire one. The real token arrives on the request.
     pub(crate) fn cancel_token(&self) -> tokio_util::sync::CancellationToken {
         self.ct.clone()
     }
@@ -1379,6 +1454,8 @@ impl ProgressSink {
             ct: ctx.ct.clone(),
             sent: 0.0,
             last: None,
+            #[cfg(test)]
+            recorded: None,
         }
     }
 
@@ -1402,8 +1479,8 @@ impl ProgressSink {
     /// Send one progress line, at most once per [`HEARTBEAT_INTERVAL`]. The
     /// message is built lazily so a throttled tick costs nothing.
     async fn tick(&mut self, message: impl FnOnce() -> String) {
-        let now = Instant::now();
-        if self.channel.is_none()
+        let now = tokio::time::Instant::now();
+        if !self.has_destination()
             || self
                 .last
                 .is_some_and(|t| now.duration_since(t) < HEARTBEAT_INTERVAL)
@@ -1412,13 +1489,70 @@ impl ProgressSink {
         }
         self.last = Some(now);
         self.sent += 1.0;
+        let message = message();
+        // Test-only, and it returns: a recording sink holds no peer, so there
+        // is nothing below it to run.
+        #[cfg(test)]
+        if let Some(log) = self.recorded.as_mut() {
+            log.push(message);
+            return;
+        }
         if let Some((peer, token)) = self.channel.as_ref() {
             let param = rmcp::model::ProgressNotificationParam::new(token.clone(), self.sent)
-                .with_message(message());
+                .with_message(message);
             let _ = peer.notify_progress(param).await;
         }
     }
 }
+/// Await a spawned delegate, sending the caller one progress line per
+/// [`HEARTBEAT_INTERVAL`] until it lands.
+///
+/// Claude Code aborts a stdio tool call that has sent nothing for 30 minutes,
+/// and every notification re-anchors that clock. A blocking `delegate` sent
+/// none, which only ever mattered because a wall clock capped the run below the
+/// abort; with a streaming run given no wall clock at all, a blocking run past
+/// 30 minutes is expected rather than pathological, and without this the call
+/// dies while the child keeps spending the target's window.
+///
+/// `tick` is a callback rather than the [`ProgressSink`] itself, for the reason
+/// `read_stdout`'s heartbeat sink is one: an in-process caller cannot build a
+/// `Peer<RoleServer>`, so a sink handed in here would swallow every notification
+/// and the throttle would have nothing to prove itself against.
+///
+/// The send is awaited INSIDE the loop, so a backed-up transport leaves the join
+/// unpolled for its duration and delays the finished envelope by that much.
+/// Accepted rather than fixed: moving the send off the loop costs a spawned task
+/// plus a channel, and a transport blocked long enough to matter has already
+/// ended the request — a notification is best-effort for exactly that reason
+/// ([`ProgressSink`]). It cannot drop the envelope, and it cannot orphan the
+/// child, which keeps running on the blocking pool either way.
+///
+/// On `notifications/cancelled` the ticking stops and the join is STILL awaited.
+/// rmcp awaits the tool handler bare, so nothing ends the call unless a loop
+/// reads the token; there is no point notifying a request id that is gone, and
+/// nothing here can yet hand an in-flight run off to a job file, so the child
+/// runs on and this waits for it.
+async fn join_ticking<T>(
+    handle: tokio::task::JoinHandle<T>,
+    ct: &tokio_util::sync::CancellationToken,
+    mut tick: impl AsyncFnMut(Duration),
+) -> std::result::Result<T, tokio::task::JoinError> {
+    // Tokio's clock rather than the std one so a paused-time test measures the
+    // schedule this loop actually keeps.
+    let started = tokio::time::Instant::now();
+    let mut handle = handle;
+    let mut abandoned = false;
+    loop {
+        tokio::select! {
+            joined = &mut handle => return joined,
+            () = ct.cancelled(), if !abandoned => abandoned = true,
+            () = tokio::time::sleep(HEARTBEAT_INTERVAL), if !abandoned => {
+                tick(started.elapsed()).await;
+            }
+        }
+    }
+}
+
 /// Floor on a cancelling `monitor`'s wait, so the common case is one call rather
 /// than two.
 ///
@@ -1557,9 +1691,20 @@ fn prepend_note(mut result: CallToolResult, note: &str) -> CallToolResult {
 
 /// Poll cadence for both `monitor` modes and the `mcp-await-job` hook.
 const JOB_POLL_INTERVAL: Duration = Duration::from_millis(200);
-/// Self-deadline for the `mcp-await-job` hook: outlast the max delegate timeout
-/// plus slack so it never gives up before a legitimately long delegate finishes.
-const AWAIT_JOB_DEADLINE_SECS: u64 = MAX_RUN_TIMEOUT_SECS + 600;
+/// Self-deadline for the `mcp-await-job` hook.
+///
+/// A delivery window, NOT a bound on the delegate: a streaming run has no wall
+/// clock, so no hook deadline can promise to outlast one and this number must
+/// not be read as trying to. It buys the common case — a run that finishes
+/// inside it is delivered without the model spending a turn — and on expiry the
+/// hook still exits 2, waking the model with a nudge to call `monitor`, so a
+/// longer run costs one deliberate check rather than a lost result.
+///
+/// Its own literal rather than a `MAX_RUN_TIMEOUT_SECS` offset, because that
+/// constant now bounds only what a caller may type. `plugins/hooks/hooks.json`
+/// carries the outer bound at 4260 s, and this must stay under it: the hook
+/// process is killed at that one, and a kill delivers nothing.
+const AWAIT_JOB_DEADLINE_SECS: u64 = 4200;
 
 /// Everything wrong with a `job_ids` list that the list alone decides, in the
 /// exact words the reply carries.
@@ -1776,10 +1921,13 @@ enum WaitOutcome {
 ///
 /// A field clauth structurally cannot have is ABSENT rather than `unknown`: no
 /// `last_output_secs_ago` before the first line arrives, no `idle_kill_in_secs`
-/// when the idle leg is off, no tail when there is none. A record carrying no
-/// `timeout_secs` predates the fields entirely (`resolve_deadlines` clamps a
-/// real one to 1..=3600), so the whole liveness set is dropped rather than
-/// counted down from a defaulted zero.
+/// when the idle leg is off, no `wall_kill_in_secs` on a streaming run (which
+/// has no wall clock), no tail when there is none.
+///
+/// Which makes a zero `timeout_secs` two different facts, and `idle_secs`
+/// separates them: WITH one, this is a healthy streaming run whose only deadline
+/// is the idle guard; WITHOUT one, the record predates these fields entirely and
+/// the whole liveness set is dropped rather than counted down from defaults.
 ///
 /// Every figure here is one epoch-ms subtraction, and the only inaccuracy is the
 /// heartbeat throttle: the file is rewritten at most once per
@@ -1797,11 +1945,13 @@ fn running_payload(job_id: &str, record: &jobs::JobRecord, now: u64) -> serde_js
         "elapsed_secs": elapsed_secs,
         "quota": quota_payload(&record.profile),
     });
-    if record.timeout_secs == 0 {
+    if record.timeout_secs == 0 && record.idle_secs.is_none() {
         return payload;
     }
-    payload["wall_kill_in_secs"] =
-        serde_json::json!(record.timeout_secs.saturating_sub(elapsed_secs));
+    if record.timeout_secs > 0 {
+        payload["wall_kill_in_secs"] =
+            serde_json::json!(record.timeout_secs.saturating_sub(elapsed_secs));
+    }
     // A run that has said nothing has been idle for its whole life, which is
     // also how the kill path counts it.
     let idle_for_secs = if record.last_output_at == 0 {
@@ -2219,7 +2369,7 @@ fn stop_reason(
     cancelled: bool,
     elapsed: Duration,
     last_progress: Duration,
-    wall: Duration,
+    wall: Option<Duration>,
     idle: Duration,
     streaming: bool,
 ) -> Option<StopReason> {
@@ -2234,42 +2384,54 @@ fn stop_reason(
 enum Expiry {
     /// Nothing arrived on stdout for the idle window.
     Idle,
-    /// The run outlived its wall-clock ceiling while still producing output.
+    /// The run outlived the wall-clock ceiling a pinned `--output-format` gave
+    /// it. Only that shape has one.
     Wall,
 }
 
-/// Resolve a delegate's `(wall, idle)` deadlines. Without the event stream there
-/// is no liveness signal, so an unset wall clock falls back to the idle default
-/// rather than leaving a hung child to sit for the full hour.
+/// Resolve a delegate's `(wall, idle)` deadlines, `None` for a run that has no
+/// wall clock at all.
+///
+/// A STREAMING run never gets one. The stream is a liveness signal, so the idle
+/// guard already ends every stuck run, and a wall clock on top of it can only
+/// ever kill a delegate that is working — mid-answer, at a cost the target
+/// account has already paid. `timeout_secs` is therefore ignored there, which is
+/// what the tool description says.
+///
+/// Without the stream there is no liveness signal at all, so silence carries no
+/// information and the idle leg is off; a wall clock is then the only thing that
+/// can end a hung child, and an unset one falls back to the idle value rather
+/// than leaving it to sit forever.
 fn resolve_deadlines(
     timeout_secs: Option<u64>,
     idle_secs: Option<u64>,
     streaming: bool,
-) -> (Duration, Duration) {
+) -> (Option<Duration>, Duration) {
     let idle = idle_secs
         .unwrap_or(DEFAULT_IDLE_SECS)
         .clamp(1, MAX_RUN_TIMEOUT_SECS);
-    let wall = match timeout_secs {
-        Some(secs) => secs.clamp(1, MAX_RUN_TIMEOUT_SECS),
-        None if streaming => DEFAULT_RUN_TIMEOUT_SECS,
-        None => idle,
+    let wall = if streaming {
+        None
+    } else {
+        Some(timeout_secs.map_or(idle, |secs| secs.clamp(1, MAX_RUN_TIMEOUT_SECS)))
     };
-    (Duration::from_secs(wall), Duration::from_secs(idle))
+    (wall.map(Duration::from_secs), Duration::from_secs(idle))
 }
 
 /// Which deadline (if either) a still-running delegate has tripped.
-/// `last_progress` is how far into the run its most recent output arrived; the
-/// idle leg is off entirely without the stream, where silence means nothing.
+/// `last_progress` is how far into the run its most recent output arrived. Each
+/// leg is off in exactly the mode where its signal means nothing: no idle leg
+/// without the stream, and no wall clock with it.
 fn expiry(
     elapsed: Duration,
     last_progress: Duration,
-    wall: Duration,
+    wall: Option<Duration>,
     idle: Duration,
     streaming: bool,
 ) -> Option<Expiry> {
-    // Wall clock first: it is the outer bound, and a delegate that stalls near
-    // the ceiling trips both in the same poll.
-    if elapsed >= wall {
+    // Wall clock first: where there is one it is the outer bound, and a delegate
+    // that stalls near the ceiling trips both in the same poll.
+    if wall.is_some_and(|wall| elapsed >= wall) {
         return Some(Expiry::Wall);
     }
     (streaming && elapsed.saturating_sub(last_progress) >= idle).then_some(Expiry::Idle)
@@ -2471,8 +2633,8 @@ fn read_stdout<R: std::io::Read>(
     capture
 }
 
-/// Milliseconds since `start`, saturating (a delegate is capped at an hour, so
-/// the cast never truncates in practice).
+/// Milliseconds since `start`, saturating (the `u128` only exceeds a `u64` after
+/// some 584 million years, so the cast never truncates in practice).
 fn elapsed_ms(start: Instant) -> u64 {
     u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX)
 }
@@ -2679,7 +2841,7 @@ fn apply_delegate_env(
 }
 
 /// Blocking delegate: acquire the target profile's runtime, spawn a headless
-/// `claude -p` with piped stdio, enforce the idle + wall-clock deadlines, and
+/// `claude -p` with piped stdio, enforce whichever deadlines that run has, and
 /// parse its JSON envelope. Returns `Ok(envelope)` on a clean parse and a
 /// [`salvage_envelope`] for every other way a SPAWNED run can end — killed,
 /// cancelled, non-zero exit, unreadable output — because each of those spent the
@@ -2950,7 +3112,10 @@ fn run_delegate(opts: DelegateOpts<'_>) -> std::result::Result<serde_json::Value
         Err(WaitEnd::Expired(expiry)) => {
             let limit = match expiry {
                 Expiry::Idle => idle,
-                Expiry::Wall => wall,
+                // `expiry` only ever reports `Wall` off a `Some` comparison, so
+                // the fallback is a convention rather than a reachable arm: it
+                // keeps the envelope quoting a real ceiling if the two drift.
+                Expiry::Wall => wall.unwrap_or(idle),
             };
             return Ok(timeout_envelope(
                 opts.profile,
@@ -3312,8 +3477,9 @@ impl ReservedJob {
 /// The cancel entry is minted HERE, with the id, rather than when the blocking
 /// pool picks the task up: the caller holds the id the moment this returns, and
 /// a cancel naming it in between used to be a silent no-op that left the run to
-/// its full `timeout_secs`. A `write_running` failure drops the reservation with
-/// the entry, so an id that never reached the caller leaves nothing behind.
+/// whichever deadline it launched under — and the default streaming shape has no
+/// wall clock at all. A `write_running` failure drops the reservation with the
+/// entry, so an id that never reached the caller leaves nothing behind.
 fn reserve_background_job(
     profile: &str,
     timeout_secs: Option<u64>,
@@ -3326,7 +3492,10 @@ fn reserve_background_job(
         job_id: jobs::new_job_id(started_at),
         profile: profile.to_string(),
         started_at,
-        timeout_secs: wall.as_secs(),
+        // `0` = no wall clock, which is what a streaming run launches under.
+        // Paired with the `idle_secs` below it stays distinguishable from a
+        // record an older server wrote, which carries neither.
+        timeout_secs: wall.map_or(0, |w| w.as_secs()),
         // Without the event stream the idle leg is off entirely, so there is no
         // such deadline to count down to rather than an unknown one.
         idle_secs: streaming.then_some(idle.as_secs()),

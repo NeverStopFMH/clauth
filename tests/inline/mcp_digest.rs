@@ -198,25 +198,28 @@ fn call_delegate_background(
     // SAFETY: test-only, serialized by the caller's `HomeSandbox` lock.
     unsafe { std::env::set_var(MCP_DEPTH_ENV, "0") };
     let result = drive(
-        server.delegate(Parameters(DelegateArgs {
-            profiles: Some(profiles.iter().map(|p| (*p).to_string()).collect()),
-            prompt: Some("hi".to_string()),
-            prompt_file: None,
-            model: None,
-            cwd: Some(
-                home.home()
-                    .join("does-not-exist")
-                    .to_string_lossy()
-                    .into_owned(),
-            ),
-            env: None,
-            args: None,
-            timeout_secs: None,
-            idle_secs: None,
-            resume: None,
-            isolated: None,
-            background: Some(true),
-        })),
+        server.delegate_with(
+            DelegateArgs {
+                profiles: Some(profiles.iter().map(|p| (*p).to_string()).collect()),
+                prompt: Some("hi".to_string()),
+                prompt_file: None,
+                model: None,
+                cwd: Some(
+                    home.home()
+                        .join("does-not-exist")
+                        .to_string_lossy()
+                        .into_owned(),
+                ),
+                env: None,
+                args: None,
+                timeout_secs: None,
+                idle_secs: None,
+                resume: None,
+                isolated: None,
+                background: Some(true),
+            },
+            ProgressSink::none(),
+        ),
     );
     // SAFETY: same as above — restore the prior value.
     unsafe {

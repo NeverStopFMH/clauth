@@ -1006,13 +1006,13 @@ pub(crate) fn delegate_result_prose(p: &Value) -> String {
 /// far each deadline still is, that account's headroom, and — on its own
 /// indented line — the newest thing the delegate wrote.
 ///
-/// Every liveness field is recorded together at reserve time, so a missing wall
-/// deadline means the whole set is missing: that job was started by a clauth
-/// that did not record them, which is a different statement from clauth having
-/// lost track of a job it is watching. An absent idle deadline under a recorded
-/// wall one is the third case: the idle leg is OFF (a caller-pinned
-/// `--output-format` leaves silence carrying no information), so clauth knows
-/// there is none.
+/// A run can be missing either deadline and still be perfectly healthy, so each
+/// absence is NAMED rather than left to read as a lost figure: a streaming run
+/// has no wall clock at all (the idle guard is its only deadline), and a run
+/// whose caller pinned its own `--output-format` has no idle one (silence there
+/// carries no information). Missing BOTH is the only case that means clauth is
+/// short a fact rather than reporting one: every deadline is recorded together
+/// at reserve time, so that job was started by a clauth which recorded neither.
 pub(super) fn running_status_prose(p: &Value) -> String {
     let job_id = p.get("job_id").and_then(Value::as_str).unwrap_or("unknown");
     let status = p.get("status").and_then(Value::as_str).unwrap_or("unknown");
@@ -1025,18 +1025,22 @@ pub(super) fn running_status_prose(p: &Value) -> String {
         out.push_str(&format!(" on `{profile}`"));
     }
     out.push_str(&format!(", elapsed {elapsed}"));
-    match p.get("wall_kill_in_secs").and_then(Value::as_u64) {
-        None => out.push_str(", liveness not recorded (started under an older clauth)"),
-        Some(wall) => {
-            match p.get("last_output_secs_ago").and_then(Value::as_u64) {
-                Some(secs) => out.push_str(&format!(", last output {secs}s ago")),
-                None => out.push_str(", no output yet"),
-            }
-            match p.get("idle_kill_in_secs").and_then(Value::as_u64) {
-                Some(secs) => out.push_str(&format!(", idle-kill in {secs}s")),
-                None => out.push_str(", no idle deadline"),
-            }
-            out.push_str(&format!(", wall-kill in {wall}s"));
+    let wall = p.get("wall_kill_in_secs").and_then(Value::as_u64);
+    let idle = p.get("idle_kill_in_secs").and_then(Value::as_u64);
+    if wall.is_none() && idle.is_none() {
+        out.push_str(", liveness not recorded (started under an older clauth)");
+    } else {
+        match p.get("last_output_secs_ago").and_then(Value::as_u64) {
+            Some(secs) => out.push_str(&format!(", last output {secs}s ago")),
+            None => out.push_str(", no output yet"),
+        }
+        match idle {
+            Some(secs) => out.push_str(&format!(", idle-kill in {secs}s")),
+            None => out.push_str(", no idle deadline"),
+        }
+        match wall {
+            Some(secs) => out.push_str(&format!(", wall-kill in {secs}s")),
+            None => out.push_str(", no wall clock"),
         }
     }
     if let Some(q) = p.get("quota") {

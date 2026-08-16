@@ -63,6 +63,15 @@ regex = "1.13.1"
 # in the tree via crossterm).
 clap = { version = "4.6.4", features = ["derive", "wrap_help"] }
 
+[dev-dependencies]
+# `test-util` alone, for `Builder::start_paused`. The blocking `delegate`'s
+# progress ticker sleeps on the real 2 s heartbeat throttle, so pinning its
+# schedule against a wall clock would cost tens of seconds per run AND race the
+# scheduler for an exact tick count; a paused clock makes the same assertion
+# exact and instant. No new crate — tokio is already a dependency above — and
+# resolver 3 keeps a dev-dependency's features out of the normal build.
+tokio = { version = "1.52.3", features = ["test-util"] }
+
 # npm installs `claude` as a `.cmd` shim that Rust's bare `Command::new` can't
 # resolve (no PATHEXT search); `which` finds it. Unix uses a bare lookup.
 [target.'cfg(windows)'.dependencies]

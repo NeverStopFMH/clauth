@@ -1033,6 +1033,24 @@ fn delegate_result_prose_renders_running_invalid_and_done() {
          wall-kill in 288s; quota: usage unknown"
     );
 
+    // A streaming run has no wall clock at all — a deadline clauth KNOWS it does
+    // not have, which is a different statement from the pre-fields record below
+    // carrying no liveness whatsoever.
+    let no_wall = serde_json::json!({
+        "job_id": "d-11",
+        "status": "running",
+        "profile": "DS0",
+        "elapsed_secs": 4000,
+        "last_output_secs_ago": 4,
+        "idle_kill_in_secs": 296,
+        "quota": {"kind": "oauth", "windows": []},
+    });
+    assert_eq!(
+        delegate_result_prose(&no_wall),
+        "job `d-11` running on `DS0`, elapsed 4000s, last output 4s ago, idle-kill in 296s, \
+         no wall clock; quota: usage unknown"
+    );
+
     let legacy = serde_json::json!({
         "job_id": "d-9",
         "status": "running",

@@ -9,13 +9,29 @@ use crate::testutil::HomeSandbox;
 
 /// The running spec every test writes through, so one signature change lands in
 /// one place.
+///
+/// It is the STREAMING shape, which is what `reserve_background_job` writes for
+/// a default `delegate({background: true})`: no wall clock, an idle guard at the
+/// default. The pair `(3600, Some(300))` this used to carry is one the producer
+/// can no longer emit, so every test in the file inherited a run that cannot
+/// exist.
 fn spec(job_id: &str, profile: &str, started_at: u64) -> RunningSpec {
     RunningSpec {
         job_id: job_id.to_string(),
         profile: profile.to_string(),
         started_at,
-        timeout_secs: 3600,
+        timeout_secs: 0,
         idle_secs: Some(300),
+    }
+}
+
+/// The other shape the producer emits: a caller-pinned `--output-format`, where
+/// the idle leg is off and the wall clock is the only deadline.
+fn pinned_format_spec(job_id: &str, profile: &str, started_at: u64) -> RunningSpec {
+    RunningSpec {
+        timeout_secs: 900,
+        idle_secs: None,
+        ..spec(job_id, profile, started_at)
     }
 }
 
@@ -74,30 +90,38 @@ fn a_job_file_from_an_older_server_still_parses() {
     assert_eq!(r.done_at, 0, "no finish stamp either");
 }
 
-/// A heartbeat rewrites the SAME running record: the identity and both
-/// deadlines survive it, and only the liveness fields move.
+/// A heartbeat rewrites the SAME running record: the identity and whichever
+/// deadline that run has survive it, and only the liveness fields move.
+///
+/// Both producible shapes, because each proves the half the other cannot — a
+/// streaming record's absent wall is a serialized default, so only the
+/// pinned-format one can show a real figure carried through.
 #[test]
 fn a_heartbeat_rewrites_the_running_record_in_place() {
     let _home = HomeSandbox::new();
-    let spec = spec("d-beat-0", "work", 1000);
-    write_running(&spec).unwrap();
-    let fresh = read("d-beat-0").expect("running record");
-    assert_eq!(fresh.last_output_at, 0, "nothing has arrived yet");
-    assert_eq!(fresh.tail, "");
+    for (id, spec) in [
+        ("d-beat-0", spec("d-beat-0", "work", 1000)),
+        ("d-beat-1", pinned_format_spec("d-beat-1", "work", 1000)),
+    ] {
+        write_running(&spec).unwrap();
+        let fresh = read(id).expect("running record");
+        assert_eq!(fresh.last_output_at, 0, "nothing has arrived yet");
+        assert_eq!(fresh.tail, "");
 
-    // Epoch ms, the same anchor `started_at` uses — a run-relative stamp would
-    // silently disagree with it by the acquire+spawn latency.
-    write_heartbeat(&spec, 41_000, "moving to the fallback tests").unwrap();
-    let beaten = read("d-beat-0").expect("heartbeat record");
-    assert_eq!(beaten.state, JobState::Running, "still the same job");
-    assert_eq!(beaten.job_id, "d-beat-0");
-    assert_eq!(beaten.profile, "work");
-    assert_eq!(beaten.started_at, 1000);
-    assert_eq!(beaten.timeout_secs, 3600);
-    assert_eq!(beaten.idle_secs, Some(300));
-    assert_eq!(beaten.last_output_at, 41_000);
-    assert_eq!(beaten.tail, "moving to the fallback tests");
-    assert!(beaten.envelope.is_none());
+        // Epoch ms, the same anchor `started_at` uses — a run-relative stamp
+        // would silently disagree with it by the acquire+spawn latency.
+        write_heartbeat(&spec, 41_000, "moving to the fallback tests").unwrap();
+        let beaten = read(id).expect("heartbeat record");
+        assert_eq!(beaten.state, JobState::Running, "still the same job");
+        assert_eq!(beaten.job_id, id);
+        assert_eq!(beaten.profile, "work");
+        assert_eq!(beaten.started_at, 1000);
+        assert_eq!(beaten.timeout_secs, spec.timeout_secs);
+        assert_eq!(beaten.idle_secs, spec.idle_secs);
+        assert_eq!(beaten.last_output_at, 41_000);
+        assert_eq!(beaten.tail, "moving to the fallback tests");
+        assert!(beaten.envelope.is_none());
+    }
 }
 
 #[test]
@@ -171,9 +195,9 @@ fn gc_reaps_expired_running_and_done_keeps_fresh() {
 }
 
 /// The Done TTL retains a file for an hour after it FINISHES, which is what its
-/// own doc promises a slow poller. Measured from the mint instead, a delegate
-/// killed at the default 3600 s wall clock is already expired the instant it
-/// finalizes, and the next sweep destroys the salvage envelope.
+/// own doc promises a slow poller. Measured from the mint instead, any delegate
+/// that ran for over an hour is already expired the instant it finalizes, and
+/// the next sweep destroys the salvage envelope.
 #[test]
 fn the_done_ttl_measures_from_the_finish_not_the_mint() {
     let _home = HomeSandbox::new();
@@ -199,6 +223,51 @@ fn the_done_ttl_measures_from_the_finish_not_the_mint() {
     assert!(read("d-stale-finish").is_none(), "an hour past the finish");
     assert!(read("d-legacy-done").is_none(), "old file, old rule");
     assert!(read("d-legacy-fresh").is_some(), "old file, still fresh");
+}
+
+/// A streaming delegate has no wall clock, so "older than the max delegate
+/// lifetime" bounds nothing any more: anchored on the mint, a run still healthy
+/// past the TTL had its `running` file deleted under it — at startup AND by the
+/// sweep every `monitor` collect runs — and the job then answered `unknown
+/// job_id` while its child kept spending the account. What separates a corpse
+/// from a long run is SILENCE, not age: a live background run rewrites this file
+/// on every heartbeat and cannot go quiet for longer than its own idle guard
+/// without being killed.
+#[test]
+fn a_job_still_talking_survives_the_corpse_sweep_however_old_it_is() {
+    let _home = HomeSandbox::new();
+    let now = 10_000_000_000u64;
+    let ancient = now - 10 * RUNNING_TTL_MS;
+
+    // Minted half a day ago, said something a second ago: alive.
+    write_heartbeat(&spec("d-talking", "p", ancient), now - 1000, "still going").unwrap();
+    // Same age, never heard from since the mint: a corpse.
+    write_running(&spec("d-silent", "p", ancient)).unwrap();
+
+    gc_running_corpses(now);
+
+    assert!(
+        read("d-talking").is_some(),
+        "a heartbeat inside the window is liveness, whatever the run's total age"
+    );
+    assert!(
+        read("d-silent").is_none(),
+        "silence past the window is still a corpse"
+    );
+
+    // The startup sweep reads the same anchor, and it is the one that runs while
+    // ANOTHER server's jobs are in flight.
+    write_heartbeat(
+        &spec("d-talking-2", "p", ancient),
+        now - 1000,
+        "still going",
+    )
+    .unwrap();
+    gc(now);
+    assert!(
+        read("d-talking-2").is_some(),
+        "startup GC must not reap a live run a sibling server is still driving"
+    );
 }
 
 /// The collect path runs a NARROWER sweep than startup: it reaps only the

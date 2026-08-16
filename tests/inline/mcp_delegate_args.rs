@@ -65,9 +65,10 @@ fn call_delegate(args: DelegateArgs) -> CallToolResult {
 
     let server = ClauthServer::new();
     let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
         .build()
         .expect("runtime");
-    let result = rt.block_on(async { server.delegate(Parameters(args)).await });
+    let result = rt.block_on(async { server.delegate_with(args, ProgressSink::none()).await });
 
     // SAFETY: same as above — restore the prior value.
     unsafe {

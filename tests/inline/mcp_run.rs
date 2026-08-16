@@ -150,6 +150,7 @@ fn run_delegate_refuses_a_disabled_target_before_acquiring_a_runtime() {
         isolation: Isolation::Shared,
         depth: 0,
         job: None,
+        cancel: None,
     })
     .expect_err("a disabled target must be refused");
     assert_eq!(err, "profile is disabled: off (run `clauth enable off`)");
@@ -204,6 +205,7 @@ fn run_delegate_refuses_an_auth_broken_target_before_acquiring_a_runtime() {
         isolation: Isolation::Shared,
         depth: 0,
         job: None,
+        cancel: None,
     })
     .expect_err("a quarantined target must be refused");
     assert_eq!(err, crate::format::login_expired("quarantined").line());
@@ -256,6 +258,7 @@ fn run_delegate_refuses_a_keyless_third_party_target_before_acquiring_a_runtime(
         isolation: Isolation::Shared,
         depth: 0,
         job: None,
+        cancel: None,
     })
     .expect_err("a keyless third-party target must be refused");
     assert_eq!(
@@ -308,6 +311,7 @@ fn run_delegate_refuses_an_empty_api_key_third_party_target() {
         isolation: Isolation::Shared,
         depth: 0,
         job: None,
+        cancel: None,
     })
     .expect_err("an empty-key third-party target must be refused");
     assert_eq!(
@@ -359,6 +363,7 @@ fn run_delegate_refuses_a_whitespace_api_key_third_party_target() {
         isolation: Isolation::Shared,
         depth: 0,
         job: None,
+        cancel: None,
     })
     .expect_err("a whitespace-key third-party target must be refused");
     assert_eq!(
@@ -411,6 +416,7 @@ fn run_delegate_refuses_a_control_char_api_key_third_party_target() {
         isolation: Isolation::Shared,
         depth: 0,
         job: None,
+        cancel: None,
     })
     .expect_err("a control-char key third-party target must be refused");
     assert_eq!(
@@ -448,6 +454,7 @@ fn delegate_stops_at_the_cwd_gate(profile: &str, cwd: &std::path::Path) -> Strin
         isolation: Isolation::Shared,
         depth: 0,
         job: None,
+        cancel: None,
     })
     .expect_err("the cwd gate must refuse the run")
 }
@@ -535,6 +542,7 @@ fn run_delegate_refuses_a_keyless_alibaba_profile() {
         isolation: Isolation::Shared,
         depth: 0,
         job: None,
+        cancel: None,
     })
     .expect_err("a keyless Alibaba profile must be refused");
     assert_eq!(
@@ -1579,11 +1587,13 @@ fn run_delegate_never_returns_between_spawning_the_reader_and_joining_it() {
 
 /// The mode seam the `watch` fold created is refused by name at the boundary,
 /// per placement rule 4 — a rule the server refuses does not have to be taught
-/// in the description. `cancel` is here only so the shipped description's
-/// `cancel: true` stops being silently dropped: rmcp deserializes tool args
-/// with a plain `from_value` and no `deny_unknown_fields`.
+/// in the description.
+///
+/// `cancel`'s own half of that seam moved to
+/// `monitor_refuses_cancel_without_job_ids` when the parameter started working:
+/// naming it beside `job_ids` is now an ordinary call.
 #[test]
-fn monitor_refuses_cancel_and_a_cross_mode_return_on() {
+fn monitor_refuses_a_cross_mode_return_on() {
     let _home = HomeSandbox::new();
     let refusal = |args: MonitorArgs| {
         let result = call_monitor_args(args);
@@ -1595,17 +1605,6 @@ fn monitor_refuses_cancel_and_a_cross_mode_return_on() {
             .map(|t| t.text.clone())
             .expect("refusal text")
     };
-
-    let text = refusal(MonitorArgs {
-        job_ids: Some(vec!["d-1-0".to_string()]),
-        wait_secs: None,
-        return_on: None,
-        cancel: Some(true),
-    });
-    assert!(
-        text.contains("`cancel`") && text.contains("not available yet"),
-        "cancel is refused by name, not silently dropped: {text}",
-    );
 
     let text = refusal(MonitorArgs {
         job_ids: None,
@@ -3528,5 +3527,697 @@ fn a_two_wallet_profile_ranks_on_the_first_currency_listed() {
             amount: 1.19,
         },
         "the first `total` row wins, not the larger amount",
+    );
+}
+
+// ---- slice 5: salvage on every lossy exit, and cancel ----
+
+/// Finding 18: a resumable run that never captured a session id used to append
+/// nothing at all, so the envelope read as silence against a description that
+/// promises a resume handle. The other two arms both say where they stand.
+#[test]
+fn a_resumable_run_with_no_session_id_says_why_there_is_no_handle() {
+    let envelope = super::timeout_envelope(
+        "work",
+        super::Expiry::Wall,
+        Duration::from_secs(3600),
+        Duration::from_secs(3600),
+        &super::StreamCapture::default(),
+        true,
+    );
+    assert!(
+        envelope.get("session_id").is_none(),
+        "there was no id to hand back"
+    );
+    let reason = envelope["result"].as_str().expect("reason");
+    assert!(
+        reason.contains("no resume handle"),
+        "the silent arm names its own absence: {reason}"
+    );
+}
+
+/// `cancel` orders a set of jobs, so it is meaningless in the state-waiting
+/// mode — refused by name at the boundary, the same shape `return_on`'s
+/// cross-mode refusal takes (placement rule 4).
+///
+/// The parameter also has to be READ at all: rmcp deserializes tool args with a
+/// plain `from_value` and no `deny_unknown_fields`, so an unhandled `cancel`
+/// the description itself teaches would be dropped and the call answered as a
+/// plain check.
+#[test]
+fn monitor_refuses_cancel_without_job_ids() {
+    let _home = HomeSandbox::new();
+    let result = call_monitor_args(MonitorArgs {
+        job_ids: None,
+        wait_secs: None,
+        return_on: None,
+        cancel: Some(true),
+    });
+    assert_eq!(result.is_error, Some(true), "a cross-mode call is refused");
+    let text = result
+        .content
+        .first()
+        .and_then(|c| c.as_text())
+        .map(|t| t.text.clone())
+        .expect("refusal text");
+    assert!(
+        text.contains("`cancel`") && text.contains("`job_ids`"),
+        "the refusal names both halves of the seam: {text}",
+    );
+}
+
+/// A streaming run that wrote token deltas and nothing else: no `assistant`
+/// event completed a block and no terminal `result` line ever landed, so its
+/// stdout is unparseable as an envelope. Real events all carry `session_id`,
+/// deltas included, which is where the resume handle comes from here.
+const DELTA_ONLY_STREAM: &str = concat!(
+    r#"{"type":"stream_event","session_id":"s9","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"half an "}}}"#,
+    "\n",
+    r#"{"type":"stream_event","session_id":"s9","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"answer"}}}"#,
+    "\n",
+);
+
+fn capture_of(stream: &str, lines: usize) -> super::StreamCapture {
+    let mut capture = super::StreamCapture::default();
+    for line in stream.lines().take(lines) {
+        capture.push_line(line);
+    }
+    capture
+}
+
+/// Finding 13, the non-zero-exit half. The account's window is spent whether or
+/// not clauth keeps the output, so a crash after six kilobytes of answer must
+/// not hand back a bare stderr string with the text and the resume handle
+/// sitting in locals two lines away.
+///
+/// Driven through the classifier rather than a hand-built envelope: the live
+/// spawn paths have no unit test by standing decision (no fake `claude` on
+/// PATH — a fake binary would assert nothing about the real envelope contract),
+/// so a real `ExitStatus` is the only way in. `#[cfg(unix)]` because
+/// `ExitStatusExt::from_raw` is the only constructor for one, and its wait-status
+/// encoding is a unix thing.
+#[cfg(unix)]
+#[test]
+fn a_non_zero_exit_still_hands_back_what_the_run_produced() {
+    use std::os::unix::process::ExitStatusExt;
+
+    let capture = capture_of(STREAM, 4);
+    let outcome = super::classify_run(
+        std::process::ExitStatus::from_raw(1 << 8),
+        b"boom: auth failed\n",
+        &capture,
+        "work",
+        true,
+    );
+    let super::RunOutcome::Exited {
+        envelope,
+        throttle_scan,
+    } = outcome
+    else {
+        panic!("a non-zero exit classifies as an exit");
+    };
+    assert_eq!(envelope["is_error"], true);
+    assert_eq!(
+        envelope["partial_result"], "alpha",
+        "the text the run had written survives the crash"
+    );
+    assert_eq!(
+        envelope["session_id"], "s1",
+        "the handle that finishes the work without paying for it twice"
+    );
+    assert!(
+        envelope.get("timed_out").is_none(),
+        "no deadline fired: {envelope}"
+    );
+    let reason = envelope["result"].as_str().expect("reason");
+    assert!(
+        reason.starts_with("claude exited with 1: boom: auth failed"),
+        "the existing reason text is kept, with the salvage clauses after it: {reason}"
+    );
+    assert!(
+        reason.contains("`partial_result`") && reason.contains("resume"),
+        "the reason names both salvage clauses: {reason}"
+    );
+    assert!(
+        throttle_scan.contains("boom: auth failed"),
+        "the rate-limit scan text comes back for the caller to record: {throttle_scan}"
+    );
+}
+
+/// Finding 13, the unparseable half: a clean exit whose stdout was never an
+/// envelope loses exactly as much, and for the same reason. `#[cfg(unix)]` for
+/// the same reason as the arm above.
+#[cfg(unix)]
+#[test]
+fn an_unparseable_envelope_still_hands_back_what_the_run_produced() {
+    use std::os::unix::process::ExitStatusExt;
+
+    let capture = capture_of(DELTA_ONLY_STREAM, 2);
+    assert!(
+        super::parse_delegate_envelope(capture.envelope_src().trim()).is_err(),
+        "the precondition: this run's stdout is not an envelope"
+    );
+    let outcome = super::classify_run(
+        std::process::ExitStatus::from_raw(0),
+        b"",
+        &capture,
+        "work",
+        true,
+    );
+    let super::RunOutcome::Unparseable(envelope) = outcome else {
+        panic!("a clean exit with unreadable output classifies as unparseable");
+    };
+    assert_eq!(envelope["is_error"], true);
+    assert_eq!(envelope["partial_result"], "half an answer");
+    assert_eq!(envelope["session_id"], "s9");
+    assert!(
+        envelope.get("timed_out").is_none(),
+        "no deadline fired: {envelope}"
+    );
+    let reason = envelope["result"].as_str().expect("reason");
+    assert!(
+        reason.starts_with("failed to parse claude output"),
+        "the existing reason text is kept: {reason}"
+    );
+}
+
+/// Finding 14's wiring, testable without a child process because the whole stop
+/// decision is one pure function: a cancel is not a deadline, and it must fire
+/// with both deadlines still far away.
+#[test]
+fn the_stop_decision_reads_the_cancel_flag_beside_both_deadlines() {
+    let far = Duration::from_secs(3600);
+    let tick = Duration::from_secs(1);
+    assert_eq!(
+        super::stop_reason(false, tick, tick, far, far, true),
+        None,
+        "nothing fired, so the run continues"
+    );
+    assert_eq!(
+        super::stop_reason(true, tick, tick, far, far, true),
+        Some(super::StopReason::Cancelled),
+        "the caller's stop does not wait for a deadline"
+    );
+    assert_eq!(
+        super::stop_reason(false, far, tick, far, far, true),
+        Some(super::StopReason::Expired(super::Expiry::Wall)),
+        "a deadline still fires on its own"
+    );
+    // The case the ordering exists for. With the two checks the other way round
+    // this tick reports the clock, telling a caller their cancel did nothing.
+    assert_eq!(
+        super::stop_reason(true, far, tick, far, far, true),
+        Some(super::StopReason::Cancelled),
+        "a cancel and a deadline landing in the same tick is a cancel"
+    );
+}
+
+/// The registry is a direct handle rather than a flag in the job file: the
+/// detached task runs in this same process. An entry lives exactly as long as
+/// the run does, so a stale id can never stop a later job that reuses it.
+#[test]
+fn the_cancel_registry_holds_a_flag_only_while_the_run_is_registered() {
+    let id = "d-777000-0";
+    assert!(!super::cancel_job(id), "nothing is registered under it yet");
+    let guard = super::CancelGuard::register(id);
+    assert!(!guard.is_cancelled(), "registering does not cancel");
+    assert!(super::cancel_job(id), "a registered id is held");
+    assert!(
+        guard.is_cancelled(),
+        "the flag the supervision loop reads is the one `cancel_job` set"
+    );
+    drop(guard);
+    assert!(
+        !super::cancel_job(id),
+        "a deregistered id can no longer be cancelled"
+    );
+}
+
+/// `cancel: true` marks the named jobs and then runs the ordinary collect, so
+/// the caller receives what they produced in the same call. The job here is
+/// already finalized: the grace exists for a real run's teardown, and this test
+/// is about the cancel rather than the wait.
+#[test]
+fn cancelling_a_live_job_flips_its_flag_and_the_reply_says_so() {
+    let _home = HomeSandbox::new();
+    let id = "d-778000-0";
+    jobs::write_done(
+        id,
+        "work",
+        1,
+        serde_json::json!({"profile": "work", "is_error": true, "result": "half an answer"}),
+    )
+    .unwrap();
+    let guard = super::CancelGuard::register(id);
+
+    let result = call_monitor_args(MonitorArgs {
+        job_ids: Some(vec![id.to_string()]),
+        wait_secs: Some(0),
+        return_on: None,
+        cancel: Some(true),
+    });
+    assert!(
+        guard.is_cancelled(),
+        "the running loop's own flag is what `cancel: true` sets"
+    );
+    let text = result
+        .content
+        .first()
+        .and_then(|c| c.as_text())
+        .map(|t| t.text.clone())
+        .expect("reply text");
+    assert!(
+        text.contains(&format!("asked `{id}` to stop")),
+        "the reply names the job it asked to stop: {text}"
+    );
+    assert!(
+        text.contains("half an answer"),
+        "and hands back what that job produced, in the same call: {text}"
+    );
+}
+
+/// A named id this server holds no run for is NAMED, with its causes hedged the
+/// way `unknown_job_reason` hedges its four. Coming back as a plain `running`
+/// row reads as "the cancel did nothing", which is the ambiguity this rework
+/// exists to kill.
+#[test]
+fn cancelling_a_job_this_server_does_not_hold_names_it_and_hedges_why() {
+    let _home = HomeSandbox::new();
+    let id = "d-779000-0";
+    jobs::write_done(
+        id,
+        "work",
+        1,
+        serde_json::json!({"profile": "work", "is_error": false, "result": "landed first"}),
+    )
+    .unwrap();
+
+    let result = call_monitor_args(MonitorArgs {
+        job_ids: Some(vec![id.to_string()]),
+        wait_secs: Some(0),
+        return_on: None,
+        cancel: Some(true),
+    });
+    let text = result
+        .content
+        .first()
+        .and_then(|c| c.as_text())
+        .map(|t| t.text.clone())
+        .expect("reply text");
+    assert!(text.contains(id), "the id is named: {text}");
+    assert!(
+        text.contains("already be finishing") && text.contains("earlier server process"),
+        "both indistinguishable causes are hedged: {text}"
+    );
+    assert_eq!(
+        result.content.len(),
+        1,
+        "one content block per reply, cancel report included"
+    );
+}
+
+/// A cancelled run finalizes like every other outcome. A file left `running`
+/// would poll forever and leave `mcp-await-job` blocked on a terminal state that
+/// never arrives.
+#[test]
+fn a_cancelled_run_finalizes_as_a_done_error_rather_than_stranding() {
+    let _home = HomeSandbox::new();
+    let capture = capture_of(STREAM, 4);
+    let envelope = super::cancelled_envelope(
+        "work",
+        "delegate cancelled after 42s".to_string(),
+        Duration::from_secs(42),
+        &capture,
+        true,
+    );
+    assert_eq!(envelope["is_error"], true);
+    assert_eq!(envelope["cancelled"], true);
+    assert!(
+        envelope.get("timed_out").is_none(),
+        "a cancel is a decision, not a deadline: {envelope}"
+    );
+    assert_eq!(envelope["partial_result"], "alpha");
+    assert_eq!(envelope["session_id"], "s1");
+
+    // The finalize `launch_background_delegate` runs on every outcome.
+    let id = "d-780000-0";
+    jobs::write_done(id, "work", 1, envelope).unwrap();
+    let record = jobs::read(id).expect("the job file is finalized");
+    assert_eq!(
+        record.state,
+        jobs::JobState::Done,
+        "never stranded `running`"
+    );
+    assert_eq!(
+        record.envelope.expect("envelope")["is_error"],
+        true,
+        "and finalized as an error, so a client branching on it reads the stop"
+    );
+}
+
+// ---- slice 5 fix round ----
+
+/// Structural validation THEN the destructive op, in that order. Partitioning
+/// the ids through `cancel_job` first killed the live runs in a list the very
+/// next check refuses, which is a spend with no undo made on the way to
+/// answering "no".
+#[test]
+fn a_refused_job_ids_list_cancels_nothing() {
+    let _home = HomeSandbox::new();
+    let live = "d-781000-0";
+    let guard = super::CancelGuard::register(live);
+    let mut ids: Vec<String> = (0..256).map(|i| format!("d-{i}-0")).collect();
+    ids.push(live.to_string());
+
+    let result = call_monitor_args(MonitorArgs {
+        job_ids: Some(ids),
+        wait_secs: Some(0),
+        return_on: None,
+        cancel: Some(true),
+    });
+    assert_eq!(result.is_error, Some(true));
+    assert_eq!(
+        result
+            .content
+            .first()
+            .and_then(|c| c.as_text())
+            .map(|t| t.text.clone())
+            .expect("refusal text"),
+        "error: `job_ids` capped at 256 ids; got 257",
+        "the refusal is the whole reply: nothing was cancelled to report"
+    );
+    assert!(
+        !guard.is_cancelled(),
+        "a list the server refuses must not have stopped a run on its way to being refused"
+    );
+}
+
+/// An id that could never name a job file is not an unheld job. It used to get
+/// the two-cause hedge prepended to its own structural refusal, which reads as
+/// though clauth went looking for it.
+#[test]
+fn cancelling_an_unsafe_job_id_refuses_it_rather_than_hedging_it() {
+    let _home = HomeSandbox::new();
+    let result = call_monitor_args(MonitorArgs {
+        job_ids: Some(vec!["../etc".to_string()]),
+        wait_secs: Some(0),
+        return_on: None,
+        cancel: Some(true),
+    });
+    assert_eq!(result.is_error, Some(true));
+    assert_eq!(
+        result
+            .content
+            .first()
+            .and_then(|c| c.as_text())
+            .map(|t| t.text.clone())
+            .expect("refusal text"),
+        "error: invalid job_id",
+        "the structural refusal is the whole reply"
+    );
+
+    // Several ids do not refuse over one unsafe member — it resolves to
+    // `unknown` in its own slot — so the note is what has to leave it alone.
+    let mixed = call_monitor_args(MonitorArgs {
+        job_ids: Some(vec!["d-1-0".to_string(), "../etc".to_string()]),
+        wait_secs: Some(0),
+        return_on: None,
+        cancel: Some(true),
+    });
+    let text = mixed
+        .content
+        .first()
+        .and_then(|c| c.as_text())
+        .map(|t| t.text.clone())
+        .expect("reply text");
+    let (note, _) = text
+        .split_once('\n')
+        .expect("the cancel note leads the reply");
+    // Identify the line as the note BEFORE reading anything off it. With no
+    // note at all the first line is `monitor_batch`'s own `job \`d-1-0\`
+    // unknown`, which satisfies both halves below for reasons that have nothing
+    // to do with the filter under test.
+    assert!(
+        note.starts_with("asked ") || note.starts_with("no running delegate here for "),
+        "the line under test is the cancel note, not the batch's own first row: {note}"
+    );
+    assert!(
+        note.contains("`d-1-0`") && !note.contains("../etc"),
+        "the cancel report covers the ids that could name a job, and no others: {note}"
+    );
+}
+
+/// The flag is read by the supervision loop, which does not exist until the
+/// child is spawned — and `ProfileRuntime::acquire` BLOCKS behind a live
+/// `clauth start` session on the same profile. So the reply can only claim the
+/// ask, never the outcome; asserting "stopped" put that word directly above a
+/// running row for the same id.
+#[test]
+fn the_cancel_report_claims_the_ask_and_never_the_outcome() {
+    let note = super::cancel_note(&["d-1-0".to_string()], &[]);
+    assert!(
+        note.contains("asked `d-1-0` to stop"),
+        "the observable is the ask: {note}"
+    );
+    assert!(
+        !note.contains("stopped"),
+        "nothing here has read the flag yet: {note}"
+    );
+}
+
+/// Registration rides the MINT, not the spawn. The id is in the caller's hands
+/// the moment `reserve_background_job` returns, and a cancel landing before the
+/// blocking pool picks the task up used to be a silent no-op — hedged under two
+/// causes that were both false — leaving the run to its full `timeout_secs`,
+/// which is finding 14's original harm.
+#[test]
+fn a_reserved_job_is_cancellable_before_its_task_starts() {
+    let _home = HomeSandbox::new();
+    let reserved = reserve_background_job("work", None, None, true).expect("reserve");
+    let job_id = reserved.spec.job_id.clone();
+    assert!(
+        super::cancel_job(&job_id),
+        "the reserve registers, so the id the caller holds is already cancellable"
+    );
+    drop(reserved);
+    assert!(
+        !super::cancel_job(&job_id),
+        "and the entry goes with the reservation"
+    );
+}
+
+/// `(None, false)` used to land in the isolated-transcript arm and tell a run
+/// that never had a session its transcript was lost to auto-rescue — two things
+/// clauth did not observe. The session question is answered FIRST: no id means
+/// no handle whatever the isolation, and the transcript clause only means
+/// something when an id exists.
+#[test]
+fn a_run_with_no_session_never_claims_a_lost_transcript() {
+    let envelope = super::salvage_envelope(
+        "work",
+        "claude exited with 1: boom".to_string(),
+        &super::StreamCapture::default(),
+        false,
+    );
+    let reason = envelope["result"].as_str().expect("reason");
+    assert!(
+        !reason.contains("auto-rescue") && !reason.contains("isolated runtime"),
+        "clauth saw no transcript and no session, so it asserts neither: {reason}"
+    );
+    assert!(
+        reason.contains("no resume handle"),
+        "it answers the question the caller actually has: {reason}"
+    );
+}
+
+/// Where the pre-spawn check sits, which is the half its behavioural twin
+/// (`a_run_cancelled_before_it_spawns_says_the_window_was_not_spent`) cannot
+/// see: that one proves the arm returns the right envelope, and infers "no
+/// child" only from a reason string the other arm happens not to use.
+///
+/// It observes the source text and nothing else — it cannot tell whether the
+/// expression is ever true, which is exactly why the behavioural test carries
+/// the weight. So it pins the guard WHOLE rather than merely mentioning it:
+/// `if false &&`, a negation, or a swap for a constant all keep the literal
+/// `CancelGuard::is_cancelled` and would slip past a `contains` of it. This
+/// repo has already paid for that lesson once, on the reader-window guard
+/// below, which missed `?` and `return;` until it was widened.
+#[test]
+fn run_delegate_reads_the_cancel_flag_between_the_acquire_and_the_spawn() {
+    let src = include_str!("../../src/mcp/mod.rs");
+    let body = src
+        .split_once("fn run_delegate(")
+        .expect("run_delegate is defined")
+        .1;
+    let acquire = body
+        .find("let runtime = ProfileRuntime::acquire(")
+        .expect("the runtime is acquired");
+    let spawn = body
+        .find("let mut child = command")
+        .expect("the child is spawned");
+    assert!(acquire < spawn, "the spawn follows the acquire");
+    let window = &body[acquire..spawn];
+    assert!(
+        window.contains("\n    if cancel.is_some_and(CancelGuard::is_cancelled) {\n"),
+        "the cancel guard between the acquire and the spawn must be the whole \
+         condition, unqualified: {window}"
+    );
+}
+
+/// The grace is a floor on the wait, not a replacement for it, and it never
+/// lifts the ceiling a peer without progress notifications has to live under.
+#[test]
+fn the_effective_wait_floors_a_cancel_at_the_grace_without_lifting_the_ceiling() {
+    assert_eq!(
+        super::effective_wait(Some(0), true, false),
+        0,
+        "an ordinary check still replies instantly"
+    );
+    assert_eq!(
+        super::effective_wait(Some(0), true, true),
+        super::CANCEL_GRACE_SECS,
+        "a bare cancel waits the grace out instead of replying before anything can move"
+    );
+    assert_eq!(
+        super::effective_wait(Some(600), true, true),
+        600,
+        "a floor, never a replacement"
+    );
+    assert_eq!(
+        super::effective_wait(Some(9999), false, true),
+        1500,
+        "and the no-progress ceiling still binds"
+    );
+}
+
+/// You asked to stop all of them, so you hear about all of them — otherwise the
+/// first lane to land ends the wait and the rest come back as `running` rows
+/// under a reply that just cancelled them.
+#[test]
+fn a_cancel_hears_about_every_job_it_named() {
+    assert_eq!(
+        super::resolve_return_on(None, true, true),
+        Ok(super::ReturnOn::All),
+        "cancelling with nothing named waits for all of them"
+    );
+    assert_eq!(
+        super::resolve_return_on(None, true, false),
+        Ok(super::ReturnOn::Any),
+        "an ordinary collect still returns on the first lane"
+    );
+    assert_eq!(
+        super::resolve_return_on(Some("any"), true, true),
+        Ok(super::ReturnOn::Any),
+        "an explicit value still wins"
+    );
+}
+
+/// What the extraction MOVED: a throttle hint can hide in the child's stderr,
+/// in its stdout, or in a `rate_limit_event` line that never reached either, so
+/// all three reach the scan.
+///
+/// The `record_rate_limit` call the scan feeds is NOT pinned here. It writes to
+/// the throughput store as a side effect of a real spawn, and this crate does
+/// not fake a `claude` on PATH; keeping the composition pure is what let the
+/// half that can be checked be checked.
+#[cfg(unix)]
+#[test]
+fn the_throttle_scan_carries_every_source_a_rate_limit_hides_in() {
+    use std::os::unix::process::ExitStatusExt;
+
+    let mut capture = super::StreamCapture::default();
+    capture.push_line(r#"{"type":"system","subtype":"init","session_id":"stdout-marker"}"#);
+    capture.push_line(r#"{"type":"rate_limit_event","note":"ratelimit-marker"}"#);
+    let outcome = super::classify_run(
+        std::process::ExitStatus::from_raw(1 << 8),
+        b"stderr-marker",
+        &capture,
+        "work",
+        true,
+    );
+    let super::RunOutcome::Exited { throttle_scan, .. } = outcome else {
+        panic!("a non-zero exit classifies as an exit");
+    };
+    for marker in ["stderr-marker", "stdout-marker", "ratelimit-marker"] {
+        assert!(
+            throttle_scan.contains(marker),
+            "{marker} must reach the scan: {throttle_scan}"
+        );
+    }
+}
+
+/// The pre-spawn arm, driven for real. A cancel that lands while
+/// `ProfileRuntime::acquire` blocks must end the run THERE, and the standing
+/// no-fake-`claude` decision does not reach this arm: its whole point is that it
+/// returns before any child exists, so there is nothing to fake.
+///
+/// It is the one arm where a source-scan pin would be the weaker check, and the
+/// only `run_delegate` test in this file that drives the real acquire — every
+/// other one is refused at or before the cwd check.
+#[test]
+fn a_run_cancelled_before_it_spawns_says_the_window_was_not_spent() {
+    let home = HomeSandbox::new();
+    // The acquire refuses outright without it ("~/.claude not found; install
+    // Claude Code first"), which would pass this test's `Ok` check for the
+    // wrong reason if it were ever relaxed to one.
+    std::fs::create_dir_all(home.home().join(".claude")).expect("stage ~/.claude");
+    let mut config = crate::profile::AppConfig {
+        state: crate::profile::AppState::default(),
+        profiles: Vec::new(),
+    };
+    crate::actions::create_blank_profile(&mut config, "work".to_string(), None, None, None)
+        .expect("create profile");
+
+    let job_id = "d-782000-0";
+    let guard = super::CancelGuard::register(job_id);
+    assert!(
+        super::cancel_job(job_id),
+        "fixture control: the run is held"
+    );
+
+    let envelope = run_delegate(DelegateOpts {
+        profile: "work",
+        prompt: "hello",
+        model: None,
+        cwd: None,
+        env: HashMap::new(),
+        extra_args: Vec::new(),
+        timeout_secs: Some(30),
+        idle_secs: None,
+        resume: None,
+        isolation: Isolation::Isolated,
+        depth: 0,
+        job: None,
+        cancel: Some(&guard),
+    })
+    .expect("a cancel is an envelope, never a transport error");
+
+    assert_eq!(envelope["cancelled"], true);
+    assert_eq!(envelope["is_error"], true);
+    assert!(
+        envelope.get("timed_out").is_none(),
+        "a cancel is not a deadline: {envelope}"
+    );
+    let reason = envelope["result"].as_str().expect("reason");
+    assert!(
+        reason.contains("before it spawned") && reason.contains("was not spent"),
+        "the fact the caller acts on is that nothing was billed: {reason}"
+    );
+    assert!(
+        envelope.get("partial_result").is_none() && envelope.get("session_id").is_none(),
+        "no child ran, so there is nothing to salvage: {envelope}"
+    );
+    // Belt and braces on "no child": a spawned delegate stamps its transcripts
+    // into the runtime's own `projects/` on the way out, and this run must not
+    // have reached that teardown either.
+    assert!(
+        !home
+            .home()
+            .join(".clauth")
+            .join("profiles")
+            .join("work")
+            .join("runtime-isolated")
+            .exists(),
+        "the isolated runtime is torn down with the guard, not left behind"
     );
 }

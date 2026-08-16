@@ -14,7 +14,7 @@ mod render;
 use std::collections::HashMap;
 use std::io::Read;
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
@@ -544,8 +544,9 @@ pub(crate) struct MonitorArgs {
     /// waits for the slowest. Needs `job_ids` — it orders a set of jobs, so
     /// naming it without them is refused.
     return_on: Option<String>,
-    /// Stop the named jobs, keeping whatever they produced. Not available yet;
-    /// passing `true` is refused rather than silently ignored.
+    /// Ask the named jobs to stop, keeping whatever they produced. The reply
+    /// carries how far each got before it did, so it is usually the only call
+    /// needed.
     cancel: Option<bool>,
 }
 
@@ -961,10 +962,11 @@ text it had plus a `session_id` to `resume`, rather than paying for that work tw
                         isolation,
                         depth,
                     };
-                    let spec = reserve_background_job(&name, timeout_secs, idle_secs, streaming)
-                        .map_err(|e| ErrorData::internal_error(e, None))?;
-                    let job_id = spec.job_id.clone();
-                    let started_at = spec.started_at;
+                    let reserved =
+                        reserve_background_job(&name, timeout_secs, idle_secs, streaming)
+                            .map_err(|e| ErrorData::internal_error(e, None))?;
+                    let job_id = reserved.spec.job_id.clone();
+                    let started_at = reserved.spec.started_at;
                     // Commits to launch: the job file is reserved and the task
                     // spawns next. `begin` reports `working` on the 0→1
                     // transition; each task's end-guard decrements, and the
@@ -972,7 +974,12 @@ text it had plus a `session_id` to `resume`, rather than paying for that work tw
                     if let Some(pane) = &self.herdr_pane {
                         pane.begin();
                     }
-                    launch_background_delegate(name.clone(), opts, spec, self.herdr_pane.clone());
+                    launch_background_delegate(
+                        name.clone(),
+                        opts,
+                        reserved,
+                        self.herdr_pane.clone(),
+                    );
                     // The handle carries the same footer the blocking reply
                     // does: the tool description steers a slow or third-party
                     // target here, so the recommended path must not be the one
@@ -1012,13 +1019,13 @@ text it had plus a `session_id` to `resume`, rather than paying for that work tw
                     // `resolve_fanout`), so a failure spends no window and loses
                     // no job id. The ids already reserved exist nowhere else;
                     // drop them and keep the all-or-nothing contract.
-                    let mut specs = Vec::with_capacity(names.len());
+                    let mut reserved = Vec::with_capacity(names.len());
                     for name in &names {
                         match reserve_background_job(name, timeout_secs, idle_secs, streaming) {
-                            Ok(spec) => specs.push(spec),
+                            Ok(job) => reserved.push(job),
                             Err(reason) => {
-                                for spec in &specs {
-                                    jobs::remove(&spec.job_id);
+                                for job in reserved {
+                                    job.abandon();
                                 }
                                 return Ok(delegate_refusal(&reason));
                             }
@@ -1026,16 +1033,16 @@ text it had plus a `session_id` to `resume`, rather than paying for that work tw
                     }
                     let now = now_epoch_secs();
                     let mut jobs = Vec::with_capacity(names.len());
-                    for (name, spec) in names.iter().zip(specs) {
+                    for (name, job) in names.iter().zip(reserved) {
                         if let Some(pane) = &self.herdr_pane {
                             pane.begin();
                         }
-                        let job_id = spec.job_id.clone();
-                        let started_at = spec.started_at;
+                        let job_id = job.spec.job_id.clone();
+                        let started_at = job.spec.started_at;
                         launch_background_delegate(
                             name.clone(),
                             opts.clone(),
-                            spec,
+                            job,
                             self.herdr_pane.clone(),
                         );
                         // Each row carries its OWN target's headroom: the
@@ -1099,6 +1106,7 @@ text it had plus a `session_id` to `resume`, rather than paying for that work tw
                 depth,
                 // A blocking delegate has no job file, so it never heartbeats.
                 job: None,
+                cancel: None,
             })
         })
         .await
@@ -1174,36 +1182,43 @@ stops the named jobs and keeps whatever they produced."
                 render::delegate_result_prose(&payload),
             )))
         };
-        if cancel == Some(true) {
-            // rmcp deserializes tool args with a plain `from_value` and no
-            // `deny_unknown_fields`, so before this parameter existed a
-            // `cancel: true` the description itself teaches was dropped and the
-            // call answered as a plain check.
+        let cancel = cancel == Some(true);
+        if cancel && job_ids.is_none() {
             return refuse(
-                "`cancel` is not available yet: stopping a running delegate ships in a later \
-                 release; drop it to check or collect the named jobs",
+                "`cancel` cannot combine with the state-waiting mode: it orders a set of jobs, \
+                 so name `job_ids` or drop it",
             );
         }
-        let return_on = match (return_on.as_deref(), job_ids.is_some()) {
-            (None, _) => ReturnOn::Any,
-            (Some(_), false) => {
-                return refuse(
-                    "`return_on` cannot combine with the state-waiting mode: it orders a set of \
-                     jobs, so name `job_ids` or drop it",
-                );
-            }
-            (Some("any"), true) => ReturnOn::Any,
-            (Some("all"), true) => ReturnOn::All,
-            (Some(raw), true) => {
-                return refuse(&format!(
-                    "unrecognized return_on \"{raw}\": accepted \"any\" and \"all\""
-                ));
-            }
+        let return_on = match resolve_return_on(return_on.as_deref(), job_ids.is_some(), cancel) {
+            Ok(chosen) => chosen,
+            Err(reason) => return refuse(&reason),
         };
-        let wait = clamp_wait(wait_secs, progress.can_receive_progress());
-        match job_ids {
+        // Structural validation, THEN the destructive op. A list this refuses
+        // must not have stopped anything on its way to being refused, and a
+        // cancel has no undo.
+        if let Some(reason) = job_ids.as_deref().and_then(job_ids_refusal) {
+            return refuse(&reason);
+        }
+        let wait = effective_wait(wait_secs, progress.can_receive_progress(), cancel);
+        // Asked BEFORE the wait, so the runs are already stopping while it runs
+        // and this reply carries whatever they reached.
+        let note = cancel
+            .then(|| {
+                // Only over ids that could name a job file at all: a registry
+                // key is always a minted id, so an unsafe one is not an unheld
+                // job, and the batch already reports it as `unknown`.
+                let (asked, unheld): (Vec<String>, Vec<String>) = job_ids
+                    .iter()
+                    .flatten()
+                    .filter(|id| jobs::is_safe_job_id(id))
+                    .cloned()
+                    .partition(|id| cancel_job(id));
+                cancel_note(&asked, &unheld)
+            })
+            .filter(|note| !note.is_empty());
+        let reply = match job_ids {
             // One id keeps the single-job reply shape; several collect as a
-            // batch. An empty list is job mode with no ids, refused below.
+            // batch. Both arms take a list `job_ids_refusal` already cleared.
             Some(ids) if ids.len() == 1 => {
                 monitor_one(
                     ids.into_iter().next().unwrap_or_default(),
@@ -1231,6 +1246,10 @@ stops the named jobs and keeps whatever they produced."
                 let prose = render::watch_prose(&payload);
                 Ok(CallToolResult::success(single_block(prose)))
             }
+        };
+        match note {
+            Some(note) => reply.map(|r| prepend_note(r, &note)),
+            None => reply,
         }
     }
 }
@@ -1264,6 +1283,47 @@ fn clamp_wait(wait_secs: Option<u64>, can_receive_progress: bool) -> u64 {
         MAX_WAIT_SECS_NO_PROGRESS
     };
     wait_secs.unwrap_or(0).min(cap)
+}
+
+/// The wait one `monitor` call actually gets: [`clamp_wait`], floored by
+/// [`CANCEL_GRACE_SECS`] when the call is stopping jobs.
+///
+/// A floor rather than a replacement — a caller who asked for longer keeps it —
+/// and deliberately under the ceiling, so a cancel never buys a peer more silent
+/// wait than it can survive.
+fn effective_wait(wait_secs: Option<u64>, can_receive_progress: bool, cancel: bool) -> u64 {
+    let wait = clamp_wait(wait_secs, can_receive_progress);
+    if cancel {
+        wait.max(CANCEL_GRACE_SECS)
+    } else {
+        wait
+    }
+}
+
+/// Which lane ends a several-ids wait, or the refusal text for a value that
+/// cannot mean anything in the mode it arrived in.
+fn resolve_return_on(
+    return_on: Option<&str>,
+    has_job_ids: bool,
+    cancel: bool,
+) -> std::result::Result<ReturnOn, String> {
+    match (return_on, has_job_ids) {
+        // You asked to stop all of them, so you want to hear about all of them:
+        // on `Any` the first lane to land ends the wait and the rest come back
+        // as `running` rows under a reply that just cancelled them.
+        (None, _) if cancel => Ok(ReturnOn::All),
+        (None, _) => Ok(ReturnOn::Any),
+        (Some(_), false) => Err(
+            "`return_on` cannot combine with the state-waiting mode: it orders a set of jobs, \
+             so name `job_ids` or drop it"
+                .to_string(),
+        ),
+        (Some("any"), true) => Ok(ReturnOn::Any),
+        (Some("all"), true) => Ok(ReturnOn::All),
+        (Some(raw), true) => Err(format!(
+            "unrecognized return_on \"{raw}\": accepted \"any\" and \"all\""
+        )),
+    }
 }
 
 /// Everything one `monitor` call needs from its own request: the peer plus the
@@ -1359,26 +1419,195 @@ impl ProgressSink {
         }
     }
 }
+/// Floor on a cancelling `monitor`'s wait, so the common case is one call rather
+/// than two.
+///
+/// It is a budget, not a guarantee: the reply carries whatever the jobs reached
+/// inside it. Once a child exists the kill itself lands within one supervision
+/// tick ([`RUN_POLL_INTERVAL`], 50 ms) and this covers the teardown that follows
+/// — `stamp_run_sessions` walks the transcript store, an isolated rescue copies
+/// it. It bounds nothing on the other side of the spawn: a run still inside
+/// `ProfileRuntime::acquire` ends when that acquire returns, which is a live
+/// session's business, not this constant's.
+const CANCEL_GRACE_SECS: u64 = 10;
+
+/// Process-local cancel registry: `job_id` → the flag that job's supervision
+/// loop reads once per tick.
+///
+/// In-process rather than a flag in the job file, because the detached task runs
+/// in this same process and an entry is therefore a direct handle with no
+/// polling. A file flag would make the supervision loop read the job file every
+/// 50 ms, per job, for a case that almost never fires, and would let any process
+/// on the box cancel any job.
+///
+/// A LEAF with no `lockorder` rank, matching the job store's own posture: NEVER
+/// acquire another lock while holding this one. Every caller takes it, does one
+/// map operation, and drops it, so there is no ordering for the rank table to
+/// police.
+static CANCEL_REGISTRY: std::sync::LazyLock<
+    std::sync::Mutex<HashMap<String, std::sync::Arc<AtomicBool>>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+
+/// A running delegate's entry in [`CANCEL_REGISTRY`], removed on drop.
+///
+/// RAII because `run_delegate` exits from many places, and an entry outliving
+/// its run would let a cancel report a stop that never happened — or stop a
+/// later job minted under the same id.
+struct CancelGuard {
+    job_id: String,
+    flag: std::sync::Arc<AtomicBool>,
+}
+
+impl CancelGuard {
+    fn register(job_id: &str) -> Self {
+        let flag = std::sync::Arc::new(AtomicBool::new(false));
+        CANCEL_REGISTRY
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(job_id.to_string(), std::sync::Arc::clone(&flag));
+        Self {
+            job_id: job_id.to_string(),
+            flag,
+        }
+    }
+
+    /// Whether a `monitor` call has asked this run to stop.
+    fn is_cancelled(&self) -> bool {
+        self.flag.load(Ordering::Relaxed)
+    }
+}
+
+impl Drop for CancelGuard {
+    fn drop(&mut self) {
+        CANCEL_REGISTRY
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&self.job_id);
+    }
+}
+
+/// Ask a running delegate to stop. `true` when this server holds a run under
+/// that id, which is the only thing the caller can be told for certain.
+fn cancel_job(job_id: &str) -> bool {
+    let registry = CANCEL_REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
+    match registry.get(job_id) {
+        Some(flag) => {
+            flag.store(true, Ordering::Relaxed);
+            true
+        }
+        None => false,
+    }
+}
+
+/// The line a cancelling `monitor` opens with: which named jobs this server
+/// asked to stop, and which it holds no run for.
+///
+/// It claims the ASK, never the outcome. Setting the flag is the whole of what
+/// this call did; the flag is read by the supervision loop, and between the
+/// registry entry and that loop sit `load_config`, the pre-flight and
+/// `ProfileRuntime::acquire` — which BLOCKS behind a live `clauth start` session
+/// on the same profile. A reply claiming "stopped" would print that word
+/// directly above a running row for the same id.
+///
+/// An id the registry does not hold is NAMED rather than left to come back as a
+/// plain `running` row, which reads as "the cancel did nothing". Its causes are
+/// hedged the way [`unknown_job_reason`] hedges its own, because nothing here
+/// can tell them apart: the run may already be finalizing (its entry drops
+/// after `write_done`), or it may belong to an earlier server process whose
+/// registry went with it.
+fn cancel_note(asked: &[String], unheld: &[String]) -> String {
+    let list = |ids: &[String]| {
+        ids.iter()
+            .map(|id| format!("`{id}`"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let mut clauses = Vec::new();
+    if !asked.is_empty() {
+        clauses.push(format!(
+            "asked {} to stop; each hands back whatever it had produced",
+            list(asked)
+        ));
+    }
+    if !unheld.is_empty() {
+        clauses.push(format!(
+            "no running delegate here for {}: it may already be finishing, or it may have been \
+             started by an earlier server process",
+            list(unheld)
+        ));
+    }
+    if clauses.is_empty() {
+        return String::new();
+    }
+    format!("{}.", clauses.join(". "))
+}
+
+/// Put a cancel report ahead of a reply's own prose, inside the SAME content
+/// block: every `monitor` arm returns exactly one, refusals included.
+fn prepend_note(mut result: CallToolResult, note: &str) -> CallToolResult {
+    let body = result
+        .content
+        .first()
+        .and_then(|c| c.as_text())
+        .map(|t| t.text.clone())
+        .unwrap_or_default();
+    result.content = single_block(format!("{note}\n{body}"));
+    result
+}
+
 /// Poll cadence for both `monitor` modes and the `mcp-await-job` hook.
 const JOB_POLL_INTERVAL: Duration = Duration::from_millis(200);
 /// Self-deadline for the `mcp-await-job` hook: outlast the max delegate timeout
 /// plus slack so it never gives up before a legitimately long delegate finishes.
 const AWAIT_JOB_DEADLINE_SECS: u64 = MAX_RUN_TIMEOUT_SECS + 600;
 
+/// Everything wrong with a `job_ids` list that the list alone decides, in the
+/// exact words the reply carries.
+///
+/// The ONE producer of these three refusals, because `monitor` has to run them
+/// BEFORE it cancels anything and the arms below still have to honour them: two
+/// spellings of one rule is how the two drift, and the drift would show up as a
+/// list refused in one place after being acted on in the other.
+///
+/// An unsafe id refuses only on the ONE-id spelling, which is where it always
+/// did. A several-ids call resolves one to `unknown` in its own slot rather than
+/// failing the whole batch, and `wait_for_batch` keeps it away from the path
+/// join.
+fn job_ids_refusal(job_ids: &[String]) -> Option<String> {
+    // The cap mirrors the job store's own retention: GC keeps at most
+    // `MAX_RETAINED` files, so a longer list could not resolve more ids, and the
+    // bound keeps one response from growing without limit.
+    if job_ids.len() > jobs::MAX_RETAINED {
+        return Some(format!(
+            "`job_ids` capped at {} ids; got {}",
+            jobs::MAX_RETAINED,
+            job_ids.len()
+        ));
+    }
+    // An empty list passes every per-id check vacuously and would return a
+    // success-shaped `{"results": []}` that collected nothing.
+    if job_ids.is_empty() {
+        return Some("`job_ids` is empty: name at least one job_id".to_string());
+    }
+    match job_ids {
+        [only] if !jobs::is_safe_job_id(only) => Some("invalid job_id".to_string()),
+        _ => None,
+    }
+}
+
 /// The one-id half of `monitor`'s job mode, byte-compatible with the
 /// pre-merge single-`job_id` spelling: one envelope/status/error in one block,
-/// an unknown or unsafe id refused by name.
+/// an unknown id refused by name.
 async fn monitor_one(
     job_id: String,
     wait: u64,
     digest: &DigestTracker,
     progress: &mut ProgressSink,
 ) -> Result<CallToolResult, ErrorData> {
-    if !jobs::is_safe_job_id(&job_id) {
-        let payload = serde_json::json!({ "is_error": true, "result": "invalid job_id" });
-        let prose = render::delegate_result_prose(&payload);
-        return Ok(CallToolResult::error(single_block(prose)));
-    }
+    // The path join below is guarded by [`job_ids_refusal`], which every caller
+    // runs before this one and which refuses a one-id list that is not a safe
+    // path component.
+    debug_assert!(jobs::is_safe_job_id(&job_id));
     // A collect is the other moment a corpse matters: a server that died
     // mid-job leaves a file polling `running` forever, and `RUNNING_TTL_MS`
     // already knows it is one. Corpses only — a reader that swept `done` files
@@ -1430,27 +1659,9 @@ async fn monitor_batch(
     digest: &DigestTracker,
     progress: &mut ProgressSink,
 ) -> Result<CallToolResult, ErrorData> {
-    // The cap mirrors the job store's own retention: GC keeps at most
-    // `MAX_RETAINED` files, so a longer list could not resolve more ids, and
-    // the bound keeps one response from growing without limit.
-    if job_ids.len() > jobs::MAX_RETAINED {
-        let reason = format!(
-            "`job_ids` capped at {} ids; got {}",
-            jobs::MAX_RETAINED,
-            job_ids.len()
-        );
-        let payload = serde_json::json!({ "is_error": true, "result": reason });
-        let prose = render::delegate_result_prose(&payload);
-        return Ok(CallToolResult::error(single_block(prose)));
-    }
-    // An empty list passes every per-id check vacuously and would return a
-    // success-shaped `{"results": []}` that collected nothing.
-    if job_ids.is_empty() {
-        let reason = "`job_ids` is empty: name at least one job_id";
-        let payload = serde_json::json!({ "is_error": true, "result": reason });
-        let prose = render::delegate_result_prose(&payload);
-        return Ok(CallToolResult::error(single_block(prose)));
-    }
+    // The cap and the empty-list rule are [`job_ids_refusal`]'s, run by every
+    // caller before this one and before any cancel.
+    debug_assert!(job_ids_refusal(&job_ids).is_none());
 
     // Same reason as the one-id arm, and the same narrow scope.
     jobs::gc_running_corpses(now_ms());
@@ -1944,6 +2155,14 @@ struct DelegateOpts<'a> {
     /// The reserved running record this run heartbeats into. `None` for a
     /// blocking delegate, which has no job file to write.
     job: Option<jobs::RunningSpec>,
+    /// The registry entry a `monitor({cancel: true})` reaches this run through,
+    /// minted by [`reserve_background_job`] and BORROWED here. Borrowed rather
+    /// than registered on entry so the id is cancellable from the moment the
+    /// caller holds it, and so there is exactly one entry per job: a second
+    /// `register` would replace an `Arc` whose flag a cancel had already set,
+    /// losing the cancel silently. `None` for a blocking delegate, which has no
+    /// id to name.
+    cancel: Option<&'a CancelGuard>,
 }
 
 /// Owned twin of [`DelegateOpts`] for a background launch: the detached task is
@@ -1970,8 +2189,44 @@ struct BackgroundOpts {
 enum WaitEnd {
     /// A deadline fired; the child was killed and hands back what it wrote.
     Expired(Expiry),
+    /// The caller stopped the run through `monitor({cancel: true})`. Its own arm
+    /// rather than a third [`Expiry`]: a cancel is not a deadline, and the
+    /// envelope must not claim one.
+    Cancelled,
     /// `try_wait` itself failed, so clauth no longer knows the child's state.
     Failed(String),
+}
+
+/// Why the supervision loop should stop waiting on the child this tick, `None`
+/// to keep waiting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StopReason {
+    /// The caller asked for this run to stop.
+    Cancelled,
+    /// One of the two deadlines fired.
+    Expired(Expiry),
+}
+
+/// The whole stop decision for one supervision tick, cancel flag beside the two
+/// deadlines. One pure function because all three end the same run the same way,
+/// and because a decision that lives in the loop can only be tested with a child
+/// process — which this crate deliberately never fakes.
+///
+/// The cancel is read first: an explicit stop and a deadline can land in the same
+/// tick, and reporting the clock there would tell the caller their cancel did
+/// nothing.
+fn stop_reason(
+    cancelled: bool,
+    elapsed: Duration,
+    last_progress: Duration,
+    wall: Duration,
+    idle: Duration,
+    streaming: bool,
+) -> Option<StopReason> {
+    if cancelled {
+        return Some(StopReason::Cancelled);
+    }
+    expiry(elapsed, last_progress, wall, idle, streaming).map(StopReason::Expired)
 }
 
 /// Which deadline killed a delegate.
@@ -2222,15 +2477,72 @@ fn elapsed_ms(start: Instant) -> u64 {
     u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX)
 }
 
-/// Envelope for a delegate clauth killed. `is_error` like any other failure, but
-/// it carries the text the run had already produced: the target account's window
-/// is spent whether or not clauth keeps the output, so discarding it is a second
-/// loss on top of the first.
+/// Every envelope for a run that handed back no clean result: its own `reason`
+/// text, then the text the run had already produced and the handle that finishes
+/// it without paying twice.
 ///
-/// `resumable` is whether the killed run's transcript outlives its runtime tree
-/// (see [`transcript_survives`]). When it does, the session id is a handle the
-/// caller can hand back as `resume`; when it does not, saying so is what stops
-/// the operator learning about the toggle by losing a second run.
+/// ONE builder for the kill path, the non-zero exit and the unparseable
+/// envelope. The argument was won for the kill path and written into its own
+/// doc comment — the target account's window is spent whether or not clauth
+/// keeps the output, so discarding it is a second loss on top of the first — and
+/// nothing about the other two exits makes it less true. Three copies of the
+/// clause rule is how they drift.
+///
+/// `resumable` is whether the run's transcript outlives its runtime tree (see
+/// [`transcript_survives`]). All three cases say where they stand: a handle, a
+/// transcript that went with the runtime, or a run that ended before any event
+/// named a session. The silent third arm was finding 18 — a description
+/// promising a handle, answered with nothing.
+fn salvage_envelope(
+    profile: &str,
+    mut reason: String,
+    capture: &StreamCapture,
+    resumable: bool,
+) -> serde_json::Value {
+    let partial = capture.partial_text();
+    if !partial.is_empty() {
+        reason.push_str(". the text it had written is in `partial_result`");
+    }
+    // The clause and the field it promises are decided together, so a reply can
+    // never offer a handle it did not attach.
+    //
+    // The session question is answered FIRST. No id means no handle whatever the
+    // isolation was, and the transcript clause only means anything when an id
+    // exists: reaching it on `(None, false)` told a run that died in 200ms with
+    // no session that auto-rescue had eaten a transcript clauth never saw.
+    let handle = match (&capture.session_id, resumable) {
+        (None, _) => {
+            reason.push_str(". no session id ever reached clauth, so there is no resume handle");
+            None
+        }
+        (Some(id), true) => {
+            reason.push_str(". pick the run back up with `resume: \"<session_id>\"`");
+            Some(id.clone())
+        }
+        (Some(_), false) => {
+            reason.push_str(
+                ". its transcript went with the isolated runtime, so it cannot be resumed; \
+                 `clauth config` auto-rescue keeps one",
+            );
+            None
+        }
+    };
+    let mut payload = serde_json::json!({
+        "profile": profile,
+        "is_error": true,
+        "result": reason,
+    });
+    if !partial.is_empty() {
+        payload["partial_result"] = serde_json::Value::String(partial);
+    }
+    if let Some(id) = handle {
+        payload["session_id"] = serde_json::Value::String(id);
+    }
+    payload
+}
+
+/// Envelope for a delegate clauth killed on one of its deadlines: the salvage
+/// plus which clock fired and how long the run got.
 fn timeout_envelope(
     profile: &str,
     expiry: Expiry,
@@ -2241,7 +2553,7 @@ fn timeout_envelope(
 ) -> serde_json::Value {
     let elapsed_secs = elapsed.as_secs();
     let limit_secs = limit.as_secs();
-    let (kind, mut reason) = match expiry {
+    let (kind, reason) = match expiry {
         Expiry::Idle => (
             "idle",
             format!(
@@ -2257,33 +2569,32 @@ fn timeout_envelope(
             ),
         ),
     };
-    let partial = capture.partial_text();
-    if !partial.is_empty() {
-        reason.push_str(". the text it had written is in `partial_result`");
-    }
-    match (&capture.session_id, resumable) {
-        (Some(_), true) => {
-            reason.push_str(". pick the run back up with `resume: \"<session_id>\"`");
-        }
-        (_, false) => reason.push_str(
-            ". its transcript went with the isolated runtime, so it cannot be resumed; \
-             `clauth config` auto-rescue keeps one",
-        ),
-        (None, true) => {}
-    }
-    let mut payload = serde_json::json!({
-        "profile": profile,
-        "is_error": true,
-        "timed_out": kind,
-        "elapsed_secs": elapsed_secs,
-        "result": reason,
-    });
-    if !partial.is_empty() {
-        payload["partial_result"] = serde_json::Value::String(partial);
-    }
-    if resumable && let Some(id) = &capture.session_id {
-        payload["session_id"] = serde_json::Value::String(id.clone());
-    }
+    let mut payload = salvage_envelope(profile, reason, capture, resumable);
+    payload["timed_out"] = serde_json::json!(kind);
+    payload["elapsed_secs"] = serde_json::json!(elapsed_secs);
+    payload
+}
+
+/// Envelope for a delegate the caller stopped through `monitor({cancel: true})`.
+///
+/// `cancelled` rather than a third `timed_out` value: a cancel is a decision,
+/// not a clock, and every reader branching on `timed_out` prints the deadline
+/// that fired.
+///
+/// `reason` is the caller's, because the two stages differ in the one fact a
+/// caller acts on: a cancel caught before the spawn spent nothing, while one
+/// caught by the supervision loop spent whatever the run had already used. The
+/// fields do not differ, so they are stamped here.
+fn cancelled_envelope(
+    profile: &str,
+    reason: String,
+    elapsed: Duration,
+    capture: &StreamCapture,
+    resumable: bool,
+) -> serde_json::Value {
+    let mut payload = salvage_envelope(profile, reason, capture, resumable);
+    payload["cancelled"] = serde_json::json!(true);
+    payload["elapsed_secs"] = serde_json::json!(elapsed.as_secs());
     payload
 }
 
@@ -2369,14 +2680,21 @@ fn apply_delegate_env(
 
 /// Blocking delegate: acquire the target profile's runtime, spawn a headless
 /// `claude -p` with piped stdio, enforce the idle + wall-clock deadlines, and
-/// parse its JSON envelope. Returns `Ok(envelope)` on a clean parse or a
-/// [`timeout_envelope`] for a killed run, and `Err(reason)` for a non-zero exit
-/// or unparseable output (the caller wraps that in an `is_error` envelope).
+/// parse its JSON envelope. Returns `Ok(envelope)` on a clean parse and a
+/// [`salvage_envelope`] for every other way a SPAWNED run can end — killed,
+/// cancelled, non-zero exit, unreadable output — because each of those spent the
+/// window and each has output worth handing back. `Err(reason)` is reserved for
+/// the refusals BEFORE the spawn, which carry no capture; the caller wraps one
+/// in an `is_error` envelope.
 /// Records observed throughput / rate-limit hits as a side effect, and runs
 /// `start::run`'s own transcript-stamp and opt-in isolated-rescue legs on the way
 /// out so a delegate's sessions are attributable and (with the toggle on)
 /// resumable. Never bubbles a transport-level error.
 fn run_delegate(opts: DelegateOpts<'_>) -> std::result::Result<serde_json::Value, String> {
+    // Anchors the pre-spawn arm's `elapsed_secs`, which measures the time spent
+    // getting to a spawn rather than the run's own: nothing has run yet.
+    let entered = Instant::now();
+    let cancel = opts.cancel;
     let config = load_config().map_err(|e| format!("failed to load config: {e}"))?;
     let target = config
         .find(opts.profile)
@@ -2423,6 +2741,31 @@ fn run_delegate(opts: DelegateOpts<'_>) -> std::result::Result<serde_json::Value
     // follows the chain — moving it mid-prompt would change who answered.
     let runtime = ProfileRuntime::acquire(target, opts.isolation, &active_env_keys, false)
         .map_err(|e| format!("failed to acquire runtime: {e}"))?;
+
+    let resumable = transcript_survives(opts.isolation, config.state.auto_rescue);
+    // The acquire above is the longest thing that can happen before a child
+    // exists, and the supervision loop that reads this flag does not exist until
+    // one does: `RotationGuard::acquire` BLOCKS behind a live `clauth start`
+    // session on the same profile, and a copy-mode host mirrors `~/.claude`
+    // inside it. A cancel that landed in there must not now spawn the run it
+    // cancelled. Nothing has been spent at this point, which is the fact the
+    // caller acts on.
+    if cancel.is_some_and(CancelGuard::is_cancelled) {
+        // One read of the clock: two would let the prose and `elapsed_secs`
+        // straddle a second boundary and disagree in the same envelope.
+        let waited = entered.elapsed();
+        return Ok(cancelled_envelope(
+            opts.profile,
+            format!(
+                "delegate cancelled after {}s, before it spawned: the account's window was \
+                 not spent",
+                waited.as_secs()
+            ),
+            waited,
+            &StreamCapture::default(),
+            resumable,
+        ));
+    }
 
     let mut command = crate::runtime::claude_command();
     apply_delegate_env(
@@ -2531,11 +2874,21 @@ fn run_delegate(opts: DelegateOpts<'_>) -> std::result::Result<serde_json::Value
             Ok(Some(status)) => break Ok(status),
             Ok(None) => {
                 let last_progress = Duration::from_millis(progress.load(Ordering::Relaxed));
-                if let Some(expiry) = expiry(start.elapsed(), last_progress, wall, idle, streaming)
-                {
+                let stopped = cancel.is_some_and(CancelGuard::is_cancelled);
+                if let Some(stop) = stop_reason(
+                    stopped,
+                    start.elapsed(),
+                    last_progress,
+                    wall,
+                    idle,
+                    streaming,
+                ) {
                     let _ = child.kill();
                     let _ = child.wait();
-                    break Err(WaitEnd::Expired(expiry));
+                    break Err(match stop {
+                        StopReason::Cancelled => WaitEnd::Cancelled,
+                        StopReason::Expired(expiry) => WaitEnd::Expired(expiry),
+                    });
                 }
                 std::thread::sleep(RUN_POLL_INTERVAL);
             }
@@ -2583,6 +2936,17 @@ fn run_delegate(opts: DelegateOpts<'_>) -> std::result::Result<serde_json::Value
     let status = match outcome {
         Ok(status) => status,
         Err(WaitEnd::Failed(reason)) => return Err(reason),
+        Err(WaitEnd::Cancelled) => {
+            // Read once, for the reason the pre-spawn arm reads once.
+            let ran_for = start.elapsed();
+            return Ok(cancelled_envelope(
+                opts.profile,
+                format!("delegate cancelled after {}s", ran_for.as_secs()),
+                ran_for,
+                &capture,
+                resumable,
+            ));
+        }
         Err(WaitEnd::Expired(expiry)) => {
             let limit = match expiry {
                 Expiry::Idle => idle,
@@ -2594,48 +2958,105 @@ fn run_delegate(opts: DelegateOpts<'_>) -> std::result::Result<serde_json::Value
                 start.elapsed(),
                 limit,
                 &capture,
-                transcript_survives(opts.isolation, auto_rescue),
+                resumable,
             ));
         }
     };
-    let stdout = capture.envelope_src();
     let now = now_epoch_secs();
+    match classify_run(status, &stderr_bytes, &capture, opts.profile, resumable) {
+        RunOutcome::Exited {
+            envelope,
+            throttle_scan,
+        } => {
+            // A non-zero exit can be a throttle; record it so `profiles` can flag
+            // the model as rate-limited (clauth never sees inference 429s any
+            // other way).
+            if let Some(retry_after) = rate_limit_hint(&throttle_scan) {
+                crate::throughput::record_rate_limit(opts.profile, opts.model, retry_after, now);
+            }
+            Ok(envelope)
+        }
+        RunOutcome::Unparseable(envelope) => Ok(envelope),
+        RunOutcome::Envelope(envelope) => {
+            // A clean exit can still carry an in-band error envelope (rate limit
+            // shows up there with `--output-format json`); branch on `is_error`
+            // so a throttle is recorded as one, not as a (bogus) throughput
+            // sample.
+            if envelope
+                .get("is_error")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false)
+            {
+                if let Some(retry_after) = rate_limit_hint(&envelope.to_string()) {
+                    crate::throughput::record_rate_limit(
+                        opts.profile,
+                        opts.model,
+                        retry_after,
+                        now,
+                    );
+                }
+            } else {
+                record_throughput_from_envelope(opts.profile, opts.model, &envelope, now);
+            }
+            Ok(envelope)
+        }
+    }
+}
+
+/// What a finished delegate's joined pieces mean, with none of the recording
+/// they imply: a throttle hit and a throughput sample are side effects on shared
+/// state, and [`run_delegate`] keeps them.
+///
+/// Split out because the live spawn paths have no unit test by standing decision
+/// — this crate never fakes a `claude` on PATH, since a fake binary would assert
+/// nothing about the real envelope contract — so handing this function a real
+/// `ExitStatus` is the only way to drive the two lossy arms at all.
+enum RunOutcome {
+    /// A clean exit whose terminal envelope parsed: the delegate's own
+    /// self-report, verbatim.
+    Envelope(serde_json::Value),
+    /// A non-zero exit, salvaged. `throttle_scan` is everything a rate-limit
+    /// hint could be hiding in.
+    Exited {
+        envelope: serde_json::Value,
+        throttle_scan: String,
+    },
+    /// A clean exit whose output was no envelope clauth could read, salvaged.
+    Unparseable(serde_json::Value),
+}
+
+fn classify_run(
+    status: std::process::ExitStatus,
+    stderr_bytes: &[u8],
+    capture: &StreamCapture,
+    profile: &str,
+    resumable: bool,
+) -> RunOutcome {
+    let stdout = capture.envelope_src();
     if !status.success() {
-        let stderr = String::from_utf8_lossy(&stderr_bytes);
-        // A non-zero exit can be a throttle; record it so `profiles` can flag
-        // the model as rate-limited (clauth never sees inference 429s any
-        // other way).
+        let stderr = String::from_utf8_lossy(stderr_bytes);
         let throttle_scan = format!(
             "{stderr}{stdout}{}",
             capture.rate_limit_line.as_deref().unwrap_or_default()
         );
-        if let Some(retry_after) = rate_limit_hint(&throttle_scan) {
-            crate::throughput::record_rate_limit(opts.profile, opts.model, retry_after, now);
-        }
-        return Err(format!(
+        let reason = format!(
             "claude exited with {}: {}",
             status
                 .code()
                 .map_or_else(|| "signal".to_string(), |c| c.to_string()),
             truncate(stderr.trim(), 2000)
-        ));
+        );
+        return RunOutcome::Exited {
+            envelope: salvage_envelope(profile, reason, capture, resumable),
+            throttle_scan,
+        };
     }
-    let envelope = parse_delegate_envelope(stdout.trim())?;
-    // A clean exit can still carry an in-band error envelope (rate limit shows up
-    // there with `--output-format json`); branch on `is_error` so a throttle is
-    // recorded as one, not as a (bogus) throughput sample.
-    if envelope
-        .get("is_error")
-        .and_then(serde_json::Value::as_bool)
-        .unwrap_or(false)
-    {
-        if let Some(retry_after) = rate_limit_hint(&envelope.to_string()) {
-            crate::throughput::record_rate_limit(opts.profile, opts.model, retry_after, now);
+    match parse_delegate_envelope(stdout.trim()) {
+        Ok(envelope) => RunOutcome::Envelope(envelope),
+        Err(reason) => {
+            RunOutcome::Unparseable(salvage_envelope(profile, reason, capture, resumable))
         }
-    } else {
-        record_throughput_from_envelope(opts.profile, opts.model, &envelope, now);
     }
-    Ok(envelope)
 }
 
 /// Refuse a resolved target that `delegate` must not spend on: a profile the
@@ -2855,19 +3276,50 @@ fn read_prompt_handle(file: std::fs::File, rel: &str) -> std::result::Result<Str
     Ok(text.to_string())
 }
 
-/// Record ONE background job's `running` file and return the spec every later
-/// write of it goes through. This is the only fallible step left after the
-/// pre-flight refusal; the spawn that follows cannot fail, so a fan-out
-/// reserves every job before launching any.
+/// A reserved background job: the spec every later write of it goes through,
+/// and the registry entry a cancel reaches it through.
+///
+/// The two travel together because they are minted together: an id in the
+/// caller's hands with no entry behind it is a cancel that silently does
+/// nothing. Dropping this removes the registry entry and NOTHING else — the
+/// `running` file it also minted outlives the drop, which is why giving a
+/// reservation up is [`Self::abandon`] rather than a `drop`.
+struct ReservedJob {
+    spec: jobs::RunningSpec,
+    cancel: CancelGuard,
+}
+
+impl ReservedJob {
+    /// Give a reservation up: remove the `running` file it minted, then release
+    /// the registry entry with the guard.
+    ///
+    /// A consuming method rather than a `Drop` impl because the success path
+    /// destructures this struct and Rust refuses to destructure a `Drop` type
+    /// (E0509). It exists so the undo lives ON the reservation instead of as a
+    /// sweep some other function remembers to run over its ids.
+    fn abandon(self) {
+        jobs::remove(&self.spec.job_id);
+    }
+}
+
+/// Record ONE background job's `running` file and return the reservation. This
+/// is the only fallible step left after the pre-flight refusal; the spawn that
+/// follows cannot fail, so a fan-out reserves every job before launching any.
 ///
 /// The deadlines are resolved HERE so the first running record already carries
 /// them and `resolve_deadlines`' streaming fork is applied exactly once.
+///
+/// The cancel entry is minted HERE, with the id, rather than when the blocking
+/// pool picks the task up: the caller holds the id the moment this returns, and
+/// a cancel naming it in between used to be a silent no-op that left the run to
+/// its full `timeout_secs`. A `write_running` failure drops the reservation with
+/// the entry, so an id that never reached the caller leaves nothing behind.
 fn reserve_background_job(
     profile: &str,
     timeout_secs: Option<u64>,
     idle_secs: Option<u64>,
     streaming: bool,
-) -> std::result::Result<jobs::RunningSpec, String> {
+) -> std::result::Result<ReservedJob, String> {
     let started_at = now_ms();
     let (wall, idle) = resolve_deadlines(timeout_secs, idle_secs, streaming);
     let spec = jobs::RunningSpec {
@@ -2879,20 +3331,25 @@ fn reserve_background_job(
         // such deadline to count down to rather than an unknown one.
         idle_secs: streaming.then_some(idle.as_secs()),
     };
+    let cancel = CancelGuard::register(&spec.job_id);
     jobs::write_running(&spec).map_err(|e| format!("failed to record job: {e}"))?;
-    Ok(spec)
+    Ok(ReservedJob { spec, cancel })
 }
 
-/// Launch ONE background delegate on the blocking pool for the reserved `spec`.
+/// Launch ONE background delegate on the blocking pool for a reservation.
 /// Infallible: `spawn_blocking` cannot fail, so every failure path lives in
 /// [`reserve_background_job`]. `opts.prompt` is an `Arc<str>` so a fan-out reads
 /// the prompt once and reuses it across N accounts.
+///
+/// The reservation's cancel entry moves into the detached task and is dropped
+/// there, AFTER the job file is finalized.
 fn launch_background_delegate(
     profile: String,
     opts: BackgroundOpts,
-    spec: jobs::RunningSpec,
+    reserved: ReservedJob,
     herdr_pane: Option<herdr_report::PaneReporter>,
 ) {
+    let ReservedJob { spec, cancel } = reserved;
     let profile_task = profile;
     // Registered so a test's `HomeSandbox::drop` can block on this task BEFORE
     // it clears the home override: `spawn_blocking` detaches with no handle
@@ -2941,6 +3398,7 @@ fn launch_background_delegate(
                 isolation,
                 depth,
                 job: Some(spec.clone()),
+                cancel: Some(&cancel),
             })
         }));
         let envelope = match outcome {
@@ -2959,6 +3417,12 @@ fn launch_background_delegate(
         // `run_delegate` has returned, so it has already joined the reader
         // thread: the last heartbeat strictly precedes this finalize.
         let _ = jobs::write_done(&spec.job_id, &profile_task, spec.started_at, envelope);
+        // Deregistered only now, AFTER the result is on disk: a cancel landing
+        // in the finalize window is answered by the very envelope the collect
+        // then returns, where dropping the entry first would answer it with the
+        // unheld hedge instead. Explicit for the same reason `_pane_end` is —
+        // the closure's own drop order would put it after the signal below.
+        drop(cancel);
         // Dropped explicitly so the completion signal below is genuinely this
         // task's last action. A guard bound in the closure drops in reverse
         // declaration order, i.e. AFTER the send, which would let a test's

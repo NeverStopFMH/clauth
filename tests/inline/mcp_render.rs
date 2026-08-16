@@ -1109,3 +1109,36 @@ fn delegate_result_prose_renders_a_wrapped_scalar_self_report() {
         "delegate to `work` finished: 42; target `work`: 5h unknown, 7d unknown"
     );
 }
+
+/// A cancelled run is not a timed-out one, and the verdict word is the first
+/// thing a reader takes off the line. The salvage clauses already render here,
+/// so a cancel carries its partial and its resume handle for free.
+#[test]
+fn envelope_prose_gives_a_cancelled_run_its_own_verdict_word() {
+    let cancelled = serde_json::json!({
+        "profile": "work",
+        "is_error": true,
+        "cancelled": true,
+        "elapsed_secs": 42,
+        "result": "delegate cancelled after 42s",
+        "partial_result": "half an answer",
+        "session_id": "s9",
+    });
+    let prose = envelope_prose(&cancelled);
+    assert!(
+        prose.starts_with("cancelled after 42s: "),
+        "the verdict word says what actually happened: {prose}"
+    );
+    assert!(
+        !prose.contains("timed out") && !prose.contains("failed"),
+        "a cancel is neither a deadline nor a crash: {prose}"
+    );
+    assert!(
+        prose.contains("; partial result: half an answer"),
+        "the salvage rides the same clause a killed run's does: {prose}"
+    );
+    assert!(
+        prose.contains("; resume with session id `s9`"),
+        "and so does the handle: {prose}"
+    );
+}

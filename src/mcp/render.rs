@@ -775,11 +775,21 @@ fn usage_prose(u: &Value) -> String {
 /// spelling, and this names the fields clauth documents.
 fn envelope_prose(e: &Value) -> String {
     let mut out = String::new();
-    if let Some(t) = e.get("timed_out").and_then(Value::as_str) {
+    let ran_for = || {
+        e.get("elapsed_secs")
+            .and_then(Value::as_u64)
+            .map_or_else(String::new, |el| format!(" after {el}s"))
+    };
+    // A cancel is read first and on its own key: it is a decision rather than a
+    // deadline, so a cancelled envelope carries no `timed_out` for the arm below
+    // to find, and "failed" would be the wrong word for a stop the caller asked
+    // for.
+    if e.get("cancelled").and_then(Value::as_bool).unwrap_or(false) {
+        out.push_str("cancelled");
+        out.push_str(&ran_for());
+    } else if let Some(t) = e.get("timed_out").and_then(Value::as_str) {
         out.push_str(&format!("timed out ({t})"));
-        if let Some(el) = e.get("elapsed_secs").and_then(Value::as_u64) {
-            out.push_str(&format!(" after {el}s"));
-        }
+        out.push_str(&ran_for());
     } else if e.get("is_error").and_then(Value::as_bool).unwrap_or(false) {
         out.push_str("failed");
     } else {

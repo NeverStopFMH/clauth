@@ -3590,6 +3590,7 @@ fn monitor_refuses_cancel_without_job_ids() {
 /// event completed a block and no terminal `result` line ever landed, so its
 /// stdout is unparseable as an envelope. Real events all carry `session_id`,
 /// deltas included, which is where the resume handle comes from here.
+#[cfg(unix)]
 const DELTA_ONLY_STREAM: &str = concat!(
     r#"{"type":"stream_event","session_id":"s9","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"half an "}}}"#,
     "\n",

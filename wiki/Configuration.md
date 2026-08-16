@@ -25,7 +25,7 @@ Three providers get typed usage panels:
 
 | Provider | Base URL | Shows |
 |----------|----------|-------|
-| DeepSeek | `https://api.deepseek.com` | balance rows per currency: total, granted, topped up |
+| DeepSeek | `https://api.deepseek.com` | balance rows per currency: api balance, granted, topped up |
 | Z.ai | `https://api.z.ai` | percentage bars per limit window (5h / 7d / 30d), per-tool rows, plan level, 7-day per-model token totals |
 | Alibaba Model Studio | the four Qwen preset endpoints below | a 7d bar carrying your tier's absolute allowance, a 5h bar when the API reports one, plan tier, subscription status and days left |
 

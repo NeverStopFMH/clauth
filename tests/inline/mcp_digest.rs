@@ -872,3 +872,49 @@ fn a_fanout_reply_carries_one_top_level_digest_and_no_row_carries_one() {
         "the fan-out reported the change, so the fan-out consumed it: {after}",
     );
 }
+
+/// F7: a blocking `delegate` reply that will never be sent must not spend the
+/// digest on its way to being dropped.
+///
+/// A caller can abandon the request while `ProfileRuntime::acquire` is blocked;
+/// the run is stopped, its envelope comes back through the join, and the handler
+/// folds a reply that rmcp then drops for a cancelled request. Reporting the
+/// delta there consumes it, so the news is gone by the time a reply someone
+/// actually reads is built.
+///
+/// `Skip` rather than `Reseed`: nothing of clauth's moved here, so the baseline
+/// must stay exactly where it was and the delta must survive to the next reply.
+#[test]
+fn an_abandoned_blocking_delegate_reply_never_consumes_the_digest() {
+    let _home = HomeSandbox::new();
+    seeded_world();
+    let tracker = DigestTracker::new();
+    let fold = |abandoned: bool| {
+        fold_delegate_live_usage(
+            serde_json::json!({"profile": "work", "result": "done"}),
+            "work",
+            0,
+            super::delegate_digest_mode(&tracker, abandoned),
+        )
+    };
+
+    // A first call only arms the baseline.
+    assert!(
+        fold(false).get("since_your_last_call").is_none(),
+        "fixture control: the first call establishes the baseline",
+    );
+    set_mtime(&credentials_path(), t1());
+
+    let dropped = fold(true);
+    assert!(
+        dropped.get("since_your_last_call").is_none(),
+        "an abandoned reply reports nothing — there is no reader: {dropped}",
+    );
+
+    let real = fold(false);
+    assert!(
+        real.get("since_your_last_call").is_some(),
+        "and crucially it consumed nothing, so the next reply that IS delivered \
+         still carries the change: {real}",
+    );
+}

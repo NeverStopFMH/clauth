@@ -150,8 +150,7 @@ fn run_delegate_refuses_a_disabled_target_before_acquiring_a_runtime() {
         resume: None,
         isolation: Isolation::Shared,
         depth: 0,
-        job: None,
-        cancel: None,
+        handoff: None,
     })
     .expect_err("a disabled target must be refused");
     assert_eq!(err, "profile is disabled: off (run `clauth enable off`)");
@@ -205,8 +204,7 @@ fn run_delegate_refuses_an_auth_broken_target_before_acquiring_a_runtime() {
         resume: None,
         isolation: Isolation::Shared,
         depth: 0,
-        job: None,
-        cancel: None,
+        handoff: None,
     })
     .expect_err("a quarantined target must be refused");
     assert_eq!(err, crate::format::login_expired("quarantined").line());
@@ -258,8 +256,7 @@ fn run_delegate_refuses_a_keyless_third_party_target_before_acquiring_a_runtime(
         resume: None,
         isolation: Isolation::Shared,
         depth: 0,
-        job: None,
-        cancel: None,
+        handoff: None,
     })
     .expect_err("a keyless third-party target must be refused");
     assert_eq!(
@@ -311,8 +308,7 @@ fn run_delegate_refuses_an_empty_api_key_third_party_target() {
         resume: None,
         isolation: Isolation::Shared,
         depth: 0,
-        job: None,
-        cancel: None,
+        handoff: None,
     })
     .expect_err("an empty-key third-party target must be refused");
     assert_eq!(
@@ -363,8 +359,7 @@ fn run_delegate_refuses_a_whitespace_api_key_third_party_target() {
         resume: None,
         isolation: Isolation::Shared,
         depth: 0,
-        job: None,
-        cancel: None,
+        handoff: None,
     })
     .expect_err("a whitespace-key third-party target must be refused");
     assert_eq!(
@@ -416,8 +411,7 @@ fn run_delegate_refuses_a_control_char_api_key_third_party_target() {
         resume: None,
         isolation: Isolation::Shared,
         depth: 0,
-        job: None,
-        cancel: None,
+        handoff: None,
     })
     .expect_err("a control-char key third-party target must be refused");
     assert_eq!(
@@ -454,8 +448,7 @@ fn delegate_stops_at_the_cwd_gate(profile: &str, cwd: &std::path::Path) -> Strin
         resume: None,
         isolation: Isolation::Shared,
         depth: 0,
-        job: None,
-        cancel: None,
+        handoff: None,
     })
     .expect_err("the cwd gate must refuse the run")
 }
@@ -542,8 +535,7 @@ fn run_delegate_refuses_a_keyless_alibaba_profile() {
         resume: None,
         isolation: Isolation::Shared,
         depth: 0,
-        job: None,
-        cancel: None,
+        handoff: None,
     })
     .expect_err("a keyless Alibaba profile must be refused");
     assert_eq!(
@@ -1021,6 +1013,10 @@ fn running_spec(job_id: &str, profile: &str, started_at: u64) -> jobs::RunningSp
         job_id: job_id.to_string(),
         profile: profile.to_string(),
         started_at,
+        // Equal, as it is for every job that started out background: the reserve
+        // mints the record at the run's own birth. Only a hand-off separates
+        // them.
+        recorded_at: started_at,
         timeout_secs: 0,
         idle_secs: Some(300),
     }
@@ -3341,12 +3337,24 @@ fn a_blocking_delegate_ticks_progress_on_the_heartbeat_throttle() {
         });
         let ct = tokio_util::sync::CancellationToken::new();
         let mut ticks: Vec<u64> = Vec::new();
-        let joined = super::join_ticking(handle, &ct, async |elapsed: Duration| {
-            ticks.push(elapsed.as_secs());
-        })
+        let joined = super::join_ticking(
+            handle,
+            &ct,
+            || unreachable!("nothing is abandoned here"),
+            async |elapsed: Duration| {
+                ticks.push(elapsed.as_secs());
+            },
+        )
         .await
         .expect("the delegate task joins");
-        assert_eq!(joined, "envelope", "the run's own result still comes back");
+        assert_eq!(
+            joined,
+            super::Joined::Ran {
+                value: "envelope",
+                abandoned: false
+            },
+            "the run's own result still comes back"
+        );
         ticks
     });
     assert_eq!(
@@ -3357,11 +3365,12 @@ fn a_blocking_delegate_ticks_progress_on_the_heartbeat_throttle() {
 }
 
 /// A cancelled request stops the ticking — nothing is listening on a request id
-/// the client has abandoned — and STILL awaits the join: the child is spending
-/// the target's window either way, and handing an in-flight run off to a job
-/// file is not this change's job.
+/// the client has abandoned. With nothing to hand off — most often because no
+/// child exists yet, so the window was never spent and the run is being stopped
+/// instead — the join is STILL awaited: rmcp awaits the handler bare, so nothing
+/// else would ever read what comes back.
 #[test]
-fn a_cancelled_blocking_delegate_stops_ticking_and_still_waits_for_its_child() {
+fn a_cancelled_blocking_delegate_with_nothing_to_hand_off_still_waits_for_its_child() {
     let rt = paused_rt();
     let ticks = rt.block_on(async {
         let handle = tokio::spawn(async {
@@ -3376,14 +3385,25 @@ fn a_cancelled_blocking_delegate_stops_ticking_and_still_waits_for_its_child() {
             firing.cancel();
         });
         let mut ticks: Vec<u64> = Vec::new();
-        let joined = super::join_ticking(handle, &ct, async |elapsed: Duration| {
-            ticks.push(elapsed.as_secs());
-        })
+        let joined = super::join_ticking(
+            handle,
+            &ct,
+            || super::Abandoned::Kept,
+            async |elapsed: Duration| {
+                ticks.push(elapsed.as_secs());
+            },
+        )
         .await
         .expect("a cancelled call still joins its task rather than aborting it");
         assert_eq!(
-            joined, "envelope",
-            "the run is awaited to completion, not dropped at the cancel",
+            joined,
+            super::Joined::Ran {
+                value: "envelope",
+                abandoned: true,
+            },
+            "the run is awaited to completion, not dropped at the cancel — and \
+             the result is flagged as reached AFTER the caller left, so the \
+             reply built from it consumes nothing it cannot deliver",
         );
         ticks
     });
@@ -3392,6 +3412,51 @@ fn a_cancelled_blocking_delegate_stops_ticking_and_still_waits_for_its_child() {
         vec![2, 4],
         "every beat before the cancel fires, and none after",
     );
+}
+
+/// The other side of the same cancel: a run with a child already spending is
+/// handed off to a job file, and the wait ends THERE rather than sitting out a
+/// run whose result now lands on disk. Before this, the handler awaited a join
+/// nobody would read and the envelope died with the request.
+#[test]
+fn an_abandoned_blocking_wait_ends_the_moment_its_run_is_handed_off() {
+    let rt = paused_rt();
+    let (joined, ticks, elapsed) = rt.block_on(async {
+        let started = tokio::time::Instant::now();
+        let handle = tokio::spawn(async {
+            tokio::time::sleep(Duration::from_secs(600)).await;
+            "envelope"
+        });
+        let ct = tokio_util::sync::CancellationToken::new();
+        let firing = ct.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            firing.cancel();
+        });
+        let mut ticks: Vec<u64> = Vec::new();
+        let joined = super::join_ticking(
+            handle,
+            &ct,
+            || super::Abandoned::HandedOff("d-900000-0".to_string()),
+            async |elapsed: Duration| {
+                ticks.push(elapsed.as_secs());
+            },
+        )
+        .await
+        .expect("a hand-off is not a join error");
+        (joined, ticks, started.elapsed())
+    });
+    assert_eq!(
+        joined,
+        super::Joined::HandedOff("d-900000-0".to_string()),
+        "the wait reports the id the run continues under",
+    );
+    assert_eq!(
+        elapsed,
+        Duration::from_secs(5),
+        "and returns at the cancel, not at the run's own end",
+    );
+    assert_eq!(ticks, vec![2, 4], "the ticking stops with the caller");
 }
 
 /// The token-less peer degrades exactly the way `monitor`'s waits do: nothing is
@@ -3412,13 +3477,24 @@ fn a_peer_that_sent_no_progress_token_still_gets_its_delegate_awaited() {
             tokio::time::sleep(super::HEARTBEAT_INTERVAL * 3).await;
             "envelope"
         });
-        super::join_ticking(handle, &ct, async |elapsed: Duration| {
-            sink.tick(|| format!("{}s", elapsed.as_secs())).await;
-        })
+        super::join_ticking(
+            handle,
+            &ct,
+            || unreachable!("nothing is abandoned here"),
+            async |elapsed: Duration| {
+                sink.tick(|| format!("{}s", elapsed.as_secs())).await;
+            },
+        )
         .await
         .expect("the delegate task joins")
     });
-    assert_eq!(joined, "envelope");
+    assert_eq!(
+        joined,
+        super::Joined::Ran {
+            value: "envelope",
+            abandoned: false
+        }
+    );
 }
 
 /// `tick` is the only thing that ever reaches `notify_progress`, and until the
@@ -3507,10 +3583,10 @@ fn the_blocking_delegate_awaits_its_task_through_the_progress_ticker() {
         .expect("delegate_with is defined")
         .1;
     let spawn = body
-        .find("let handle = tokio::task::spawn_blocking(")
+        .find("let handle = spawn_delegate(")
         .expect("the blocking delegate is spawned");
     let collect = body[spawn..]
-        .find("let envelope = match outcome")
+        .find("match joined {")
         .expect("its outcome is folded into an envelope");
     // Whitespace-free, so the needles do not have to track how rustfmt broke
     // the call across lines this week.
@@ -4166,15 +4242,21 @@ fn the_stop_decision_reads_the_cancel_flag_beside_both_deadlines() {
 /// The registry is a direct handle rather than a flag in the job file: the
 /// detached task runs in this same process. An entry lives exactly as long as
 /// the run does, so a stale id can never stop a later job that reuses it.
+///
+/// The flag is the CALLER's, which is the half a run handed off mid-flight
+/// depends on: it is already reading its own, so an entry minted around a fresh
+/// one would leave its id cancellable in name only.
 #[test]
 fn the_cancel_registry_holds_a_flag_only_while_the_run_is_registered() {
     let id = "d-777000-0";
     assert!(!super::cancel_job(id), "nothing is registered under it yet");
-    let guard = super::CancelGuard::register(id);
-    assert!(!guard.is_cancelled(), "registering does not cancel");
+    let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let guard = super::CancelGuard::register(id, std::sync::Arc::clone(&flag));
+    let read = || flag.load(std::sync::atomic::Ordering::Relaxed);
+    assert!(!read(), "registering does not cancel");
     assert!(super::cancel_job(id), "a registered id is held");
     assert!(
-        guard.is_cancelled(),
+        read(),
         "the flag the supervision loop reads is the one `cancel_job` set"
     );
     drop(guard);
@@ -4199,7 +4281,8 @@ fn cancelling_a_live_job_flips_its_flag_and_the_reply_says_so() {
         serde_json::json!({"profile": "work", "is_error": true, "result": "half an answer"}),
     )
     .unwrap();
-    let guard = super::CancelGuard::register(id);
+    let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let _guard = super::CancelGuard::register(id, std::sync::Arc::clone(&flag));
 
     let result = call_monitor_args(MonitorArgs {
         job_ids: Some(vec![id.to_string()]),
@@ -4208,7 +4291,7 @@ fn cancelling_a_live_job_flips_its_flag_and_the_reply_says_so() {
         cancel: Some(true),
     });
     assert!(
-        guard.is_cancelled(),
+        flag.load(std::sync::atomic::Ordering::Relaxed),
         "the running loop's own flag is what `cancel: true` sets"
     );
     let text = result
@@ -4316,7 +4399,8 @@ fn a_cancelled_run_finalizes_as_a_done_error_rather_than_stranding() {
 fn a_refused_job_ids_list_cancels_nothing() {
     let _home = HomeSandbox::new();
     let live = "d-781000-0";
-    let guard = super::CancelGuard::register(live);
+    let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let _guard = super::CancelGuard::register(live, std::sync::Arc::clone(&flag));
     let mut ids: Vec<String> = (0..256).map(|i| format!("d-{i}-0")).collect();
     ids.push(live.to_string());
 
@@ -4338,7 +4422,7 @@ fn a_refused_job_ids_list_cancels_nothing() {
         "the refusal is the whole reply: nothing was cancelled to report"
     );
     assert!(
-        !guard.is_cancelled(),
+        !flag.load(std::sync::atomic::Ordering::Relaxed),
         "a list the server refuses must not have stopped a run on its way to being refused"
     );
 }
@@ -4519,7 +4603,7 @@ fn run_delegate_reads_the_cancel_flag_between_the_acquire_and_the_spawn() {
     assert!(acquire < spawn, "the spawn follows the acquire");
     let window = &body[acquire..spawn];
     assert!(
-        window.contains("\n    if cancel.is_some_and(CancelGuard::is_cancelled) {\n"),
+        window.contains("\n    if handoff.as_ref().is_some_and(|h| h.is_cancelled()) {\n"),
         "the cancel guard between the acquire and the spawn must be the whole \
          condition, unqualified: {window}"
     );
@@ -4629,11 +4713,12 @@ fn a_run_cancelled_before_it_spawns_says_the_window_was_not_spent() {
     crate::actions::create_blank_profile(&mut config, "work".to_string(), None, None, None)
         .expect("create profile");
 
-    let job_id = "d-782000-0";
-    let guard = super::CancelGuard::register(job_id);
+    // The real abandonment path, not a hand-built flag: a caller walking away
+    // from a run with no child yet gets it STOPPED, and `Kept` is that decision.
+    let handoff = super::Handoff::blocking(mint_spec("work"));
     assert!(
-        super::cancel_job(job_id),
-        "fixture control: the run is held"
+        matches!(handoff.hand_off(), super::Abandoned::Kept),
+        "fixture control: nothing spawned, so nothing is handed off"
     );
 
     let envelope = run_delegate(DelegateOpts {
@@ -4648,8 +4733,7 @@ fn a_run_cancelled_before_it_spawns_says_the_window_was_not_spent() {
         resume: None,
         isolation: Isolation::Isolated,
         depth: 0,
-        job: None,
-        cancel: Some(&guard),
+        handoff: Some(std::sync::Arc::clone(&handoff)),
     })
     .expect("a cancel is an envelope, never a transport error");
 
@@ -4681,4 +4765,452 @@ fn a_run_cancelled_before_it_spawns_says_the_window_was_not_spent() {
             .exists(),
         "the isolated runtime is torn down with the guard, not left behind"
     );
+    // And the other half of the same decision: a run stopped before it spent
+    // anything leaves no job file for anyone to collect.
+    assert!(
+        job_files().is_empty(),
+        "a pre-spawn cancel mints nothing: {:?}",
+        job_files()
+    );
+}
+
+// ---- an abandoned blocking delegate becomes a background job ----
+
+/// The mint a blocking `delegate` hands its run, in the shape the handler builds
+/// one: streaming, so no wall clock, and a `started_at` from a minute ago —
+/// which is the only way a mint that re-read the clock instead of carrying the
+/// run's own start could be caught.
+fn mint_spec(profile: &str) -> super::MintSpec {
+    super::MintSpec {
+        profile: profile.to_string(),
+        started_at: now_ms().saturating_sub(60_000),
+        timeout_secs: None,
+        idle_secs: None,
+        streaming: true,
+    }
+}
+
+/// Every file in the sandboxed job store, so a test can say "nothing was
+/// minted" without knowing what an id would have been.
+fn job_files() -> Vec<String> {
+    let Ok(dir) = jobs::jobs_dir() else {
+        return Vec::new();
+    };
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect()
+}
+
+/// The conversion itself: a caller who walks away from a run whose child is
+/// already spending gets that run a job file, and the envelope it eventually
+/// produces lands there instead of dying with the request. Until this existed
+/// the same abandonment left the child running to its idle guard with nobody to
+/// receive a word of what it wrote.
+///
+/// `mark_spawned` IS "the child exists" — `run_delegate` sets it on the line
+/// after `command.spawn()` returns — so staging the cancel after it stages it
+/// after the child, without faking a child this crate deliberately never fakes.
+#[test]
+fn an_abandoned_run_with_a_live_child_hands_off_to_a_job_file() {
+    let _home = HomeSandbox::new();
+    let mint = mint_spec("work");
+    let handoff = super::Handoff::blocking(mint.clone());
+    assert!(
+        handoff.spec().is_none(),
+        "a blocking run owns no record until it is handed one"
+    );
+    handoff.mark_spawned();
+
+    let super::Abandoned::HandedOff(job_id) = handoff.hand_off() else {
+        panic!("a run with a live child is handed off, never dropped");
+    };
+
+    let record = jobs::read(&job_id).expect("the hand-off minted a running record");
+    assert_eq!(record.state, jobs::JobState::Running);
+    assert_eq!(record.profile, "work");
+    assert_eq!(
+        record.started_at, mint.started_at,
+        "the record carries the RUN's start: a fresh stamp reports a long run as \
+         brand new on every check and resets its retention anchor with it",
+    );
+    assert_eq!(
+        handoff.spec().map(|s| s.job_id),
+        Some(job_id.clone()),
+        "and the run heartbeats into that record from here",
+    );
+
+    // The entry minted beside the id reaches THIS run's own flag; a fresh `Arc`
+    // would leave the id cancellable in name only.
+    assert!(super::cancel_job(&job_id), "the new id is held");
+    assert!(
+        handoff.is_cancelled(),
+        "and what it set is the flag the supervision loop reads",
+    );
+
+    let envelope = serde_json::json!({
+        "profile": "work",
+        "is_error": false,
+        "result": "the answer nobody waited for",
+    });
+    handoff.finalize(&envelope);
+    let record = jobs::read(&job_id).expect("the record survives the finalize");
+    assert_eq!(
+        record.state,
+        jobs::JobState::Done,
+        "never stranded `running`"
+    );
+    assert_eq!(
+        record.envelope.as_ref(),
+        Some(&envelope),
+        "and the done envelope IS what the run produced",
+    );
+
+    // The whole point of minting it: the id resolves through `monitor`, which is
+    // the only path a spent window's result is ever collected on.
+    let text = monitor_text(&job_id);
+    assert!(
+        text.contains("the answer nobody waited for"),
+        "the handed-off run's result collects like any other job's: {text}",
+    );
+}
+
+/// The boundary the conversion turns on, from the handler's side. Before a child
+/// exists nothing has been billed, so there is no result to preserve and a job
+/// file would only promise one that is never coming: the run is STOPPED instead,
+/// through the same flag its pre-spawn arm reads.
+///
+/// Its twin `a_run_cancelled_before_it_spawns_says_the_window_was_not_spent`
+/// carries the other half — that `run_delegate` acts on the flag this sets.
+#[test]
+fn an_abandoned_run_with_no_child_yet_mints_nothing_and_stops_instead() {
+    let _home = HomeSandbox::new();
+    let handoff = super::Handoff::blocking(mint_spec("work"));
+
+    assert!(
+        matches!(handoff.hand_off(), super::Abandoned::Kept),
+        "with nothing spent there is nothing to hand off",
+    );
+    assert!(
+        job_files().is_empty(),
+        "and no job file is minted for a window nobody paid: {:?}",
+        job_files(),
+    );
+    assert!(
+        handoff.is_cancelled(),
+        "what happens instead is the run being stopped",
+    );
+}
+
+/// A run that lands before its abandoning caller reaches the mint keeps its
+/// envelope on the join, and the reservation minted for it in that window is
+/// given up rather than left behind as a `running` record nothing will ever
+/// finalize. The mint sits outside the state lock (so both leaves stay leaves),
+/// which is exactly what makes this window exist.
+#[test]
+fn a_run_that_finishes_first_keeps_its_envelope_and_leaves_no_job_file() {
+    let _home = HomeSandbox::new();
+    let handoff = super::Handoff::blocking(mint_spec("work"));
+    handoff.mark_spawned();
+
+    handoff.finalize(&serde_json::json!({"profile": "work", "result": "landed first"}));
+    assert!(
+        job_files().is_empty(),
+        "a run still attached to its caller writes nothing: {:?}",
+        job_files(),
+    );
+
+    assert!(
+        matches!(handoff.hand_off(), super::Abandoned::Kept),
+        "and a hand-off reaching a finished run reports nothing to collect",
+    );
+    assert!(
+        job_files().is_empty(),
+        "leaving no orphan behind either: {:?}",
+        job_files(),
+    );
+
+    // The true race — the run landing while its reservation is being minted —
+    // is only reachable at `install`, since `hand_off` re-reads the state before
+    // it mints. What the arm costs is exactly this: a `running` record for a run
+    // that will never finalize.
+    let reserved = reserve_job(
+        &mint_spec("work"),
+        std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    )
+    .expect("mint the reservation the race would strand");
+    let stranded = reserved.spec.job_id.clone();
+    assert!(
+        jobs::read(&stranded).is_some(),
+        "fixture control: the mint wrote its running record",
+    );
+    assert!(
+        matches!(handoff.install(reserved), super::Abandoned::Kept),
+        "a reservation minted for a run that already landed is not installed",
+    );
+    assert!(
+        jobs::read(&stranded).is_none(),
+        "and it is given up rather than left polling `running` until GC",
+    );
+    assert!(
+        !super::cancel_job(&stranded),
+        "its registry entry goes with it",
+    );
+}
+
+/// A background run is on the far side of the same seam from its first line: it
+/// heartbeats into the file its reserve already minted, finalizes into it, and
+/// nothing about the hand-off can move it. One `Handoff` for both shapes is only
+/// safe while that holds.
+#[test]
+fn a_reserved_run_is_already_across_the_seam_and_a_hand_off_cannot_move_it() {
+    let _home = HomeSandbox::new();
+    let reserved = reserve_background_job("work", None, None, true).expect("reserve");
+    let job_id = reserved.spec.job_id.clone();
+    let handoff = super::Handoff::reserved(reserved);
+
+    assert_eq!(
+        handoff.spec().map(|s| s.job_id),
+        Some(job_id.clone()),
+        "it heartbeats into its own record from the start",
+    );
+    handoff.mark_spawned();
+    assert!(
+        matches!(handoff.hand_off(), super::Abandoned::Kept),
+        "and an abandoned caller mints it nothing second",
+    );
+    assert_eq!(
+        job_files().len(),
+        1,
+        "exactly one record for one run: {:?}",
+        job_files(),
+    );
+    assert!(
+        super::cancel_job(&job_id),
+        "its one registry entry is still the reserve's",
+    );
+    assert!(handoff.is_cancelled(), "and the run reads that flag");
+
+    handoff.finalize(&serde_json::json!({"profile": "work", "result": "done"}));
+    let record = jobs::read(&job_id).expect("finalized");
+    assert_eq!(record.state, jobs::JobState::Done);
+    assert!(
+        !super::cancel_job(&job_id),
+        "the entry is released with the finalize, so a later job reusing the id \
+         cannot be stopped by a stale cancel",
+    );
+}
+
+/// F1: the record a hand-off mints must survive the very `monitor` that comes to
+/// read it.
+///
+/// `monitor` sweeps running corpses before every collect, and a `Running`
+/// record's retention is silence measured from an anchor. Anchor that on the
+/// RUN's birth and a delegate handed off after two hours is minted already past
+/// `RUNNING_TTL_MS`: the next collect deletes the file and answers `unknown
+/// job_id` for a run whose child is still spending — the M1 defect walking back
+/// in through the hand-off door, on exactly the long runs M3 exists to rescue.
+/// A pinned-`--output-format` run never heartbeats at all, so for that shape
+/// EVERY collect would reap it until the finalize wrote the done record back.
+///
+/// The fix is the record's own `recorded_at` mint stamp. Stamping `last_output_at`
+/// instead would hold the file alive by claiming output that never arrived —
+/// `idle_kill_in_secs` counts from that field, so a run 280 s into a 300 s idle
+/// guard would report a full window of headroom moments before it was killed.
+#[test]
+fn a_handed_off_run_is_not_reaped_by_the_monitor_that_comes_to_read_it() {
+    let _home = HomeSandbox::new();
+    // Older than the corpse window, which M1 made an ordinary age: a streaming
+    // delegate has no wall clock, so nothing bounds how long one may run.
+    let mut mint = mint_spec("work");
+    mint.started_at = now_ms().saturating_sub(4_300_000);
+    let handoff = super::Handoff::blocking(mint);
+    handoff.mark_spawned();
+    let super::Abandoned::HandedOff(job_id) = handoff.hand_off() else {
+        panic!("a run with a live child is handed off");
+    };
+
+    let result = call_monitor(&job_id, Some(0));
+    assert!(
+        jobs::read(&job_id).is_some(),
+        "the collect's corpse sweep must not delete a record it just came to read",
+    );
+    let text = result
+        .content
+        .first()
+        .and_then(|c| c.as_text())
+        .map(|t| t.text.clone())
+        .expect("status text");
+    assert_ne!(
+        result.is_error,
+        Some(true),
+        "a live handed-off run is not an error: {text}",
+    );
+    assert!(
+        text.starts_with(&format!("job `{job_id}` running on `work`, elapsed ")),
+        "it reports as running, never `unknown job_id`: {text}",
+    );
+
+    // And the fix does not buy that with a false liveness claim: nothing has
+    // been written to stdout, so the check must not report output or a refreshed
+    // idle countdown.
+    let record = jobs::read(&job_id).expect("record");
+    assert_eq!(
+        record.last_output_at, 0,
+        "no line has arrived, and the mint must not pretend one did",
+    );
+    assert!(
+        !text.contains("last output"),
+        "so the check reports no last-output age: {text}",
+    );
+}
+
+/// F6: the fact the whole seam turns on — a child EXISTS — must be recorded only
+/// where one does.
+///
+/// `Handoff::hand_off` reads `spawned` to choose between minting a job file and
+/// stopping the run, so a `mark_spawned` that runs on a path with no child
+/// inverts contract 3 silently: a caller abandoning during a two-minute
+/// `ProfileRuntime::acquire` would get a record minted for a run that never
+/// spawns, and `finalize` would write the pre-spawn refusal into it as though a
+/// window had been spent.
+///
+/// This drives the real `run_delegate` to a refusal that returns before the
+/// acquire, so it reds for any `mark_spawned` hoisted anywhere above it. The
+/// narrower window — between the acquire and the spawn — is where a child cannot
+/// be faked, and the scan below carries it.
+#[test]
+fn a_run_that_refused_before_spawning_leaves_the_seam_unarmed() {
+    let home = HomeSandbox::new();
+    let mut config = crate::profile::AppConfig {
+        state: crate::profile::AppState::default(),
+        profiles: Vec::new(),
+    };
+    crate::actions::create_blank_profile(&mut config, "work".to_string(), None, None, None)
+        .expect("create profile");
+    let handoff = super::Handoff::blocking(mint_spec("work"));
+
+    // The cwd gate refuses ahead of the acquire and ahead of any spawn.
+    let missing = home.home().join("no-such-dir");
+    let err = run_delegate(DelegateOpts {
+        profile: "work",
+        prompt: "hello",
+        model: None,
+        cwd: Some(&missing.to_string_lossy()),
+        env: HashMap::new(),
+        extra_args: Vec::new(),
+        timeout_secs: None,
+        idle_secs: None,
+        resume: None,
+        isolation: Isolation::Shared,
+        depth: 0,
+        handoff: Some(std::sync::Arc::clone(&handoff)),
+    })
+    .expect_err("the cwd gate refuses this run");
+    assert!(err.contains("cwd does not exist"), "fixture control: {err}");
+
+    assert!(
+        matches!(handoff.hand_off(), super::Abandoned::Kept),
+        "no child ever existed, so an abandoned caller stops the run rather than \
+         minting a job file to collect a window nobody paid for",
+    );
+    assert!(
+        job_files().is_empty(),
+        "and nothing is minted: {:?}",
+        job_files(),
+    );
+}
+
+/// The half the test above cannot reach: `mark_spawned` sits AFTER the spawn and
+/// nowhere earlier. A child between the acquire and `command.spawn()` cannot be
+/// faked, and this crate never fakes one, so the ordering is pinned structurally
+/// — but by POSITION rather than by spelling, so a renamed method or a reflowed
+/// call still passes while any hoist reds.
+///
+/// Position is the whole argument: `command.spawn()` ends in `?`, so everything
+/// below it runs only on a successful spawn. Exactly one call site, because a
+/// second one anywhere is a second answer to "does a child exist".
+#[test]
+fn run_delegate_records_the_spawn_only_after_the_child_exists() {
+    let src = include_str!("../../src/mcp/mod.rs");
+    assert_eq!(
+        src.matches(".mark_spawned()").count(),
+        1,
+        "exactly one call site decides whether a child exists",
+    );
+    let body = src
+        .split_once("fn run_delegate(")
+        .expect("run_delegate is defined")
+        .1;
+    let spawn = body
+        .find("let mut child = command")
+        .expect("the child is spawned");
+    let reader = body
+        .find("let stdout_reader = child.stdout.take()")
+        .expect("the reader thread is spawned");
+    let marked = body
+        .find(".mark_spawned()")
+        .expect("the spawn is recorded on the seam");
+    assert!(
+        spawn < marked && marked < reader,
+        "`mark_spawned` must follow the `?`-terminated spawn and precede the \
+         reader: hoisting it above the spawn arms the seam for a run that may \
+         never have a child (spawn @{spawn}, mark @{marked}, reader @{reader})",
+    );
+}
+
+/// The wiring between two behaviourally-pinned halves: `join_ticking` carries
+/// the abandoned bit (`a_cancelled_blocking_delegate_with_nothing_to_hand_off…`)
+/// and `delegate_digest_mode` acts on it
+/// (`an_abandoned_blocking_delegate_reply_never_consumes_the_digest`), but
+/// nothing reds if the handler between them passes a literal instead.
+///
+/// Reaching that at runtime needs a `claude` child that outlives a cancel, which
+/// this crate never fakes, so it is pinned over the source — rejecting the two
+/// shapes that lose the bit rather than blessing one spelling: a literal
+/// argument, and a return to the unconditional `DigestMode::Report` this
+/// replaced. What it cannot decide, stated because a scan reads stronger than it
+/// is: whether `abandoned` is ever TRUE at that point. The `join_ticking` test
+/// above owns that half.
+#[test]
+fn the_blocking_delegate_folds_its_digest_on_the_abandoned_bit() {
+    let src = include_str!("../../src/mcp/mod.rs");
+    let body = src
+        .split_once("async fn delegate_with(")
+        .expect("delegate_with is defined")
+        .1;
+    let joined = body
+        .find("match joined {")
+        .expect("the wait's outcome is read");
+    // Bounded at the NEXT tool's attribute, i.e. the end of this handler: run to
+    // the end of the file and `monitor`'s own perfectly correct
+    // `DigestMode::Report` trips the refusals below.
+    let end = joined
+        + body[joined..]
+            .find("#[tool(")
+            .expect("another tool follows the delegate handler");
+    let tail: String = body[joined..end]
+        .lines()
+        .filter(|l| !l.trim_start().starts_with("//"))
+        .flat_map(str::chars)
+        .filter(|c| !c.is_whitespace())
+        .collect();
+    assert!(
+        tail.contains("delegate_digest_mode(&self.digest,abandoned)"),
+        "the reply's digest mode must be chosen from the wait's own bit: {tail}",
+    );
+    for literal in [
+        "delegate_digest_mode(&self.digest,true)",
+        "delegate_digest_mode(&self.digest,false)",
+        "DigestMode::Report(",
+    ] {
+        assert!(
+            !tail.contains(literal),
+            "a blocking reply that always reports ({literal:?}) spends the delta \
+             into a response rmcp drops for a cancelled request: {tail}",
+        );
+    }
 }

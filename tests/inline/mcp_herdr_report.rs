@@ -572,9 +572,13 @@ fn overlap_reports_idle_once_after_last_end() {
         let _pin = EnvPin::new(&home, Some("pane-9"), Some(&shim));
         PaneReporter::resolve().expect("pane env resolves a reporter")
     };
-    // Two overlapping delegates: one working report on the 0→1 transition...
-    let g1 = InFlightGuard::begin(&reporter);
-    let g2 = InFlightGuard::begin(&reporter);
+    // Two overlapping delegates, each entered the way a delegate enters: the
+    // handler's `begin` at commit-to-launch, the run's own end-guard in its
+    // task.
+    reporter.begin();
+    let g1 = InFlightGuard::end_only(reporter.clone());
+    reporter.begin();
+    let g2 = InFlightGuard::end_only(reporter.clone());
     let lines = report_lines(home.home());
     assert_eq!(
         lines.len(),

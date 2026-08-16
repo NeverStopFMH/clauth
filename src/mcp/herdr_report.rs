@@ -11,10 +11,11 @@
 //!
 //! Every report is best-effort: a failed or hanging herdr spawn never fails a
 //! delegate. It does cost time, and the serve runtime is
-//! `new_current_thread()`, so the cost is the whole server's. A sync run pays
-//! [`REPORT_TIMEOUT`] twice against that one thread, in two separate blocks:
-//! `working` before the delegate reaches `spawn_blocking`, `idle` from the
-//! guard's drop after the await. Failures are silent except for one `logline`
+//! `new_current_thread()`, so the cost is the whole server's. Only the
+//! `working` half is charged to that thread now — it runs at commit-to-launch,
+//! before the delegate reaches `spawn_blocking` — while `idle` rides the run's
+//! own blocking task, where a hung herdr delays nothing but that task's own
+//! end. Failures are silent except for one `logline`
 //! each (the MCP stdio channel carries only the JSON-RPC frame on stdout, and
 //! `logline` routes off it — to the log file on an interactive pane, stderr
 //! otherwise).
@@ -257,25 +258,17 @@ fn resolve_bin() -> Option<PathBuf> {
     crate::plugin_probe::on_path(&raw)
 }
 
-/// RAII in-flight tracker half. [`InFlightGuard::begin`] reports `working`;
-/// the drop reports `idle` once nothing else is in flight, on every exit path,
-/// panic included.
+/// RAII in-flight tracker half: the drop reports `idle` once nothing else is in
+/// flight, on every exit path, panic included.
 pub(crate) struct InFlightGuard {
     reporter: PaneReporter,
 }
 
 impl InFlightGuard {
-    /// Track + report `working` for a synchronous delegate.
-    pub(crate) fn begin(reporter: &PaneReporter) -> Self {
-        reporter.begin();
-        Self {
-            reporter: reporter.clone(),
-        }
-    }
-
-    /// Track only — for a detached background task whose `begin` already ran
-    /// at commit-to-launch. Created first thing in the task so no early return
-    /// can skip the decrement.
+    /// Track only — every delegate's `begin` runs at commit-to-launch, and the
+    /// guard is created first thing in the run's own task so no early return
+    /// can skip the decrement and so the panel follows the RUN rather than the
+    /// call that started it.
     pub(crate) fn end_only(reporter: PaneReporter) -> Self {
         Self { reporter }
     }

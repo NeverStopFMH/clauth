@@ -4,10 +4,22 @@
 //! blocking task. The result must outlive the originating tool call AND be
 //! readable by a separate process (the `mcp-await-job` PostToolUse hook), so it
 //! lands on disk at `~/.clauth/jobs/<job_id>.json` rather than an in-memory
-//! registry. Writes are atomic (tmp + rename) so a concurrent reader never sees a
-//! torn file. No lock is taken: the path is keyed by a unique `job_id` and the
+//! registry. Writes are atomic (tmp + rename) so a concurrent reader never sees
+//! a torn file. No lock is taken: the path is keyed by a unique `job_id` and the
 //! finalizing task is the sole writer for its own file — a leaf with no ordering
 //! against the runtime/state locks.
+//!
+//! A BLOCKING delegate whose caller walks away also ends up here
+//! (`Handoff::hand_off` mints it a record mid-run), and it writes the same file
+//! through the same code — but it is NOT delivered the same way, and the
+//! paragraph above does not reach it. Measured on Claude Code 2.1.233: a tool
+//! call the client cancelled or timed out dispatches `PostToolUseFailure`, never
+//! `PostToolUse`, so the bundled hook never runs for it; and the reply carrying
+//! the minted id is dropped by rmcp before it reaches the transport, so the
+//! model never learns the id to ask for it. Such a record is written so the
+//! spent window's result EXISTS rather than because anything currently collects
+//! it: today it is reachable by an operator reading the store, and by `monitor`
+//! only from an id learned some other way.
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -32,6 +44,12 @@ pub(super) const DONE_TTL_MS: u64 = 60 * 60 * 1000; // 1h
 /// have had its file deleted under it, and answered `unknown job_id` while its
 /// child kept spending the account.
 ///
+/// "Silent" is measured from the record's own mint (`recorded_at`), not the
+/// run's birth. A blocking delegate handed off mid-flight keeps a `started_at`
+/// from arbitrarily long before its file existed, so anchoring on that would
+/// mint a two-hour run already expired — and a pinned-format one, which never
+/// heartbeats at all, would be reaped by every reader for the rest of its life.
+///
 /// The two background shapes reach 3600 + 600 s by different routes, and only
 /// the first one heartbeats:
 ///
@@ -53,7 +71,9 @@ pub(super) const DONE_TTL_MS: u64 = 60 * 60 * 1000; // 1h
 /// is still inside that acquire with no child, while a pinned-format one can be
 /// well past it, since a 700 s block plus its 3600 s wall already puts the record
 /// 4300 s silent-since-mint with the child 3600 s in and still spending. Both
-/// exposures are exactly what the age rule carried, and neither is widened here.
+/// exposures are exactly what the age rule carried. A handed-off run adds no
+/// third one: its clock starts at the crossing, which is strictly after the
+/// spawn, so it is bounded by whichever of the two shapes it already is.
 const RUNNING_TTL_MS: u64 = (3600 + 600) * 1000;
 /// Hard cap on retained job files; newest kept, older reaped. Also the cap on
 /// one `monitor` `job_ids` list: the store holds at most this many files, so a
@@ -99,8 +119,29 @@ pub(crate) struct JobRecord {
     /// arrived yet. (A run-relative stamp would be anchored at the child's
     /// spawn, which trails the mint by the config load, the pre-flight and the
     /// runtime acquire.)
+    ///
+    /// It is NOT the retention anchor's floor — see [`recorded_at`]. Stamping
+    /// this at a mint to hold a record alive would buy that with a false
+    /// liveness claim: it renders as `last_output_secs_ago` and it is what
+    /// `idle_kill_in_secs` counts from, so a run silent for 280 s of its 300 s
+    /// idle guard would report a full 300 s of headroom moments before the
+    /// supervision loop killed it.
+    ///
+    /// [`recorded_at`]: Self::recorded_at
     #[serde(default, skip_serializing_if = "is_zero")]
     pub(crate) last_output_at: u64,
+    /// Epoch ms this RECORD was written, which is not always when its RUN
+    /// started: a blocking delegate handed off mid-flight (`Handoff::hand_off`)
+    /// keeps the run's real `started_at`, because `elapsed_secs` and the job id
+    /// are derived from it, while its file has existed only since the crossing.
+    ///
+    /// [`retention_anchor`] needs the later of the two, or a run handed off
+    /// after two hours is minted already past [`RUNNING_TTL_MS`] and the very
+    /// next `monitor` reaps the record it came to read. `0` on a file written
+    /// before this field existed, where `started_at` was the mint and the
+    /// fallback is exact.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub(crate) recorded_at: u64,
     /// A bounded single-line tail of the delegate's assistant text.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub(crate) tail: String,
@@ -122,6 +163,11 @@ pub(crate) struct RunningSpec {
     pub(crate) job_id: String,
     pub(crate) profile: String,
     pub(crate) started_at: u64,
+    /// When the record was minted; equal to `started_at` for a job that started
+    /// out background, later for one handed off mid-run. Carried through every
+    /// heartbeat, since a beat rewrites the whole record and would otherwise
+    /// drop it back to the run's birth.
+    pub(crate) recorded_at: u64,
     pub(crate) timeout_secs: u64,
     pub(crate) idle_secs: Option<u64>,
 }
@@ -176,10 +222,15 @@ pub(crate) fn write_running(spec: &RunningSpec) -> Result<()> {
 /// Lock-free against [`write_done`] because the two cannot interleave: the
 /// stdout reader thread is this function's only caller, and `run_delegate` joins
 /// that thread on every exit path before it builds any envelope, while
-/// `launch_background_delegate` calls `write_done` only after `run_delegate`
-/// returns. `run_delegate_never_returns_between_spawning_the_reader_and_joining_it`
+/// `Handoff::finalize` — the sole `write_done` caller for a job — runs only
+/// after `run_delegate` returns.
+/// `run_delegate_never_returns_between_spawning_the_reader_and_joining_it`
 /// is what holds the single-exit half of that up, since a `return` in between
 /// would orphan a thread that then overwrites the finalized record.
+///
+/// A run handed off mid-flight does not widen that: the record it starts
+/// heartbeating into is minted before its first beat resolves one, and the same
+/// single reader thread does every beat either way.
 pub(crate) fn write_heartbeat(spec: &RunningSpec, last_output_at: u64, tail: &str) -> Result<()> {
     write_atomic(&JobRecord {
         job_id: spec.job_id.clone(),
@@ -190,6 +241,7 @@ pub(crate) fn write_heartbeat(spec: &RunningSpec, last_output_at: u64, tail: &st
         timeout_secs: spec.timeout_secs,
         idle_secs: spec.idle_secs,
         last_output_at,
+        recorded_at: spec.recorded_at,
         tail: tail.to_string(),
         done_at: 0,
     })
@@ -214,6 +266,7 @@ pub(crate) fn write_done(
         timeout_secs: 0,
         idle_secs: None,
         last_output_at: 0,
+        recorded_at: 0,
         tail: String::new(),
         done_at: crate::usage::now_ms(),
     })
@@ -271,6 +324,13 @@ enum Scope {
 /// TTL itself got wrong twice: sorted on the mint, the cap evicts a long
 /// delegate's fresh, never-read result ahead of a short run's older one, and
 /// [`RUNNING_TTL_MS`] reaped a live long run for having started a while ago.
+///
+/// A `Running` record takes the latest of its three stamps rather than the two
+/// it used to, because a hand-off separated the run's birth from the record's:
+/// on `started_at` alone, a delegate handed off after two hours is minted
+/// already expired and the next reader sweeps it. `recorded_at` is `0` on a file
+/// written before that field, where the mint WAS `started_at` and the pair
+/// collapses back to the old rule exactly.
 fn retention_anchor(record: &JobRecord) -> u64 {
     match record.state {
         JobState::Done => {
@@ -280,7 +340,10 @@ fn retention_anchor(record: &JobRecord) -> u64 {
                 record.started_at
             }
         }
-        JobState::Running => record.last_output_at.max(record.started_at),
+        JobState::Running => record
+            .last_output_at
+            .max(record.recorded_at)
+            .max(record.started_at),
     }
 }
 

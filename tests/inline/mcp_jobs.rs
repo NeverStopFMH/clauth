@@ -15,11 +15,16 @@ use crate::testutil::HomeSandbox;
 /// default. The pair `(3600, Some(300))` this used to carry is one the producer
 /// can no longer emit, so every test in the file inherited a run that cannot
 /// exist.
+/// `recorded_at` equals `started_at` here because that is what a job which
+/// STARTED background carries — the reserve mints the record at the run's own
+/// birth. A run handed off mid-flight is the shape where the two differ, and
+/// the tests about that difference set it apart deliberately.
 fn spec(job_id: &str, profile: &str, started_at: u64) -> RunningSpec {
     RunningSpec {
         job_id: job_id.to_string(),
         profile: profile.to_string(),
         started_at,
+        recorded_at: started_at,
         timeout_secs: 0,
         idle_secs: Some(300),
     }

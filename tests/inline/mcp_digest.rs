@@ -1,4 +1,5 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
+#![allow(unsafe_code)]
 
 //! The since-your-last-call digest, pinned on the traps that make it a
 //! feature rather than a no-op:
@@ -16,7 +17,9 @@
 //!   sleeps holding the baseline lock;
 //! - the usage cache is keyed on the profile it was read from, so a profile
 //!   change is never dressed up as a refresh of a file nobody refreshed;
-//! - a batch is one call: one digest, top-level, rendered in the prose reply.
+//! - a batch is one call: one digest, top-level, rendered in the prose reply,
+//!   and a background `delegate` handle is a batch of one or of N under the
+//!   same rule.
 //!
 //! Replies are prose now (the JSON payload is internal to the renderers), so
 //! the digest assertions read the prose clause: "since your last call: ...".
@@ -173,11 +176,76 @@ fn call_monitor_state(server: &ClauthServer, wait_secs: u64) -> String {
     )))
 }
 
+/// A background `delegate`, the one reply shape whose digest each handle site
+/// folds for itself. Returns the reply's prose.
+///
+/// `cwd` points at nothing on purpose: each detached task then stops at the cwd
+/// gate before any `claude` spawn, and `HomeSandbox::drop` blocks on its
+/// completion signal. Depth is pinned to 0 because a suite running INSIDE a
+/// delegate would otherwise refuse at the recursion guard, ahead of the fold
+/// under test.
+///
+/// # Safety
+/// `set_var`/`remove_var` are unsafe in Rust 2024 (not thread-safe). The
+/// caller's `HomeSandbox` holds `HOME_TEST_LOCK`, which is the serialization,
+/// and the prior value is restored before this returns.
+fn call_delegate_background(
+    server: &ClauthServer,
+    home: &HomeSandbox,
+    profiles: &[&str],
+) -> String {
+    let saved = std::env::var(MCP_DEPTH_ENV).ok();
+    // SAFETY: test-only, serialized by the caller's `HomeSandbox` lock.
+    unsafe { std::env::set_var(MCP_DEPTH_ENV, "0") };
+    let result = drive(
+        server.delegate(Parameters(DelegateArgs {
+            profiles: Some(profiles.iter().map(|p| (*p).to_string()).collect()),
+            prompt: Some("hi".to_string()),
+            prompt_file: None,
+            model: None,
+            cwd: Some(
+                home.home()
+                    .join("does-not-exist")
+                    .to_string_lossy()
+                    .into_owned(),
+            ),
+            env: None,
+            args: None,
+            timeout_secs: None,
+            idle_secs: None,
+            resume: None,
+            isolated: None,
+            background: Some(true),
+        })),
+    );
+    // SAFETY: same as above — restore the prior value.
+    unsafe {
+        match &saved {
+            Some(v) => std::env::set_var(MCP_DEPTH_ENV, v),
+            None => std::env::remove_var(MCP_DEPTH_ENV),
+        }
+    }
+    block_text(&result)
+}
+
 /// The full fresh-server fixture every test starts from: one active profile,
 /// a usage cache, and a credentials file, all stamped at `t0()`.
 fn seeded_world() {
     seed_state("work", t0());
     seed_credentials_file(t0());
+}
+
+/// [`seeded_world`] plus a second delegable account, so the fan-out arm has two
+/// real targets. `work` stays active, so the digest's own observables are the
+/// ones `seeded_world` stamped.
+fn seeded_world_with_a_second_account() {
+    seeded_world();
+    save_app_state(&AppState {
+        active_profile: Some(ProfileName::from("work")),
+        profiles: vec![ProfileName::from("work"), ProfileName::from("spare")],
+        ..Default::default()
+    })
+    .expect("save state");
 }
 
 #[test]
@@ -721,5 +789,83 @@ fn monitor_batch_prose_renders_the_digest() {
         call_monitor_ids(&server, &["d-bprose-1"], 0),
         "delegate to `work` finished: all done; target `work`: 5h unknown, 7d unknown; \
          since your last call: credentials file rewritten",
+    );
+}
+
+/// The single background handle reports the digest like every other
+/// digest-bearing reply, and REPORTING CONSUMES IT — the field being rendered
+/// is only half the contract, and the half a `Reseed` or a second `Report`
+/// would break invisibly.
+#[test]
+fn a_background_handle_reports_the_digest_once_and_consumes_it() {
+    let home = HomeSandbox::new();
+    seeded_world();
+    let server = ClauthServer::new();
+
+    let first = call_delegate_background(&server, &home, &["work"]);
+    assert_eq!(
+        first.matches("since your last call").count(),
+        0,
+        "the first digest call seeds, through a handle like anywhere else: {first}",
+    );
+
+    set_mtime(&credentials_path(), t1());
+    let second = call_delegate_background(&server, &home, &["work"]);
+    assert_eq!(
+        second.matches("since your last call").count(),
+        1,
+        "the handle reports what moved, exactly once: {second}",
+    );
+    assert!(
+        second.contains("since your last call: credentials file rewritten"),
+        "and it names what moved: {second}",
+    );
+
+    let after = call_session(&server);
+    assert!(
+        !after.contains("since your last call"),
+        "the handle reported the change, so the handle consumed it: {after}",
+    );
+}
+
+/// A fan-out is ONE call, so its digest rides the reply once, at the top level
+/// after every target's headroom — never folded per job row.
+///
+/// This repo has already shipped the per-row spelling once: nesting the digest
+/// inside each result put it on the first row only, left the renderer with
+/// nothing to print, consumed the delta and dropped it for good
+/// (`docs/plugin-mcp.md`, "Since-your-last-call digest"). A row-level fold is
+/// silent in the prose, so nothing but a count can catch it.
+#[test]
+fn a_fanout_reply_carries_one_top_level_digest_and_no_row_carries_one() {
+    let home = HomeSandbox::new();
+    seeded_world_with_a_second_account();
+    let server = ClauthServer::new();
+
+    let first = call_delegate_background(&server, &home, &["work", "spare"]);
+    assert_eq!(
+        first.matches("since your last call").count(),
+        0,
+        "the first call seeds through a fan-out too: {first}",
+    );
+
+    set_mtime(&credentials_path(), t1());
+    let second = call_delegate_background(&server, &home, &["work", "spare"]);
+    assert_eq!(
+        second.matches("since your last call").count(),
+        1,
+        "one call is one digest: two rows must not each fold a copy, and a row \
+         that folded one would eat the delta the reply then cannot print: {second}",
+    );
+    assert!(
+        second.ends_with("since your last call: credentials file rewritten"),
+        "top level, after both targets' headroom — not spliced between two job \
+         rows: {second}",
+    );
+
+    let after = call_session(&server);
+    assert!(
+        !after.contains("since your last call"),
+        "the fan-out reported the change, so the fan-out consumed it: {after}",
     );
 }

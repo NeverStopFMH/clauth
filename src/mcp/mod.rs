@@ -378,15 +378,18 @@ fn fold_active_live_usage(
 }
 
 /// Which endpoint a delegate's requests actually WENT to, as the roster's own
-/// host spelling — `anthropic` for an account with no effective `base_url`.
-/// `None` when clauth cannot read that account's config, which the renderer
-/// treats as "cannot say" rather than as Anthropic.
+/// host spelling — `anthropic` only for an account routing through neither an
+/// `[env] ANTHROPIC_BASE_URL` nor an effective managed `base_url`. `None` when
+/// clauth cannot read that account's config, which the renderer treats as
+/// "cannot say" rather than as Anthropic.
 ///
-/// The question is "where did this request go", so it reads the stored endpoint
-/// and not `is_third_party` (which answers "is the provider one clauth has a
-/// typed integration for") and not `usage_cache_is_third_party` (which answers
-/// "which cache holds this account's figures"). All three disagree on a generic
-/// api-key endpoint, and only this one bounds what `total_cost_usd` may claim.
+/// The question is "where did this request go", so it reads `stored_endpoint`
+/// (both sources, env first) and not `is_third_party` (which answers "is the
+/// provider one clauth has a typed integration for"), not
+/// `usage_cache_is_third_party` (which answers "which cache holds this
+/// account's figures"), and not `Profile::is_oauth` (which reads the managed
+/// field alone). All four disagree somewhere, and only this one bounds what
+/// `total_cost_usd` may claim.
 ///
 /// Name-keyed rather than threaded from a resolved `Profile`, because
 /// `fold_done_envelope` holds only the job record's name and `load_profile`
@@ -929,12 +932,12 @@ text it had plus a `session_id` to `resume`, rather than paying for that work tw
         if background.unwrap_or(false) {
             match target {
                 Target::One(name) => {
-                    // Refuse a disabled or keyless third-party target BEFORE the
+                    // Refuse a target `delegate` must not spend on BEFORE the
                     // job file is reserved: the caller gets the refusal
                     // synchronously, never a running job whose collected result
-                    // carries it. The blocking path refuses the same pair inside
-                    // `run_delegate`; `resolve_fanout` runs the same pre-flight
-                    // per fan-out member.
+                    // carries it. The blocking path runs the same three gates
+                    // inside `run_delegate`; `resolve_fanout` runs them per
+                    // fan-out member.
                     let target = config.find(&name).ok_or_else(|| {
                         ErrorData::internal_error(
                             "resolved target missing from config".to_string(),

@@ -1200,6 +1200,72 @@ fn a_generic_api_key_target_answers_with_the_figures_clauth_holds() {
     );
 }
 
+/// The cost basis asks where a request GOES, and an operator-authored
+/// `[env] ANTHROPIC_BASE_URL` is where it goes: `build_claude_settings_json`
+/// applies `profile.env` LAST, so such an entry wins over the managed
+/// `base_url` field, and routes the run on its own when there is no managed
+/// field at all. A predicate reading only the managed field prices that run at
+/// Anthropic's card and lets the figure read as the bill.
+///
+/// A minimal pair driven through the REAL stored read: the two accounts differ
+/// only by that env entry.
+#[test]
+fn an_env_authored_endpoint_qualifies_the_cost_clause() {
+    let _home = HomeSandbox::new();
+    crate::profile::save_profile(&crate::profile::Profile::new(
+        "plain".to_string(),
+        None,
+        None,
+    ))
+    .expect("save oauth profile");
+    let mut env_only = crate::profile::Profile::new("envhost".to_string(), None, None);
+    env_only.env.insert(
+        "ANTHROPIC_BASE_URL".to_string(),
+        "https://api.deepseek.com/anthropic".to_string(),
+    );
+    crate::profile::save_profile(&env_only).expect("save env-endpoint profile");
+
+    let priced = |name: &str| {
+        render::delegate_prose(&fold_delegate_live_usage(
+            serde_json::json!({"is_error": false, "result": "ok", "total_cost_usd": 2.06}),
+            name,
+            0,
+            DigestMode::Skip,
+        ))
+    };
+    let plain = priced("plain");
+    assert!(
+        plain.contains("(cost $2.06)"),
+        "control: an account with no endpoint of any kind stays bare: {plain}",
+    );
+    let env_priced = priced("envhost");
+    assert!(
+        env_priced.contains("(cost $2.06 at Anthropic rates, not this endpoint's)"),
+        "an env-only endpoint is still an endpoint: {env_priced}",
+    );
+}
+
+/// The fail-safe arm, driven through the real read rather than a hand-built
+/// payload: a name whose profile config cannot be read at all is `Unknown`,
+/// never `Anthropic`. It earns the qualifier — and its OWN qualifier, because
+/// `not this endpoint's` would assert an endpoint clauth never saw.
+#[test]
+fn an_unreadable_profile_config_prices_as_endpoint_unknown() {
+    let _home = HomeSandbox::new();
+
+    let prose = render::delegate_prose(&fold_delegate_live_usage(
+        serde_json::json!({"is_error": false, "result": "ok", "total_cost_usd": 2.06}),
+        "never-stored",
+        0,
+        DigestMode::Skip,
+    ));
+    assert!(
+        prose.contains("(cost $2.06 at Anthropic rates, endpoint unknown)"),
+        "an unclassifiable target neither reads as Anthropic-priced nor claims \
+         to know the endpoint: {prose}",
+    );
+}
+
 /// The same check against the OTHER shape a provider cache really takes: bars
 /// and a plan label instead of balance rows (a wallet provider writes no `bars`
 /// and no `plan` at all). Both are real captures, so a reader that assumed one

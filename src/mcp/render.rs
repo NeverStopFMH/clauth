@@ -800,21 +800,27 @@ fn envelope_prose(e: &Value) -> String {
         // `total_cost_usd` is the CHILD CLI's own figure, priced against
         // Anthropic's card whatever endpoint served the call, so a DeepSeek or
         // z.ai target's number is a wrong-basis figure a caller reads as the
-        // bill. The bare clause needs a POSITIVE `anthropic`: an unfolded
-        // envelope, or a target clauth could not classify, must not read as
-        // Anthropic-priced. The endpoint arrives as data through the fold —
-        // this file derives no figure the JSON did not carry.
-        let anthropic = e
+        // bill. The endpoint arrives as data through the fold — this file
+        // derives no figure the JSON did not carry.
+        //
+        // Three readings, kept apart for the same reason `live_usage_prose`
+        // keeps its three: only a POSITIVE `anthropic` earns the bare clause;
+        // a named other endpoint is known NOT to be Anthropic's; and an
+        // unfolded envelope, or a target clauth could not classify, knows
+        // neither — saying `not this endpoint's` there would assert an endpoint
+        // nobody read.
+        match e
             .get("live_usage")
             .and_then(|lu| lu.get("endpoint"))
             .and_then(Value::as_str)
-            == Some("anthropic");
-        if anthropic {
-            out.push_str(&format!(" (cost ${cost})"));
-        } else {
-            out.push_str(&format!(
+        {
+            Some("anthropic") => out.push_str(&format!(" (cost ${cost})")),
+            Some(_) => out.push_str(&format!(
                 " (cost ${cost} at Anthropic rates, not this endpoint's)"
-            ));
+            )),
+            None => out.push_str(&format!(
+                " (cost ${cost} at Anthropic rates, endpoint unknown)"
+            )),
         }
     }
     if let Some(u) = e.get("usage") {

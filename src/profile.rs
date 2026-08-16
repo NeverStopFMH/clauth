@@ -1585,12 +1585,18 @@ fn console_config(cred: Option<&ConsoleCredential>) -> ConsoleConfig {
 /// re-loginable (`clear_profile_api_key`). Normalized at the LOAD boundary, same
 /// discipline as the `max_auto_spend` case. This governs the managed base_url
 /// FIELD only: clauth never copies `ANTHROPIC_BASE_URL` into `profile.env`, so an
-/// env override is always operator-authored and is left untouched — normalize
-/// the state clauth authors, not an explicit one.
+/// env override is always operator-authored and is never normalized here —
+/// normalize the state clauth authors, not an explicit one.
 ///
-/// One rule, two readers: [`load_profile`] and
+/// "Never normalized" is not "never read". An env override still ROUTES the
+/// account (`build_claude_settings_json` applies `profile.env` last), so a
+/// caller asking where requests go must ask [`stored_endpoint`], which reads
+/// both sources. This function alone answers only the managed half, which is
+/// why a `None` from it does not mean Anthropic.
+///
+/// One rule, three readers: [`load_profile`],
 /// [`stored_usage_cache_is_third_party`], which answers the same question
-/// without the side effects.
+/// without the side effects, and [`stored_endpoint`]'s managed half.
 fn effective_base_url(
     configured: Option<String>,
     has_credentials: bool,
@@ -1667,15 +1673,20 @@ pub(crate) fn stored_usage_cache_is_third_party(name: &str) -> bool {
 
 /// Where an account's requests actually GO, for a caller holding only a name.
 ///
-/// The question is "which endpoint served this call", the one
-/// [`Profile::is_oauth`] answers for a caller holding a loaded profile — never
-/// "is this a recognised provider" ([`Profile::is_third_party`]) and never
-/// "which cache holds this account's figures"
+/// The question is "which endpoint answers this account's calls" — never "is
+/// this a recognised provider" ([`Profile::is_third_party`]) and never "which
+/// cache holds this account's figures"
 /// ([`Profile::usage_cache_is_third_party`]). The three disagree on a generic
 /// api-key endpoint and on a hybrid, so a reader that borrows the wrong one
 /// inherits its question rather than its answer.
+///
+/// Nor is it [`Profile::is_oauth`], which reads the managed `base_url` field
+/// alone: an account routes through an operator-authored
+/// `[env] ANTHROPIC_BASE_URL` too, and does so even when the managed field is
+/// empty. This type answers over BOTH sources.
 pub(crate) enum StoredEndpoint {
-    /// No effective `base_url`: requests go to Anthropic's own endpoint.
+    /// Requests go to Anthropic's own endpoint: no `[env] ANTHROPIC_BASE_URL`
+    /// and no effective managed `base_url`.
     Anthropic,
     /// Requests go to this endpoint.
     Custom(String),
@@ -1687,10 +1698,22 @@ pub(crate) enum StoredEndpoint {
     Unknown,
 }
 
-/// [`StoredEndpoint`] for `name`, read lock-free the same way
-/// [`stored_usage_cache_is_third_party`] reads its own answer — deliberately
-/// NOT through [`load_profile`], whose staged-rotation recovery takes the
-/// state flock and would invert the lock order under the MCP layer's leaves.
+/// [`StoredEndpoint`] for `name`, off ONE read of its `config.toml`.
+///
+/// Both endpoint sources are consulted, and the profile `[env]` entry wins,
+/// because that is the order the PRODUCER applies them:
+/// [`crate::claude::build_claude_settings_json`] writes the managed `base_url`
+/// into the settings env block and then inserts `profile.env` last, so an
+/// explicit `ANTHROPIC_BASE_URL` there is what the spawned `claude` reads.
+/// Deciding the precedence any other way would describe an endpoint no request
+/// ever reaches. An entry that is blank once trimmed is no override, the same
+/// test [`crate::claude::has_inference_auth`] applies to the env entries it
+/// reads.
+///
+/// Read lock-free the same way [`stored_usage_cache_is_third_party`] reads its
+/// own answer — deliberately NOT through [`load_profile`], whose
+/// staged-rotation recovery takes the state flock and would invert the lock
+/// order under the MCP layer's leaves.
 ///
 /// It carries that read's documented divergence too, in the direction that
 /// fails safe: a profile whose OAuth pair exists only as a staged
@@ -1707,6 +1730,14 @@ pub(crate) fn stored_endpoint(name: &str) -> StoredEndpoint {
     let Ok(config) = toml::from_str::<ProfileConfig>(&raw) else {
         return StoredEndpoint::Unknown;
     };
+    if let Some(url) = config
+        .env
+        .get("ANTHROPIC_BASE_URL")
+        .map(|v| v.trim())
+        .filter(|v| !v.is_empty())
+    {
+        return StoredEndpoint::Custom(url.to_string());
+    }
     let has_credentials = profile_credentials_path(name).is_ok_and(|p| p.exists());
     match effective_base_url(config.base_url, has_credentials, config.api_key.as_deref()) {
         Some(url) => StoredEndpoint::Custom(url),

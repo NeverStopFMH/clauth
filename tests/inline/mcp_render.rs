@@ -928,6 +928,11 @@ fn the_cost_clause_is_bare_only_for_an_anthropic_target() {
 /// The gate's direction, pinned on its own: only a POSITIVE `anthropic` earns
 /// the bare clause. An unfolded envelope, or one whose target clauth could not
 /// classify, must not read as Anthropic-priced.
+///
+/// It gets its OWN qualifier, though. `not this endpoint's` asserts the
+/// endpoint was something else, which is a fact clauth does not hold here —
+/// collapsing "no answer" into "known otherwise" is the same defect the
+/// none-vs-unknown ruling forbids in the other direction.
 #[test]
 fn a_cost_with_no_endpoint_to_read_is_qualified_never_bare() {
     let unfolded = serde_json::json!({
@@ -938,8 +943,10 @@ fn a_cost_with_no_endpoint_to_read_is_qualified_never_bare() {
     });
     assert!(
         delegate_prose(&unfolded)
-            .contains("finished: ok (cost $2.06 at Anthropic rates, not this endpoint's)"),
-        "no `live_usage` at all still qualifies the figure",
+            .contains("finished: ok (cost $2.06 at Anthropic rates, endpoint unknown)"),
+        "no `live_usage` at all still qualifies the figure, without claiming to \
+         know the endpoint: {}",
+        delegate_prose(&unfolded),
     );
 
     let unclassified = serde_json::json!({
@@ -951,7 +958,7 @@ fn a_cost_with_no_endpoint_to_read_is_qualified_never_bare() {
     });
     assert!(
         delegate_prose(&unclassified)
-            .contains("finished: ok (cost $2.06 at Anthropic rates, not this endpoint's)"),
+            .contains("finished: ok (cost $2.06 at Anthropic rates, endpoint unknown)"),
         "a folded payload with no endpoint key qualifies too",
     );
 }

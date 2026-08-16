@@ -93,10 +93,10 @@ fn third_party_headline_skips_value_less_heading_row() {
     // dangling `USD balance:` with nothing after it.
     let s = third_party_stats(
         vec![],
-        vec![row("USD balance", ""), row("total", "$4.20")],
+        vec![row("USD balance", ""), row("api balance", "$4.20")],
         None,
     );
-    assert_eq!(third_party_headline(&s), "total: $4.20");
+    assert_eq!(third_party_headline(&s), "api balance: $4.20");
 }
 
 #[test]
@@ -391,41 +391,50 @@ fn live_usage_prose_names_every_window_and_warns() {
     );
 }
 
-/// The none-vs-unknown ruling, on the headroom clause. A third-party account
-/// has no 5h/7d pool at all — clauth knows that exactly — while an OAuth
-/// account with nothing cached is the one case it genuinely does not know.
-/// Rendering both as `unknown` told the reader clauth had lost track of a state
-/// it knew.
+/// The denial is conditional on what the provider publishes. One that reports
+/// its own `5h`/`7d` bars HAS those limits, so a denial beside them contradicts
+/// the very figure it introduces; one answering with a wallet has none, and the
+/// reader needs telling before reading the amount as a window. A third-party
+/// account with no figure at all denies nothing: the provider's limits are
+/// exactly what clauth cannot answer for there.
 #[test]
-fn windows_prose_separates_a_window_that_cannot_exist_from_one_never_fetched() {
-    // The denial names ANTHROPIC's pool, and the figure names whose account it
-    // belongs to: a provider publishes windows under the same `5h`/`7d` labels
-    // (z.ai reports 5h, 7d and 30d), so a bare `no 5h/7d window` beside them
-    // denies a window and prints one in the same clause.
+fn windows_prose_denies_a_5h_7d_limit_only_where_the_provider_publishes_none() {
     assert_eq!(
         windows_prose(&serde_json::json!({
             "kind": "third_party",
             "balance": "pro: 5h 12.5%, 7d 48%",
+            "provider_windows": true,
         })),
-        "no Anthropic 5h/7d window; provider reports pro: 5h 12.5%, 7d 48%",
+        "pro: 5h 12.5%, 7d 48%",
     );
     assert_eq!(
         windows_prose(&serde_json::json!({
             "kind": "third_party",
-            "balance": "total: 31.45 CNY",
+            "balance": "api balance: 31.45 CNY",
+            "provider_windows": false,
         })),
-        "no Anthropic 5h/7d window; provider reports total: 31.45 CNY",
+        "no 5h/7d limits; api balance: 31.45 CNY",
     );
     assert_eq!(
         windows_prose(&serde_json::json!({"kind": "third_party", "balance": null})),
-        "no Anthropic 5h/7d window; provider usage unknown",
-        "the Anthropic window is none, the provider's figure is genuinely unknown, \
-         and they are different facts",
+        "usage unknown",
+        "no figure means no ground to deny the provider's limits from",
     );
     assert_eq!(
         windows_prose(&serde_json::json!({"kind": "oauth", "windows": []})),
         "usage unknown",
-        "an OAuth account with no cache is the one clauth cannot answer for",
+        "an OAuth account with no cache reads the same way",
+    );
+    // The flag decides, never the text: a bar-shaped figure whose `5h` substring
+    // says "window" is still denied when the flag says scalar, which is what a
+    // substring match on `5h` would get wrong.
+    assert_eq!(
+        windows_prose(&serde_json::json!({
+            "kind": "third_party",
+            "balance": "pro: 5h 12.5%, 7d 48%",
+            "provider_windows": false,
+        })),
+        "no 5h/7d limits; pro: 5h 12.5%, 7d 48%",
     );
 }
 
@@ -442,7 +451,7 @@ fn windows_prose_never_dates_a_figure_it_did_not_print() {
             "fetched_secs_ago": 120,
             "stale": true,
         })),
-        "no Anthropic 5h/7d window; provider usage unknown",
+        "usage unknown",
     );
     assert_eq!(
         windows_prose(&serde_json::json!({
@@ -458,10 +467,22 @@ fn windows_prose_never_dates_a_figure_it_did_not_print() {
     assert_eq!(
         windows_prose(&serde_json::json!({
             "kind": "third_party",
-            "balance": "total: 31.45 CNY",
+            "balance": "api balance: 31.45 CNY",
+            "provider_windows": false,
             "stale": true,
         })),
-        "no Anthropic 5h/7d window; provider reports total: 31.45 CNY (stale)",
+        "no 5h/7d limits; api balance: 31.45 CNY (stale)",
+    );
+    // And on the arm that prints no denial, so the clause rides the FIGURE
+    // rather than whatever text happens to precede it.
+    assert_eq!(
+        windows_prose(&serde_json::json!({
+            "kind": "third_party",
+            "balance": "pro: 5h 12.5%, 7d 48%",
+            "provider_windows": true,
+            "fetched_secs_ago": 240,
+        })),
+        "pro: 5h 12.5%, 7d 48% (cached 4m ago)",
     );
 }
 
@@ -469,8 +490,8 @@ fn windows_prose_never_dates_a_figure_it_did_not_print() {
 fn list_profiles_prose_renders_each_row_with_unknown_for_null_fields() {
     // One carrier per row: the third-party account's figures ride its `windows`
     // object, and the quiet flags follow. The vendor row is the third-party
-    // shape, so its window clause denies Anthropic's pool and reports the
-    // provider's own.
+    // shape a wallet provider writes, so its clause denies the 5h/7d limits that
+    // provider has none of and then reports what it does publish.
     let solo = serde_json::json!({
         "name": "solo",
         "active": true,
@@ -484,7 +505,11 @@ fn list_profiles_prose_renders_each_row_with_unknown_for_null_fields() {
         "provider": "DeepSeek",
         "tier": null,
         "host": "api.deepseek.com",
-        "windows": {"kind": "third_party", "balance": "pro: 5h 50% used"},
+        "windows": {
+            "kind": "third_party",
+            "balance": "api balance: 31.45 CNY",
+            "provider_windows": false,
+        },
         "has_live_session": true,
         "throughput": [{
             "model": "deepseek-chat",
@@ -499,8 +524,8 @@ fn list_profiles_prose_renders_each_row_with_unknown_for_null_fields() {
     assert_eq!(
         text,
         "- solo (active) [anthropic]: usage unknown; tier unknown\n\
-         - vendor [DeepSeek, api.deepseek.com]: no Anthropic 5h/7d window; provider reports \
-         pro: 5h 50% used; live session; throughput: `deepseek-chat` 12.3 tok/s (degraded)"
+         - vendor [DeepSeek, api.deepseek.com]: no 5h/7d limits; api balance: 31.45 CNY; \
+         live session; throughput: `deepseek-chat` 12.3 tok/s (degraded)"
     );
 }
 
@@ -519,8 +544,8 @@ fn list_profiles_prose_handles_empty_roster_and_error_envelope() {
 }
 
 /// The same ruling on the folded live-usage clause: a delegate to an api-key
-/// account reports that account's own figures, denies the pool it cannot draw
-/// on by name, and dates the figure off its own cache.
+/// account reports that account's own figures, denies the limits that account
+/// really lacks, and dates the figure off its own cache.
 #[test]
 fn live_usage_prose_answers_for_a_third_party_target() {
     assert_eq!(
@@ -528,13 +553,26 @@ fn live_usage_prose_answers_for_a_third_party_target() {
             &serde_json::json!({
                 "profile": "vendor",
                 "kind": "third_party",
-                "balance": "total: 31.45 CNY",
+                "balance": "api balance: 31.45 CNY",
+                "provider_windows": false,
                 "fetched_secs_ago": 30,
             }),
             "target",
         ),
-        "target `vendor`: no Anthropic 5h/7d window; provider reports total: 31.45 CNY \
-         (cached 30s ago)",
+        "target `vendor`: no 5h/7d limits; api balance: 31.45 CNY (cached 30s ago)",
+    );
+    assert_eq!(
+        live_usage_prose(
+            &serde_json::json!({
+                "profile": "vendor",
+                "kind": "third_party",
+                "balance": "pro: 5h 12.5%, 7d 48%",
+                "provider_windows": true,
+                "fetched_secs_ago": 30,
+            }),
+            "target",
+        ),
+        "target `vendor`: pro: 5h 12.5%, 7d 48% (cached 30s ago)",
     );
     assert_eq!(
         live_usage_prose(
@@ -545,7 +583,7 @@ fn live_usage_prose_answers_for_a_third_party_target() {
             }),
             "target",
         ),
-        "target `vendor`: no Anthropic 5h/7d window; provider usage unknown",
+        "target `vendor`: usage unknown",
     );
 }
 
@@ -880,7 +918,8 @@ fn delegate_fanout_prose_carries_headroom_per_target_and_one_digest() {
                     "profile": "vendor",
                     "endpoint": "api.deepseek.com",
                     "kind": "third_party",
-                    "balance": "total: 31.45 USD"
+                    "balance": "api balance: 31.45 USD",
+                    "provider_windows": false
                 }
             },
         ],
@@ -890,7 +929,7 @@ fn delegate_fanout_prose_carries_headroom_per_target_and_one_digest() {
         delegate_fanout_prose(&fanout),
         "delegated to `solo` (job `d-7-0`), `vendor` (job `d-7-1`); \
          target `solo`: 5h 12% used, 7d 45.6% used; \
-         target `vendor`: no Anthropic 5h/7d window; provider reports total: 31.45 USD; \
+         target `vendor`: no 5h/7d limits; api balance: 31.45 USD; \
          since your last call: credentials file rewritten",
     );
 }

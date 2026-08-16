@@ -245,7 +245,7 @@ impl OverviewWidths {
             .filter(|p| p.provider == Some(Provider::DeepSeek))
             .filter_map(|p| p.third_party_usage.as_ref())
             .flat_map(|s| s.rows.iter())
-            .filter(|r| r.label == "total")
+            .filter(|r| crate::providers::is_balance_row(&r.label))
             .filter_map(|r| r.value.rsplit_once(' ').map(|(a, _)| a.chars().count()))
             .max()
             .unwrap_or(0);
@@ -564,7 +564,7 @@ fn any_deepseek(app: &App) -> bool {
 /// DeepSeek balance total strings (e.g. `"1.71 USD"`, `"100.00 CNY"`) to show
 /// in the overview cell, sorted by numeric amount descending. All balances above
 /// 0 are included; when none are above 0, only the highest one is returned.
-/// Empty when there is no cached snapshot or no total rows.
+/// Empty when there is no cached snapshot or no balance row.
 fn deepseek_balances_to_show(profile: &Profile) -> Vec<&str> {
     let mut parsed: Vec<(f64, &str)> = profile
         .third_party_usage
@@ -572,7 +572,7 @@ fn deepseek_balances_to_show(profile: &Profile) -> Vec<&str> {
         .map(|s| &s.rows)
         .into_iter()
         .flatten()
-        .filter(|r| r.label == "total")
+        .filter(|r| crate::providers::is_balance_row(&r.label))
         .filter_map(|r| {
             let (amount_str, _) = r.value.rsplit_once(' ')?;
             let amount: f64 = amount_str.parse().ok()?;

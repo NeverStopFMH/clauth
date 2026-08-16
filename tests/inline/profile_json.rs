@@ -75,7 +75,9 @@ fn profile_windows_reads_a_third_party_accounts_own_cache() {
     seed_usage_cache("vendor", &five_hour_at(99.0), Duration::from_secs(10_000));
 
     match profile_windows(&vendor_profile("vendor")) {
-        ProfileWindows::ThirdParty { stats, age_secs } => {
+        ProfileWindows::ThirdParty {
+            stats, age_secs, ..
+        } => {
             let stats = stats.expect("the provider cache on disk parses");
             assert_eq!(
                 stats
@@ -105,7 +107,9 @@ fn profile_windows_leaves_an_unfetched_third_party_account_without_stats() {
     let _home = HomeSandbox::new();
 
     match profile_windows(&vendor_profile("vendor")) {
-        ProfileWindows::ThirdParty { stats, age_secs } => {
+        ProfileWindows::ThirdParty {
+            stats, age_secs, ..
+        } => {
             assert!(stats.is_none(), "nothing has been fetched yet");
             assert!(age_secs.is_none(), "no cache, so no age to report");
         }

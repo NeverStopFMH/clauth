@@ -483,8 +483,26 @@ pub(crate) fn blank_profile(name: &str) -> crate::profile::Profile {
 // Rust agrees with whatever the reader guessed, while these go through the
 // production reader like every real consumer does.
 
-/// The balance shape: `rows` only, no `bars`, and no `plan` key at all.
+/// The balance shape: `rows` only, no `bars`, and no `plan` key at all. Its
+/// wallet row carries the CAPTURED `total`, which is also the label every cache
+/// an older clauth wrote still holds on disk today, and the one the generic
+/// scanner still passes an endpoint's own key through as. Consumers must keep
+/// reading it — [`DEEPSEEK_CACHE_BYTES`] is the same shape at the current
+/// spelling, and the two together are what hold both halves of that.
 pub(crate) const THIRD_PARTY_CACHE_BYTES: &str = r#"{"is_available":true,"rows":[{"label":"CNY balance","value":"","kind":"heading"},{"label":"total","value":"31.45 CNY","kind":"body"},{"label":"granted","value":"0.00 CNY","kind":"body"},{"label":"topped up","value":"31.45 CNY","kind":"body"}],"bars":[],"best_effort":false}"#;
+
+/// [`THIRD_PARTY_CACHE_BYTES`] as the DeepSeek leg writes it now: same capture,
+/// same key set, wallet row at [`crate::providers::DEEPSEEK_BALANCE_ROW_LABEL`].
+/// For a test asserting what a DeepSeek account renders TODAY; the constant
+/// above is what it renders off a cache written before the rename.
+pub(crate) const DEEPSEEK_CACHE_BYTES: &str = r#"{"is_available":true,"rows":[{"label":"CNY balance","value":"","kind":"heading"},{"label":"api balance","value":"31.45 CNY","kind":"body"},{"label":"granted","value":"0.00 CNY","kind":"body"},{"label":"topped up","value":"31.45 CNY","kind":"body"}],"bars":[],"best_effort":false}"#;
+
+/// The third shape, and the one a bar-count reader gets wrong: a provider that
+/// PUBLISHES usage windows answering with none of them. `alibaba::window_bar`
+/// drops a window whose percentage the response omitted and both are optional,
+/// so this is what a qwen account caches when neither arrived — plan and
+/// subscription rows, an empty `bars`, and no wallet anywhere.
+pub(crate) const ALIBABA_NO_BARS_CACHE_BYTES: &str = r#"{"is_available":true,"rows":[{"label":"subscription","value":"","kind":"heading"},{"label":"status","value":"valid","kind":"body"},{"label":"remaining","value":"84 days","kind":"body"}],"bars":[],"plan":"coding plan","best_effort":false}"#;
 
 /// The bar shape: three `bars` under a `plan` label, of which only the longest
 /// window carries `used`/`total`, plus the section-headed row set a token

@@ -315,9 +315,9 @@ fn pct_clause(v: Option<f64>) -> String {
 /// Three readings the clause keeps apart, because collapsing any two of them
 /// tells the reader clauth lost something it holds: no profile at all reads
 /// `none` and names no window (there is no account whose windows could be
-/// reported); a third-party account has no 5h/7d pool to report, so it reads as
-/// the structural none [`windows_prose`] spells; only an OAuth window with
-/// nothing cached reads `unknown`.
+/// reported); a third-party account with a figure reads whichever headroom
+/// [`windows_prose`] renders for it; an account with nothing cached — OAuth or
+/// third-party alike — reads `unknown`.
 pub(crate) fn live_usage_prose(lu: &Value, lead: &str) -> String {
     let Some(name) = lu.get("profile").and_then(Value::as_str) else {
         return format!("{lead} none");
@@ -451,36 +451,43 @@ fn age_clause(v: &Value) -> String {
 /// The headroom clause, off the discriminated payload
 /// [`crate::profile_json::ProfileWindows`] produces: an OAuth account's windows,
 /// or a third-party account's own figures in place of a pool it does not draw
-/// on. An OAuth account with nothing cached is the ONE case that reads
-/// `unknown` — no cache is not a zero, and it is also not a window that cannot
-/// exist.
+/// on. `unknown` answers for an empty cache on either side and for nothing
+/// else — no cache is not a zero. A third-party account with no figure yet says
+/// only that, no denial: what clauth cannot answer for is the provider's own
+/// limits, which is exactly what the denial would be claiming to know.
 ///
-/// The denial names ANTHROPIC's pool rather than `5h/7d` bare, because a
-/// provider publishes windows under those same labels (z.ai reports `5h`, `7d`
-/// and `30d`; Alibaba reports `7d`), and a clause that denies a `5h/7d` window
-/// and prints one in the same breath is a contradiction the reader has to
-/// resolve. `provider reports` then names whose account every following number
-/// belongs to: the denial is about the Anthropic subscription pool every other
-/// 5h/7d figure in clauth refers to, and the rest is this endpoint's own.
+/// A third-party account is told it has no 5h/7d limit only when clauth knows
+/// it has none. A provider that publishes usage windows of its own (z.ai,
+/// Alibaba) HAS the limits whether or not this one response carried any, so a
+/// denial beside its figure is false; a provider answering with a wallet or a
+/// counter (DeepSeek, ollama, a generic endpoint) has none, and saying so is
+/// what stops its figure reading as one more window someone can wait out. The
+/// split is the payload's `provider_windows` flag, decided from the provider
+/// plus the response's bars at the source — matching the rendered figure for a
+/// `5h` substring would make the copy decide its own meaning.
 ///
-/// A freshness clause rides the FIGURE it dates and nothing else, on both arms:
-/// stamping a cache's age onto `unknown` — or onto a structural none — asserts a
-/// measurement clauth does not have.
+/// A freshness clause rides the FIGURE it dates and nothing else: stamping a
+/// cache's age onto `unknown` asserts a measurement clauth does not have.
 fn windows_prose(windows: &Value) -> String {
     match windows.get("kind").and_then(Value::as_str) {
         Some("third_party") => {
-            let mut out = "no Anthropic 5h/7d window".to_string();
-            match windows
+            let Some(figure) = windows
                 .get("balance")
                 .and_then(Value::as_str)
                 .filter(|b| !b.is_empty())
+            else {
+                return "usage unknown".to_string();
+            };
+            let mut out = if windows
+                .get("provider_windows")
+                .and_then(Value::as_bool)
+                .unwrap_or(true)
             {
-                Some(figure) => {
-                    out.push_str(&format!("; provider reports {figure}"));
-                    out.push_str(&freshness_clause(windows));
-                }
-                None => out.push_str("; provider usage unknown"),
-            }
+                figure.to_string()
+            } else {
+                format!("no 5h/7d limits; {figure}")
+            };
+            out.push_str(&freshness_clause(windows));
             out
         }
         Some("oauth") => {

@@ -37,7 +37,10 @@ fn stats_builds_heading_and_body_rows() {
     assert_eq!(stats.rows.len(), 4);
     assert_eq!(stats.rows[0].kind, StatRowKind::Heading);
     assert_eq!(stats.rows[0].label, "USD balance");
-    assert_eq!(stats.rows[1].label, "total");
+    // The literal, not the constant: this row's label is a cross-module contract
+    // (the overview's balance column and the MCP roster's wallet rank both match
+    // on it), so a rename has to red here rather than follow silently.
+    assert_eq!(stats.rows[1].label, "api balance");
     assert_eq!(stats.rows[1].value, "110.00 USD");
     assert!(stats.rows[1..].iter().all(|r| r.kind == StatRowKind::Body));
 }

@@ -1671,6 +1671,30 @@ pub(crate) fn stored_usage_cache_is_third_party(name: &str) -> bool {
     )
 }
 
+/// The recognised [`Provider`] for `name`, read lock-free off one `config.toml`
+/// read the same way [`stored_usage_cache_is_third_party`] reads its own answer.
+/// `None` for an unreadable config, an OAuth account, and a generic api-key
+/// endpoint alike. `profile_windows_for` carries it so the headroom prose can
+/// deny a 5h/7d limit from the PROVIDER rather than from one cached response's
+/// bar count. Classified off the managed `base_url` only, matching the typed
+/// integration an account is scheduled under — an operator-authored
+/// `ANTHROPIC_BASE_URL` reroutes the request but does not change which provider
+/// clauth typed it as.
+pub(crate) fn stored_provider(name: &str) -> Option<Provider> {
+    let Ok(config_path) = profile_config_path(name) else {
+        return None;
+    };
+    let Ok(raw) = std::fs::read_to_string(&config_path) else {
+        return None;
+    };
+    let Ok(config) = toml::from_str::<ProfileConfig>(&raw) else {
+        return None;
+    };
+    let has_credentials = profile_credentials_path(name).is_ok_and(|p| p.exists());
+    let base_url = effective_base_url(config.base_url, has_credentials, config.api_key.as_deref());
+    base_url.as_deref().and_then(Provider::from_base_url)
+}
+
 /// Where an account's requests actually GO, for a caller holding only a name.
 ///
 /// The question is "which endpoint answers this account's calls" — never "is

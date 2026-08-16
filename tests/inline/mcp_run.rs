@@ -1159,12 +1159,12 @@ fn a_running_check_on_a_third_party_target_reports_that_accounts_own_figures() {
     // Shaped-from-a-capture provider-cache bytes through the production reader:
     // the consumer must parse the shape the fetch leg actually writes.
     let cache = crate::profile_cache::profile_cache_path("vendor", THIRD_PARTY_CACHE_FILE).unwrap();
-    std::fs::write(&cache, crate::testutil::THIRD_PARTY_CACHE_BYTES).expect("provider cache");
+    std::fs::write(&cache, crate::testutil::DEEPSEEK_CACHE_BYTES).expect("provider cache");
     seed_running("d-vendor-0", "vendor", now_ms());
 
     let text = monitor_text("d-vendor-0");
     assert!(
-        text.contains("; quota: no Anthropic 5h/7d window; provider reports total: 31.45 CNY"),
+        text.contains("; quota: no 5h/7d limits; api balance: 31.45 CNY"),
         "the target's own cache answers, and the 5h/7d window it cannot have reads as none: {text}",
     );
     assert!(
@@ -1194,7 +1194,7 @@ fn a_generic_api_key_target_answers_with_the_figures_clauth_holds() {
 
     let text = monitor_text("d-generic-0");
     assert!(
-        text.contains("; quota: no Anthropic 5h/7d window; provider reports total: 31.45 CNY"),
+        text.contains("; quota: no 5h/7d limits; total: 31.45 CNY"),
         "a generic endpoint's own cache answers its quota: {text}",
     );
 
@@ -1205,9 +1205,7 @@ fn a_generic_api_key_target_answers_with_the_figures_clauth_holds() {
         DigestMode::Skip,
     ));
     assert!(
-        folded.contains(
-            "target `litellm`: no Anthropic 5h/7d window; provider reports total: 31.45 CNY"
-        ),
+        folded.contains("target `litellm`: no 5h/7d limits; total: 31.45 CNY"),
         "and the same figures ride the delegate footer: {folded}",
     );
 }
@@ -1297,10 +1295,44 @@ fn a_running_check_renders_a_bar_shaped_provider_cache_too() {
 
     let text = monitor_text("d-bars-0");
     assert!(
-        text.contains(
-            "; quota: no Anthropic 5h/7d window; provider reports pro: 5h 12.5%, 7d 48%, 30d 3%"
-        ),
+        text.contains("; quota: pro: 5h 12.5%, 7d 48%, 30d 3%"),
         "the provider's own bars and plan reach the check: {text}",
+    );
+    assert!(
+        !text.contains("no 5h/7d limits"),
+        "a provider publishing 5h and 7d bars is never told it has neither: {text}",
+    );
+}
+
+/// The denial is a claim about the PROVIDER, so an empty bar list is not the
+/// evidence for it. Alibaba's `window_bar` drops a window whose percentage the
+/// response omitted, and both percentages are optional, so a qwen account really
+/// can cache a bar-less response — the operator's own qwen cache carries one
+/// window rather than two today. Reading "no 5h/7d limits" off that empty list
+/// tells a picker the opposite of the truth about an account that has them, on
+/// the surface it routes from. z.ai reaches the same state through an empty
+/// `data.limits`.
+#[test]
+fn a_windows_publishing_provider_is_never_denied_over_a_bar_less_response() {
+    let _home = HomeSandbox::new();
+    crate::profile::save_profile(&crate::profile::Profile::new(
+        "qwen".to_string(),
+        Some("https://token-plan.ap-southeast-1.maas.aliyuncs.com".to_string()),
+        Some("sk-fixture".to_string()),
+    ))
+    .expect("save alibaba profile");
+    let cache = crate::profile_cache::profile_cache_path("qwen", THIRD_PARTY_CACHE_FILE).unwrap();
+    std::fs::write(&cache, crate::testutil::ALIBABA_NO_BARS_CACHE_BYTES).expect("provider cache");
+    seed_running("d-qwen-0", "qwen", now_ms());
+
+    let text = monitor_text("d-qwen-0");
+    assert!(
+        !text.contains("no 5h/7d limits"),
+        "the provider publishes windows whether or not this response carried any: {text}",
+    );
+    assert!(
+        text.contains("; quota: coding plan: status: valid"),
+        "and it still reports whatever the response did carry: {text}",
     );
 }
 
@@ -3921,7 +3953,9 @@ fn roster_rank_reports_free_percent_from_the_best_known_window() {
     assert_eq!(roster_rank("bars"), RosterRank::Window(92.0));
 
     // A balance-only provider ranks on its wallet instead, carrying the currency
-    // so `roster_lines` can keep two of them from ever being compared.
+    // so `roster_lines` can keep two of them from ever being compared. The row is
+    // labelled the way the generic scanner passes an endpoint's own `total` key
+    // through — the spelling DeepSeek no longer uses, and still a wallet.
     write_profile_cache(
         "balance",
         THIRD_PARTY_CACHE_FILE,
@@ -3948,8 +3982,9 @@ fn roster_rank_reports_free_percent_from_the_best_known_window() {
     assert_eq!(roster_rank("never-cached"), RosterRank::Unknown);
 }
 
-/// The wallet parse is deliberately strict. It reads a `total` row, and every
-/// provider writes something into one — z.ai's counts tokens. Anything that is
+/// The wallet parse is deliberately strict. It reads whichever row a provider
+/// singles out as its balance, and every one writes something into one — z.ai's
+/// counts tokens under the `total` spelling. Anything that is
 /// not exactly one finite amount and one currency code describes no wallet, and
 /// a loose parse would mint a rank out of it and order the roster on token counts.
 #[test]
@@ -3992,7 +4027,7 @@ fn parse_balance_takes_an_amount_and_a_currency_and_nothing_else() {
 #[test]
 fn a_two_wallet_profile_ranks_on_the_first_currency_listed() {
     use crate::profile_cache::{THIRD_PARTY_CACHE_FILE, write_profile_cache};
-    use crate::providers::{StatRow, StatRowKind, ThirdPartyStats};
+    use crate::providers::{DEEPSEEK_BALANCE_ROW_LABEL, StatRow, StatRowKind, ThirdPartyStats};
 
     let _home = HomeSandbox::new();
     let row = |label: &str, value: &str| StatRow {
@@ -4008,10 +4043,10 @@ fn a_two_wallet_profile_ranks_on_the_first_currency_listed() {
             is_available: true,
             rows: vec![
                 row("USD balance", ""),
-                row("total", "1.19 USD"),
+                row(DEEPSEEK_BALANCE_ROW_LABEL, "1.19 USD"),
                 row("granted", "0.00 USD"),
                 row("CNY balance", ""),
-                row("total", "1117.65 CNY"),
+                row(DEEPSEEK_BALANCE_ROW_LABEL, "1117.65 CNY"),
             ],
             bars: Vec::new(),
             plan: None,
@@ -4025,7 +4060,7 @@ fn a_two_wallet_profile_ranks_on_the_first_currency_listed() {
             currency: "USD".to_string(),
             amount: 1.19,
         },
-        "the first `total` row wins, not the larger amount",
+        "the first balance row wins, not the larger amount",
     );
 }
 

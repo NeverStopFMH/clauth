@@ -34,6 +34,17 @@ mod deepseek;
 mod generic;
 mod zai;
 
+pub(crate) use deepseek::BALANCE_ROW_LABEL as DEEPSEEK_BALANCE_ROW_LABEL;
+
+/// Whether a `StatRow` label names the account's spendable balance, in either
+/// spelling a cache on disk can carry: the current [`DEEPSEEK_BALANCE_ROW_LABEL`],
+/// or the legacy `total` an older clauth wrote and the generic scanner still
+/// passes an endpoint's own key through as. The three readers that single the
+/// wallet row out all ask this, so a rename lives in one place.
+pub(crate) fn is_balance_row(label: &str) -> bool {
+    label == DEEPSEEK_BALANCE_ROW_LABEL || label == "total"
+}
+
 use serde::{Deserialize, Serialize};
 
 use crate::profile::ConsoleCredential;
@@ -68,6 +79,16 @@ impl Provider {
             Self::Zai => zai::DISPLAY_NAME,
             Self::Alibaba => alibaba::DISPLAY_NAME,
         }
+    }
+
+    /// Whether this provider publishes usage windows of its own (percentage
+    /// bars under 5h/7d-style labels) rather than a scalar balance. `Zai` and
+    /// `Alibaba` do; `DeepSeek` publishes a wallet. The MCP headroom clause
+    /// denies a 5h/7d limit only where it knows the provider has none: a
+    /// windows-publishing provider HAS the limits even when one cached response
+    /// carried no bars.
+    pub(crate) fn publishes_windows(self) -> bool {
+        matches!(self, Self::Zai | Self::Alibaba)
     }
 
     /// The vendor page where this endpoint's api key is minted, for a surface

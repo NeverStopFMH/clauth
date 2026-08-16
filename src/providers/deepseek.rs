@@ -15,6 +15,14 @@ const BALANCE_URL: &str = "https://api.deepseek.com/user/balance";
 /// published by <https://api-docs.deepseek.com/> ("Your First API Call").
 pub(super) const CONSOLE_URL: &str = "https://platform.deepseek.com/api_keys";
 
+/// Label of the row carrying `total_balance` — the amount still spendable, not a
+/// sum of the two rows under it, which is what `total` beside `granted` and
+/// `topped up` reads as. Every consumer that singles this row out matches on
+/// this constant, because the label is the only thing marking it: renaming it at
+/// the producer alone silently empties the overview's balance column and drops a
+/// DeepSeek account out of the roster's balance rank.
+pub(crate) const BALANCE_ROW_LABEL: &str = "api balance";
+
 pub(super) fn matches_base_url(url: &str) -> bool {
     url_matches_host(url, ORIGIN)
 }
@@ -39,7 +47,7 @@ fn stats(raw: &DeepSeekResponse) -> ThirdPartyStats {
             kind: StatRowKind::Heading,
         });
         rows.push(StatRow {
-            label: "total".to_string(),
+            label: BALANCE_ROW_LABEL.to_string(),
             value: format!("{} {}", info.total_balance, info.currency),
             kind: StatRowKind::Body,
         });

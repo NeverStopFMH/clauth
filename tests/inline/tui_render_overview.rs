@@ -240,7 +240,7 @@ fn deepseek_profile(name: &str, totals: &[&str]) -> Profile {
             });
         }
         rows.push(crate::providers::StatRow {
-            label: "total".into(),
+            label: crate::providers::DEEPSEEK_BALANCE_ROW_LABEL.into(),
             value: (*t).to_string(),
             kind: crate::providers::StatRowKind::Body,
         });
@@ -1781,6 +1781,37 @@ fn deepseek_row_shows_total_balance_in_5h_column() {
         cell.chars().count(),
         widths.five_hour,
         "the cell is exactly the column width so the next column does not shift"
+    );
+}
+
+/// The cache on disk outlives the label clauth writes into it. Every DeepSeek
+/// account carries a `third_party_cache.json` an older binary wrote, `profile.rs`
+/// seeds it into `third_party_usage` on every start, and two populations never
+/// get a rewrite at all: a disabled profile is dropped by
+/// `collect_third_party_entries`, and a failing fetch never reaches the arm that
+/// writes. A cell keyed on the current label alone blanks those accounts
+/// permanently, which is why this reads the CAPTURED legacy bytes through the
+/// production reader rather than a row built in Rust.
+#[test]
+fn a_deepseek_cache_written_before_the_rename_still_shows_its_balance() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let stats: crate::providers::ThirdPartyStats =
+        serde_json::from_str(crate::testutil::THIRD_PARTY_CACHE_BYTES)
+            .expect("the captured legacy cache parses");
+    let mut ds = deepseek_profile("ds", &[]);
+    ds.third_party_usage = Some(stats);
+    let app = App::new(config_with(vec![ds], Some("ds"), vec![]));
+
+    let widths = OverviewWidths::new(120, &app);
+    assert_eq!(
+        widths.deepseek_amount_w, 5,
+        "the legacy row still sizes the amount column (from `31.45`), not 0",
+    );
+    let row = render_overview_row(&app, 0, &widths, false, false);
+    let cell = five_hour_cell_text(&widths, true, &row);
+    assert!(
+        cell.starts_with("[31.45 CNY"),
+        "a cache written before the rename still renders its balance: {cell:?}"
     );
 }
 

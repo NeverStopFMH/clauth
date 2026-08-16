@@ -126,6 +126,15 @@ fn load_windows(name: &str) -> (Option<UsageWindow>, Option<UsageWindow>) {
 /// ONE carrier per account — an OAuth account's windows, or the balance/bars a
 /// third-party account publishes in place of a window it does not have — so no
 /// reply can print one account's figure twice or date it in a second place.
+///
+/// `provider_windows` carries the one thing the rendered `balance` string cannot
+/// be asked for: whether this account's PROVIDER publishes usage windows of its
+/// own, or answers with a scalar (a wallet, a counter). A windows-publishing
+/// provider keeps the flag true even when one cached response carried no bars,
+/// because the denial is a claim about the provider, not the response; a
+/// generic endpoint falls back to whether its response carried bars. It rides
+/// the payload because the prose layer never sees the stats — recovering it by
+/// matching the rendered text would tie the copy to a substring of itself.
 fn windows_payload(windows: &ProfileWindows) -> serde_json::Value {
     match windows {
         // An empty array is a missing FIGURE, the one case the prose reads as
@@ -134,9 +143,13 @@ fn windows_payload(windows: &ProfileWindows) -> serde_json::Value {
             "kind": "oauth",
             "windows": usage.as_deref().map(oauth_windows).unwrap_or_default(),
         }),
-        ProfileWindows::ThirdParty { stats, .. } => serde_json::json!({
+        ProfileWindows::ThirdParty {
+            stats, provider, ..
+        } => serde_json::json!({
             "kind": "third_party",
             "balance": stats.as_ref().map(render::third_party_headline),
+            "provider_windows": provider.is_some_and(|p| p.publishes_windows())
+                || stats.as_ref().is_some_and(|s| !s.bars.is_empty()),
         }),
     }
 }
@@ -261,7 +274,7 @@ fn roster_rank(name: &str) -> RosterRank {
     stats
         .rows
         .iter()
-        .find(|r| r.label == "total")
+        .find(|r| crate::providers::is_balance_row(&r.label))
         .and_then(|r| parse_balance(&r.value))
         .map_or(RosterRank::Unknown, |(currency, amount)| {
             RosterRank::Balance { currency, amount }
@@ -269,7 +282,7 @@ fn roster_rank(name: &str) -> RosterRank {
 }
 
 /// `"31.45 USD"` → `("USD", 31.45)`: one finite amount plus one 2-5 letter
-/// ASCII currency code. The narrowness is the point: a `total` row carrying
+/// ASCII currency code. The narrowness is the point: a balance row carrying
 /// anything else (z.ai's `123.4M  (1.2k calls)`, a second word, `nan`/`inf`)
 /// describes no wallet. A loose parse would invent one to rank on. Taking the
 /// FIRST such row is also what lands a profile holding two wallets in exactly

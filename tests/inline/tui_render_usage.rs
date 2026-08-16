@@ -331,6 +331,44 @@ fn tp_rows_empty_key_profile_is_terminal() {
     }
 }
 
+/// `TP_KEY_W` exists so every value in a stat block starts at one column.
+/// `key_cell` widens rather than truncates, so a label longer than the constant
+/// does not clip — it pushes that one row's value right of all its siblings, and
+/// the misalignment reads as a render bug rather than as a too-narrow constant.
+/// The block that catches it is the one with the longest label, DeepSeek's.
+#[test]
+fn tp_body_rows_share_one_value_column() {
+    let mut profile = crate::testutil::blank_profile("ds");
+    profile.base_url = Some("https://api.deepseek.com/anthropic".to_string());
+    profile.provider =
+        crate::providers::Provider::from_base_url("https://api.deepseek.com/anthropic");
+    profile.third_party_usage = Some(
+        serde_json::from_str(crate::testutil::DEEPSEEK_CACHE_BYTES)
+            .expect("the captured balance cache parses"),
+    );
+
+    // A body row is `["  " + key_cell, value]`, so the value's start column is
+    // the width of everything before it.
+    let starts: Vec<(String, usize)> =
+        build_tp_rows(&profile, 52, false, false, ResetFmt::default())
+            .iter()
+            .filter(|l| l.spans.len() == 2)
+            .map(|l| {
+                (
+                    l.spans[0].content.trim().to_string(),
+                    l.spans[0].content.chars().count(),
+                )
+            })
+            .collect();
+
+    assert!(starts.len() >= 3, "the balance block renders: {starts:?}");
+    let first = starts[0].1;
+    assert!(
+        starts.iter().all(|(_, w)| *w == first),
+        "every value starts at the same column: {starts:?}",
+    );
+}
+
 /// An Alibaba profile with a console session but NO api key is the inverse: it
 /// IS scheduled (its quota runs on the console session), so it must keep
 /// loading rather than claim a missing key.

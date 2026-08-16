@@ -79,7 +79,7 @@ fn names_filter_selects_one_profile_case_insensitively() {
         lines(&call_profiles(None, None)),
         vec![
             "- solo (active) [anthropic]: usage unknown; tier unknown",
-            "- vendor [DeepSeek, api.deepseek.com]: no Anthropic 5h/7d window; provider usage unknown; no api key",
+            "- vendor [DeepSeek, api.deepseek.com]: usage unknown; no api key",
         ],
         "fixture control: both profiles are visible unfiltered",
     );
@@ -88,9 +88,7 @@ fn names_filter_selects_one_profile_case_insensitively() {
     // casing.
     assert_eq!(
         lines(&call_profiles(Some(vec!["VENDOR"]), None)),
-        vec![
-            "- vendor [DeepSeek, api.deepseek.com]: no Anthropic 5h/7d window; provider usage unknown; no api key"
-        ],
+        vec!["- vendor [DeepSeek, api.deepseek.com]: usage unknown; no api key"],
     );
     // An empty list is the same ask as no list at all, never "nothing".
     assert_eq!(
@@ -217,13 +215,11 @@ fn keyless_flag_names_only_the_keyless_third_party_profile() {
         "an OAuth profile never carries the keyless clause",
     );
     assert!(
-        !text.contains("keyed [DeepSeek, api.deepseek.com]: no Anthropic 5h/7d window; provider usage unknown; no"),
+        !text.contains("keyed [DeepSeek, api.deepseek.com]: usage unknown; no"),
         "a keyed third-party profile must not carry the keyless clause",
     );
     assert!(
-        text.contains(
-            "- keyless [DeepSeek, api.deepseek.com]: no Anthropic 5h/7d window; provider usage unknown; no api key"
-        ),
+        text.contains("- keyless [DeepSeek, api.deepseek.com]: usage unknown; no api key"),
         "the keyless profile names its missing api key in words: {text}",
     );
 }
@@ -241,9 +237,8 @@ fn prose_names_the_keyless_profile_and_leaves_the_others_unchanged() {
         lines,
         vec![
             "- solo (active) [anthropic]: usage unknown; tier unknown".to_string(),
-            "- keyed [DeepSeek, api.deepseek.com]: no Anthropic 5h/7d window; provider usage unknown".to_string(),
-            "- keyless [DeepSeek, api.deepseek.com]: no Anthropic 5h/7d window; provider usage unknown; no api key"
-                .to_string(),
+            "- keyed [DeepSeek, api.deepseek.com]: usage unknown".to_string(),
+            "- keyless [DeepSeek, api.deepseek.com]: usage unknown; no api key".to_string(),
         ],
         "three lines: the OAuth and keyed lines render as before, the keyless          one names its missing api key in words",
     );
@@ -325,8 +320,7 @@ fn the_three_refusal_markers_render_as_one_group() {
     }));
     assert_eq!(
         line,
-        "- wreck [DeepSeek, api.deepseek.com]: no Anthropic 5h/7d window; provider usage \
-         unknown; live session; disabled; login expired; no api key; subscription canceled",
+        "- wreck [DeepSeek, api.deepseek.com]: usage unknown; live session; disabled; login expired; no api key; subscription canceled",
     );
 }
 
@@ -435,9 +429,7 @@ fn a_generic_api_key_row_reports_its_own_figures_and_claims_no_anthropic_plan() 
 
     let row = lines(&call_profiles(None, None)).remove(0);
     assert_eq!(
-        row,
-        "- litellm (active) [anthropic, 127.0.0.1:4000]: no Anthropic 5h/7d window; \
-         provider reports total: 31.45 CNY",
+        row, "- litellm (active) [anthropic, 127.0.0.1:4000]: no 5h/7d limits; total: 31.45 CNY",
         "the account's own cached figures, and no claim about a plan it cannot have",
     );
 }
@@ -478,8 +470,9 @@ fn a_third_party_session_row_claims_no_unknown_it_structurally_has_none_of() {
         "a third-party account has no plan tier, so none is missing: {row}",
     );
     assert!(
-        row.contains("no Anthropic 5h/7d window"),
-        "and no Anthropic pool either, which is a none rather than an unknown: {row}",
+        row.contains("usage unknown") && !row.contains("no 5h/7d limits"),
+        "and nothing cached about its provider's limits, which is an unknown rather \
+         than a none: {row}",
     );
 }
 

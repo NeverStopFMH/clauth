@@ -10,7 +10,7 @@ use crate::profile::Profile;
 use crate::profile_cache::{
     THIRD_PARTY_CACHE_FILE, USAGE_CACHE_FILE, load_profile_cache, profile_cache_mtime_ms,
 };
-use crate::providers::ThirdPartyStats;
+use crate::providers::{Provider, ThirdPartyStats};
 use crate::usage::{PlanInfo, PlanTier, UsageInfo, now_ms};
 
 /// The last-persisted `/profile` plan for a name, off the same on-disk cache
@@ -139,6 +139,10 @@ pub(crate) enum ProfileWindows {
     ThirdParty {
         stats: Option<ThirdPartyStats>,
         age_secs: Option<u64>,
+        /// The recognised provider, so the prose can decide the 5h/7d denial
+        /// from what the PROVIDER publishes rather than from what one response
+        /// carried. `None` for a generic endpoint.
+        provider: Option<Provider>,
     },
 }
 
@@ -161,7 +165,7 @@ impl ProfileWindows {
 /// Read one account's headroom out of whichever cache its own fetch leg writes,
 /// discriminated by [`ProfileWindows`].
 pub(crate) fn profile_windows(p: &Profile) -> ProfileWindows {
-    windows_of(p.name.as_str(), p.usage_cache_is_third_party())
+    windows_of(p.name.as_str(), p.usage_cache_is_third_party(), p.provider)
 }
 
 /// [`profile_windows`] for a caller holding only a name, classified the same
@@ -170,16 +174,18 @@ pub(crate) fn profile_windows_for(name: &str) -> ProfileWindows {
     windows_of(
         name,
         crate::profile::stored_usage_cache_is_third_party(name),
+        crate::profile::stored_provider(name),
     )
 }
 
-fn windows_of(name: &str, third_party: bool) -> ProfileWindows {
+fn windows_of(name: &str, third_party: bool, provider: Option<Provider>) -> ProfileWindows {
     let file = cache_file_of(third_party);
     let age_secs = cache_age_secs(name, file);
     if third_party {
         return ProfileWindows::ThirdParty {
             stats: load_profile_cache::<ThirdPartyStats>(name, file),
             age_secs,
+            provider,
         };
     }
     ProfileWindows::Oauth {

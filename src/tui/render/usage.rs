@@ -1367,9 +1367,9 @@ fn fmt_amount(n: f64) -> String {
     }
 }
 
-/// Key column width for third-party stat rows (wider than `KEY_W` to fit
-/// labels like "topped up" plus a 1-space gap).
-const TP_KEY_W: usize = 10;
+/// Key column width for third-party stat rows (wider than `KEY_W` to fit the
+/// longest label — DeepSeek's `api balance` — plus a 1-space gap).
+const TP_KEY_W: usize = 11;
 
 fn key_value_span(key: &str, value: &str, value_style: Style) -> Vec<Span<'static>> {
     let mut spans = vec![Span::styled(

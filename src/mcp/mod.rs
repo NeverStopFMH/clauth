@@ -835,8 +835,9 @@ free.\n\n\
 `background: true` returns a `{job_id}` now and the result arrives on its own; prefer it for a \
 slow or third-party target. Two or more `profiles` fan out, one window spent per \
 account; the call waits for every one unless `background: true`. Check, collect or stop a job with `monitor`.\n\n\
-`isolated: true` for a one-shot: no operator `CLAUDE.md`, plugins, hooks, skills or MCP servers, \
-so it bills fewer tokens. Leave it false when the task needs this repo's tools. Either way the \
+`isolated: true` runs a stock `claude`: no operator `CLAUDE.md`, plugins, hooks, skills, subagents \
+or MCP servers, so nothing steers it but `prompt`. Use it to test stock behaviour; leave it false \
+for delegated work, which a native subagent runs with the operator's context loaded. Either way the \
 delegate loads the project `CLAUDE.md` of `cwd`, so point `cwd` at a clean dir for an unrelated \
 one-shot.\n\n\
 A run silent for `idle_secs` is killed and hands back the text it had plus a `session_id` to \

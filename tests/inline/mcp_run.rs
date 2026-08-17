@@ -4089,8 +4089,14 @@ fn the_delegate_description_keeps_its_load_bearing_warnings() {
         "host is free",
         // the background steer
         "prefer it for a slow or third-party target",
-        // the isolated-versus-repo-tools choice
-        "Leave it false when the task needs this repo's tools",
+        // the isolated-versus-shared choice. It used to read "Leave it false
+        // when the task needs this repo's tools"; the owner's 2026-08-17 ruling
+        // widened it from repo-tools work to ALL delegated work, because a
+        // native subagent runs with the operator's context loaded and the
+        // shared default is what matches it.
+        "leave it false for delegated work",
+        // what `isolated` buys, which is the only claim about it that survived
+        "nothing steers it but `prompt`",
         // the cwd footgun
         "point `cwd` at a clean dir",
         // a self-report is not a verified result
@@ -4104,6 +4110,21 @@ fn the_delegate_description_keeps_its_load_bearing_warnings() {
         assert!(
             text.contains(phrase),
             "`delegate` description dropped {phrase:?}: {text}",
+        );
+    }
+
+    // The removal is pinned as hard as the phrases above, so it cannot read as
+    // an accidental deletion and cannot be undone by someone restoring a
+    // "helpful" steer. `isolated: true` was documented as billing fewer tokens;
+    // a controlled A/B on 2026-08-17 measured it billing 15.5% MORE, and the
+    // direction is a property of the operator's own configuration (five MCP
+    // servers push the session over Claude Code's tool-deferral threshold, so
+    // dropping them re-emits every built-in tool schema in full). A description
+    // is per-user text, so neither the claim nor its inverse may ship here.
+    for banned in ["fewer tokens", "cheaper", "bills less"] {
+        assert!(
+            !text.contains(banned),
+            "`delegate` description states a cost claim about `isolated` again ({banned:?}): {text}",
         );
     }
 }

@@ -488,7 +488,8 @@ pub(crate) struct ProfilesArgs {
 pub(crate) struct DelegateArgs {
     /// Which account(s) to run on, in canonical-resolved spelling: one name is
     /// a single delegate (blocking unless `background` is set); two or more is
-    /// a background-only fan-out spending one usage window per account.
+    /// a fan-out spending one usage window per account, blocking unless
+    /// `background` is set.
     profiles: Option<Vec<String>>,
     /// Prompt passed to the delegated `claude -p` session.
     prompt: Option<String>,
@@ -832,8 +833,8 @@ Cost by target: an account with no `host` burns that subscription's 5h window; D
 bills real money; Alibaba Model Studio draws down a prepaid plan; a loopback or LAN host is \
 free.\n\n\
 `background: true` returns a `{job_id}` now and the result arrives on its own; prefer it for a \
-slow or third-party target. Two or more `profiles` always run background, one window spent per \
-account. Check, collect or stop a job with `monitor`.\n\n\
+slow or third-party target. Two or more `profiles` fan out, one window spent per \
+account; the call waits for every one unless `background: true`. Check, collect or stop a job with `monitor`.\n\n\
 `isolated: true` for a one-shot: no operator `CLAUDE.md`, plugins, hooks, skills or MCP servers, \
 so it bills fewer tokens. Leave it false when the task needs this repo's tools. Either way the \
 delegate loads the project `CLAUDE.md` of `cwd`, so point `cwd` at a clean dir for an unrelated \
@@ -917,8 +918,8 @@ talking runs as long as it needs, and `timeout_secs` binds only a run whose `arg
 
         // Which accounts to spend, in canonical spelling, resolved BEFORE any
         // spawn or read. One name is one target (blocking unless `background`);
-        // a fan-out is background-only — blocking N accounts has no sensible
-        // timeout story, so it is refused by name here.
+        // two or more fan out, one delegate per account, blocking unless
+        // `background` is set.
         enum Target {
             One(String),
             Many(Vec<String>),
@@ -932,10 +933,6 @@ talking runs as long as it needs, and `timeout_secs` binds only a run whose `arg
         } else if raw.is_empty() {
             return Ok(delegate_refusal(
                 "`profiles` is empty: name at least one profile",
-            ));
-        } else if !background.unwrap_or(false) {
-            return Ok(delegate_refusal(
-                "`profiles` requires `background: true` for a fan-out",
             ));
         } else {
             match resolve_fanout(&config, &raw) {
@@ -1107,13 +1104,130 @@ talking runs as long as it needs, and `timeout_secs` binds only a run whose `arg
             }
         }
 
-        // Blocking single delegate. A fan-out never reaches here: it is refused
-        // above unless `background` is set.
-        let Target::One(target) = target else {
-            return Err(ErrorData::internal_error(
-                "fan-out reached the blocking path".to_string(),
-                None,
-            ));
+        // Blocking delegates: one name runs one account, several run every
+        // account at once and wait for all of them.
+        let target = match target {
+            Target::One(target) => target,
+            Target::Many(names) => {
+                let extra_args = args.unwrap_or_default();
+                let streaming = !sets_output_format(&extra_args);
+                let opts = BackgroundOpts {
+                    prompt,
+                    model,
+                    cwd,
+                    env: env.unwrap_or_default(),
+                    extra_args,
+                    timeout_secs,
+                    idle_secs,
+                    resume,
+                    isolation,
+                    depth,
+                };
+                // A Handoff and a spawn per member, joined as one; no job file
+                // is minted on the happy path. `opts` clones per member so the
+                // one prompt read serves every account.
+                let mut handles = Vec::with_capacity(names.len());
+                let mut handoffs = Vec::with_capacity(names.len());
+                let mut starts = Vec::with_capacity(names.len());
+                for name in &names {
+                    if let Some(pane) = &self.herdr_pane {
+                        pane.begin();
+                    }
+                    let started_at = now_ms();
+                    starts.push(started_at);
+                    let handoff = Handoff::blocking(MintSpec {
+                        profile: name.clone(),
+                        started_at,
+                        timeout_secs,
+                        idle_secs,
+                        streaming,
+                    });
+                    handles.push(spawn_delegate(
+                        name.clone(),
+                        opts.clone(),
+                        std::sync::Arc::clone(&handoff),
+                        self.herdr_pane.clone(),
+                    ));
+                    handoffs.push(handoff);
+                }
+                let ct = progress.cancel_token();
+                let label = names.join("`, `");
+                let joined = join_all_ticking(
+                    handles,
+                    &ct,
+                    || hand_off_members(&names, &handoffs, &starts),
+                    async move |elapsed: Duration| {
+                        progress
+                            .tick(|| format!("delegate on `{label}` · {}s", elapsed.as_secs()))
+                            .await;
+                    },
+                )
+                .await;
+
+                // The reply's freshness is about when it is written, so the
+                // epoch second is read after every run lands, matching the
+                // single-delegate path.
+                let now = now_epoch_secs();
+                match joined {
+                    JoinedAll::Ran { values, abandoned } => {
+                        let rows = fold_fanout_rows(&names, values, now);
+                        let is_error = fanout_is_error(&rows);
+                        let mut payload = serde_json::json!({ "results": rows });
+                        // One digest for the whole call, top-level beside
+                        // `results`, exactly where the batch collect path
+                        // carries its own.
+                        if let Some(delta) = delegate_digest_mode(&self.digest, abandoned).folded()
+                        {
+                            payload["since_your_last_call"] = delta;
+                        }
+                        let prose = render::delegate_fanout_results_prose(&payload);
+                        if is_error {
+                            return Ok(CallToolResult::error(single_block(prose)));
+                        }
+                        return Ok(CallToolResult::success(single_block(prose)));
+                    }
+                    JoinedAll::HandedOff(members) => {
+                        // The caller abandoned the fan-out while at least one
+                        // child was still spending; every member that handed off
+                        // keeps running as a background job. This reply is never
+                        // sent, for the reason the single path's comment names,
+                        // so it is built for shape and `Skip` keeps the digest
+                        // from consuming a delta into a reply that does not
+                        // exist.
+                        let names_and_ids = members
+                            .iter()
+                            .map(|m| format!("`{}` as job `{}`", m.profile, m.job_id))
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        logline!("clauth: abandoned delegate fan-out continues: {names_and_ids}");
+                        let jobs = members
+                            .into_iter()
+                            .map(|m| {
+                                let HandedOffMember {
+                                    job_id,
+                                    profile,
+                                    started_at,
+                                } = m;
+                                fold_delegate_live_usage(
+                                    serde_json::json!({
+                                        "job_id": job_id,
+                                        "profile": &profile,
+                                        "started_at": started_at,
+                                        "status": "running",
+                                    }),
+                                    &profile,
+                                    now,
+                                    DigestMode::Skip,
+                                )
+                            })
+                            .collect::<Vec<_>>();
+                        let payload = serde_json::json!({ "jobs": jobs });
+                        return Ok(CallToolResult::success(single_block(
+                            render::delegate_fanout_prose(&payload),
+                        )));
+                    }
+                }
+            }
         };
         let extra_args = args.unwrap_or_default();
         // Resolved out here as well as inside the run, because an abandoned call
@@ -1612,6 +1726,91 @@ async fn join_ticking<T>(
     }
 }
 
+/// [`join_ticking`] for a set: joins every handle at once and returns one
+/// `Result` per member, in the order the handles were passed in, so one
+/// member's panic does not discard the siblings' spent windows. The result set
+/// is pre-sized to the member count and filled by index, so a member with no
+/// outcome still holds its slot and the caller's positional fold cannot shift a
+/// later answer onto the wrong account. One tick for the whole set, one abandon
+/// decision for the whole set — the caller's `on_abandon` hands off every member
+/// still spending and returns them; non-empty means the wait is over, empty
+/// means keep joining silently.
+async fn join_all_ticking<T>(
+    handles: Vec<tokio::task::JoinHandle<T>>,
+    ct: &tokio_util::sync::CancellationToken,
+    on_abandon: impl Fn() -> Vec<HandedOffMember>,
+    mut tick: impl AsyncFnMut(Duration),
+) -> JoinedAll<T>
+where
+    T: Send + 'static,
+{
+    // Tokio's clock rather than the std one so a paused-time test measures the
+    // schedule this loop actually keeps.
+    let started = tokio::time::Instant::now();
+    let member_count = handles.len();
+    let mut set = tokio::task::JoinSet::new();
+    for (index, handle) in handles.into_iter().enumerate() {
+        set.spawn(async move { (index, handle.await) });
+    }
+    let mut landed: Vec<Option<std::result::Result<T, String>>> =
+        (0..member_count).map(|_| None).collect();
+    let mut abandoned = false;
+    while !set.is_empty() {
+        tokio::select! {
+            joined = set.join_next() => {
+                match joined {
+                    Some(Ok((index, Ok(value)))) => landed[index] = Some(Ok(value)),
+                    Some(Ok((index, Err(e)))) => {
+                        landed[index] = Some(Err(format!("delegate task panicked: {e}")));
+                    }
+                    // The wrapper task died without its index: unreachable (it
+                    // only awaits a handle, and nothing aborts it), and a
+                    // JoinSet-level error has no member to file it under. The
+                    // slot stays `None` and folds into that member's own
+                    // "result lost" row below, so the siblings keep their places.
+                    Some(Err(e)) => logline!("clauth: delegate fan-out join error: {e}"),
+                    None => {}
+                }
+            }
+            () = ct.cancelled(), if !abandoned => {
+                abandoned = true;
+                let members = on_abandon();
+                if !members.is_empty() {
+                    return JoinedAll::HandedOff(members);
+                }
+            }
+            () = tokio::time::sleep(HEARTBEAT_INTERVAL), if !abandoned => {
+                tick(started.elapsed()).await;
+            }
+        }
+    }
+    let values = landed
+        .into_iter()
+        .map(|slot| slot.unwrap_or_else(|| Err("delegate result lost".to_string())))
+        .collect();
+    JoinedAll::Ran { values, abandoned }
+}
+
+/// How a [`join_all_ticking`] wait ended.
+#[derive(Debug, PartialEq, Eq)]
+enum JoinedAll<T> {
+    /// Every run finished with this wait still on it, one `Result` per member
+    /// in the order the handles were passed in: a panic becomes that member's
+    /// own `Err`, and a member with no outcome reads "result lost", so the set
+    /// is always as long as the member list.
+    ///
+    /// `abandoned` is true when the caller had ALREADY gone and there was
+    /// nothing to hand off for any member, so the results are real but the
+    /// reply built from them is never sent.
+    Ran {
+        values: Vec<std::result::Result<T, String>>,
+        abandoned: bool,
+    },
+    /// The caller went away and at least one member outlived them; every member
+    /// that handed off owns a job file under its id now and finishes on its own.
+    HandedOff(Vec<HandedOffMember>),
+}
+
 /// How a [`join_ticking`] wait ended.
 #[derive(Debug, PartialEq, Eq)]
 enum Joined<T> {
@@ -1627,6 +1826,40 @@ enum Joined<T> {
     HandedOff(String),
 }
 
+/// One fan-out member whose run outlived the caller: the job id it continues
+/// under, plus the account and start time its reply names. Captured at hand-off
+/// time because the run can finalize and move its reservation out of `Converted`
+/// before the abandoned reply is built, hiding the id from a later re-read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct HandedOffMember {
+    job_id: String,
+    profile: String,
+    started_at: u64,
+}
+
+/// Hand off every member still spending, collecting the ones that landed a job
+/// file. `starts` runs parallel to `handoffs` and carries each member's mint
+/// time, so a reply row names the account and its start time without re-reading
+/// a `Handoff` whose state moves as its run lands.
+fn hand_off_members(
+    names: &[String],
+    handoffs: &[std::sync::Arc<Handoff>],
+    starts: &[u64],
+) -> Vec<HandedOffMember> {
+    names
+        .iter()
+        .zip(handoffs.iter().zip(starts))
+        .filter_map(|(name, (handoff, started_at))| match handoff.hand_off() {
+            Abandoned::HandedOff(job_id) => Some(HandedOffMember {
+                job_id,
+                profile: name.clone(),
+                started_at: *started_at,
+            }),
+            Abandoned::Kept => None,
+        })
+        .collect()
+}
+
 /// Which digest mode a blocking `delegate` reply gets.
 ///
 /// Reporting CONSUMES the delta, and a reply to an abandoned request is dropped
@@ -1640,6 +1873,44 @@ fn delegate_digest_mode(digest: &DigestTracker, abandoned: bool) -> DigestMode<'
     } else {
         DigestMode::Report(digest)
     }
+}
+
+/// Fold a fan-out's per-member results into reply rows, in the order named. An
+/// `Err` member becomes its own `is_error` row — a panic or a lost result
+/// — rather than discarding every sibling's spent window. The pure split exists
+/// so a reversed pairing reds a test instead of rendering two identical rows.
+fn fold_fanout_rows(
+    names: &[String],
+    values: Vec<std::result::Result<serde_json::Value, String>>,
+    now: i64,
+) -> Vec<serde_json::Value> {
+    names
+        .iter()
+        .zip(values)
+        .map(|(name, result)| {
+            let envelope = match result {
+                Ok(value) => value,
+                Err(reason) => serde_json::json!({
+                    "profile": name,
+                    "is_error": true,
+                    "result": reason,
+                }),
+            };
+            fold_delegate_live_usage(envelope, name, now, DigestMode::Skip)
+        })
+        .collect()
+}
+
+/// Whether a fan-out's whole result set is error rows. True only when every
+/// row carries `is_error: true` and there is at least one: one bad account in
+/// a fan-out must not hide the rest, and an empty set has nothing to report.
+fn fanout_is_error(rows: &[serde_json::Value]) -> bool {
+    !rows.is_empty()
+        && rows.iter().all(|row| {
+            row.get("is_error")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false)
+        })
 }
 
 /// Floor on a cancelling `monitor`'s wait, so the common case is one call rather

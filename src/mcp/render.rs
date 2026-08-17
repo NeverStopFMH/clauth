@@ -860,6 +860,31 @@ fn envelope_prose(e: &Value) -> String {
     out
 }
 
+/// One `delegate` sync-envelope row: the target account and the envelope prose,
+/// then that account's live-usage clause. No digest — the digest is the reply's
+/// own, folded once by the caller that owns the whole reply.
+fn delegate_row(p: &Value) -> String {
+    let target = p
+        .get("live_usage")
+        .and_then(|lu| lu.get("profile"))
+        .and_then(Value::as_str);
+    let mut out = match target {
+        Some(t) => format!("delegate to `{t}` {}", envelope_prose(p)),
+        None => {
+            let profile = p
+                .get("profile")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown");
+            format!("delegate to `{profile}` {}", envelope_prose(p))
+        }
+    };
+    if let Some(lu) = p.get("live_usage") {
+        out.push_str("; ");
+        out.push_str(&live_usage_prose(lu, "target"));
+    }
+    out
+}
+
 /// Prose for `delegate`: the background handle or the sync envelope. Both carry
 /// the folded live-usage footer and the digest — a handle is a reply about a
 /// spend that just started, and the caller's next routing decision needs the
@@ -886,24 +911,7 @@ pub(crate) fn delegate_prose(p: &Value) -> String {
         }
         return out;
     }
-    let target = p
-        .get("live_usage")
-        .and_then(|lu| lu.get("profile"))
-        .and_then(Value::as_str);
-    let mut out = match target {
-        Some(t) => format!("delegate to `{t}` {}", envelope_prose(p)),
-        None => {
-            let profile = p
-                .get("profile")
-                .and_then(Value::as_str)
-                .unwrap_or("unknown");
-            format!("delegate to `{profile}` {}", envelope_prose(p))
-        }
-    };
-    if let Some(lu) = p.get("live_usage") {
-        out.push_str("; ");
-        out.push_str(&live_usage_prose(lu, "target"));
-    }
+    let mut out = delegate_row(p);
     let digest = digest_prose(&p["since_your_last_call"]);
     if !digest.is_empty() {
         out.push_str("; ");
@@ -971,6 +979,28 @@ pub(crate) fn delegate_fanout_prose(p: &Value) -> String {
     let digest = digest_prose(&p["since_your_last_call"]);
     if !digest.is_empty() {
         out.push_str("; ");
+        out.push_str(&digest);
+    }
+    out
+}
+
+/// Prose for a blocking fan-out's results: one [`delegate_row`] per account,
+/// one per line, then the reply's own digest on a last line when it carries one.
+/// The rows keep caller order; each names the account it spent.
+pub(crate) fn delegate_fanout_results_prose(p: &Value) -> String {
+    let results = p
+        .get("results")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
+    let mut out = results
+        .iter()
+        .map(delegate_row)
+        .collect::<Vec<_>>()
+        .join("\n");
+    let digest = digest_prose(&p["since_your_last_call"]);
+    if !digest.is_empty() {
+        out.push('\n');
         out.push_str(&digest);
     }
     out

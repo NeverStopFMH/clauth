@@ -3491,6 +3491,242 @@ fn an_abandoned_blocking_wait_ends_the_moment_its_run_is_handed_off() {
     assert_eq!(ticks, vec![2, 4], "the ticking stops with the caller");
 }
 
+/// The multi-account sibling of the heartbeat-throttle test: N blocking runs
+/// share one ticker, so the call still re-anchors the client's idle clock on
+/// the same throttle while it waits for all of them.
+#[test]
+fn a_blocking_fanout_ticks_progress_on_the_heartbeat_throttle() {
+    let rt = paused_rt();
+    let ticks = rt.block_on(async {
+        let handles = vec![
+            tokio::spawn(async {
+                tokio::time::sleep(super::HEARTBEAT_INTERVAL * 3 + Duration::from_secs(1)).await;
+                "a"
+            }),
+            tokio::spawn(async {
+                tokio::time::sleep(super::HEARTBEAT_INTERVAL * 3 + Duration::from_secs(1)).await;
+                "b"
+            }),
+        ];
+        let ct = tokio_util::sync::CancellationToken::new();
+        let mut ticks: Vec<u64> = Vec::new();
+        let joined = super::join_all_ticking(
+            handles,
+            &ct,
+            || unreachable!("nothing is abandoned here"),
+            async |elapsed: Duration| {
+                ticks.push(elapsed.as_secs());
+            },
+        )
+        .await;
+        let super::JoinedAll::Ran { values, abandoned } = joined else {
+            panic!("the fan-out lands, it does not hand off");
+        };
+        assert_eq!(values.len(), 2, "each member's own result comes back");
+        assert!(
+            matches!(&values[0], Ok("a")),
+            "the first member keeps its result in caller order: {values:?}",
+        );
+        assert!(
+            matches!(&values[1], Ok("b")),
+            "the second member keeps its result in caller order: {values:?}",
+        );
+        assert!(!abandoned, "nothing was abandoned");
+        ticks
+    });
+    assert_eq!(
+        ticks,
+        vec![2, 4, 6],
+        "one tick per HEARTBEAT_INTERVAL for as long as the fan-out takes, and none after it lands",
+    );
+}
+
+/// A cancelled fan-out with nothing to hand off (every member stopped or
+/// already landed) keeps joining: rmcp awaits the handler bare, and the
+/// results are real even if the reply built from them is never sent.
+#[test]
+fn a_cancelled_blocking_fanout_with_nothing_to_hand_off_still_waits_for_every_child() {
+    let rt = paused_rt();
+    let ticks = rt.block_on(async {
+        let handles = vec![
+            tokio::spawn(async {
+                tokio::time::sleep(Duration::from_secs(11)).await;
+                "a"
+            }),
+            tokio::spawn(async {
+                tokio::time::sleep(Duration::from_secs(11)).await;
+                "b"
+            }),
+        ];
+        let ct = tokio_util::sync::CancellationToken::new();
+        let firing = ct.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            firing.cancel();
+        });
+        let mut ticks: Vec<u64> = Vec::new();
+        let joined = super::join_all_ticking(handles, &ct, Vec::new, async |elapsed: Duration| {
+            ticks.push(elapsed.as_secs());
+        })
+        .await;
+        let super::JoinedAll::Ran { values, abandoned } = joined else {
+            panic!("a cancelled fan-out with nothing to hand off still joins");
+        };
+        assert_eq!(values.len(), 2, "every child is awaited to completion");
+        assert!(
+            matches!(&values[0], Ok("a")),
+            "the first child's result is kept: {values:?}",
+        );
+        assert!(
+            matches!(&values[1], Ok("b")),
+            "the second child's result is kept: {values:?}",
+        );
+        assert!(
+            abandoned,
+            "the set is flagged as reached after the caller left",
+        );
+        ticks
+    });
+    assert_eq!(
+        ticks,
+        vec![2, 4],
+        "every beat before the cancel fires, and none after",
+    );
+}
+
+/// The fan-out side of the hand-off: when the caller goes away, every member
+/// still spending is handed off to its own job file and the wait ends at the
+/// cancel rather than sitting out N runs whose results now land on disk. The
+/// closure is the real one, each collected member is checked against the job
+/// file it minted, and one member reaches `finalize` inside the abandon window
+/// so the collected id is proven to survive a run that lands after its hand-off.
+#[test]
+fn an_abandoned_blocking_fanout_hands_every_member_off() {
+    let home = crate::testutil::HomeSandbox::new();
+    let rt = paused_rt();
+    let (joined, ticks, elapsed) = rt.block_on(async {
+        let started = tokio::time::Instant::now();
+        let names = vec!["solo".to_string(), "vendor".to_string()];
+        let starts = vec![900_000u64, 900_001u64];
+        let handoffs: Vec<std::sync::Arc<super::Handoff>> = names
+            .iter()
+            .zip(&starts)
+            .map(|(name, started_at)| {
+                let handoff = super::Handoff::blocking(super::MintSpec {
+                    profile: name.clone(),
+                    started_at: *started_at,
+                    timeout_secs: None,
+                    idle_secs: None,
+                    streaming: true,
+                });
+                handoff.mark_spawned();
+                handoff
+            })
+            .collect();
+        let handles = vec![
+            tokio::spawn(async {
+                tokio::time::sleep(Duration::from_secs(600)).await;
+                "a"
+            }),
+            tokio::spawn(async {
+                tokio::time::sleep(Duration::from_secs(600)).await;
+                "b"
+            }),
+        ];
+        let ct = tokio_util::sync::CancellationToken::new();
+        let firing = ct.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            firing.cancel();
+        });
+        let mut ticks: Vec<u64> = Vec::new();
+        let joined = super::join_all_ticking(
+            handles,
+            &ct,
+            || {
+                let members = super::hand_off_members(&names, &handoffs, &starts);
+                // The solo member's run lands right after its hand-off, moving
+                // it to `Finished` before the reply reads anything.
+                handoffs[0].finalize(&serde_json::json!({ "result": "done" }));
+                assert!(
+                    handoffs[0].spec().is_none(),
+                    "the finalized member reached Finished",
+                );
+                members
+            },
+            async |elapsed: Duration| {
+                ticks.push(elapsed.as_secs());
+            },
+        )
+        .await;
+        (joined, ticks, started.elapsed())
+    });
+    let super::JoinedAll::HandedOff(members) = joined else {
+        panic!("the fan-out hands every member off, it does not land");
+    };
+    assert_eq!(members.len(), 2, "every member is handed off");
+    for member in &members {
+        let expected_start = match member.profile.as_str() {
+            "solo" => 900_000,
+            "vendor" => 900_001,
+            other => panic!("unexpected member profile {other}"),
+        };
+        assert_eq!(
+            member.started_at, expected_start,
+            "the member's start time travels with its account",
+        );
+        assert!(
+            member.job_id.starts_with(&format!("d-{expected_start}-")),
+            "the job id is minted from its own member's start time: {}",
+            member.job_id,
+        );
+        let job_file = home
+            .home()
+            .join(".clauth/jobs")
+            .join(format!("{}.json", member.job_id));
+        assert!(
+            job_file.exists(),
+            "the collected id names a job file that actually landed: {}",
+            member.job_id,
+        );
+    }
+    assert_eq!(
+        elapsed,
+        Duration::from_secs(5),
+        "and returns at the cancel, not at the runs' own end",
+    );
+    assert_eq!(ticks, vec![2, 4], "the ticking stops with the caller");
+}
+
+/// One member's task panic must not throw away every sibling's spent window:
+/// each member comes back as its own `Result` in caller order, and the healthy
+/// ones keep their envelopes.
+#[test]
+fn a_blocking_fanout_keeps_every_sibling_when_one_member_panics() {
+    let rt = paused_rt();
+    let joined = rt.block_on(async {
+        let handles = vec![
+            tokio::spawn(async { "healthy" }),
+            tokio::spawn(async { panic!("boom") }),
+        ];
+        let ct = tokio_util::sync::CancellationToken::new();
+        super::join_all_ticking(handles, &ct, Vec::new, async |_elapsed: Duration| {}).await
+    });
+    let super::JoinedAll::Ran { values, abandoned } = joined else {
+        panic!("every member lands as a result, the set does not hand off");
+    };
+    assert!(!abandoned, "nothing was abandoned");
+    assert_eq!(values.len(), 2, "both members come back");
+    assert!(
+        values[0].is_ok(),
+        "the healthy member keeps its result: {values:?}",
+    );
+    assert!(
+        values[1].is_err(),
+        "the panicking member reports its own error: {values:?}",
+    );
+}
+
 /// The token-less peer degrades exactly the way `monitor`'s waits do: nothing is
 /// sent, and the wait itself is untouched. `ProgressSink::none()` is that peer,
 /// not test scaffolding, which is why every blocking-`delegate` test in this

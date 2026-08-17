@@ -946,6 +946,44 @@ fn delegate_fanout_prose_carries_headroom_per_target_and_one_digest() {
     );
 }
 
+/// A blocking fan-out's results: one row per account in caller order, each with
+/// its own live-usage clause, then the reply's digest on its own last line.
+#[test]
+fn delegate_fanout_results_prose_names_each_row_and_digest_last() {
+    let payload = serde_json::json!({
+        "results": [
+            {
+                "profile": "solo",
+                "result": "ok",
+                "live_usage": {
+                    "profile": "solo",
+                    "endpoint": "anthropic",
+                    "5h_used_pct": 12.0,
+                    "7d_used_pct": 45.6
+                }
+            },
+            {
+                "profile": "vendor",
+                "result": "done",
+                "live_usage": {
+                    "profile": "vendor",
+                    "endpoint": "api.deepseek.com",
+                    "kind": "third_party",
+                    "balance": "api balance: 31.45 USD",
+                    "provider_windows": false
+                }
+            },
+        ],
+        "since_your_last_call": {"credentials": true}
+    });
+    assert_eq!(
+        delegate_fanout_results_prose(&payload),
+        "delegate to `solo` finished: ok; target `solo`: 5h 12% used, 7d 45.6% used\n\
+         delegate to `vendor` finished: done; target `vendor`: no 5h/7d limits; api balance: 31.45 USD\n\
+         since your last call: credentials file rewritten",
+    );
+}
+
 /// `total_cost_usd` is the child CLI's own figure, priced against Anthropic's
 /// rate card whatever endpoint served the call. So the bare clause is gated on
 /// where the request actually WENT — the target's own endpoint, threaded

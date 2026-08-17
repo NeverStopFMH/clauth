@@ -3,7 +3,8 @@
 
 //! Guard coverage for `delegate`'s two new inputs: `prompt_file` (a reusable
 //! prompt read from disk, validated against the delegate's `cwd`) and
-//! `profiles` (a background-only fan-out that spends one window per account).
+//! `profiles` (a fan-out that spends one window per account, blocking unless
+//! `background` is set).
 //!
 //! Every refusal here is pinned on the reason it names, so a guard dropped
 //! during a later edit fails its test rather than silently passing.
@@ -538,17 +539,16 @@ fn profiles_unknown_is_refused_by_name() {
     assert_refusal(&result, &["profile not found: ghost"]);
 }
 
-/// A fan-out (two or more names) is background-only: blocking N accounts has
-/// no sensible timeout story. ONE name without `background` is the ordinary
-/// blocking single delegate and must not refuse — that arm moved here from the
-/// deleted `profile` field.
+/// One name without `background` is the ordinary blocking single delegate. Two
+/// or more names without `background` fan out: the old background-only refusal
+/// is gone, so a bad member now refuses at resolution like any other fan-out.
 #[test]
-fn a_blocking_fanout_is_refused_but_one_name_is_not() {
+fn a_blocking_single_delegate_is_not_a_fanout_and_a_fanout_resolves_members() {
     let _home = HomeSandbox::new();
     seed_profiles(&["solo"], false);
 
     // One name, blocking: reaches the prompt/target validation, so it must
-    // NOT refuse with the fan-out guard. `solo` is real, so the refusal-free
+    // NOT refuse with any fan-out guard. `solo` is real, so the refusal-free
     // path runs straight to the cwd gate.
     let single = call_delegate(DelegateArgs {
         profiles: Some(vec!["solo".to_string()]),
@@ -558,17 +558,15 @@ fn a_blocking_fanout_is_refused_but_one_name_is_not() {
     });
     assert_refusal(&single, &["cwd does not exist or is not a directory"]);
 
-    // Two names, blocking: the fan-out guard refuses before any resolution.
+    // Two names, blocking, one unknown: the fan-out resolves every member and
+    // refuses the unknown one by name, never with the deleted guard.
     let fanout = call_delegate(DelegateArgs {
         profiles: Some(vec!["solo".to_string(), "vendor".to_string()]),
         prompt: Some("hi".to_string()),
         background: None,
         ..base()
     });
-    assert_refusal(
-        &fanout,
-        &["`profiles` requires `background: true` for a fan-out"],
-    );
+    assert_refusal(&fanout, &["profile not found: vendor"]);
 }
 
 /// A reserve failure refuses before any spawn: with the jobs dir replaced by a
@@ -822,6 +820,51 @@ fn a_valid_fanout_returns_one_job_per_account() {
     wait_for_jobs_done(2);
 }
 
+/// Two or more names without `background` now fan out and wait for every
+/// account, returning one row per account in the order named, all in one
+/// content block. The nonexistent cwd stops each run at the cwd gate, so no
+/// `claude` spawns on the blank enabled profiles.
+#[test]
+fn a_blocking_fanout_returns_one_row_per_account_in_order_named() {
+    let home = HomeSandbox::new();
+    seed_profiles(&["solo", "vendor"], false);
+
+    let result = call_delegate(DelegateArgs {
+        profiles: Some(vec!["solo".to_string(), "VENDOR".to_string()]),
+        prompt: Some("hi".to_string()),
+        background: None,
+        cwd: Some(
+            home.home()
+                .join("does-not-exist")
+                .to_str()
+                .unwrap()
+                .to_string(),
+        ),
+        ..base()
+    });
+    assert_eq!(
+        result.content.len(),
+        1,
+        "one content block carries every row"
+    );
+    let text = first_text(&result);
+    let rows: Vec<&str> = text.lines().collect();
+    assert_eq!(rows.len(), 2, "one row per account: {text}");
+    assert!(
+        rows[0].starts_with("delegate to `solo` "),
+        "the first row names the first account, in the order named: {text}",
+    );
+    assert!(
+        rows[1].starts_with("delegate to `vendor` "),
+        "the second row names the second account, case canonicalised: {text}",
+    );
+    assert!(
+        text.contains("target `solo`: 5h unknown, 7d unknown")
+            && text.contains("target `vendor`: 5h unknown, 7d unknown"),
+        "each row carries its own headroom: {text}",
+    );
+}
+
 /// The tool description steers a slow or third-party target to `background`,
 /// and two doc lines promise `delegate` carries live usage — so the recommended
 /// path must not be the uninformed one. The handle reply carries the target's
@@ -932,7 +975,7 @@ fn prose_refusals_read_as_a_sentence_and_stay_one_block() {
     });
     assert_prose_refusal(
         &blocking,
-        &["delegate failed: `profiles` requires `background: true` for a fan-out"],
+        &["delegate failed: profile not found: solo, vendor"],
     );
 }
 
@@ -981,4 +1024,183 @@ fn fanout_prose_names_each_target_with_its_job() {
     );
 
     wait_for_jobs_done(2);
+}
+
+/// [`fanout_is_error`] is true only when every row errored: one bad account in
+/// a fan-out must not hide the others' answers, and an empty set has nothing
+/// to report.
+#[test]
+fn fanout_is_error_requires_every_row_errored() {
+    let err = |profile: &str| {
+        serde_json::json!({
+            "profile": profile,
+            "is_error": true,
+            "result": "boom",
+        })
+    };
+    let ok = |profile: &str| {
+        serde_json::json!({
+            "profile": profile,
+            "is_error": false,
+            "result": "fine",
+        })
+    };
+    assert!(
+        fanout_is_error(&[err("a"), err("b")]),
+        "all errors is an error set"
+    );
+    assert!(
+        !fanout_is_error(&[err("a"), ok("b")]),
+        "one clean answer clears the set"
+    );
+    assert!(!fanout_is_error(&[]), "an empty set has nothing to report");
+}
+
+/// The row-building loop pairs each account's own envelope with its name: with
+/// two distinguishable envelopes, a reversed zip would render the wrong answer
+/// under each name.
+#[test]
+fn fold_fanout_rows_pairs_each_envelope_with_its_own_account() {
+    let _home = HomeSandbox::new();
+    let names = vec!["solo".to_string(), "vendor".to_string()];
+    let rows = fold_fanout_rows(
+        &names,
+        vec![
+            Ok(serde_json::json!({ "result": "solo-out" })),
+            Ok(serde_json::json!({ "result": "vendor-out" })),
+        ],
+        0,
+    );
+    assert_eq!(rows.len(), 2, "one row per account");
+    assert_eq!(
+        rows[0]["result"].as_str(),
+        Some("solo-out"),
+        "the first row carries the first account's envelope",
+    );
+    assert_eq!(
+        rows[1]["result"].as_str(),
+        Some("vendor-out"),
+        "the second row carries the second account's envelope",
+    );
+    assert_eq!(
+        rows[0]["live_usage"]["profile"].as_str(),
+        Some("solo"),
+        "the first row is folded under the first name",
+    );
+    assert_eq!(
+        rows[1]["live_usage"]["profile"].as_str(),
+        Some("vendor"),
+        "the second row is folded under the second name",
+    );
+}
+
+/// A member whose task died becomes its own error row; the siblings' envelopes
+/// pass through untouched.
+#[test]
+fn fold_fanout_rows_turns_one_members_error_into_its_own_row() {
+    let _home = HomeSandbox::new();
+    let names = vec!["solo".to_string(), "vendor".to_string()];
+    let rows = fold_fanout_rows(
+        &names,
+        vec![
+            Ok(serde_json::json!({ "result": "fine" })),
+            Err("delegate task panicked: task 0 panicked".to_string()),
+        ],
+        0,
+    );
+    assert_eq!(rows.len(), 2, "both members produce a row");
+    assert_ne!(
+        rows[0].get("is_error").and_then(|v| v.as_bool()),
+        Some(true),
+        "the healthy member stays clean",
+    );
+    assert_eq!(
+        rows[1].get("is_error").and_then(|v| v.as_bool()),
+        Some(true),
+        "the failed member is an error row",
+    );
+    assert!(
+        rows[1]["result"]
+            .as_str()
+            .is_some_and(|s| s.contains("delegate task panicked")),
+        "the error row names the panic: {}",
+        rows[1]["result"],
+    );
+    assert_eq!(
+        rows[1]["live_usage"]["profile"].as_str(),
+        Some("vendor"),
+        "the error row still names its own account",
+    );
+}
+
+/// A member with no outcome at all (its join slot never filled) still holds
+/// its place in the result set, so a later answer cannot shift onto its name.
+#[test]
+fn fold_fanout_rows_keeps_a_lost_member_in_its_own_slot() {
+    let _home = HomeSandbox::new();
+    let names = vec![
+        "solo".to_string(),
+        "vendor".to_string(),
+        "kerry".to_string(),
+    ];
+    let rows = fold_fanout_rows(
+        &names,
+        vec![
+            Ok(serde_json::json!({ "result": "solo-out" })),
+            Err("delegate result lost".to_string()),
+            Ok(serde_json::json!({ "result": "kerry-out" })),
+        ],
+        0,
+    );
+    assert_eq!(rows.len(), 3, "one row per account, none shifted away");
+    assert_eq!(
+        rows[0]["result"].as_str(),
+        Some("solo-out"),
+        "the first account keeps its own envelope",
+    );
+    assert_eq!(
+        rows[1].get("is_error").and_then(|v| v.as_bool()),
+        Some(true),
+        "the lost member is its own error row",
+    );
+    assert_eq!(
+        rows[1]["result"].as_str(),
+        Some("delegate result lost"),
+        "the lost row names what happened",
+    );
+    assert_eq!(
+        rows[2]["result"].as_str(),
+        Some("kerry-out"),
+        "the third account's envelope did not shift onto the second name",
+    );
+    assert_eq!(
+        rows[2]["live_usage"]["profile"].as_str(),
+        Some("kerry"),
+        "the third row is still folded under the third name",
+    );
+}
+
+/// The fold uses the reply's own time for throughput freshness: a rate-limit
+/// recorded `now` reads as recent, and one past the recent window does not.
+/// This is what a pre-run `now` would get wrong on a long fan-out.
+#[test]
+fn fold_fanout_rows_ages_a_rate_limit_off_after_the_recent_window() {
+    let _home = HomeSandbox::new();
+    crate::throughput::record_rate_limit("solo", Some("claude-opus"), Some(10), 1_000);
+    let names = vec!["solo".to_string()];
+    let envelope = || Ok(serde_json::json!({ "result": "boom" }));
+    let fresh = fold_fanout_rows(&names, vec![envelope()], 1_000);
+    assert!(
+        fresh[0]["live_usage"]["throughput_warning"]
+            .as_str()
+            .is_some_and(|s| s.contains("rate-limited")),
+        "a rate-limit inside the recent window is flagged: {}",
+        fresh[0]["live_usage"],
+    );
+    let stale = fold_fanout_rows(&names, vec![envelope()], 2_000);
+    assert!(
+        stale[0]["live_usage"].get("throughput_warning").is_none(),
+        "a rate-limit past the recent window ages off: {}",
+        stale[0]["live_usage"],
+    );
 }

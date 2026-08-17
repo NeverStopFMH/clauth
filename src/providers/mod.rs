@@ -21,7 +21,10 @@
 //!    render layer reads the same one). A provider whose usage credential can
 //!    die with no refresh path returns [`ThirdPartyError::AuthExpired`] rather
 //!    than a generic failure, which is what stops the cadence and tells the
-//!    operator to re-authenticate instead of waiting.
+//!    operator to re-authenticate instead of waiting. The shared `get_json`
+//!    already maps a 401 to it — a dead api key has no refresh path either — so
+//!    a provider only needs to produce the verdict itself when its credential
+//!    is session-shaped (Alibaba) and the death arrives in an HTTP 200 body.
 //!
 //! No render-layer changes needed — [`ThirdPartyStats`] carries provider-agnostic
 //! [`UsageBar`]s (percentage windows) and [`StatRow`]s (text), which
@@ -328,9 +331,11 @@ pub(crate) enum StatRowKind {
 
 #[derive(Debug)]
 pub(crate) enum ThirdPartyError {
-    /// Provider returned a non-429 >=400 status (e.g. 401 bad key). The caller
-    /// doesn't branch on the code — third-party profiles have no chain to
-    /// rotate — so it collapses to a cache-fallback like `Network`/`Parse`.
+    /// Provider returned a non-429, non-401 >=400 status. The caller doesn't
+    /// branch on the code — third-party profiles have no chain to rotate — so
+    /// it collapses to a cache-fallback like `Network`/`Parse`. A 401 never
+    /// reaches this variant: the shared `get_json` maps it to [`AuthExpired`],
+    /// since a dead api key can never succeed on retry.
     Status,
     /// HTTP 429. `retry_after` is the server's `retry-after` header in
     /// delta-seconds form (the HTTP-date form is treated as absent), used to
@@ -344,8 +349,9 @@ pub(crate) enum ThirdPartyError {
     /// refresh path exists — only an operator re-login clears it. Distinct from
     /// `Status` because retrying on the cadence can never succeed: the scheduler
     /// session-suppresses this profile and the UI names the login instead of a
-    /// network fault. Alibaba's 48-hour console session is the case that needs
-    /// it (the verdict rides an HTTP 200 body).
+    /// network fault. Two producers: a 401 from the shared `get_json` (a dead
+    /// api key), and Alibaba's 48-hour console session (the verdict rides an
+    /// HTTP 200 body).
     AuthExpired,
 }
 
@@ -365,6 +371,14 @@ fn get_json(url: &str, api_key: &str) -> Result<String, ThirdPartyError> {
             .and_then(|v| v.to_str().ok())
             .and_then(crate::usage::parse_retry_after);
         return Err(ThirdPartyError::RateLimited { retry_after });
+    }
+    if status == 401 {
+        // The api key is dead for this host and no refresh path exists, so
+        // retrying on the cadence can never succeed — `AuthExpired` is what
+        // stops the poll and names a key re-entry instead of a network fault.
+        // Shared by every api-key fetch: the typed providers and the generic
+        // prober alike.
+        return Err(ThirdPartyError::AuthExpired);
     }
     if status >= 400 {
         return Err(ThirdPartyError::Status);

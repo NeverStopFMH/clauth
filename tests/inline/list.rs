@@ -325,3 +325,35 @@ fn a_profile_that_never_stored_a_session_is_told_it_needs_one() {
         "nothing lapsed here, so nothing may say it did, got:\n{table}"
     );
 }
+
+/// A non-Alibaba profile has no session to lapse, so its `AuthExpired` can only
+/// mean the api key was rejected — the suffix must say so, or the operator goes
+/// hunting for a login that does not exist.
+#[test]
+fn a_dead_api_key_is_told_the_key_was_rejected() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let base = "https://api.deepseek.com/anthropic";
+    let mut p = crate::profile::Profile::new("deepseek".to_string(), Some(base.to_string()), None);
+    p.provider = crate::providers::Provider::from_base_url(base);
+    p.api_key = Some("sk-revoked".to_string());
+    let config = AppConfig {
+        state: crate::profile::AppState {
+            profiles: vec!["deepseek".into()],
+            ..crate::profile::AppState::default()
+        },
+        profiles: vec![p],
+    };
+    let fp = crate::usage::profile_credential_fingerprint(&config.profiles[0]).unwrap();
+    crate::profile_cache::write_auth_expired("deepseek", fp);
+
+    let body = crate::daemon::build_status(&config, 300_000, None, false);
+    let table = render_table(&config, &body);
+    assert!(
+        table.contains("key rejected"),
+        "a dead api key is not a login problem, got:\n{table}"
+    );
+    assert!(
+        !table.contains("login"),
+        "no session exists to name, got:\n{table}"
+    );
+}

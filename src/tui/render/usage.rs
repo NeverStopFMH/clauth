@@ -23,7 +23,7 @@ use super::panes::{
 };
 use crate::format::{account_tier, format_pct};
 use crate::profile::Profile;
-use crate::providers::StatRowKind;
+use crate::providers::{Provider, StatRowKind};
 use crate::usage::{
     ExtraPeriod, FetchStatus, KickBlock, ProfileActivity, StreakCounts, UsageWindow, WindowDollars,
     ideal_pace_pct, is_stuck_streak, kick_block_switch_grade, now_epoch_secs, now_ms,
@@ -986,14 +986,17 @@ fn status_lines(profile: &Profile, header: &HeaderState, inner_w: u16) -> Vec<Li
             // next attempt to count down to. Only a re-login (or a manual
             // refresh, which retries once) moves this.
             //
-            // "expired" only when a session actually lapsed. An account that
-            // never stored one reaches this state too — a working api key does
-            // not authenticate the usage gateway — and telling that operator
-            // something expired sends them hunting for what to renew instead of
-            // to the login they have not run. Same split the terminal message
-            // below makes.
+            // Three dead-credential causes read as three labels. "expired" only
+            // when a session actually lapsed; an account that never stored one
+            // reaches this state too (a working api key does not authenticate
+            // the usage gateway), and telling that operator something expired
+            // sends them hunting for what to renew instead of to the login they
+            // have not run. A non-Alibaba profile has no session at all, so its
+            // verdict can only mean the api key itself was rejected.
             let label = if profile.console.is_some() {
                 "login expired"
+            } else if profile.provider != Some(Provider::Alibaba) {
+                "key rejected"
             } else {
                 "login needed"
             };
@@ -1216,11 +1219,16 @@ fn build_tp_rows(
             match profile.fetch_status {
                 Some(FetchStatus::Failed) => "no usage available",
                 Some(FetchStatus::RateLimited) => "rate limited, retrying",
-                // The two ways a provider's usage credential can be unusable
-                // read differently to the operator, and the profile itself says
-                // which one this is.
+                // The ways a provider's usage credential can be unusable read
+                // differently to the operator, and the profile itself says
+                // which one this is: a lapsed or never-captured console session
+                // (Alibaba), or a dead api key (any other provider, whose
+                // verdict only a 401 can produce).
                 Some(FetchStatus::AuthExpired) if profile.console.is_some() => {
                     "console login expired, run clauth login"
+                }
+                Some(FetchStatus::AuthExpired) if profile.provider != Some(Provider::Alibaba) => {
+                    "api key rejected, re-enter it on the setup tab"
                 }
                 Some(FetchStatus::AuthExpired) => "console login needed, run clauth login",
                 // A profile no leg will ever fetch must not claim to be

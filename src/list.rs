@@ -57,11 +57,14 @@ struct Row {
     /// has no freshness column, so without the suffix the stale window
     /// percentages above read as ordinary live numbers.
     ///
-    /// Two labels, because the state has two causes and they want opposite
-    /// actions: a stored session lapsed (`login expired`), or none was ever
-    /// stored (`login needed`). An api-key account reaches the second the moment
-    /// it gets a typed provider whose quota rides a separate credential, and
-    /// "expired" would tell that operator to renew something they never had.
+    /// Three labels, because the state has three causes and they want
+    /// different actions: a stored session lapsed (`login expired`), none was
+    /// ever stored (`login needed`), or an api key the provider rejected
+    /// (`key rejected`). An api-key account reaches the second the moment it
+    /// gets a typed provider whose quota rides a separate credential, and
+    /// "expired" would tell that operator to renew something they never had;
+    /// a non-Alibaba account reaches only the third, since it has no session
+    /// to lapse.
     usage_login: Option<&'static str>,
 }
 
@@ -84,8 +87,14 @@ impl Row {
             disabled: config.find(name).is_some_and(|p| p.is_disabled()),
             canceled: crate::profile_json::is_canceled_cached(name),
             usage_login: (entry["fetch_status"].as_str() == Some("AuthExpired")).then(|| {
-                if config.find(name).is_some_and(|p| p.console.is_some()) {
+                let p = config.find(name);
+                if p.is_some_and(|p| p.console.is_some()) {
                     "login expired"
+                } else if p.is_some_and(|p| p.provider != Some(crate::providers::Provider::Alibaba))
+                {
+                    // No console session can be the cause here: the verdict can
+                    // only come from a 401 on the api key.
+                    "key rejected"
                 } else {
                     "login needed"
                 }

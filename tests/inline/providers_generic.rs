@@ -1,6 +1,8 @@
 //! Inline tests for the generic usage engine — the JSON scanner
-//! (bars/rows/plan) and error-envelope rejection. `fetch` hits the network and
-//! is exercised manually, not here.
+//! (bars/rows/plan), error-envelope rejection, and the one network leg worth a
+//! listener (the 401 early-abort). Everything else `fetch` does is exercised
+//! manually, not here.
+#![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use super::*;
 
@@ -69,4 +71,62 @@ fn humanize_label_handles_cases() {
     assert_eq!(humanize_label("TIME_LIMIT"), "time limit");
     assert_eq!(humanize_label("modelCode"), "model code");
     assert_eq!(humanize_label("total_balance"), "total balance");
+}
+
+/// A loopback listener answering up to `n` requests with 401, idling out two
+/// seconds after the last one. The request count pins the probe's walk (an
+/// early abort leaves requests unserved); the deadline is what lets a wrong
+/// abort FAIL the test instead of hanging it — a blocking accept would hold
+/// the join forever once the probe stops before `n`.
+fn serve_401s(n: usize) -> (String, std::thread::JoinHandle<()>) {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+    let addr = format!("http://{}", listener.local_addr().expect("local addr"));
+    let server = std::thread::spawn(move || {
+        listener.set_nonblocking(true).expect("nonblocking accept");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let mut served = 0;
+        while served < n && std::time::Instant::now() < deadline {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    let mut buf = [0u8; 4096];
+                    let _ = std::io::Read::read(&mut stream, &mut buf);
+                    let _ = std::io::Write::write_all(
+                        &mut stream,
+                        b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    );
+                    served += 1;
+                }
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                Err(_) => break,
+            }
+        }
+    });
+    (addr, server)
+}
+
+/// A HINT 401 is the key's verdict: that endpoint worked before, so its answer
+/// is about the credential, not the route. The prober stops on the FIRST
+/// request and hands the caller `AuthExpired` — which suppresses the profile —
+/// rather than walking the rest of the list.
+#[test]
+fn a_hint_401_stops_the_probe_and_reads_auth_expired() {
+    let (addr, server) = serve_401s(1);
+    let err = fetch(&addr, "sk-dead", Some("/api/usage")).expect_err("the key is dead");
+    server.join().expect("the listener answered once");
+    assert!(matches!(err, ThirdPartyError::AuthExpired), "got {err:?}");
+}
+
+/// A CANDIDATE 401 is just another miss: hosts that 401 unmatched routes
+/// exist, and reading one as a dead key would write a durable AuthExpired
+/// record a key re-entry cannot clear (the fingerprint hashes the key). With
+/// no hint the prober walks the whole candidate list and reports the generic
+/// failure, which suppresses as Failed.
+#[test]
+fn a_candidate_401_is_just_another_miss() {
+    let (addr, server) = serve_401s(CANDIDATE_PATHS.len());
+    let err = fetch(&addr, "sk-dead", None).expect_err("no candidate worked");
+    server.join().expect("every candidate was answered");
+    assert!(matches!(err, ThirdPartyError::Status), "got {err:?}");
 }

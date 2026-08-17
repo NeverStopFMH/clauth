@@ -331,6 +331,63 @@ fn tp_rows_empty_key_profile_is_terminal() {
     }
 }
 
+/// The three dead-credential causes read as three messages: a lapsed Alibaba
+/// session, a never-captured one, and a rejected api key. A non-Alibaba
+/// profile has no session, so its verdict can only ever mean the third.
+#[test]
+fn tp_rows_auth_expired_copy_splits_by_credential() {
+    let body = |profile: &super::Profile| -> String {
+        build_tp_rows(profile, 52, false, false, ResetFmt::default())
+            .iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.content.clone()))
+            .collect::<Vec<_>>()
+            .join("")
+    };
+
+    // A dead key on a typed api-key provider.
+    let mut ds = crate::testutil::blank_profile("ds");
+    ds.base_url = Some("https://api.deepseek.com/anthropic".to_string());
+    ds.provider = crate::providers::Provider::from_base_url("https://api.deepseek.com/anthropic");
+    ds.api_key = Some("sk-dead".to_string());
+    ds.fetch_status = Some(FetchStatus::AuthExpired);
+    let msg = body(&ds);
+    assert!(msg.contains("api key rejected"), "got {msg}");
+
+    // A dead key on an unrecognised endpoint reaches the same verdict.
+    let mut generic = crate::testutil::blank_profile("generic");
+    generic.base_url = Some("https://proxy.example/v1".to_string());
+    generic.api_key = Some("sk-dead".to_string());
+    generic.fetch_status = Some(FetchStatus::AuthExpired);
+    let msg = body(&generic);
+    assert!(msg.contains("api key rejected"), "got {msg}");
+    assert!(
+        !msg.contains("console"),
+        "no session exists to name, got {msg}"
+    );
+
+    // An Alibaba profile with a stored session: the session lapsed.
+    let mut qwen = crate::testutil::blank_profile("qwen");
+    qwen.base_url =
+        Some("https://token-plan.ap-southeast-1.maas.aliyuncs.com/apps/anthropic".to_string());
+    qwen.provider = crate::providers::Provider::from_base_url(
+        "https://token-plan.ap-southeast-1.maas.aliyuncs.com/apps/anthropic",
+    );
+    qwen.console = Some(crate::profile::ConsoleCredential {
+        token: "dead".to_string(),
+        site: crate::profile::ConsoleSite::International,
+        region: "ap-southeast-1".to_string(),
+    });
+    qwen.fetch_status = Some(FetchStatus::AuthExpired);
+    let msg = body(&qwen);
+    assert!(msg.contains("console login expired"), "got {msg}");
+
+    // The same account before any session was captured: it needs one.
+    qwen.console = None;
+    let msg = body(&qwen);
+    assert!(msg.contains("console login needed"), "got {msg}");
+    assert!(!msg.contains("expired"), "nothing lapsed, got {msg}");
+}
+
 /// `TP_KEY_W` exists so every value in a stat block starts at one column.
 /// `key_cell` widens rather than truncates, so a label longer than the constant
 /// does not clip — it pushes that one row's value right of all its siblings, and

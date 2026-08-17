@@ -315,7 +315,8 @@ pub(crate) type ThirdPartyStatusStore =
 ///
 /// Two admissions, and the type name records only the first: a GENERIC profile
 /// whose last fetch yielded no data, and ANY profile whose usage credential is
-/// dead ([`FetchStatus::AuthExpired`] — a known provider can hit that one).
+/// dead ([`FetchStatus::AuthExpired`]: a dead api key or a dead console
+/// session, either of which any third-party profile can hit).
 /// 429s are never added; they keep the server-directed deferral instead.
 ///
 /// Cleared by a manual refresh (the TUI's `refetch_queue`) OR by the credential
@@ -441,10 +442,11 @@ pub(crate) enum FetchStatus {
     /// The provider's usage credential is dead or absent and no refresh path
     /// exists — only an operator re-login clears it, so the profile is
     /// session-suppressed rather than re-polled, and re-admitted when the
-    /// credential on disk changes. Third-party only (Alibaba's console session,
-    /// whose window is set by the operator's browser sign-in and cannot be
-    /// extended from here); the OAuth leg has its own `auth_broken` quarantine
-    /// for the analogous state.
+    /// credential on disk changes. Third-party only, with two producers: a 401
+    /// on any api-key fetch (a dead key), and Alibaba's console session, whose
+    /// window is set by the operator's browser sign-in and cannot be extended
+    /// from here. The OAuth leg has its own `auth_broken` quarantine for the
+    /// analogous state.
     AuthExpired,
 }
 

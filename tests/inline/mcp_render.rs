@@ -266,6 +266,18 @@ fn a_spent_window_still_outranks_the_richest_wallet() {
     assert_eq!(out, "- nearly-spent, rich [DeepSeek, api.deepseek.com]\n");
 }
 
+/// An overdrawn wallet ranks after every positive wallet in its currency
+/// group: "more left first" must survive the negation of a negative amount.
+#[test]
+fn an_overdrawn_wallet_ranks_last_in_its_currency_group() {
+    let profiles = vec![
+        wallet_snapshot("overdrawn", "USD", -0.2),
+        wallet_snapshot("healthy", "USD", 5.0),
+    ];
+    let out = roster_lines(&profiles);
+    assert_eq!(out, "- healthy, overdrawn [DeepSeek, api.deepseek.com]\n");
+}
+
 #[test]
 fn session_auth_variants_shape_switch_note_and_runtime_paths() {
     // Global: warns the current session's identity changes on next refresh.

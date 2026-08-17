@@ -4018,6 +4018,9 @@ fn parse_balance_takes_an_amount_and_a_currency_and_nothing_else() {
     // wallet rank of an unknown provider that spelled its total that way.
     assert_eq!(parse_balance("1e3 USD"), Some(("USD".to_string(), 1000.0)));
     assert_eq!(parse_balance("+1.5 USD"), Some(("USD".to_string(), 1.5)));
+    // An overdrawn openrouter wallet: the sign parses and the negated-amount
+    // sort key puts it after every positive wallet in its currency group.
+    assert_eq!(parse_balance("-0.20 USD"), Some(("USD".to_string(), -0.2)));
 }
 
 /// A profile holding two wallets joins exactly one currency group: the first its

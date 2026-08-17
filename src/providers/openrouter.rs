@@ -1,12 +1,22 @@
-//! OpenRouter provider — credit stats from `GET /api/v1/key`.
+//! OpenRouter provider — credit stats from two endpoints.
 //!
-//! Wire shape per <https://openrouter.ai/docs/api_reference/limits>. All
-//! figures are USD credits. `limit` / `limit_remaining` are `null` for an
-//! unlimited key. The `/api/v1/credits` endpoint is deliberately not used: it
-//! requires a management key, which a regular api key is not (403).
+//! `/api/v1/credits` is the wallet: `total_credits` purchased vs `total_usage`
+//! spent. The remaining balance is their difference, NEGATIVE once the account
+//! is overdrawn — the state an inference call answers with `402 ... can only
+//! afford 0` (measured 2026-08-17). It answers for a REGULAR api key: the
+//! docs' "management key required" note is stale, verified on two regular keys
+//! the same day (`docs/domain-knowledge.md`).
 //!
-//! `label` and the deprecated `rate_limit` object are deliberately not
-//! modeled — nothing renders them.
+//! `/api/v1/key` is best-effort enrichment: the daily/weekly/monthly usage, the
+//! free-tier flag, and the key's own cap (`limit` / `limit_remaining`). A `null`
+//! cap says the key has no cap of its own — NOTHING about the wallet, which a
+//! null-cap key can still overdraw (the same probe). The key's `usage` field is
+//! per-key (since minting), not the account's, so the wallet never reads it.
+//!
+//! Wire shapes per <https://openrouter.ai/docs/api_reference/limits> and
+//! <https://openrouter.ai/docs/api/api-reference/credits/get-remaining-credits>.
+//! `label`, `byok_*`, `is_management_key` and the deprecated `rate_limit`
+//! object are deliberately not modeled — nothing renders them.
 
 use serde::Deserialize;
 
@@ -19,6 +29,7 @@ pub(super) const DISPLAY_NAME: &str = "OpenRouter";
 
 pub(super) const ORIGIN: &str = "https://openrouter.ai";
 
+const CREDITS_PATH: &str = "/api/v1/credits";
 const KEY_PATH: &str = "/api/v1/key";
 
 /// Where an operator mints the api key this provider authenticates with, as
@@ -30,13 +41,22 @@ pub(super) fn matches_base_url(url: &str) -> bool {
 }
 
 pub(super) fn fetch(api_key: &str) -> Result<ThirdPartyStats, ThirdPartyError> {
-    let text = super::get_json(&format!("{ORIGIN}{KEY_PATH}"), api_key)?;
-    let raw: KeyEnvelope = serde_json::from_str(&text).map_err(|_| ThirdPartyError::Parse)?;
-    Ok(stats(&raw.data))
+    let credits_text = super::get_json(&format!("{ORIGIN}{CREDITS_PATH}"), api_key)?;
+    let credits: CreditsEnvelope =
+        serde_json::from_str(&credits_text).map_err(|_| ThirdPartyError::Parse)?;
+    // Key stats: best-effort enrichment. A failure (or an empty response)
+    // drops the period rows and the free-tier flag, never the wallet.
+    let key = super::get_json(&format!("{ORIGIN}{KEY_PATH}"), api_key)
+        .ok()
+        .and_then(|text| serde_json::from_str::<KeyEnvelope>(&text).ok());
+    Ok(stats(&credits.data, key.as_ref().map(|k| &k.data)))
 }
 
-/// Pure response → display rows, separated from HTTP for testability.
-fn stats(d: &KeyData) -> ThirdPartyStats {
+/// Pure responses → display rows, separated from HTTP for testability. `key` is
+/// the best-effort half; `None` drops the period rows and the free-tier flag,
+/// never the wallet.
+fn stats(credits: &CreditsData, key: Option<&KeyData>) -> ThirdPartyStats {
+    let remaining = credits.total_credits - credits.total_usage;
     let mut rows = vec![StatRow {
         label: "credits".to_string(),
         value: String::new(),
@@ -47,11 +67,11 @@ fn stats(d: &KeyData) -> ThirdPartyStats {
     // label out, and a remaining credit pool is the spendable balance.
     rows.push(StatRow {
         label: DEEPSEEK_BALANCE_ROW_LABEL.to_string(),
-        value: d.limit_remaining.map(dollars).unwrap_or_else(unlimited),
+        value: dollars(remaining),
         // Danger must agree with what the row SAYS: anything under half a cent
-        // (and any negative answer) renders as `0.00 USD`, so an exact
-        // `== 0.0` test would leave a spent key reading as a healthy one.
-        kind: if d.limit_remaining.is_some_and(|r| r < 0.005) {
+        // (an overdrawn account included) renders as `0.00 USD` or worse, so an
+        // exact `== 0.0` test would leave a spent key reading as a healthy one.
+        kind: if remaining < 0.005 {
             StatRowKind::Danger
         } else {
             StatRowKind::Body
@@ -59,50 +79,87 @@ fn stats(d: &KeyData) -> ThirdPartyStats {
     });
     rows.push(StatRow {
         label: "used".to_string(),
-        value: dollars(d.usage),
+        value: dollars(credits.total_usage),
         kind: StatRowKind::Body,
     });
     rows.push(StatRow {
-        label: "limit".to_string(),
-        value: d.limit.map(dollars).unwrap_or_else(unlimited),
+        label: "purchased".to_string(),
+        value: dollars(credits.total_credits),
         kind: StatRowKind::Body,
     });
-    rows.push(StatRow {
-        label: "today".to_string(),
-        value: dollars(d.usage_daily),
-        kind: StatRowKind::Body,
-    });
-    rows.push(StatRow {
-        label: "this week".to_string(),
-        value: dollars(d.usage_weekly),
-        kind: StatRowKind::Body,
-    });
-    rows.push(StatRow {
-        label: "this month".to_string(),
-        value: dollars(d.usage_monthly),
-        kind: StatRowKind::Body,
-    });
-    if d.is_free_tier {
+    if let Some(key) = key {
         rows.push(StatRow {
-            label: "free tier".to_string(),
-            value: String::new(),
-            kind: StatRowKind::Faint,
+            label: "today".to_string(),
+            value: dollars(key.usage_daily),
+            kind: StatRowKind::Body,
         });
+        rows.push(StatRow {
+            label: "this week".to_string(),
+            value: dollars(key.usage_weekly),
+            kind: StatRowKind::Body,
+        });
+        rows.push(StatRow {
+            label: "this month".to_string(),
+            value: dollars(key.usage_monthly),
+            kind: StatRowKind::Body,
+        });
+        if let Some(cap) = key.limit {
+            rows.push(StatRow {
+                label: "key limit".to_string(),
+                value: dollars(cap),
+                kind: StatRowKind::Body,
+            });
+        }
+        if let Some(left) = key.limit_remaining {
+            rows.push(StatRow {
+                label: "key limit left".to_string(),
+                value: dollars(left),
+                kind: StatRowKind::Body,
+            });
+        }
+        if key.is_free_tier {
+            rows.push(StatRow {
+                label: "free tier".to_string(),
+                value: String::new(),
+                kind: StatRowKind::Faint,
+            });
+        }
     }
-    ThirdPartyStats::from_rows(rows)
+    ThirdPartyStats {
+        // An overdrawn wallet cannot afford any call, so the daemon's
+        // reachability dot must read red. The rows still render: the TUI and
+        // MCP surfaces only consult `is_available` when no row carries a
+        // value, which never happens here.
+        is_available: remaining >= 0.005,
+        rows,
+        bars: Vec::new(),
+        plan: None,
+        endpoint: None,
+        best_effort: false,
+    }
 }
 
 /// `1.5` → `"1.50 USD"` — the `amount currency` shape the roster's
-/// `parse_balance` reads (a `$` prefix would parse as no wallet).
+/// `parse_balance` reads (a `$` prefix would parse as no wallet). An overdrawn
+/// remaining formats negative (`-0.20 USD`), which the same parse ranks last.
 fn dollars(n: f64) -> String {
     format!("{n:.2} USD")
 }
 
-fn unlimited() -> String {
-    "unlimited".to_string()
+// ── Wire types ──────────────────────────────────────────────────────────────────
+
+/// `total_credits` and `total_usage` are required numbers — a body missing
+/// either fails the parse rather than inventing a wallet.
+#[derive(Debug, Clone, Deserialize)]
+struct CreditsEnvelope {
+    data: CreditsData,
 }
 
-// ── Wire types ──────────────────────────────────────────────────────────────────
+#[derive(Debug, Clone, Deserialize)]
+struct CreditsData {
+    total_credits: f64,
+    total_usage: f64,
+}
 
 /// `data` is required — an error envelope carrying no key info must never read
 /// as usable usage — but its fields default: a degraded body renders zeros
@@ -116,15 +173,13 @@ struct KeyEnvelope {
 
 #[derive(Debug, Clone, Deserialize)]
 struct KeyData {
-    /// Credit limit for the key, `null` when unlimited.
+    /// The key's own spending cap, `null` when the key carries none. Says
+    /// nothing about the wallet — the credits endpoint is the wallet.
     #[serde(default)]
     limit: Option<f64>,
-    /// Remaining credits, `null` when unlimited.
+    /// What is left under the key's own cap, `null` with `limit`.
     #[serde(default)]
     limit_remaining: Option<f64>,
-    /// Total credits used, all time.
-    #[serde(default)]
-    usage: f64,
     /// Credits used in the current UTC day.
     #[serde(default)]
     usage_daily: f64,

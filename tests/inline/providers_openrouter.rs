@@ -1,5 +1,5 @@
 //! Inline tests for the OpenRouter provider — base-URL matching and the
-//! `/api/v1/key` response → display-rows mapping.
+//! two-endpoint response → display-rows mapping.
 
 use super::*;
 
@@ -49,32 +49,61 @@ fn from_base_url_rejects_host_extension_and_userinfo() {
 }
 
 // ── wire parsing ───────────────────────────────────────────────────────────────
+//
+// Both fixtures are real captured bodies (2026-08-17, two live regular keys),
+// redacted of the label and the user id. The credits body is the key whose
+// inference calls answer `402 ... can only afford 0`: its `limit` fields are
+// null while the wallet is overdrawn, which is what the null-cap row semantics
+// below pin.
+
+const KEY_BODY: &str = r#"{
+    "data": {
+        "label": "sk-or-v1-e3d...94f",
+        "is_management_key": false,
+        "is_provisioning_key": false,
+        "limit": null,
+        "limit_reset": null,
+        "limit_remaining": null,
+        "include_byok_in_limit": false,
+        "usage": 162.870592992,
+        "usage_daily": 0.000001536,
+        "usage_weekly": 0.000001536,
+        "usage_monthly": 0.003722806,
+        "byok_usage": 9.49797775,
+        "byok_usage_daily": 0,
+        "byok_usage_weekly": 0,
+        "byok_usage_monthly": 0,
+        "is_free_tier": false,
+        "expires_at": null,
+        "rate_limit": {"requests": -1, "interval": "10s"}
+    }
+}"#;
+
+const CREDITS_BODY: &str = r#"{
+    "data": {"total_credits": 600.815, "total_usage": 601.014979078}
+}"#;
 
 #[test]
-fn key_response_parses_wire_shape() {
-    // Shape per https://openrouter.ai/docs/api_reference/limits
-    let json = r#"{
-        "data": {
-            "label": "my-key",
-            "limit": 100.0,
-            "limit_remaining": 50.0,
-            "usage": 50.0,
-            "usage_daily": 10.0,
-            "usage_weekly": 20.0,
-            "usage_monthly": 50.0,
-            "is_free_tier": false
-        }
-    }"#;
-    let raw: KeyEnvelope = serde_json::from_str(json).expect("parse key response");
-    assert_eq!(raw.data.limit, Some(100.0));
-    assert_eq!(raw.data.limit_remaining, Some(50.0));
-    assert_eq!(raw.data.usage, 50.0);
-    // Every field the mapping renders, so a serde rename or typo reds here
-    // rather than silently zeroing a row.
-    assert_eq!(raw.data.usage_daily, 10.0);
-    assert_eq!(raw.data.usage_weekly, 20.0);
-    assert_eq!(raw.data.usage_monthly, 50.0);
-    assert!(!raw.data.is_free_tier);
+fn both_responses_parse_wire_shape() {
+    let credits: CreditsEnvelope = serde_json::from_str(CREDITS_BODY).expect("parse credits");
+    assert_eq!(credits.data.total_credits, 600.815);
+    assert_eq!(credits.data.total_usage, 601.014979078);
+
+    let key: KeyEnvelope = serde_json::from_str(KEY_BODY).expect("parse key response");
+    assert_eq!(key.data.limit, None);
+    assert_eq!(key.data.limit_remaining, None);
+    assert!(!key.data.is_free_tier);
+    // Every period field the mapping renders, so a serde rename or typo reds
+    // here rather than silently zeroing a row.
+    assert_eq!(key.data.usage_daily, 0.000001536);
+    assert_eq!(key.data.usage_weekly, 0.000001536);
+    assert_eq!(key.data.usage_monthly, 0.003722806);
+}
+
+#[test]
+fn credits_without_required_numbers_fails_to_parse() {
+    // Both numbers are required: a degraded wallet body must never invent one.
+    assert!(serde_json::from_str::<CreditsEnvelope>(r#"{"data":{}}"#).is_err());
 }
 
 #[test]
@@ -88,17 +117,13 @@ fn key_response_without_data_fails_to_parse() {
 
 #[test]
 fn stats_builds_wallet_rows() {
-    let raw = KeyData {
-        limit: Some(100.0),
-        limit_remaining: Some(50.0),
-        usage: 50.0,
-        usage_daily: 10.0,
-        usage_weekly: 20.0,
-        usage_monthly: 50.0,
-        is_free_tier: false,
-    };
-    let stats = stats(&raw);
-    assert!(stats.is_available);
+    let credits: CreditsEnvelope = serde_json::from_str(CREDITS_BODY).unwrap();
+    let key: KeyEnvelope = serde_json::from_str(KEY_BODY).unwrap();
+    let stats = stats(&credits.data, Some(&key.data));
+    // The live account is overdrawn: the rows render, but the reachability
+    // dot must read red (every paid call 402s).
+    assert!(!stats.is_available);
+    // Heading + 3 wallet rows + 3 period rows. No cap, no free tier.
     assert_eq!(stats.rows.len(), 7);
     assert_eq!(stats.rows[0].kind, StatRowKind::Heading);
     assert_eq!(stats.rows[0].label, "credits");
@@ -106,86 +131,83 @@ fn stats_builds_wallet_rows() {
     // (the MCP roster's wallet rank matches on it), so a rename has to red here
     // rather than follow silently.
     assert_eq!(stats.rows[1].label, "api balance");
-    assert_eq!(stats.rows[1].value, "50.00 USD");
-    assert_eq!(stats.rows[1].kind, StatRowKind::Body);
+    // The live overdrawn account: usage exceeds the purchased credits.
+    assert_eq!(stats.rows[1].value, "-0.20 USD");
+    assert_eq!(stats.rows[1].kind, StatRowKind::Danger);
     let labels: Vec<&str> = stats.rows[2..].iter().map(|r| r.label.as_str()).collect();
     assert_eq!(
         labels,
-        ["used", "limit", "today", "this week", "this month"]
+        ["used", "purchased", "today", "this week", "this month"]
     );
-    assert_eq!(stats.rows[2].value, "50.00 USD");
-    assert_eq!(stats.rows[3].value, "100.00 USD");
-    assert_eq!(stats.rows[4].value, "10.00 USD");
-    assert_eq!(stats.rows[5].value, "20.00 USD");
-    assert_eq!(stats.rows[6].value, "50.00 USD");
+    assert_eq!(stats.rows[2].value, "601.01 USD");
+    assert_eq!(stats.rows[3].value, "600.82 USD");
+    assert_eq!(stats.rows[4].value, "0.00 USD");
+    assert_eq!(stats.rows[5].value, "0.00 USD");
+    assert_eq!(stats.rows[6].value, "0.00 USD");
 }
 
 #[test]
-fn unlimited_limit_reads_unlimited() {
-    let raw = KeyData {
-        limit: None,
-        limit_remaining: None,
-        usage: 50.0,
-        usage_daily: 0.0,
-        usage_weekly: 0.0,
-        usage_monthly: 0.0,
-        is_free_tier: false,
-    };
-    let stats = stats(&raw);
-    assert_eq!(stats.rows[1].value, "unlimited");
-    assert_eq!(stats.rows[1].kind, StatRowKind::Body);
-    assert_eq!(stats.rows[3].value, "unlimited");
-}
-
-#[test]
-fn zero_balance_reads_danger() {
-    // A sub-cent remainder formats as `0.00 USD` too, so the Danger predicate
-    // must reach it — `== 0.0` would leave a spent key reading as a healthy
-    // one. A full cent still formats as `0.01 USD` and stays Body.
-    for remaining in [0.0, 0.0005] {
-        let raw = KeyData {
-            limit: Some(100.0),
-            limit_remaining: Some(remaining),
-            usage: 100.0,
-            usage_daily: 0.0,
-            usage_weekly: 0.0,
-            usage_monthly: 0.0,
-            is_free_tier: false,
+fn remaining_danger_boundary_tracks_the_rendered_value() {
+    // Danger must agree with what the row SAYS: anything under half a cent
+    // (an overdrawn account included) renders as `0.00 USD` or worse, so an
+    // exact `== 0.0` test would leave a spent key reading as a healthy one.
+    // A full cent still formats as `0.01 USD` and stays Body.
+    for (total, used, expect_kind, expect_value, expect_available) in [
+        (100.0, 100.0, StatRowKind::Danger, "0.00 USD", false),
+        (100.0, 99.999, StatRowKind::Danger, "0.00 USD", false),
+        (100.0, 100.2, StatRowKind::Danger, "-0.20 USD", false),
+        (100.0, 99.99, StatRowKind::Body, "0.01 USD", true),
+    ] {
+        let credits = CreditsData {
+            total_credits: total,
+            total_usage: used,
         };
-        let stats = stats(&raw);
+        let stats = stats(&credits, None);
+        assert_eq!(stats.rows[1].kind, expect_kind, "total {total} used {used}");
         assert_eq!(
-            stats.rows[1].kind,
-            StatRowKind::Danger,
-            "remaining {remaining}"
+            stats.rows[1].value, expect_value,
+            "total {total} used {used}"
         );
-        assert_eq!(stats.rows[1].value, "0.00 USD");
+        assert_eq!(
+            stats.is_available, expect_available,
+            "total {total} used {used}"
+        );
     }
-    let cent = KeyData {
-        limit: Some(100.0),
-        limit_remaining: Some(0.01),
-        usage: 99.99,
-        usage_daily: 0.0,
-        usage_weekly: 0.0,
-        usage_monthly: 0.0,
-        is_free_tier: false,
-    };
-    let stats = stats(&cent);
-    assert_eq!(stats.rows[1].kind, StatRowKind::Body);
-    assert_eq!(stats.rows[1].value, "0.01 USD");
 }
 
 #[test]
-fn free_tier_appends_faint_row() {
-    let raw = KeyData {
-        limit: Some(1.0),
-        limit_remaining: Some(0.5),
-        usage: 0.5,
+fn key_cap_and_free_tier_rows_append_when_present() {
+    let credits = CreditsData {
+        total_credits: 100.0,
+        total_usage: 40.0,
+    };
+    let key = KeyData {
+        limit: Some(50.0),
+        limit_remaining: Some(10.0),
         usage_daily: 0.0,
         usage_weekly: 0.0,
         usage_monthly: 0.0,
         is_free_tier: true,
     };
-    let stats = stats(&raw);
-    assert_eq!(stats.rows.last().unwrap().label, "free tier");
-    assert_eq!(stats.rows.last().unwrap().kind, StatRowKind::Faint);
+    let stats = stats(&credits, Some(&key));
+    let rows: Vec<(&str, &str, StatRowKind)> = stats
+        .rows
+        .iter()
+        .map(|r| (r.label.as_str(), r.value.as_str(), r.kind))
+        .collect();
+    assert!(rows.contains(&("key limit", "50.00 USD", StatRowKind::Body)));
+    assert!(rows.contains(&("key limit left", "10.00 USD", StatRowKind::Body)));
+    assert!(rows.contains(&("free tier", "", StatRowKind::Faint)));
+}
+
+#[test]
+fn key_endpoint_absent_drops_only_the_key_rows() {
+    let credits = CreditsData {
+        total_credits: 100.0,
+        total_usage: 40.0,
+    };
+    let stats = stats(&credits, None);
+    let labels: Vec<&str> = stats.rows.iter().map(|r| r.label.as_str()).collect();
+    assert_eq!(labels, ["credits", "api balance", "used", "purchased"]);
+    assert_eq!(stats.rows[1].value, "60.00 USD");
 }

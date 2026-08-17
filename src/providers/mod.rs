@@ -32,6 +32,7 @@
 pub(crate) mod alibaba;
 mod deepseek;
 mod generic;
+mod openrouter;
 mod zai;
 
 pub(crate) use deepseek::BALANCE_ROW_LABEL as DEEPSEEK_BALANCE_ROW_LABEL;
@@ -57,6 +58,7 @@ pub(crate) enum Provider {
     DeepSeek,
     Zai,
     Alibaba,
+    OpenRouter,
 }
 
 impl Provider {
@@ -68,6 +70,8 @@ impl Provider {
             Some(Self::Zai)
         } else if alibaba::matches_base_url(url) {
             Some(Self::Alibaba)
+        } else if openrouter::matches_base_url(url) {
+            Some(Self::OpenRouter)
         } else {
             None
         }
@@ -78,15 +82,16 @@ impl Provider {
             Self::DeepSeek => deepseek::DISPLAY_NAME,
             Self::Zai => zai::DISPLAY_NAME,
             Self::Alibaba => alibaba::DISPLAY_NAME,
+            Self::OpenRouter => openrouter::DISPLAY_NAME,
         }
     }
 
     /// Whether this provider publishes usage windows of its own (percentage
     /// bars under 5h/7d-style labels) rather than a scalar balance. `Zai` and
-    /// `Alibaba` do; `DeepSeek` publishes a wallet. The MCP headroom clause
-    /// denies a 5h/7d limit only where it knows the provider has none: a
-    /// windows-publishing provider HAS the limits even when one cached response
-    /// carried no bars.
+    /// `Alibaba` do; `DeepSeek` and `OpenRouter` publish a wallet. The MCP
+    /// headroom clause denies a 5h/7d limit only where it knows the provider
+    /// has none: a windows-publishing provider HAS the limits even when one
+    /// cached response carried no bars.
     pub(crate) fn publishes_windows(self) -> bool {
         matches!(self, Self::Zai | Self::Alibaba)
     }
@@ -94,7 +99,7 @@ impl Provider {
     /// The vendor page where this endpoint's api key is minted, for a surface
     /// that offers to open it. [`alibaba`] answers with four different pages,
     /// since its four endpoints are two products across two consoles; the other
-    /// two have one page each.
+    /// three have one page each.
     ///
     /// `None` means the `base_url` doesn't belong to `self`, which is why every
     /// arm re-checks it rather than only the arm that has to. Returning a page
@@ -105,6 +110,9 @@ impl Provider {
             Self::DeepSeek => deepseek::matches_base_url(base_url).then_some(deepseek::CONSOLE_URL),
             Self::Zai => zai::matches_base_url(base_url).then_some(zai::CONSOLE_URL),
             Self::Alibaba => alibaba::console_url(base_url),
+            Self::OpenRouter => {
+                openrouter::matches_base_url(base_url).then_some(openrouter::CONSOLE_URL)
+            }
         }
     }
 }
@@ -140,6 +148,7 @@ impl ThirdPartyTarget {
                 Provider::Zai => zai::ORIGIN.to_string(),
                 // One of four console gateways, chosen by region + site.
                 Provider::Alibaba => alibaba::gateway_origin(console.as_ref()).to_string(),
+                Provider::OpenRouter => openrouter::ORIGIN.to_string(),
             },
             Self::Generic { base_url } => api_origin(base_url).unwrap_or_else(|| base_url.clone()),
         }
@@ -208,6 +217,7 @@ pub(crate) fn fetch_third_party_usage(
             Provider::Zai => zai::fetch(api_key),
             // The api key is not a quota credential here — the console session is.
             Provider::Alibaba => alibaba::fetch(console.as_ref()),
+            Provider::OpenRouter => openrouter::fetch(api_key),
         },
         ThirdPartyTarget::Generic { base_url } => generic::fetch(base_url, api_key, hint),
     }

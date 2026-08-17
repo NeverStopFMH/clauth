@@ -188,6 +188,14 @@ fn throttle_key_known_provider_uses_canonical_origin() {
         .throttle_key(),
         "https://api.z.ai"
     );
+    assert_eq!(
+        ThirdPartyTarget::Known {
+            provider: Provider::OpenRouter,
+            console: None,
+        }
+        .throttle_key(),
+        "https://openrouter.ai"
+    );
 }
 
 #[test]
@@ -228,6 +236,10 @@ fn console_url_is_the_vendor_page_per_provider() {
         Provider::Zai.console_url("https://api.z.ai/api/anthropic"),
         Some("https://z.ai/manage-apikey/apikey-list")
     );
+    assert_eq!(
+        Provider::OpenRouter.console_url("https://openrouter.ai/api"),
+        Some("https://openrouter.ai/settings/keys")
+    );
 }
 
 #[test]
@@ -238,6 +250,10 @@ fn console_url_answers_none_for_a_base_url_the_provider_does_not_own() {
     // so every arm re-checks, not just Alibaba's.
     assert_eq!(
         Provider::Alibaba.console_url("https://api.deepseek.com"),
+        None
+    );
+    assert_eq!(
+        Provider::OpenRouter.console_url("https://api.deepseek.com"),
         None
     );
     assert_eq!(Provider::DeepSeek.console_url("https://api.z.ai"), None);

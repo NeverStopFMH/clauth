@@ -73,6 +73,15 @@ const BUILTINS: &[Builtin] = &[
         pin_every_tier: false,
     },
     Builtin {
+        name: "OpenRouter",
+        // OpenRouter's own Claude Code guide pins this exact base URL, so CC's
+        // `/v1/messages` lands on `/api/v1/messages` (openrouter.ai docs,
+        // "Connect Claude to OpenRouter").
+        base_url: "https://openrouter.ai/api",
+        model: "openrouter/auto",
+        pin_every_tier: false,
+    },
+    Builtin {
         name: "Qwen-TokenPlan-Intl",
         base_url: "https://token-plan.ap-southeast-1.maas.aliyuncs.com/apps/anthropic",
         model: "qwen3.8-max",

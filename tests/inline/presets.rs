@@ -14,9 +14,10 @@ fn models(default: &str) -> ModelSettings {
 }
 
 /// The shipped names in menu order, so a table change lands in one place.
-const BUILTIN_NAMES: [&str; 6] = [
+const BUILTIN_NAMES: [&str; 7] = [
     "DeepSeek",
     "Z.ai",
+    "OpenRouter",
     "Qwen-TokenPlan-Intl",
     "Qwen-TokenPlan-CN",
     "Qwen-CodingPlan-Intl",
@@ -55,13 +56,24 @@ fn the_builtins_ship_with_their_endpoint_and_base_model() {
         Some("https://api.z.ai/api/anthropic")
     );
     assert_eq!(zai.models.default.as_deref(), Some("glm-5.2"));
+
+    let openrouter = &listed[2];
+    assert_eq!(
+        openrouter.base_url.as_deref(),
+        Some("https://openrouter.ai/api")
+    );
+    assert_eq!(
+        openrouter.models.default.as_deref(),
+        Some("openrouter/auto")
+    );
+    assert_eq!(openrouter.models.opus, None);
 }
 
 /// Alibaba's endpoints answer `400 "Model not exist."` for any Claude model id,
 /// so the alias an uncovered tier resolves to is a hard failure there rather
 /// than a degraded route. Every alibaba preset therefore pins each alias AND the
 /// subagent row, not just `models.default` — the deliberate deviation from the
-/// two presets above.
+/// presets above.
 #[test]
 fn an_alibaba_preset_pins_every_alias_and_the_subagent_row() {
     let _home = crate::testutil::HomeSandbox::new();

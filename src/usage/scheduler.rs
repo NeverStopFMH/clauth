@@ -239,6 +239,7 @@ impl ThirdPartyEntry {
                         crate::providers::Provider::DeepSeek => b"deepseek".as_slice(),
                         crate::providers::Provider::Zai => b"zai".as_slice(),
                         crate::providers::Provider::Alibaba => b"alibaba".as_slice(),
+                        crate::providers::Provider::OpenRouter => b"openrouter".as_slice(),
                     },
                 );
                 match console {

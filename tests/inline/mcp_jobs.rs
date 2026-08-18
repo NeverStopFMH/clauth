@@ -27,6 +27,16 @@ fn spec(job_id: &str, profile: &str, started_at: u64) -> RunningSpec {
         recorded_at: started_at,
         timeout_secs: 0,
         idle_secs: Some(300),
+        kind: RecordKind::Collectable,
+    }
+}
+
+/// The same shape a BLOCKING run's spawn mints: identical bytes, different
+/// spelling on disk.
+fn live_spec(job_id: &str, profile: &str, started_at: u64) -> RunningSpec {
+    RunningSpec {
+        kind: RecordKind::Liveness,
+        ..spec(job_id, profile, started_at)
     }
 }
 
@@ -127,6 +137,120 @@ fn a_heartbeat_rewrites_the_running_record_in_place() {
         assert_eq!(beaten.tail, "moving to the fallback tests");
         assert!(beaten.envelope.is_none());
     }
+}
+
+/// The structural guarantee behind the liveness spelling, asserted as BEHAVIOUR
+/// rather than as a comment: no id a reader accepts can resolve a liveness
+/// record, so `monitor` cannot collect a result whose blocking caller is still
+/// waiting for it.
+///
+/// Two halves, and both are needed. The id a liveness file is written under
+/// resolves only to the COLLECTABLE spelling, which is a different file; and the
+/// only string that would spell the liveness path is refused by the charset
+/// gate every reader filters through first. Drop either half — let
+/// [`is_safe_job_id`] admit `.`, or point the `Liveness` arm of `job_path` at
+/// `{id}.json` — and one of these reds.
+#[test]
+fn no_id_a_reader_accepts_can_resolve_a_liveness_record() {
+    let _home = HomeSandbox::new();
+    let id = new_job_id(1000);
+    write_running(&live_spec(&id, "work", 1000)).unwrap();
+
+    // Fixture control: the file really is on disk, under the other spelling.
+    let dir = jobs_dir().unwrap();
+    assert!(
+        dir.join(format!("{id}.live.json")).exists(),
+        "a liveness record lands under its own name: {:?}",
+        std::fs::read_dir(&dir).unwrap().flatten().count(),
+    );
+    assert!(
+        !dir.join(format!("{id}.json")).exists(),
+        "and never under the collectable one",
+    );
+
+    assert!(
+        read(&id).is_none(),
+        "the run's own id resolves to the collectable file, which does not exist",
+    );
+    let naming_it = format!("{id}.live");
+    assert!(
+        !is_safe_job_id(&naming_it),
+        "and the one id whose `{{id}}.json` join would land on it is refused: {naming_it}",
+    );
+}
+
+/// The crossing: one run keeps ONE identity, and only the spelling moves.
+///
+/// A fresh mint here would leave two ids for one run — the one its own
+/// heartbeats already carry, and the one the caller is handed — so a record
+/// collected under the second would have been heartbeat into under the first.
+#[test]
+fn promote_moves_the_spelling_and_keeps_the_id() {
+    let _home = HomeSandbox::new();
+    let id = new_job_id(1000);
+    write_heartbeat(&live_spec(&id, "work", 1000), 41_000, "half way").unwrap();
+
+    let collectable = RunningSpec {
+        kind: RecordKind::Collectable,
+        ..live_spec(&id, "work", 1000)
+    };
+    promote(&collectable).unwrap();
+
+    let record = read(&id).expect("the run's own id now resolves");
+    assert_eq!(record.job_id, id, "the id did not change");
+    assert_eq!(
+        record.tail, "half way",
+        "and the record carried its heartbeats across rather than starting over",
+    );
+    let dir = jobs_dir().unwrap();
+    assert!(
+        !dir.join(format!("{id}.live.json")).exists(),
+        "the liveness spelling is gone, so nothing is listed twice",
+    );
+
+    // The other arm: nothing to rename, because the liveness write never landed
+    // or a finish removed the file first. The record still has to exist for the
+    // run to be collectable at all.
+    let fresh = new_job_id(2000);
+    let spec = RunningSpec {
+        kind: RecordKind::Collectable,
+        ..spec(&fresh, "work", 2000)
+    };
+    promote(&spec).unwrap();
+    assert!(
+        read(&fresh).is_some(),
+        "a promote with no source still leaves a collectable record",
+    );
+}
+
+/// A blocking run's record rides the same GC as any other: the extension is
+/// still `.json`, so the corpse rule and the retention cap reach it with no arm
+/// of their own.
+#[test]
+fn a_liveness_record_is_swept_on_the_same_rules_as_any_other_running_one() {
+    let _home = HomeSandbox::new();
+    let now = 10_000_000_000u64;
+    let ancient = now - 10 * RUNNING_TTL_MS;
+
+    write_heartbeat(
+        &live_spec("d-live-talking", "p", ancient),
+        now - 1000,
+        "alive",
+    )
+    .unwrap();
+    write_running(&live_spec("d-live-silent", "p", ancient)).unwrap();
+
+    gc_running_corpses(now);
+
+    let dir = jobs_dir().unwrap();
+    assert!(
+        dir.join("d-live-talking.live.json").exists(),
+        "a blocking run that is still talking survives, whatever its age",
+    );
+    assert!(
+        !dir.join("d-live-silent.live.json").exists(),
+        "and one whose server died is reaped like any other corpse",
+    );
 }
 
 #[test]
@@ -395,6 +519,133 @@ fn the_retention_cap_keeps_the_newest_finish_not_the_newest_mint() {
         std::fs::read_dir(jobs_dir().unwrap()).unwrap().count(),
         MAX_RETAINED,
         "capped to MAX_RETAINED"
+    );
+}
+
+/// The listing reads and NOTHING else. Not the Done TTL, not the `.tmp` sweep,
+/// not the retention cap, not the corpse reap — every one of them is somebody
+/// asking for a sweep by name, and a reader that reaps what it came for is the
+/// defect this store has shipped twice.
+///
+/// The fixture is deliberately made of records every destructive rule wants:
+/// a `done` file hours past its TTL, a `running` corpse, a stray `.tmp`, and one
+/// record more than the retention cap.
+#[test]
+fn the_listing_destroys_nothing_it_reads() {
+    let _home = HomeSandbox::new();
+    let now = 10_000_000_000u64;
+
+    seed_done_at(
+        "d-expired",
+        now - 2 * DONE_TTL_MS,
+        Some(now - 2 * DONE_TTL_MS),
+    );
+    write_running(&spec("d-corpse", "p", now - RUNNING_TTL_MS - 1)).unwrap();
+    write_running(&live_spec("d-live-corpse", "p", now - RUNNING_TTL_MS - 1)).unwrap();
+    let dir = jobs_dir().unwrap();
+    std::fs::write(dir.join("d-partial.json.tmp"), b"partial").unwrap();
+    std::fs::write(dir.join("d-garbage.json"), b"{ not json").unwrap();
+    for i in 0..=MAX_RETAINED {
+        seed_done_at(&format!("d-cap-{i}"), now - i as u64, Some(now - i as u64));
+    }
+    let names = || -> std::collections::BTreeSet<String> {
+        std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect()
+    };
+    let before = names();
+    // Read off the FIXTURE rather than off the listing, so a sweep inside `list`
+    // reds the comparison below instead of short-circuiting on this line.
+    assert!(
+        before.len() > MAX_RETAINED,
+        "fixture control: the store is over the cap, so a sweep here would show",
+    );
+
+    let listed = list(now);
+
+    assert_eq!(
+        before,
+        names(),
+        "listing the store must leave every file exactly where it was",
+    );
+    assert!(
+        !listed.iter().any(|j| j.record.job_id == "d-garbage"),
+        "an unreadable file is skipped, never reported and never deleted",
+    );
+}
+
+/// The listing classifies a corpse the way [`gc_running_corpses`] reaps one, and
+/// the pin is absolute rather than relative: a rule that moved would have to
+/// move BOTH sides, so naming which record lands where is what catches it.
+#[test]
+fn the_listing_calls_a_corpse_what_the_sweep_would_reap() {
+    let _home = HomeSandbox::new();
+    let now = 10_000_000_000u64;
+    let ancient = now - 10 * RUNNING_TTL_MS;
+
+    write_heartbeat(&spec("d-talking", "p", ancient), now - 1000, "alive").unwrap();
+    write_running(&spec("d-silent", "p", ancient)).unwrap();
+    seed_done_at("d-finished", now - 60_000, Some(now - 60_000));
+
+    let by_id = |id: &str| {
+        list(now)
+            .into_iter()
+            .find(|j| j.record.job_id == id)
+            .unwrap_or_else(|| panic!("{id} listed"))
+    };
+    assert_eq!(by_id("d-talking").liveness, JobLiveness::Running);
+    assert_eq!(by_id("d-silent").liveness, JobLiveness::Corpse);
+    assert_eq!(by_id("d-finished").liveness, JobLiveness::Done);
+
+    // And the sweep agrees about which one is dead, so the row a reader sees as
+    // a corpse is the row the next collect removes.
+    gc_running_corpses(now);
+    assert!(read("d-talking").is_some());
+    assert!(read("d-silent").is_none());
+    assert!(read("d-finished").is_some());
+}
+
+/// Newest-mattering first, on the same stamp both retention rules read — so the
+/// row a sweep would drop LAST is the row a reader sees FIRST. Sorting on the
+/// mint instead puts a long run that just spoke below a short one that finished
+/// an hour ago.
+#[test]
+fn the_listing_orders_on_the_retention_anchor_across_both_spellings() {
+    let _home = HomeSandbox::new();
+    let now = 10_000_000_000u64;
+
+    // Oldest mint, freshest sign of life.
+    write_heartbeat(
+        &live_spec("d-long", "p", now - 3_600_000),
+        now - 1_000,
+        "still going",
+    )
+    .unwrap();
+    // Newest mint, nothing since.
+    write_running(&spec("d-quiet", "p", now - 300_000)).unwrap();
+    // Finished in between.
+    seed_done_at("d-old", now - 1_000, Some(now - 600_000));
+
+    let listed = list(now);
+    let order: Vec<&str> = listed.iter().map(|j| j.record.job_id.as_str()).collect();
+    assert_eq!(
+        order,
+        vec!["d-long", "d-quiet", "d-old"],
+        "ordered by when each record last mattered, never by when it was minted",
+    );
+    assert_eq!(
+        listed[0].kind,
+        RecordKind::Liveness,
+        "and each row reports which spelling held it",
+    );
+    assert_eq!(listed[1].kind, RecordKind::Collectable);
+    assert_eq!(
+        listed[0].anchor,
+        now - 1_000,
+        "the anchor it sorted on rides along, so a reader dates a row from the \
+         same stamp the store keeps it by",
     );
 }
 

@@ -1,9 +1,12 @@
-//! Plugin-tab `herdr` row render tests: the dot color carries the verdict, the
-//! selector row right-aligns a `[f]` marker exactly when the check offers a fix.
-//! The verdict logic itself is unit-tested in `tests/inline/tui_app.rs`; these
-//! pin the render (dot hue + marker) per drift state.
+//! Plugin-tab render tests. The `herdr` row: the dot color carries the verdict,
+//! the selector row right-aligns a `[f]` marker exactly when the check offers a
+//! fix — the verdict logic itself is unit-tested in `tests/inline/tui_app.rs`,
+//! these pin the render per drift state. And the delegates pane: its rows, its
+//! agreement with what `monitor` reports for the same record, its overflow
+//! marker, and its empty state.
 
 use crate::herdr::{ConfigStatus, HerdrProbe, RegistryEntry, SidebarState};
+use crate::mcp::jobs::{self, JobRecord, JobState, RecordKind, RunningSpec};
 use crate::profile::{AppConfig, AppState};
 use crate::tui::app::{App, Check, Health, herdr_check};
 use ratatui::Terminal;
@@ -116,6 +119,525 @@ fn assert_row(check: Check, expected: Health, expect_fix: bool) {
         "selector `[f]` marker for {:?}:\n{}",
         expected,
         rows.join("\n")
+    );
+}
+
+// ── delegates pane ──────────────────────────────────────────────────────────────
+
+/// A realistic wall clock rather than a round synthetic one: every row's state is
+/// chosen by comparing its own stamps against this, and a year-2096 `now` routes
+/// whole classes into one branch.
+///
+/// Only the PURE tests may pin it. A `TestBackend` render reaches the pane
+/// through `draw`, which reads the real clock, so every render fixture below is
+/// seeded relative to `now_ms()` and asserts what the clock cannot move — the
+/// state words, the accounts, which fields are present, and the steer line. The
+/// exact figures are pinned where `now` is an argument.
+const NOW: u64 = 1_800_000_000_000;
+
+fn app_with_delegates(delegates: Vec<jobs::StoredJob>) -> App {
+    let mut app = App::new(AppConfig {
+        state: AppState::default(),
+        profiles: Vec::new(),
+    });
+    app.plugin.delegates = delegates;
+    app
+}
+
+/// The streaming shape a real reserve writes: no wall clock, the default idle
+/// guard.
+fn running_spec(job_id: &str, profile: &str, started_at: u64, kind: RecordKind) -> RunningSpec {
+    RunningSpec {
+        job_id: job_id.to_string(),
+        profile: profile.to_string(),
+        started_at,
+        recorded_at: started_at,
+        timeout_secs: 0,
+        idle_secs: Some(300),
+        kind,
+    }
+}
+
+/// Seed one row of each state through the store's OWN writers, then list it back
+/// — so the fixture is bytes the producer really emits rather than a struct
+/// literal that agrees with whatever the fields are today.
+fn seed_every_state(now: u64) -> Vec<jobs::StoredJob> {
+    // Freshest first once listed: each anchor is further back than the last.
+    jobs::write_heartbeat(
+        &running_spec("d-bg-0", "uwuclxdy", now - 134_000, RecordKind::Collectable),
+        now - 12_000,
+        "reading the plan doc",
+    )
+    .unwrap();
+    jobs::write_heartbeat(
+        &running_spec("d-blk-0", "kerry", now - 40_000, RecordKind::Liveness),
+        now - 30_000,
+        "still thinking",
+    )
+    .unwrap();
+    // Written as bytes rather than through `write_done`, which stamps the real
+    // clock: when a job finished is exactly the field this row is dated by, so
+    // the test has to choose it.
+    let dir = jobs::jobs_dir().unwrap();
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("d-old-0.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "job_id": "d-old-0",
+            "profile": "DS8",
+            "state": "done",
+            "started_at": now - 1_800_000,
+            "done_at": now - 900_000,
+            "envelope": { "result": "finished a while back" },
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    // Output landing on this very millisecond: the one input that reaches
+    // `age_phrase`'s zero branch, without which the row reads `now ago`.
+    jobs::write_heartbeat(
+        &running_spec("d-fresh-0", "glm2", now - 5_000, RecordKind::Collectable),
+        now,
+        "just spoke",
+    )
+    .unwrap();
+    // Silent far past the corpse window: its server is gone.
+    jobs::write_running(&running_spec(
+        "d-dead-0",
+        "glm1",
+        now - 90_000_000,
+        RecordKind::Collectable,
+    ))
+    .unwrap();
+    jobs::list(now)
+}
+
+/// The exact figures, at a `now` the test owns: elapsed, last-output age and the
+/// deadline that lands first, each from the fields the heartbeat already writes.
+#[test]
+fn a_delegate_row_carries_the_figures_its_own_record_holds() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let cells = super::delegate_cells(&seed_every_state(NOW), NOW);
+    let facts = |account: &str| -> String {
+        cells
+            .iter()
+            .find(|c| c.profile == account)
+            .unwrap_or_else(|| panic!("no row for `{account}`"))
+            .facts
+            .join(" · ")
+    };
+    assert_eq!(
+        facts("uwuclxdy"),
+        "elapsed 2m 14s · last output 12s ago · idle-kill in 4m 48s",
+        "a running row counts from its own stamps",
+    );
+    assert_eq!(
+        facts("kerry"),
+        "elapsed 40s · last output 30s ago · idle-kill in 4m 30s",
+        "and a blocking one reads identically — only its spelling differs",
+    );
+    assert_eq!(
+        facts("glm2"),
+        "elapsed 5s · last output just now · idle-kill in 5m",
+        "a run that spoke this millisecond reads `just now`, never `now ago`",
+    );
+    assert_eq!(
+        facts("DS8"),
+        "finished 15m ago",
+        "a finished job is dated by its finish, and says nothing it no longer has",
+    );
+    assert_eq!(
+        facts("glm1"),
+        "last seen 1d 1h ago",
+        "a corpse by when it was last heard from",
+    );
+}
+
+#[test]
+fn the_delegates_pane_names_each_state_and_carries_the_steer_line() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let app = app_with_delegates(seed_every_state(crate::usage::now_ms()));
+    let (rows, _) = render(&app);
+    let screen = rows.join("\n");
+
+    // Each row is identified by its own ACCOUNT, so a needle can never be read
+    // off the wrong line.
+    let row_for = |account: &str| -> String {
+        rows.iter()
+            .find(|r| r.contains(account))
+            .unwrap_or_else(|| panic!("no row for `{account}`:\n{screen}"))
+            .clone()
+    };
+    assert!(
+        row_for("uwuclxdy").contains("● running"),
+        "a background job reads as running:\n{screen}"
+    );
+    assert!(
+        row_for("kerry").contains("● blocking"),
+        "a run whose caller still holds the line reads apart from it:\n{screen}"
+    );
+    assert!(
+        row_for("DS8").contains("● done"),
+        "a finished job reads as done:\n{screen}"
+    );
+    assert!(
+        row_for("glm1").contains("○ orphaned"),
+        "and a corpse is drawn as one, never as live:\n{screen}"
+    );
+
+    // The liveness fields reach the screen. Their VALUES move with the real
+    // clock this path reads, and are pinned exactly by the test above.
+    let running = row_for("uwuclxdy");
+    for needle in ["elapsed ", "last output ", "idle-kill in "] {
+        assert!(
+            running.contains(needle),
+            "`{needle}` missing from the running row:\n{running}"
+        );
+    }
+    assert!(
+        running.contains("\"reading the"),
+        "the delegate's own words ride last, quoted so they cannot read as \
+         clauth's:\n{running}"
+    );
+    assert!(
+        running.contains('…'),
+        "and the tail is what gives way when the row runs out of width, rather \
+         than pushing a figure off it:\n{running}"
+    );
+    assert!(
+        row_for("DS8").contains("finished "),
+        "a done row is dated by its finish:\n{screen}"
+    );
+    assert!(
+        screen.contains("manage delegates in clauth app on web or mobile (coming soon)"),
+        "the steer line renders under the list:\n{screen}"
+    );
+}
+
+/// M9's own verify line: what the pane draws and what `monitor` tells the model
+/// about ONE record must not be able to disagree.
+///
+/// Every figure asserted here is read OUT of `monitor`'s payload and then looked
+/// for in the rendered row, so a pane that grew a second copy of the arithmetic
+/// reds this even when its own numbers look plausible.
+#[test]
+fn the_delegates_pane_reports_what_monitor_reports_for_the_same_record() {
+    let _home = crate::testutil::HomeSandbox::new();
+    // A pinned-`--output-format` run, so BOTH deadlines are present and the pane
+    // has to pick the one that lands first — and one handed off mid-flight, so
+    // `recorded_at` sits well after `started_at`. That gap is what makes the
+    // test discriminate: on a record where the two are equal (every job that
+    // started out background), a pane counting elapsed from the wrong field
+    // agrees with `monitor` by accident.
+    let spec = RunningSpec {
+        timeout_secs: 900,
+        idle_secs: Some(300),
+        recorded_at: NOW - 120_000,
+        ..running_spec(
+            "d-pin-0",
+            "uwuclxdy",
+            NOW - 200_000,
+            RecordKind::Collectable,
+        )
+    };
+    jobs::write_heartbeat(&spec, NOW - 47_000, "mid-run").unwrap();
+
+    let stored = jobs::list(NOW);
+    let record: &JobRecord = &stored[0].record;
+    assert_eq!(record.state, JobState::Running, "fixture control");
+
+    let payload = crate::mcp::running_payload_for_test(&record.job_id, record, NOW);
+    let secs = |key: &str| {
+        payload
+            .get(key)
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or_else(|| panic!("monitor reports {key}: {payload}"))
+    };
+    let cells = super::delegate_cells(&stored, NOW);
+    let facts = cells[0].facts.join(" · ");
+
+    assert!(
+        facts.contains(&format!(
+            "elapsed {}",
+            crate::usage::humanize_duration(secs("elapsed_secs") as i64)
+        )),
+        "elapsed disagrees with monitor's {payload}: {facts}"
+    );
+    assert!(
+        facts.contains(&format!(
+            "last output {} ago",
+            crate::usage::humanize_duration(secs("last_output_secs_ago") as i64)
+        )),
+        "last-output age disagrees with monitor's {payload}: {facts}"
+    );
+    // The idle guard lands first on this fixture, so that is the countdown the
+    // row spends its one cell on — and it is monitor's own figure.
+    let idle = secs("idle_kill_in_secs");
+    assert!(
+        idle < secs("wall_kill_in_secs"),
+        "fixture control: the idle guard is the deadline that fires: {payload}"
+    );
+    assert!(
+        facts.contains(&format!(
+            "idle-kill in {}",
+            crate::usage::humanize_duration(idle as i64)
+        )),
+        "the next deadline disagrees with monitor's {payload}: {facts}"
+    );
+}
+
+/// A record an older server wrote carries no deadlines at all, and both surfaces
+/// have to say so rather than counting down from a default. Real bytes: the
+/// shape is one only a previous version emitted, so a struct literal would agree
+/// with whatever the fields are today and prove nothing about the wire.
+#[test]
+fn a_record_from_an_older_server_reads_as_liveness_not_recorded() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let dir = jobs::jobs_dir().unwrap();
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("d-legacy-0.json"),
+        format!(
+            r#"{{"job_id":"d-legacy-0","profile":"uwuclxdy","state":"running","started_at":{}}}"#,
+            NOW - 61_000
+        ),
+    )
+    .unwrap();
+
+    let cells = super::delegate_cells(&jobs::list(NOW), NOW);
+    let facts = cells[0].facts.join(" · ");
+    assert!(
+        facts.contains("elapsed 1m 1s"),
+        "the one figure such a record still supports: {facts}"
+    );
+    assert!(
+        facts.contains("liveness not recorded"),
+        "and the rest is named absent, never counted down from a default: {facts}"
+    );
+    assert!(
+        !facts.contains("kill in"),
+        "no deadline is invented for it: {facts}"
+    );
+}
+
+/// More delegates than the pane can hold: the last row says how many did not
+/// fit. A scrollbar would be the contract's overflow signal, but this pane binds
+/// no key, so it would advertise a scroll that cannot happen.
+#[test]
+fn the_delegates_pane_marks_its_overflow_with_a_count() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let now = crate::usage::now_ms();
+    for i in 0..9 {
+        jobs::write_heartbeat(
+            &running_spec(
+                &format!("d-many-{i}"),
+                &format!("acct{i}"),
+                now - 10_000 - i as u64,
+                RecordKind::Collectable,
+            ),
+            now - 1_000 - i as u64,
+            "working",
+        )
+        .unwrap();
+    }
+    let app = app_with_delegates(jobs::list(now));
+    let (rows, _) = render(&app);
+    let screen = rows.join("\n");
+
+    assert!(
+        screen.contains("acct0"),
+        "the newest delegate is the one kept:\n{screen}"
+    );
+    assert!(
+        !screen.contains("acct8"),
+        "the oldest is the one dropped:\n{screen}"
+    );
+    let marker = rows
+        .iter()
+        .find(|r| r.contains("more"))
+        .unwrap_or_else(|| panic!("no overflow marker:\n{screen}"));
+    assert!(
+        marker.contains("+4 more"),
+        "the marker counts what did not fit, and 9 rows into a 5-row list leaves \
+         4: {marker}"
+    );
+}
+
+/// A live row must survive the truncation that a burst of finished ones causes.
+///
+/// `jobs::list` orders on the retention anchor, which for a `done` record is its
+/// FINISH — so every background job that landed a second ago outranks a blocking
+/// run that last spoke twenty seconds ago. On anchor order alone the row this
+/// pane exists for is the first one evicted, and the pane binds no key, so
+/// nothing reaches it afterwards.
+#[test]
+fn a_live_delegate_outranks_finished_ones_however_recently_they_landed() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let now = crate::usage::now_ms();
+    // The row the whole pane exists for: a blocking run, three minutes in.
+    jobs::write_heartbeat(
+        &running_spec("d-blk-0", "kerry", now - 180_000, RecordKind::Liveness),
+        now - 20_000,
+        "still thinking",
+    )
+    .unwrap();
+    let dir = jobs::jobs_dir().unwrap();
+    std::fs::create_dir_all(&dir).unwrap();
+    for i in 0..7 {
+        std::fs::write(
+            dir.join(format!("d-bg-{i}.json")),
+            serde_json::to_vec(&serde_json::json!({
+                "job_id": format!("d-bg-{i}"),
+                "profile": format!("bg{i}"),
+                "state": "done",
+                "started_at": now - 60_000,
+                "done_at": now - 1_000,
+                "envelope": { "result": "landed" },
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+    }
+
+    let app = app_with_delegates(jobs::list(now));
+    let (rows, _) = render(&app);
+    let screen = rows.join("\n");
+
+    assert!(
+        rows.iter().any(|r| r.contains("more")),
+        "fixture control: more delegates than the pane holds, so something is \
+         evicted:\n{screen}"
+    );
+    assert!(
+        screen.contains("kerry"),
+        "and it is never the live one:\n{screen}"
+    );
+    assert!(
+        rows.iter()
+            .any(|r| r.contains("kerry") && r.contains("● blocking")),
+        "which still reads as what it is:\n{screen}"
+    );
+}
+
+/// The height negotiation, pinned from BOTH sides of every constant it reads.
+/// No render test reaches it — every one of them runs at 100x24, where the room
+/// always exceeds what the pane wants — so without this the whole
+/// drop-rather-than-clip half of the function is unexecuted, including the floor
+/// pairing its own doc comment leans on.
+#[test]
+fn the_delegates_pane_drops_whole_rather_than_clipping_when_the_tab_needs_the_rows() {
+    use super::delegates_height;
+
+    // An empty store wants the empty state's own 4 rows plus chrome, and the
+    // empty state is the one thing that cannot be shown in part.
+    assert_eq!(delegates_height(0, 19), 0, "one row short: the pane drops");
+    assert_eq!(delegates_height(0, 20), 7, "exactly enough: it draws");
+
+    // One delegate wants 4 rows, which is under the clipping floor — the floor
+    // must not refuse a pane that already fits.
+    assert_eq!(delegates_height(1, 16), 0);
+    assert_eq!(
+        delegates_height(1, 17),
+        4,
+        "a pane that fits is not refused"
+    );
+
+    // Two or more want at least 5, which IS the floor, so the list can never be
+    // left with a single row holding nothing but an overflow marker.
+    assert_eq!(delegates_height(2, 17), 0);
+    assert_eq!(delegates_height(2, 18), 5);
+
+    // Past the cap the pane stops growing and the marker carries the rest.
+    assert_eq!(
+        delegates_height(9, 24),
+        9,
+        "capped at DELEGATE_ROWS_MAX + chrome"
+    );
+    assert_eq!(
+        delegates_height(9, 200),
+        9,
+        "and a tall terminal buys no more"
+    );
+    assert_eq!(
+        delegates_height(9, 20),
+        7,
+        "while a short one clips to what is left, never past it",
+    );
+}
+
+/// Within a band the listing's newest-first order has to survive the band sort.
+///
+/// The fixture INTERLEAVES the two bands, which is what makes it a real
+/// permutation rather than a no-op: on an input already grouped by rank, pdqsort
+/// short-circuits and an unstable sort returns the same vector, so a same-rank or
+/// pre-grouped fixture cannot fail whatever the sort does.
+#[test]
+fn the_band_sort_keeps_each_band_newest_first() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let now = crate::usage::now_ms();
+    let dir = jobs::jobs_dir().unwrap();
+    std::fs::create_dir_all(&dir).unwrap();
+    for i in 0..20u64 {
+        jobs::write_heartbeat(
+            &running_spec(
+                &format!("d-run-{i:02}"),
+                &format!("run{i:02}"),
+                now - 900_000,
+                RecordKind::Collectable,
+            ),
+            now - 1_000 - i * 1_000,
+            "working",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join(format!("d-dun-{i:02}.json")),
+            serde_json::to_vec(&serde_json::json!({
+                "job_id": format!("d-dun-{i:02}"),
+                "profile": format!("dun{i:02}"),
+                "state": "done",
+                "started_at": now - 900_000,
+                "done_at": now - 1_500 - i * 1_000,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+    }
+
+    let order: Vec<String> = super::delegate_cells(&jobs::list(now), now)
+        .into_iter()
+        .map(|c| c.profile)
+        .collect();
+    let (live, finished) = order.split_at(20);
+    assert!(
+        live.iter().all(|n| n.starts_with("run")),
+        "the live band comes first, whole: {order:?}"
+    );
+    let want_live: Vec<String> = (0..20).map(|i| format!("run{i:02}")).collect();
+    assert_eq!(live, want_live, "and newest-first inside it");
+    let want_done: Vec<String> = (0..20).map(|i| format!("dun{i:02}")).collect();
+    assert_eq!(
+        finished, want_done,
+        "the finished band keeps its own order too, which is what decides which \
+         rows the overflow marker swallows",
+    );
+}
+
+/// An empty store still renders the pane, so the steer line is reachable before
+/// anyone has ever run a delegate.
+#[test]
+fn the_delegates_pane_renders_its_empty_state_with_the_steer_line() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let app = app_with_delegates(Vec::new());
+    let (rows, _) = render(&app);
+    let screen = rows.join("\n");
+
+    assert!(
+        screen.contains("no delegates"),
+        "the empty state renders:\n{screen}"
+    );
+    assert!(
+        screen.contains("manage delegates in clauth app on web or mobile (coming soon)"),
+        "and the steer line with it:\n{screen}"
     );
 }
 

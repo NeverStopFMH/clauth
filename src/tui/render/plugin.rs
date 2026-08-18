@@ -1,6 +1,8 @@
 //! Plugin tab — Claude Code integration health on the left, the selected row's
-//! readout on the right. Master-detail, mirroring the Status tab's two-pane
-//! machinery (counts as 2 of the 3-panel budget; no third panel).
+//! readout on the right, and the running delegates underneath. The master-detail
+//! mirrors the Status tab's two-pane machinery and counts as 2 of the 3-panel
+//! budget; the delegates pane is the third, so the budget is now SPENT and a
+//! fourth panel means restructuring the screen.
 //!
 //! The left panel is one cursor-driven selector over the integration checks
 //! (clauth on PATH, mcpServers wiring, plugin install, CC version, and a
@@ -10,10 +12,15 @@
 //! the selected row's fix (when one applies). All data is recomputed
 //! synchronously on tab focus and `r` — there is no background thread, so the
 //! title spinner only flickers while the cached `claude --version` is probed.
+//!
+//! The delegates pane is read-only and takes no keys at all: stopping a delegate
+//! is `monitor({job_ids, cancel: true})`'s job, and a second stop path would
+//! need its own confirm. That is also why its overflow reads `+N more` rather
+//! than carrying a scrollbar — see [`delegate_lines`].
 
 use ratatui::Frame;
-use ratatui::layout::Rect;
-use ratatui::style::{Modifier, Style};
+use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::symbols::border;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Paragraph};
@@ -21,14 +28,24 @@ use ratatui::widgets::{Block, Paragraph};
 use super::super::app::{App, Health, PluginFocus};
 use super::super::theme;
 use super::format::spinner_frame;
-use super::panes::{draw_scrollbar, empty_state, master_detail, section_box};
+use super::panes::{draw_scrollbar, empty_state, key_cell, master_detail, section_box};
 use crate::format::truncate;
+use crate::mcp::jobs::{self, JobLiveness, RunningLiveness, StoredJob};
+use crate::usage::humanize_duration;
 
 pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
-    let (selector, detail) = master_detail(area, app.plugin.row_count());
+    let rows = delegate_cells(&app.plugin.delegates, crate::usage::now_ms());
+    let [top, delegates] = Layout::vertical([
+        Constraint::Min(MASTER_MIN),
+        Constraint::Length(delegates_height(rows.len(), area.height)),
+    ])
+    .areas(area);
+
+    let (selector, detail) = master_detail(top, app.plugin.row_count());
 
     draw_selector(frame, selector, app);
     draw_detail(frame, detail, app);
+    draw_delegates(frame, delegates, &rows);
 }
 
 // ── Left panel: checks + profiles selector ──────────────────────────────────────
@@ -325,6 +342,340 @@ fn value_tone(key: &str, value: &str) -> Style {
         ("sidebar", "templated") => theme::success(),
         ("sidebar", "not") => theme::warning(),
         _ => theme::body(),
+    }
+}
+
+// ── Bottom panel: what the delegates are doing ──────────────────────────────────
+
+/// Rows the master-detail above keeps before the delegates pane may claim any:
+/// the stacked selector's own floor plus its `Min(8)` detail pane, which is what
+/// makes the tab usable at all. The delegates pane is what gives way.
+const MASTER_MIN: u16 = 13;
+/// Border rows plus the steer line — everything the pane spends that is not a
+/// delegate.
+const PANE_CHROME: u16 = 3;
+/// Rows [`empty_state`] needs to draw its own frame and both its lines.
+const EMPTY_STATE_H: usize = 4;
+/// Most delegate rows the pane will grow to hold; past it the overflow marker
+/// carries the rest. A tab whose subject is the integration checks does not give
+/// half the screen to a fan-out.
+const DELEGATE_ROWS_MAX: usize = 6;
+/// Width of the state word column (`orphaned` is the longest).
+const STATE_W: usize = 8;
+/// Cap on the account column, so one long name cannot push every row's figures
+/// off the pane.
+const NAME_W_MAX: usize = 18;
+/// A tail shorter than this is all ellipsis and no signal, so it is dropped
+/// whole instead.
+const TAIL_MIN_W: usize = 8;
+
+/// The line under the list. Owner's words, verbatim: the pane takes no keys, so
+/// this is the whole of what it offers beyond the list itself.
+const DELEGATES_STEER: &str = "manage delegates in clauth app on web or mobile (coming soon)";
+
+/// Rows the delegates pane takes: its content plus [`PANE_CHROME`], capped so
+/// the master-detail above keeps [`MASTER_MIN`] rows, and `0` when that leaves
+/// too little — the pane drops WHOLE rather than clipping to a box with nothing
+/// readable in it, the same rule the overview's live column plays by.
+///
+/// Never a constant: pinned at one height it would waste rows on an empty store
+/// and hide runs on a busy one.
+///
+/// The floor is compared against `want` as well as against itself, so a pane
+/// that fits at its natural height (one delegate wants 4 rows) is drawn rather
+/// than refused for being under a floor that only exists to stop clipping. That
+/// pairing is also what keeps a one-row viewport from ever holding nothing but
+/// an overflow marker: two or more rows want at least 5, which the floor then
+/// requires, which leaves the list at least 2 rows.
+fn delegates_height(rows: usize, area_height: u16) -> u16 {
+    let content = if rows == 0 {
+        EMPTY_STATE_H
+    } else {
+        rows.min(DELEGATE_ROWS_MAX)
+    };
+    let want = u16::try_from(content)
+        .unwrap_or(u16::MAX)
+        .saturating_add(PANE_CHROME);
+    let room = area_height.saturating_sub(MASTER_MIN);
+    let floor = PANE_CHROME
+        + if rows == 0 {
+            u16::try_from(EMPTY_STATE_H).unwrap_or(u16::MAX)
+        } else {
+            2
+        };
+    if room < floor.min(want) {
+        return 0;
+    }
+    want.min(room)
+}
+
+fn draw_delegates(frame: &mut Frame<'_>, area: Rect, rows: &[DelegateCells]) {
+    if area.height == 0 {
+        return;
+    }
+    // Third panel on this body, and never focused — no key reaches it — so it
+    // keeps the blurred chrome and the non-first panel's TEXT_DIM title.
+    let block = section_box("delegates", false, false);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    if inner.height == 0 {
+        return;
+    }
+
+    let [list_area, steer_area] =
+        Layout::vertical([Constraint::Fill(1), Constraint::Length(1)]).areas(inner);
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(DELEGATES_STEER, theme::faint())))
+            .style(theme::base()),
+        steer_area,
+    );
+
+    if rows.is_empty() {
+        frame.render_widget(empty_state("no delegates", "r", "to refresh"), list_area);
+        return;
+    }
+    let lines = delegate_lines(rows, list_area.height as usize, list_area.width as usize);
+    frame.render_widget(Paragraph::new(lines).style(theme::base()), list_area);
+}
+
+/// The rows that fit, plus a `+N more` line naming what did not.
+///
+/// **House deviation**: the cloudy-tui contract makes a scrollbar the only legal
+/// overflow signal. This pane binds no key, so a scrollbar here would advertise
+/// a scroll that cannot happen; a count says the same thing and promises
+/// nothing. The reason lives here because it is the only written home it has —
+/// the `docs/tui-design.md` entry recording it is owed and not yet written.
+fn delegate_lines(rows: &[DelegateCells], viewport: usize, width: usize) -> Vec<Line<'static>> {
+    if viewport == 0 {
+        return Vec::new();
+    }
+    let (shown, hidden) = if rows.len() > viewport {
+        (viewport - 1, rows.len() - (viewport - 1))
+    } else {
+        (rows.len(), 0)
+    };
+    let visible = &rows[..shown];
+    let name_w = visible
+        .iter()
+        .map(|r| r.profile.chars().count())
+        .max()
+        .unwrap_or(0)
+        .min(NAME_W_MAX);
+    let mut lines: Vec<Line<'static>> = visible
+        .iter()
+        .map(|row| delegate_line(row, name_w, width))
+        .collect();
+    if hidden > 0 {
+        lines.push(Line::from(Span::styled(
+            format!("+{hidden} more"),
+            theme::faint(),
+        )));
+    }
+    lines
+}
+
+/// One delegate row: `● running  account  facts …  "tail"`.
+fn delegate_line(cells: &DelegateCells, name_w: usize, width: usize) -> Line<'static> {
+    let mut spans = vec![
+        Span::styled(
+            format!("{} ", cells.state.mark()),
+            Style::default().fg(cells.state.color()),
+        ),
+        Span::styled(key_cell(cells.state.label(), STATE_W, 2), theme::dim()),
+        Span::styled(
+            key_cell(&truncate(&cells.profile, name_w), name_w, 2),
+            theme::body(),
+        ),
+        Span::styled(cells.facts.join(" · "), theme::dim()),
+    ];
+    // The delegate's own words, quoted so they cannot read as clauth's report
+    // about it, and last so the columns before them never move.
+    let used: usize = spans.iter().map(Span::width).sum();
+    let room = width.saturating_sub(used + 4); // the 2-space gap and both quotes
+    if !cells.tail.is_empty() && room >= TAIL_MIN_W {
+        spans.push(Span::styled(
+            format!("  \"{}\"", truncate(&cells.tail, room)),
+            theme::faint(),
+        ));
+    }
+    Line::from(spans)
+}
+
+/// How a delegate row reads. The word is mandatory beside the mark: three of the
+/// four share the `●` glyph, so hue alone cannot carry the state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DelegateState {
+    /// A background job. Its result waits in the store until `monitor` collects
+    /// it.
+    Running,
+    /// A run whose caller is still holding the line — the shape a plain
+    /// `delegate` call takes, and the one an operator watching a frozen turn is
+    /// actually looking for. It reads apart from `running` because the two are
+    /// different situations, not different progress: nothing can collect this
+    /// one, and the session waiting on it is the session in front of you.
+    Blocking,
+    Done,
+    /// Its `clauth mcp` server stopped writing the record — the run is gone and
+    /// its result with it.
+    Orphaned,
+}
+
+impl DelegateState {
+    /// `●` for a run that is or was doing something, `○` for one whose server is
+    /// gone: the contract's active / disconnected dot pair.
+    fn mark(self) -> &'static str {
+        match self {
+            Self::Running | Self::Blocking | Self::Done => "●",
+            Self::Orphaned => "○",
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Running => "running",
+            Self::Blocking => "blocking",
+            Self::Done => "done",
+            Self::Orphaned => "orphaned",
+        }
+    }
+
+    fn color(self) -> Color {
+        match self {
+            Self::Running | Self::Blocking => theme::accent_color(),
+            Self::Done => theme::success_color(),
+            // Disconnected carries no semantic charge of its own; the word does.
+            Self::Orphaned => theme::text_dim_color(),
+        }
+    }
+
+    /// Which band a row sits in when the pane has more rows than height. A run
+    /// still spending outranks one that is over, whatever the clock says: a
+    /// `done` record is anchored on its FINISH, so on anchor order alone a burst
+    /// of background jobs landing now evicts the blocking run this pane exists
+    /// to show, and no key reaches it afterwards.
+    ///
+    /// An orphan bands with the finished: nothing is waiting on it and its
+    /// result is already gone.
+    fn rank(self) -> u8 {
+        match self {
+            Self::Blocking | Self::Running => 0,
+            Self::Done | Self::Orphaned => 1,
+        }
+    }
+}
+
+/// One delegate's row before anything is styled.
+///
+/// Its liveness figures come from [`jobs::running_liveness`] — the same
+/// derivation `monitor`'s running check renders for the calling model — so the
+/// operator's row and the model's reply cannot disagree about one record. Pure
+/// of the terminal AND of the clock, so a test can drive it at a fixed `now`.
+#[derive(Debug, Clone)]
+struct DelegateCells {
+    state: DelegateState,
+    profile: String,
+    /// What this record can say, in the order a reader scans it.
+    facts: Vec<String>,
+    /// The delegate's own last words, already bounded by the writer. Empty when
+    /// it has said nothing, and on every finished record (a done envelope
+    /// carries the whole result, so a tail beside it says nothing new).
+    tail: String,
+}
+
+fn delegate_cells(stored: &[StoredJob], now: u64) -> Vec<DelegateCells> {
+    let mut rows: Vec<DelegateCells> = stored.iter().map(|job| delegate_row(job, now)).collect();
+    // Live rows first, each band still newest-first: `jobs::list` hands them
+    // over in anchor order and this sort is stable, so the band is the only
+    // thing that moves. It is done HERE and not in `jobs::list`, whose order is
+    // its own documented contract — the record a sweep would drop last is the
+    // one it lists first — and answers a different question than "which row must
+    // a reader not lose".
+    rows.sort_by_key(|row| row.state.rank());
+    rows
+}
+
+fn delegate_row(job: &StoredJob, now: u64) -> DelegateCells {
+    let record = &job.record;
+    let profile = record.profile.clone();
+    // The store's own retention stamp, so a row is dated by the same field that
+    // decides how long it survives.
+    let since = now.saturating_sub(job.anchor) / 1000;
+    match job.liveness {
+        JobLiveness::Done => DelegateCells {
+            state: DelegateState::Done,
+            profile,
+            facts: vec![format!("finished {}", age_phrase(since))],
+            tail: String::new(),
+        },
+        JobLiveness::Corpse => DelegateCells {
+            state: DelegateState::Orphaned,
+            profile,
+            facts: vec![format!("last seen {}", age_phrase(since))],
+            tail: record.tail.clone(),
+        },
+        JobLiveness::Running => {
+            let live = jobs::running_liveness(record, now);
+            let mut facts = vec![format!(
+                "elapsed {}",
+                humanize_duration(live.elapsed_secs as i64)
+            )];
+            if live.recorded {
+                facts.push(match live.last_output_secs_ago {
+                    Some(secs) => format!("last output {}", age_phrase(secs)),
+                    None => "no output yet".to_string(),
+                });
+                if let Some((label, secs)) = next_deadline(&live) {
+                    facts.push(if secs == 0 {
+                        format!("{label} now")
+                    } else {
+                        format!("{label} in {}", humanize_duration(secs as i64))
+                    });
+                }
+            } else {
+                // `monitor`'s own wording for the same gap, so one record does
+                // not get two names for what is missing from it.
+                facts.push("liveness not recorded".to_string());
+            }
+            DelegateCells {
+                // The spelling on disk is the whole difference: a liveness
+                // record exists only while its caller holds the join, so no
+                // second field is needed to say which situation this is.
+                state: match job.kind {
+                    jobs::RecordKind::Collectable => DelegateState::Running,
+                    jobs::RecordKind::Liveness => DelegateState::Blocking,
+                },
+                profile,
+                facts,
+                tail: record.tail.clone(),
+            }
+        }
+    }
+}
+
+/// Which kill lands first and how far off it is. `monitor` reports both figures
+/// because a model can hold both; a row has width for one, and the one worth the
+/// cell is the one that fires.
+fn next_deadline(live: &RunningLiveness) -> Option<(&'static str, u64)> {
+    match (live.idle_kill_in_secs, live.wall_kill_in_secs) {
+        (Some(idle), Some(wall)) if wall <= idle => Some(("wall-kill", wall)),
+        (Some(idle), _) => Some(("idle-kill", idle)),
+        (None, Some(wall)) => Some(("wall-kill", wall)),
+        (None, None) => None,
+    }
+}
+
+/// A duration rendered as an age.
+///
+/// Two-unit [`humanize_duration`] rather than `relative_age`'s single unit, and
+/// deliberately: every age here is a liveness figure read against a 300 s idle
+/// guard, where collapsing everything under a minute to `just now` is the whole
+/// signal lost. Zero takes that phrase anyway, because `humanize_duration`
+/// spells it `now` and `now ago` is not a thing.
+fn age_phrase(secs: u64) -> String {
+    if secs == 0 {
+        "just now".to_string()
+    } else {
+        format!("{} ago", humanize_duration(secs as i64))
     }
 }
 

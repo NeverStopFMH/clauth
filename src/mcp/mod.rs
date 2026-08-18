@@ -8,7 +8,11 @@
 
 mod digest;
 mod herdr_report;
-mod jobs;
+/// Reachable outside this module because the TUI's delegates pane reads the same
+/// store through the same parser: two readers of one store is a drift risk, and
+/// a second parser would be the drift itself. The pane calls [`jobs::list`] and
+/// [`jobs::running_liveness`] and writes nothing.
+pub(crate) mod jobs;
 mod render;
 
 use std::collections::HashMap;
@@ -2290,47 +2294,48 @@ enum WaitOutcome {
 /// separates them: WITH one, this is a healthy streaming run whose only deadline
 /// is the idle guard; WITHOUT one, the record predates these fields entirely and
 /// the whole liveness set is dropped rather than counted down from defaults.
-///
-/// Every figure here is one epoch-ms subtraction, and the only inaccuracy is the
-/// heartbeat throttle: the file is rewritten at most once per
-/// [`HEARTBEAT_INTERVAL`], so `last_output_secs_ago` can over-report silence by
-/// up to that interval and each countdown under-report by the same. The kill
-/// path itself does not read this file — it reads the in-process `progress`
-/// atomic — so the two never have to agree exactly.
+/// [`jobs::RunningLiveness`] holds that arithmetic, and holds it for the TUI's
+/// delegates pane as well, so the two surfaces cannot report one record
+/// differently. The throttle's accuracy bound is documented there.
 fn running_payload(job_id: &str, record: &jobs::JobRecord, now: u64) -> serde_json::Value {
-    let elapsed_ms = now.saturating_sub(record.started_at);
-    let elapsed_secs = elapsed_ms / 1000;
+    let live = jobs::running_liveness(record, now);
     let mut payload = serde_json::json!({
         "job_id": job_id,
         "status": "running",
         "profile": record.profile,
-        "elapsed_secs": elapsed_secs,
+        "elapsed_secs": live.elapsed_secs,
         "quota": quota_payload(&record.profile),
     });
-    if record.timeout_secs == 0 && record.idle_secs.is_none() {
+    if !live.recorded {
         return payload;
     }
-    if record.timeout_secs > 0 {
-        payload["wall_kill_in_secs"] =
-            serde_json::json!(record.timeout_secs.saturating_sub(elapsed_secs));
+    if let Some(secs) = live.wall_kill_in_secs {
+        payload["wall_kill_in_secs"] = serde_json::json!(secs);
     }
-    // A run that has said nothing has been idle for its whole life, which is
-    // also how the kill path counts it.
-    let idle_for_secs = if record.last_output_at == 0 {
-        elapsed_secs
-    } else {
-        now.saturating_sub(record.last_output_at) / 1000
-    };
-    if record.last_output_at > 0 {
-        payload["last_output_secs_ago"] = serde_json::json!(idle_for_secs);
+    if let Some(secs) = live.last_output_secs_ago {
+        payload["last_output_secs_ago"] = serde_json::json!(secs);
     }
-    if let Some(idle) = record.idle_secs {
-        payload["idle_kill_in_secs"] = serde_json::json!(idle.saturating_sub(idle_for_secs));
+    if let Some(secs) = live.idle_kill_in_secs {
+        payload["idle_kill_in_secs"] = serde_json::json!(secs);
     }
     if !record.tail.is_empty() {
         payload["tail"] = serde_json::json!(record.tail);
     }
     payload
+}
+
+/// [`running_payload`] for the TUI's agreement pin, which has to compare what
+/// the delegates pane draws against what `monitor` tells the model about the
+/// same record. Test-only on purpose: the pane derives its own figures from
+/// [`jobs::running_liveness`], which is the half both surfaces share, while this
+/// one also reads the target's usage cache off disk for the `quota` clause.
+#[cfg(test)]
+pub(crate) fn running_payload_for_test(
+    job_id: &str,
+    record: &jobs::JobRecord,
+    now: u64,
+) -> serde_json::Value {
+    running_payload(job_id, record, now)
 }
 
 /// The epoch-ms a job id's stamp segment decodes to, base-36, `None` for a
@@ -2360,6 +2365,19 @@ fn job_id_minted_at(token: &str) -> Option<u64> {
 /// fresh branch because nothing on disk survives either, and the sweep leads the
 /// aged one.
 fn unknown_job_reason(job_id: &str, now: u64) -> String {
+    // Checked FIRST, because it is the one cause this function can actually
+    // know. Everything below hedges; this does not. A blocking delegate's record
+    // is real and minted, so the three generic clauses are each false for it —
+    // never collected, never dropped, and certainly minted — and answering an id
+    // clauth is holding a live run under with "clauth may never have minted it"
+    // is the mirror of the M5 defect where it asserted a mint it could not know.
+    if jobs::liveness_exists(job_id) {
+        return format!(
+            "job_id {job_id} names a blocking `delegate` that is still running: \
+             its result goes back through the call that started it, so there is \
+             nothing here for `monitor` to collect"
+        );
+    }
     let Some(minted_at) = job_id_minted_at(job_id) else {
         return format!(
             "unknown job_id: {job_id} — clauth never minted it (a real id reads \
@@ -3921,23 +3939,23 @@ fn reserve_background_job(
     )
 }
 
-/// The minting itself, shared by the reserve above and by a blocking run's
-/// hand-off — which reaches it with a `cancel` flag its run is already reading
-/// and a `started_at` from before the mint, and which must NOT re-run the
-/// pre-flight or the runtime acquire that run is already past.
-fn reserve_job(
-    mint: &MintSpec,
-    cancel: std::sync::Arc<AtomicBool>,
-) -> std::result::Result<ReservedJob, String> {
+/// The minting itself, shared by the reserve above and by a blocking run's spawn
+/// — which reaches it with a `started_at` from before the mint, and which must
+/// NOT re-run the pre-flight or the runtime acquire that run is already past.
+///
+/// [`resolve_deadlines`] runs HERE and nowhere else per run, so its streaming
+/// fork is applied exactly once and every later write of the record inherits the
+/// same answer.
+fn mint_spec(mint: &MintSpec, kind: jobs::RecordKind) -> jobs::RunningSpec {
     let (wall, idle) = resolve_deadlines(mint.timeout_secs, mint.idle_secs, mint.streaming);
-    let spec = jobs::RunningSpec {
+    jobs::RunningSpec {
         job_id: jobs::new_job_id(mint.started_at),
         profile: mint.profile.clone(),
         started_at: mint.started_at,
         // The record's own age, which is the run's only for a job that started
-        // out background. A hand-off mints one for a run of any age, and
-        // anchoring its retention on `started_at` would leave a long delegate
-        // expired the instant it crossed.
+        // out background. A blocking run mints at its SPAWN, which is after the
+        // pre-flight and the runtime acquire, and anchoring its retention on
+        // `started_at` would spend that whole delay out of its silence budget.
         recorded_at: now_ms(),
         // `0` = no wall clock, which is what a streaming run launches under.
         // Paired with the `idle_secs` below it stays distinguishable from a
@@ -3946,7 +3964,16 @@ fn reserve_job(
         // Without the event stream the idle leg is off entirely, so there is no
         // such deadline to count down to rather than an unknown one.
         idle_secs: mint.streaming.then_some(idle.as_secs()),
-    };
+        kind,
+    }
+}
+
+/// Mint a COLLECTABLE record plus its cancel entry: the background shape.
+fn reserve_job(
+    mint: &MintSpec,
+    cancel: std::sync::Arc<AtomicBool>,
+) -> std::result::Result<ReservedJob, String> {
+    let spec = mint_spec(mint, jobs::RecordKind::Collectable);
     let cancel = CancelGuard::register(&spec.job_id, cancel);
     jobs::write_running(&spec).map_err(|e| format!("failed to record job: {e}"))?;
     Ok(ReservedJob { spec, cancel })
@@ -3968,15 +3995,6 @@ fn reserve_job(
 /// abandoning a blocking call left a child spending a window whose result was
 /// dropped with the handler's future, bounded only by the idle guard.
 struct Handoff {
-    /// Set once a child exists. The whole crossing hangs on it: before the spawn
-    /// nothing has been spent, so an abandoned call STOPS the run through
-    /// `cancel` instead of minting a job to collect a window nobody paid for.
-    ///
-    /// Read without synchronising against the spawn itself, so a cancel racing
-    /// the spawn can lose by one supervision tick: the flag then kills a child
-    /// 50 ms in and its envelope goes nowhere. That is the same loss the
-    /// pre-spawn arm already reports, and cheaper than a lock on the run's path.
-    spawned: AtomicBool,
     /// The flag `run_delegate` reads each tick — held here from the start, and
     /// REGISTERED (under the id minted at the crossing) only there. A blocking
     /// run has no id to name until then, so nothing can reach it, and it ends up
@@ -3990,14 +4008,29 @@ struct Handoff {
 
 /// Which side of a [`Handoff`] a run is on.
 enum HandoffState {
-    /// A caller still holds the join and takes the envelope from there. Carries
-    /// what a late mint needs, because the run is long past the code that
-    /// resolved it.
-    Attached(MintSpec),
+    /// A caller still holds the join and takes the envelope from there.
+    Attached(AttachedRun),
     /// The run owns this reservation and finalizes into it.
     Converted(ReservedJob),
     /// The run is over; there is nothing left to hand off.
     Finished,
+}
+
+/// A run whose caller is still waiting.
+struct AttachedRun {
+    /// What a mint needs, carried because the run is long past the code that
+    /// resolved it.
+    mint: MintSpec,
+    /// The liveness record, `None` until a child exists.
+    ///
+    /// It doubles as the "has this run spawned" fact, which is what makes the
+    /// two impossible to disagree: before the spawn nothing has been spent, so
+    /// an abandoned call STOPS the run instead of minting a job to collect a
+    /// window nobody paid for, and that decision reads the same field the record
+    /// lives in. Installed under the state lock, so a `hand_off` racing the
+    /// spawn either sees no record and cancels — killing a child ~50 ms in, the
+    /// same loss the pre-spawn arm already reports — or sees one and crosses.
+    live: Option<jobs::RunningSpec>,
 }
 
 /// What became of a run whose caller went away.
@@ -4016,9 +4049,8 @@ impl Handoff {
     /// holding the join.
     fn blocking(mint: MintSpec) -> std::sync::Arc<Self> {
         std::sync::Arc::new(Self {
-            spawned: AtomicBool::new(false),
             cancel: std::sync::Arc::new(AtomicBool::new(false)),
-            state: std::sync::Mutex::new(HandoffState::Attached(mint)),
+            state: std::sync::Mutex::new(HandoffState::Attached(AttachedRun { mint, live: None })),
         })
     }
 
@@ -4026,7 +4058,6 @@ impl Handoff {
     /// flag so the entry minted with the id is the one this run consults.
     fn reserved(job: ReservedJob) -> std::sync::Arc<Self> {
         std::sync::Arc::new(Self {
-            spawned: AtomicBool::new(false),
             cancel: std::sync::Arc::clone(&job.cancel.flag),
             state: std::sync::Mutex::new(HandoffState::Converted(job)),
         })
@@ -4037,9 +4068,36 @@ impl Handoff {
     }
 
     /// A child exists: from here an abandoned caller hands this run off rather
-    /// than stopping it.
+    /// than stopping it, and the operator can see the run.
+    ///
+    /// The liveness record is minted HERE rather than at construction because
+    /// this is the boundary a child exists at — the same one [`Self::hand_off`]
+    /// already reads. A run refused by the pre-flight, or still blocked inside
+    /// `ProfileRuntime::acquire`, has spent nothing and must leave no file
+    /// behind to say otherwise.
+    ///
+    /// A background run reaches here already `Converted`, its record minted at
+    /// the reserve, and mints nothing.
     fn mark_spawned(&self) {
-        self.spawned.store(true, Ordering::Relaxed);
+        let spec = {
+            let mut state = self.lock();
+            match &mut *state {
+                HandoffState::Attached(run) if run.live.is_none() => {
+                    let spec = mint_spec(&run.mint, jobs::RecordKind::Liveness);
+                    run.live = Some(spec.clone());
+                    Some(spec)
+                }
+                HandoffState::Attached(_) | HandoffState::Converted(_) | HandoffState::Finished => {
+                    None
+                }
+            }
+        };
+        // Outside the lock: this leaf is never held across IO. Best-effort — a
+        // failed write costs the operator sight of this run, and `hand_off`'s
+        // own write fallback still preserves its result.
+        if let Some(spec) = spec {
+            let _ = jobs::write_running(&spec);
+        }
     }
 
     /// Whether this run has been asked to stop.
@@ -4047,35 +4105,45 @@ impl Handoff {
         self.cancel.load(Ordering::Relaxed)
     }
 
-    /// The record this run heartbeats into, `None` while it has none.
+    /// The record this run heartbeats into, `None` while it has none. An
+    /// attached run answers with its liveness record from the spawn on, which is
+    /// what puts a blocking delegate's heartbeat on disk at all.
     fn spec(&self) -> Option<jobs::RunningSpec> {
         match &*self.lock() {
             HandoffState::Converted(job) => Some(job.spec.clone()),
-            HandoffState::Attached(_) | HandoffState::Finished => None,
+            HandoffState::Attached(run) => run.live.clone(),
+            HandoffState::Finished => None,
         }
     }
 
     /// The caller went away. Hand the run off to a job file if it has already
     /// started spending, and stop it if it has not.
     fn hand_off(&self) -> Abandoned {
+        let live = match &*self.lock() {
+            HandoffState::Attached(run) => run.live.clone(),
+            // Already across (a background run), or over.
+            HandoffState::Converted(_) | HandoffState::Finished => return Abandoned::Kept,
+        };
         // The same boundary `run_delegate` reads right after
         // `ProfileRuntime::acquire` returns, from the other side: with no child
         // there is nothing to collect and nothing was billed, so a job file
         // would only promise a result that is never coming.
-        if !self.spawned.load(Ordering::Relaxed) {
+        let Some(live) = live else {
             self.cancel.store(true, Ordering::Relaxed);
             return Abandoned::Kept;
-        }
-        let mint = match &*self.lock() {
-            HandoffState::Attached(mint) => mint.clone(),
-            // Already across (a background run), or over.
-            HandoffState::Converted(_) | HandoffState::Finished => return Abandoned::Kept,
         };
-        // Minted OUTSIDE the lock, because `reserve_job` takes CANCEL_REGISTRY's:
-        // both stay TRUE leaves only while neither is ever held across the
-        // other. What that costs is the window `install` exists to close.
-        match reserve_job(&mint, std::sync::Arc::clone(&self.cancel)) {
-            Ok(job) => self.install(job),
+        // The run keeps its own id across the crossing; only the spelling moves.
+        let spec = jobs::RunningSpec {
+            kind: jobs::RecordKind::Collectable,
+            ..live
+        };
+        // Registered OUTSIDE the state lock, because `CancelGuard::register`
+        // takes CANCEL_REGISTRY's: both stay TRUE leaves only while neither is
+        // ever held across the other. What that costs is the window `install`
+        // exists to close.
+        let cancel = CancelGuard::register(&spec.job_id, std::sync::Arc::clone(&self.cancel));
+        match jobs::promote(&spec) {
+            Ok(()) => self.install(ReservedJob { spec, cancel }),
             Err(reason) => {
                 logline!("clauth: delegate hand-off failed, its result is lost: {reason}");
                 Abandoned::Kept
@@ -4134,18 +4202,37 @@ impl Handoff {
         };
         let owned = match previous {
             HandoffState::Converted(job) => Some(job),
-            // Attached: a caller is still holding the join and takes the
-            // envelope from there.
-            other => {
-                debug_assert!(
-                    matches!(other, HandoffState::Attached(_)),
-                    "one finalize per run",
-                );
+            // A caller is still holding the join and takes the envelope from
+            // there, so this run's liveness record has no result left to offer.
+            // Leaving it would advertise a job nothing will ever collect, and
+            // writing a `done` record into it would deliver one result twice.
+            // Outside the lock, like every other write here.
+            HandoffState::Attached(run) => {
+                if let Some(spec) = run.live {
+                    jobs::remove_liveness(&spec.job_id);
+                }
+                None
+            }
+            HandoffState::Finished => {
+                debug_assert!(false, "one finalize per run");
                 None
             }
         };
         // Outside the lock: this leaf is never held across IO.
         if let Some(ReservedJob { spec, cancel }) = owned {
+            // Any liveness record still standing under this id is provably an
+            // orphan, and clearing it here is what makes the crossing safe at
+            // all. The rename in `promote` is atomic, but the WRITER racing it
+            // is not bounded by it: the stdout reader resolves `spec()` and only
+            // then does its IO, so a beat that resolved the liveness spelling
+            // lands after the rename and recreates the file. `mark_spawned` has
+            // the same shape, installing the spec under the lock and writing
+            // outside it. Neither window can be closed by ordering the rename.
+            // What closes both is WHEN this runs: `run_delegate` joins the
+            // reader thread before it returns and this is called after it does,
+            // so no beat exists to lose a second race to. A no-op for a run that
+            // started out background and never had the spelling.
+            jobs::remove_liveness(&spec.job_id);
             let _ = jobs::write_done(
                 &spec.job_id,
                 &spec.profile,

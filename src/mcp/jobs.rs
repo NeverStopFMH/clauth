@@ -10,8 +10,8 @@
 //! against the runtime/state locks.
 //!
 //! A BLOCKING delegate whose caller walks away also ends up here
-//! (`Handoff::hand_off` mints it a record mid-run), and it writes the same file
-//! through the same code — but it is NOT delivered the same way, and the
+//! (`Handoff::hand_off` promotes its record mid-run), and it writes the same
+//! file through the same code — but it is NOT delivered the same way, and the
 //! paragraph above does not reach it. Measured on Claude Code 2.1.233: a tool
 //! call the client cancelled or timed out dispatches `PostToolUseFailure`, never
 //! `PostToolUse`, so the bundled hook never runs for it; and the reply carrying
@@ -20,6 +20,15 @@
 //! spent window's result EXISTS rather than because anything currently collects
 //! it: today it is reachable by an operator reading the store, and by `monitor`
 //! only from an id learned some other way.
+//!
+//! A blocking delegate that is STILL attached to its caller keeps a second
+//! spelling here, `<job_id>.live.json` ([`RecordKind::Liveness`]) — the same
+//! bytes, heartbeat and all, under a filename no reader can name. It exists so
+//! an operator can see a run whose model-facing result is still travelling back
+//! through the join; nothing collects it, and [`RecordKind`] documents why that
+//! is structural rather than a convention. It ends one of two ways: renamed to
+//! the collectable spelling when the caller walks away, or deleted when the run
+//! finishes with its caller still there.
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -63,6 +72,11 @@ pub(super) const DONE_TTL_MS: u64 = 60 * 60 * 1000; // 1h
 ///   entire life and the anchor is its mint. What bounds it is the wall clock it
 ///   always has (also ≤ 3600 s), not any liveness it emits.
 ///
+/// A blocking run's [`RecordKind::Liveness`] record is a third shape and the
+/// cheapest of the three: it is minted at the SPAWN rather than at the reserve,
+/// so the pre-spawn delay is outside its clock entirely and what bounds it is
+/// the run's own deadline.
+///
 /// So the silent window this must cover is the pre-spawn delay for a streaming
 /// run, and the pre-spawn delay PLUS the whole run for a pinned-format one. Both
 /// can overrun it, from the same cause — `ProfileRuntime::acquire` blocks behind
@@ -88,6 +102,41 @@ static JOB_COUNTER: AtomicU64 = AtomicU64::new(0);
 pub(crate) enum JobState {
     Running,
     Done,
+}
+
+/// Which spelling of a record a path names. Not serialized: it is a property of
+/// the FILENAME, so a record carries no flag saying which one holds it and there
+/// is no flag to forget to set.
+///
+/// The split is what lets a blocking delegate be visible without being
+/// collectable, and it closes structurally rather than by a refusal arm.
+///
+/// The property, stated so it survives the next reader being added: **no
+/// CALLER-SUPPLIED id can resolve a `Liveness` record's content.** Two different
+/// mechanisms hold it up, and both are needed because neither covers the other:
+///
+/// - An **id-keyed** reader returns content only through [`read`], which joins
+///   `Collectable` and nothing else. `monitor`'s collect and wait paths and
+///   `mcp::await_job` all go through it, and each also filters the id through
+///   [`is_safe_job_id`], which refuses the `.` a `Liveness` name needs.
+///   [`liveness_exists`] names the other spelling but answers a bool rather than
+///   content, and guards its own id.
+/// - [`list`] DOES return `Liveness` content — the pane draws that record's
+///   tail. It is safe because it takes no id at all: it enumerates the directory
+///   and returns what it finds, so nothing a caller spells selects a file.
+///
+/// So a new reader is safe iff it returns no `Liveness` content FOR AN ID. The
+/// shape to refuse is an id-keyed wrapper over `list` — `list(now).find(|j|
+/// j.record.job_id == id)` reads correct, returns a blocking run's record under
+/// a caller's string, and reopens exactly what this type closes. An id-keyed
+/// lookup belongs on `read`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RecordKind {
+    /// `<id>.json` — a result a `monitor` call may collect.
+    Collectable,
+    /// `<id>.live.json` — liveness only, for a blocking run whose caller still
+    /// holds the join and takes the envelope from there.
+    Liveness,
 }
 
 /// `#[serde(skip_serializing_if)]` predicate for a numeric field at its default.
@@ -153,8 +202,9 @@ pub(crate) struct JobRecord {
     pub(crate) done_at: u64,
 }
 
-/// What a background job's `running` record carries from its reserve through
-/// every heartbeat: identity plus the deadlines the run launched under. Grouped
+/// What one job's `running` record carries from its mint through every
+/// heartbeat: identity, the spelling it lands under, and the deadlines the run
+/// launched under. Grouped
 /// so the reserve resolves them once and the heartbeat cannot re-derive them
 /// differently — `resolve_deadlines` applies defaults, clamps and a streaming
 /// fork, and a second derivation goes wrong the first time that fork changes.
@@ -170,6 +220,10 @@ pub(crate) struct RunningSpec {
     pub(crate) recorded_at: u64,
     pub(crate) timeout_secs: u64,
     pub(crate) idle_secs: Option<u64>,
+    /// Which spelling every write of this record lands under. A background job
+    /// is `Collectable` from its reserve; a blocking one is `Liveness` until its
+    /// caller walks away and [`promote`] renames it.
+    pub(crate) kind: RecordKind,
 }
 
 pub(crate) fn jobs_dir() -> Result<PathBuf> {
@@ -220,22 +274,34 @@ pub(crate) fn is_safe_job_id(id: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
 }
 
-fn job_path(job_id: &str) -> Result<PathBuf> {
-    Ok(jobs_dir()?.join(format!("{job_id}.json")))
+/// The file one record lands in. `Collectable` is the only kind any reader of
+/// caller-supplied ids ever asks for, and the `.` [`is_safe_job_id`] refuses is
+/// what keeps its join off a `Liveness` file — see [`RecordKind`].
+fn job_path(job_id: &str, kind: RecordKind) -> Result<PathBuf> {
+    let name = match kind {
+        RecordKind::Collectable => format!("{job_id}.json"),
+        RecordKind::Liveness => format!("{job_id}{LIVE_SUFFIX}"),
+    };
+    Ok(jobs_dir()?.join(name))
 }
+
+/// The filename tail marking a [`RecordKind::Liveness`] record. It still ends
+/// `.json`, so [`gc`] and [`gc_running_corpses`] already retain and reap one on
+/// the same rules as any other running record, with no arm of their own.
+const LIVE_SUFFIX: &str = ".live.json";
 
 /// Persist a record atomically (tmp + rename, so a reader sees either the old
 /// file or the fully-written new one, never a torn write). Owner-only: a job
 /// file carries the delegate's prompt and the account's full response, and lands
 /// under `~/.clauth`, so it rides the 0o600 dir-0o700 invariant.
-fn write_atomic(record: &JobRecord) -> Result<()> {
+fn write_atomic(record: &JobRecord, kind: RecordKind) -> Result<()> {
     let bytes = serde_json::to_vec(record)?;
-    crate::profile::atomic_write_600(&job_path(&record.job_id)?, &bytes)?;
+    crate::profile::atomic_write_600(&job_path(&record.job_id, kind)?, &bytes)?;
     Ok(())
 }
 
-/// Write the initial `running` record for a freshly-started background job:
-/// the reserved spec with nothing observed yet.
+/// Write the initial `running` record for a freshly-started job: the minted spec
+/// with nothing observed yet, under whichever spelling `spec.kind` names.
 /// `#[serde(default)]` on every later `JobRecord` field is what lets a job file
 /// written by an older server still parse here.
 pub(crate) fn write_running(spec: &RunningSpec) -> Result<()> {
@@ -258,19 +324,47 @@ pub(crate) fn write_running(spec: &RunningSpec) -> Result<()> {
 /// heartbeating into is minted before its first beat resolves one, and the same
 /// single reader thread does every beat either way.
 pub(crate) fn write_heartbeat(spec: &RunningSpec, last_output_at: u64, tail: &str) -> Result<()> {
-    write_atomic(&JobRecord {
-        job_id: spec.job_id.clone(),
-        profile: spec.profile.clone(),
-        state: JobState::Running,
-        started_at: spec.started_at,
-        envelope: None,
-        timeout_secs: spec.timeout_secs,
-        idle_secs: spec.idle_secs,
-        last_output_at,
-        recorded_at: spec.recorded_at,
-        tail: tail.to_string(),
-        done_at: 0,
-    })
+    write_atomic(
+        &JobRecord {
+            job_id: spec.job_id.clone(),
+            profile: spec.profile.clone(),
+            state: JobState::Running,
+            started_at: spec.started_at,
+            envelope: None,
+            timeout_secs: spec.timeout_secs,
+            idle_secs: spec.idle_secs,
+            last_output_at,
+            recorded_at: spec.recorded_at,
+            tail: tail.to_string(),
+            done_at: 0,
+        },
+        spec.kind,
+    )
+}
+
+/// Make `spec`'s COLLECTABLE record exist, keeping the run's id: what a blocking
+/// delegate's hand-off crosses on.
+///
+/// A rename rather than a fresh mint, so one run keeps ONE identity across the
+/// crossing — the id its own heartbeats already carry — and no reader ever sees
+/// the id resolve to nothing. The write fallback covers the two ways the source
+/// can be missing: the liveness write has not landed yet, or the run finished
+/// and [`remove_liveness`] got there first. In the second case the caller's own
+/// install hands the record straight back, so the fallback cannot strand one.
+///
+/// What this does NOT do is stop the liveness spelling coming back. The rename
+/// is atomic; the concurrent writer is not bounded by it, and a heartbeat that
+/// resolved its destination before the rename lands after it. `Handoff::finalize`
+/// is what clears that, from a position where no writer is left to race — see
+/// the comment there.
+pub(crate) fn promote(spec: &RunningSpec) -> Result<()> {
+    debug_assert_eq!(spec.kind, RecordKind::Collectable);
+    let from = job_path(&spec.job_id, RecordKind::Liveness)?;
+    let to = job_path(&spec.job_id, RecordKind::Collectable)?;
+    if std::fs::rename(&from, &to).is_err() {
+        write_running(spec)?;
+    }
+    Ok(())
 }
 
 /// Finalize a job: overwrite its file with the completed envelope, stamped with
@@ -283,31 +377,63 @@ pub(crate) fn write_done(
     started_at: u64,
     envelope: serde_json::Value,
 ) -> Result<()> {
-    write_atomic(&JobRecord {
-        job_id: job_id.to_string(),
-        profile: profile.to_string(),
-        state: JobState::Done,
-        started_at,
-        envelope: Some(envelope),
-        timeout_secs: 0,
-        idle_secs: None,
-        last_output_at: 0,
-        recorded_at: 0,
-        tail: String::new(),
-        done_at: crate::usage::now_ms(),
-    })
+    write_atomic(
+        &JobRecord {
+            job_id: job_id.to_string(),
+            profile: profile.to_string(),
+            state: JobState::Done,
+            started_at,
+            envelope: Some(envelope),
+            timeout_secs: 0,
+            idle_secs: None,
+            last_output_at: 0,
+            recorded_at: 0,
+            tail: String::new(),
+            done_at: crate::usage::now_ms(),
+        },
+        // A result is always collectable: the one run that finalizes with a
+        // liveness record still open is a blocking one, and its caller already
+        // took the envelope from the join, so `Handoff::finalize` deletes that
+        // record rather than writing a second delivery into it.
+        RecordKind::Collectable,
+    )
 }
 
-/// Read a job record, or `None` if the file is absent or unparseable.
+/// Read a job record, or `None` if the file is absent or unparseable. Resolves
+/// the collectable spelling ONLY — see [`RecordKind`].
 pub(crate) fn read(job_id: &str) -> Option<JobRecord> {
-    let bytes = std::fs::read(job_path(job_id).ok()?).ok()?;
+    let bytes = std::fs::read(job_path(job_id, RecordKind::Collectable).ok()?).ok()?;
     serde_json::from_slice(&bytes).ok()
 }
 
 /// Delete a job file (best-effort). Called after a fallback `monitor` collect
 /// hands the envelope back.
 pub(crate) fn remove(job_id: &str) {
-    if let Ok(path) = job_path(job_id) {
+    if let Ok(path) = job_path(job_id, RecordKind::Collectable) {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
+/// Whether a blocking run's liveness record stands under this id.
+///
+/// The one fact that separates "clauth never minted this" from "clauth minted it
+/// and its result is going back through the blocking call that owns it" — two
+/// answers a caller acts on differently, and only this file tells them apart.
+/// Guarded by [`is_safe_job_id`] here rather than at the caller, because it is
+/// the only reader whose question is about an id that resolved to NOTHING, where
+/// a caller has already stopped expecting the id to be well-formed.
+pub(crate) fn liveness_exists(job_id: &str) -> bool {
+    is_safe_job_id(job_id) && job_path(job_id, RecordKind::Liveness).is_ok_and(|path| path.exists())
+}
+
+/// Delete a blocking run's liveness record (best-effort).
+///
+/// Its own function rather than a `kind` argument on [`remove`], because the two
+/// answer different questions: `remove` evicts a result a caller has just taken
+/// delivery of, this one retracts an offer of visibility for a run whose result
+/// went back through the join.
+pub(crate) fn remove_liveness(job_id: &str) {
+    if let Ok(path) = job_path(job_id, RecordKind::Liveness) {
         let _ = std::fs::remove_file(path);
     }
 }
@@ -373,6 +499,146 @@ fn retention_anchor(record: &JobRecord) -> u64 {
     }
 }
 
+/// Whether a `running` record has been SILENT past [`RUNNING_TTL_MS`] — the one
+/// question [`gc_running_corpses`] reaps on. [`list`] classifies with it too, so
+/// a reader drawing a corpse and the sweep destroying one cannot disagree about
+/// which records are dead.
+fn running_is_silent(record: &JobRecord, now: u64) -> bool {
+    now.saturating_sub(retention_anchor(record)) > RUNNING_TTL_MS
+}
+
+/// How a reader sees one record: its own state, plus the corpse verdict a
+/// `running` record earns once its server has stopped writing to it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum JobLiveness {
+    Running,
+    Done,
+    /// `running` on disk, silent past [`RUNNING_TTL_MS`]: the server that was
+    /// writing it is gone. Drawn as such rather than as live.
+    Corpse,
+}
+
+/// One record as a reader finds it: the parsed record, which spelling held it,
+/// and how it reads right now.
+#[derive(Debug, Clone)]
+pub(crate) struct StoredJob {
+    pub(crate) record: JobRecord,
+    pub(crate) kind: RecordKind,
+    pub(crate) liveness: JobLiveness,
+    /// The stamp this listing sorted on and both retention rules read: a `done`
+    /// record's finish, a `running` one's freshest sign of life, each with its
+    /// own fallback for a file an older server wrote. Carried so a reader dates
+    /// a row from the same stamp the store keeps it by, rather than picking a
+    /// field per state and drifting from [`retention_anchor`].
+    pub(crate) anchor: u64,
+}
+
+/// Every record in the store, newest-mattering first.
+///
+/// READ-ONLY, and that is the contract rather than an implementation detail: no
+/// Done TTL, no `.tmp` sweep, no retention cap, no corpse reap. A reader that
+/// destroys what it came for is the defect this store has shipped twice, so
+/// every destructive rule stays in [`gc`] / [`gc_running_corpses`] where a
+/// caller asks for it by name. An unreadable file is skipped, never deleted.
+///
+/// Ordered on [`retention_anchor`] — the same stamp both retention rules read —
+/// so the record a sweep would drop last is the one this lists first.
+pub(crate) fn list(now: u64) -> Vec<StoredJob> {
+    let Ok(dir) = jobs_dir() else {
+        return Vec::new();
+    };
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return Vec::new();
+    };
+    let mut found: Vec<(u64, StoredJob)> = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("json") {
+            continue;
+        }
+        let kind = match path.file_name().and_then(|n| n.to_str()) {
+            Some(name) if name.ends_with(LIVE_SUFFIX) => RecordKind::Liveness,
+            _ => RecordKind::Collectable,
+        };
+        let record = std::fs::read(&path)
+            .ok()
+            .and_then(|b| serde_json::from_slice::<JobRecord>(&b).ok());
+        let Some(record) = record else {
+            continue;
+        };
+        let liveness = match record.state {
+            JobState::Done => JobLiveness::Done,
+            JobState::Running if running_is_silent(&record, now) => JobLiveness::Corpse,
+            JobState::Running => JobLiveness::Running,
+        };
+        let anchor = retention_anchor(&record);
+        found.push((
+            anchor,
+            StoredJob {
+                record,
+                kind,
+                liveness,
+                anchor,
+            },
+        ));
+    }
+    found.sort_by_key(|(anchor, _)| std::cmp::Reverse(*anchor));
+    found.into_iter().map(|(_, job)| job).collect()
+}
+
+/// Every liveness figure a `running` record yields at one instant.
+///
+/// ONE derivation for two surfaces: `monitor`'s running payload renders it for
+/// the calling model, and the TUI's delegates pane draws it for the operator, so
+/// neither can answer differently about the same file. A `None` is a figure the
+/// record structurally does not have, never an unknown one — the same rule the
+/// payload's absent keys already render by.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RunningLiveness {
+    pub(crate) elapsed_secs: u64,
+    /// `false` on a record written before these fields existed, where every
+    /// figure below is absent rather than zero. A wall-less streaming run is the
+    /// other zero-`timeout_secs` shape, and `idle_secs` is what tells them apart.
+    pub(crate) recorded: bool,
+    pub(crate) last_output_secs_ago: Option<u64>,
+    pub(crate) idle_kill_in_secs: Option<u64>,
+    pub(crate) wall_kill_in_secs: Option<u64>,
+}
+
+/// Derive [`RunningLiveness`] from a record at epoch-ms `now`.
+///
+/// Every figure is one epoch-ms subtraction; the only inaccuracy is the
+/// heartbeat throttle, which can over-report silence and under-report each
+/// countdown by up to one beat. The kill path reads an in-process atomic rather
+/// than this file, so the two never have to agree exactly.
+pub(crate) fn running_liveness(record: &JobRecord, now: u64) -> RunningLiveness {
+    let elapsed_secs = now.saturating_sub(record.started_at) / 1000;
+    if record.timeout_secs == 0 && record.idle_secs.is_none() {
+        return RunningLiveness {
+            elapsed_secs,
+            recorded: false,
+            last_output_secs_ago: None,
+            idle_kill_in_secs: None,
+            wall_kill_in_secs: None,
+        };
+    }
+    // A run that has said nothing has been idle for its whole life, which is
+    // also how the kill path counts it.
+    let idle_for_secs = if record.last_output_at == 0 {
+        elapsed_secs
+    } else {
+        now.saturating_sub(record.last_output_at) / 1000
+    };
+    RunningLiveness {
+        elapsed_secs,
+        recorded: true,
+        last_output_secs_ago: (record.last_output_at > 0).then_some(idle_for_secs),
+        idle_kill_in_secs: record.idle_secs.map(|i| i.saturating_sub(idle_for_secs)),
+        wall_kill_in_secs: (record.timeout_secs > 0)
+            .then(|| record.timeout_secs.saturating_sub(elapsed_secs)),
+    }
+}
+
 fn sweep(now: u64, scope: Scope) {
     let full = scope == Scope::Everything;
     let Ok(dir) = jobs_dir() else {
@@ -404,7 +670,7 @@ fn sweep(now: u64, scope: Scope) {
         let anchor = retention_anchor(&record);
         let expired = match record.state {
             JobState::Done => full && now.saturating_sub(anchor) > DONE_TTL_MS,
-            JobState::Running => now.saturating_sub(anchor) > RUNNING_TTL_MS,
+            JobState::Running => running_is_silent(&record, now),
         };
         if expired {
             let _ = std::fs::remove_file(&path);

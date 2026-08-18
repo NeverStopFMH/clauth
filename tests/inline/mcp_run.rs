@@ -1019,6 +1019,9 @@ fn running_spec(job_id: &str, profile: &str, started_at: u64) -> jobs::RunningSp
         recorded_at: started_at,
         timeout_secs: 0,
         idle_secs: Some(300),
+        // A background job's record is collectable from its reserve; the
+        // liveness spelling belongs to a blocking run alone.
+        kind: jobs::RecordKind::Collectable,
     }
 }
 
@@ -5349,6 +5352,236 @@ fn a_run_that_finishes_first_keeps_its_envelope_and_leaves_no_job_file() {
     assert!(
         !super::cancel_job(&stranded),
         "its registry entry goes with it",
+    );
+}
+
+/// The structural guarantee at the reader that matters: `monitor` cannot collect
+/// a blocking run's record, whichever id it is asked for.
+///
+/// Two ids reach the same file on disk and neither works — the run's own, which
+/// resolves to the collectable spelling that does not exist, and the string that
+/// would spell the liveness path, which the id gate refuses BY NAME before any
+/// path is joined. No arm of `monitor` says "liveness", which is the point: the
+/// refusal is the charset plus the join, not a rule someone has to remember.
+#[test]
+fn monitor_cannot_collect_a_blocking_run_under_either_spelling() {
+    let _home = HomeSandbox::new();
+    let handoff = super::Handoff::blocking(mint_spec("work"));
+    handoff.mark_spawned();
+    let id = handoff.spec().expect("liveness record").job_id;
+    jobs::write_heartbeat(
+        &handoff.spec().expect("spec"),
+        now_ms(),
+        "words only the operator sees",
+    )
+    .unwrap();
+
+    let own = monitor_text(&id);
+    assert!(
+        own.contains(&format!("job_id {id} names a blocking `delegate`")),
+        "the run's own id collects nothing, and is told why in terms that are \
+         TRUE of it: {own}",
+    );
+    for false_clause in [
+        "already collected",
+        "dropped once the store passed",
+        "may never have minted it",
+    ] {
+        assert!(
+            !own.contains(false_clause),
+            "`{false_clause}` is false for an id clauth is holding a live run \
+             under: {own}",
+        );
+    }
+    assert!(
+        !own.contains("words only the operator sees"),
+        "and nothing leaks the record's contents through it: {own}",
+    );
+
+    let spelled = format!("{id}.live");
+    let named = monitor_text(&spelled);
+    assert!(
+        named.contains("invalid job_id") || named.contains(&format!("unknown job_id: {spelled}")),
+        "and the string that would spell its path is refused before any read: {named}",
+    );
+    assert!(
+        !named.contains("words only the operator sees"),
+        "with nothing of the record in the reply either: {named}",
+    );
+}
+
+/// M9's half of the seam: a blocking run gets a LIVENESS record at its spawn, so
+/// an operator can watch a delegate whose caller is still holding the line — and
+/// the record goes away when that caller takes the envelope, because a record
+/// left behind promises a result nobody will ever collect.
+///
+/// The mint sits at the spawn rather than at construction because that is the
+/// boundary a child exists at; the pre-spawn arm below is what that buys.
+#[test]
+fn a_blocking_run_is_visible_from_its_spawn_and_leaves_nothing_when_it_finishes() {
+    let _home = HomeSandbox::new();
+    let handoff = super::Handoff::blocking(mint_spec("work"));
+    assert!(
+        job_files().is_empty(),
+        "nothing exists before a child does: {:?}",
+        job_files(),
+    );
+
+    handoff.mark_spawned();
+    let spec = handoff
+        .spec()
+        .expect("a spawned blocking run heartbeats into a record");
+    assert_eq!(
+        spec.kind,
+        jobs::RecordKind::Liveness,
+        "and that record is the liveness spelling, never a collectable one",
+    );
+    assert_eq!(
+        job_files(),
+        vec![format!("{}.live.json", spec.job_id)],
+        "exactly one file, under the name no `monitor` id can reach",
+    );
+    assert!(
+        jobs::read(&spec.job_id).is_none(),
+        "so the id it carries collects nothing while its caller is still waiting",
+    );
+
+    // The heartbeat path is the same one a background run takes, and it lands in
+    // the liveness file because the spec says so.
+    jobs::write_heartbeat(&spec, crate::usage::now_ms(), "thinking").unwrap();
+    let listed = jobs::list(crate::usage::now_ms());
+    assert_eq!(
+        listed.len(),
+        1,
+        "the operator's listing sees it: {listed:?}"
+    );
+    assert_eq!(listed[0].record.tail, "thinking");
+    assert_eq!(listed[0].kind, jobs::RecordKind::Liveness);
+
+    handoff.finalize(&serde_json::json!({"profile": "work", "result": "the caller got this"}));
+    assert!(
+        job_files().is_empty(),
+        "the caller took the envelope from the join, so the record retires with \
+         it rather than offering a second delivery: {:?}",
+        job_files(),
+    );
+}
+
+/// The crossing, from M9's side: a run handed off mid-flight ends with exactly
+/// ONE record, under the id its own heartbeats were already carrying. Minting a
+/// fresh one there would leave a second identity for one run and an orphaned
+/// liveness file to sweep.
+#[test]
+fn a_blocking_run_handed_off_keeps_one_id_and_leaves_one_collectable_record() {
+    let _home = HomeSandbox::new();
+    let handoff = super::Handoff::blocking(mint_spec("work"));
+    handoff.mark_spawned();
+    let live_id = handoff.spec().expect("liveness record").job_id;
+
+    let super::Abandoned::HandedOff(job_id) = handoff.hand_off() else {
+        panic!("a run with a live child is handed off");
+    };
+    assert_eq!(
+        job_id, live_id,
+        "one run, one identity: the id handed back is the id it was already \
+         heartbeating under",
+    );
+    assert_eq!(
+        job_files(),
+        vec![format!("{job_id}.json")],
+        "and one record, in the collectable spelling: {:?}",
+        job_files(),
+    );
+    assert_eq!(
+        handoff.spec().map(|s| s.kind),
+        Some(jobs::RecordKind::Collectable),
+        "every later heartbeat goes to the collectable file too",
+    );
+    assert!(
+        jobs::read(&job_id).is_some(),
+        "which is what makes the result collectable at all",
+    );
+
+    handoff.finalize(&serde_json::json!({"profile": "work", "result": "collected later"}));
+    assert_eq!(
+        job_files(),
+        vec![format!("{job_id}.json")],
+        "the finalize writes into that same one file: {:?}",
+        job_files(),
+    );
+    let record = jobs::read(&job_id).expect("the done record");
+    assert_eq!(record.state, jobs::JobState::Done);
+}
+
+/// A heartbeat that resolved its destination BEFORE the crossing lands after it,
+/// recreating the liveness spelling the rename just retired. The stdout reader
+/// resolves `handoff.spec()` and only then does its IO, so this interleave is a
+/// plain thread race, reconstructed here in order rather than timed.
+///
+/// Left alone it strands a phantom `blocking` row beside the run's own `done`
+/// row for `RUNNING_TTL_MS`, in the very pane this task adds.
+#[test]
+fn a_heartbeat_that_raced_the_crossing_cannot_outlive_it() {
+    let _home = HomeSandbox::new();
+    let handoff = super::Handoff::blocking(mint_spec("work"));
+    handoff.mark_spawned();
+    // What a beat already in flight is holding: the liveness spec.
+    let in_flight = handoff.spec().expect("liveness spec");
+
+    let super::Abandoned::HandedOff(job_id) = handoff.hand_off() else {
+        panic!("a run with a live child is handed off");
+    };
+    // The beat lands now, writing where it resolved.
+    jobs::write_heartbeat(&in_flight, now_ms(), "late beat").unwrap();
+
+    handoff.finalize(&serde_json::json!({"profile": "work", "result": "done"}));
+    assert_eq!(
+        job_files(),
+        vec![format!("{job_id}.json")],
+        "one run leaves one record: the raced beat's file is an orphan the \
+         finalize is positioned to clear, since `run_delegate` has already \
+         joined the reader thread by then",
+    );
+    let listed = jobs::list(now_ms());
+    assert_eq!(
+        listed.len(),
+        1,
+        "so the pane cannot draw the same run as live and finished at once: {listed:?}",
+    );
+}
+
+/// The same class through the other window: `mark_spawned` installs the spec
+/// under the state lock and writes the file OUTSIDE it, so a hand-off crossing
+/// in between finds `run.live` set and no file. `promote`'s rename then fails,
+/// its fallback writes the collectable record, and the spawn's own write lands
+/// afterwards under the liveness spelling.
+///
+/// Staged in order rather than timed: the delete is what a not-yet-landed write
+/// looks like to the reader.
+#[test]
+fn a_spawn_write_that_lost_the_race_to_the_crossing_is_cleared_too() {
+    let _home = HomeSandbox::new();
+    let handoff = super::Handoff::blocking(mint_spec("work"));
+    handoff.mark_spawned();
+    let live = handoff.spec().expect("liveness spec");
+    let dir = jobs::jobs_dir().unwrap();
+    std::fs::remove_file(dir.join(format!("{}.live.json", live.job_id))).unwrap();
+
+    let super::Abandoned::HandedOff(job_id) = handoff.hand_off() else {
+        panic!("a spawned run is handed off even when its record has not landed");
+    };
+    assert!(
+        jobs::read(&job_id).is_some(),
+        "promote's fallback still leaves the run collectable",
+    );
+    // The spawn's own write, landing late.
+    jobs::write_running(&live).unwrap();
+
+    handoff.finalize(&serde_json::json!({"profile": "work", "result": "done"}));
+    assert_eq!(
+        job_files(),
+        vec![format!("{job_id}.json")],
+        "one run, one record, whichever of the two writers lost the race",
     );
 }
 

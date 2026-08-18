@@ -1292,6 +1292,25 @@ pub(crate) struct PluginState {
     /// spawns three subprocesses, so a tab switch and the per-tick refresh reuse
     /// the cached value.
     pub(crate) herdr: Option<Option<crate::herdr::HerdrProbe>>,
+    /// The `clauth mcp` job store as of the last refresh, newest first: what the
+    /// delegates pane draws. Re-read on the same cadence as the checks, because
+    /// the server writing it is a DIFFERENT process, so there is nothing to
+    /// subscribe to and no event to wait for. Read-only: the TUI never writes
+    /// this store, and never sweeps it.
+    ///
+    /// The cost is one readdir plus a parse per file. `jobs::MAX_RETAINED` does
+    /// NOT bound that from here: the cap is applied only by the startup sweep
+    /// inside a `clauth mcp` process, which the TUI neither runs nor depends on
+    /// having run, and the count spans both record spellings. What the directory
+    /// really holds is whatever the last such startup trimmed it to, plus every
+    /// job written since. Measured at the cap against the 1 s tick, 256 records
+    /// over ~5 MB of envelopes, best of 5 warm: **~3 ms release, ~20 ms debug**.
+    /// Written as a bound rather than to two figures on purpose — two
+    /// independent runs on this box landed 2.2 ms and 3.2 ms release, neither on
+    /// a quiet machine, so a point figure would read as stale to the next person
+    /// who re-derives it and misses by half. What binds is the order: single-
+    /// digit ms in release, roughly ten times that in debug.
+    pub(crate) delegates: Vec<crate::mcp::jobs::StoredJob>,
 }
 
 impl Default for PluginState {
@@ -1307,6 +1326,7 @@ impl Default for PluginState {
             cc_version: None,
             mcp_boot: None,
             herdr: None,
+            delegates: Vec::new(),
         }
     }
 }
@@ -3629,6 +3649,12 @@ fn recompute_plugin_checks(app: &mut App, refresh_version: bool) {
     });
 
     app.plugin.checks = checks;
+
+    // The delegates pane's data. Read here rather than on its own timer so it
+    // rides the cadence this tab already documents (tab focus, `r`, and the 1 s
+    // tick while focused) — a `clauth mcp` run is a different process, so a
+    // watcher would buy freshness this tab has never promised.
+    app.plugin.delegates = crate::mcp::jobs::list(crate::usage::now_ms());
 
     // Keep the cursor in range after the check set changes.
     let max = app.plugin.row_count().saturating_sub(1);

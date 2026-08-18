@@ -649,6 +649,77 @@ fn the_listing_orders_on_the_retention_anchor_across_both_spellings() {
     );
 }
 
+/// Two records sharing an anchor come back in ONE order, every call.
+///
+/// Without the `job_id` tiebreak a tie falls through to `read_dir`, which is
+/// arbitrary and not stable across calls on an unchanged store: a fan-out whose
+/// members land inside the same millisecond enumerated differently each time, so
+/// a model diffing two `monitor` replies saw changes that had not happened and
+/// an operator watching `clauth jobs` saw rows swap under a still store.
+///
+/// Six records at ONE anchor, written in an order that is neither the expected
+/// output nor its reverse: at six, an accidental `read_dir` agreement is 1 in
+/// 720, and the mutation run against this confirmed the red rather than assuming
+/// it. The ids are same-width base-36 stamps with distinct counters, which is
+/// what a real same-millisecond fan-out mints.
+#[test]
+fn records_sharing_an_anchor_are_ordered_by_id_not_by_readdir() {
+    let _home = HomeSandbox::new();
+    let now = crate::usage::now_ms();
+    // One stamp, six counters. Written scrambled.
+    for n in [3u64, 0, 5, 1, 4, 2] {
+        write_running(&spec(&format!("d-msvr98yv-{n}"), "p", now - 60_000)).unwrap();
+    }
+
+    let listed: Vec<String> = list(now).into_iter().map(|j| j.record.job_id).collect();
+
+    assert_eq!(
+        listed,
+        vec![
+            "d-msvr98yv-5",
+            "d-msvr98yv-4",
+            "d-msvr98yv-3",
+            "d-msvr98yv-2",
+            "d-msvr98yv-1",
+            "d-msvr98yv-0",
+        ],
+        "one anchor, one order — newest mint first",
+    );
+
+    // Stability is the property, so assert it ACROSS calls rather than inferring
+    // it from a single one: an unstable order can satisfy any one permutation.
+    for _ in 0..3 {
+        let again: Vec<String> = list(now).into_iter().map(|j| j.record.job_id).collect();
+        assert_eq!(
+            again, listed,
+            "the same store answers the same way each call"
+        );
+    }
+}
+
+/// The tiebreak orders a tie and nothing else: a fresher anchor still wins,
+/// whatever the ids say.
+///
+/// Its own test because the one above cannot see this — every record there
+/// shares an anchor, so a mutant that sorted by `job_id` ALONE would pass it.
+#[test]
+fn the_id_tiebreak_never_outranks_the_anchor() {
+    let _home = HomeSandbox::new();
+    let now = crate::usage::now_ms();
+    // The id that sorts LAST descending, on the freshest anchor.
+    write_running(&spec("d-aaaa-0", "p", now - 10_000)).unwrap();
+    // The id that sorts FIRST descending, on the oldest.
+    write_running(&spec("d-zzzz-9", "p", now - 600_000)).unwrap();
+
+    let listed: Vec<String> = list(now).into_iter().map(|j| j.record.job_id).collect();
+
+    assert_eq!(
+        listed,
+        vec!["d-aaaa-0", "d-zzzz-9"],
+        "the anchor decides; the id only breaks a tie",
+    );
+}
+
 /// A job file carries the delegate's prompt and the account's full response, and
 /// the dir naming every background job is as readable as the files in it. Both
 /// ride clauth's owner-only rule for `~/.clauth`.

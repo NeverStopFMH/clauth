@@ -172,6 +172,19 @@ pub(crate) enum Command {
         disabled: bool,
     },
 
+    /// List the delegate jobs clauth is holding
+    ///
+    /// One row per record in ~/.clauth/jobs/: background runs still going,
+    /// blocking runs whose caller is still waiting, finished results nothing
+    /// has collected yet, and runs whose server died. Read-only — stopping one
+    /// is the `monitor` tool's job. An empty store exits 0.
+    Jobs {
+        /// Emit a stable newest-first JSON array instead of the table. The
+        /// field set is fixed; a figure the record does not have is null.
+        #[arg(long)]
+        json: bool,
+    },
+
     /// List Claude Code sessions as a table
     ///
     /// Exits 0 on success, 2 on a usage error, 1 on any other failure.

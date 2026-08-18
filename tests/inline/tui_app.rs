@@ -108,6 +108,99 @@ fn plugin_check(app: &App) -> &super::Check {
         .expect("plugin check present")
 }
 
+/// The delegates pane's rows arrive BANDED, from the store.
+///
+/// `recompute_plugin_checks` is the pane's only reader, and it must call
+/// `jobs::list_banded` — the same function `clauth jobs` and `monitor`'s listing
+/// call — rather than `jobs::list`. The renderer sorts nothing any more, so this
+/// read is the whole of the pane's ordering: reverting it to the raw retention
+/// order silently drops a long-running delegate below a burst of completions,
+/// which is the defect the shared function exists to prevent, and no render test
+/// would catch it because they all feed their fixtures in directly.
+///
+/// Cross-band on purpose, and the finished rows are anchored NEWER than the live
+/// one, so raw retention order and banded order disagree.
+#[test]
+fn the_delegates_pane_reads_the_store_in_banded_order() {
+    use crate::mcp::jobs::{self, JobPhase};
+
+    let _home = crate::testutil::HomeSandbox::new();
+    let now = crate::usage::now_ms();
+    let live = |job_id: &str, anchor_ago: u64| {
+        jobs::write_heartbeat(
+            &jobs::RunningSpec {
+                job_id: job_id.to_string(),
+                profile: "acct".to_string(),
+                started_at: now - 900_000,
+                recorded_at: now - 900_000,
+                timeout_secs: 0,
+                idle_secs: Some(300),
+                kind: jobs::RecordKind::Collectable,
+            },
+            now - anchor_ago,
+            "working",
+        )
+        .expect("heartbeat");
+    };
+    let done = |job_id: &str, anchor_ago: u64| {
+        let dir = jobs::jobs_dir().expect("jobs dir");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        std::fs::write(
+            dir.join(format!("{job_id}.json")),
+            serde_json::to_vec(&serde_json::json!({
+                "job_id": job_id,
+                "profile": "acct",
+                "state": "done",
+                "started_at": now - 900_000,
+                "done_at": now - anchor_ago,
+                "envelope": { "result": "ok" },
+            }))
+            .expect("serialize"),
+        )
+        .expect("write");
+    };
+
+    // INTERLEAVED by anchor, live and finished alternating. A fixture where the
+    // live rows are all oldest (or all newest) is banded correctly by any
+    // monotone reordering of the anchor, so a mutant that merely reverses the
+    // order passes it — the "the mutant is non-equivalent and the fixture cannot
+    // tell" shape. Here no reordering of the anchor produces the banded answer.
+    live("d-live-new-0", 1_000);
+    done("d-fin-a-0", 2_000);
+    live("d-live-old-0", 3_000);
+    done("d-fin-b-0", 4_000);
+
+    let mut app = bare_app();
+    super::recompute_plugin_checks(&mut app, false);
+
+    let ids: Vec<String> = app
+        .plugin
+        .delegates
+        .iter()
+        .map(|j| j.record.job_id.clone())
+        .collect();
+    let phases: Vec<JobPhase> = app.plugin.delegates.iter().map(|j| j.phase()).collect();
+
+    assert_eq!(phases.len(), 4, "fixture control: every record was read");
+    assert_eq!(
+        phases,
+        vec![
+            JobPhase::Running,
+            JobPhase::Running,
+            JobPhase::Done,
+            JobPhase::Done
+        ],
+        "live band whole and first, finished band after it: {ids:?}"
+    );
+    // And within each band the store's own newest-mattering order survives, so
+    // the banding is the ONLY thing the read reordered.
+    assert_eq!(
+        ids,
+        vec!["d-live-new-0", "d-live-old-0", "d-fin-a-0", "d-fin-b-0"],
+        "each band still newest-mattering first",
+    );
+}
+
 #[test]
 fn plugin_check_ok_when_installed_globally() {
     let _home = crate::testutil::HomeSandbox::new();

@@ -12,7 +12,7 @@ const BASH: &str = r#"_clauth() {
     if [ "$COMP_CWORD" -eq 1 ]; then
         local profiles
         profiles=$(clauth __complete 2>/dev/null)
-        COMPREPLY=( $(compgen -W "${profiles} start login delete disable enable rolling-token static-token which list sessions resume info daemon status mcp herdr completions --theme" -- "${cur}") )
+        COMPREPLY=( $(compgen -W "${profiles} start login delete disable enable rolling-token static-token which list jobs sessions resume info daemon status mcp herdr completions --theme" -- "${cur}") )
     elif [ "$prev" = "--theme" ]; then
         COMPREPLY=( $(compgen -W "full compatible" -- "${cur}") )
     elif [ "${COMP_WORDS[1]}" = "login" ] && [ "${cur:0:2}" = "--" ]; then
@@ -33,6 +33,8 @@ const BASH: &str = r#"_clauth() {
         COMPREPLY=( $(compgen -W "--json" -- "${cur}") )
     elif [ "$COMP_CWORD" -eq 2 ] && [ "$prev" = "sessions" ]; then
         COMPREPLY=( $(compgen -W "--json --tokens" -- "${cur}") )
+    elif [ "$COMP_CWORD" -eq 2 ] && [ "$prev" = "jobs" ]; then
+        COMPREPLY=( $(compgen -W "--json" -- "${cur}") )
     elif [ "$COMP_CWORD" -eq 2 ] && [ "$prev" = "herdr" ]; then
         COMPREPLY=( $(compgen -W "install" -- "${cur}") )
     elif [ "${COMP_WORDS[1]}" = "herdr" ] && [ "${cur:0:2}" = "--" ]; then
@@ -71,6 +73,7 @@ _clauth() {
             'static-token[restore the static setup-token mint, or --clear the long-lived token]' \
             'which[print profile owning the loaded credentials]' \
             'list[list accounts as a table with per-profile usage]' \
+            'jobs[list the delegate jobs clauth is holding (add --json)]' \
             'sessions[list Claude Code sessions (add --json / --tokens)]' \
             'resume[resume a session under a chosen profile]' \
             'info[print resume command + storage path for a session]' \
@@ -107,6 +110,8 @@ _clauth() {
     elif (( CURRENT == 3 )) && [[ "${words[2]}" == sessions ]]; then
         _values 'flag' '--json[emit the stable machine-readable array]' \
             '--tokens[add token totals + cost; reads every transcript in full]'
+    elif (( CURRENT == 3 )) && [[ "${words[2]}" == jobs ]]; then
+        _values 'flag' '--json[emit the stable machine-readable array]'
     elif (( CURRENT >= 3 )) && [[ "${words[2]}" == resume ]]; then
         _values 'flag' '--profile[resume under this profile instead of prompting]'
     elif (( CURRENT >= 4 )) && [[ "${words[2]}" == login ]]; then
@@ -146,6 +151,7 @@ complete -c clauth -f -n __fish_is_first_token -a rolling-token -d "Serve a prof
 complete -c clauth -f -n __fish_is_first_token -a static-token -d "Restore the static setup-token mint, or --clear the long-lived token"
 complete -c clauth -f -n __fish_is_first_token -a which -d "Print profile owning the loaded credentials"
 complete -c clauth -f -n __fish_is_first_token -a list -d "List accounts as a table with per-profile usage"
+complete -c clauth -f -n __fish_is_first_token -a jobs -d "List the delegate jobs clauth is holding"
 complete -c clauth -f -n __fish_is_first_token -a sessions -d "List Claude Code sessions"
 complete -c clauth -f -n __fish_is_first_token -a resume -d "Resume a session under a chosen profile"
 complete -c clauth -f -n __fish_is_first_token -a info -d "Print resume command + storage path"
@@ -167,6 +173,7 @@ complete -c clauth -f -n "__fish_seen_subcommand_from start" -a --no-rescue -d "
 complete -c clauth -f -n "__fish_seen_subcommand_from start" -a --with-fallback -d "Follow the fallback chain; needs a running daemon"
 complete -c clauth -f -n "__fish_seen_subcommand_from which" -a --json -d "Emit JSON"
 complete -c clauth -f -n "__fish_seen_subcommand_from sessions" -a --json -d "Emit the stable machine-readable array"
+complete -c clauth -f -n "__fish_seen_subcommand_from jobs" -a --json -d "Emit the stable machine-readable array"
 complete -c clauth -f -n "__fish_seen_subcommand_from sessions" -a --tokens -d "Add token totals + cost; reads every transcript in full"
 complete -c clauth -f -n "__fish_seen_subcommand_from resume" -a --profile -d "Resume under this profile instead of prompting"
 complete -c clauth -f -n "__fish_seen_subcommand_from login" -a --base-url -d "API base url"

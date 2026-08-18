@@ -16,10 +16,12 @@
 //! call the client cancelled or timed out dispatches `PostToolUseFailure`, never
 //! `PostToolUse`, so the bundled hook never runs for it; and the reply carrying
 //! the minted id is dropped by rmcp before it reaches the transport, so the
-//! model never learns the id to ask for it. Such a record is written so the
-//! spent window's result EXISTS rather than because anything currently collects
-//! it: today it is reachable by an operator reading the store, and by `monitor`
-//! only from an id learned some other way.
+//! model never learns the id from the call it was minted for. So the record is
+//! written to keep the spent window's result rather than to answer that caller,
+//! and the id is recovered afterwards by ENUMERATION rather than by delivery:
+//! `monitor` with no `job_ids` lists it, `clauth jobs` prints it, and the TUI's
+//! delegates pane draws it. All three go through [`list_banded`], and so through
+//! [`list`] beneath it.
 //!
 //! A blocking delegate that is STILL attached to its caller keeps a second
 //! spelling here, `<job_id>.live.json` ([`RecordKind::Liveness`]) — the same
@@ -518,6 +520,74 @@ pub(crate) enum JobLiveness {
     Corpse,
 }
 
+/// How one stored record reads to a reader ENUMERATING the store — four
+/// situations where [`JobLiveness`] carries three, because a `Running` record
+/// means two different things depending on which spelling holds it and only the
+/// pair answers "is anything already waiting on this".
+///
+/// One derivation for every surface that names a record's situation — `clauth
+/// jobs`, `monitor`'s listing and the TUI's delegates pane — so none of them can
+/// give one record a different name, a different band, or a different word.
+/// `src/tui/render/plugin.rs` keeps only what a TERMINAL adds on top: the glyph
+/// and the hue.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum JobPhase {
+    /// A background job still going. Its result waits in the store until a
+    /// `monitor` call collects it.
+    Running,
+    /// A blocking run whose caller still holds the join. Nothing can collect it:
+    /// the envelope goes back through the call that started it.
+    Blocking,
+    /// Finished, with its envelope on disk, until someone collects it or the
+    /// Done TTL reaps it.
+    Done,
+    /// `running` on disk and silent past [`RUNNING_TTL_MS`]: the `clauth mcp`
+    /// server writing it is gone, and so is the result.
+    Orphaned,
+}
+
+impl JobPhase {
+    /// The one word every text surface names this phase by. Shared so a row
+    /// cannot read `blocking` in one place and `attached` in another.
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Running => "running",
+            Self::Blocking => "blocking",
+            Self::Done => "done",
+            Self::Orphaned => "orphaned",
+        }
+    }
+
+    /// Whether a `monitor` call naming this record's id could collect a result
+    /// from it. False for a blocking run by construction (see [`RecordKind`])
+    /// and for an orphan, whose result died with its server.
+    pub(crate) fn is_collectable(self) -> bool {
+        matches!(self, Self::Running | Self::Done)
+    }
+
+    /// Whether something is still spending an account under this record.
+    ///
+    /// A DIFFERENT question from [`is_collectable`], and the pair splits the
+    /// four phases two ways that do not line up: a blocking run is live and not
+    /// collectable, a done one is collectable and not live. Naming both keeps a
+    /// later caller from reaching for whichever predicate happens to be there.
+    ///
+    /// [`is_collectable`]: Self::is_collectable
+    pub(crate) fn is_live(self) -> bool {
+        matches!(self, Self::Running | Self::Blocking)
+    }
+
+    /// Which band a row sits in when a reader has to drop some: live first.
+    ///
+    /// Derived from [`is_live`] rather than matched again, so the band split is
+    /// decided in exactly one place.
+    ///
+    /// [`is_live`]: Self::is_live
+    pub(crate) fn rank(self) -> u8 {
+        u8::from(!self.is_live())
+    }
+}
+
 /// One record as a reader finds it: the parsed record, which spelling held it,
 /// and how it reads right now.
 #[derive(Debug, Clone)]
@@ -533,6 +603,36 @@ pub(crate) struct StoredJob {
     pub(crate) anchor: u64,
 }
 
+impl StoredJob {
+    /// How long since this record last mattered, in seconds: the same
+    /// [`retention_anchor`] the store keeps it by, so a reader dates a row from
+    /// the stamp that decides how long it survives.
+    pub(crate) fn age_secs(&self, now: u64) -> u64 {
+        now.saturating_sub(self.anchor) / 1000
+    }
+
+    /// Which of the four situations this record is in.
+    ///
+    /// The one classification in the crate: `clauth jobs`, `monitor`'s listing
+    /// and the TUI's delegates pane all read a record's situation from here, so
+    /// none of them can answer differently about one file.
+    ///
+    /// The spelling on disk is the whole difference between the two live ones:
+    /// a [`RecordKind::Liveness`] file exists only while its caller holds the
+    /// join, so no second field is needed to say which situation a `running`
+    /// record is in.
+    pub(crate) fn phase(&self) -> JobPhase {
+        match self.liveness {
+            JobLiveness::Done => JobPhase::Done,
+            JobLiveness::Corpse => JobPhase::Orphaned,
+            JobLiveness::Running => match self.kind {
+                RecordKind::Collectable => JobPhase::Running,
+                RecordKind::Liveness => JobPhase::Blocking,
+            },
+        }
+    }
+}
+
 /// Every record in the store, newest-mattering first.
 ///
 /// READ-ONLY, and that is the contract rather than an implementation detail: no
@@ -542,7 +642,26 @@ pub(crate) struct StoredJob {
 /// caller asks for it by name. An unreadable file is skipped, never deleted.
 ///
 /// Ordered on [`retention_anchor`] — the same stamp both retention rules read —
-/// so the record a sweep would drop last is the one this lists first.
+/// so the record a sweep would drop last is the one this lists first, then on
+/// `job_id` DESCENDING where two records share an anchor.
+///
+/// The tiebreak REFINES that contract rather than changing it: it only orders
+/// what the anchor left unordered. Without it a tie falls through to `read_dir`
+/// order, which is arbitrary and not stable across two calls on an unchanged
+/// store — a fan-out whose members land inside one millisecond enumerated
+/// differently every time, so a model diffing two replies saw changes that had
+/// not happened and an operator watching `clauth jobs` saw rows swap under a
+/// still store.
+///
+/// **`job_id` is not an arbitrary string here**, which is why it is the
+/// tiebreak: [`new_job_id`] mints `d-<base36 started_at>-<counter>`, so the
+/// comparison is over a mint stamp followed by a per-process sequence, and
+/// descending order puts the newest mint first — the same direction the anchor
+/// sorts. Two bounds worth stating rather than discovering: base-36 stamps
+/// compare as numbers only while they are the same width (the next width change
+/// is decades out), and the counter is decimal, so `-9` sorts above `-10` within
+/// one millisecond. Neither can reorder records with different anchors, and both
+/// are stable — which is the property this is for.
 pub(crate) fn list(now: u64) -> Vec<StoredJob> {
     let Ok(dir) = jobs_dir() else {
         return Vec::new();
@@ -582,8 +701,37 @@ pub(crate) fn list(now: u64) -> Vec<StoredJob> {
             },
         ));
     }
-    found.sort_by_key(|(anchor, _)| std::cmp::Reverse(*anchor));
+    // Anchor descending, then id descending. `sort_by` rather than
+    // `sort_by_key` so the id is compared in place instead of cloned into a key
+    // for every record.
+    found.sort_by(|a, b| {
+        b.0.cmp(&a.0)
+            .then_with(|| b.1.record.job_id.cmp(&a.1.record.job_id))
+    });
     found.into_iter().map(|(_, job)| job).collect()
+}
+
+/// [`list`] banded for a READER: live rows first, each band still in `list`'s
+/// own newest-mattering order.
+///
+/// **A retention order is not a display order**, and this is the whole reason
+/// this function exists rather than a `.take()` over `list`. `retention_anchor`
+/// dates a `done` record by its FINISH, so ten delegates that landed seconds ago
+/// outrank one that has been running quietly for five minutes — and any reader
+/// that caps its rows then drops the live one, which is the row every one of
+/// these surfaces was built to show. `list`'s own order stays exactly as
+/// documented; the banding happens here, where a reader asks for it.
+///
+/// The sort is STABLE, so the band is the only thing that moves and `list`'s
+/// within-band order survives untouched.
+///
+/// `src/tui/render/plugin.rs` bands its own rows the same way for the same
+/// reason, one layer later (it sorts already-rendered cells). Folding the two
+/// onto this one is owed.
+pub(crate) fn list_banded(now: u64) -> Vec<StoredJob> {
+    let mut jobs = list(now);
+    jobs.sort_by_key(|job| job.phase().rank());
+    jobs
 }
 
 /// Every liveness figure a `running` record yields at one instant.

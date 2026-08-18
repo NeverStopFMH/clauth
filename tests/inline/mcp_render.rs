@@ -732,6 +732,106 @@ fn watch_prose_renders_armed_changed_and_unchanged() {
     );
 }
 
+/// The listing rides every state arm, names one line per job, and disappears
+/// entirely when there is nothing to list.
+///
+/// The empty-ARRAY case is pinned here rather than only through the handler:
+/// the handler writes no `jobs` key at all for an empty store, so a guard tested
+/// only from there is an equivalent mutant, and this renderer is `pub(crate)`
+/// and answers for whatever payload it is handed.
+#[test]
+fn watch_prose_lists_the_delegates_and_says_nothing_when_there_are_none() {
+    assert_eq!(
+        watch_prose(&serde_json::json!({"status": "armed", "jobs": []})),
+        "monitor armed: baseline set on this first digest call, nothing to compare against yet",
+        "an empty list is no list at all"
+    );
+
+    let listed = watch_prose(&serde_json::json!({
+        "status": "unchanged",
+        "waited_secs": 5,
+        "jobs": [
+            {"job_id": "d-a-0", "profile": "one", "state": "running", "elapsed_secs": 65},
+            {"job_id": "d-b-0", "profile": "two", "state": "blocking", "elapsed_secs": 20},
+            {"job_id": "d-c-0", "profile": "three", "state": "done", "since_secs": 90},
+            {"job_id": "d-d-0", "profile": "four", "state": "orphaned", "since_secs": 4000},
+        ],
+        "jobs_not_listed": 3,
+    }));
+    assert_eq!(
+        listed,
+        [
+            "monitor: no change after 5s",
+            "delegates clauth holds:",
+            "  job `d-a-0` running on `one`, elapsed 1m 5s",
+            "  job `d-b-0` blocking on `two` (its own caller takes the result), elapsed 20s",
+            "  job `d-c-0` done on `three`, finished 1m 30s ago",
+            "  job `d-d-0` orphaned on `four`, last seen 1h 6m ago",
+            "  +3 older not listed",
+        ]
+        .join("\n"),
+        "each state is dated by the question that state makes worth asking"
+    );
+}
+
+/// Zero is a real value on every one of these spans, and `humanize_duration`
+/// spells it `now` — which renders `elapsed now` and `finished now ago`.
+///
+/// A job that finished under a second ago and a fan-out member that just
+/// launched are both routine, so this is not an edge case. The rule lives in
+/// `format::humanize_span`, shared with `clauth jobs`, rather than being guarded
+/// a third time here.
+#[test]
+fn a_listing_row_renders_a_zero_span_as_a_length_not_as_an_instant() {
+    let listed = watch_prose(&serde_json::json!({
+        "status": "armed",
+        "jobs": [
+            {"job_id": "d-a-0", "profile": "one", "state": "running", "elapsed_secs": 0},
+            {"job_id": "d-b-0", "profile": "two", "state": "done", "since_secs": 0},
+            {"job_id": "d-c-0", "profile": "three", "state": "orphaned", "since_secs": 0},
+        ],
+    }));
+
+    assert!(
+        listed.contains("job `d-a-0` running on `one`, elapsed 0s"),
+        "{listed}"
+    );
+    assert!(
+        listed.contains("job `d-b-0` done on `two`, finished 0s ago"),
+        "{listed}"
+    );
+    assert!(
+        listed.contains("job `d-c-0` orphaned on `three`, last seen 0s ago"),
+        "{listed}"
+    );
+    assert!(
+        !listed.contains("now ago") && !listed.contains("elapsed now"),
+        "a span never reads as an instant: {listed}"
+    );
+}
+
+/// A `jobs_not_listed` of zero is a claim about nothing.
+///
+/// Pinned at the renderer as well as at the producer: the rule belongs to each
+/// layer, and this function answers for whatever payload it is handed.
+#[test]
+fn watch_prose_names_no_overflow_when_nothing_was_left_out() {
+    let listed = watch_prose(&serde_json::json!({
+        "status": "armed",
+        "jobs": [{"job_id": "d-a-0", "profile": "one", "state": "running", "elapsed_secs": 30}],
+        "jobs_not_listed": 0,
+    }));
+
+    assert!(
+        listed.contains("job `d-a-0`"),
+        "the row still renders: {listed}"
+    );
+    assert!(
+        !listed.contains("older not listed"),
+        "but zero left out is nothing to say: {listed}"
+    );
+}
+
 #[test]
 fn session_scope_prose_says_unknown_when_unresolved() {
     let p = serde_json::json!({

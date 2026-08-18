@@ -209,7 +209,7 @@ fn seed_every_state(now: u64) -> Vec<jobs::StoredJob> {
         RecordKind::Collectable,
     ))
     .unwrap();
-    jobs::list(now)
+    jobs::list_banded(now)
 }
 
 /// The exact figures, at a `now` the test owns: elapsed, last-output age and the
@@ -250,6 +250,59 @@ fn a_delegate_row_carries_the_figures_its_own_record_holds() {
         facts("glm1"),
         "last seen 1d 1h ago",
         "a corpse by when it was last heard from",
+    );
+}
+
+/// The three hues the four states map onto, off the styled buffer.
+///
+/// The pane had NO colour assertion at all until the `JobPhase` fold, and the
+/// arm that mattered was `blocking`: it is LIVE but not COLLECTABLE, so a fold
+/// that reconstructed the hue from `is_collectable()` instead of the live band
+/// would have recoloured it to `done`'s success green with every test in the
+/// repo still green. The rendered rows are plain strings; only the buffer holds
+/// the style.
+///
+/// Mapped to the theme here rather than through `state_color`, so a regression
+/// in that mapping reds this instead of moving both sides together — the same
+/// rule `assert_row` plays by for the health dot.
+#[test]
+fn each_delegate_state_carries_its_own_hue() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let app = app_with_delegates(seed_every_state(crate::usage::now_ms()));
+    let (rows, buf) = render(&app);
+    let screen = rows.join("\n");
+
+    let hue = |account: &str| {
+        let row_idx = rows
+            .iter()
+            .position(|r| r.contains(account))
+            .unwrap_or_else(|| panic!("no row for `{account}`:\n{screen}"));
+        let row = &rows[row_idx];
+        // Buffer COLUMN, not byte offset — the dot is multi-byte.
+        let byte = row.find(['●', '○']).expect("state dot renders");
+        let col = row[..byte].chars().count();
+        buf.content[row_idx * W as usize + col].fg
+    };
+
+    assert_eq!(
+        hue("uwuclxdy"),
+        super::theme::accent_color(),
+        "a running delegate is accent:\n{screen}"
+    );
+    assert_eq!(
+        hue("kerry"),
+        super::theme::accent_color(),
+        "and so is a blocking one — it bands with running, not with done:\n{screen}"
+    );
+    assert_eq!(
+        hue("DS8"),
+        super::theme::success_color(),
+        "a finished job is success:\n{screen}"
+    );
+    assert_eq!(
+        hue("glm1"),
+        super::theme::text_dim_color(),
+        "an orphan is dim; the word carries the charge:\n{screen}"
     );
 }
 
@@ -342,7 +395,7 @@ fn the_delegates_pane_reports_what_monitor_reports_for_the_same_record() {
     };
     jobs::write_heartbeat(&spec, NOW - 47_000, "mid-run").unwrap();
 
-    let stored = jobs::list(NOW);
+    let stored = jobs::list_banded(NOW);
     let record: &JobRecord = &stored[0].record;
     assert_eq!(record.state, JobState::Running, "fixture control");
 
@@ -404,7 +457,7 @@ fn a_record_from_an_older_server_reads_as_liveness_not_recorded() {
     )
     .unwrap();
 
-    let cells = super::delegate_cells(&jobs::list(NOW), NOW);
+    let cells = super::delegate_cells(&jobs::list_banded(NOW), NOW);
     let facts = cells[0].facts.join(" · ");
     assert!(
         facts.contains("elapsed 1m 1s"),
@@ -440,7 +493,7 @@ fn the_delegates_pane_marks_its_overflow_with_a_count() {
         )
         .unwrap();
     }
-    let app = app_with_delegates(jobs::list(now));
+    let app = app_with_delegates(jobs::list_banded(now));
     let (rows, _) = render(&app);
     let screen = rows.join("\n");
 
@@ -481,6 +534,18 @@ fn a_live_delegate_outranks_finished_ones_however_recently_they_landed() {
         "still thinking",
     )
     .unwrap();
+    // A second live row, anchored NEWER than every finished one. Without it the
+    // live row is also the OLDEST record in the store, and a mutant that merely
+    // reverses the anchor order bands correctly by accident — the same
+    // "the mutant is non-equivalent and the fixture cannot tell" shape this file
+    // already records for pdqsort. Interleaved, no monotone reordering of the
+    // anchor can produce the banded answer.
+    jobs::write_heartbeat(
+        &running_spec("d-run-9", "fresh", now - 30_000, RecordKind::Collectable),
+        now - 500,
+        "just spoke",
+    )
+    .unwrap();
     let dir = jobs::jobs_dir().unwrap();
     std::fs::create_dir_all(&dir).unwrap();
     for i in 0..7 {
@@ -499,7 +564,7 @@ fn a_live_delegate_outranks_finished_ones_however_recently_they_landed() {
         .unwrap();
     }
 
-    let app = app_with_delegates(jobs::list(now));
+    let app = app_with_delegates(jobs::list_banded(now));
     let (rows, _) = render(&app);
     let screen = rows.join("\n");
 
@@ -509,8 +574,8 @@ fn a_live_delegate_outranks_finished_ones_however_recently_they_landed() {
          evicted:\n{screen}"
     );
     assert!(
-        screen.contains("kerry"),
-        "and it is never the live one:\n{screen}"
+        screen.contains("kerry") && screen.contains("fresh"),
+        "and it is never a live one — BOTH survive, whatever their anchors:\n{screen}"
     );
     assert!(
         rows.iter()
@@ -603,7 +668,7 @@ fn the_band_sort_keeps_each_band_newest_first() {
         .unwrap();
     }
 
-    let order: Vec<String> = super::delegate_cells(&jobs::list(now), now)
+    let order: Vec<String> = super::delegate_cells(&jobs::list_banded(now), now)
         .into_iter()
         .map(|c| c.profile)
         .collect();

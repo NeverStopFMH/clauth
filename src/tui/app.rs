@@ -3654,7 +3654,11 @@ fn recompute_plugin_checks(app: &mut App, refresh_version: bool) {
     // rides the cadence this tab already documents (tab focus, `r`, and the 1 s
     // tick while focused) — a `clauth mcp` run is a different process, so a
     // watcher would buy freshness this tab has never promised.
-    app.plugin.delegates = crate::mcp::jobs::list(crate::usage::now_ms());
+    //
+    // `list_banded`, the same call `clauth jobs` and `monitor`'s listing make,
+    // so the pane's row order is not a second derivation of one. It arrives
+    // banded and the renderer sorts nothing.
+    app.plugin.delegates = crate::mcp::jobs::list_banded(crate::usage::now_ms());
 
     // Keep the cursor in range after the check set changes.
     let max = app.plugin.row_count().saturating_sub(1);

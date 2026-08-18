@@ -9,7 +9,7 @@
 //! grab-bag `format.rs` (surveyed 2026-07-16).
 
 use crate::profile::Profile;
-use crate::usage::PlanTier;
+use crate::usage::{PlanTier, humanize_duration};
 
 // ── Cross-surface diagnostics ───────────────────────────────────────────────
 //
@@ -326,6 +326,24 @@ pub(crate) const RESOLVE_IN_TUI: &str = "resolve the divergence in the clauth TU
 /// The `s` a count needs, per cloudy-tui's counts rule: singular at one.
 pub(crate) fn plural(n: usize) -> &'static str {
     if n == 1 { "" } else { "s" }
+}
+
+/// A duration as a LENGTH, never as an instant.
+///
+/// `humanize_duration` spells zero `now`, which is right where the figure is a
+/// countdown to something and wrong wherever it is a span: `elapsed now` and
+/// `finished now ago` both read as broken. Every value above zero is that
+/// function's, so this is the zero boundary and nothing else.
+///
+/// One helper because the rule kept being re-answered: three surfaces wrote
+/// their own guard and reached three different words. `src/tui/render/plugin.rs`
+/// still spells its own `just now`, deliberately — a pane's phrasing is its own
+/// — and folding that one in is owed.
+pub(crate) fn humanize_span(secs: u64) -> String {
+    if secs == 0 {
+        return "0s".to_string();
+    }
+    humanize_duration(secs as i64)
 }
 
 /// Trailing-ellipsis truncation to `max` chars (counts `char`s, not bytes).

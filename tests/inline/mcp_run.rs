@@ -5881,3 +5881,540 @@ fn throughput_note_drops_the_prefix_and_the_default_placeholder() {
         Some("⚠ deepseek-chat slow (~25 tok/s)".to_string())
     );
 }
+
+// ---- the state mode's listing (M10) ----
+
+/// Drive `monitor`'s state mode — no `job_ids` — and return its prose.
+fn monitor_state_text() -> String {
+    call_monitor_args(MonitorArgs {
+        job_ids: None,
+        wait_secs: Some(0),
+        return_on: None,
+        cancel: None,
+    })
+    .content
+    .first()
+    .and_then(|c| c.as_text())
+    .map(|t| t.text.clone())
+    .expect("state-mode reply text")
+}
+
+/// Every job id a listing named, in the order it named them. Read off the
+/// ``job `<id>` `` opener each row carries rather than off a line index, so a
+/// reordered or reworded reply cannot silently satisfy an ordering assertion.
+fn listed_ids(text: &str) -> Vec<String> {
+    text.lines()
+        .filter_map(|line| {
+            let rest = line.trim().strip_prefix("job `")?;
+            Some(rest.split('`').next()?.to_string())
+        })
+        .collect()
+}
+
+/// Seed a `done` file with an explicit `done_at`. `jobs::write_done` stamps the
+/// real clock, and every band and age question below is about a stamp the test
+/// has to choose.
+fn seed_done_at(job_id: &str, profile: &str, started_at: u64, done_at: u64, tail: &str) {
+    let dir = jobs::jobs_dir().unwrap();
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join(format!("{job_id}.json")),
+        serde_json::to_vec(&serde_json::json!({
+            "job_id": job_id,
+            "profile": profile,
+            "state": "done",
+            "started_at": started_at,
+            "done_at": done_at,
+            "tail": tail,
+            "envelope": { "result": "ok" },
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+}
+
+/// **A store's retention order is not a display order.**
+///
+/// `jobs::list` dates a `done` record by its FINISH, so ten delegates that
+/// landed seconds ago outrank one that has been running quietly for ten minutes.
+/// A listing that capped over that raw order dropped the live run — the exact
+/// row this mode exists to name, and the row the description promises.
+///
+/// Both surfaces are asserted from ONE fixture, because they have to agree, and
+/// the fixture is cross-band on purpose: `the_state_mode_listing_is_bounded_and_newest_first`
+/// seeds twelve records that are all `running`, so the band question is
+/// invisible to it and extending it would have proved nothing.
+#[test]
+fn a_live_delegate_is_never_evicted_by_a_burst_of_finished_ones() {
+    let _home = HomeSandbox::new();
+    let now = now_ms();
+    // The run the mode exists for: ten minutes in, last spoke five minutes ago.
+    // Both stamps put it far below every `done` record on anchor order.
+    jobs::write_heartbeat(
+        &running_spec("d-handedoff-0", "acct", now - 600_000),
+        now - 300_000,
+        "still working",
+    )
+    .unwrap();
+    // A second live run, anchored NEWER than every finished one. Without it the
+    // live row is also the OLDEST record here, and a mutant that merely reverses
+    // the anchor order lands it first by accident — non-equivalent, and the
+    // fixture could not tell. Interleaved, no monotone reordering of the anchor
+    // produces the banded answer.
+    jobs::write_heartbeat(
+        &running_spec("d-fresh-0", "acct", now - 60_000),
+        now - 500,
+        "just spoke",
+    )
+    .unwrap();
+    // Ten finished jobs, anchored between the two live ones.
+    for i in 1..=10u64 {
+        seed_done_at(
+            &format!("d-fin{i}-0"),
+            "acct",
+            now - 900_000,
+            now - i * 1_000,
+            "",
+        );
+    }
+
+    let text = monitor_state_text();
+    let listed = listed_ids(&text);
+
+    // Fixture control FIRST: unless something is actually being dropped, the
+    // eviction assertion below is vacuous.
+    assert!(
+        text.contains("older not listed"),
+        "the fixture must overflow the bound or this proves nothing: {text}"
+    );
+    assert_eq!(
+        &listed[..2],
+        ["d-fresh-0".to_string(), "d-handedoff-0".to_string()],
+        "the live band leads WHOLE, whatever the finished ones' clocks say, and \
+         each band is still newest-mattering first: {text}"
+    );
+    assert_eq!(listed.len(), LISTING_MAX, "still bounded: {text}");
+    // And the ones dropped are finished ones, newest-finished kept.
+    assert!(
+        listed[2..].iter().all(|id| id.starts_with("d-fin")),
+        "the rest of the listing is the finished rows: {listed:?}"
+    );
+
+    // The operator's table bands identically, or the two surfaces disagree
+    // about one store.
+    let cli: Vec<String> = crate::jobs_cli::rows(now_ms())
+        .iter()
+        .map(|r| r.job_id.clone())
+        .collect();
+    assert_eq!(
+        &cli[..2],
+        ["d-fresh-0".to_string(), "d-handedoff-0".to_string()],
+        "`clauth jobs` bands the same way: {cli:?}"
+    );
+    assert_eq!(cli.len(), 12, "and caps nothing: {cli:?}");
+}
+
+/// Every state reaches the listing through `listing_row`'s own arm, dated by the
+/// stamp that state makes worth reading.
+///
+/// Its own test because every other handler fixture was all-live: with none of
+/// them seeding a `done` or a corpse, replacing the finished arm's whole age
+/// figure with a constant left the suite green, which is a REACH hole rather
+/// than a weak assertion. It is also why the `finished now ago` wording shipped
+/// — nothing rendered a real finished row.
+///
+/// The BLOCKING row is here for the same reason one layer down: its age key is
+/// `elapsed_secs`, and without a handler fixture driving one, that arm was
+/// carried by the `is_live` predicate rather than by any assertion.
+#[test]
+fn the_listing_dates_every_state_by_the_stamp_that_state_makes_worth_reading() {
+    let _home = HomeSandbox::new();
+    let now = now_ms();
+    jobs::write_heartbeat(
+        &jobs::RunningSpec {
+            kind: jobs::RecordKind::Liveness,
+            ..running_spec("d-blk-0", "acct", now - 125_500)
+        },
+        now - 4_000,
+        "mid-run",
+    )
+    .unwrap();
+    seed_done_at("d-fin-0", "acct", now - 900_000, now - 90_500, "");
+    // Silent past the corpse window, which is what makes a record an orphan.
+    seed_running("d-dead-0", "acct", now - (3600 + 600) * 1000 - 200_500);
+
+    let text = monitor_state_text();
+    let line = |id: &str| -> String {
+        text.lines()
+            .find(|l| l.contains(id))
+            .unwrap_or_else(|| panic!("no row for {id}:\n{text}"))
+            .to_string()
+    };
+
+    // A live run is dated by how long it has been GOING.
+    assert_eq!(
+        line("d-blk-0").trim(),
+        "job `d-blk-0` blocking on `acct` (its own caller takes the result), elapsed 2m 5s",
+    );
+    // A finished one by how long its result has been sitting there.
+    assert_eq!(
+        line("d-fin-0").trim(),
+        "job `d-fin-0` done on `acct`, finished 1m 30s ago",
+    );
+    // An orphan by when anything last wrote to it.
+    assert_eq!(
+        line("d-dead-0").trim(),
+        "job `d-dead-0` orphaned on `acct`, last seen 1h 13m ago",
+    );
+    // And the two dead ones carry no elapsed figure — asserted per LINE, so the
+    // live row's own `elapsed` cannot satisfy it.
+    for id in ["d-fin-0", "d-dead-0"] {
+        assert!(!line(id).contains("elapsed"), "{}", line(id));
+    }
+}
+
+/// A store at or under the bound says nothing about what it left out.
+///
+/// The `jobs` key carries its only-when-true rule at two layers and both are
+/// pinned; its sibling `jobs_not_listed` had neither, so dropping the producer's
+/// `rest > 0` guard rendered `+0 older not listed` with the whole suite green.
+#[test]
+fn a_store_inside_the_bound_names_no_overflow() {
+    let _home = HomeSandbox::new();
+    let now = now_ms();
+    for i in 0..LISTING_MAX as u64 {
+        seed_running(&format!("d-at{i}-0"), "acct", now - (i + 1) * 1_000);
+    }
+
+    let text = monitor_state_text();
+
+    assert_eq!(listed_ids(&text).len(), LISTING_MAX, "{text}");
+    assert!(
+        !text.contains("older not listed"),
+        "exactly at the bound is not an overflow: {text}"
+    );
+    // Pinned at the payload too, where the producer's guard lives.
+    let mut payload = serde_json::json!({ "status": "armed" });
+    fold_jobs_listing(&mut payload, now_ms());
+    assert!(
+        payload.get("jobs_not_listed").is_none(),
+        "no zero-valued overflow key either: {payload}"
+    );
+}
+
+/// The one thing the job mode structurally cannot do: name an id the caller
+/// does not have. A blocking `delegate` the caller interrupted keeps running as
+/// an ordinary background job whose id reached nobody, and this is where the
+/// model finds it.
+#[test]
+fn the_state_mode_lists_a_handed_off_jobs_id() {
+    let _home = HomeSandbox::new();
+    let now = now_ms();
+    // A hand-off promotes the run's liveness record to the collectable spelling
+    // keeping its id, so what it leaves behind is an ordinary running record.
+    jobs::write_heartbeat(
+        &jobs::RunningSpec {
+            // The crossing is what separates these two on a handed-off record.
+            recorded_at: now - 30_000,
+            // Half a second off a whole second, so the ms that pass between
+            // this stamp and the handler's own `now` cannot move the figure.
+            ..running_spec("d-handedoff-0", "acct", now - 250_500)
+        },
+        now - 4_000,
+        "still working",
+    )
+    .unwrap();
+
+    let text = monitor_state_text();
+
+    assert!(
+        text.contains("delegates clauth holds:"),
+        "the listing labels itself: {text}"
+    );
+    assert_eq!(
+        listed_ids(&text),
+        vec!["d-handedoff-0"],
+        "the abandoned run's id is what the caller came for: {text}"
+    );
+    assert!(
+        text.contains("running on `acct`"),
+        "with the account it is spending: {text}"
+    );
+    assert!(
+        text.contains("elapsed 4m 10s"),
+        "and how long it has been going: {text}"
+    );
+}
+
+/// An empty store adds nothing at all — not a "no jobs" line.
+///
+/// A session that never delegates should pay no tokens for a listing it has no
+/// use for, which is the only-when-true rule the roster flags already render by.
+#[test]
+fn an_empty_store_adds_no_listing_to_the_state_reply() {
+    let _home = HomeSandbox::new();
+
+    let text = monitor_state_text();
+
+    assert!(
+        text.starts_with("monitor armed"),
+        "the state reply itself is unchanged: {text}"
+    );
+    assert!(
+        !text.contains("delegates clauth holds"),
+        "no listing header on an empty store: {text}"
+    );
+    assert!(!text.contains("job `"), "and no rows either: {text}");
+
+    // Pinned at the payload as well as at the prose, because the rule is
+    // carried at both layers and either guard alone renders the same empty
+    // string: without this the payload's guard is an equivalent mutant.
+    let mut payload = serde_json::json!({ "status": "armed" });
+    fold_jobs_listing(&mut payload, now_ms());
+    assert!(
+        payload.get("jobs").is_none(),
+        "no `jobs` key on an empty store, not an empty array: {payload}"
+    );
+    assert!(payload.get("jobs_not_listed").is_none(), "{payload}");
+}
+
+/// The listing is bounded and newest-mattering first, and says how many it did
+/// not name.
+///
+/// The anchors are INTERLEAVED rather than seeded in order: a sort over an input
+/// that is already grouped can short-circuit, so a fixture in anchor order
+/// cannot tell a real ordering from none at all.
+///
+/// What this fixture CANNOT see, stated rather than left for someone to assume:
+/// every record here is `running`, so they are all one band and banding is a
+/// no-op across it. This pins the bound, the overflow count, and the
+/// within-band order. The band itself is
+/// `a_live_delegate_is_never_evicted_by_a_burst_of_finished_ones`.
+#[test]
+fn the_state_mode_listing_is_bounded_and_newest_first() {
+    let _home = HomeSandbox::new();
+    let now = now_ms();
+    // Twelve jobs, two past the bound. Ages in seconds, deliberately out of
+    // order and all well inside the corpse window.
+    let ages: [u64; 12] = [700, 100, 1300, 400, 50, 1900, 250, 900, 10, 1600, 550, 1100];
+    for age in ages {
+        seed_running(&format!("d-age{age}-0"), "acct", now - age * 1000);
+    }
+
+    let text = monitor_state_text();
+    let listed = listed_ids(&text);
+
+    let mut expected: Vec<u64> = ages.to_vec();
+    expected.sort_unstable();
+    let expected: Vec<String> = expected
+        .iter()
+        .take(LISTING_MAX)
+        .map(|age| format!("d-age{age}-0"))
+        .collect();
+    assert_eq!(listed, expected, "the ten freshest, freshest first: {text}");
+    assert!(
+        text.contains("+2 older not listed"),
+        "and it says what it dropped: {text}"
+    );
+}
+
+/// **The listing enumerates; it never resolves a caller's id.**
+///
+/// `jobs::list` returns a blocking run's content — the listing draws that
+/// record's row — and that is safe for exactly one reason: it takes no id, so
+/// nothing a caller spells selects a file. The shape this pins against is an
+/// id-keyed wrapper over `list`, which reads correct and hands a caller's string
+/// a `Liveness` record's content.
+///
+/// **The property is asserted as a SHAPE, not as a list of leaks someone thought
+/// of.** An earlier version named three needles (the tail, `elapsed`) and killed
+/// a wrapper leaking `tail` while a wrapper leaking `profile` shipped green — the
+/// same class as a source scan asserting that a literal appears. So the reply is
+/// pinned BYTE-EXACT: no field of that record can appear in it without changing
+/// the bytes, whichever field it is and whether or not anyone predicted it. The
+/// sentinel sweep underneath is diagnosis, not the property — it names which
+/// field leaked when the equality fails.
+#[test]
+fn an_id_keyed_monitor_call_cannot_reach_what_the_listing_shows() {
+    let _home = HomeSandbox::new();
+    let now = now_ms();
+    // Every field carries its own sentinel, so nothing in this record is a value
+    // that could plausibly arrive from anywhere else.
+    let dir = jobs::jobs_dir().unwrap();
+    std::fs::create_dir_all(&dir).unwrap();
+    let record = serde_json::json!({
+        "job_id": "d-attached-0",
+        "profile": "ZQXPROFILESENTINEL",
+        "state": "running",
+        "started_at": now - 91_500,
+        "recorded_at": now - 90_500,
+        "last_output_at": now - 3_500,
+        "timeout_secs": 4242,
+        "idle_secs": 3131,
+        "tail": "ZQXTAILSENTINEL",
+    });
+    std::fs::write(
+        dir.join("d-attached-0.live.json"),
+        serde_json::to_vec(&record).unwrap(),
+    )
+    .unwrap();
+
+    // Direction one: the enumeration DOES see it. Without this the test could
+    // pass against a listing that had simply stopped working.
+    let listing = monitor_state_text();
+    assert_eq!(
+        listed_ids(&listing),
+        vec!["d-attached-0"],
+        "the enumeration sees it: {listing}"
+    );
+    assert!(
+        listing.contains("blocking on `ZQXPROFILESENTINEL`"),
+        "and says its caller is still on the line: {listing}"
+    );
+
+    // Direction two: the id-keyed path handed that same id answers with the
+    // refusal and NOTHING else. Byte-exact, so this cannot be satisfied by a
+    // leak nobody enumerated.
+    let keyed = call_monitor("d-attached-0", Some(0))
+        .content
+        .first()
+        .and_then(|c| c.as_text())
+        .map(|t| t.text.clone())
+        .expect("keyed reply text");
+    assert_eq!(
+        keyed,
+        "error: job_id d-attached-0 names a blocking `delegate` that is still \
+         running: its result goes back through the call that started it, so there is nothing \
+         here for `monitor` to collect",
+        "the refusal is the WHOLE reply"
+    );
+
+    // Diagnosis only: names the field when the equality above fails.
+    for (field, value) in record.as_object().expect("record object") {
+        // `job_id` is the string the caller supplied. `state` is a closed
+        // two-word vocabulary the refusal's own prose shares ("still running"),
+        // so it carries no record identity and would false-positive here. Both
+        // stay covered by the byte-exact equality above, which is the property;
+        // this loop only has to name the field when that fails.
+        if field == "job_id" || field == "state" {
+            continue;
+        }
+        let spelled = match value {
+            serde_json::Value::String(v) => v.clone(),
+            other => other.to_string(),
+        };
+        assert!(
+            !keyed.contains(&spelled),
+            "`{field}` ({spelled}) of a liveness record reached an id-keyed reply: {keyed}"
+        );
+    }
+}
+
+/// `clauth jobs` and `monitor`'s listing report ONE store, in one order.
+///
+/// Both read it through `jobs::list_banded` and classify with
+/// `StoredJob::phase`, so the only way they can disagree about a record is if
+/// one grows a second parser or a sort of its own — which is exactly what this
+/// reds on.
+///
+/// **The fixture is CROSS-BAND on purpose, and it was not always.** With three
+/// live records and nothing finished, banding is a no-op across the whole
+/// fixture: pointing ONE of the two surfaces back at raw `jobs::list` made them
+/// genuinely disagree about order and this test stayed green — the one test
+/// whose job is cross-surface order agreement could not see cross-surface order
+/// disagreement. The `done` row is anchored NEWER than every live one, so the
+/// two orders differ unless both surfaces band.
+///
+/// What it does NOT claim is that the two always see the same SET of files.
+/// `serve()` sweeps orphaned `running` records at startup, so a long-dead one an
+/// operator still sees in `clauth jobs` — a fresh process that sweeps nothing —
+/// can already be gone by the time a model asks the server. That is the sweep's
+/// doing, not a second reader's, and this test drives `monitor_with` directly,
+/// which runs no sweep at all.
+#[test]
+fn the_cli_listing_and_the_state_mode_listing_report_the_same_store() {
+    let _home = HomeSandbox::new();
+    let now = now_ms();
+    seed_running("d-one-0", "alpha", now - 30_000);
+    jobs::write_heartbeat(
+        &jobs::RunningSpec {
+            kind: jobs::RecordKind::Liveness,
+            ..running_spec("d-two-0", "beta", now - 200_000)
+        },
+        now - 90_000,
+        "mid-run",
+    )
+    .unwrap();
+    seed_running("d-three-0", "gamma", now - 600_000);
+    // Finished ten seconds ago — the FRESHEST anchor in the store, so on raw
+    // retention order it leads and on banded order it comes last.
+    seed_done_at("d-done-0", "delta", now - 900_000, now - 10_000, "");
+
+    let cli: Vec<String> = crate::jobs_cli::rows(now_ms())
+        .iter()
+        .map(|r| format!("{} {}", r.job_id, r.phase.label()))
+        .collect();
+    let mcp = monitor_state_text();
+
+    assert_eq!(
+        cli,
+        vec![
+            "d-one-0 running".to_string(),
+            "d-two-0 blocking".to_string(),
+            "d-three-0 running".to_string(),
+            "d-done-0 done".to_string(),
+        ],
+        "the operator's rows: live band whole and first, each band \
+         newest-mattering first",
+    );
+    assert_eq!(
+        listed_ids(&mcp),
+        vec!["d-one-0", "d-two-0", "d-three-0", "d-done-0"],
+        "and the model's, same store, same order: {mcp}"
+    );
+    // The state word is shared too, not merely the id set.
+    assert!(mcp.contains("job `d-two-0` blocking"), "{mcp}");
+    assert!(mcp.contains("job `d-three-0` running"), "{mcp}");
+}
+
+/// `monitor`'s description has to teach the listing, because a caller cannot be
+/// refused into discovering a mode that exists to answer "what ids are there".
+///
+/// The interrupted-delegate sentence is the load-bearing half: without it a
+/// model that just lost a blocking call has no reason to believe the run is
+/// still going, so it re-runs the prompt and spends the window twice.
+#[test]
+fn the_monitor_description_names_the_listing_and_the_interrupted_delegate() {
+    let tools = ClauthServer::new().tool_router.list_all();
+    let monitor = tools
+        .iter()
+        .find(|t| t.name == "monitor")
+        .expect("monitor tool is registered");
+    let text = monitor.description.as_deref().unwrap_or_default();
+
+    for phrase in [
+        "no `job_ids`",
+        "list the delegates clauth holds",
+        // What it puts FIRST, which is what a caller hunting an id needs and
+        // what the rows actually do since they band.
+        "live runs first",
+        "An interrupted blocking `delegate`",
+        "background job",
+        "where you find its id",
+    ] {
+        assert!(
+            text.contains(phrase),
+            "`monitor` description dropped {phrase:?}: {text}"
+        );
+    }
+    // It lists at most `LISTING_MAX`, so it must not claim completeness. A pin
+    // that only asserted the presence of a phrase locked the overclaim in once
+    // already.
+    for overclaim in ["every delegate", "all delegates", "every job"] {
+        assert!(
+            !text.contains(overclaim),
+            "`monitor` description claims completeness it does not deliver \
+             ({overclaim:?}, bounded at {LISTING_MAX}): {text}"
+        );
+    }
+}

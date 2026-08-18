@@ -8,6 +8,7 @@ mod daemon;
 mod fallback;
 mod format;
 mod herdr;
+mod jobs_cli;
 mod jsonsync;
 // macOS-only: Claude Code reads its login from the Keychain, not the credentials
 // file, so a switch must also write there. Gated so non-macOS builds stay clean.
@@ -163,6 +164,7 @@ fn dispatch(cli: Cli) -> Result<()> {
         Command::RollingToken { profile } => cmd_rolling_token(&profile),
         Command::Which { json } => which::run(json),
         Command::List { all, disabled } => list::run(all || disabled),
+        Command::Jobs { json } => jobs_cli::run(json),
         Command::Sessions { json, tokens } => sessions_cli::run_sessions(json, tokens),
         Command::Resume { target, profile } => {
             sessions_cli::run_resume(&target, profile.as_deref())

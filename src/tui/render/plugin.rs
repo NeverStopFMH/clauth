@@ -30,7 +30,7 @@ use super::super::theme;
 use super::format::spinner_frame;
 use super::panes::{draw_scrollbar, empty_state, key_cell, master_detail, section_box};
 use crate::format::truncate;
-use crate::mcp::jobs::{self, JobLiveness, RunningLiveness, StoredJob};
+use crate::mcp::jobs::{self, JobPhase, RunningLiveness, StoredJob};
 use crate::usage::humanize_duration;
 
 pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
@@ -478,8 +478,8 @@ fn delegate_lines(rows: &[DelegateCells], viewport: usize, width: usize) -> Vec<
 fn delegate_line(cells: &DelegateCells, name_w: usize, width: usize) -> Line<'static> {
     let mut spans = vec![
         Span::styled(
-            format!("{} ", cells.state.mark()),
-            Style::default().fg(cells.state.color()),
+            format!("{} ", state_mark(cells.state)),
+            Style::default().fg(state_color(cells.state)),
         ),
         Span::styled(key_cell(cells.state.label(), STATE_W, 2), theme::dim()),
         Span::styled(
@@ -501,66 +501,31 @@ fn delegate_line(cells: &DelegateCells, name_w: usize, width: usize) -> Line<'st
     Line::from(spans)
 }
 
-/// How a delegate row reads. The word is mandatory beside the mark: three of the
-/// four share the `●` glyph, so hue alone cannot carry the state.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum DelegateState {
-    /// A background job. Its result waits in the store until `monitor` collects
-    /// it.
-    Running,
-    /// A run whose caller is still holding the line — the shape a plain
-    /// `delegate` call takes, and the one an operator watching a frozen turn is
-    /// actually looking for. It reads apart from `running` because the two are
-    /// different situations, not different progress: nothing can collect this
-    /// one, and the session waiting on it is the session in front of you.
-    Blocking,
-    Done,
-    /// Its `clauth mcp` server stopped writing the record — the run is gone and
-    /// its result with it.
-    Orphaned,
+// How a delegate row reads: `JobPhase`, the crate's one classification of a
+// stored record, plus the two things a TERMINAL adds to it.
+//
+// The four situations, the word for each, and the band a row sits in all live on
+// `JobPhase` in `src/mcp/jobs.rs`, because `clauth jobs` and `monitor`'s listing
+// answer the same questions and three copies of one rule is how they drift. What
+// stays here is presentation and only presentation: the glyph and the hue. The
+// word is mandatory beside the mark either way — three of the four share the `●`
+// glyph, so hue alone cannot carry the state.
+
+/// `●` for a run that is or was doing something, `○` for one whose server is
+/// gone: the contract's active / disconnected dot pair.
+fn state_mark(phase: JobPhase) -> &'static str {
+    match phase {
+        JobPhase::Running | JobPhase::Blocking | JobPhase::Done => "●",
+        JobPhase::Orphaned => "○",
+    }
 }
 
-impl DelegateState {
-    /// `●` for a run that is or was doing something, `○` for one whose server is
-    /// gone: the contract's active / disconnected dot pair.
-    fn mark(self) -> &'static str {
-        match self {
-            Self::Running | Self::Blocking | Self::Done => "●",
-            Self::Orphaned => "○",
-        }
-    }
-
-    fn label(self) -> &'static str {
-        match self {
-            Self::Running => "running",
-            Self::Blocking => "blocking",
-            Self::Done => "done",
-            Self::Orphaned => "orphaned",
-        }
-    }
-
-    fn color(self) -> Color {
-        match self {
-            Self::Running | Self::Blocking => theme::accent_color(),
-            Self::Done => theme::success_color(),
-            // Disconnected carries no semantic charge of its own; the word does.
-            Self::Orphaned => theme::text_dim_color(),
-        }
-    }
-
-    /// Which band a row sits in when the pane has more rows than height. A run
-    /// still spending outranks one that is over, whatever the clock says: a
-    /// `done` record is anchored on its FINISH, so on anchor order alone a burst
-    /// of background jobs landing now evicts the blocking run this pane exists
-    /// to show, and no key reaches it afterwards.
-    ///
-    /// An orphan bands with the finished: nothing is waiting on it and its
-    /// result is already gone.
-    fn rank(self) -> u8 {
-        match self {
-            Self::Blocking | Self::Running => 0,
-            Self::Done | Self::Orphaned => 1,
-        }
+fn state_color(phase: JobPhase) -> Color {
+    match phase {
+        JobPhase::Running | JobPhase::Blocking => theme::accent_color(),
+        JobPhase::Done => theme::success_color(),
+        // Disconnected carries no semantic charge of its own; the word does.
+        JobPhase::Orphaned => theme::text_dim_color(),
     }
 }
 
@@ -572,7 +537,7 @@ impl DelegateState {
 /// of the terminal AND of the clock, so a test can drive it at a fixed `now`.
 #[derive(Debug, Clone)]
 struct DelegateCells {
-    state: DelegateState,
+    state: JobPhase,
     profile: String,
     /// What this record can say, in the order a reader scans it.
     facts: Vec<String>,
@@ -582,16 +547,17 @@ struct DelegateCells {
     tail: String,
 }
 
+/// One cell set per stored record, in the order they arrive.
+///
+/// **It sorts nothing.** Banding is `jobs::list_banded`'s, which is what
+/// `recompute_plugin_checks` reads the store through, and what `clauth jobs` and
+/// `monitor`'s listing read it through as well. This pane used to band its own
+/// already-rendered cells off the same shared rank, which could not drift TODAY
+/// and was still two sort sites: a later change to `list_banded` — a tiebreak, a
+/// third band — would have reached the text surfaces and not this one, with
+/// nothing to red.
 fn delegate_cells(stored: &[StoredJob], now: u64) -> Vec<DelegateCells> {
-    let mut rows: Vec<DelegateCells> = stored.iter().map(|job| delegate_row(job, now)).collect();
-    // Live rows first, each band still newest-first: `jobs::list` hands them
-    // over in anchor order and this sort is stable, so the band is the only
-    // thing that moves. It is done HERE and not in `jobs::list`, whose order is
-    // its own documented contract — the record a sweep would drop last is the
-    // one it lists first — and answers a different question than "which row must
-    // a reader not lose".
-    rows.sort_by_key(|row| row.state.rank());
-    rows
+    stored.iter().map(|job| delegate_row(job, now)).collect()
 }
 
 fn delegate_row(job: &StoredJob, now: u64) -> DelegateCells {
@@ -599,21 +565,25 @@ fn delegate_row(job: &StoredJob, now: u64) -> DelegateCells {
     let profile = record.profile.clone();
     // The store's own retention stamp, so a row is dated by the same field that
     // decides how long it survives.
-    let since = now.saturating_sub(job.anchor) / 1000;
-    match job.liveness {
-        JobLiveness::Done => DelegateCells {
-            state: DelegateState::Done,
+    let since = job.age_secs(now);
+    // Through `phase()` rather than by re-matching `(liveness, kind)` here: a
+    // fifth situation added there must not compile clean into this pane still
+    // classifying by the old four.
+    let state = job.phase();
+    match state {
+        JobPhase::Done => DelegateCells {
+            state,
             profile,
             facts: vec![format!("finished {}", age_phrase(since))],
             tail: String::new(),
         },
-        JobLiveness::Corpse => DelegateCells {
-            state: DelegateState::Orphaned,
+        JobPhase::Orphaned => DelegateCells {
+            state,
             profile,
             facts: vec![format!("last seen {}", age_phrase(since))],
             tail: record.tail.clone(),
         },
-        JobLiveness::Running => {
+        JobPhase::Running | JobPhase::Blocking => {
             let live = jobs::running_liveness(record, now);
             let mut facts = vec![format!(
                 "elapsed {}",
@@ -637,13 +607,7 @@ fn delegate_row(job: &StoredJob, now: u64) -> DelegateCells {
                 facts.push("liveness not recorded".to_string());
             }
             DelegateCells {
-                // The spelling on disk is the whole difference: a liveness
-                // record exists only while its caller holds the join, so no
-                // second field is needed to say which situation this is.
-                state: match job.kind {
-                    jobs::RecordKind::Collectable => DelegateState::Running,
-                    jobs::RecordKind::Liveness => DelegateState::Blocking,
-                },
+                state,
                 profile,
                 facts,
                 tail: record.tail.clone(),

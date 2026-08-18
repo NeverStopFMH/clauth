@@ -1338,12 +1338,14 @@ talking runs as long as it needs, and `timeout_secs` binds only a run whose `arg
     }
 
     #[tool(
-        description = "Check, collect or stop a backgrounded `delegate`, or wait on clauth's own \
-state. A running job reports its account, elapsed time, how long until each deadline kills it, and \
-its latest output, so a check is worth the turn it costs; a finished one returns the delegate \
-envelope. `wait_secs` blocks until one named job finishes, or until clauth's state moves when you \
-name none. `return_on: \"all\"` waits for the slowest job instead of the first. `cancel: true` \
-stops the named jobs and keeps whatever they produced."
+        description = "Check, collect or stop a backgrounded `delegate`, or — with no `job_ids` — \
+list the delegates clauth holds, live runs first, and wait on clauth's own state. A running job reports its \
+account, elapsed time, how long until each deadline kills it, and its latest output, so a check is \
+worth the turn it costs; a finished one returns the delegate envelope. An interrupted blocking \
+`delegate` keeps running as a background job; the listing is where you find its id. \
+`wait_secs` blocks until one named job finishes, or until clauth's state moves when you name none. \
+`return_on: \"all\"` waits for the slowest job instead of the first. `cancel: true` stops the \
+named jobs and keeps whatever they produced."
     )]
     async fn monitor(
         &self,
@@ -1428,10 +1430,12 @@ stops the named jobs and keeps whatever they produced."
             }
             Some(ids) => monitor_batch(ids, wait, return_on, &self.digest, &mut progress).await,
             // No ids: the state-waiting mode absorbed from the old `watch`
-            // tool — the same digest, all three observables, no filter.
+            // tool — the same digest, all three observables, no filter — plus
+            // the listing, which is the one thing `job_ids` cannot ask for
+            // because asking needs an id you do not have.
             None => {
                 let outcome = self.digest.watch(WatchSet::ALL, wait, &mut progress).await;
-                let payload = match outcome {
+                let mut payload = match outcome {
                     WatchOutcome::Armed => serde_json::json!({ "status": "armed" }),
                     WatchOutcome::Unchanged { waited_secs } => {
                         serde_json::json!({ "status": "unchanged", "waited_secs": waited_secs })
@@ -1441,6 +1445,10 @@ stops the named jobs and keeps whatever they produced."
                         "since_your_last_call": delta.to_json(),
                     }),
                 };
+                // Resolved AFTER the wait, so a caller that blocked for ten
+                // minutes is told what the store holds now rather than what it
+                // held when the call arrived.
+                fold_jobs_listing(&mut payload, now_ms());
                 let prose = render::watch_prose(&payload);
                 Ok(CallToolResult::success(single_block(prose)))
             }
@@ -2071,6 +2079,80 @@ const JOB_POLL_INTERVAL: Duration = Duration::from_millis(200);
 /// carries the outer bound at 4260 s, and this must stay under it: the hook
 /// process is killed at that one, and a kill delivers nothing.
 const AWAIT_JOB_DEADLINE_SECS: u64 = 4200;
+
+/// Most rows the state mode's listing names before it stops naming them.
+///
+/// The store retains [`jobs::MAX_RETAINED`], and spending 256 rows on a caller
+/// who asked whether clauth's state had moved is the cost this surface was
+/// reworked to refuse.
+///
+/// **This bound deliberately CUTS ACROSS the store's retention rule, and that is
+/// the point rather than a cost.** The rows arrive from [`jobs::list_banded`],
+/// so a stale live run is kept and a fresher finished one dropped — the exact
+/// trade the retention cap would refuse, because retention answers "which record
+/// is least worth keeping" while this answers "which row must a reader not
+/// lose". An earlier version of this comment argued the opposite, that the bound
+/// agreed with retention; that reasoning is what shipped a listing which evicted
+/// the long-running delegate the mode exists to name, so do not restore it.
+///
+/// An operator wanting all of them runs `clauth jobs`, which bands the same way
+/// and caps nothing.
+const LISTING_MAX: usize = 10;
+
+/// Fold the delegate jobs clauth is holding into a state-mode reply.
+///
+/// Adds nothing at all when the store is empty, so a session that has never
+/// delegated pays nothing for a listing it has no use for — the same
+/// only-when-true rule the roster's flags render by.
+///
+/// **This is safe to return a blocking run's content from, and the reason is
+/// structural**: [`jobs::list_banded`] takes NO id, and neither does the
+/// [`jobs::list`] it sorts. They enumerate the directory and return what they
+/// find, so nothing a caller spells selects a file, which is
+/// what [`jobs::RecordKind`] documents as the condition a new reader has to
+/// meet. Filtering this listing by a caller-supplied id would be the exact
+/// shape that type forbids; an id-keyed lookup belongs on `jobs::read`.
+///
+/// Each row carries an id, an account, a state and ONE age. No tail, no quota,
+/// no deadline countdown: this exists so a caller can name a job, and
+/// `monitor({job_ids})` is the check that reports what one is doing.
+fn fold_jobs_listing(payload: &mut serde_json::Value, now: u64) {
+    // Banded, never raw — see [`LISTING_MAX`] and `jobs::list_banded`.
+    let stored = jobs::list_banded(now);
+    if stored.is_empty() {
+        return;
+    }
+    let rows: Vec<serde_json::Value> = stored
+        .iter()
+        .take(LISTING_MAX)
+        .map(|job| listing_row(job, now))
+        .collect();
+    payload["jobs"] = serde_json::Value::Array(rows);
+    let rest = stored.len().saturating_sub(LISTING_MAX);
+    if rest > 0 {
+        payload["jobs_not_listed"] = serde_json::json!(rest);
+    }
+}
+
+/// One listing row. A live run is dated by how long it has been going, a
+/// finished or orphaned one by how long since its record last mattered — two
+/// different questions, so two different keys rather than one that means
+/// whichever the state implies.
+fn listing_row(job: &jobs::StoredJob, now: u64) -> serde_json::Value {
+    let phase = job.phase();
+    let mut row = serde_json::json!({
+        "job_id": job.record.job_id,
+        "profile": job.record.profile,
+        "state": phase.label(),
+    });
+    if phase.is_live() {
+        row["elapsed_secs"] =
+            serde_json::json!(jobs::running_liveness(&job.record, now).elapsed_secs);
+    } else {
+        row["since_secs"] = serde_json::json!(job.age_secs(now));
+    }
+    row
+}
 
 /// Everything wrong with a `job_ids` list that the list alone decides, in the
 /// exact words the reply carries.

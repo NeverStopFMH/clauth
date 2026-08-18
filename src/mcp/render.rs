@@ -5,7 +5,7 @@
 
 use serde_json::Value;
 
-use crate::format::format_pct;
+use crate::format::{format_pct, humanize_span};
 use crate::providers::ThirdPartyStats;
 use crate::usage::humanize_duration;
 use crate::which::SessionAuth;
@@ -389,11 +389,12 @@ pub(crate) fn digest_prose(d: &Value) -> String {
 }
 
 /// The state-waiting mode's reply: the change it caught, the baseline it
-/// armed, or the wait that found nothing. Self-labels `monitor` — the reply
-/// names the tool that can be called again, and a label naming a tool the
-/// handshake does not list sends the model searching for one.
+/// armed, or the wait that found nothing, then the delegates clauth is holding.
+/// Self-labels `monitor` — the reply names the tool that can be called again,
+/// and a label naming a tool the handshake does not list sends the model
+/// searching for one.
 pub(crate) fn watch_prose(p: &Value) -> String {
-    match p.get("status").and_then(Value::as_str) {
+    let state = match p.get("status").and_then(Value::as_str) {
         Some("changed") => format!("monitor: {}", digest_prose(&p["since_your_last_call"])),
         Some("armed") => {
             "monitor armed: baseline set on this first digest call, nothing to compare against yet"
@@ -403,6 +404,85 @@ pub(crate) fn watch_prose(p: &Value) -> String {
             let waited = p.get("waited_secs").and_then(Value::as_u64).unwrap_or(0);
             format!("monitor: no change after {waited}s")
         }
+    };
+    let listing = jobs_listing_prose(p);
+    if listing.is_empty() {
+        return state;
+    }
+    format!("{state}\n{listing}")
+}
+
+/// The delegate jobs clauth is holding, one line each, or nothing at all when
+/// it holds none.
+///
+/// Empty rather than a "no jobs" line: a session that never delegated should
+/// pay nothing for a listing it has no use for, which is the only-when-true rule
+/// the roster flags already render by. Each line opens with ``job `<id>` `` —
+/// the same opener `delegate_result_batch_prose` uses — so the id a caller has
+/// to copy out is always in the same place.
+///
+/// One age per row and no tail, no quota and no deadline countdown: this
+/// enumerates so a caller can NAME a job, and `monitor({job_ids})` is the check
+/// that reports what one is doing. Ten rows of the full running line would cost
+/// more than the reply it rides on.
+fn jobs_listing_prose(p: &Value) -> String {
+    let Some(rows) = p.get("jobs").and_then(Value::as_array) else {
+        return String::new();
+    };
+    if rows.is_empty() {
+        return String::new();
+    }
+    let mut out = String::from("delegates clauth holds:");
+    for row in rows {
+        let job_id = row
+            .get("job_id")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        let state = row
+            .get("state")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        out.push_str(&format!("\n  job `{job_id}` {state}"));
+        if let Some(profile) = row.get("profile").and_then(Value::as_str) {
+            out.push_str(&format!(" on `{profile}`"));
+        }
+        // Said here rather than left to the collect refusal, because the refusal
+        // costs the caller a whole turn to learn a fact this row can carry in
+        // five words.
+        if state == "blocking" {
+            out.push_str(" (its own caller takes the result)");
+        }
+        out.push_str(&age_phrase(row));
+    }
+    // Guarded here as well as at the producer, because the only-when-true rule
+    // belongs to each layer: a `+0 older not listed` line is a claim about
+    // nothing, and this renderer answers for whatever payload it is handed.
+    match p.get("jobs_not_listed").and_then(Value::as_u64) {
+        Some(rest) if rest > 0 => out.push_str(&format!("\n  +{rest} older not listed")),
+        _ => {}
+    }
+    out
+}
+
+/// The one age a listing row carries, named for the question that row's state
+/// makes worth asking: a live run's is how long it has been going, a finished
+/// one's how long its result has been sitting there, an orphan's how long ago
+/// anything last wrote to it.
+fn age_phrase(row: &Value) -> String {
+    // `humanize_span`, never `humanize_duration`: every figure here is a SPAN,
+    // and at zero that function spells `now`, which renders `elapsed now` and
+    // `finished now ago`. A job that finished under a second ago and a fan-out
+    // member that just launched are both routine.
+    if let Some(secs) = row.get("elapsed_secs").and_then(Value::as_u64) {
+        return format!(", elapsed {}", humanize_span(secs));
+    }
+    let Some(secs) = row.get("since_secs").and_then(Value::as_u64) else {
+        return String::new();
+    };
+    let when = humanize_span(secs);
+    match row.get("state").and_then(Value::as_str) {
+        Some("orphaned") => format!(", last seen {when} ago"),
+        _ => format!(", finished {when} ago"),
     }
 }
 

@@ -898,7 +898,7 @@ pub(crate) fn delegate_prose(p: &Value) -> String {
         let status = p.get("status").and_then(Value::as_str).unwrap_or("unknown");
         // A raw start epoch carries no news a reader acts on; the JSON spelling
         // keeps it. The handle's own spelling is unchanged: the bundled
-        // `asyncRewake` hook scans this prose for `d-<ms>-<n>` tokens.
+        // `asyncRewake` hook scans this prose for `d-<base36-ms>-<n>` tokens.
         let mut out = format!("delegate to `{profile}` {status}, job `{job_id}`");
         if let Some(lu) = p.get("live_usage") {
             out.push_str("; ");

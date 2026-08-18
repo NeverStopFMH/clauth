@@ -154,6 +154,20 @@ fn new_job_id_is_unique_and_safe() {
     assert!(is_safe_job_id(&a) && is_safe_job_id(&b));
 }
 
+/// `base36`'s buffer is sized by an argument no wall-clock stamp can ever
+/// exercise, so passing the widest input at all is what reds an under-sized one
+/// — by panicking before any assertion here runs, on the index in release and
+/// on the counter's own underflow in debug. An OVER-sized buffer is invisible to
+/// this test and costs nothing but stack, so nothing below claims to catch it:
+/// the two assertions pin the encoding, not the sizing.
+#[test]
+fn base36_spans_its_whole_domain() {
+    assert_eq!(base36(0), "0", "zero is a digit, never the empty string");
+    let widest = base36(u64::MAX);
+    assert_eq!(widest.len(), 13, "u64::MAX spells 13 base-36 digits");
+    assert_eq!(u64::from_str_radix(&widest, 36), Ok(u64::MAX));
+}
+
 /// Write a `done` file with an explicit `done_at`, as raw bytes: `write_done`
 /// stamps the real clock, and the retention rule under test is about a stamp a
 /// test has to choose. Omitting `done_at` writes the pre-`done_at` shape.

@@ -2306,8 +2306,8 @@ fn monitor_single_spelling_keeps_the_pre_merge_done_bytes_and_names_its_unknown_
             .and_then(|c| c.as_text())
             .map(|t| t.text.clone())
             .expect("refusal text"),
-        "error: unknown job_id: d-pin-unknown-0 — clauth never minted it (a real one reads \
-         `d-<epoch_ms>-<counter>`); check the id `delegate` handed back"
+        "error: unknown job_id: d-pin-unknown-0 — clauth never minted it (a real id reads \
+         `d-<base36-ms>-<counter>`); check the id `delegate` handed back"
     );
 
     jobs::write_done(
@@ -2588,31 +2588,49 @@ fn find_job_ids_collects_every_fanout_job() {
 #[test]
 fn find_job_ids_scans_fanout_prose() {
     // The prose fan-out reply carries no `job_id` field at all; the token scan
-    // is the only way its jobs auto-arrive. Non-digit `d-` tokens and a lone
-    // `d-<n>` are not ids.
+    // is the only way its jobs auto-arrive. The stamps carry letters because a
+    // real one does, and a digits-only scanner drops exactly those silently. A
+    // `d-` token with the wrong segment count is not an id; a lowercase base-36
+    // middle segment now matches, so the skip examples use segment-count shapes
+    // rather than letter-bearing ones.
     let payload = serde_json::json!({
         "tool_response": {
             "content": [{
                 "type": "text",
-                "text": "delegated to `solo` (job `d-1755-0`) and `vendor` (job `d-1755-1`); \
-    ignore d-evil-2 and d-12",
+                "text": "delegated to `solo` (job `d-msvr98yv-0`) and `vendor` (job \
+    `d-msvr98yv-1`); ignore d-12 and d-1755-2-extra",
             }]
         }
     });
-    assert_eq!(find_job_ids(&payload), vec!["d-1755-0", "d-1755-1"]);
+    assert_eq!(find_job_ids(&payload), vec!["d-msvr98yv-0", "d-msvr98yv-1"]);
 }
 
 /// The fan-out prose now carries a per-target headroom footer, and the bundled
 /// `asyncRewake` hook reads that same prose for job ids — so the footer is
-/// checked against the scanner it shares a line with. The producer is DRIVEN
+/// checked against the scanner it shares a line with. Both halves are DRIVEN
 /// rather than hand-spelled: a literal fixture would agree with whatever this
-/// test's author guessed the footer looks like.
+/// test's author guessed, about the footer and about the mint shape alike.
 #[test]
 fn find_job_ids_over_a_footered_fanout_prose_yields_exactly_the_real_ids() {
+    // Minted through the producer, but from a FIXED stamp rather than the wall
+    // clock: what this test needs from an id is a letter in its stamp, and
+    // `base36(now_ms())` is all-digits for a small slice of wall-clock moments,
+    // which would silently degenerate to the pre-M5 fixture on those runs
+    // instead of failing.
+    let first = jobs::new_job_id(1_786_881_748_135);
+    let second = jobs::new_job_id(1_786_881_748_135);
+    // The STAMP segment, never the whole id: every id opens with the `d-`
+    // prefix, so a letter-anywhere check passes on that `d` whatever the stamp
+    // holds.
+    let stamp = first.split('-').nth(1).expect("a minted id has a stamp");
+    assert!(
+        stamp.contains(|c: char| c.is_ascii_lowercase()),
+        "fixture control: the stamp carries a letter, the half a digits-only scanner drops: {first}",
+    );
     let prose = render::delegate_fanout_prose(&serde_json::json!({
         "jobs": [
             {
-                "job_id": "d-1755-0",
+                "job_id": first.as_str(),
                 "profile": "solo",
                 "started_at": 1,
                 "status": "running",
@@ -2625,7 +2643,7 @@ fn find_job_ids_over_a_footered_fanout_prose_yields_exactly_the_real_ids() {
                 },
             },
             {
-                "job_id": "d-1755-1",
+                "job_id": second.as_str(),
                 "profile": "vendor",
                 "started_at": 2,
                 "status": "running",
@@ -2645,7 +2663,7 @@ fn find_job_ids_over_a_footered_fanout_prose_yields_exactly_the_real_ids() {
     let payload = serde_json::json!({
         "tool_response": { "content": [{ "type": "text", "text": prose }] }
     });
-    assert_eq!(find_job_ids(&payload), vec!["d-1755-0", "d-1755-1"]);
+    assert_eq!(find_job_ids(&payload), vec![first, second]);
 }
 
 #[test]
@@ -3675,8 +3693,9 @@ fn an_abandoned_blocking_fanout_hands_every_member_off() {
             member.started_at, expected_start,
             "the member's start time travels with its account",
         );
-        assert!(
-            member.job_id.starts_with(&format!("d-{expected_start}-")),
+        assert_eq!(
+            job_id_minted_at(&member.job_id),
+            Some(expected_start),
             "the job id is minted from its own member's start time: {}",
             member.job_id,
         );
@@ -3981,15 +4000,22 @@ fn the_wait_cap_clamps_without_a_progress_token() {
 /// branch rather than inventing a distinction.
 #[test]
 fn an_unknown_job_id_names_which_cause_it_was() {
-    let now = 4_000_000_000_000u64;
+    // A REAL 2026 clock, not a round synthetic one: which age branch a
+    // never-minted token reaches is decided by its decoded stamp against `now`,
+    // so a far-future `now` silently routes the whole class into one branch and
+    // hides whatever the other branch says.
+    let now = 1_786_881_748_135u64;
 
     let never = unknown_job_reason("not-a-job", now);
     assert!(
-        never.contains("never minted") && never.contains("d-<epoch_ms>-<counter>"),
+        never.contains("never minted") && never.contains("d-<base36-ms>-<counter>"),
         "an id off the mint shape says so and names the shape: {never}",
     );
 
-    let swept = unknown_job_reason(&format!("d-{}-0", now - 2 * 60 * 60 * 1000), now);
+    // Minted through the producer so the id really decodes to the stamp below;
+    // a hand-spelled decimal id would parse as a far-future base-36 stamp and
+    // take the under-an-hour branch instead.
+    let swept = unknown_job_reason(&jobs::new_job_id(now - 2 * 60 * 60 * 1000), now);
     assert!(
         swept.contains("swept") && swept.contains("re-run"),
         "an id older than the done TTL names the sweep and the fix: {swept}",
@@ -4001,10 +4027,39 @@ fn an_unknown_job_id_names_which_cause_it_was() {
         swept.find("already collected") < swept.find("swept"),
         "the likelier cause leads: {swept}",
     );
-
-    let collected = unknown_job_reason(&format!("d-{}-3", now - 1000), now);
     assert!(
-        collected.contains("already collected") && collected.contains("256"),
+        swept.contains("stamp reads over an hour old"),
+        "the age is attributed to the stamp, never asserted as a mint: {swept}",
+    );
+
+    // A lowercase word is valid base-36, so it passes the shape gate and gets an
+    // age branch it was never minted into. WHICH branch is the stamp's accident:
+    // `day` decodes to 1970 and ages, `notebook` decodes past this clock and
+    // reads fresh, and every pre-M5 all-digit id lands with `notebook`. Both
+    // classes are driven, because covering one leaves the other free to
+    // presuppose a job that never existed.
+    let aged_word = unknown_job_reason("d-day-1", now);
+    let fresh_word = unknown_job_reason("d-notebook-1", now);
+    // The cap needle is the whole phrase, never the bare number: the id is
+    // interpolated into this same string, and the process-global counter spells
+    // `256` often enough (256, 1256, 2560..2569, ...) that a bare needle binds
+    // to the id instead of to `MAX_RETAINED`.
+    let cap = format!("{} newest jobs", jobs::MAX_RETAINED);
+    assert!(
+        aged_word.contains("swept") && fresh_word.contains(&cap),
+        "fixture control: the two words really take opposite age branches: \
+         {aged_word} / {fresh_word}",
+    );
+    for reason in [&aged_word, &fresh_word] {
+        assert!(
+            reason.contains("never have minted it") && reason.contains("d-<base36-ms>-<counter>"),
+            "an id clauth may never have minted is never told it had one: {reason}",
+        );
+    }
+
+    let collected = unknown_job_reason(&jobs::new_job_id(now - 1000), now);
+    assert!(
+        collected.contains("already collected") && collected.contains(&cap),
         "a fresh id names collection and the retention cap together: {collected}",
     );
     for reason in [&never, &swept, &collected] {
@@ -4013,6 +4068,47 @@ fn an_unknown_job_id_names_which_cause_it_was() {
             "every cause keeps the lead the caller greps for: {reason}"
         );
     }
+}
+
+/// The shortened id is minted and parsed at opposite ends of one shape; pin that
+/// they agree, so a change to the encoder without the parser (or vice versa)
+/// reds here. A base-36 stamp carries letters, which the old digits-only shape
+/// refused.
+#[test]
+fn minted_job_ids_round_trip_through_job_id_minted_at() {
+    let stamp = 1_786_881_748_135;
+    let id = jobs::new_job_id(stamp);
+    assert_eq!(
+        job_id_minted_at(&id),
+        Some(stamp),
+        "minted id parses back: {id}"
+    );
+    assert_eq!(
+        job_id_minted_at("d-msvr98yv-0"),
+        Some(stamp),
+        "a letter-bearing base-36 stamp parses"
+    );
+    // `0` encodes as `0`, never the empty string, so `new_job_id(0)` is not
+    // `d--<n>` (which the shape gate rejects).
+    assert_eq!(job_id_minted_at(&jobs::new_job_id(0)), Some(0));
+}
+
+#[test]
+fn token_is_job_id_accepts_fresh_and_legacy_and_rejects_bad_shapes() {
+    assert!(token_is_job_id("d-msvr98yv-0"), "a fresh base-36 id");
+    assert!(
+        token_is_job_id("d-1786881748135-0"),
+        "a legacy decimal stamp is also valid base-36"
+    );
+    assert!(!token_is_job_id("d-0"), "two segments");
+    assert!(!token_is_job_id("d-abc-1-0"), "four segments");
+    assert!(!token_is_job_id("d--1"), "empty stamp");
+    assert!(!token_is_job_id("d-abc-"), "empty counter");
+    assert!(!token_is_job_id("d-ABC-1"), "uppercase stamp char");
+    assert!(!token_is_job_id("d-ab!c-1"), "non-base-36 stamp char");
+    assert!(!token_is_job_id("d-abc-1x"), "non-digit counter");
+    assert!(!token_is_job_id("nope"));
+    assert!(!token_is_job_id(""));
 }
 
 /// A caller-pinned format is read whole: it is one JSON document, and splitting

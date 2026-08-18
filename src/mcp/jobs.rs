@@ -176,11 +176,37 @@ pub(crate) fn jobs_dir() -> Result<PathBuf> {
     Ok(clauth_dir()?.join("jobs"))
 }
 
-/// A fresh, process-unique, filesystem-safe job id: `started_at` (epoch ms) plus
-/// a monotonic counter.
+/// Lowercase base-36 digits for [`base36`], ordered by value so `n % 36`
+/// indexes straight into it.
+const B36: &[u8; 36] = b"0123456789abcdefghijklmnopqrstuvwxyz";
+
+/// The smallest base-36 spelling of `n`, `0` for zero. A `u64` needs at most 13
+/// base-36 digits, so the fixed buffer never overruns.
+fn base36(mut n: u64) -> String {
+    if n == 0 {
+        return "0".to_string();
+    }
+    let mut rev = [0u8; 13];
+    let mut i = rev.len();
+    while n > 0 {
+        i -= 1;
+        rev[i] = B36[(n % 36) as usize];
+        n /= 36;
+    }
+    let mut out = String::with_capacity(rev.len() - i);
+    for &b in &rev[i..] {
+        out.push(char::from(b));
+    }
+    out
+}
+
+/// A fresh, process-unique, filesystem-safe job id: `started_at` (epoch ms) in
+/// base-36, then a decimal monotonic counter. The stamp is encoded to keep the
+/// id short; the counter stays decimal because a same-millisecond run count is
+/// already tiny, and its only job is to differ.
 pub(crate) fn new_job_id(started_at: u64) -> String {
     let n = JOB_COUNTER.fetch_add(1, Ordering::Relaxed);
-    format!("d-{started_at}-{n}")
+    format!("d-{}-{n}", base36(started_at))
 }
 
 /// True iff `id` is safe as a single path component (no separators, no

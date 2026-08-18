@@ -2333,48 +2333,65 @@ fn running_payload(job_id: &str, record: &jobs::JobRecord, now: u64) -> serde_js
     payload
 }
 
-/// The epoch-ms a job id carries in its own mint shape, `None` for a token
-/// clauth never minted.
+/// The epoch-ms a job id's stamp segment decodes to, base-36, `None` for a
+/// token off the mint SHAPE. It answers what the stamp says and never whether
+/// clauth minted the id: the shape gate admits any lowercase stamp, so a
+/// pre-shortening all-digit id decodes far-future while a word like `d-day-1`
+/// decodes to 1970. Those land in OPPOSITE age branches of [`unknown_job_reason`],
+/// which is why both of them hedge the mint rather than presupposing a job.
 fn job_id_minted_at(token: &str) -> Option<u64> {
     token_is_job_id(token)
         .then(|| token.split('-').nth(1))
         .flatten()
-        .and_then(|ms| ms.parse().ok())
+        .and_then(|ms| u64::from_str_radix(ms, 36).ok())
 }
 
 /// Why an id names no job file, and what the caller can do about it.
 ///
-/// Only the FIRST branch is a derivation: a token off the mint shape was never a
-/// clauth job at all. The mint stamp the id carries bounds a job's age and
-/// nothing more — it cannot say which of the other three causes fired, since a
-/// job minted two hours ago may equally have been collected five minutes ago —
-/// so the age branch names the sweep as the likeliest cause and hedges like the
-/// branch below it, rather than asserting a cause and telling the caller to
-/// spend another window on it. Already-collected and dropped-past-the-cap share
-/// one branch because nothing on disk survives either.
+/// Only the FIRST branch is a derivation, and only of the SHAPE: a token that is
+/// not `d-<base36>-<digits>` was never a clauth job at all. Past that gate the
+/// stamp bounds a job's age and nothing more — it cannot say which cause fired,
+/// since a job minted two hours ago may equally have been collected five minutes
+/// ago, and it cannot even say the id was minted, because the base-36 stamp
+/// admits any lowercase word. So both age branches hedge every cause they name
+/// AND carry the never-minted one, rather than asserting a cause and telling the
+/// caller to spend another window on it. Which of the two a caller lands in is
+/// the stamp's accident: already-collected and dropped-past-the-cap share the
+/// fresh branch because nothing on disk survives either, and the sweep leads the
+/// aged one.
 fn unknown_job_reason(job_id: &str, now: u64) -> String {
     let Some(minted_at) = job_id_minted_at(job_id) else {
         return format!(
-            "unknown job_id: {job_id} — clauth never minted it (a real one reads \
-             `d-<epoch_ms>-<counter>`); check the id `delegate` handed back"
+            "unknown job_id: {job_id} — clauth never minted it (a real id reads \
+             `d-<base36-ms>-<counter>`); check the id `delegate` handed back"
         );
     };
     let collected = "already collected by an earlier `monitor` call or delivered by clauth's \
                      auto-delivery hook";
+    // Neither age branch can tell a real id from a token clauth never minted,
+    // so both carry this rather than presupposing a job existed. The stamp is
+    // what splits them and it discriminates nothing: at a 2026 clock `d-day-1`
+    // decodes to 1970 and takes the aged branch while `d-notebook-1` decodes
+    // past today and takes the fresh one, and every pre-M5 all-digit id decodes
+    // far-future into that same fresh branch. Putting it on the aged branch
+    // alone would answer the rarer half.
+    let unminted = "clauth may never have minted it at all (a real id reads \
+                    `d-<base36-ms>-<counter>`)";
     if now.saturating_sub(minted_at) > jobs::DONE_TTL_MS {
         // Collection leads even here. Every collect evicts through
         // `jobs::remove`, while the hour-after-finish sweep runs at startup
         // alone, so on a session that has been up a while the sweep is the
         // rarer of the two rather than the likelier.
         return format!(
-            "unknown job_id: {job_id} — most likely {collected}; minted over an hour ago, so \
-             it may also have been swept an hour after it finished. check this session's \
-             earlier replies before re-running the delegate"
+            "unknown job_id: {job_id} — most likely {collected}; its stamp reads over an hour \
+             old, so it may also have been swept an hour after it finished. {unminted}. check \
+             this session's earlier replies before re-running the delegate"
         );
     }
     format!(
-        "unknown job_id: {job_id} — {collected}, or dropped once the store passed its {} \
-         newest jobs; check this session's earlier replies for the result",
+        "unknown job_id: {job_id} — most likely {collected}, or dropped once the store passed \
+         its {} \
+         newest jobs. {unminted}. check this session's earlier replies for the result",
         jobs::MAX_RETAINED
     )
 }
@@ -2617,17 +2634,20 @@ fn collect_job_ids(v: &serde_json::Value, out: &mut Vec<String>) {
         serde_json::Value::String(s) => match serde_json::from_str::<serde_json::Value>(s) {
             Ok(parsed) => collect_job_ids(&parsed, out),
             // Not JSON: the prose spelling. The fan-out prose has no `job_id`
-            // field at all, so its `d-<ms>-<n>` tokens are the only way those
-            // jobs auto-arrive.
+            // field at all, so its `d-<base36-ms>-<n>` tokens are the only way
+            // those jobs auto-arrive.
             Err(_) => out.extend(scan_job_ids(s)),
         },
         _ => {}
     }
 }
 
-/// Real job ids are `d-<epoch_ms>-<counter>`. Scan a plain string for such
-/// tokens so a prose tool reply still yields every job of a fan-out. The shape
-/// is pinned to digits so an unrelated `d-`-prefixed word never matches.
+/// Real job ids are `d-<base36-ms>-<n>`. Scan a plain string for such tokens so
+/// a prose tool reply still yields every job of a fan-out. The stamp is base-36
+/// rather than digits, so a lowercase `d-`-prefixed word such as `d-day-1` now
+/// matches too; that widening is deliberate — a length floor on the stamp would
+/// break the day the encoding width changes, and the digits-only gate already
+/// matched `d-2024-1`.
 fn scan_job_ids(s: &str) -> Vec<String> {
     s.split(|c: char| !(c.is_ascii_alphanumeric() || c == '-'))
         .filter(|token| token_is_job_id(token))
@@ -2635,13 +2655,17 @@ fn scan_job_ids(s: &str) -> Vec<String> {
         .collect()
 }
 
-/// `d-<digits>-<digits>`, the exact [`jobs::new_job_id`] shape.
+/// `d-<base36>-<digits>`, the exact [`jobs::new_job_id`] shape: a base-36
+/// `[0-9a-z]` stamp then a decimal counter. A legacy all-digit stamp is a valid
+/// base-36 spelling, so pre-shortening ids keep matching.
 fn token_is_job_id(token: &str) -> bool {
     let mut parts = token.split('-');
     matches!(parts.next(), Some("d"))
-        && parts
-            .next()
-            .is_some_and(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
+        && parts.next().is_some_and(|p| {
+            !p.is_empty()
+                && p.bytes()
+                    .all(|b| b.is_ascii_digit() || b.is_ascii_lowercase())
+        })
         && parts
             .next()
             .is_some_and(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))

@@ -5605,3 +5605,46 @@ fn the_blocking_delegate_folds_its_digest_on_the_abandoned_bit() {
         );
     }
 }
+
+/// The warning shrinks to the fact: no `throughput:` prefix, and no `default`
+/// model name when the delegate named none. A named model stays.
+#[test]
+fn throughput_note_drops_the_prefix_and_the_default_placeholder() {
+    let _home = HomeSandbox::new();
+    crate::throughput::record_rate_limit("defaulted", Some("default"), Some(10), 1_000);
+    assert_eq!(
+        throughput_note("defaulted", 1_000),
+        Some("⚠ rate-limited (retry ~10s)".to_string())
+    );
+
+    // An empty or whitespace-only model is the same non-name as `default`, so
+    // neither renders and no double space leaks into the warning.
+    crate::throughput::record_rate_limit("blank", Some(""), Some(10), 1_000);
+    assert_eq!(
+        throughput_note("blank", 1_000),
+        Some("⚠ rate-limited (retry ~10s)".to_string())
+    );
+    crate::throughput::record_rate_limit("spacey", Some("   "), Some(10), 1_000);
+    assert_eq!(
+        throughput_note("spacey", 1_000),
+        Some("⚠ rate-limited (retry ~10s)".to_string())
+    );
+
+    // A whitespace-padded model is still a real name: it renders trimmed,
+    // with no double space.
+    crate::throughput::record_rate_limit("padded", Some("  claude-opus-4  "), Some(10), 1_000);
+    assert_eq!(
+        throughput_note("padded", 1_000),
+        Some("⚠ claude-opus-4 rate-limited (retry ~10s)".to_string())
+    );
+
+    // An old fast sample sets the best; two recent slow ones pull the
+    // recency-weighted pace below half of it, so the row reads degraded.
+    crate::throughput::record_success("named", Some("deepseek-chat"), 100, 1_000, 1_000);
+    crate::throughput::record_success("named", Some("deepseek-chat"), 10, 1_000, 1_000);
+    crate::throughput::record_success("named", Some("deepseek-chat"), 10, 1_000, 1_000);
+    assert_eq!(
+        throughput_note("named", 1_000),
+        Some("⚠ deepseek-chat slow (~25 tok/s)".to_string())
+    );
+}

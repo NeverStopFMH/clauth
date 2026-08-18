@@ -742,38 +742,195 @@ pub(crate) fn switch_prose(p: &Value) -> String {
     }
 }
 
+/// The whole usage clause renders within this many characters. The real
+/// envelope renders 117 and the composite-heavy one 291, while the pre-change
+/// line ran ~700 characters of mostly zeros; 320 sits far above every
+/// envelope this project has observed and cuts only pathological ones.
+const USAGE_BUDGET: usize = 320;
+
 /// The token-usage object of a delegate envelope as one clause. The two fields
-/// clauth's envelope contract documents read as English (`input N tokens`);
-/// anything else claude put there (cache tiers arrive version-dependent) keeps
-/// its field name in backticks so no figure silently vanishes.
+/// clauth's envelope contract documents always render and read as English
+/// (`input N tokens`), or `input unknown tokens` when the wire carries no
+/// number, because a run that produced no output is real signal and the
+/// clause never drops. Every other key renders one clause per surviving
+/// figure, named by its dotted path from the top-level key, recursing into
+/// objects and arrays alike (`output_tokens_details.thinking_tokens`,
+/// `iterations.0.tokens`). The rule is "no FIGURE vanishes": a zero number, a
+/// string that parses as zero, an empty string, a null, a `false` flag, and a
+/// composite whose leaves all carry no figure drop, so no raw JSON reaches the
+/// reply. A string that parses as a number IS the figure, because clauth
+/// fronts third-party proxies that stringify numerics. The dotted path
+/// locates a figure for reading, never for round-tripping: a dotted key and a
+/// nesting render the same (`{"a.b":1}` and `{"a":{"b":1}}`), and an array
+/// index joins the path the same way, so `{"a":[1]}` and `{"a":{"0":1}}`
+/// collide too. Survivor order is claude's wire order, which `serde_json`'s
+/// `preserve_order` feature keeps in the object map. The joined clause is
+/// then cut to `USAGE_BUDGET` characters, ending with `…` only on overflow.
 fn usage_prose(u: &Value) -> String {
     let Some(obj) = u.as_object() else {
         return "unknown".to_string();
     };
-    if obj.is_empty() {
-        return String::new();
-    }
-    obj.iter()
-        .map(|(k, v)| {
-            let val = match v {
-                Value::Number(n) => n.to_string(),
-                Value::Bool(b) => b.to_string(),
-                Value::String(s) => s.clone(),
-                Value::Null => "unknown".to_string(),
-                other => other.to_string(),
-            };
-            let noun = match (k.as_str(), v) {
-                ("input_tokens", Value::Number(_)) => Some("input"),
-                ("output_tokens", Value::Number(_)) => Some("output"),
-                _ => None,
-            };
-            match noun {
-                Some(n) => format!("{n} {val} tokens"),
-                None => format!("`{k}` {val}"),
+    let mut clauses: Vec<String> = Vec::new();
+    for (k, v) in obj {
+        match k.as_str() {
+            // A run that produced no output is a real run: the two documented
+            // fields render even at zero, and say `unknown` rather than drop
+            // when the wire carries no number at all.
+            "input_tokens" | "output_tokens" => {
+                let noun = if k == "input_tokens" {
+                    "input"
+                } else {
+                    "output"
+                };
+                let figure = match v {
+                    Value::Number(n) => Some(n.to_string()),
+                    Value::String(s) => string_figure(s).map(|(num, _)| num),
+                    _ => None,
+                };
+                match figure {
+                    Some(n) => clauses.push(format!("{noun} {n} tokens")),
+                    None => clauses.push(format!("{noun} unknown tokens")),
+                }
             }
-        })
-        .collect::<Vec<_>>()
-        .join(", ")
+            _ => leaf_clauses(k, v, &mut clauses),
+        }
+    }
+    truncate_clause(clauses.join(", "))
+}
+
+/// A string that spells a finite number, or `None`. `"83930"`, `" 83930 "`
+/// and `"0"` all parse; the returned string is the trimmed spelling, so a
+/// stringified figure reads exactly as its numeric twin would. `"NaN"` and
+/// `"inf"` parse as numbers Rust can hold but not show, so both are `None`.
+fn string_figure(s: &str) -> Option<(String, f64)> {
+    let t = s.trim();
+    if t.is_empty() {
+        return None;
+    }
+    let n = t.parse::<f64>().ok()?;
+    if !n.is_finite() {
+        return None;
+    }
+    Some((t.to_string(), n))
+}
+
+/// Walk one usage value to its surviving figures, pushing one clause each. An
+/// object key or array index joins the path with a dot; arrays recurse, so a
+/// figure inside an array keeps its own path. A composite with no surviving
+/// figure pushes nothing, and its top-level key drops.
+fn leaf_clauses(path: &str, v: &Value, out: &mut Vec<String>) {
+    match v {
+        Value::Array(a) => {
+            for (i, child) in a.iter().enumerate() {
+                leaf_clauses(&format!("{path}.{i}"), child, out);
+            }
+        }
+        Value::Object(o) => {
+            for (k, child) in o {
+                leaf_clauses(&format!("{path}.{k}"), child, out);
+            }
+        }
+        Value::Number(n) => {
+            if n.as_f64() != Some(0.0) {
+                out.push(format!("`{path}` {n}"));
+            }
+        }
+        Value::String(s) => {
+            if let Some((num, val)) = string_figure(s) {
+                if val != 0.0 {
+                    out.push(format!("`{path}` {num}"));
+                }
+            } else if !s.is_empty() {
+                out.push(format!("`{path}` {s}"));
+            }
+        }
+        // A set flag is signal; an unset one is the boolean twin of the zero
+        // this function drops, so `false` drops and only `true` reads `set`.
+        Value::Bool(true) => out.push(format!("`{path}` set")),
+        Value::Bool(false) | Value::Null => {}
+    }
+}
+
+/// Cut the clause to `USAGE_BUDGET` characters, ending a cut clause with a
+/// single `…`. No marker and no count: this is a one-line summary, so a
+/// pathological usage object is cut rather than allowed to dominate the
+/// reply. The JSON spelling is internal-only, so a cut figure is not
+/// recoverable by the caller. Characters are walked, so the cut never lands
+/// mid-UTF-8.
+fn truncate_clause(clause: String) -> String {
+    if clause.chars().count() <= USAGE_BUDGET {
+        clause
+    } else {
+        let mut cut: String = clause.chars().take(USAGE_BUDGET - 1).collect();
+        cut.push('…');
+        cut
+    }
+}
+
+/// A cost in dollars with the raw f64 tail trimmed: four decimals, trailing
+/// zeros dropped. A value that rounds to `0` reads `0`, except a positive one,
+/// which reads `<0.0001` because a cheap run is not a free one.
+fn fmt_cost(cost: f64) -> String {
+    let rounded = (cost * 10_000.0).round() / 10_000.0;
+    if rounded == 0.0 {
+        return if cost > 0.0 {
+            "<0.0001".to_string()
+        } else {
+            "0".to_string()
+        };
+    }
+    format!("{rounded:.4}")
+        .trim_end_matches('0')
+        .trim_end_matches('.')
+        .to_string()
+}
+
+/// The `permission_denials` field as a clause body, or `None` when the clause
+/// drops (absent, null, an empty list, or an empty string). A string renders
+/// as its own text. A list renders named tools once in first-seen order with
+/// a `N times` count when repeated, then any nameless entries as `N unnamed`
+/// after the named ones — `unnamed` is a spellable tool name, so the count
+/// keeps the synthetic group out of that namespace. A present value of any
+/// other shape reads `(unreadable)`, so a denial the envelope carried is
+/// never invisible.
+fn denial_names(denials: Option<&Value>) -> Option<String> {
+    let value = denials?;
+    if value.is_null() {
+        return None;
+    }
+    if let Value::String(s) = value {
+        return (!s.is_empty()).then(|| s.clone());
+    }
+    let Some(arr) = value.as_array() else {
+        return Some("(unreadable)".to_string());
+    };
+    if arr.is_empty() {
+        return None;
+    }
+    let mut named: Vec<(String, usize)> = Vec::new();
+    let mut unnamed = 0usize;
+    for entry in arr {
+        let name = entry
+            .get("tool_name")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        match name {
+            Some(n) => match named.iter_mut().find(|(x, _)| x == n) {
+                Some((_, count)) => *count += 1,
+                None => named.push((n.to_string(), 1)),
+            },
+            None => unnamed += 1,
+        }
+    }
+    let mut parts: Vec<String> = named
+        .into_iter()
+        .map(|(n, c)| if c > 1 { format!("{n} {c} times") } else { n })
+        .collect();
+    if unnamed > 0 {
+        parts.push(format!("{unnamed} unnamed"));
+    }
+    Some(parts.join(", "))
 }
 
 /// Prose for a delegate envelope: the verdict (`finished` / `failed` / `timed
@@ -814,6 +971,7 @@ fn envelope_prose(e: &Value) -> String {
     });
 
     if let Some(cost) = e.get("total_cost_usd").and_then(Value::as_f64) {
+        let cost_s = fmt_cost(cost);
         // `total_cost_usd` is the CHILD CLI's own figure, priced against
         // Anthropic's card whatever endpoint served the call, so a DeepSeek or
         // z.ai target's number is a wrong-basis figure a caller reads as the
@@ -831,12 +989,12 @@ fn envelope_prose(e: &Value) -> String {
             .and_then(|lu| lu.get("endpoint"))
             .and_then(Value::as_str)
         {
-            Some("anthropic") => out.push_str(&format!(" (cost ${cost})")),
+            Some("anthropic") => out.push_str(&format!(" (cost ${cost_s})")),
             Some(_) => out.push_str(&format!(
-                " (cost ${cost} at Anthropic rates, not this endpoint's)"
+                " (cost ${cost_s} at Anthropic rates, not this endpoint's)"
             )),
             None => out.push_str(&format!(
-                " (cost ${cost} at Anthropic rates, endpoint unknown)"
+                " (cost ${cost_s} at Anthropic rates, endpoint unknown)"
             )),
         }
     }
@@ -852,10 +1010,8 @@ fn envelope_prose(e: &Value) -> String {
     if let Some(sid) = e.get("session_id").and_then(Value::as_str) {
         out.push_str(&format!("; resume with session id `{sid}`"));
     }
-    if let Some(denials) = e.get("permission_denials")
-        && !denials.is_null()
-    {
-        out.push_str(&format!("; permission denials: {denials}"));
+    if let Some(names) = denial_names(e.get("permission_denials")) {
+        out.push_str(&format!("; permission denials: {names}"));
     }
     out
 }

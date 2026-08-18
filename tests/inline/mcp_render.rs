@@ -393,13 +393,13 @@ fn live_usage_prose_names_every_window_and_warns() {
             "profile": "work",
             "5h_used_pct": 12.0,
             "7d_used_pct": 45.6,
-            "throughput_warning": "⚠ throughput: deepseek-chat degraded"
+            "throughput_warning": "⚠ deepseek-chat slow (~40 tok/s)"
         }),
         "target",
     );
     assert_eq!(
         warned,
-        "target `work`: 5h 12% used, 7d 45.6% used; ⚠ throughput: deepseek-chat degraded"
+        "target `work`: 5h 12% used, 7d 45.6% used; ⚠ deepseek-chat slow (~40 tok/s)"
     );
 }
 
@@ -818,6 +818,166 @@ fn usage_prose_documented_fields_read_english_and_unknown_keys_survive() {
         usage_prose(&u),
         "input 100 tokens, output 50 tokens, `cache_read_input_tokens` 30"
     );
+}
+
+/// The usage object a real delegate produced on 2026-08-17, kept as the
+/// captured bytes. A zero, an empty string, an empty array, and an all-zero
+/// nested object carry no figure and drop. `input_tokens` and `output_tokens`
+/// stay even at zero. Survivors keep claude's wire order.
+const CAPTURED_USAGE: &str = r#"{"input_tokens":83930,"cache_creation_input_tokens":0,"cache_read_input_tokens":3948672,"output_tokens":40681,"output_tokens_details":{"thinking_tokens":0},"server_tool_use":{"web_search_requests":0,"web_fetch_requests":0},"service_tier":"standard","cache_creation":{"ephemeral_1h_input_tokens":0,"ephemeral_5m_input_tokens":0},"inference_geo":"","iterations":[],"speed":"standard"}"#;
+
+#[test]
+fn usage_prose_drops_fields_without_a_figure_and_keeps_wire_order() {
+    let u: Value = serde_json::from_str(CAPTURED_USAGE).unwrap();
+    assert_eq!(
+        usage_prose(&u),
+        "input 83930 tokens, `cache_read_input_tokens` 3948672, output 40681 tokens, \
+         `service_tier` standard, `speed` standard"
+    );
+}
+
+/// The same delegate's usage with each composite holding one non-zero leaf
+/// beside zero siblings. The lucky fixture above hid that composites dumped
+/// raw JSON; this one reds on the dotted-path rewrite.
+const NONLUCKY_USAGE: &str = r#"{"input_tokens":83930,"cache_creation_input_tokens":26800,"cache_read_input_tokens":3948672,"output_tokens":40681,"output_tokens_details":{"thinking_tokens":5000},"server_tool_use":{"web_search_requests":2,"web_fetch_requests":0},"service_tier":"standard","cache_creation":{"ephemeral_1h_input_tokens":0,"ephemeral_5m_input_tokens":26800},"inference_geo":"","iterations":[],"speed":"standard"}"#;
+
+#[test]
+fn usage_prose_renders_surviving_leaves_by_dotted_path() {
+    let u: Value = serde_json::from_str(NONLUCKY_USAGE).unwrap();
+    assert_eq!(
+        usage_prose(&u),
+        "input 83930 tokens, `cache_creation_input_tokens` 26800, \
+         `cache_read_input_tokens` 3948672, output 40681 tokens, \
+         `output_tokens_details.thinking_tokens` 5000, \
+         `server_tool_use.web_search_requests` 2, `service_tier` standard, \
+         `cache_creation.ephemeral_5m_input_tokens` 26800, `speed` standard"
+    );
+}
+
+/// A run that produced no output is a real run. The two documented fields
+/// render even at zero while a zero elsewhere drops.
+#[test]
+fn usage_prose_keeps_input_and_output_tokens_even_at_zero() {
+    let u: Value = serde_json::from_str(
+        r#"{"input_tokens":0,"output_tokens":0,"cache_creation_input_tokens":0,"service_tier":"standard"}"#,
+    )
+    .unwrap();
+    assert_eq!(
+        usage_prose(&u),
+        "input 0 tokens, output 0 tokens, `service_tier` standard"
+    );
+}
+
+/// A set flag reads `set`; an unset flag is the boolean twin of the zero this
+/// function drops, and a null is claude's own noise. Both bool arms and the
+/// null arm are reached here.
+#[test]
+fn usage_prose_renders_a_set_flag_and_drops_unset_and_null() {
+    let u = serde_json::json!({"input_tokens":1,"flag":true,"off":false,"gone":null});
+    assert_eq!(usage_prose(&u), "input 1 tokens, `flag` set");
+}
+
+/// An empty object and an object whose every field filters out both read as
+/// nothing, so the caller's `!tokens.is_empty()` guard drops the clause.
+#[test]
+fn usage_prose_empty_and_all_filtered_are_empty() {
+    assert_eq!(usage_prose(&serde_json::json!({})), "");
+    assert_eq!(usage_prose(&serde_json::json!({"z": 0, "n": {"x": 0}})), "");
+}
+
+/// The two documented fields always produce a clause: a run that produced no
+/// output is real signal, and a non-number still reads English and says
+/// clauth has no figure rather than dropping the clause.
+#[test]
+fn usage_prose_renders_the_documented_fields_even_without_a_number() {
+    let u = serde_json::json!({"input_tokens": null, "output_tokens": ""});
+    assert_eq!(
+        usage_prose(&u),
+        "input unknown tokens, output unknown tokens"
+    );
+}
+
+/// Arrays recurse like objects, an index joining the path with a dot. A zero
+/// scalar still drops; the surviving leaves keep their full paths.
+#[test]
+fn usage_prose_recurses_into_arrays_and_scalars() {
+    let u = serde_json::json!({"samples": [5, 0, 7]});
+    assert_eq!(usage_prose(&u), "`samples.0` 5, `samples.2` 7");
+}
+
+/// A stringified number is a figure: clauth fronts third-party proxies that
+/// stringify numerics, so `"83930"` reads as the number, and a stringified
+/// zero is still the always-render zero on a documented key.
+#[test]
+fn usage_prose_reads_a_stringified_number_as_the_figure() {
+    let u = serde_json::json!({"input_tokens": "83930", "output_tokens": "0"});
+    assert_eq!(usage_prose(&u), "input 83930 tokens, output 0 tokens");
+}
+
+/// A stringified zero drops like any zero; a stringified non-zero survives as
+/// the number.
+#[test]
+fn usage_prose_drops_a_stringified_zero_and_keeps_a_stringified_figure() {
+    let u = serde_json::json!({"a": "0", "b": "26800"});
+    assert_eq!(usage_prose(&u), "`b` 26800");
+}
+
+/// A pathological usage object is cut to the budget and ends with a single
+/// `…`, so it cannot dominate the reply. The cut walks characters, so it
+/// never lands mid-UTF-8.
+#[test]
+fn usage_prose_cuts_a_long_clause_and_ends_with_an_ellipsis() {
+    let u = serde_json::json!({"s": "x".repeat(2000)});
+    let prose = usage_prose(&u);
+    assert!(prose.ends_with('…'), "{prose}");
+    assert_eq!(prose.chars().count(), USAGE_BUDGET, "{prose}");
+    assert_eq!(prose, format!("`s` {}…", "x".repeat(USAGE_BUDGET - 5)));
+}
+
+/// Pins the budget from ABOVE, which its sibling cut test cannot: that one
+/// derives its expected length from `USAGE_BUDGET` itself, so raising the
+/// constant moves both sides together and the assertion follows it anywhere.
+/// This fixture is a fixed 330 characters, so a budget raised past it stops
+/// cutting and reds here. With the no-cut guard below pinning from underneath,
+/// the constant is bounded to (291, 330) rather than merely "some number".
+#[test]
+fn usage_prose_cuts_a_clause_only_a_little_over_the_budget() {
+    let u = serde_json::json!({"s": "x".repeat(326)});
+    let prose = usage_prose(&u);
+    assert!(prose.ends_with('…'), "a 330-char clause is cut: {prose}");
+    assert!(
+        prose.chars().count() < 330,
+        "the cut is a real cut, not a copy: {prose}",
+    );
+}
+
+/// The composite-heavy envelope renders at 291 of the 320 budget and must not
+/// be cut. This is the regression guard on the budget: the day the constant
+/// drops below the observed envelope, or the wire grows a field, this exact
+/// string reds rather than silently gaining a trailing `…`.
+#[test]
+fn usage_prose_does_not_cut_the_composite_heavy_envelope() {
+    let u: Value = serde_json::from_str(NONLUCKY_USAGE).unwrap();
+    let prose = usage_prose(&u);
+    assert_eq!(
+        prose,
+        "input 83930 tokens, `cache_creation_input_tokens` 26800, \
+         `cache_read_input_tokens` 3948672, output 40681 tokens, \
+         `output_tokens_details.thinking_tokens` 5000, \
+         `server_tool_use.web_search_requests` 2, `service_tier` standard, \
+         `cache_creation.ephemeral_5m_input_tokens` 26800, `speed` standard"
+    );
+    assert_eq!(prose.chars().count(), 291, "{prose}");
+    assert!(!prose.ends_with('…'), "{prose}");
+}
+
+/// `f64::from_str` accepts `"NaN"` and `"inf"`, but neither is a number
+/// clauth can show, so a non-finite string is not a figure: on a documented
+/// key it reads `unknown`, elsewhere it takes the string-leaf path.
+#[test]
+fn usage_prose_treats_a_non_finite_string_as_not_a_figure() {
+    let u = serde_json::json!({"input_tokens": "NaN", "speed": "inf"});
+    assert_eq!(usage_prose(&u), "input unknown tokens, `speed` inf");
 }
 
 #[test]
@@ -1248,4 +1408,117 @@ fn envelope_prose_gives_a_cancelled_run_its_own_verdict_word() {
         prose.contains("; resume with session id `s9`"),
         "and so does the handle: {prose}"
     );
+}
+
+/// The raw f64 tail of a cost reads as noise. Four decimals with trailing
+/// zeros trimmed is the figure a reader sees. A non-zero cost that rounds to
+/// zero prints `<0.0001` so a cheap run never reads as free.
+#[test]
+fn fmt_cost_renders_four_decimals_trimmed_and_never_reads_free() {
+    assert_eq!(fmt_cost(3.4110109999999993), "3.411");
+    assert_eq!(fmt_cost(2.06), "2.06");
+    assert_eq!(fmt_cost(0.0), "0");
+    assert_eq!(fmt_cost(0.00004), "<0.0001");
+    assert_eq!(fmt_cost(-0.00004), "0");
+}
+
+/// The finished envelope a real delegate produced on 2026-08-17, rendered by
+/// the same path the tool uses. The shrink is the point: the usage clause
+/// keeps only figures, the cost keeps its settled wording, and a permission
+/// denial names the tool that was blocked instead of dumping the array.
+#[test]
+fn delegate_prose_shrinks_the_finished_envelope() {
+    let envelope = serde_json::json!({
+        "result": "<the delegate's answer>",
+        "is_error": false,
+        "total_cost_usd": 3.4110109999999993,
+        "live_usage": {
+            "profile": "DS8",
+            "kind": "third_party",
+            "endpoint": "api.deepseek.com",
+            "provider_windows": false,
+            "balance": "api balance: 1044.41 CNY",
+            "fetched_secs_ago": 35
+        },
+        "usage": serde_json::from_str::<Value>(CAPTURED_USAGE).unwrap(),
+        "session_id": "d44b2c9c-...",
+        "permission_denials": [
+            {
+                "tool_name": "Bash",
+                "tool_use_id": "call_00_001bgZEkvreKaAsIiZ9R2184",
+                "tool_input": {
+                    "command": "rtk read /tmp/m5_gate.log",
+                    "description": "Read the gate log"
+                }
+            }
+        ]
+    });
+    assert_eq!(
+        delegate_prose(&envelope),
+        "delegate to `DS8` finished: <the delegate's answer> (cost $3.411 at Anthropic rates, \
+         not this endpoint's), usage: input 83930 tokens, `cache_read_input_tokens` 3948672, \
+         output 40681 tokens, `service_tier` standard, `speed` standard; resume with session id \
+         `d44b2c9c-...`; permission denials: Bash; target `DS8`: no 5h/7d limits; \
+         api balance: 1044.41 CNY (cached 35s ago)"
+    );
+}
+
+/// Repeated names count as `N times`, nameless entries read `N unnamed` after
+/// the named ones, and first-seen order holds.
+#[test]
+fn denial_names_counts_repeats_and_unnamed_entries() {
+    let denials = serde_json::json!([
+        {"tool_name": "Bash"},
+        {"tool_name": "Bash"},
+        {"tool_name": "Bash"},
+        {"tool_use_id": "x"},
+        {"tool_use_id": "y"},
+        {"tool_name": "Read"}
+    ]);
+    assert_eq!(
+        denial_names(Some(&denials)),
+        Some("Bash 3 times, Read, 2 unnamed".to_string())
+    );
+}
+
+/// Null, an empty list, and an empty string drop the clause; a string denial
+/// renders its own text; a present value of any other shape reads
+/// `(unreadable)` so a denial the envelope carried is never invisible.
+#[test]
+fn denial_names_drops_empty_and_names_the_unparseable() {
+    let null = serde_json::Value::Null;
+    let empty = serde_json::json!([]);
+    let empty_str = serde_json::json!("");
+    let unparseable = serde_json::json!({"not": "an array"});
+    assert_eq!(denial_names(None), None);
+    assert_eq!(denial_names(Some(&null)), None);
+    assert_eq!(denial_names(Some(&empty)), None);
+    assert_eq!(denial_names(Some(&empty_str)), None);
+    assert_eq!(
+        denial_names(Some(&serde_json::json!("Bash denied"))),
+        Some("Bash denied".to_string())
+    );
+    assert_eq!(
+        denial_names(Some(&unparseable)),
+        Some("(unreadable)".to_string())
+    );
+}
+
+/// The clause itself, not just the helper: a real list names its tools, an
+/// unreadable one reads `(unreadable)`, an empty one drops.
+#[test]
+fn envelope_prose_names_denials_and_marks_the_unreadable() {
+    let listed = serde_json::json!({"result": "ok", "permission_denials": [{"tool_name": "Bash"}]});
+    assert_eq!(
+        envelope_prose(&listed),
+        "finished: ok; permission denials: Bash"
+    );
+    let unreadable = serde_json::json!({"result": "ok", "permission_denials": {"not": "an array"}});
+    assert!(
+        envelope_prose(&unreadable).contains("; permission denials: (unreadable)"),
+        "{}",
+        envelope_prose(&unreadable)
+    );
+    let empty = serde_json::json!({"result": "ok", "permission_denials": []});
+    assert!(!envelope_prose(&empty).contains("permission denials"));
 }

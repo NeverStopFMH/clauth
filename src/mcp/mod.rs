@@ -4418,17 +4418,26 @@ fn throughput_note(profile: &str, now: i64) -> Option<String> {
         .into_iter()
         .filter(|m| m.degraded || m.rate_limited_recent)
         .map(|m| {
+            // `default` is not a model, it is what `src/throughput.rs` writes
+            // when the delegate named none. An empty or whitespace-only model
+            // is the same non-name, so both drop from the warning.
+            let name = m.model.trim();
+            let name = if name.is_empty() || name == "default" {
+                String::new()
+            } else {
+                format!("{name} ")
+            };
             if m.rate_limited_recent {
                 match m.retry_after_s {
-                    Some(s) => format!("{} rate-limited (retry ~{s}s)", m.model),
-                    None => format!("{} rate-limited", m.model),
+                    Some(s) => format!("{name}rate-limited (retry ~{s}s)"),
+                    None => format!("{name}rate-limited"),
                 }
             } else {
-                format!("{} slow (~{:.0} tok/s)", m.model, m.tok_s)
+                format!("{name}slow (~{:.0} tok/s)", m.tok_s)
             }
         })
         .collect();
-    (!flagged.is_empty()).then(|| format!("⚠ throughput: {}", flagged.join(", ")))
+    (!flagged.is_empty()).then(|| format!("⚠ {}", flagged.join(", ")))
 }
 
 /// Read a child pipe to EOF into a buffer, swallowing read errors (a partial

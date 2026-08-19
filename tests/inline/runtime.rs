@@ -3261,6 +3261,60 @@ fn build_runtime_dir_prunes_dangling_symlink() {
     });
 }
 
+/// The DIRECTORY-link half of the prune, which the file-symlink case above
+/// cannot reach. On Windows `remove_file` clears a dangling file symlink but
+/// answers os error 5 on a dangling junction or directory symlink and leaves it
+/// standing (measured on Windows 11, elevated and with the symlink privilege
+/// stripped alike); a survivor is permanent, because `build_runtime_dir`'s
+/// re-walk skips any entry whose `symlink_metadata` succeeds.
+///
+/// Calls `prune_dangling_links` directly rather than through `build_runtime_dir`
+/// so the fixture needs no `LinkMode::Real`, which a Windows box outside
+/// Developer Mode cannot pose. On unix `remove_file` unlinks any symlink, so
+/// this leg can only ever red on Windows — which is the whole reason it must not
+/// be a unix-only pin.
+#[test]
+fn prune_removes_a_dangling_directory_link() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let runtime = tmp.path().join("runtime");
+    fs::create_dir_all(&runtime).expect("mkdir runtime");
+    let target = tmp.path().join("skills-target");
+    fs::create_dir_all(&target).expect("mkdir target");
+
+    let dangling = runtime.join("skills");
+    pose_dir_link(&dangling, &target);
+    fs::remove_dir(&target).expect("drop the target");
+    assert!(
+        dangling.symlink_metadata().is_ok(),
+        "the link itself is still there"
+    );
+    assert!(!dangling.exists(), "its target is gone");
+
+    // Positive controls on the dimension the guard reads. The EMPTY one is the
+    // load-bearing half: a non-empty directory survives `remove_dir` on its own
+    // merits, so only an empty one can tell the guard from the call's own
+    // refusal, and it is the single entry an unguarded `remove_dir` would take.
+    let keep_full = runtime.join("projects");
+    fs::create_dir_all(keep_full.join("nested")).expect("mkdir full keeper");
+    let keep_empty = runtime.join("paste-cache");
+    fs::create_dir_all(&keep_empty).expect("mkdir empty keeper");
+
+    prune_dangling_links(&runtime).expect("prune");
+
+    assert!(
+        dangling.symlink_metadata().is_err(),
+        "a dangling directory link must be pruned, not left for the re-walk to skip forever"
+    );
+    assert!(
+        keep_full.join("nested").is_dir(),
+        "a real directory is never touched"
+    );
+    assert!(
+        keep_empty.is_dir(),
+        "an EMPTY real directory is never touched either — the guard decides that, not remove_dir"
+    );
+}
+
 // ── isolation liveness + GC ──────────────────────────────────────────────────
 
 /// THE LIVENESS GATE behind delete and disable. Every session now keys its

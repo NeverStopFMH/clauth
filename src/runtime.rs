@@ -2463,8 +2463,9 @@ fn build_runtime_dir(
 /// Remove top-level symlinks in the runtime whose target no longer resolves
 /// (the `~/.claude/` source was moved or deleted). Self-heals the dangling-link
 /// artifact a prior build can leave; only symlinks are touched — regular files
-/// and directories are never removed. `.credentials.json` is reconciled
-/// separately afterwards, so pruning a stale one here is safe.
+/// and directories are never removed, and a link is removed only once its
+/// target is already gone. `.credentials.json` is reconciled separately
+/// afterwards, so pruning a stale one here is safe.
 fn prune_dangling_links(runtime: &Path) -> Result<()> {
     let entries = match std::fs::read_dir(runtime) {
         Ok(e) => e,
@@ -2476,7 +2477,26 @@ fn prune_dangling_links(runtime: &Path) -> Result<()> {
             && meta.file_type().is_symlink()
             && !path.exists()
         {
-            let _ = std::fs::remove_file(&path);
+            // Windows splits link removal by what the link POINTS AT, not by
+            // what the link is: `remove_file` clears a dangling FILE symlink but
+            // answers os error 5 on a dangling junction or directory symlink and
+            // leaves it standing (measured on Windows 11, elevated and with
+            // `SeCreateSymbolicLinkPrivilege` stripped alike). A survivor is
+            // permanent, not cosmetic — the re-walk below skips any entry whose
+            // `symlink_metadata` succeeds, so that name never re-materializes.
+            //
+            // `remove_dir`, never `remove_dir_all`: it unlinks the link itself
+            // and refuses a non-empty directory, and the guard above already
+            // proved the target is gone, so there is nothing behind this link
+            // for either call to reach.
+            if let Err(file_err) = std::fs::remove_file(&path)
+                && let Err(dir_err) = std::fs::remove_dir(&path)
+            {
+                logline!(
+                    "clauth: stale link {} could not be removed ({file_err}; as a dir: {dir_err})",
+                    path.display()
+                );
+            }
         }
     }
     Ok(())

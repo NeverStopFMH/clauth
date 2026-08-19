@@ -50,9 +50,6 @@ use crate::profile::{atomic_write_600, clauth_dir};
 use crate::tokens::{ModelTokens, today_date};
 use crate::usage::now_ms;
 
-#[cfg(test)]
-use std::collections::HashMap;
-
 /// Live price feed (genai-prices v2 generated data, fetched from GitHub `main`).
 const FEED_URL: &str =
     "https://raw.githubusercontent.com/pydantic/genai-prices/main/prices/new_data/v2/data.json";
@@ -222,31 +219,6 @@ pub(crate) struct PriceTable {
     pub(crate) fetched_at_ms: u64,
 }
 
-#[cfg(test)]
-impl PriceTable {
-    /// Literal table for tests outside this module — keeps the internals
-    /// private (lookups stay funneled through `rate`/`cost`/`total_cost`).
-    /// Each flat rate becomes one unconstrained price entry behind an exact
-    /// match, so every date and hour resolves to it.
-    pub(crate) fn from_rates(rates: HashMap<String, ModelRate>) -> Self {
-        let models = rates
-            .into_iter()
-            .map(|(id, r)| PricedModel {
-                id: id.clone(),
-                match_: MatchClause::Equals(id.to_lowercase()),
-                prices: vec![PriceEntry {
-                    input: r.input,
-                    output: r.output,
-                    cache_read: r.cache_read,
-                    cache_write: r.cache_write,
-                    constraint: None,
-                }],
-            })
-            .collect();
-        Self::capture(models, today_date(), 0, Vec::new())
-    }
-}
-
 impl PriceTable {
     /// Fold a successful fetch into a table: stamp `fetched_at_ms`, append a
     /// snapshot dated `captured` ONLY when the distilled models differ from the
@@ -354,7 +326,6 @@ impl PriceTable {
     /// each hour at its own `(date, hour)` rate (peak/off-peak). `None` when
     /// the model has no matching rate — a model's match clause is
     /// time-independent, so a match at hour 0 guarantees one at every hour.
-    #[allow(dead_code)] // slice B contract: the hourly axis calls this next
     pub(crate) fn cost_day(
         &self,
         model: &str,
@@ -370,36 +341,6 @@ impl PriceTable {
                 + h.cache_create as f64 * r.cache_write;
         }
         Some(total)
-    }
-
-    // ── Migration adapters (removed in slice C) ─────────────────────────────
-    // Flat "today" lookups: the Tokens tab and sessions surface still call
-    // these; slice C wires their callers to the dated API directly.
-
-    /// Today's rate at hour 0. See [`PriceTable::rate_at`].
-    pub(crate) fn rate(&self, model: &str) -> Option<ModelRate> {
-        self.rate_at(model, &today_date(), 0)
-    }
-
-    /// Today's cost at hour 0. See [`PriceTable::cost_at`].
-    pub(crate) fn cost(&self, m: &ModelTokens) -> Option<f64> {
-        self.cost_at(m, &today_date(), 0)
-    }
-
-    /// Summed cost over a slice of models. Returns `(priced_total_usd,
-    /// unpriced_count)` — `unpriced_count` is how many had nonzero tokens but no
-    /// matching rate, so the UI can flag that the figure is a floor.
-    pub(crate) fn total_cost(&self, models: &[ModelTokens]) -> (f64, usize) {
-        let mut total = 0.0;
-        let mut unpriced = 0usize;
-        for m in models {
-            match self.cost(m) {
-                Some(c) => total += c,
-                None if m.total() > 0 => unpriced += 1,
-                None => {}
-            }
-        }
-        (total, unpriced)
     }
 }
 

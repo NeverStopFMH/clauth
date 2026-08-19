@@ -728,82 +728,45 @@ fn fixture_distills_resolvers_and_excludes_resellers() {
     );
 }
 
-// ── from_rates + cost ────────────────────────────────────────────────────────
-
-#[test]
-fn from_rates_wraps_each_rate_as_unconstrained() {
-    let mut rates = HashMap::new();
-    rates.insert(
-        "m".to_owned(),
-        ModelRate {
-            input: 1e-6,
-            output: 2e-6,
-            cache_read: 1e-7,
-            cache_write: 1.25e-6,
-        },
-    );
-    let t = PriceTable::from_rates(rates);
-    // Any date/hour resolves (single snapshot + unconstrained entry).
-    assert_eq!(t.rate_at("m", "2026-08-19", 0).map(|r| r.input), Some(1e-6));
-    assert_eq!(
-        t.rate_at("m", "2020-01-01", 23).map(|r| r.output),
-        Some(2e-6)
-    );
-    // Case-insensitive exact match.
-    assert_eq!(t.rate_at("M", "2026-08-19", 0).map(|r| r.input), Some(1e-6));
-}
+// ── cost ─────────────────────────────────────────────────────────────────────
 
 #[test]
 fn cost_sums_all_four_buckets() {
     // Clean rates: $1/$2/$0.10/$1.25 per million.
-    let t = PriceTable::from_rates(HashMap::from([(
-        "m".to_owned(),
-        ModelRate {
+    let t = table(vec![PricedModel {
+        id: "m".to_owned(),
+        match_: MatchClause::Equals("m".to_owned()),
+        prices: vec![PriceEntry {
             input: 1e-6,
             output: 2e-6,
             cache_read: 1e-7,
             cache_write: 1.25e-6,
-        },
-    )]));
+            constraint: None,
+        }],
+    }]);
     let m = model("m", 1_000_000, 1_000_000, 1_000_000, 1_000_000);
     // 1.0 + 2.0 + 0.10 + 1.25 = 4.35
-    let c = t.cost(&m).expect("priced");
+    let c = t.cost_at(&m, "2026-08-19", 0).expect("priced");
     assert!((c - 4.35).abs() < 1e-9, "got {c}");
 }
 
 #[test]
 fn cost_none_for_unpriced_model() {
-    let t = PriceTable::from_rates(HashMap::from([(
-        "m".to_owned(),
-        ModelRate {
+    let t = table(vec![PricedModel {
+        id: "m".to_owned(),
+        match_: MatchClause::Equals("m".to_owned()),
+        prices: vec![PriceEntry {
             input: 1e-6,
             output: 2e-6,
             cache_read: 1e-7,
             cache_write: 1.25e-6,
-        },
-    )]));
-    assert!(t.cost(&model("unknown", 1000, 0, 0, 0)).is_none());
-}
-
-#[test]
-fn total_cost_counts_unpriced_with_tokens() {
-    let t = PriceTable::from_rates(HashMap::from([(
-        "m".to_owned(),
-        ModelRate {
-            input: 1e-6,
-            output: 2e-6,
-            cache_read: 0.0,
-            cache_write: 0.0,
-        },
-    )]));
-    let models = vec![
-        model("m", 1_000_000, 0, 0, 0),     // $1.00, priced
-        model("unknown", 500_000, 0, 0, 0), // unpriced, has tokens → counted
-        model("empty-unknown", 0, 0, 0, 0), // unpriced, no tokens → ignored
-    ];
-    let (total, unpriced) = t.total_cost(&models);
-    assert!((total - 1.0).abs() < 1e-9, "got {total}");
-    assert_eq!(unpriced, 1);
+            constraint: None,
+        }],
+    }]);
+    assert!(
+        t.cost_at(&model("unknown", 1000, 0, 0, 0), "2026-08-19", 0)
+            .is_none()
+    );
 }
 
 #[test]

@@ -7,7 +7,6 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use super::*;
-use std::collections::HashMap;
 use std::collections::HashSet;
 use std::fs;
 use std::time::{Duration, SystemTime};
@@ -52,8 +51,30 @@ fn tool_result_line(sid: &str) -> String {
 /// model, and input/output token counts. `parse_file` requires a timestamp, so
 /// one is always stamped.
 fn usage_line(sid: &str, cwd: &str, msg_id: &str, model: &str, input: u64, output: u64) -> String {
+    usage_line_at(
+        sid,
+        cwd,
+        msg_id,
+        model,
+        input,
+        output,
+        "2026-06-11T10:30:00+00:00",
+    )
+}
+
+/// `usage_line` at an explicit UTC timestamp — the hour byte (offset 11) drives
+/// the peak/off-peak tier.
+fn usage_line_at(
+    sid: &str,
+    cwd: &str,
+    msg_id: &str,
+    model: &str,
+    input: u64,
+    output: u64,
+    timestamp: &str,
+) -> String {
     json!({
-        "sessionId": sid, "cwd": cwd, "timestamp": "2026-06-11T10:30:00+00:00",
+        "sessionId": sid, "cwd": cwd, "timestamp": timestamp,
         "message": {
             "id": msg_id, "role": "assistant", "model": model,
             "usage": {
@@ -65,21 +86,73 @@ fn usage_line(sid: &str, cwd: &str, msg_id: &str, model: &str, input: u64, outpu
     .to_string()
 }
 
+// ── price-table builders ─────────────────────────────────────────────────────
+
+/// One unconstrained price entry at the given input/output rates (cache 0).
+fn flat_entry(input: f64, output: f64) -> crate::pricing::PriceEntry {
+    crate::pricing::PriceEntry {
+        input,
+        output,
+        cache_read: 0.0,
+        cache_write: 0.0,
+        constraint: None,
+    }
+}
+
+/// An exact-match model from its price entries.
+fn priced_model(id: &str, entries: Vec<crate::pricing::PriceEntry>) -> crate::pricing::PricedModel {
+    crate::pricing::PricedModel {
+        id: id.to_owned(),
+        match_: crate::pricing::MatchClause::Equals(id.to_lowercase()),
+        prices: entries,
+    }
+}
+
 /// A `PriceTable` from `(model_id, input_rate, output_rate)` rows; cache rates 0.
 fn price_table(rows: &[(&str, f64, f64)]) -> crate::pricing::PriceTable {
-    let mut rates = HashMap::new();
-    for &(id, input, output) in rows {
-        rates.insert(
-            id.to_owned(),
-            crate::pricing::ModelRate {
-                input,
-                output,
-                cache_read: 0.0,
-                cache_write: 0.0,
-            },
-        );
-    }
-    crate::pricing::PriceTable::from_rates(rates)
+    crate::pricing::PriceTable::capture(
+        rows.iter()
+            .map(|&(id, input, output)| priced_model(id, vec![flat_entry(input, output)]))
+            .collect(),
+        crate::tokens::today_date(),
+        0,
+        Vec::new(),
+    )
+}
+
+/// (model id, peak input/output, off-peak input/output) per-token rates.
+type WindowRates<'a> = (&'a str, (f64, f64), (f64, f64));
+
+/// deepseek-chat-shaped pricing: an off-peak fallback entry plus a peak
+/// `00:30–16:30Z` time-window entry, which reversed-entry selection prefers
+/// while it is active. Hour 0 prices off-peak and hour 16 peak.
+fn windowed_table(rows: &[WindowRates<'_>]) -> crate::pricing::PriceTable {
+    use crate::pricing::Constraint;
+    crate::pricing::PriceTable::capture(
+        rows.iter()
+            .map(|&(id, peak, off_peak)| {
+                priced_model(
+                    id,
+                    vec![
+                        flat_entry(off_peak.0, off_peak.1),
+                        crate::pricing::PriceEntry {
+                            input: peak.0,
+                            output: peak.1,
+                            cache_read: 0.0,
+                            cache_write: 0.0,
+                            constraint: Some(Constraint::TimeWindow {
+                                start: "00:30:00Z".to_owned(),
+                                end: "16:30:00Z".to_owned(),
+                            }),
+                        },
+                    ],
+                )
+            })
+            .collect(),
+        crate::tokens::today_date(),
+        0,
+        Vec::new(),
+    )
 }
 
 fn find<'a>(groups: &'a [WorkspaceGroup], id: &str) -> Option<&'a SessionInfo> {
@@ -509,6 +582,135 @@ fn annotate_sums_tokens_and_cost_across_models() {
 }
 
 #[test]
+fn annotate_prices_peak_and_off_peak_hours_at_their_tiers() {
+    let sb = HomeSandbox::new();
+    let path = sb.home().join(".claude/projects/-w-win/swin.jsonl");
+    // Two responses an hour apart: hour 0 prices off-peak, hour 16 peak —
+    // per the settled hour-granularity formula (window 00:30–16:30Z sampled
+    // at the hour's start).
+    write_jsonl(
+        &path,
+        &[
+            usage_line_at(
+                "swin",
+                "/w/win",
+                "w1",
+                "deepseek-chat",
+                1000,
+                0,
+                "2026-06-11T00:10:00+00:00",
+            ),
+            usage_line_at(
+                "swin",
+                "/w/win",
+                "w2",
+                "deepseek-chat",
+                1000,
+                0,
+                "2026-06-11T16:10:00+00:00",
+            ),
+        ],
+    );
+    let table = windowed_table(&[("deepseek-chat", (2e-6, 4e-6), (1e-6, 2e-6))]);
+
+    let mut groups = build_index();
+    annotate_all(&mut groups, Some(&table));
+
+    let info = find(&groups, "swin").expect("session indexed");
+    assert_eq!(info.tokens, Some(2000));
+    // 1000 * 1e-6 (off-peak) + 1000 * 2e-6 (peak) = $0.003 — neither the
+    // all-off-peak ($0.002) nor the all-peak ($0.004) flat total.
+    let cost = info.cost.expect("priced");
+    assert!((cost - 0.003).abs() < 1e-9, "got {cost}");
+}
+
+#[test]
+fn annotate_priced_zero_cost_session_is_some_zero() {
+    let sb = HomeSandbox::new();
+    let path = sb.home().join(".claude/projects/-w-zero/szero.jsonl");
+    // A token-bearing row with zero counts on a priced model: the session has
+    // usage, the model has a rate ⇒ Some(0.0), distinct from all-unpriced None.
+    write_jsonl(
+        &path,
+        &[usage_line(
+            "szero",
+            "/w/zero",
+            "z1",
+            "claude-opus-4-8",
+            0,
+            0,
+        )],
+    );
+    let table = price_table(&[("claude-opus-4-8", 1e-6, 2e-6)]);
+
+    let mut groups = build_index();
+    annotate_all(&mut groups, Some(&table));
+
+    let info = find(&groups, "szero").expect("session indexed");
+    assert_eq!(info.tokens, Some(0));
+    assert_eq!(info.cost, Some(0.0));
+}
+
+#[test]
+fn annotate_prices_each_day_at_its_dated_rate() {
+    let sb = HomeSandbox::new();
+    let path = sb.home().join(".claude/projects/-w-dated/sdated.jsonl");
+    // Two usage days straddling a 06-12 rate change: each (model, day) pair
+    // prices at the snapshot live on its own date — 06-11 at the old rate,
+    // 06-13 at the new one.
+    write_jsonl(
+        &path,
+        &[
+            usage_line_at(
+                "sdated",
+                "/w/dated",
+                "d1",
+                "m",
+                1000,
+                0,
+                "2026-06-11T10:30:00+00:00",
+            ),
+            usage_line_at(
+                "sdated",
+                "/w/dated",
+                "d2",
+                "m",
+                1000,
+                0,
+                "2026-06-13T10:30:00+00:00",
+            ),
+        ],
+    );
+    let cheap = priced_model("m", vec![flat_entry(1e-6, 0.0)]);
+    let dear = priced_model("m", vec![flat_entry(2e-6, 0.0)]);
+    let table = crate::pricing::PriceTable::capture(
+        vec![dear.clone()],
+        crate::tokens::today_date(),
+        0,
+        vec![
+            crate::pricing::RateSnapshot {
+                captured: "2026-06-01".to_owned(),
+                models: vec![cheap],
+            },
+            crate::pricing::RateSnapshot {
+                captured: "2026-06-12".to_owned(),
+                models: vec![dear],
+            },
+        ],
+    );
+
+    let mut groups = build_index();
+    annotate_all(&mut groups, Some(&table));
+
+    let info = find(&groups, "sdated").expect("session indexed");
+    assert_eq!(info.tokens, Some(2000));
+    // 1000 * 1e-6 (06-11) + 1000 * 2e-6 (06-13) = $0.003, not $0.004 at the
+    // newest rate for both.
+    let cost = info.cost.expect("priced");
+    assert!((cost - 0.003).abs() < 1e-9, "got {cost}");
+}
+
+#[test]
 fn annotate_leaves_tokenless_session_blank() {
     let sb = HomeSandbox::new();
     let path = sb.home().join(".claude/projects/-w-none/snone.jsonl");
@@ -569,6 +771,8 @@ fn annotate_dedupes_carried_forward_line_by_tok_key() {
     let info = find(&groups, "sdupe").expect("session indexed");
     // Single-counted: 1000 + 500, NOT doubled to 3000.
     assert_eq!(info.tokens, Some(1500));
+    // No table ⇒ cost stays None, however many tokens the file carries.
+    assert_eq!(info.cost, None);
 }
 
 // ── A3: session → last-ran-profile stamp/read ────────────────────────────────

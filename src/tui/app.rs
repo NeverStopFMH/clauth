@@ -1837,10 +1837,10 @@ impl App {
             drop((tokens_sender, tokens_refresh_rx));
         }
 
-        // Pricing loader: fetches per-token model rates (LiteLLM JSON) for the
-        // Tokens tab's cost lens, disk-cached under `~/.clauth`. Same test-skip
-        // rationale as the status/token workers — a detached thread could outlive
-        // a test's `HOME_OVERRIDE` and write the real `~/.clauth`.
+        // Pricing loader: fetches the genai-prices v2 distilled model rates for
+        // the Tokens tab's cost lens, disk-cached under `~/.clauth`. Same
+        // test-skip rationale as the status/token workers — a detached thread
+        // could outlive a test's `HOME_OVERRIDE` and write the real `~/.clauth`.
         let (pricing_sender, pricing_events) =
             std::sync::mpsc::channel::<crate::pricing::PricingEvent>();
         let (pricing_refresh, pricing_refresh_rx) = std::sync::mpsc::channel::<()>();
@@ -2803,7 +2803,32 @@ pub(crate) fn token_period_models(app: &App) -> Vec<crate::tokens::PeriodModel> 
         stats
             .today
             .as_ref()
-            .map(|t| t.models.iter().map(PeriodModel::from_full).collect())
+            .map(|t| {
+                // Daily-lens rows carry today's per-hour buckets (unlike
+                // lifetime rows, whose aggregate holds no dates), so the
+                // top-models and detail views price the same hourly rates
+                // the today card does.
+                use crate::pricing::HourTokens;
+                let mut hours: HashMap<&str, [HourTokens; 24]> = t
+                    .model_hours
+                    .iter()
+                    .map(|m| (m.model.as_str(), m.hours))
+                    .collect();
+                t.models
+                    .iter()
+                    .map(|m| PeriodModel {
+                        model: m.model.clone(),
+                        in_out: m.in_out(),
+                        split: m.clone(),
+                        split_complete: true,
+                        days: vec![crate::tokens::PeriodDay {
+                            date: t.date.clone(),
+                            split: m.clone(),
+                            hours: hours.remove(m.model.as_str()),
+                        }],
+                    })
+                    .collect()
+            })
             .unwrap_or_default()
     } else {
         crate::tokens::group_models(&stats.models)

@@ -681,20 +681,37 @@ fn isolated_holds(depth: usize) -> Vec<IsolatedHold> {
 /// `Some(0)` — when the file yields no token-bearing row, so a session with no
 /// usage renders blank rather than a misleading zero.
 ///
-/// `cost` follows [`PriceTable::total_cost`]: `Some(usd)` when a table is present
-/// and at least one of the session's models has a matching rate; `None` when no
-/// table is given OR every model is unpriced. The priced/unpriced boundary is read
-/// from the rate table directly, not from `usd > 0`, so a priced but genuinely
-/// zero-cost session is `Some(0.0)` — distinct from an unpriced `None`.
+/// `cost` sums each (model, day) pair's hourly buckets at that day's dated rate
+/// ([`PriceTable::cost_day`]): `Some(usd)` when a table is present and at least
+/// one pair has a matching rate; `None` when no table is given OR every pair is
+/// unpriced. The priced/unpriced boundary is read from the rate table directly,
+/// not from `usd > 0`, so a priced but genuinely zero-cost session is
+/// `Some(0.0)` — distinct from an unpriced `None`.
 pub(crate) fn annotate(info: &mut SessionInfo, price: Option<&PriceTable>) {
-    let models = crate::tokens::file_model_tokens(&info.path);
+    let days = crate::tokens::file_hourly_model_tokens(&info.path);
     // >= 1 token-bearing row ⇒ a real total (possibly 0); no rows ⇒ blank.
-    info.tokens = (!models.is_empty()).then(|| models.iter().map(|m| m.in_out()).sum());
+    info.tokens = (!days.is_empty()).then(|| {
+        days.iter()
+            .map(|d| {
+                d.hours
+                    .iter()
+                    .map(|h| h.input.saturating_add(h.output))
+                    .sum::<u64>()
+            })
+            .sum()
+    });
     info.cost = price.and_then(|p| {
-        let (usd, _unpriced) = p.total_cost(&models);
-        // "At least one model priced" is read off the table, not `usd > 0`, so a
+        let mut usd = 0.0;
+        let mut any_priced = false;
+        for d in &days {
+            if let Some(c) = p.cost_day(&d.model, &d.day, &d.hours) {
+                usd += c;
+                any_priced = true;
+            }
+        }
+        // "At least one pair priced" is read off the table, not `usd > 0`, so a
         // priced zero-cost session reads `Some(0.0)` while all-unpriced reads None.
-        models.iter().any(|m| p.cost(m).is_some()).then_some(usd)
+        any_priced.then_some(usd)
     });
 }
 

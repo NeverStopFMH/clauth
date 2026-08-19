@@ -7,7 +7,6 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use super::*;
-use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
 use std::time::{Duration, SystemTime};
@@ -25,7 +24,7 @@ fn user_line(sid: &str, cwd: &str, text: &str) -> String {
     json!({"sessionId": sid, "cwd": cwd, "message": {"role": "user", "content": text}}).to_string()
 }
 
-/// An assistant usage line — the token-bearing row `file_model_tokens` reads.
+/// An assistant usage line — the token-bearing row `file_hourly_model_tokens` reads.
 fn usage_line(sid: &str, cwd: &str, msg_id: &str, model: &str, input: u64, output: u64) -> String {
     json!({
         "sessionId": sid, "cwd": cwd, "timestamp": "2026-06-11T10:30:00+00:00",
@@ -42,19 +41,24 @@ fn usage_line(sid: &str, cwd: &str, msg_id: &str, model: &str, input: u64, outpu
 
 /// A `PriceTable` from `(model_id, input_rate, output_rate)` rows; cache rates 0.
 fn price_table(rows: &[(&str, f64, f64)]) -> crate::pricing::PriceTable {
-    let mut rates = HashMap::new();
-    for &(id, input, output) in rows {
-        rates.insert(
-            id.to_owned(),
-            crate::pricing::ModelRate {
-                input,
-                output,
-                cache_read: 0.0,
-                cache_write: 0.0,
-            },
-        );
-    }
-    crate::pricing::PriceTable::from_rates(rates)
+    crate::pricing::PriceTable::capture(
+        rows.iter()
+            .map(|&(id, input, output)| crate::pricing::PricedModel {
+                id: id.to_owned(),
+                match_: crate::pricing::MatchClause::Equals(id.to_lowercase()),
+                prices: vec![crate::pricing::PriceEntry {
+                    input,
+                    output,
+                    cache_read: 0.0,
+                    cache_write: 0.0,
+                    constraint: None,
+                }],
+            })
+            .collect(),
+        crate::tokens::today_date(),
+        0,
+        Vec::new(),
+    )
 }
 
 // ── clauth sessions --json ──
@@ -198,11 +202,13 @@ fn the_table_carries_the_token_columns_only_under_tokens() {
 
     // Annotated through the same call the flag makes, so the row has real
     // figures to print and a missing column is the flag's doing, not an empty
-    // fixture rendering blank either way.
+    // fixture rendering blank either way. The rates put the cost at $1.05 —
+    // above the row's two-decimal rounding floor, so the assertion pins the
+    // VALUE, not just a dollar-shaped cell (a zeroed cost also renders "$0.00").
     let mut groups = build_listing(false);
     crate::sessions::annotate_all(
         &mut groups,
-        Some(&price_table(&[("claude-sonnet-4", 0.000003, 0.000015)])),
+        Some(&price_table(&[("claude-sonnet-4", 0.003, 0.015)])),
     );
     let session = &groups[0].sessions[0];
 
@@ -215,7 +221,7 @@ fn the_table_carries_the_token_columns_only_under_tokens() {
 
     let annotated = session_row(session, true);
     assert!(
-        annotated.contains("150") && annotated.contains("$0."),
+        annotated.contains("150") && annotated.contains("$1.05"),
         "--tokens adds both cells: {annotated}"
     );
 }

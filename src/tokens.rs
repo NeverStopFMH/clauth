@@ -113,7 +113,6 @@ pub(crate) struct DayModelTokens {
 /// per-hour buckets when the source carried them (`None` for v1-ledger days,
 /// which price at the default tier).
 #[derive(Debug, Clone)]
-#[allow(dead_code)] // slice C contract: period cost reads these rows next
 pub(crate) struct PeriodDay {
     pub(crate) date: String, // "YYYY-MM-DD"
     pub(crate) split: ModelTokens,
@@ -181,7 +180,6 @@ pub(crate) struct DayActivity {
 /// Per-hour token buckets for one model on one day — the per-model twin of
 /// [`DaySummary::token_hours`]. Index = hour of day 0..23.
 #[derive(Debug, Clone)]
-#[allow(dead_code)] // slice C contract: today's per-model cost reads these next
 pub(crate) struct HourlyModel {
     pub(crate) model: String,
     pub(crate) hours: [HourTokens; 24],
@@ -191,7 +189,6 @@ pub(crate) struct HourlyModel {
 /// transcript file by [`file_hourly_model_tokens`] — the sessions surface's
 /// dated-cost view. Index = hour of day 0..23.
 #[derive(Debug, Clone)]
-#[allow(dead_code)] // slice C contract: the sessions surface consumes this next
 pub(crate) struct HourlyDayModel {
     pub(crate) model: String,
     pub(crate) day: String, // "YYYY-MM-DD"
@@ -1254,40 +1251,12 @@ fn collapse_streamed_turns(recs: Vec<LineRec>) -> Vec<LineRec> {
     plain
 }
 
-/// Fold one transcript file into per-model token sums for a per-session
-/// annotation (see [`crate::sessions`]). `parse_file` already collapses each
-/// turn's streaming deltas to its completed line and dedupes a carried-forward
-/// response within the file (same `message.id`, identical usage), so each
-/// token-bearing line here is one distinct response and can be summed directly.
-/// Fail-soft: an unreadable file yields `[]`.
-pub(crate) fn file_model_tokens(path: &Path) -> Vec<ModelTokens> {
-    let recs = parse_file(path);
-    let mut by_model: HashMap<&str, ModelTokens> = HashMap::new();
-    for r in &recs {
-        if !r.has_usage {
-            continue;
-        }
-        let e = by_model
-            .entry(r.model.as_str())
-            .or_insert_with(|| ModelTokens {
-                model: r.model.clone(),
-                ..Default::default()
-            });
-        e.input = e.input.saturating_add(r.input);
-        e.output = e.output.saturating_add(r.output);
-        e.cache_read = e.cache_read.saturating_add(r.cache_read);
-        e.cache_create = e.cache_create.saturating_add(r.cache_create);
-    }
-    by_model.into_values().collect()
-}
-
-/// [`file_model_tokens`]'s hourly twin: fold one transcript file into per-
-/// (model, day) per-hour buckets for the sessions surface's dated cost view.
-/// Same dedup guarantees as [`file_model_tokens`] — `parse_file` collapses
-/// each turn's streaming deltas and dedupes a carried-forward response within
-/// the file, so each token-bearing line here is one distinct response and can
-/// be summed directly. Fail-soft: an unreadable file yields `[]`.
-#[allow(dead_code)] // slice C contract: the sessions surface calls this next
+/// Fold one transcript file into per-(model, day) per-hour buckets for the
+/// sessions surface's dated cost view. `parse_file` collapses each turn's
+/// streaming deltas to its completed line and dedupes a carried-forward
+/// response within the file, so each token-bearing line here is one distinct
+/// response and can be summed directly. Fail-soft: an unreadable file yields
+/// `[]`.
 pub(crate) fn file_hourly_model_tokens(path: &Path) -> Vec<HourlyDayModel> {
     let recs = parse_file(path);
     let mut by_key: HashMap<(&str, &str), HourlyDayModel> = HashMap::new();

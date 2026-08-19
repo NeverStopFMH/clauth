@@ -496,58 +496,19 @@ pub(crate) struct DelegateArgs {
     profiles: Option<Vec<String>>,
     /// The task for the delegate, as plain text. This is the only thing it knows
     /// about the job. To run the delegate as one of your `Agent` types, start
-    /// `prompt` with `@"{type} (agent)"`, for example `@"rust-pro (agent)"`. This
-    /// needs `isolated: false`. Type the name exactly as the `Agent` tool lists
-    /// it: a name that does not match is ignored with no error, and if it matches
-    /// a file path that file gets read in instead.
+    /// `prompt` with `@"{type} (agent)"`. This needs `isolated: false`. Type the
+    /// name exactly as the `Agent` tool lists it: a name that does not match is
+    /// ignored with no error, and if it matches a file path that file gets read
+    /// in instead.
     prompt: Option<String>,
-    /// Read the prompt from this file instead of passing it inline. The path is
-    /// relative to `cwd`. clauth reads the file once and reuses it for every
-    /// account, so a long reusable prompt costs this session's context nothing.
-    /// Pass exactly one of `prompt` or `prompt_file`.
+    /// Use a txt/md file as the prompt instead of passing it inline. Path is
+    /// relative to `cwd`. Best for a prompt you reuse across turns, or one that
+    /// changes only slightly between delegates. Pass exactly one of `prompt` or
+    /// `prompt_file`.
     prompt_file: Option<String>,
-    /// Model for the delegated session. Leave it unset to let `claude` pick as it
-    /// normally would.
-    model: Option<String>,
-    /// Directory the delegate runs in. Must exist. Defaults to the directory the
-    /// MCP server was started in. The delegate picks up a `CLAUDE.md` from here,
-    /// so point it at a clean directory for an unrelated one-shot task.
-    cwd: Option<String>,
-    /// Extra environment variables for the delegate, for example
-    /// `CLAUDE_CODE_MAX_OUTPUT_TOKENS`. clauth always sets `CLAUDE_CONFIG_DIR`
-    /// and its own depth guard, and you cannot override those here.
-    env: Option<HashMap<String, String>>,
-    /// Extra command-line arguments for the `claude` invocation. They go after
-    /// clauth's own `-p` and streaming flags, after `--strict-mcp-config` on an
-    /// isolated run, and after `--model` when `model` is set. Pinning
-    /// `--output-format` here replaces clauth's, which turns off the idle limit
-    /// and leaves `timeout_secs` as the only one.
-    args: Option<Vec<String>>,
-    /// Wall-clock limit in seconds (1 to 3600). It applies only when `args` pins
-    /// its own `--output-format`. There is no output stream in that case, so
-    /// silence means nothing and this is the only limit left; leave it unset
-    /// there and `idle_secs` supplies the figure instead. On every other run it
-    /// is ignored, because a delegate that is still producing output should not
-    /// be killed.
-    timeout_secs: Option<u64>,
-    /// Kill the delegate if it produces no output at all for this many seconds (1
-    /// to 3600, default 300). It hands back whatever text it had, plus a
-    /// `session_id` you can pass to `resume`. This is the only time limit on a
-    /// normal run: a delegate that keeps producing output is never cut off,
-    /// however long it takes. Raise it only when the task makes one slow tool
-    /// call, such as a long build. If `args` pins its own `--output-format`, this
-    /// stops killing on silence and becomes the default for `timeout_secs`
-    /// instead.
-    idle_secs: Option<u64>,
-    /// Continue an earlier delegate instead of starting a new one. Pass the
-    /// `session_id` that a killed run handed back, and `prompt` becomes the next
-    /// message in that conversation. clauth runs it in the directory the session
-    /// was recorded in, so `cwd` is not needed here (and is refused if it
-    /// disagrees).
-    resume: Option<String>,
-    /// `isolated: false` (default): the delegate loads your Claude Code setup,
-    /// the same as a normal session. That means your `CLAUDE.md`, plugins, hooks,
-    /// skills, MCP servers and `Agent` types. Use this for real work.
+    /// `isolated: false` (default): the delegate loads your `CLAUDE.md`, plugins,
+    /// hooks, skills, MCP servers and tools the same as a normal session or a
+    /// native agent. Use this for real work.
     ///
     /// `isolated: true`: none of that loads. The delegate starts blank, so only
     /// `prompt` steers it. Use this to test what a stock `claude` does.
@@ -557,9 +518,42 @@ pub(crate) struct DelegateArgs {
     ///
     /// `background: true`: the call returns a `{job_id}` instead of the output,
     /// and the delegate keeps running. Its result is delivered to you
-    /// automatically when it finishes. You can also check it, collect it or stop
-    /// it with `monitor`.
+    /// automatically when it finishes. You can check, collect or stop it with
+    /// `monitor`.
     background: Option<bool>,
+    /// Model for the delegated session. Unset = default model for that profile.
+    model: Option<String>,
+    /// Directory the delegate runs in (must exist). Defaults to where this
+    /// session started. The delegate reads `CLAUDE.md` from its cwd
+    /// unconditionally.
+    cwd: Option<String>,
+    /// Continue a delegate by `session_id`, and `prompt` becomes the next message
+    /// in that conversation. clauth resumes it in the directory the session was
+    /// running in, so `cwd` is not needed here (refuses if it varies).
+    resume: Option<String>,
+    /// Kill the delegate if it produces no output at all for this many seconds
+    /// (max: 3600, default 300). It returns any text it had and a `session_id`
+    /// you can pass to `resume`. This is the only time limit on a normal run: a
+    /// delegate that keeps producing output runs to completion, however long it
+    /// takes. Raise it only when the task makes one slow tool call, such as a
+    /// long build. If `args` pins its own `--output-format`, this stops killing
+    /// on silence and works the same as `timeout_secs`.
+    idle_secs: Option<u64>,
+    /// Wall-clock limit in seconds (max: 3600). It applies only when `args` pins
+    /// its own `--output-format`; leave it unset there and `idle_secs` supplies
+    /// the figure instead. On every other run it is ignored: a delegate that is
+    /// still producing output keeps running.
+    timeout_secs: Option<u64>,
+    /// Extra env vars to pass to the delegate session, e.g.
+    /// `CLAUDE_CODE_MAX_OUTPUT_TOKENS`. `CLAUDE_CONFIG_DIR` and its own depth
+    /// guard are clauth-managed, which you cannot override.
+    env: Option<HashMap<String, String>>,
+    /// Extra CLI arguments that go after clauth's own `claude -p` invocation and
+    /// streaming flags, after `--strict-mcp-config` on an isolated run, and after
+    /// `--model` when `model` is set. Pinning `--output-format` here replaces
+    /// clauth's, which turns off the idle limit and leaves `timeout_secs` as the
+    /// only guard.
+    args: Option<Vec<String>>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -843,12 +837,10 @@ disturbing this session, use `delegate`."
 
     #[tool(
         description = "Run a task on another clauth account. `delegate` starts a fresh headless `claude` session on \
-that account and returns what it produced. `delegate` is like the Agent tool, but the agent \
-runs on a different account's login.\n\n\
+that account and returns its final response. This is like the Agent tool, but the agent runs on \
+a different account's login.\n\n\
 The delegate knows nothing about this conversation. Put everything it needs into `prompt`.\n\n\
-Delegating spends the target account, so pick the account with `profiles` first. An account \
-with no `host` uses that subscription's 5h window. DeepSeek and Z.ai charge real money. Alibaba \
-Model Studio draws down a prepaid plan. A loopback or LAN host is free."
+Delegating spends the target account, so pick the account with `profiles` first."
     )]
     async fn delegate(
         &self,

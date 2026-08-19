@@ -4208,11 +4208,11 @@ fn the_delegate_description_keeps_its_load_bearing_warnings() {
 
     for phrase in [
         // it spends a real account, and which shape that spend takes
+        // The provider-by-provider cost table left on 2026-08-19: the owner
+        // ruled it inferrable from the `instructions` roster, which already
+        // names each account's provider and host. The spend warning itself
+        // stays, because nothing else in the entry carries it.
         "Delegating spends the target account",
-        "uses that subscription's 5h window",
-        "charge real money",
-        "draws down a prepaid plan",
-        "LAN host is free",
         // a delegate is blind to this conversation, so the prompt is the whole
         // brief
         "knows nothing about this conversation",

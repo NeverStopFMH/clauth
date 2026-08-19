@@ -1003,6 +1003,133 @@ fn mirror_tree_does_not_write_through_a_runtime_side_symlink() {
     );
 }
 
+/// A dangling link on the CANONICAL side must cost that ONE name, not the tick.
+/// `symlink_metadata` stats the link and says the entry is there, so the
+/// `(Some, Some)` arm runs and `files_match` reads THROUGH the broken link for an
+/// ENOENT that propagates out of `mirror_tree` — every reconcile pass on a
+/// copy-transport host dies from then on, and nothing self-heals it because the
+/// operator's tree is where the moved-aside target lives. Ordinary trigger: the
+/// operator moves a `~/.claude` file aside while the runtime holds its copy.
+///
+/// The link itself must survive: `~/.claude` is the operator's tree, so a link
+/// there is their intent and the mirror never deletes.
+#[test]
+fn mirror_tree_survives_a_dangling_canonical_link() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let claude = tmp.path().join("claude");
+    let runtime = tmp.path().join("runtime");
+    for dir in [&claude, &runtime] {
+        fs::create_dir_all(dir).expect("mkdir");
+    }
+    // `notes.md` sorts before `todos.json`, so the broken name is walked first
+    // and a failing tick can never reach the ordinary file behind it.
+    if !pose_file_link(&claude.join("notes.md"), &tmp.path().join("moved-aside.md")) {
+        return;
+    }
+    fs::write(runtime.join("notes.md"), b"STALE COPY").expect("write runtime copy");
+    fs::write(claude.join("todos.json"), b"[]").expect("write canonical");
+
+    mirror_tree(&claude, &runtime).expect("one broken name must not fail the tick");
+
+    assert_eq!(
+        fs::read(runtime.join("todos.json")).expect("read runtime"),
+        b"[]",
+        "the rest of the tree still reconciles past a dangling name"
+    );
+    assert!(
+        claude
+            .join("notes.md")
+            .symlink_metadata()
+            .expect("canonical entry present")
+            .file_type()
+            .is_symlink(),
+        "the operator's link is their intent; the mirror never unlinks it"
+    );
+    assert_eq!(
+        fs::read(runtime.join("notes.md")).expect("read runtime copy"),
+        b"STALE COPY",
+        "and the runtime copy is left where it is, not published over the broken link"
+    );
+}
+
+/// The DIRECTORY shape of the same defect, which the file fixture cannot reach:
+/// a dangling canonical link whose runtime counterpart is a real directory takes
+/// the `b_is_dir` branch, where `a.exists()` is false through the broken link and
+/// `mkdir_700(a)` runs. A recursive create swallows EEXIST only when a follow-up
+/// stat says the path is a directory, and a dangling link answers neither, so it
+/// returns `File exists (os error 17)` and fails the tick.
+#[test]
+fn mirror_tree_survives_a_dangling_canonical_link_over_a_runtime_dir() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let claude = tmp.path().join("claude");
+    let runtime = tmp.path().join("runtime");
+    fs::create_dir_all(&claude).expect("mkdir claude");
+    fs::create_dir_all(runtime.join("skills")).expect("mkdir runtime skills");
+    fs::write(runtime.join("skills").join("skill.md"), b"skill body").expect("write skill");
+    // `skills` sorts before `todos.json`, same reason as the fixture above.
+    if !pose_file_link(&claude.join("skills"), &tmp.path().join("moved-aside")) {
+        return;
+    }
+    fs::write(claude.join("todos.json"), b"[]").expect("write canonical");
+
+    mirror_tree(&claude, &runtime).expect("one broken name must not fail the tick");
+
+    assert_eq!(
+        fs::read(runtime.join("todos.json")).expect("read runtime"),
+        b"[]",
+        "the rest of the tree still reconciles past a dangling name"
+    );
+    assert!(
+        claude
+            .join("skills")
+            .symlink_metadata()
+            .expect("canonical entry present")
+            .file_type()
+            .is_symlink(),
+        "the mirror must not have replaced the operator's link with a directory"
+    );
+}
+
+/// The RUNTIME side of the same predicate: a broken link there reads as an
+/// existing entry too, so `files_match` fails on the `b` read instead of the `a`
+/// one and takes the same tick down. Self-healing that side is
+/// [`prune_dangling_links`]'s job at build time; the mirror only has to keep
+/// walking.
+#[test]
+fn mirror_tree_survives_a_dangling_runtime_link() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let claude = tmp.path().join("claude");
+    let runtime = tmp.path().join("runtime");
+    for dir in [&claude, &runtime] {
+        fs::create_dir_all(dir).expect("mkdir");
+    }
+    if !pose_file_link(
+        &runtime.join("notes.md"),
+        &tmp.path().join("moved-aside.md"),
+    ) {
+        return;
+    }
+    fs::write(claude.join("notes.md"), b"CANON").expect("write canonical");
+    fs::write(claude.join("todos.json"), b"[]").expect("write canonical todos");
+
+    mirror_tree(&claude, &runtime).expect("one broken name must not fail the tick");
+
+    assert_eq!(
+        fs::read(runtime.join("todos.json")).expect("read runtime"),
+        b"[]",
+        "the rest of the tree still reconciles past a dangling name"
+    );
+    assert!(
+        runtime
+            .join("notes.md")
+            .symlink_metadata()
+            .expect("runtime entry present")
+            .file_type()
+            .is_symlink(),
+        "the mirror never unlinks either side; prune_dangling_links owns that repair"
+    );
+}
+
 #[test]
 fn copy_file_overwrites_existing_destination() {
     let tmp = tempfile::tempdir().expect("tempdir");

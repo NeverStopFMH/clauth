@@ -3065,6 +3065,26 @@ fn merge_path(a: &Path, b: &Path) -> Result<()> {
     let a_meta = a.symlink_metadata().ok();
     let b_meta = b.symlink_metadata().ok();
 
+    // A dangling link on EITHER side costs this one name, never the tick. Its
+    // path is occupied — `symlink_metadata` stats the link — while every read,
+    // write and stat THROUGH it answers ENOENT, so each branch below misfires on
+    // it: `files_match` and `copy_file` read through the link, and the directory
+    // branch sees `exists()` false and calls a recursive create that returns
+    // EEXIST rather than succeeding. One moved-aside `~/.claude` target would
+    // otherwise take down every reconcile pass on a copy-transport host.
+    //
+    // Skipped whole, never unlinked: the mirror is additive and "not yet seen"
+    // is already its vocabulary for a name it cannot merge. Canonical is the
+    // OPERATOR's tree, so a link there is their intent, and the runtime side's
+    // self-heal belongs to `prune_dangling_links` at build time.
+    //
+    // Soft edge, same one `prune_dangling_links` documents: `Path::exists`
+    // swallows every stat error, so a live link over a dropped mount reads as
+    // dangling and is skipped for that tick.
+    if is_dangling_link(a, a_meta.as_ref()) || is_dangling_link(b, b_meta.as_ref()) {
+        return Ok(());
+    }
+
     // `Path::is_dir` follows symlinks, unlike the `symlink_metadata` file-type
     // above: a symlink/junction to a DIRECTORY must recurse like a real dir, or
     // `copy_file` hits `std::fs::copy` on a directory and fails the whole tick
@@ -3153,14 +3173,26 @@ fn merge_path(a: &Path, b: &Path) -> Result<()> {
 /// leave both trees, which is correct for a link the operator made and wrong for
 /// one found in clauth's own copy; see [`merge_path`].
 ///
-/// A DANGLING link keeps its own path, so the write re-creates it as a regular
-/// file. That is the pre-existing outcome and not what this exists to change:
-/// the arm that reaches it reads the link first and fails the tick there.
+/// The fallback to `p` itself is a defensive default rather than a behaviour:
+/// [`merge_path`] skips a name whose either side is a dangling link before it
+/// ever asks for a write target, so the only way `canonicalize` fails here is a
+/// link that broke between that check and this call.
 fn write_target(p: &Path) -> PathBuf {
     match p.symlink_metadata() {
         Ok(m) if m.file_type().is_symlink() => p.canonicalize().unwrap_or_else(|_| p.to_path_buf()),
         _ => p.to_path_buf(),
     }
+}
+
+/// Is `p` a symlink whose target no longer resolves? Takes the caller's
+/// already-taken `symlink_metadata` so the link's own file type and the
+/// follow-through `exists()` describe one stat pair rather than two.
+///
+/// The `is_symlink` half states the shape rather than narrowing it — nothing but
+/// a link can answer `symlink_metadata` Ok and `exists()` false — so dropping it
+/// leaves the whole suite green (measured). It stays for the reader.
+fn is_dangling_link(p: &Path, meta: Option<&std::fs::Metadata>) -> bool {
+    meta.is_some_and(|m| m.file_type().is_symlink()) && !p.exists()
 }
 
 fn mtime_newer(a: Option<SystemTime>, b: Option<SystemTime>) -> bool {

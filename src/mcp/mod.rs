@@ -829,25 +829,26 @@ disturbing this session, use `delegate`."
     }
 
     #[tool(
-        description = "Run a task on another clauth account: a fresh headless `claude` session \
-under that account's credentials. It spends that account's window or money, so pick the target \
-from `profiles`. The delegate sees only `prompt` and nothing of this conversation, so state the \
-whole task there, and spot-verify its `result` like any subagent's.\n\n\
+        description = "Run a task in a fresh headless `claude` session on another account. \
+It spends that account's usage window or money. Pick the target from `profiles`. The delegate \
+sees only `prompt` and no context of this conversation; state what it needs to do in the prompt. \
+`delegate` is like the Agent tool that runs on a different login.\n\n\
 Cost by target: an account with no `host` burns that subscription's 5h window; DeepSeek or Z.ai \
 bills real money; Alibaba Model Studio draws down a prepaid plan; a loopback or LAN host is \
 free.\n\n\
-`background: true` returns a `{job_id}` now and the result arrives on its own; prefer it for a \
-slow or third-party target. Two or more `profiles` fan out, one window spent per \
-account; the call waits for every one unless `background: true`. Check, collect or stop a job with `monitor`.\n\n\
-`isolated: true` runs a stock `claude`: no operator `CLAUDE.md`, plugins, hooks, skills, subagents \
-or MCP servers, so nothing steers it but `prompt`. Use it to test stock behaviour; leave it false \
-for delegated work, which a native subagent runs with the operator's context loaded. Either way the \
-delegate loads the project `CLAUDE.md` of `cwd`, so point `cwd` at a clean dir for an unrelated \
+`background: true` returns a `{job_id}` and works in the background. The result arrives back to \
+you on its own. When you spawn two or more delegates at once, the call blocks the session until \
+completion of all, unless `background: true`. Check, collect or stop a job with `monitor`.\n\n\
+`isolated: true` runs a stock `claude` setup: no `CLAUDE.md`, plugins, hooks, skills, subagents \
+or MCP servers, so nothing steers it but your `prompt`. Use it to test stock behaviour; leave it \
+false for actual work. When `isolated: false`, the delegate can be one of the specialists listed \
+in the `Agents` tool. Start the `prompt` by `@\"{type} (agent)\"`, replacing `{type}` with one of \
+the available ones from `Agents` schema, and the delegate will run as that specialist. \
+`delegate` loads `CLAUDE.md` files either way, so point `cwd` at a clean dir for an unrelated \
 one-shot.\n\n\
-A run silent for `idle_secs` is killed and hands back the text it had plus a `session_id` to \
-`resume`, rather than paying for that work twice. That is its only deadline: one that keeps \
-talking runs as long as it needs, and `timeout_secs` binds only a run whose `args` pin their own \
-`--output-format`."
+A run silent for `idle_secs` is killed and hands back the text it had. `resume` it via its \
+`session_id`. `idle_secs` is its only deadline: as long as it keeps talking, it runs until \
+completion. `timeout_secs` binds only a run whose `args` pin their own `--output-format`."
     )]
     async fn delegate(
         &self,

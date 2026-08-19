@@ -51,6 +51,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use serde::Deserialize;
 
 use crate::poll::run_polling_loop;
+use crate::pricing::HourTokens;
 use crate::usage::{epoch_secs_to_iso, iso_to_epoch_secs, now_epoch_secs};
 
 // ── Refresh cadence ─────────────────────────────────────────────────────────
@@ -101,6 +102,22 @@ pub(crate) struct DayModelTokens {
     pub(crate) in_out: u64,
     /// Full split when known; `split.model` mirrors `model`.
     pub(crate) split: Option<ModelTokens>,
+    /// Per-hour buckets (index = hour 0..23) when the source carried
+    /// timestamps: transcript-derived rows and v2-ledger rows. `None` for
+    /// stats-cache (pre-cutoff) rows and v1-ledger rows — approximation:
+    /// those days price at the default tier on their dated rate (slice C).
+    pub(crate) hours: Option<[HourTokens; 24]>,
+}
+
+/// One day's contribution to a [`PeriodModel`]: the full split plus its
+/// per-hour buckets when the source carried them (`None` for v1-ledger days,
+/// which price at the default tier).
+#[derive(Debug, Clone)]
+#[allow(dead_code)] // slice C contract: period cost reads these rows next
+pub(crate) struct PeriodDay {
+    pub(crate) date: String, // "YYYY-MM-DD"
+    pub(crate) split: ModelTokens,
+    pub(crate) hours: Option<[HourTokens; 24]>,
 }
 
 /// One model's aggregate over a date range ([`period_models`]). `split` sums
@@ -112,6 +129,12 @@ pub(crate) struct PeriodModel {
     pub(crate) in_out: u64,
     pub(crate) split: ModelTokens,
     pub(crate) split_complete: bool,
+    /// The split-bearing days that make up `split`, in date order — so a
+    /// period cost can price each day at its dated rate and each hour at its
+    /// own rate (slice C). Stats-cache days contribute in+out and the
+    /// incomplete flag but no row; `from_full` rows carry none (they hold no
+    /// dates).
+    pub(crate) days: Vec<PeriodDay>,
 }
 
 impl PeriodModel {
@@ -123,6 +146,7 @@ impl PeriodModel {
             in_out: m.in_out(),
             split: m.clone(),
             split_complete: true,
+            days: Vec::new(),
         }
     }
 
@@ -154,6 +178,26 @@ pub(crate) struct DayActivity {
     pub(crate) tool_calls: u64,
 }
 
+/// Per-hour token buckets for one model on one day — the per-model twin of
+/// [`DaySummary::token_hours`]. Index = hour of day 0..23.
+#[derive(Debug, Clone)]
+#[allow(dead_code)] // slice C contract: today's per-model cost reads these next
+pub(crate) struct HourlyModel {
+    pub(crate) model: String,
+    pub(crate) hours: [HourTokens; 24],
+}
+
+/// One (model, day) pair's per-hour buckets, aggregated over a single
+/// transcript file by [`file_hourly_model_tokens`] — the sessions surface's
+/// dated-cost view. Index = hour of day 0..23.
+#[derive(Debug, Clone)]
+#[allow(dead_code)] // slice C contract: the sessions surface consumes this next
+pub(crate) struct HourlyDayModel {
+    pub(crate) model: String,
+    pub(crate) day: String, // "YYYY-MM-DD"
+    pub(crate) hours: [HourTokens; 24],
+}
+
 /// Single-day token + message rollup, built live from today's transcripts during
 /// the top-up pass (so it carries the full in/out/cache split, unlike `DayTokens`).
 #[derive(Debug, Clone, Default)]
@@ -168,6 +212,13 @@ pub(crate) struct DaySummary {
     /// Message count per hour of day for the day, index = hour 0..23 — the
     /// daily-period twin of `TokenStats::hour_counts`.
     pub(crate) hours: [u64; 24],
+    /// Token buckets per hour of day for the day, index = hour 0..23 — the
+    /// per-hour twin of the flat totals above, so cost can price each hour at
+    /// its own rate (peak/off-peak). Exact: every top-up rec carries its hour.
+    pub(crate) token_hours: [HourTokens; 24],
+    /// Per-hour buckets per model, one entry per model in `models` (same
+    /// DESC-by-total order). Carried so cost can be priced per model per hour.
+    pub(crate) model_hours: Vec<HourlyModel>,
     /// Per-model breakdown of the day's tokens. Carried so cost can be priced
     /// per model (rates differ by family) — the day's lifetime totals can't be
     /// isolated from `TokenStats::models`. Empty until the top-up populates it.
@@ -457,6 +508,7 @@ pub(crate) fn load_base(claude_dir: &Path) -> Option<TokenStats> {
                     model: model.clone(),
                     in_out,
                     split: None,
+                    hours: None,
                 })
         })
         .collect();
@@ -630,6 +682,7 @@ pub(crate) fn period_models(days: &[DayModelTokens], from: &str, to: &str) -> Ve
                 ..Default::default()
             },
             split_complete: true,
+            days: Vec::new(),
         });
         e.in_out = e.in_out.saturating_add(d.in_out);
         match &d.split {
@@ -638,11 +691,22 @@ pub(crate) fn period_models(days: &[DayModelTokens], from: &str, to: &str) -> Ve
                 e.split.output = e.split.output.saturating_add(s.output);
                 e.split.cache_read = e.split.cache_read.saturating_add(s.cache_read);
                 e.split.cache_create = e.split.cache_create.saturating_add(s.cache_create);
+                e.days.push(PeriodDay {
+                    date: d.date.clone(),
+                    split: s.clone(),
+                    hours: d.hours,
+                });
             }
             None => e.split_complete = false,
         }
     }
     let mut out: Vec<PeriodModel> = map.into_values().collect();
+    // Input order is the caller's; `daily_models` is sorted ASC by
+    // (date, model), but a hand-built slice may not be — pin date order per
+    // model regardless, so slice C's per-day cost walks a chronological list.
+    for m in &mut out {
+        m.days.sort_unstable_by(|a, b| a.date.cmp(&b.date));
+    }
     out.sort_unstable_by_key(|m| std::cmp::Reverse(m.in_out));
     out
 }
@@ -718,6 +782,23 @@ impl LineRec {
             .saturating_add(self.cache_read)
             .saturating_add(self.cache_create)
     }
+}
+
+/// Add one line's token counts into an hour bucket. The hour is safe to index
+/// directly: `parse_file` bounds `LineRec::hour` to 0..=23.
+fn add_to_hour(bucket: &mut HourTokens, r: &LineRec) {
+    bucket.input = bucket.input.saturating_add(r.input);
+    bucket.output = bucket.output.saturating_add(r.output);
+    bucket.cache_read = bucket.cache_read.saturating_add(r.cache_read);
+    bucket.cache_create = bucket.cache_create.saturating_add(r.cache_create);
+}
+
+/// One model's accumulation on one day during [`merge_topup`]: the flat split
+/// plus per-hour buckets, so a pushed [`DayModelTokens`] row and today's
+/// rollup both carry the hourly axis.
+struct ModelDayAcc {
+    flat: ModelTokens,
+    hours: [HourTokens; 24],
 }
 
 struct FileContrib {
@@ -823,8 +904,9 @@ fn merge_topup(
         .map(|m| (m.model.clone(), m))
         .collect();
 
-    // Per-day per-model splits for post-cutoff days (weekly/monthly lens).
-    let mut day_models: HashMap<(String, String), ModelTokens> = HashMap::new();
+    // Per-day per-model splits for post-cutoff days (weekly/monthly lens),
+    // flat plus per-hour buckets.
+    let mut day_models: HashMap<(String, String), ModelDayAcc> = HashMap::new();
     // Per-day activity for post-cutoff days + lifetime deltas.
     let mut day_msgs: HashMap<String, u64> = HashMap::new();
     let mut day_sessions: HashMap<String, HashSet<String>> = HashMap::new();
@@ -836,7 +918,7 @@ fn merge_topup(
         date: today_date.to_owned(),
         ..Default::default()
     };
-    let mut today_models: HashMap<String, ModelTokens> = HashMap::new();
+    let mut today_models: HashMap<String, ModelDayAcc> = HashMap::new();
 
     let mut seen_tok: HashSet<&str> = HashSet::new();
     let mut seen_uuid: HashSet<&str> = HashSet::new();
@@ -871,36 +953,47 @@ fn merge_topup(
             }
 
             // Token / model accumulation (assistant usage lines), deduped by key.
+            // The hour buckets ride the same deduped branch, so a skipped
+            // duplicate line contributes nothing to them either.
             if r.has_usage && (r.tok_key.is_empty() || seen_tok.insert(r.tok_key.as_str())) {
                 if r.date == today_date {
                     today_acc.input = today_acc.input.saturating_add(r.input);
                     today_acc.output = today_acc.output.saturating_add(r.output);
                     today_acc.cache_read = today_acc.cache_read.saturating_add(r.cache_read);
                     today_acc.cache_create = today_acc.cache_create.saturating_add(r.cache_create);
+                    add_to_hour(&mut today_acc.token_hours[r.hour as usize], r);
                     let tm = today_models
                         .entry(r.model.clone())
-                        .or_insert_with(|| ModelTokens {
-                            model: r.model.clone(),
-                            ..Default::default()
+                        .or_insert_with(|| ModelDayAcc {
+                            flat: ModelTokens {
+                                model: r.model.clone(),
+                                ..Default::default()
+                            },
+                            hours: [HourTokens::default(); 24],
                         });
-                    tm.input = tm.input.saturating_add(r.input);
-                    tm.output = tm.output.saturating_add(r.output);
-                    tm.cache_read = tm.cache_read.saturating_add(r.cache_read);
-                    tm.cache_create = tm.cache_create.saturating_add(r.cache_create);
+                    tm.flat.input = tm.flat.input.saturating_add(r.input);
+                    tm.flat.output = tm.flat.output.saturating_add(r.output);
+                    tm.flat.cache_read = tm.flat.cache_read.saturating_add(r.cache_read);
+                    tm.flat.cache_create = tm.flat.cache_create.saturating_add(r.cache_create);
+                    add_to_hour(&mut tm.hours[r.hour as usize], r);
                 }
                 if r.date.as_str() > cutoff_date {
                     *daily_map.entry(r.date.clone()).or_insert(0) +=
                         r.input.saturating_add(r.output);
                     let dm = day_models
                         .entry((r.date.clone(), r.model.clone()))
-                        .or_insert_with(|| ModelTokens {
-                            model: r.model.clone(),
-                            ..Default::default()
+                        .or_insert_with(|| ModelDayAcc {
+                            flat: ModelTokens {
+                                model: r.model.clone(),
+                                ..Default::default()
+                            },
+                            hours: [HourTokens::default(); 24],
                         });
-                    dm.input = dm.input.saturating_add(r.input);
-                    dm.output = dm.output.saturating_add(r.output);
-                    dm.cache_read = dm.cache_read.saturating_add(r.cache_read);
-                    dm.cache_create = dm.cache_create.saturating_add(r.cache_create);
+                    dm.flat.input = dm.flat.input.saturating_add(r.input);
+                    dm.flat.output = dm.flat.output.saturating_add(r.output);
+                    dm.flat.cache_read = dm.flat.cache_read.saturating_add(r.cache_read);
+                    dm.flat.cache_create = dm.flat.cache_create.saturating_add(r.cache_create);
+                    add_to_hour(&mut dm.hours[r.hour as usize], r);
                     let e = model_map
                         .entry(r.model.clone())
                         .or_insert_with(|| ModelTokens {
@@ -925,10 +1018,16 @@ fn merge_topup(
     // Publish today's rollup (independent of the cutoff, so even a no-new-history
     // pass can still carry today's data).
     if today_acc.messages > 0 || today_acc.total() > 0 {
-        today_acc.models = today_models.into_values().collect();
-        today_acc
-            .models
-            .sort_unstable_by_key(|m| std::cmp::Reverse(m.total()));
+        let mut accs: Vec<ModelDayAcc> = today_models.into_values().collect();
+        accs.sort_unstable_by_key(|a| std::cmp::Reverse(a.flat.total()));
+        today_acc.models = accs.iter().map(|a| a.flat.clone()).collect();
+        today_acc.model_hours = accs
+            .into_iter()
+            .map(|a| HourlyModel {
+                model: a.flat.model,
+                hours: a.hours,
+            })
+            .collect();
         base.today = Some(today_acc);
     }
 
@@ -951,14 +1050,15 @@ fn merge_topup(
 
     // Post-cutoff per-day per-model rows are transcript-authoritative: drop any
     // base rows past the cutoff (normally none — stats-cache stops there) and
-    // append the reconstructed split-bearing ones.
+    // append the reconstructed split-bearing ones, hour buckets included.
     base.daily_models.retain(|d| d.date.as_str() <= cutoff_date);
-    for ((date, _), tokens) in day_models {
+    for ((date, _), acc) in day_models {
         base.daily_models.push(DayModelTokens {
             date,
-            model: tokens.model.clone(),
-            in_out: tokens.in_out(),
-            split: Some(tokens),
+            model: acc.flat.model.clone(),
+            in_out: acc.flat.in_out(),
+            split: Some(acc.flat),
+            hours: Some(acc.hours),
         });
     }
     base.daily_models.sort_unstable_by(|a, b| {
@@ -1165,6 +1265,32 @@ pub(crate) fn file_model_tokens(path: &Path) -> Vec<ModelTokens> {
         e.cache_create = e.cache_create.saturating_add(r.cache_create);
     }
     by_model.into_values().collect()
+}
+
+/// [`file_model_tokens`]'s hourly twin: fold one transcript file into per-
+/// (model, day) per-hour buckets for the sessions surface's dated cost view.
+/// Same dedup guarantees as [`file_model_tokens`] — `parse_file` collapses
+/// each turn's streaming deltas and dedupes a carried-forward response within
+/// the file, so each token-bearing line here is one distinct response and can
+/// be summed directly. Fail-soft: an unreadable file yields `[]`.
+#[allow(dead_code)] // slice C contract: the sessions surface calls this next
+pub(crate) fn file_hourly_model_tokens(path: &Path) -> Vec<HourlyDayModel> {
+    let recs = parse_file(path);
+    let mut by_key: HashMap<(&str, &str), HourlyDayModel> = HashMap::new();
+    for r in &recs {
+        if !r.has_usage {
+            continue;
+        }
+        let e = by_key
+            .entry((r.model.as_str(), r.date.as_str()))
+            .or_insert_with(|| HourlyDayModel {
+                model: r.model.clone(),
+                day: r.date.clone(),
+                hours: [HourTokens::default(); 24],
+            });
+        add_to_hour(&mut e.hours[r.hour as usize], r);
+    }
+    by_key.into_values().collect()
 }
 
 // ── Background thread ─────────────────────────────────────────────────────────

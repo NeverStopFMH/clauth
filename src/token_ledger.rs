@@ -25,25 +25,72 @@
 //! - [`Ledger::apply_to_base`] folds only days strictly after the base's
 //!   `lastComputedDate`, so if CC's own aggregation later catches up past a ledger
 //!   day, the ledger never double-counts against the base.
+//!
+//! # Schema
+//!
+//! v2 adds per-hour buckets ([`WireModel::hours`]), optional on the wire: a v1
+//! file (no `hours` key) loads with `None` and keeps `None` on save, so days
+//! recorded before the hourly axis keep their v1 shape until a new day is
+//! recorded beside them — v1 days price at the default tier (slice C).
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use crate::pricing::HourTokens;
 use crate::tokens::{DayModelTokens, DayTokens, ModelTokens, TokenStats};
 use crate::usage::{epoch_secs_to_iso, iso_to_epoch_secs};
 
 const LEDGER_FILE: &str = "token_ledger.json";
 
 /// One model's stored split for one day (mirrors [`ModelTokens`] without the
-/// redundant `model` name, which is the map key).
+/// redundant `model` name, which is the map key). `hours` is the schema-v2
+/// hourly axis.
 #[derive(Serialize, Deserialize, Default)]
 struct WireModel {
     input: u64,
     output: u64,
     cache_read: u64,
     cache_create: u64,
+    /// Per-hour buckets, index = hour 0..23. `#[serde(default)]` keeps a v1
+    /// file loading (`None` — that day prices at the default tier);
+    /// `skip_serializing_if` keeps a v1 day's wire shape byte-for-byte v1 on
+    /// save, so the file only gains `hours` entries as new days are recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    hours: Option<[WireHour; 24]>,
+}
+
+/// One hour's token buckets on the wire — the serde twin of [`HourTokens`]
+/// (which deliberately carries no serde derives).
+#[derive(Serialize, Deserialize, Clone, Copy)]
+struct WireHour {
+    input: u64,
+    output: u64,
+    cache_read: u64,
+    cache_create: u64,
+}
+
+impl From<HourTokens> for WireHour {
+    fn from(h: HourTokens) -> Self {
+        Self {
+            input: h.input,
+            output: h.output,
+            cache_read: h.cache_read,
+            cache_create: h.cache_create,
+        }
+    }
+}
+
+impl From<WireHour> for HourTokens {
+    fn from(w: WireHour) -> Self {
+        Self {
+            input: w.input,
+            output: w.output,
+            cache_read: w.cache_read,
+            cache_create: w.cache_create,
+        }
+    }
 }
 
 /// Durable per-day token totals, persisted across processes.
@@ -94,8 +141,10 @@ impl Ledger {
     /// Fold the ledger's recorded days into `base` (already holding stats-cache
     /// data), extending `daily`, `daily_models`, `models`, and the totals — the
     /// same shape the top-up produces, so the Tokens views need no ledger
-    /// awareness. Only days strictly after `last_computed_date` are folded, so a
-    /// base that later advances past a ledger day never double-counts.
+    /// awareness. Each pushed row also carries the stored per-hour buckets when
+    /// the ledger day has them. Only days strictly after `last_computed_date`
+    /// are folded, so a base that later advances past a ledger day never
+    /// double-counts.
     pub(crate) fn apply_to_base(&self, base: &mut TokenStats, last_computed_date: Option<&str>) {
         let floor = last_computed_date.unwrap_or("");
         let mut model_map: HashMap<String, ModelTokens> = base
@@ -124,6 +173,7 @@ impl Ledger {
                     model: model.clone(),
                     in_out: split.in_out(),
                     split: Some(split.clone()),
+                    hours: w.hours.as_ref().map(|hs| hs.map(HourTokens::from)),
                 });
                 let e = model_map
                     .entry(model.clone())
@@ -177,6 +227,7 @@ impl Ledger {
                     output: split.output,
                     cache_read: split.cache_read,
                     cache_create: split.cache_create,
+                    hours: d.hours.map(|hs| hs.map(WireHour::from)),
                 },
             );
             changed = true;

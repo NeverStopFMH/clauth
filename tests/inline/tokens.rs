@@ -3,6 +3,7 @@ use super::*;
 use std::io::Write as _;
 use std::time::{Duration, SystemTime};
 
+use crate::pricing::HourTokens;
 use crate::testutil::{HomeSandbox, set_mtime};
 
 // ── helpers ──────────────────────────────────────────────────────────────────
@@ -897,12 +898,19 @@ fn bucket_activity_sums_counts_under_the_bucket_key() {
     assert_eq!(weeks[0].tool_calls, 12);
 }
 
-fn day_model(date: &str, model: &str, in_out: u64, split: Option<ModelTokens>) -> DayModelTokens {
+fn day_model(
+    date: &str,
+    model: &str,
+    in_out: u64,
+    split: Option<ModelTokens>,
+    hours: Option<[HourTokens; 24]>,
+) -> DayModelTokens {
     DayModelTokens {
         date: date.into(),
         model: model.into(),
         in_out,
         split,
+        hours,
     }
 }
 
@@ -917,11 +925,11 @@ fn period_models_aggregates_range_and_split_flags() {
     };
     let days = vec![
         // Outside the range — must not count.
-        day_model("2026-06-30", "claude-opus-4", 999, None),
+        day_model("2026-06-30", "claude-opus-4", 999, None, None),
         // stats-cache day: in+out only.
-        day_model("2026-07-01", "claude-opus-4", 100, None),
+        day_model("2026-07-01", "claude-opus-4", 100, None, None),
         // transcript day: full split.
-        day_model("2026-07-07", "claude-opus-4", 50, Some(split.clone())),
+        day_model("2026-07-07", "claude-opus-4", 50, Some(split.clone()), None),
         day_model(
             "2026-07-07",
             "gpt-5",
@@ -932,6 +940,7 @@ fn period_models_aggregates_range_and_split_flags() {
                 output: 4,
                 ..Default::default()
             }),
+            None,
         ),
     ];
     let rows = period_models(&days, "2026-07-01", "2026-07-09");
@@ -1014,6 +1023,10 @@ fn load_populates_daily_models_from_stats_cache_and_topup() {
     assert_eq!(cached.model, "claude-opus-4");
     assert_eq!(cached.in_out, 500);
     assert!(cached.split.is_none());
+    assert!(
+        cached.hours.is_none(),
+        "stats-cache days carry no hourly axis"
+    );
     let live = stats
         .daily_models
         .iter()
@@ -1025,6 +1038,13 @@ fn load_populates_daily_models_from_stats_cache_and_topup() {
     assert_eq!(split.output, 100);
     assert_eq!(split.cache_read, 20);
     assert_eq!(split.cache_create, 10);
+    // The 10:30 timestamp buckets the whole line into hour 10.
+    let live_hours = live.hours.expect("transcript days carry per-hour buckets");
+    assert_eq!(live_hours[10].input, 300);
+    assert_eq!(live_hours[10].output, 100);
+    assert_eq!(live_hours[10].cache_read, 20);
+    assert_eq!(live_hours[10].cache_create, 10);
+    assert_eq!(live_hours[9].input, 0);
 }
 
 #[test]
@@ -1078,4 +1098,317 @@ fn today_hours_track_todays_messages() {
     assert_eq!(t.hours[12], 2);
     assert_eq!(t.hours[3], 1);
     assert_eq!(t.hours.iter().sum::<u64>(), 3);
+}
+
+// ── 7. hourly axis ────────────────────────────────────────────────────────────
+
+/// Recs at different hours accumulate into the right `[24]` slots — today's
+/// rollup (per-day and per-model) and post-cutoff `day_models` rows alike,
+/// hour 23 (the last slot) included.
+#[test]
+fn hourly_buckets_accumulate_into_hour_slots() {
+    let sb = HomeSandbox::new();
+    let claude_dir = make_claude_dir(&sb);
+    write_stats_cache(
+        &claude_dir,
+        r#"{
+            "lastComputedDate": "2026-06-10",
+            "totalSessions": 0, "totalMessages": 0,
+            "dailyActivity": [], "dailyModelTokens": [],
+            "modelUsage": {}, "hourCounts": {}
+        }"#,
+    );
+
+    let today = crate::usage::epoch_secs_to_iso(crate::usage::now_epoch_secs());
+    let today_date = today[..10].to_owned();
+
+    let proj_dir = claude_dir.join("projects").join("p1");
+    std::fs::create_dir_all(&proj_dir).expect("create project dir");
+    let p = proj_dir.join("sess.jsonl");
+    let lines = [
+        // Today, hour 12: two distinct lines accumulate into one slot.
+        jsonl_line(
+            &format!("{today_date}T12:00:00+00:00"),
+            "claude-opus-4",
+            100,
+            50,
+            20,
+            5,
+        ),
+        jsonl_line(
+            &format!("{today_date}T12:30:00+00:00"),
+            "claude-opus-4",
+            10,
+            5,
+            0,
+            0,
+        ),
+        // Today, hour 23 — the last slot.
+        jsonl_line(
+            &format!("{today_date}T23:00:00+00:00"),
+            "claude-opus-4",
+            7,
+            3,
+            1,
+            1,
+        ),
+        // Today, a second model at its own hour.
+        jsonl_line(&format!("{today_date}T14:00:00+00:00"), "gpt-5", 1, 1, 0, 0),
+        // Post-cutoff day 2026-06-11: hours 01 and 23, two models.
+        jsonl_line(
+            "2026-06-11T01:00:00+00:00",
+            "claude-opus-4",
+            300,
+            100,
+            20,
+            10,
+        ),
+        jsonl_line("2026-06-11T23:30:00+00:00", "claude-opus-4", 5, 2, 0, 0),
+        jsonl_line("2026-06-11T23:45:00+00:00", "gpt-5", 9, 9, 0, 0),
+    ];
+    std::fs::write(&p, lines.join("\n")).expect("write");
+    set_mtime(&p, SystemTime::now());
+
+    let stats = load(&claude_dir).expect("load");
+
+    // Today's rollup: hour 12 sums both lines, hour 23 holds its line.
+    let t = stats.today.as_ref().expect("today");
+    assert_eq!(t.token_hours[12].input, 110);
+    assert_eq!(t.token_hours[12].output, 55);
+    assert_eq!(t.token_hours[12].cache_read, 20);
+    assert_eq!(t.token_hours[12].cache_create, 5);
+    assert_eq!(t.token_hours[23].input, 7);
+    assert_eq!(t.token_hours[23].output, 3);
+    assert_eq!(t.token_hours[23].cache_read, 1);
+    assert_eq!(t.token_hours[0].input, 0, "unused slots stay empty");
+    // Bucket totals equal the flat day totals.
+    assert_eq!(t.token_hours.iter().map(|h| h.input).sum::<u64>(), t.input);
+    assert_eq!(
+        t.token_hours.iter().map(|h| h.output).sum::<u64>(),
+        t.output
+    );
+    assert_eq!(
+        t.token_hours.iter().map(|h| h.cache_read).sum::<u64>(),
+        t.cache_read
+    );
+    assert_eq!(
+        t.token_hours.iter().map(|h| h.cache_create).sum::<u64>(),
+        t.cache_create
+    );
+
+    // model_hours carries one entry per model, in the same DESC-total order
+    // as `models`.
+    assert_eq!(t.models.len(), 2);
+    assert_eq!(t.model_hours.len(), 2);
+    assert_eq!(t.model_hours[0].model, "claude-opus-4");
+    assert_eq!(t.model_hours[0].hours[12].input, 110);
+    assert_eq!(t.model_hours[0].hours[23].input, 7);
+    assert_eq!(t.model_hours[1].model, "gpt-5");
+    assert_eq!(t.model_hours[1].hours[14].input, 1);
+    assert_eq!(t.model_hours[1].hours[0].output, 0);
+
+    // Post-cutoff day rows carry per-hour splits, hour 23 included.
+    let day = stats
+        .daily_models
+        .iter()
+        .find(|d| d.date == "2026-06-11" && d.model == "claude-opus-4")
+        .expect("day row");
+    let hours = day.hours.expect("transcript rows carry hours");
+    assert_eq!(hours[1].input, 300);
+    assert_eq!(hours[1].output, 100);
+    assert_eq!(hours[1].cache_read, 20);
+    assert_eq!(hours[1].cache_create, 10);
+    assert_eq!(hours[23].input, 5);
+    assert_eq!(hours[23].output, 2);
+    assert_eq!(hours[12].input, 0);
+    let gpt = stats
+        .daily_models
+        .iter()
+        .find(|d| d.date == "2026-06-11" && d.model == "gpt-5")
+        .expect("gpt row");
+    assert_eq!(gpt.hours.expect("hours")[23].input, 9);
+    assert_eq!(gpt.hours.expect("hours")[23].output, 9);
+}
+
+/// Today's hour buckets dedupe exactly like the flat fields: a response
+/// mirrored into two transcripts counts once in `token_hours` and once in
+/// `model_hours`, not per copy.
+#[test]
+fn today_hour_buckets_dedupe_like_the_flat_fields() {
+    let sb = HomeSandbox::new();
+    let claude_dir = make_claude_dir(&sb);
+    write_stats_cache(
+        &claude_dir,
+        r#"{
+            "lastComputedDate": "2026-06-10",
+            "totalSessions": 0, "totalMessages": 0,
+            "dailyActivity": [], "dailyModelTokens": [],
+            "modelUsage": {}, "hourCounts": {}
+        }"#,
+    );
+
+    let today = crate::usage::epoch_secs_to_iso(crate::usage::now_epoch_secs());
+    let today_date = today[..10].to_owned();
+    let ts = format!("{today_date}T12:00:00+00:00");
+
+    let proj_dir = claude_dir.join("projects").join("p1");
+    std::fs::create_dir_all(&proj_dir).expect("create project dir");
+    let line = jsonl_line_with_ids(&ts, "req_1", "msg_1", "claude-opus-4", 100, 50);
+    for name in ["a.jsonl", "b.jsonl"] {
+        let f = proj_dir.join(name);
+        std::fs::write(&f, format!("{line}\n")).expect("write");
+        set_mtime(&f, SystemTime::now());
+    }
+
+    let stats = load(&claude_dir).expect("load");
+    let t = stats.today.as_ref().expect("today");
+    assert_eq!(t.input, 100);
+    assert_eq!(t.output, 50);
+    assert_eq!(
+        t.token_hours[12].input, 100,
+        "hour buckets follow the same dedup"
+    );
+    assert_eq!(t.token_hours[12].output, 50);
+    assert_eq!(t.token_hours.iter().map(|h| h.input).sum::<u64>(), 100);
+    assert_eq!(t.models.len(), 1);
+    assert_eq!(t.model_hours.len(), 1);
+    assert_eq!(t.model_hours[0].model, "claude-opus-4");
+    assert_eq!(t.model_hours[0].hours[12].input, 100);
+    assert_eq!(t.model_hours[0].hours[12].output, 50);
+    assert_eq!(t.model_hours[0].hours[0].output, 0);
+}
+
+/// `period_models` carries one [`PeriodDay`] row per split-bearing day, in
+/// date order regardless of input order, with the hours passed through when
+/// the source row carried them. Days without a split keep the existing
+/// `split_complete = false` floor semantics and produce no row.
+#[test]
+fn period_models_carries_per_day_split_rows_in_date_order() {
+    let mut h03 = [HourTokens::default(); 24];
+    h03[2] = HourTokens {
+        input: 30,
+        output: 20,
+        cache_read: 500,
+        cache_create: 5,
+    };
+    let mut h07 = [HourTokens::default(); 24];
+    h07[9] = HourTokens {
+        input: 12,
+        output: 8,
+        cache_read: 0,
+        cache_create: 0,
+    };
+    let split_03 = ModelTokens {
+        model: "claude-opus-4".into(),
+        input: 30,
+        output: 20,
+        cache_read: 500,
+        cache_create: 5,
+    };
+    let split_07 = ModelTokens {
+        model: "claude-opus-4".into(),
+        input: 12,
+        output: 8,
+        cache_read: 0,
+        cache_create: 0,
+    };
+
+    let days = vec![
+        // Split-bearing, out of date order on purpose.
+        day_model("2026-07-07", "claude-opus-4", 20, Some(split_07), Some(h07)),
+        // stats-cache day: contributes in+out and the incomplete flag only.
+        day_model("2026-07-01", "claude-opus-4", 100, None, None),
+        // Split-bearing without hours (a v1-ledger row) — hours stay None.
+        day_model(
+            "2026-07-05",
+            "gpt-5",
+            10,
+            Some(ModelTokens {
+                model: "gpt-5".into(),
+                input: 6,
+                output: 4,
+                ..Default::default()
+            }),
+            None,
+        ),
+        day_model("2026-07-03", "claude-opus-4", 50, Some(split_03), Some(h03)),
+    ];
+    let rows = period_models(&days, "2026-07-01", "2026-07-09");
+    assert_eq!(rows.len(), 2);
+
+    let opus = rows
+        .iter()
+        .find(|r| r.model == "claude-opus-4")
+        .expect("opus");
+    assert_eq!(opus.in_out, 170); // 100 + 50 + 20
+    assert!(
+        !opus.split_complete,
+        "the stats-cache day keeps the floor semantics"
+    );
+    assert_eq!(
+        opus.days.len(),
+        2,
+        "only split-bearing days get PeriodDay rows"
+    );
+    assert_eq!(
+        opus.days[0].date, "2026-07-03",
+        "date order regardless of input order"
+    );
+    assert_eq!(opus.days[1].date, "2026-07-07");
+    assert_eq!(opus.days[0].split.input, 30);
+    assert_eq!(opus.days[0].hours.expect("hours")[2].cache_read, 500);
+    assert_eq!(opus.days[1].hours.expect("hours")[9].input, 12);
+    // split sums the two split-bearing days only.
+    assert_eq!(opus.split.input, 42);
+    assert_eq!(opus.split.output, 28);
+
+    let gpt = rows.iter().find(|r| r.model == "gpt-5").expect("gpt");
+    assert!(gpt.split_complete);
+    assert_eq!(gpt.days.len(), 1);
+    assert_eq!(gpt.days[0].date, "2026-07-05");
+    assert_eq!(gpt.days[0].split.input, 6);
+    assert!(
+        gpt.days[0].hours.is_none(),
+        "a split-bearing row without hours keeps None"
+    );
+}
+
+/// [`file_hourly_model_tokens`] splits one multi-day transcript file by
+/// (model, day) with the per-hour slots each line's timestamp lands in.
+#[test]
+fn file_hourly_model_tokens_splits_by_model_and_day() {
+    let sb = HomeSandbox::new();
+    let claude_dir = make_claude_dir(&sb);
+    let proj_dir = claude_dir.join("projects").join("p1");
+    std::fs::create_dir_all(&proj_dir).expect("create project dir");
+    let p = proj_dir.join("sess.jsonl");
+    let lines = [
+        jsonl_line("2026-06-11T10:00:00+00:00", "claude-opus-4", 100, 50, 0, 0),
+        jsonl_line("2026-06-11T10:30:00+00:00", "claude-opus-4", 20, 5, 0, 0),
+        jsonl_line("2026-06-11T22:00:00+00:00", "gpt-5", 7, 3, 0, 0),
+        jsonl_line("2026-06-12T01:00:00+00:00", "claude-opus-4", 400, 100, 0, 0),
+    ];
+    std::fs::write(&p, lines.join("\n")).expect("write");
+    set_mtime(&p, SystemTime::now());
+
+    let rows = file_hourly_model_tokens(&p);
+    assert_eq!(rows.len(), 3, "one row per (model, day) pair");
+    let opus_11 = rows
+        .iter()
+        .find(|r| r.model == "claude-opus-4" && r.day == "2026-06-11")
+        .expect("opus day 11");
+    assert_eq!(opus_11.hours[10].input, 120, "both hour-10 lines sum");
+    assert_eq!(opus_11.hours[10].output, 55);
+    assert_eq!(opus_11.hours[22].input, 0, "opus never ran at 22:00");
+    let opus_12 = rows
+        .iter()
+        .find(|r| r.model == "claude-opus-4" && r.day == "2026-06-12")
+        .expect("opus day 12");
+    assert_eq!(opus_12.hours[1].input, 400);
+    assert_eq!(opus_12.hours[0].input, 0);
+    let gpt = rows.iter().find(|r| r.model == "gpt-5").expect("gpt row");
+    assert_eq!(gpt.day, "2026-06-11");
+    assert_eq!(gpt.hours[22].input, 7);
+    assert_eq!(gpt.hours[22].output, 3);
+    assert_eq!(gpt.hours[10].input, 0);
 }

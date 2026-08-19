@@ -200,11 +200,8 @@ pub(crate) struct RateSnapshot {
     pub(crate) models: Vec<PricedModel>,
 }
 
-/// Per-hour token buckets behind [`PriceTable::cost_day`]. Pricing-local for
-/// now — slice B moves this onto the hourly axis and re-exports it from
-/// `crate::tokens`.
+/// Per-hour token buckets behind [`PriceTable::cost_day`].
 #[derive(Debug, Clone, Copy, Default)]
-#[allow(dead_code)] // slice B contract: the hourly axis consumes this next
 pub(crate) struct HourTokens {
     pub(crate) input: u64,
     pub(crate) output: u64,

@@ -1130,6 +1130,57 @@ fn mirror_tree_survives_a_dangling_runtime_link() {
     );
 }
 
+/// The skip predicate is written to the OUTCOME, not to symlinks. A regular file
+/// unlinked between `merge_path`'s `symlink_metadata` and its follow-through
+/// answers the same "present but unfollowable" shape, and `mirror_tree` walks
+/// lockless by its own doc, so a file vanishing mid-walk is ordinary rather than
+/// exotic. Narrow the predicate back to `is_symlink` and this pair reaches
+/// `files_match`, which fails the whole tick on an ENOENT — the exact class the
+/// guard exists to close.
+///
+/// Driven as a unit because the race cannot be posed as a static fixture: the
+/// two stats have to straddle the unlink, which is what this reproduces exactly.
+#[test]
+fn an_entry_that_vanished_mid_walk_reads_as_unresolvable() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let victim = tmp.path().join("vanishes.json");
+    fs::write(&victim, b"{}").expect("write victim");
+
+    // The stat the walk already took, before the unlink it cannot see.
+    let meta = victim.symlink_metadata().expect("stat before the unlink");
+    assert!(
+        !meta.file_type().is_symlink(),
+        "fixture poses nothing unless the entry is a REGULAR file"
+    );
+    fs::remove_file(&victim).expect("unlink under the walk");
+
+    assert!(
+        is_unresolvable_entry(&victim, Some(&meta)),
+        "a file unlinked between the two stats must be skipped, not merged"
+    );
+}
+
+/// A symlink LOOP is the third shape the predicate's doc names: `symlink_metadata`
+/// succeeds on the link, and `exists()` is false because `Path::exists` swallows
+/// ELOOP the same way it swallows ENOENT. Pins the doc's claim rather than a
+/// branch — the wide predicate and the old narrow one both catch this one.
+#[cfg(unix)]
+#[test]
+fn a_symlink_loop_reads_as_unresolvable() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let a = tmp.path().join("a");
+    let b = tmp.path().join("b");
+    std::os::unix::fs::symlink("b", &a).expect("symlink a -> b");
+    std::os::unix::fs::symlink("a", &b).expect("symlink b -> a");
+
+    let meta = a.symlink_metadata().expect("the link itself stats fine");
+    assert!(
+        !a.exists(),
+        "fixture poses nothing unless the loop is unfollowable"
+    );
+    assert!(is_unresolvable_entry(&a, Some(&meta)));
+}
+
 /// Two `~/.claude` names resolving to ONE file must converge on the CLOCK, not on
 /// filename sort order. `union_children` sorts, so the first name's runtime copy
 /// is published onto the shared target and stamps it with mtime-now; the second

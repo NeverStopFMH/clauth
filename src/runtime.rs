@@ -3177,23 +3177,33 @@ fn merge_path(a: &Path, b: &Path, classes: &mut AliasClasses) -> Result<()> {
     let a_meta = a.symlink_metadata().ok();
     let b_meta = b.symlink_metadata().ok();
 
-    // A dangling link on EITHER side costs this one name, never the tick. Its
-    // path is occupied — `symlink_metadata` stats the link — while every read,
-    // write and stat THROUGH it answers ENOENT, so each branch below misfires on
-    // it: `files_match` and `copy_file` read through the link, and the directory
-    // branch sees `exists()` false and calls a recursive create that returns
-    // EEXIST rather than succeeding. One moved-aside `~/.claude` target would
-    // otherwise take down every reconcile pass on a copy-transport host.
+    // An entry EITHER side has but nothing can follow costs this one name, never
+    // the tick. Its path is occupied — `symlink_metadata` sees it — while every
+    // read, write and stat through it fails, so each branch below misfires on it:
+    // `files_match` and `copy_file` read through it, and the directory branch
+    // sees `exists()` false and calls a recursive create that returns EEXIST
+    // rather than succeeding. One moved-aside `~/.claude` target would otherwise
+    // take down every reconcile pass on a copy-transport host.
     //
     // Skipped whole, never unlinked: the mirror is additive and "not yet seen"
     // is already its vocabulary for a name it cannot merge. Canonical is the
     // OPERATOR's tree, so a link there is their intent, and the runtime side's
     // self-heal belongs to `prune_dangling_links` at build time.
     //
-    // Soft edge, same one `prune_dangling_links` documents: `Path::exists`
+    // Two accepted limits, both PERMANENT rather than one-tick, because the skip
+    // is unconditional and mutates neither side, so nothing re-converges them:
+    //
+    // - a canonical dangling link with a real runtime FILE under the same name
+    //   strands that file. Real symlink mode would not: a write through a
+    //   dangling link creates the target and leaves the link a link (measured on
+    //   Linux), so fake mode diverges here rather than emulating.
+    // - a dangling canonical DIRECTORY link stalls that whole subtree, not one
+    //   name.
+    //
+    // Plus the soft edge `prune_dangling_links` documents: `Path::exists`
     // swallows every stat error, so a live link over a dropped mount reads as
-    // dangling and is skipped for that tick.
-    if is_dangling_link(a, a_meta.as_ref()) || is_dangling_link(b, b_meta.as_ref()) {
+    // unresolvable and is skipped for that tick.
+    if is_unresolvable_entry(a, a_meta.as_ref()) || is_unresolvable_entry(b, b_meta.as_ref()) {
         return Ok(());
     }
 
@@ -3320,15 +3330,20 @@ fn write_target(p: &Path) -> PathBuf {
     }
 }
 
-/// Is `p` a symlink whose target no longer resolves? Takes the caller's
-/// already-taken `symlink_metadata` so the link's own file type and the
+/// Does `p` name an entry that exists but cannot be followed? Takes the caller's
+/// already-taken `symlink_metadata` so the entry's presence and the
 /// follow-through `exists()` describe one stat pair rather than two.
 ///
-/// The `is_symlink` half states the shape rather than narrowing it — nothing but
-/// a link can answer `symlink_metadata` Ok and `exists()` false — so dropping it
-/// leaves the whole suite green (measured). It stays for the reader.
-fn is_dangling_link(p: &Path, meta: Option<&std::fs::Metadata>) -> bool {
-    meta.is_some_and(|m| m.file_type().is_symlink()) && !p.exists()
+/// Deliberately not "is this a dangling symlink". Four shapes answer yes, and
+/// [`merge_path`] fails identically on all four, so the predicate is written to
+/// the outcome rather than to one cause: a link whose target is gone, a link that
+/// loops (ELOOP), a regular file unlinked between the caller's
+/// `symlink_metadata` and this `exists()`, and a parent that lost `+x` in the
+/// same window. `mirror_tree` walks lockless by its own doc, so both races are
+/// ordinary. `Path::exists` swallowing every stat error is what folds EACCES and
+/// ELOOP in beside ENOENT.
+fn is_unresolvable_entry(p: &Path, meta: Option<&std::fs::Metadata>) -> bool {
+    meta.is_some() && !p.exists()
 }
 
 fn mtime_newer(a: Option<SystemTime>, b: Option<SystemTime>) -> bool {

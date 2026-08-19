@@ -235,6 +235,14 @@ fn drive(server: &ClauthServer, args: DelegateArgs) -> CallToolResult {
         .expect("runtime");
     let result = rt.block_on(async { server.delegate_with(args, ProgressSink::none()).await });
 
+    // Same reason as `mcp_delegate_args::call_delegate`: the detached tasks are
+    // joined while `rt` is still alive, because a queued `spawn_blocking` task
+    // is discarded un-run when its runtime shuts down. Each task's pane report
+    // is written and waited on before its completion send, so the shim's log is
+    // final here too.
+    crate::testutil::join_background_tasks();
+    drop(rt);
+
     // SAFETY: same as above — restore the prior value.
     unsafe {
         match &saved {
@@ -252,33 +260,6 @@ fn drive(server: &ClauthServer, args: DelegateArgs) -> CallToolResult {
 fn pinned_server(home: &HomeSandbox, pane: &str, shim: &Path) -> ClauthServer {
     let _pin = EnvPin::new(home, Some(pane), Some(shim));
     ClauthServer::new().with_herdr_pane(PaneReporter::resolve())
-}
-
-/// Hold the sandbox until `count` jobs reach done, so their `write_done`
-/// lands under the sandbox and never the real `~/.clauth` (mirrors
-/// `mcp_delegate_args::wait_for_jobs_done`).
-fn wait_for_jobs_done(count: usize) {
-    let deadline = Instant::now() + Duration::from_secs(10);
-    loop {
-        let done = jobs::jobs_dir()
-            .ok()
-            .and_then(|d| std::fs::read_dir(d).ok())
-            .map(|rd| {
-                rd.flatten()
-                    .filter_map(|e| {
-                        let id = e.path().file_stem()?.to_str()?.to_string();
-                        jobs::read(&id).map(|r| r.state == jobs::JobState::Done)
-                    })
-                    .filter(|done| *done)
-                    .count()
-            })
-            .unwrap_or(0);
-        if done >= count {
-            return;
-        }
-        assert!(Instant::now() < deadline, "jobs never reached done");
-        std::thread::sleep(Duration::from_millis(20));
-    }
 }
 
 // ── gating: what `PaneReporter::resolve` accepts ─────────────────────────────
@@ -520,26 +501,24 @@ fn fanout_reports_working_once_and_idle_last() {
         },
     );
     assert_ne!(result.is_error, Some(true), "the fan-out is accepted");
-    // Both finalizes precede their task's idle report (the end-guard drops
-    // after `write_done`), so both episodes are paired off once every working
-    // has its idle. Waiting on the LAST APPENDED line instead would be a race:
-    // `report` holds no lock, two of them run at once, and the shim writing
-    // second is not the report minted second.
-    wait_for_jobs_done(2);
-    let deadline = Instant::now() + Duration::from_secs(20);
-    let lines = loop {
-        let mut lines = report_lines(home.home());
-        lines.sort_by_key(|line| seq_of(line));
-        let idles = lines.iter().filter(|l| state_of(l) == Some("idle")).count();
-        if idles > 0 && idles * 2 == lines.len() {
-            break lines;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "reports never paired off after both jobs finalized: {lines:?}"
-        );
-        std::thread::sleep(Duration::from_millis(10));
-    };
+    // `drive` joins both tasks before it returns, and each reports its idle —
+    // waiting on the shim child — before its completion send, so the log is
+    // final here and needs no second wall clock. Sorting by seq is still
+    // needed: `report` holds no lock, two of them run at once, and the shim
+    // writing second is not the report minted second.
+    assert_eq!(
+        crate::testutil::pending_background_tasks(),
+        0,
+        "`drive` joined both detached tasks before dropping its runtime"
+    );
+    crate::testutil::assert_jobs_done(2);
+    let mut lines = report_lines(home.home());
+    lines.sort_by_key(|line| seq_of(line));
+    let idles = lines.iter().filter(|l| state_of(l) == Some("idle")).count();
+    assert!(
+        idles > 0 && idles * 2 == lines.len(),
+        "one idle per working once both jobs finalized: {lines:?}"
+    );
     // Two in-flight episodes (tasks overlap or not): one working + one idle
     // per episode, so two or four lines — the count transitions decide.
     assert!(

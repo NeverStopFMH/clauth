@@ -1050,6 +1050,16 @@ pub(crate) fn clear_home_override() {
     }
 }
 
+/// Whether some live guard is currently redirecting [`home_dir`]. The question
+/// it answers is "is a sandbox alive to own what I am about to register", not
+/// "does THIS thread hold it": every redirect (`testutil::HomeSandbox`,
+/// runtime's `with_fake_home`) sets the override for exactly its own lifetime
+/// while holding `HOME_TEST_LOCK`, so a set override means one of them is live.
+#[cfg(test)]
+pub(crate) fn home_override_active() -> bool {
+    HOME_OVERRIDE.lock().is_ok_and(|g| g.is_some())
+}
+
 /// The home every `~/.clauth` and `~/.claude` path is built from. Under `cfg(test)`
 /// the override is the ONLY answer: falling back to the operator's real home there
 /// writes into their live tree and takes the `~/.clauth/.lock` a running clauth

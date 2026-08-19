@@ -4474,14 +4474,39 @@ fn arm_detach_gate() -> std::sync::mpsc::Sender<()> {
 
 /// Block if a test armed [`arm_detach_gate`]; a no-op otherwise (production,
 /// or a test that never arms it).
+///
+/// Bounded, and it says so when the bound fires. A test that arms the gate and
+/// then dies before releasing it would otherwise park this task forever, and
+/// the sandbox teardown waiting on the task turns that into a CI run that times
+/// out naming nothing. Releasing ourselves after the bound lets the run reach
+/// its real assertion instead. The number is a hang detector: the only caller
+/// releases within ~100ms.
 #[cfg(test)]
 fn detach_test_gate() {
+    detach_test_gate_with(DETACH_GATE_TIMEOUT);
+}
+
+/// How long [`detach_test_gate`] waits for its release. A hang detector, not a
+/// race bound: the only caller releases within ~100ms.
+#[cfg(test)]
+const DETACH_GATE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// [`detach_test_gate`] against a caller-supplied bound, so the timeout branch
+/// can be exercised without a test that waits out the real one.
+#[cfg(test)]
+fn detach_test_gate_with(timeout: std::time::Duration) {
     let armed = DETACH_START_GATE
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .take();
-    if let Some(rx) = armed {
-        let _ = rx.recv();
+    if let Some(rx) = armed
+        && let Err(std::sync::mpsc::RecvTimeoutError::Timeout) = rx.recv_timeout(timeout)
+    {
+        crate::out::errln!(
+            "clauth: the detach start gate was never released ({timeout:?}) — a test armed \
+             `arm_detach_gate` and did not send; proceeding so the run fails on its own \
+             assertion instead of hanging"
+        );
     }
 }
 

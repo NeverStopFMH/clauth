@@ -71,6 +71,15 @@ fn call_delegate(args: DelegateArgs) -> CallToolResult {
         .expect("runtime");
     let result = rt.block_on(async { server.delegate_with(args, ProgressSink::none()).await });
 
+    // Join the fan-out's DETACHED background tasks while `rt` is still alive,
+    // then drop it. `spawn_blocking` schedules non-mandatory work: a task still
+    // queued when its runtime shuts down is discarded un-run, so dropping `rt`
+    // here first leaves a job at `running` that nothing will ever finalize.
+    // Measured under load: two tasks spawned, one never entered its closure,
+    // its job still `running` after 120s.
+    crate::testutil::join_background_tasks();
+    drop(rt);
+
     // SAFETY: same as above — restore the prior value.
     unsafe {
         match &saved {
@@ -124,36 +133,6 @@ fn assert_prose_refusal(result: &CallToolResult, needles: &[&str]) {
     );
     for needle in needles {
         assert!(text.contains(needle), "the prose names {needle:?}: {text}");
-    }
-}
-
-/// Poll the sandbox jobs dir until `count` jobs reached `done`, holding the home
-/// override alive so their `write_done` lands under the sandbox, never the real
-/// `~/.clauth`.
-fn wait_for_jobs_done(count: usize) {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-    loop {
-        let done = jobs::jobs_dir()
-            .ok()
-            .and_then(|d| std::fs::read_dir(d).ok())
-            .map(|rd| {
-                rd.flatten()
-                    .filter_map(|e| {
-                        let id = e.path().file_stem()?.to_str()?.to_string();
-                        jobs::read(&id).map(|r| r.state == jobs::JobState::Done)
-                    })
-                    .filter(|done| *done)
-                    .count()
-            })
-            .unwrap_or(0);
-        if done >= count {
-            return;
-        }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "jobs never reached done"
-        );
-        std::thread::sleep(std::time::Duration::from_millis(20));
     }
 }
 
@@ -817,7 +796,7 @@ fn a_valid_fanout_returns_one_job_per_account() {
 
     // Hold the sandbox until both detached tasks finish, so their `write_done`
     // lands under the sandbox and never the real `~/.clauth`.
-    wait_for_jobs_done(2);
+    crate::testutil::assert_jobs_done(2);
 }
 
 /// Two or more names without `background` now fan out and wait for every
@@ -915,7 +894,7 @@ fn a_background_handle_carries_the_targets_live_usage_footer() {
         "the handle names the target's headroom: {text}",
     );
 
-    wait_for_jobs_done(1);
+    crate::testutil::assert_jobs_done(1);
 }
 
 /// The fan-out sibling: every job row carries its OWN target's headroom, so a
@@ -955,7 +934,7 @@ fn a_fanout_reply_carries_headroom_for_every_target() {
         "the fan-out reply is still one line: {text}",
     );
 
-    wait_for_jobs_done(2);
+    crate::testutil::assert_jobs_done(2);
 }
 
 #[test]
@@ -1029,7 +1008,7 @@ fn fanout_prose_names_each_target_with_its_job() {
         "names each target with its job: {text}"
     );
 
-    wait_for_jobs_done(2);
+    crate::testutil::assert_jobs_done(2);
 }
 
 /// [`fanout_is_error`] is true only when every row errored: one bad account in
@@ -1209,4 +1188,54 @@ fn fold_fanout_rows_ages_a_rate_limit_off_after_the_recent_window() {
         "a rate-limit past the recent window ages off: {}",
         stale[0]["live_usage"],
     );
+}
+
+// ── the fan-out's detached tasks ─────────────────────────────────────────────
+
+/// `call_delegate` must join the fan-out's detached tasks while its runtime is
+/// still alive.
+///
+/// `tokio::task::spawn_blocking` schedules NON-MANDATORY work: a task still
+/// queued when its runtime shuts down is discarded un-run. Measured on a loaded
+/// box, twice, on two different fan-out tests: two tasks spawned, one never
+/// entered its closure, and its job sat at `running` past 120s. Through the
+/// 10s wall clock the module used to poll, that read as a timeout — always
+/// within 60ms of the ceiling, one whole-suite release run in three, in a
+/// module the diff under test never touched. The deadline was the symptom.
+///
+/// Pinned on the join rather than on the job states, because the job states
+/// only red when the race happens to bite; an empty registry reds every time
+/// the join is gone.
+#[test]
+fn a_fanout_joins_its_detached_tasks_before_the_driver_returns() {
+    let home = HomeSandbox::new();
+    seed_profiles(&["solo", "vendor"], false);
+
+    let result = call_delegate(DelegateArgs {
+        profiles: Some(vec!["solo".to_string(), "vendor".to_string()]),
+        prompt: Some("hi".to_string()),
+        background: Some(true),
+        // Stops each detached task at the cwd gate, so no `claude` spawns.
+        cwd: Some(
+            home.home()
+                .join("does-not-exist")
+                .to_str()
+                .unwrap()
+                .to_string(),
+        ),
+        ..base()
+    });
+    assert_ne!(
+        result.is_error,
+        Some(true),
+        "a valid fan-out is not an error"
+    );
+
+    assert_eq!(
+        crate::testutil::pending_background_tasks(),
+        0,
+        "the driver joined both detached tasks before dropping its runtime; \
+         leaving them to teardown lets the runtime discard a queued one un-run"
+    );
+    crate::testutil::assert_jobs_done(2);
 }

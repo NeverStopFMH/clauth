@@ -72,6 +72,15 @@ impl Drop for HomeSandbox {
 static BACKGROUND_TASK_DONE: std::sync::Mutex<Vec<std::sync::mpsc::Receiver<()>>> =
     std::sync::Mutex::new(Vec::new());
 
+/// How long [`join_background_tasks`] waits on one detached task before it
+/// gives up and says so. A hang detector, not a race bound: every task that
+/// registers here finishes in milliseconds, so nothing legitimate comes close.
+/// The point of bounding it at all is that an unbounded `recv` turns a stuck
+/// task into a CI job that times out with no output naming what it was waiting
+/// on.
+#[cfg(test)]
+const BACKGROUND_TASK_JOIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
 /// Register a detached task's completion receiver so [`HomeSandbox::drop`]
 /// can block on it before it clears the home override. The returned sender is
 /// the task's contract: send on it as the LAST action, after every
@@ -79,8 +88,20 @@ static BACKGROUND_TASK_DONE: std::sync::Mutex<Vec<std::sync::mpsc::Receiver<()>>
 /// inside the task drops in reverse declaration order and therefore lands
 /// AFTER the send, so any guard whose `Drop` reaches `$HOME` has to be dropped
 /// explicitly before it.
+///
+/// Panics when no home sandbox is alive. The registry is process-global, so a
+/// receiver pushed with nothing to drain it sits there until some later,
+/// unrelated test's teardown blocks on a task that test never launched — a
+/// failure that names the wrong test and reads as a hang in it. Failing at the
+/// registration names the caller instead.
 #[cfg(test)]
 pub(crate) fn register_background_task() -> std::sync::mpsc::Sender<()> {
+    assert!(
+        crate::profile::home_override_active(),
+        "a background task was registered with no home sandbox alive — hold a \
+         `HomeSandbox` across the launch, or its completion signal outlives this \
+         test and blocks an unrelated one's teardown"
+    );
     let (tx, rx) = std::sync::mpsc::channel();
     if let Ok(mut done) = BACKGROUND_TASK_DONE.lock() {
         done.push(rx);
@@ -88,17 +109,102 @@ pub(crate) fn register_background_task() -> std::sync::mpsc::Sender<()> {
     tx
 }
 
-/// Block until every task registered via [`register_background_task`] has
-/// signaled completion.
+/// How many registered tasks have not been joined yet. Lets a test pin that a
+/// driver joined its own detached work rather than leaving it to teardown.
 #[cfg(test)]
-fn join_background_tasks() {
+pub(crate) fn pending_background_tasks() -> usize {
+    BACKGROUND_TASK_DONE.lock().map(|d| d.len()).unwrap_or(0)
+}
+
+/// Block until every task registered via [`register_background_task`] has
+/// signaled completion, or [`BACKGROUND_TASK_JOIN_TIMEOUT`] elapses on one.
+///
+/// A disconnected channel is a finished wait, not a failure: a task that
+/// panics drops its sender while unwinding, and the panic itself is what the
+/// run should report.
+///
+/// Callable while a runtime is still alive, which is the point — a
+/// `tokio::task::spawn_blocking` task is scheduled NON-MANDATORY, so dropping
+/// its runtime while it is still queued discards it un-run (measured: two
+/// detached fan-out delegates spawned, one never entered its closure, its job
+/// left `running` past 120s). Draining here, before the drop, is what makes the
+/// task's completion something a test can rely on.
+#[cfg(test)]
+pub(crate) fn join_background_tasks() {
+    join_background_tasks_with(BACKGROUND_TASK_JOIN_TIMEOUT);
+}
+
+/// [`join_background_tasks`] against a caller-supplied bound, so the timeout
+/// branch can be exercised without a test that waits out the real one.
+#[cfg(test)]
+pub(crate) fn join_background_tasks_with(timeout: std::time::Duration) {
     let pending: Vec<_> = BACKGROUND_TASK_DONE
         .lock()
         .map(|mut d| std::mem::take(&mut *d))
         .unwrap_or_default();
     for rx in pending {
-        let _ = rx.recv();
+        if let Err(std::sync::mpsc::RecvTimeoutError::Timeout) = rx.recv_timeout(timeout) {
+            let msg = format!(
+                "a detached background task did not signal completion within {:?} \
+                 (`testutil::join_background_tasks`); it is stuck before its final \
+                 send, so the home override cannot be cleared safely",
+                timeout
+            );
+            // This runs inside `HomeSandbox::drop`, where panicking during an
+            // unwind aborts the process and buries the original failure.
+            if std::thread::panicking() {
+                crate::out::errln!("clauth: {msg}");
+            } else {
+                panic!("{msg}");
+            }
+        }
     }
+}
+
+/// Every delegate job in the sandbox's store, as `id=state` pairs, sorted so a
+/// failure message reads the same twice.
+#[cfg(test)]
+fn job_states() -> Vec<(String, crate::mcp::jobs::JobState)> {
+    let mut out: Vec<_> = crate::mcp::jobs::jobs_dir()
+        .ok()
+        .and_then(|dir| std::fs::read_dir(dir).ok())
+        .map(|entries| {
+            entries
+                .flatten()
+                .filter_map(|e| {
+                    let id = e.path().file_stem()?.to_str()?.to_string();
+                    let record = crate::mcp::jobs::read(&id)?;
+                    Some((id, record.state))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    out
+}
+
+/// Assert that exactly `count` delegate jobs in the sandbox's store reached
+/// `done` — so a job left at `running` reds, which is the shape the wall clock
+/// this replaces reported as a timeout.
+///
+/// A plain assertion, not a poll. Every driver joins its detached tasks before
+/// it returns, and a task writes its job file BEFORE its completion send, so
+/// the store is final by the time a test reaches here. It replaces two copies
+/// of a helper that polled a 10s wall clock instead — which reported a task
+/// that never ran as a timeout, always within 60ms of the ceiling, in one
+/// whole-suite release run out of three, in a module the diff under test never
+/// touched.
+#[cfg(test)]
+pub(crate) fn assert_jobs_done(count: usize) {
+    let states = job_states();
+    let done = states
+        .iter()
+        .filter(|(_, state)| *state == crate::mcp::jobs::JobState::Done)
+        .count();
+    assert_eq!(
+        done, count,
+        "every job the run created is finalized once its driver returns: {states:?}"
+    );
 }
 
 // ── printable-escape-hatch probes ────────────────────────────────────────────

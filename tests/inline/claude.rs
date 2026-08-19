@@ -486,6 +486,7 @@ fn build_settings_writes_model_knobs() {
 /// from it makes that tier's ONLY-set case a silent no-write.
 #[test]
 fn a_tier_override_alone_is_enough_to_write_settings() {
+    let _home = crate::testutil::HomeSandbox::new();
     let tmp = tempfile::tempdir().expect("tempdir");
     let base = tmp.path().join("settings.json"); // absent → nothing to merge onto
     let mut profile = crate::profile::Profile::new("p".to_string(), None, None);

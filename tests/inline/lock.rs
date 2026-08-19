@@ -65,6 +65,7 @@ fn cross_thread_with_state_lock_serializes() {
 /// Same-thread nested `with_state_lock` calls must not deadlock.
 #[test]
 fn same_thread_reentrancy_does_not_deadlock() {
+    let _home = crate::testutil::HomeSandbox::new();
     let result = with_state_lock(|| with_state_lock(|| with_state_lock(|| Ok(42u32))));
     assert_eq!(result.unwrap(), 42);
 }
@@ -76,6 +77,8 @@ fn same_thread_reentrancy_does_not_deadlock() {
 #[test]
 fn poison_recovery_after_panicking_closure() {
     use std::panic::{AssertUnwindSafe, catch_unwind};
+
+    let _home = crate::testutil::HomeSandbox::new();
 
     let panicked = catch_unwind(AssertUnwindSafe(|| {
         let _guard = StateLock::acquire().expect("acquire before panic");

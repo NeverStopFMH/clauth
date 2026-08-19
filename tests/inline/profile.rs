@@ -2194,3 +2194,30 @@ fn the_pre_rename_session_feed_key_is_not_carried() {
         "installs that ran the feature branch re-run `clauth rolling-token <p>` once"
     );
 }
+
+/// A test that forgets its sandbox must fail rather than reach the operator's
+/// tree: `~/.clauth` is live state a running clauth writes and flocks, so a
+/// stray write lands in their accounts and a stray `~/.clauth/.lock` wait times
+/// the test out on contention it never staged.
+#[test]
+fn resolving_a_home_with_no_sandbox_held_panics() {
+    // Hold the lock a sandbox holds and set NO override: under a shared-process
+    // runner a parallel sandbox would otherwise answer this call.
+    let _guard = HOME_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+    let reached = std::panic::catch_unwind(|| home_dir().map(|p| p.display().to_string()));
+
+    let payload = match reached {
+        Ok(home) => panic!("a sandbox-less test resolved a home instead of panicking: {home:?}"),
+        Err(payload) => payload,
+    };
+    let message = payload
+        .downcast_ref::<&str>()
+        .map(|s| (*s).to_string())
+        .or_else(|| payload.downcast_ref::<String>().cloned())
+        .unwrap_or_default();
+    assert!(
+        message.contains("HomeSandbox"),
+        "the panic must name the fix, got: {message}"
+    );
+}

@@ -283,7 +283,10 @@ fn is_cargo_installed() -> bool {
     let Ok(exe) = env::current_exe() else {
         return false;
     };
-    let Some(home) = dirs::home_dir() else {
+    // Through `profile::home_dir` rather than `dirs` directly: that resolver is
+    // the one a test can redirect, so this stays inside the sandbox with every
+    // other home-derived path.
+    let Ok(home) = crate::profile::home_dir() else {
         return false;
     };
     exe.starts_with(home.join(".cargo").join("bin"))

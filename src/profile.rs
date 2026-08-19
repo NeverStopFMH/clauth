@@ -1050,12 +1050,28 @@ pub(crate) fn clear_home_override() {
     }
 }
 
+/// The home every `~/.clauth` and `~/.claude` path is built from. Under `cfg(test)`
+/// the override is the ONLY answer: falling back to the operator's real home there
+/// writes into their live tree and takes the `~/.clauth/.lock` a running clauth
+/// holds, so the test fails on contention it never staged while disturbing the
+/// operator it never meant to touch. Panicking names the test that forgot its
+/// sandbox at the moment it reaches for the home, which a returned `Err` would not:
+/// callers that read a home path through `.ok()` swallow one and go quiet again.
 pub(crate) fn home_dir() -> Result<PathBuf> {
     #[cfg(test)]
-    if let Some(path) = HOME_OVERRIDE.lock().ok().and_then(|g| g.clone()) {
-        return Ok(path);
+    {
+        match HOME_OVERRIDE.lock().ok().and_then(|g| g.clone()) {
+            Some(path) => Ok(path),
+            None => panic!(
+                "test resolved the operator's real home; hold a `testutil::HomeSandbox` \
+                 across the whole test, background threads included"
+            ),
+        }
     }
-    dirs::home_dir().context("cannot determine home directory")
+    #[cfg(not(test))]
+    {
+        dirs::home_dir().context("cannot determine home directory")
+    }
 }
 
 pub(crate) fn clauth_dir() -> Result<PathBuf> {

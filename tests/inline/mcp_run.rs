@@ -4003,6 +4003,7 @@ fn the_wait_cap_clamps_without_a_progress_token() {
 /// branch rather than inventing a distinction.
 #[test]
 fn an_unknown_job_id_names_which_cause_it_was() {
+    let _home = crate::testutil::HomeSandbox::new();
     // A REAL 2026 clock, not a round synthetic one: which age branch a
     // never-minted token reaches is decided by its decoded stamp against `now`,
     // so a far-future `now` silently routes the whole class into one branch and

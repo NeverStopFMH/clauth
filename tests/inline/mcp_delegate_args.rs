@@ -865,10 +865,16 @@ fn a_blocking_fanout_returns_one_row_per_account_in_order_named() {
     );
 }
 
-/// The tool description steers a slow or third-party target to `background`,
-/// and two doc lines promise `delegate` carries live usage — so the recommended
-/// path must not be the uninformed one. The handle reply carries the target's
-/// own headroom footer, and still exactly one content block.
+/// `background`'s own doc promises a handle instead of the output, and two doc
+/// lines promise `delegate` carries live usage, so the handle must not be the
+/// uninformed reply. It carries the target's own headroom footer, and still
+/// exactly one content block.
+///
+/// The earlier version of this comment cited a "prefer `background` for a slow
+/// or third-party target" steer in the tool description as the reason this test
+/// exists. The owner removed that steer on 2026-08-19 as an invented heuristic
+/// (a third-party target is not inherently slow). What the test actually
+/// asserts is the footer, so it survives the removal; only the rationale moved.
 #[test]
 fn a_background_handle_carries_the_targets_live_usage_footer() {
     let home = HomeSandbox::new();

@@ -4175,37 +4175,70 @@ fn the_delegate_description_keeps_its_load_bearing_warnings() {
         .iter()
         .find(|t| t.name == "delegate")
         .expect("delegate tool is registered");
-    let text = delegate.description.as_deref().unwrap_or_default();
+    // The unit is the whole tool ENTRY, not the description. rmcp renders a
+    // JSON Schema `description` per argument off each field's doc comment, and
+    // both halves ship in the same entry and load together. Measured 2026-08-19
+    // on this tool: 584 tokens of description against 947 of argument docs, so
+    // pinning only the description watched the smaller half. Every phrase below
+    // is required SOMEWHERE in the entry; which half owns it is a placement
+    // decision the sweep is free to revisit without redding this test.
+    let mut text = delegate
+        .description
+        .as_deref()
+        .unwrap_or_default()
+        .to_string();
+    let props = delegate
+        .input_schema
+        .get("properties")
+        .and_then(|p| p.as_object());
+    for (name, spec) in props.expect("delegate takes arguments") {
+        let doc = spec
+            .get("description")
+            .and_then(|d| d.as_str())
+            .unwrap_or_else(|| panic!("argument `{name}` has no description"));
+        text.push('\n');
+        text.push_str(doc);
+    }
+    // A doc comment's wrap column is a formatting artifact `cargo fmt` can move,
+    // and schemars preserves it as a newline in the rendered description, so a
+    // pinned phrase would red purely for spanning a line break. Match on
+    // whitespace-collapsed text: the phrases below assert content, not layout.
+    let text: String = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let text = text.as_str();
 
     for phrase in [
-        // spends a real account's window or money
-        "spends that account's window or money",
-        // a delegate is blind to this conversation, so the prompt is the whole brief
-        "nothing of this conversation",
-        // the four cost shapes, each named
-        "burns that subscription's 5h window",
-        "bills real money",
+        // it spends a real account, and which shape that spend takes
+        "Delegating spends the target account",
+        "uses that subscription's 5h window",
+        "charge real money",
         "draws down a prepaid plan",
-        "host is free",
-        // the background steer
-        "prefer it for a slow or third-party target",
-        // the isolated-versus-shared choice. It used to read "Leave it false
-        // when the task needs this repo's tools"; the owner's 2026-08-17 ruling
-        // widened it from repo-tools work to ALL delegated work, because a
-        // native subagent runs with the operator's context loaded and the
-        // shared default is what matches it.
-        "leave it false for delegated work",
-        // what `isolated` buys, which is the only claim about it that survived
-        "nothing steers it but `prompt`",
-        // the cwd footgun
-        "point `cwd` at a clean dir",
-        // a self-report is not a verified result
-        "spot-verify its `result` like any subagent",
+        "LAN host is free",
+        // a delegate is blind to this conversation, so the prompt is the whole
+        // brief
+        "knows nothing about this conversation",
+        // the `isolated` arms. The owner's 2026-08-17 ruling (M8) widened the
+        // shared default from repo-tools work to ALL delegated work, because a
+        // native subagent runs with the operator's context loaded; the shared
+        // arm therefore states what it loads and says to use it for real work.
+        // Both arms are pinned: a reader who only meets `true` has to infer
+        // `false`.
+        "`isolated: false` (default)",
+        "`isolated: true`",
+        "Use this for real work",
+        "only `prompt` steers it",
+        // both `background` arms, same reason
+        "`background: false` (default)",
+        "`background: true`",
         // which deadline actually binds: a streaming run has no wall clock, so a
         // caller reading `timeout_secs` as one would size a run against a limit
         // that is not applied
-        "That is its only deadline",
-        "`timeout_secs` binds only a run whose `args` pin their own `--output-format`",
+        "the only time limit on a normal run",
+        "It applies only when `args` pins its own `--output-format`",
+        // the mention grammar clauth teaches, and the silent failure it has to
+        // warn about: an unresolved `@`-mention is dropped with no error, and a
+        // mistyped type that matches a path is read in as a file instead
+        "(agent)",
+        "ignored with no error",
     ] {
         assert!(
             text.contains(phrase),

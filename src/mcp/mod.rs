@@ -490,62 +490,75 @@ pub(crate) struct ProfilesArgs {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub(crate) struct DelegateArgs {
-    /// Which account(s) to run on, in canonical-resolved spelling: one name is
-    /// a single delegate (blocking unless `background` is set); two or more is
-    /// a fan-out spending one usage window per account, blocking unless
-    /// `background` is set.
+    /// Which accounts to run on. One name runs one delegate. Several names run
+    /// one delegate per account, all at the same time. Names are
+    /// case-insensitive.
     profiles: Option<Vec<String>>,
-    /// Prompt passed to the delegated `claude -p` session.
+    /// The task for the delegate, as plain text. This is the only thing it knows
+    /// about the job. To run the delegate as one of your `Agent` types, start
+    /// `prompt` with `@"{type} (agent)"`, for example `@"rust-pro (agent)"`. This
+    /// needs `isolated: false`. Type the name exactly as the `Agent` tool lists
+    /// it: a name that does not match is ignored with no error, and if it matches
+    /// a file path that file gets read in instead.
     prompt: Option<String>,
-    /// Path (relative to `cwd`) of a file whose contents are the prompt, read
-    /// once and reused across a fan-out so a long reusable prompt costs the
-    /// calling model's context nothing. Exactly one of `prompt` or this one,
-    /// never both and never neither: a call naming both (or neither) is refused
-    /// by name.
+    /// Read the prompt from this file instead of passing it inline. The path is
+    /// relative to `cwd`. clauth reads the file once and reuses it for every
+    /// account, so a long reusable prompt costs this session's context nothing.
+    /// Pass exactly one of `prompt` or `prompt_file`.
     prompt_file: Option<String>,
-    /// Optional model override for the delegated session.
+    /// Model for the delegated session. Leave it unset to let `claude` pick as it
+    /// normally would.
     model: Option<String>,
-    /// Working directory for the delegate (must exist). Defaults to the MCP
-    /// server's cwd. Set a clean dir to keep the delegate from picking up a
-    /// project `CLAUDE.md`.
+    /// Directory the delegate runs in. Must exist. Defaults to the directory the
+    /// MCP server was started in. The delegate picks up a `CLAUDE.md` from here,
+    /// so point it at a clean directory for an unrelated one-shot task.
     cwd: Option<String>,
-    /// Extra environment variables for the delegate (e.g.
-    /// `CLAUDE_CODE_MAX_OUTPUT_TOKENS`). `CLAUDE_CONFIG_DIR` and the depth guard
-    /// are always set by clauth and cannot be overridden here.
+    /// Extra environment variables for the delegate, for example
+    /// `CLAUDE_CODE_MAX_OUTPUT_TOKENS`. clauth always sets `CLAUDE_CONFIG_DIR`
+    /// and its own depth guard, and you cannot override those here.
     env: Option<HashMap<String, String>>,
-    /// Extra arguments appended to the `claude` invocation (after clauth's own
-    /// `-p` and streaming flags, the isolated-only `--strict-mcp-config`, and
-    /// `--model <model>` when `model` is set). Pinning `--output-format` here
-    /// replaces clauth's, which turns the idle deadline off and leaves the wall
-    /// clock as the only one.
+    /// Extra command-line arguments for the `claude` invocation. They go after
+    /// clauth's own `-p` and streaming flags, after `--strict-mcp-config` on an
+    /// isolated run, and after `--model` when `model` is set. Pinning
+    /// `--output-format` here replaces clauth's, which turns off the idle limit
+    /// and leaves `timeout_secs` as the only one.
     args: Option<Vec<String>>,
-    /// Wall-clock ceiling in seconds (1..=3600), binding ONLY a run whose `args`
-    /// pin their own `--output-format`: there is no event stream then, so
-    /// silence carries no information and this is the only deadline left (unset,
-    /// it falls back to `idle_secs`). IGNORED on any other run — a streaming
-    /// delegate has no wall clock, because one can only ever kill a delegate
-    /// that is still working.
+    /// Wall-clock limit in seconds (1 to 3600). It applies only when `args` pins
+    /// its own `--output-format`. There is no output stream in that case, so
+    /// silence means nothing and this is the only limit left; leave it unset
+    /// there and `idle_secs` supplies the figure instead. On every other run it
+    /// is ignored, because a delegate that is still producing output should not
+    /// be killed.
     timeout_secs: Option<u64>,
-    /// Kill the delegate after this many seconds with NO output at all
-    /// (1..=3600). Defaults to 300, and it is a streaming run's ONLY deadline:
-    /// one that keeps streaming is never cut off however long it takes, so raise
-    /// this only when the task makes one blocking tool call longer than the
-    /// default (a long build). When `args` pins its own `--output-format` it
+    /// Kill the delegate if it produces no output at all for this many seconds (1
+    /// to 3600, default 300). It hands back whatever text it had, plus a
+    /// `session_id` you can pass to `resume`. This is the only time limit on a
+    /// normal run: a delegate that keeps producing output is never cut off,
+    /// however long it takes. Raise it only when the task makes one slow tool
+    /// call, such as a long build. If `args` pins its own `--output-format`, this
     /// stops killing on silence and becomes the default for `timeout_secs`
-    /// instead, so it still bounds that run.
+    /// instead.
     idle_secs: Option<u64>,
-    /// Continue an earlier delegate instead of starting fresh: the `session_id`
-    /// a killed run handed back. `prompt` becomes the next turn of that
-    /// conversation. clauth runs it in the workspace the session was recorded in,
-    /// so `cwd` is unnecessary (and refused when it disagrees).
+    /// Continue an earlier delegate instead of starting a new one. Pass the
+    /// `session_id` that a killed run handed back, and `prompt` becomes the next
+    /// message in that conversation. clauth runs it in the directory the session
+    /// was recorded in, so `cwd` is not needed here (and is refused if it
+    /// disagrees).
     resume: Option<String>,
-    /// Run authenticated but without operator memory/plugins/hooks (a clean
-    /// blind session). Defaults to false.
+    /// `isolated: false` (default): the delegate loads your Claude Code setup,
+    /// the same as a normal session. That means your `CLAUDE.md`, plugins, hooks,
+    /// skills, MCP servers and `Agent` types. Use this for real work.
+    ///
+    /// `isolated: true`: none of that loads. The delegate starts blank, so only
+    /// `prompt` steers it. Use this to test what a stock `claude` does.
     isolated: Option<bool>,
-    /// Return a `{job_id}` immediately instead of blocking for the result. The
-    /// delegate runs on a detached task; the result arrives on its own via
-    /// clauth's PostToolUse hook, and `monitor` checks, collects or stops it.
-    /// Defaults to false.
+    /// `background: false` (default): the call waits for the delegate to finish
+    /// and returns its output. With several `profiles`, it waits for all of them.
+    ///
+    /// `background: true`: the call returns a `{job_id}` instead of the output,
+    /// and the delegate keeps running. Its result is delivered to you
+    /// automatically when it finishes. You can also check it, collect it or stop
+    /// it with `monitor`.
     background: Option<bool>,
 }
 
@@ -829,26 +842,13 @@ disturbing this session, use `delegate`."
     }
 
     #[tool(
-        description = "Run a task in a fresh headless `claude` session on another account. \
-It spends that account's usage window or money. Pick the target from `profiles`. The delegate \
-sees only `prompt` and no context of this conversation; state what it needs to do in the prompt. \
-`delegate` is like the Agent tool that runs on a different login.\n\n\
-Cost by target: an account with no `host` burns that subscription's 5h window; DeepSeek or Z.ai \
-bills real money; Alibaba Model Studio draws down a prepaid plan; a loopback or LAN host is \
-free.\n\n\
-`background: true` returns a `{job_id}` and works in the background. The result arrives back to \
-you on its own. When you spawn two or more delegates at once, the call blocks the session until \
-completion of all, unless `background: true`. Check, collect or stop a job with `monitor`.\n\n\
-`isolated: true` runs a stock `claude` setup: no `CLAUDE.md`, plugins, hooks, skills, subagents \
-or MCP servers, so nothing steers it but your `prompt`. Use it to test stock behaviour; leave it \
-false for actual work. When `isolated: false`, the delegate can be one of the specialists listed \
-in the `Agents` tool. Start the `prompt` by `@\"{type} (agent)\"`, replacing `{type}` with one of \
-the available ones from `Agents` schema, and the delegate will run as that specialist. \
-`delegate` loads `CLAUDE.md` files either way, so point `cwd` at a clean dir for an unrelated \
-one-shot.\n\n\
-A run silent for `idle_secs` is killed and hands back the text it had. `resume` it via its \
-`session_id`. `idle_secs` is its only deadline: as long as it keeps talking, it runs until \
-completion. `timeout_secs` binds only a run whose `args` pin their own `--output-format`."
+        description = "Run a task on another clauth account. `delegate` starts a fresh headless `claude` session on \
+that account and returns what it produced. `delegate` is like the Agent tool, but the agent \
+runs on a different account's login.\n\n\
+The delegate knows nothing about this conversation. Put everything it needs into `prompt`.\n\n\
+Delegating spends the target account, so pick the account with `profiles` first. An account \
+with no `host` uses that subscription's 5h window. DeepSeek and Z.ai charge real money. Alibaba \
+Model Studio draws down a prepaid plan. A loopback or LAN host is free."
     )]
     async fn delegate(
         &self,
@@ -1017,9 +1017,8 @@ completion. `timeout_secs` binds only a run whose `args` pin their own `--output
                         self.herdr_pane.clone(),
                     );
                     // The handle carries the same footer the blocking reply
-                    // does: the tool description steers a slow or third-party
-                    // target here, so the recommended path must not be the one
-                    // that never hears what it just spent.
+                    // does: a caller that takes the job id instead of the
+                    // output must still hear what it just spent.
                     let payload = fold_delegate_live_usage(
                         serde_json::json!({
                             "job_id": job_id,

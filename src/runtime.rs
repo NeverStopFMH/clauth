@@ -3110,8 +3110,11 @@ impl AliasClasses {
     /// the same tick, rather than one tick per alias.
     ///
     /// Single-copy classes are the whole non-aliased tree and are skipped, so it
-    /// costs nothing beyond the map. An unreadable target skips its class rather
-    /// than failing the tick: the merge is additive and the next tick re-tries.
+    /// costs nothing beyond the map. An unreadable target skips its class, since
+    /// there is nothing to converge onto. A failed PUBLISH still fails the tick,
+    /// like every other publish in the walk — and `tick` runs `mirror_tree`
+    /// before `mirror_credentials`, so an error here also costs that tick its
+    /// credential reconcile.
     fn converge(&self) -> Result<()> {
         for (target, class) in &self.classes {
             if class.copies.len() < 2 {
@@ -3346,10 +3349,8 @@ fn merge_path(
 /// leave both trees, which is correct for a link the operator made and wrong for
 /// one found in clauth's own copy; see [`merge_path`].
 ///
-/// The fallback to `p` itself is a defensive default rather than a behaviour:
-/// [`merge_path`] skips a name whose either side is a dangling link before it
-/// ever asks for a write target, so the only way `canonicalize` fails here is a
-/// link that broke between that check and this call.
+/// A link `canonicalize` cannot resolve falls back to `p` itself, so the write
+/// re-creates it as a regular file.
 fn write_target(p: &Path) -> PathBuf {
     match p.symlink_metadata() {
         Ok(m) if m.file_type().is_symlink() => p.canonicalize().unwrap_or_else(|_| p.to_path_buf()),

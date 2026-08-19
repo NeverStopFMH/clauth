@@ -1761,6 +1761,15 @@ fn reload_fingerprint_ignores_a_bare_session_token_stamp() {
     // two fingerprints byte-identical at 100ns precision, and the closing
     // `assert_ne!` then read a retired receipt as a live one — 1 run in 3
     // under the full suite. An hour is a value the clock cannot produce here.
+    //
+    // NOT the sibling tests' `wait_for_a_distinguishable_mtime`, which is the
+    // established answer to this same hazard: it waits for a write to land past
+    // the path's CURRENT mtime, and by the re-mint below that is the receipted
+    // `stamped` half a minute in the FUTURE, so it would wait out its own 2 s
+    // deadline and fail. Backdating still leaves the re-mint a real write and
+    // the thing under test — a write that stopped moving the mtime leaves the
+    // sidecar on this value, which is the one `before` was taken at, so the
+    // closing assertion reds exactly as it should.
     let minted = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
     crate::testutil::set_mtime(&sidecar, minted);
 

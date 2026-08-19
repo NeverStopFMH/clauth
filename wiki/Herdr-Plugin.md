@@ -61,9 +61,9 @@ description = "clauth accounts"
 
 ## The pane tag
 
-Every herdr pane running Claude Code spends some account, and which one is invisible from the pane itself. The plugin hooks agent detection and publishes the answer as pane metadata under the name `clauth`.
+Every herdr pane running Claude Code spends some account, and which one is invisible from the pane itself. The plugin hooks agent detection, publishes the answer as pane metadata under the name `clauth`, and starts a per-pane watcher that re-publishes it every few seconds until the pane closes.
 
-It refreshes on every agent status change, so a `clauth start --with-fallback` session that moves onto the next chain member stops naming the account it left. herdr detects other agents too, and a pane running one of those is left untagged rather than labelled with an account it never touches.
+The watcher is what keeps the tag right across an account swap, which fires no herdr event. A `clauth start --with-fallback` session that moves onto the next chain member, or a bare `claude` that follows a `clauth switch`, both repoint the account invisibly. herdr detects other agents too, and a pane running one of those is left untagged rather than labelled with an account it never touches.
 
 herdr renders a reported value only where your own agent-row template asks for it, so **the tag stays invisible until `$clauth` is in a row**. `clauth herdr install` adds this one; Claude Code panes take the `rows_by_agent` template rather than the generic `rows`:
 

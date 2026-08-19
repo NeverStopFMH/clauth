@@ -20,12 +20,12 @@ That runs herdr's installer, then writes the two things a herdr plugin cannot de
 
 ## What it runs as you
 
-Two actions and two event hooks, all of them one of the two shell scripts below:
+Two actions and two event hooks, all of them one of the two shell scripts below, plus a per-pane background watcher:
 
 - `clauth.open` opens the dashboard in a popup.
-- `clauth.which` re-reads the account the focused pane burns and publishes it as pane metadata, and the same script runs on herdr's `pane.agent_detected` and `pane.agent_status_changed` events.
+- `clauth.which` re-reads the account the focused pane burns and publishes it as pane metadata, and the same script runs on herdr's `pane.agent_detected` and `pane.agent_status_changed` events. Reporting a Claude Code pane starts the watcher for that pane.
 
-Neither script writes anything outside herdr's own pane metadata.
+The watcher re-publishes the account every few seconds until the pane closes. An account swap fires no herdr event, so the timer is what keeps the tag from going stale. The scripts write only herdr's own pane metadata plus one pidfile per watched pane in the plugin state directory.
 
 ## Paste these if you installed by hand
 
@@ -51,3 +51,4 @@ claude = [["state_icon", "workspace", "tab"], ["terminal_title_stripped"], ["age
 | `herdr-plugin.toml` | Manifest: one popup entrypoint, two actions, two event hooks |
 | `open-pane.sh` | Opens an entrypoint, treating "popup already open" as a no-op |
 | `report-profile.sh` | Resolves the account a pane burns and publishes it as pane metadata |
+| `watch-profile.sh` | Per-pane watcher re-publishing the account on a timer |

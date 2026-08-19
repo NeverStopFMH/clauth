@@ -1235,46 +1235,59 @@ fn mirror_tree_converges_two_names_when_the_first_sorted_is_newest() {
     );
 }
 
-/// A copy already holding the target's bytes is that content observed LATER, so
-/// the class takes ITS clock. Otherwise the target keeps the older stamp of the
-/// same bytes and a strictly older sibling outranks it, publishing stale bytes
-/// over content the walk had just confirmed current.
+/// A copy byte-equal to the canonical target must NOT lend the class its clock.
+/// Such a copy is this mirror's own echo from an earlier tick and an mtime move
+/// is not a write, so a freshly-touched echo would outrank the sibling carrying a
+/// real edit and the merge would publish the old shared bytes back over it.
+///
+/// The fixture is the `CLAUDE.local.md` -> `CLAUDE.md` shape, on the exact clocks
+/// that make the echo look newest: the echo sorts first at now-100 while the edit
+/// sits at now-600 behind a canonical file from now-900. One tick must land the
+/// edit on the canonical file AND on both runtime copies —
+/// [`mirror_tree`]'s contract is that it never destroys data.
 #[test]
-fn mirror_tree_alias_class_takes_the_clock_of_a_copy_that_already_matches() {
+fn mirror_tree_alias_echo_does_not_outrank_a_siblings_real_edit() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let claude = tmp.path().join("claude");
     let runtime = tmp.path().join("runtime");
-    let real = tmp.path().join("dotfiles");
-    for dir in [&claude, &runtime, &real] {
+    for dir in [&claude, &runtime] {
         fs::create_dir_all(dir).expect("mkdir");
     }
-    let target = real.join("shared.md");
-    fs::write(&target, b"CURRENT").expect("write target");
-    if !pose_file_link(&claude.join("alias-a.md"), &target) {
+    let memory = claude.join("CLAUDE.md");
+    fs::write(&memory, b"OLD SHARED").expect("write memory");
+    if !pose_file_link(&claude.join("CLAUDE.local.md"), &memory) {
         return;
     }
-    if !pose_file_link(&claude.join("alias-b.md"), &target) {
-        return;
-    }
-    fs::write(runtime.join("alias-a.md"), b"CURRENT").expect("write runtime a");
-    fs::write(runtime.join("alias-b.md"), b"STALE").expect("write runtime b");
+    fs::write(runtime.join("CLAUDE.md"), b"OPERATOR EDIT").expect("write runtime memory");
+    fs::write(runtime.join("CLAUDE.local.md"), b"OLD SHARED").expect("write runtime echo");
 
     let now = SystemTime::now();
-    set_mtime(&target, now - Duration::from_secs(600));
-    set_mtime(&runtime.join("alias-a.md"), now - Duration::from_secs(200));
-    set_mtime(&runtime.join("alias-b.md"), now - Duration::from_secs(400));
+    set_mtime(&memory, now - Duration::from_secs(900));
+    set_mtime(
+        runtime.join("CLAUDE.md").as_path(),
+        now - Duration::from_secs(600),
+    );
+    set_mtime(
+        runtime.join("CLAUDE.local.md").as_path(),
+        now - Duration::from_secs(100),
+    );
 
     mirror_tree(&claude, &runtime).expect("mirror");
 
     assert_eq!(
-        fs::read(&target).expect("read target"),
-        b"CURRENT",
-        "a matching copy's clock is the freshest evidence FOR the target's bytes"
+        fs::read(&memory).expect("read memory"),
+        b"OPERATOR EDIT",
+        "a touched echo must not beat the sibling holding the only real edit"
     );
     assert_eq!(
-        fs::read(runtime.join("alias-b.md")).expect("read runtime b"),
-        b"CURRENT",
-        "and the stale sibling takes them instead of overwriting them"
+        fs::read(runtime.join("CLAUDE.md")).expect("read runtime memory"),
+        b"OPERATOR EDIT",
+        "and the edit is certainly not overwritten in place"
+    );
+    assert_eq!(
+        fs::read(runtime.join("CLAUDE.local.md")).expect("read runtime echo"),
+        b"OPERATOR EDIT",
+        "the echo converges onto the edit within the same tick"
     );
 }
 

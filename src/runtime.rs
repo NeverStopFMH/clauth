@@ -3097,16 +3097,6 @@ impl AliasClasses {
         }
     }
 
-    /// A copy holding the target's bytes is the same content observed LATER, so
-    /// it is the freshest evidence FOR that content: advance the clock to it,
-    /// never back. `Option<SystemTime>` orders `None` below every `Some`, so a
-    /// first-ever reading lands here too.
-    fn bump_owner_time(&mut self, target: &Path, when: Option<SystemTime>) {
-        if let Some(class) = self.classes.get_mut(target) {
-            class.owner_time = class.owner_time.max(when);
-        }
-    }
-
     /// Give every copy in an ALIASED class the target's bytes. The per-name merge
     /// above has already put the class's newest bytes on the target, so this is
     /// what converges a copy the walk visited BEFORE the eventual winner — within
@@ -3278,9 +3268,13 @@ fn merge_path(a: &Path, b: &Path, classes: &mut AliasClasses) -> Result<()> {
     match (a_meta, b_meta) {
         (Some(_), Some(_)) => {
             if files_match(a, b)? {
-                if let Some(k) = key.as_deref() {
-                    classes.bump_owner_time(k, b_time);
-                }
+                // The class clock stays where it is. A copy byte-equal to the
+                // canonical target is overwhelmingly this mirror's OWN echo from
+                // an earlier tick, and an mtime move is not a write, so its
+                // clock is evidence of nothing. Advancing to it lets the echo
+                // outrank a sibling copy carrying a real edit, and the merge
+                // then publishes the old shared bytes over that edit — which
+                // `mirror_tree` promises never to do.
                 return Ok(());
             }
             if mtime_newer(owner_time, b_time) {

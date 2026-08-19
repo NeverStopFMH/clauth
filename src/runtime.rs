@@ -2689,9 +2689,14 @@ fn copy_tree(src: &Path, dst: &Path) -> Result<()> {
     // `metadata` follows symlinks, unlike `symlink_metadata`: a symlink/junction
     // to a DIRECTORY in `~/.claude` (a skill linked at a plugin dir) must recurse
     // like a real dir, not hit `copy_file` — `std::fs::copy` follows the link and
-    // refuses a directory ("Access is denied" on Windows, "Is a directory" on
-    // Linux). A symlink to a FILE still reaches `copy_file`, which materializes
-    // the target's bytes as a regular file, the fake-mode contract.
+    // refuses a directory. Measured, and the two platforms disagree on more than
+    // wording: Windows 11 gives `PermissionDenied` / "Access is denied. (os error
+    // 5)", naming a permission problem that does not exist, while Linux gives
+    // `InvalidInput` with no errno ("the source path is neither a regular file
+    // nor a symlink to a regular file"), since `File::open` on a directory
+    // succeeds there and std refuses in `open_from` rather than at EISDIR.
+    // A symlink to a FILE still reaches `copy_file`, which materializes the
+    // target's bytes as a regular file, the fake-mode contract.
     let meta = src
         .metadata()
         .with_context(|| format!("failed to stat {}", src.display()))?;
@@ -3038,8 +3043,11 @@ fn merge_path(a: &Path, b: &Path) -> Result<()> {
     // `Path::is_dir` follows symlinks, unlike the `symlink_metadata` file-type
     // above: a symlink/junction to a DIRECTORY must recurse like a real dir, or
     // `copy_file` hits `std::fs::copy` on a directory and fails the whole tick
-    // ("Access is denied" on Windows, "Is a directory" on Linux). `a_meta`/`b_meta`
-    // stay `symlink_metadata` for the existence match below.
+    // (per-platform error strings on `copy_tree`). BOTH sides, not just the
+    // canonical one: under fake mode Claude Code runs out of the shared runtime
+    // tree, so a plugin skill it links lands on the `b` side with nothing
+    // opposite it. `a_meta`/`b_meta` stay `symlink_metadata` for the existence
+    // match below.
     let a_is_dir = a.is_dir();
     let b_is_dir = b.is_dir();
 

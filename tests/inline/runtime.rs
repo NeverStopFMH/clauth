@@ -381,14 +381,71 @@ fn copy_tree_skips_a_publish_in_flight() {
     );
 }
 
-/// A symlink to a DIRECTORY in `~/.claude` (a skill linked at a plugin dir) must
-/// recurse in fake mode, not fall into `copy_file`: `std::fs::copy` follows the
-/// link and refuses a directory, failing the whole acquire on Windows with
-/// "Access is denied" (os error 5). Followed, the target's files land as a real
-/// dir in the runtime.
-#[cfg(unix)]
+/// Pose a directory link at `link` pointing at `target`: a symlink on unix, a
+/// JUNCTION on Windows.
+///
+/// A junction because it is the directory link a fake-mode host can still be
+/// carrying — it needs no `SeCreateSymbolicLinkPrivilege`, and the absence of
+/// that privilege is what puts the host on the copy transport in the first place
+/// (`docs/domain-knowledge.md`). A directory SYMLINK reaches the same branch,
+/// measured identical on Windows 11, and is reachable too: Developer Mode or an
+/// elevated process can lay one down before an unprivileged run probes `Fake`.
+///
+/// `mklink /J` because a junction has no std constructor — `symlink_dir` wants
+/// the privilege the host lacks, and `FSCTL_SET_REPARSE_POINT` wants a winapi
+/// dep plus `unsafe`. Its ceiling, since `docs/architecture.md`'s 2026-07-06
+/// entry says never to pass data args through `cmd /C`: `mklink` is a cmd
+/// builtin, so no shell-free route exists, and a `%` in either path would still
+/// reach cmd's variable expansion. Both paths here are tempdir-derived. Upgrade
+/// path is a junction crate, or the FSCTL behind a test-only dep.
+///
+/// Asserts the fixture poses the misclassification under test: on a host where a
+/// directory link reads as a plain directory under `symlink_metadata`, every
+/// caller below would assert nothing.
+fn pose_dir_link(link: &Path, target: &Path) {
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(target, link).expect("symlink dir");
+    #[cfg(windows)]
+    {
+        let out = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(link)
+            .arg(target)
+            .output()
+            .expect("spawn `cmd /C mklink /J`");
+        assert!(
+            out.status.success(),
+            "mklink /J {} {} failed ({}): {}{}",
+            link.display(),
+            target.display(),
+            out.status,
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    assert!(
+        !link
+            .symlink_metadata()
+            .expect("posed link is present")
+            .file_type()
+            .is_dir(),
+        "fixture poses nothing: {} reads as a plain directory under \
+         symlink_metadata, which is the misclassification under test",
+        link.display()
+    );
+}
+
+/// A directory LINK in `~/.claude` (a skill linked at a plugin dir) must recurse
+/// in fake mode, not fall into `copy_file`: `std::fs::copy` follows the link and
+/// refuses a directory, failing the whole acquire. Measured error per platform,
+/// both against a link and against a plain dir: Windows 11 gives
+/// `PermissionDenied` / "Access is denied. (os error 5)", and Linux (rustc
+/// 1.97.1) gives `InvalidInput` / "the source path is neither a regular file nor
+/// a symlink to a regular file" with no errno — `File::open` on a directory
+/// succeeds there, so std refuses in `open_from` and EISDIR is never reached.
+/// Followed, the target's files land as a real dir in the runtime.
 #[test]
-fn copy_tree_follows_a_symlink_to_a_directory() {
+fn copy_tree_follows_a_directory_link() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let real = tmp.path().join("plugin");
     fs::create_dir_all(real.join("nested")).expect("mkdir target");
@@ -396,14 +453,36 @@ fn copy_tree_follows_a_symlink_to_a_directory() {
 
     let src = tmp.path().join("src");
     fs::create_dir_all(&src).expect("mkdir src");
-    std::os::unix::fs::symlink(&real, src.join("agent-browser")).expect("symlink dir");
+    pose_dir_link(&src.join("agent-browser"), &real);
 
     let dst = tmp.path().join("dst");
     copy_tree(&src, &dst).expect("copy_tree");
 
-    assert_eq!(
-        fs::read(dst.join("agent-browser").join("nested").join("skill.md")).expect("read"),
-        b"skill body"
+    // Both levels, because they pin different halves and only one of them can
+    // red today. The LEAF is live: swapping `copy_tree`'s `copy_file` for
+    // `link_entry` reds it. The ENTRY is a forward guard and is unkillable as
+    // the code stands — a directory always takes the recursing branch, so
+    // nothing there can leave a link behind. Keep it anyway: it is the level a
+    // leaf assert cannot see, since a leaf read THROUGH a directory link still
+    // reports `is_symlink=false` (measured).
+    let linked = dst.join("agent-browser");
+    assert!(
+        !linked
+            .symlink_metadata()
+            .expect("entry present")
+            .file_type()
+            .is_symlink(),
+        "the entry itself must be a real dir, not a link back at the source"
+    );
+    let leaf = linked.join("nested").join("skill.md");
+    assert_eq!(fs::read(&leaf).expect("read"), b"skill body");
+    assert!(
+        !leaf
+            .symlink_metadata()
+            .expect("leaf present")
+            .file_type()
+            .is_symlink(),
+        "fake mode materializes the target's bytes; a re-created link is not the contract"
     );
 }
 
@@ -695,13 +774,12 @@ fn mirror_tree_seeds_canonical_only_nested_to_runtime() {
     );
 }
 
-/// The mirror must treat a symlink to a directory on the `~/.claude` side as a
-/// dir, not a file: otherwise `merge_path` hands `copy_file` a directory and
-/// `std::fs::copy` fails the whole tick ("Access is denied" on Windows, "Is a
-/// directory" on Linux).
-#[cfg(unix)]
+/// The mirror must treat a directory link on the CANONICAL (`~/.claude`) side as
+/// a dir, not a file: otherwise `merge_path` hands `copy_file` a directory and
+/// `std::fs::copy` fails the whole tick. Per-platform error strings are on
+/// [`copy_tree_follows_a_directory_link`].
 #[test]
-fn mirror_tree_follows_a_symlink_to_a_directory() {
+fn mirror_tree_follows_a_directory_link() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let real = tmp.path().join("plugin");
     fs::create_dir_all(real.join("nested")).expect("mkdir target");
@@ -711,13 +789,58 @@ fn mirror_tree_follows_a_symlink_to_a_directory() {
     let runtime = tmp.path().join("runtime");
     fs::create_dir_all(&claude).expect("mkdir claude");
     fs::create_dir_all(&runtime).expect("mkdir runtime");
-    std::os::unix::fs::symlink(&real, claude.join("skills")).expect("symlink dir");
+    pose_dir_link(&claude.join("skills"), &real);
+
+    mirror_tree(&claude, &runtime).expect("mirror");
+
+    // Forward guard, unkillable as the code stands: `merge_path` reaches only
+    // `copy_file`, which cannot produce a link. It pins the level a leaf assert
+    // cannot see (a leaf read THROUGH a directory link reports
+    // `is_symlink=false`), so it earns its place without earning a kill.
+    let mirrored = runtime.join("skills");
+    assert!(
+        !mirrored
+            .symlink_metadata()
+            .expect("entry present")
+            .file_type()
+            .is_symlink(),
+        "the mirrored entry must be a real dir, not a link back at the source"
+    );
+    assert_eq!(
+        fs::read(mirrored.join("nested").join("skill.md")).expect("read"),
+        b"skill body"
+    );
+}
+
+/// The RUNTIME side of the same predicate pair, which the test above cannot
+/// reach: it poses the link on the canonical side only, so `b_is_dir` is false
+/// under the fixed AND the pre-fix spelling and reverting that one line alone
+/// leaves the whole suite green.
+///
+/// Reachable in production, which is why it is worth its own fixture: under fake
+/// mode Claude Code runs OUT of the shared runtime tree, so a plugin skill it
+/// links lands at `<runtime>/skills/<name>` with nothing on the `~/.claude` side
+/// yet. `merge_path` then takes its `(None, Some(_))` arm and hands `copy_file`
+/// the link — the same failure as the canonical side, once per tick, forever.
+#[test]
+fn mirror_tree_follows_a_directory_link_on_the_runtime_side() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let real = tmp.path().join("plugin");
+    fs::create_dir_all(real.join("nested")).expect("mkdir target");
+    fs::write(real.join("nested").join("skill.md"), b"cc wrote this").expect("write target");
+
+    let claude = tmp.path().join("claude");
+    let runtime = tmp.path().join("runtime");
+    fs::create_dir_all(&claude).expect("mkdir claude");
+    fs::create_dir_all(&runtime).expect("mkdir runtime");
+    pose_dir_link(&runtime.join("skills"), &real);
 
     mirror_tree(&claude, &runtime).expect("mirror");
 
     assert_eq!(
-        fs::read(runtime.join("skills").join("nested").join("skill.md")).expect("read"),
-        b"skill body"
+        fs::read(claude.join("skills").join("nested").join("skill.md")).expect("read"),
+        b"cc wrote this",
+        "a runtime-side directory link must seed the canonical side, not fail the tick"
     );
 }
 

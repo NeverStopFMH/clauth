@@ -2686,10 +2686,16 @@ fn reconcile_credentials(runtime_path: &Path, canonical: &Path, mode: LinkMode) 
 
 /// Used in fake-symlink mode when the OS denies symlink creation rights.
 fn copy_tree(src: &Path, dst: &Path) -> Result<()> {
+    // `metadata` follows symlinks, unlike `symlink_metadata`: a symlink/junction
+    // to a DIRECTORY in `~/.claude` (a skill linked at a plugin dir) must recurse
+    // like a real dir, not hit `copy_file` — `std::fs::copy` follows the link and
+    // refuses a directory ("Access is denied" on Windows, "Is a directory" on
+    // Linux). A symlink to a FILE still reaches `copy_file`, which materializes
+    // the target's bytes as a regular file, the fake-mode contract.
     let meta = src
-        .symlink_metadata()
+        .metadata()
         .with_context(|| format!("failed to stat {}", src.display()))?;
-    if meta.file_type().is_dir() {
+    if meta.is_dir() {
         std::fs::create_dir_all(dst)
             .with_context(|| format!("failed to create {}", dst.display()))?;
         for entry in
@@ -3029,8 +3035,13 @@ fn merge_path(a: &Path, b: &Path) -> Result<()> {
     let a_meta = a.symlink_metadata().ok();
     let b_meta = b.symlink_metadata().ok();
 
-    let a_is_dir = a_meta.as_ref().is_some_and(|m| m.file_type().is_dir());
-    let b_is_dir = b_meta.as_ref().is_some_and(|m| m.file_type().is_dir());
+    // `Path::is_dir` follows symlinks, unlike the `symlink_metadata` file-type
+    // above: a symlink/junction to a DIRECTORY must recurse like a real dir, or
+    // `copy_file` hits `std::fs::copy` on a directory and fails the whole tick
+    // ("Access is denied" on Windows, "Is a directory" on Linux). `a_meta`/`b_meta`
+    // stay `symlink_metadata` for the existence match below.
+    let a_is_dir = a.is_dir();
+    let b_is_dir = b.is_dir();
 
     if a_is_dir || b_is_dir {
         if a_is_dir && !b.exists() {

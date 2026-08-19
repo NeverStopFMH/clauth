@@ -381,6 +381,32 @@ fn copy_tree_skips_a_publish_in_flight() {
     );
 }
 
+/// A symlink to a DIRECTORY in `~/.claude` (a skill linked at a plugin dir) must
+/// recurse in fake mode, not fall into `copy_file`: `std::fs::copy` follows the
+/// link and refuses a directory, failing the whole acquire on Windows with
+/// "Access is denied" (os error 5). Followed, the target's files land as a real
+/// dir in the runtime.
+#[cfg(unix)]
+#[test]
+fn copy_tree_follows_a_symlink_to_a_directory() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let real = tmp.path().join("plugin");
+    fs::create_dir_all(real.join("nested")).expect("mkdir target");
+    fs::write(real.join("nested").join("skill.md"), b"skill body").expect("write target");
+
+    let src = tmp.path().join("src");
+    fs::create_dir_all(&src).expect("mkdir src");
+    std::os::unix::fs::symlink(&real, src.join("agent-browser")).expect("symlink dir");
+
+    let dst = tmp.path().join("dst");
+    copy_tree(&src, &dst).expect("copy_tree");
+
+    assert_eq!(
+        fs::read(dst.join("agent-browser").join("nested").join("skill.md")).expect("read"),
+        b"skill body"
+    );
+}
+
 #[test]
 fn mirror_credentials_newer_runtime_wins() {
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -666,6 +692,32 @@ fn mirror_tree_seeds_canonical_only_nested_to_runtime() {
     assert_eq!(
         fs::read(runtime.join("projects").join("alpha").join("notes.json")).expect("read"),
         br#"{"note":"hi"}"#
+    );
+}
+
+/// The mirror must treat a symlink to a directory on the `~/.claude` side as a
+/// dir, not a file: otherwise `merge_path` hands `copy_file` a directory and
+/// `std::fs::copy` fails the whole tick ("Access is denied" on Windows, "Is a
+/// directory" on Linux).
+#[cfg(unix)]
+#[test]
+fn mirror_tree_follows_a_symlink_to_a_directory() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let real = tmp.path().join("plugin");
+    fs::create_dir_all(real.join("nested")).expect("mkdir target");
+    fs::write(real.join("nested").join("skill.md"), b"skill body").expect("write target");
+
+    let claude = tmp.path().join("claude");
+    let runtime = tmp.path().join("runtime");
+    fs::create_dir_all(&claude).expect("mkdir claude");
+    fs::create_dir_all(&runtime).expect("mkdir runtime");
+    std::os::unix::fs::symlink(&real, claude.join("skills")).expect("symlink dir");
+
+    mirror_tree(&claude, &runtime).expect("mirror");
+
+    assert_eq!(
+        fs::read(runtime.join("skills").join("nested").join("skill.md")).expect("read"),
+        b"skill body"
     );
 }
 

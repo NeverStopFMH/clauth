@@ -67,3 +67,20 @@ printf '%s\n' "$profile"
 # The pane id goes BEFORE the flags. `report-metadata --help` prints it last,
 # and that order answers `unknown option: <value>` at exit 2 on 0.8.0.
 "$herdr_bin" pane report-metadata "$pane" --source "${HERDR_PLUGIN_ID:-clauth}" --token "clauth=$profile"
+
+# A --with-fallback session moves onto another account mid-run with no herdr
+# event, so the one-shot report above goes stale until the next status change.
+# Spawn a detached per-pane watcher to re-report on a timer instead. Only
+# claude panes spend a clauth account; a plain shell pane resolves `agent`
+# empty and is left alone. The pidfile makes later invocations skip the spawn
+# while that watch lives, and the watcher removes it when the pane closes.
+[ "$agent" = claude ] || exit 0
+[ -n "$pane" ] || exit 0
+state_dir="${HERDR_PLUGIN_STATE_DIR:-${TMPDIR:-/tmp}/clauth}"
+mkdir -p "$state_dir" 2>/dev/null || exit 0
+pidfile="$state_dir/watch-$pane.pid"
+if [ -f "$pidfile" ] && kill -0 "$(cat "$pidfile" 2>/dev/null)" 2>/dev/null; then
+    exit 0
+fi
+dir=$(dirname "$0")
+"$dir/watch-profile.sh" "$pane" "$pidfile" </dev/null >/dev/null 2>&1 &

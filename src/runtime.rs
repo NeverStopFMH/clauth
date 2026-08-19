@@ -3027,12 +3027,19 @@ fn mirror_tree(claude_home: &Path, runtime: &Path) -> Result<()> {
     let skip_top: HashSet<&str> = ["settings.json", ".credentials.json", ".claude.json"]
         .into_iter()
         .collect();
+    // The one `canonicalize` this walk pays for: every entry below inherits it.
+    let root_key = claude_home.canonicalize().ok();
     let mut classes = AliasClasses::default();
     for name in union_children(claude_home, runtime) {
         if name.to_str().is_some_and(|n| skip_top.contains(n)) {
             continue;
         }
-        merge_path(&claude_home.join(&name), &runtime.join(&name), &mut classes)?;
+        merge_path(
+            &claude_home.join(&name),
+            &runtime.join(&name),
+            root_key.as_deref(),
+            &mut classes,
+        )?;
     }
     classes.converge()
 }
@@ -3124,21 +3131,31 @@ impl AliasClasses {
     }
 }
 
-/// Identity of the canonical file a write aimed at `p` lands on, with EVERY
-/// symlink component resolved rather than just the leaf.
+/// Identity of the canonical file a write aimed at `a` lands on, given the
+/// already-resolved identity of its parent directory and `a`'s own
+/// `symlink_metadata`. Every symlink component is resolved, but each one only
+/// once — a link resolves itself, and everything else inherits its parent's
+/// answer and appends its own name.
 ///
-/// The parent-plus-lexical-tail fallback is load-bearing twice over: it gives a
-/// stable identity to a canonical path that does not exist yet (`merge_path`'s
-/// `(None, Some(_))` arm), and it catches the DIRECTORY spelling of the aliasing
+/// Resolving each entry independently is the obvious spelling and the expensive
+/// one: `canonicalize` walks the whole path per FILE rather than per directory,
+/// which cost a third of the walk on a large converged tree.
+///
+/// Inheriting is also what gives a stable identity to a canonical path that does
+/// not exist YET ([`merge_path`]'s `(None, Some(_))` arm, where `canonicalize`
+/// can answer nothing), and what catches the DIRECTORY spelling of the aliasing
 /// bug — two `~/.claude` names linked at one directory, reaching its files under
 /// leaf names that are not themselves links.
-fn resolved_key(p: &Path) -> Option<PathBuf> {
-    if let Ok(c) = p.canonicalize() {
-        return Some(c);
+fn child_key(
+    a: &Path,
+    parent_key: Option<&Path>,
+    a_meta: Option<&std::fs::Metadata>,
+) -> Option<PathBuf> {
+    if a_meta.is_some_and(|m| m.file_type().is_symlink()) {
+        return a.canonicalize().ok();
     }
-    let parent = p.parent()?;
-    let name = p.file_name()?;
-    Some(parent.canonicalize().ok()?.join(name))
+    let name = a.file_name()?;
+    Some(parent_key?.join(name))
 }
 
 /// Unioned child-name set of two directories, minus the publishes in flight.
@@ -3171,9 +3188,16 @@ fn union_children(a: &Path, b: &Path) -> Vec<std::ffi::OsString> {
 /// Reconcile one path between canonical (`a`) and runtime (`b`) sides.
 /// Directories recurse via the same union-walk; files merge by mtime.
 ///
+/// `parent_key` is `a`'s parent directory with every symlink component already
+/// resolved, threaded down so [`child_key`] costs a join instead of a walk.
 /// `classes` is the walk-scoped alias bookkeeping — see [`AliasClasses`] for why
 /// the mtime comparisons below read the class's clock instead of re-stating `a`.
-fn merge_path(a: &Path, b: &Path, classes: &mut AliasClasses) -> Result<()> {
+fn merge_path(
+    a: &Path,
+    b: &Path,
+    parent_key: Option<&Path>,
+    classes: &mut AliasClasses,
+) -> Result<()> {
     let a_meta = a.symlink_metadata().ok();
     let b_meta = b.symlink_metadata().ok();
 
@@ -3207,6 +3231,10 @@ fn merge_path(a: &Path, b: &Path, classes: &mut AliasClasses) -> Result<()> {
         return Ok(());
     }
 
+    // Resolved once here and handed to the recursion, so every symlink component
+    // on the way down is resolved once per DIRECTORY rather than once per file.
+    let key = child_key(a, parent_key, a_meta.as_ref());
+
     // `Path::is_dir` follows symlinks, unlike the `symlink_metadata` file-type
     // above: a symlink/junction to a DIRECTORY must recurse like a real dir, or
     // `copy_file` hits `std::fs::copy` on a directory and fails the whole tick
@@ -3231,7 +3259,7 @@ fn merge_path(a: &Path, b: &Path, classes: &mut AliasClasses) -> Result<()> {
                 .with_context(|| format!("failed to create {}", a.display()))?;
         }
         for name in union_children(a, b) {
-            merge_path(&a.join(&name), &b.join(&name), classes)?;
+            merge_path(&a.join(&name), &b.join(&name), key.as_deref(), classes)?;
         }
         return Ok(());
     }
@@ -3264,10 +3292,9 @@ fn merge_path(a: &Path, b: &Path, classes: &mut AliasClasses) -> Result<()> {
     let a_time = a.metadata().ok().and_then(|m| m.modified().ok());
     let b_time = b_meta.as_ref().and_then(|m| m.modified().ok());
 
-    // Which canonical file this pair actually lands on, and the clock to judge
-    // `b` against. `(None, None)` records nothing: a name neither side has must
-    // never enter a class, or `converge` would CREATE the runtime copy.
-    let key = resolved_key(a);
+    // The clock to judge `b` against. `(None, None)` records nothing: a name
+    // neither side has must never enter a class, or `converge` would CREATE the
+    // runtime copy.
     let owner_time = match (&a_meta, &b_meta) {
         (None, None) => a_time,
         _ => key

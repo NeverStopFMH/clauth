@@ -1755,9 +1755,14 @@ fn reload_fingerprint_ignores_a_bare_session_token_stamp() {
     let sidecar = profile_dir("p")
         .expect("profile_dir")
         .join("session-token.json");
-    let minted = std::fs::metadata(&sidecar)
-        .and_then(|m| m.modified())
-        .expect("mint mtime");
+    // Backdated rather than read off the mint, so the re-mint at the bottom
+    // CANNOT land on the same `SystemTime`. Both writes are real and both
+    // stamp "now": two of them inside one filesystem timestamp tick left the
+    // two fingerprints byte-identical at 100ns precision, and the closing
+    // `assert_ne!` then read a retired receipt as a live one — 1 run in 3
+    // under the full suite. An hour is a value the clock cannot produce here.
+    let minted = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+    crate::testutil::set_mtime(&sidecar, minted);
 
     let before = reload_fingerprint();
     // What a swap onto this token-mode member leaves behind.

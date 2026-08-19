@@ -3109,6 +3109,13 @@ impl AliasClasses {
     /// what converges a copy the walk visited BEFORE the eventual winner — within
     /// the same tick, rather than one tick per alias.
     ///
+    /// It also decides one case the per-name merge deliberately declines: an
+    /// exact mtime tie with divergent bytes, which `mtime_newer`'s strict `>`
+    /// leaves untouched on both sides. Inside a class that would be a standing
+    /// disagreement between two spellings of ONE file, which has no resting
+    /// state, so the target's bytes win. Outside a class the tie is still left
+    /// alone, because two independent files are allowed to differ.
+    ///
     /// Single-copy classes are the whole non-aliased tree and are skipped, so it
     /// costs nothing beyond the map. An unreadable target skips its class, since
     /// there is nothing to converge onto. A failed PUBLISH still fails the tick,

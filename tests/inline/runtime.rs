@@ -1389,6 +1389,82 @@ fn mirror_tree_converges_two_directory_aliases_on_one_target() {
     );
 }
 
+/// An exact mtime tie with divergent bytes: `mtime_newer` is strict, so the
+/// per-name merge writes nothing and both sides keep what they hold. Inside an
+/// alias class that leaves two spellings of ONE file disagreeing with no resting
+/// state, so `converge` breaks the tie toward the shared target. Outside a class
+/// nothing breaks it, because two independent files are allowed to differ — both
+/// halves are pinned here, since the second is what bounds the first.
+#[test]
+fn mirror_tree_breaks_an_mtime_tie_only_inside_an_alias_class() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let claude = tmp.path().join("claude");
+    let runtime = tmp.path().join("runtime");
+    let real = tmp.path().join("dotfiles");
+    for dir in [&claude, &runtime, &real] {
+        fs::create_dir_all(dir).expect("mkdir");
+    }
+    let target = real.join("shared.md");
+    fs::write(&target, b"SHARED").expect("write target");
+    if !pose_file_link(&claude.join("alias-a.md"), &target) {
+        return;
+    }
+    if !pose_file_link(&claude.join("alias-b.md"), &target) {
+        return;
+    }
+    fs::write(runtime.join("alias-a.md"), b"DIVERGED").expect("write runtime a");
+    fs::write(runtime.join("alias-b.md"), b"SHARED").expect("write runtime b");
+    fs::write(claude.join("solo.md"), b"CANON SOLO").expect("write canon solo");
+    fs::write(runtime.join("solo.md"), b"RUNTIME SOLO").expect("write runtime solo");
+
+    let tie = SystemTime::now() - Duration::from_secs(300);
+    for p in [
+        target.as_path(),
+        &runtime.join("alias-a.md"),
+        &runtime.join("alias-b.md"),
+        &claude.join("solo.md"),
+        &runtime.join("solo.md"),
+    ] {
+        set_mtime(p, tie);
+    }
+    // The fixture poses nothing unless the stamps land EXACTLY equal: one
+    // filesystem tick of drift turns this into an ordinary newer-side merge.
+    let stamp = |p: &Path| p.metadata().expect("meta").modified().expect("mtime");
+    assert_eq!(
+        stamp(&target),
+        stamp(&runtime.join("alias-a.md")),
+        "aliased pair must be an exact tie"
+    );
+    assert_eq!(
+        stamp(&claude.join("solo.md")),
+        stamp(&runtime.join("solo.md")),
+        "solo pair must be an exact tie"
+    );
+
+    mirror_tree(&claude, &runtime).expect("mirror");
+
+    assert_eq!(
+        fs::read(runtime.join("alias-a.md")).expect("read runtime a"),
+        b"SHARED",
+        "an aliased tie has no resting state, so the shared target breaks it"
+    );
+    assert_eq!(
+        fs::read(&target).expect("read target"),
+        b"SHARED",
+        "and the tie never moves the target itself"
+    );
+    assert_eq!(
+        fs::read(claude.join("solo.md")).expect("read canon solo"),
+        b"CANON SOLO",
+        "a tie between two independent files is still left exactly alone"
+    );
+    assert_eq!(
+        fs::read(runtime.join("solo.md")).expect("read runtime solo"),
+        b"RUNTIME SOLO",
+        "both sides of it, in both directions"
+    );
+}
+
 /// The regression guard for the rule we did NOT pick. Skipping an aliased name
 /// would also stop sort order deciding, and it would strand the common shape:
 /// `CLAUDE.local.md` symlinked at `CLAUDE.md`, whose two runtime copies are

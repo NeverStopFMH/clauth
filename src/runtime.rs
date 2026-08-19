@@ -2488,7 +2488,12 @@ fn prune_dangling_links(runtime: &Path) -> Result<()> {
             // `remove_dir`, never `remove_dir_all`: it unlinks the link itself
             // and refuses a non-empty directory, and the guard above already
             // proved the target is gone, so there is nothing behind this link
-            // for either call to reach.
+            // for either call to reach. `rmdir` is additionally believed unable
+            // to traverse a LIVE link on either platform, which would make the
+            // call safe without the guard — unverified, so the guard is what
+            // this rests on. Its one soft edge: `Path::exists` swallows every
+            // stat error, so a live link over a dropped mount reads as dangling
+            // and gets unlinked. The re-walk re-links it on the same pass.
             if let Err(file_err) = std::fs::remove_file(&path)
                 && let Err(dir_err) = std::fs::remove_dir(&path)
             {
@@ -3089,26 +3094,33 @@ fn merge_path(a: &Path, b: &Path) -> Result<()> {
         return Ok(());
     }
 
-    // A symlink to a FILE is followed for both the CLOCK and the WRITE, the same
-    // rule the directory branch above takes. `a_meta`/`b_meta` stay
-    // `symlink_metadata`, because the match below asks only "does this entry
-    // exist", which a dangling link answers yes to.
+    // A symlink to a FILE is followed on the CANONICAL side only, for both the
+    // clock and the write. `a_meta`/`b_meta` stay `symlink_metadata`, because
+    // the match below asks only "does this entry exist", which a dangling link
+    // answers yes to.
     //
-    // The clock: a symlink carries its OWN mtime, and writing its target never
-    // moves it. So the link side loses every comparison once the other side has
-    // been written even once, and the mirror copies STALE bytes back over an
-    // edit the operator just made. It also disagrees with Claude Code, whose
-    // own re-read gate stats THROUGH a link at the target ("an mtime-preserving
-    // swap is invisible", `docs/domain-knowledge.md`).
+    // Canonical (`a`) is the OPERATOR's tree, so a link there is their intent
+    // and both halves have to honour it. The clock: a symlink carries its own
+    // mtime, and writing its target never moves it, so the link side loses every
+    // comparison once the other side has been written even once and the mirror
+    // copies STALE bytes back over an edit the operator just made. It also
+    // disagrees with Claude Code, whose re-read gate stats THROUGH a link at the
+    // target ("an mtime-preserving swap is invisible",
+    // `docs/domain-knowledge.md`). The write: `copy_file` publishes by rename,
+    // which replaces the link itself with a regular file and strands the
+    // operator's real file where nothing reads it.
     //
-    // The write: `copy_file` publishes by rename, which replaces the link itself
-    // with a regular file, stranding the operator's real file where nothing
-    // reads it. Both halves destroy data, which this mirror's contract says it
-    // never does.
+    // Runtime (`b`) is CLAUTH's tree, built by copy, and deliberately does not
+    // follow. A link there is not the operator's intent, and following one would
+    // aim a mirror write at an arbitrary absolute path outside BOTH trees, past
+    // everything `docs/security.md`'s 0600/0700 invariant reaches; renaming a
+    // regular file over it instead restores the copy-of-canonical shape the tree
+    // is meant to have. The DIRECTORY branch above still follows both sides,
+    // because there the alternative is `copy_file` on a directory, which is a
+    // hard error rather than a choice.
     let a_write = write_target(a);
-    let b_write = write_target(b);
     let a_time = a.metadata().ok().and_then(|m| m.modified().ok());
-    let b_time = b.metadata().ok().and_then(|m| m.modified().ok());
+    let b_time = b_meta.as_ref().and_then(|m| m.modified().ok());
 
     match (a_meta, b_meta) {
         (Some(_), Some(_)) => {
@@ -3116,13 +3128,13 @@ fn merge_path(a: &Path, b: &Path) -> Result<()> {
                 return Ok(());
             }
             if mtime_newer(a_time, b_time) {
-                copy_file(a, &b_write)?;
+                copy_file(a, b)?;
             } else if mtime_newer(b_time, a_time) {
                 copy_file(b, &a_write)?;
             }
         }
         (Some(_), None) => {
-            copy_file(a, &b_write)?;
+            copy_file(a, b)?;
         }
         (None, Some(_)) => {
             copy_file(b, &a_write)?;
@@ -3136,6 +3148,10 @@ fn merge_path(a: &Path, b: &Path) -> Result<()> {
 /// at when `p` is a symlink that still resolves. Answers the write question
 /// only — "does this entry exist" stays `symlink_metadata`'s, and "is this a
 /// directory to traverse" stays `Path::is_dir`'s.
+///
+/// Called on the CANONICAL side only. It hands back an absolute path that can
+/// leave both trees, which is correct for a link the operator made and wrong for
+/// one found in clauth's own copy; see [`merge_path`].
 ///
 /// A DANGLING link keeps its own path, so the write re-creates it as a regular
 /// file. That is the pre-existing outcome and not what this exists to change:

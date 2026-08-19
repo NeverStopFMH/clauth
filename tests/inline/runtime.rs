@@ -960,6 +960,49 @@ fn mirror_tree_writes_through_a_canonical_symlink() {
     );
 }
 
+/// The asymmetry, pinned: a link on the RUNTIME side is not followed, because
+/// that side is clauth's own copy rather than anything the operator declared.
+/// Following one would aim a mirror write at an absolute path outside BOTH
+/// trees, past everything the 0600/0700 tree invariant reaches.
+///
+/// Reachability is narrow — `detect_link_mode` picks `Fake` precisely because
+/// `try_real_symlink` failed in the profile root, so a file link rarely exists
+/// inside a fake-mode runtime tree at all — but the blast radius is a write to
+/// an arbitrary path, so it is pinned rather than argued away.
+#[test]
+fn mirror_tree_does_not_write_through_a_runtime_side_symlink() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let claude = tmp.path().join("claude");
+    let runtime = tmp.path().join("runtime");
+    let outside = tmp.path().join("outside");
+    for dir in [&claude, &runtime, &outside] {
+        fs::create_dir_all(dir).expect("mkdir");
+    }
+    let stray = outside.join("target.md");
+    fs::write(&stray, b"OUTSIDE").expect("write stray");
+    if !pose_file_link(&runtime.join("notes.md"), &stray) {
+        return;
+    }
+    fs::write(claude.join("notes.md"), b"CANON").expect("write canonical");
+
+    let now = SystemTime::now();
+    set_mtime(&stray, now + Duration::from_secs(300));
+    set_mtime(&claude.join("notes.md"), now + Duration::from_secs(600));
+
+    mirror_tree(&claude, &runtime).expect("mirror");
+
+    assert_eq!(
+        fs::read(&stray).expect("read stray"),
+        b"OUTSIDE",
+        "a runtime-side link must never redirect a mirror write outside both trees"
+    );
+    assert_eq!(
+        fs::read(runtime.join("notes.md")).expect("read runtime"),
+        b"CANON",
+        "the write lands in the runtime tree, restoring its copy-of-canonical shape"
+    );
+}
+
 #[test]
 fn copy_file_overwrites_existing_destination() {
     let tmp = tempfile::tempdir().expect("tempdir");

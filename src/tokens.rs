@@ -105,7 +105,7 @@ pub(crate) struct DayModelTokens {
     /// Per-hour buckets (index = hour 0..23) when the source carried
     /// timestamps: transcript-derived rows and v2-ledger rows. `None` for
     /// stats-cache (pre-cutoff) rows and v1-ledger rows — approximation:
-    /// those days price at the default tier on their dated rate (slice C).
+    /// those days price at the default tier on their dated rate.
     pub(crate) hours: Option<[HourTokens; 24]>,
 }
 
@@ -130,7 +130,7 @@ pub(crate) struct PeriodModel {
     pub(crate) split_complete: bool,
     /// The split-bearing days that make up `split`, in date order — so a
     /// period cost can price each day at its dated rate and each hour at its
-    /// own rate (slice C). Stats-cache days contribute in+out and the
+    /// own rate. Stats-cache days contribute in+out and the
     /// incomplete flag but no row; `from_full` rows carry none (they hold no
     /// dates).
     pub(crate) days: Vec<PeriodDay>,
@@ -700,7 +700,7 @@ pub(crate) fn period_models(days: &[DayModelTokens], from: &str, to: &str) -> Ve
     let mut out: Vec<PeriodModel> = map.into_values().collect();
     // Input order is the caller's; `daily_models` is sorted ASC by
     // (date, model), but a hand-built slice may not be — pin date order per
-    // model regardless, so slice C's per-day cost walks a chronological list.
+    // model regardless, so the per-day cost walks a chronological list.
     for m in &mut out {
         m.days.sort_unstable_by(|a, b| a.date.cmp(&b.date));
     }

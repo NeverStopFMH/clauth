@@ -26,7 +26,7 @@ The cost figure is what your recorded usage **would cost on the pay-as-you-go AP
 
 It is computed per model, never off a blended rate, and it prices the four token classes separately: input, output, cache reads, cache writes. The <kbd>c</kbd> toggle changes whether cache tokens count toward the token *totals*; cost always counts them.
 
-Prices come from LiteLLM's public price table, fetched daily and cached at `~/.clauth/price_cache.json`. clauth loads the cache first so the tab paints instantly and works offline. A model with no matching rate contributes nothing to cost, renders as a faint dash, and puts the surrounding totals on a `$X+` floor.
+Prices come from pydantic's genai-prices v2 public dataset, fetched daily and cached at `~/.clauth/genai_price_cache.json`. clauth loads the cache first so the tab paints instantly and works offline. A model with no matching rate contributes nothing to cost, renders as a faint dash, and puts the surrounding totals on a `$X+` floor.
 
 ## Model grouping
 

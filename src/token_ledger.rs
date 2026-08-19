@@ -20,8 +20,9 @@
 //! # Boundaries
 //!
 //! - The ledger only ever records days strictly before "today" (a running day is
-//!   incomplete). Recording takes the max per field so a mid-write re-read never
-//!   lowers a stored day.
+//!   incomplete). Recording inserts the first-seen split for each finalized
+//!   day; the monotonic watermark makes each day record exactly once, so a
+//!   later re-read can never lower or double-count a stored day.
 //! - [`Ledger::apply_to_base`] folds only days strictly after the base's
 //!   `lastComputedDate`, so if CC's own aggregation later catches up past a ledger
 //!   day, the ledger never double-counts against the base.
@@ -31,7 +32,7 @@
 //! v2 adds per-hour buckets ([`WireModel::hours`]), optional on the wire: a v1
 //! file (no `hours` key) loads with `None` and keeps `None` on save, so days
 //! recorded before the hourly axis keep their v1 shape until a new day is
-//! recorded beside them — v1 days price at the default tier (slice C).
+//! recorded beside them — v1 days price at the default tier.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};

@@ -148,7 +148,7 @@ fn cost_line(label: &str, cost: Option<(f64, bool)>) -> Line<'static> {
     Line::from(vec![key(label), Span::styled(value, money_style())])
 }
 
-// ── cost resolution (slice C: dated + hourly rates) ─────────────────────────
+// ── cost resolution (dated + hourly rates) ──────────────────────────────────
 
 /// Per-bucket USD cost (input/output/cache) of one model over some window —
 /// the model-detail card's breakdown.

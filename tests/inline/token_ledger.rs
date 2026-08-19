@@ -232,6 +232,18 @@ fn hours_survive_record_save_load_apply() {
     // The flat split is untouched by the new axis.
     assert_eq!(fresh.total_input, 100);
     assert_eq!(row.split.as_ref().expect("split").cache_read, 2000);
+
+    // A replay after the watermark advanced skips the day entirely — its
+    // hours are neither rewritten nor dropped.
+    let mut replay = reloaded;
+    assert!(
+        !replay.record(&fresh, "2026-06-18"),
+        "a day at/before the watermark is never re-recorded"
+    );
+    let wm = &replay.days["2026-06-16"]["claude-opus-4"];
+    let wm_hours = wm.hours.as_ref().expect("hours survive a replay");
+    assert_eq!(wm_hours[5].input, 40);
+    assert_eq!(wm_hours[23].output, 1);
 }
 
 /// A v1-shaped ledger (no `hours` keys) loads with `None`, applies its flat

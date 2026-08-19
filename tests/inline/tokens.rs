@@ -1221,6 +1221,21 @@ fn hourly_buckets_accumulate_into_hour_slots() {
     assert_eq!(hours[23].input, 5);
     assert_eq!(hours[23].output, 2);
     assert_eq!(hours[12].input, 0);
+    // The day's hourly buckets sum to its flat split exactly.
+    let day_split = day.split.as_ref().expect("split");
+    assert_eq!(hours.iter().map(|h| h.input).sum::<u64>(), day_split.input);
+    assert_eq!(
+        hours.iter().map(|h| h.output).sum::<u64>(),
+        day_split.output
+    );
+    assert_eq!(
+        hours.iter().map(|h| h.cache_read).sum::<u64>(),
+        day_split.cache_read
+    );
+    assert_eq!(
+        hours.iter().map(|h| h.cache_create).sum::<u64>(),
+        day_split.cache_create
+    );
     let gpt = stats
         .daily_models
         .iter()
@@ -1228,6 +1243,14 @@ fn hourly_buckets_accumulate_into_hour_slots() {
         .expect("gpt row");
     assert_eq!(gpt.hours.expect("hours")[23].input, 9);
     assert_eq!(gpt.hours.expect("hours")[23].output, 9);
+    assert_eq!(
+        gpt.hours
+            .expect("hours")
+            .iter()
+            .map(|h| h.input)
+            .sum::<u64>(),
+        gpt.split.as_ref().expect("split").input
+    );
 }
 
 /// Today's hour buckets dedupe exactly like the flat fields: a response
@@ -1358,6 +1381,20 @@ fn period_models_carries_per_day_split_rows_in_date_order() {
     assert_eq!(opus.days[0].split.input, 30);
     assert_eq!(opus.days[0].hours.expect("hours")[2].cache_read, 500);
     assert_eq!(opus.days[1].hours.expect("hours")[9].input, 12);
+    // Each PeriodDay's hourly buckets sum to its own split exactly.
+    for day in &opus.days {
+        let hs = day.hours.expect("hours");
+        assert_eq!(hs.iter().map(|h| h.input).sum::<u64>(), day.split.input);
+        assert_eq!(hs.iter().map(|h| h.output).sum::<u64>(), day.split.output);
+        assert_eq!(
+            hs.iter().map(|h| h.cache_read).sum::<u64>(),
+            day.split.cache_read
+        );
+        assert_eq!(
+            hs.iter().map(|h| h.cache_create).sum::<u64>(),
+            day.split.cache_create
+        );
+    }
     // split sums the two split-bearing days only.
     assert_eq!(opus.split.input, 42);
     assert_eq!(opus.split.output, 28);

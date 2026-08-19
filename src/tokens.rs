@@ -954,7 +954,12 @@ fn merge_topup(
 
             // Token / model accumulation (assistant usage lines), deduped by key.
             // The hour buckets ride the same deduped branch, so a skipped
-            // duplicate line contributes nothing to them either.
+            // duplicate line contributes nothing to them either, and the
+            // winning line's own hour carries its whole turn (within a file
+            // that is the earliest max-total delta, so a turn spanning an hour
+            // boundary lands in its final delta's hour; across files the
+            // first-seen copy wins) — the same first-wins rule the flat fields
+            // apply, so buckets and flat totals always agree whichever copy won.
             if r.has_usage && (r.tok_key.is_empty() || seen_tok.insert(r.tok_key.as_str())) {
                 if r.date == today_date {
                     today_acc.input = today_acc.input.saturating_add(r.input);

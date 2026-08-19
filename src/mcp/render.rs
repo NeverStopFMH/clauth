@@ -3,6 +3,8 @@
 //! folded-in live-usage clause included. No I/O, no locks — callers pass in
 //! already-loaded cache data so these stay unit-testable.
 
+use std::net::{IpAddr, Ipv6Addr};
+
 use serde_json::Value;
 
 use crate::format::{format_pct, humanize_span};
@@ -49,15 +51,143 @@ pub(super) fn base_url_host(url: &str) -> &str {
     rest.split('/').next().unwrap_or(rest)
 }
 
-/// The `[provider, tier, host]` bracket a roster line ends in. Profiles sharing
-/// one bracket share a line.
+/// The word a host [`host_locality`] places earns. Returned by that function
+/// rather than read beside it: the word rides the decision, so a carrier holds
+/// no spelling of its own that could drift from the other's.
+const LOCAL_ENDPOINT: &str = "local endpoint";
+
+/// A port is digits, and ZERO digits is the defaulted port of a legal
+/// `http://host:/path` — the same spelling
+/// [`crate::providers::url_matches_host`] already accepts, so the two layers do
+/// not disagree about one string.
+fn is_port(s: &str) -> bool {
+    s.bytes().all(|b| b.is_ascii_digit())
+}
+
+/// The address inside a well-formed authority host, or `None` when the string is
+/// not one. Accepted: `[IPv6]`, `[IPv6%zone]`, an IPv4 literal, or a name — each
+/// optionally followed by `:` and a port.
+///
+/// DISCARD NOTHING UNACCOUNTED FOR. `IpAddr::from_str` already does total
+/// accounting on an address, so every bug this function has had was bytes thrown
+/// away BEFORE that parse ran: the bracket arm dropped whatever followed `]`, and
+/// a zone cut dropped whatever followed `%`, neither validating what it dropped.
+/// Each made a PREFIX of a hostile host answer for the whole of it —
+/// `[::1]@evil.com` and `127.0.0.1%2Eevil.com` both read as loopback while naming
+/// `evil.com`. That is the defect [`crate::providers::url_matches_host`] already
+/// documents one module over, where a bare `starts_with` would have claimed
+/// `api.deepseek.com.evil.tld`. So every byte here is consumed as host, port or
+/// zone, or the whole string is refused.
+///
+/// A zone id rides INSIDE the brackets and only there (RFC 6874), which is what
+/// makes cutting it safe: no "looks like a zone" test could do this work, since
+/// `.` is `unreserved` and `2Eevil.com` is a syntactically legal zone. A zone on
+/// an IPv4-mapped address is refused rather than cut — that is IPv6 syntax naming
+/// a v4 endpoint, so it has no interface to name.
+fn authority_host(host: &str) -> Option<&str> {
+    if let Some(rest) = host.strip_prefix('[') {
+        let (inner, tail) = rest.split_once(']')?;
+        if !(tail.is_empty() || tail.strip_prefix(':').is_some_and(is_port)) {
+            return None;
+        }
+        let (addr, zoned) = match inner.split_once('%') {
+            None => (inner, false),
+            Some((addr, zone)) => {
+                if zone.is_empty() {
+                    return None;
+                }
+                (addr, true)
+            }
+        };
+        let v6 = addr.parse::<Ipv6Addr>().ok()?;
+        if zoned && v6.to_ipv4_mapped().is_some() {
+            return None;
+        }
+        return Some(addr);
+    }
+    // Unbracketed, so a surviving colon can only be the port separator, and a
+    // bare IPv6 literal is refused. That input is REACHABLE, not impossible:
+    // `base_url_host` splits without validating, `Profile::base_url` is raw config
+    // text, and nothing in the crate parses a url — so `http://::1/v1` arrives
+    // here as `::1` from the commonest IPv6-url typo there is. Refusing it is a
+    // deliberate cut: clauth does not guess which authority a malformed one meant.
+    match host.rsplit_once(':') {
+        Some((h, port)) => (!h.contains(':') && is_port(port)).then_some(h),
+        None => Some(host),
+    }
+}
+
+/// The locality marker a base-url host earns, or `None` for a host clauth
+/// cannot place. Both roster carriers ([`roster_bracket`] and [`profile_line`])
+/// call this on the host string each already holds, so one predicate answers for
+/// both surfaces.
+///
+/// The claim is about WHERE the endpoint is, and stops there. An address that
+/// names a machine on this box or this network is not a hosted vendor endpoint,
+/// which is what makes it the cheap target on a roster — but the box answering
+/// may be someone else's, or a proxy fronting a metered API, so the marker says
+/// where the endpoint lives and leaves the bill to the reader. Which is also why
+/// the host is the only field read: it is the one that says where.
+///
+/// Placed: an IP literal that is loopback, private (`10/8`, `172.16/12`,
+/// `192.168/16`), link-local (`169.254/16`, `fe80::/10`), unique-local
+/// (`fc00::/7`) or unspecified (`0.0.0.0`, `::`), or the exact name `localhost`.
+/// The last two sit here on the same argument as the rest: an unspecified address
+/// names this box, and a link-local one reaches no further than a link, so
+/// neither can be a hosted vendor endpoint.
+///
+/// A link-local address is placed in the one spelling a url authority can carry
+/// it in — `[fe80::1%25eth0]` — because [`authority_host`] cuts the zone before
+/// parsing. `IpAddr::from_str` rejects a zone, and the zone-less form is the one
+/// a multi-interface box cannot connect to, so matching only that form would fire
+/// on every spelling except the working one. The bare `fe80::1%eth0` is refused
+/// with every other unbracketed IPv6, which RFC 3986 has no authority syntax for
+/// — a reachable config typo that clauth declines to guess at, not an impossible
+/// input. See [`authority_host`].
+///
+/// NOT placed, each for its own reason. Any other NAME, because clauth resolves
+/// nothing — `ollama`, but equally `foo.localhost` and `localhost.`, which RFC
+/// 6761 does guarantee as loopback; widening to those is a live option rather
+/// than an oversight. And `100.64/10`, carrier-grade NAT space a mesh VPN happens
+/// to use, so the block itself says nothing about who runs the box.
+fn host_locality(host: &str) -> Option<&'static str> {
+    let addr = authority_host(host)?;
+    if addr.eq_ignore_ascii_case("localhost") {
+        return Some(LOCAL_ENDPOINT);
+    }
+    // Canonicalised first: `::ffff:0:0/96` carries no verdict of its own, so
+    // folding a mapped address to its IPv4 twin adds no reading the address did
+    // not already have. Only a MAPPED address folds — measured, `::` stays V6 —
+    // which is what keeps the two `is_unspecified` terms on separate arms.
+    let placed = match addr.parse::<IpAddr>().ok()?.to_canonical() {
+        IpAddr::V4(v4) => {
+            v4.is_loopback() || v4.is_private() || v4.is_link_local() || v4.is_unspecified()
+        }
+        IpAddr::V6(v6) => {
+            v6.is_loopback()
+                || v6.is_unique_local()
+                || v6.is_unicast_link_local()
+                || v6.is_unspecified()
+        }
+    };
+    placed.then_some(LOCAL_ENDPOINT)
+}
+
+/// The `[provider, tier, host]` bracket a roster line ends in, plus the
+/// [`host_locality`] marker when the host earns one. Profiles sharing one
+/// bracket share a line, and the marker adds no grouping distinction of its own:
+/// it is a pure function of the host, which the key already carries ahead of it.
 fn roster_bracket(p: &ProfileSnapshot) -> String {
     let mut parts = vec![p.provider.clone()];
     if let Some(s) = &p.sub_type {
         parts.push(s.clone());
     }
     if let Some(b) = &p.base_url {
-        parts.push(base_url_host(b).to_string());
+        let host = base_url_host(b);
+        parts.push(host.to_string());
+        if let Some(marker) = host_locality(host) {
+            parts.push(marker.to_string());
+        }
     }
     format!("[{}]", parts.join(", "))
 }
@@ -636,9 +766,10 @@ fn throughput_prose(rows: &[Value]) -> String {
 }
 
 /// One roster row as a prose line: name + active marker, the
-/// `[provider, tier, host]` bracket, this account's own headroom, then the quiet
-/// flags. A null tier reads `unknown` on an account that HAS a plan tier and
-/// drops out on one that structurally has none.
+/// `[provider, tier, host]` bracket with whatever [`host_locality`] marker its
+/// host earns, this account's own headroom, then the quiet flags. A null tier
+/// reads `unknown` on an account that HAS a plan tier and drops out on one that
+/// structurally has none.
 ///
 /// The tier guard asks the headroom payload's `kind`, never the display
 /// `provider`: [`crate::profile_json::provider_label`] renders every
@@ -661,6 +792,9 @@ fn profile_line(row: &Value) -> String {
     }
     if let Some(h) = host {
         bracket.push(h.to_string());
+        if let Some(marker) = host_locality(h) {
+            bracket.push(marker.to_string());
+        }
     }
 
     let mut out = format!(

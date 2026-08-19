@@ -541,6 +541,221 @@ fn list_profiles_prose_renders_each_row_with_unknown_for_null_fields() {
     );
 }
 
+/// One endpoint account as the `instructions` carrier holds it: a full base url,
+/// which reaches the locality predicate only through `base_url_host`.
+fn endpoint_snapshot(name: &str, base_url: &str) -> ProfileSnapshot {
+    ProfileSnapshot {
+        name: name.to_string(),
+        active: false,
+        provider: "anthropic".to_string(),
+        base_url: Some(base_url.to_string()),
+        sub_type: None,
+        rank: RosterRank::Unknown,
+    }
+}
+
+/// The same account as the `profiles` carrier holds it: an already-extracted
+/// host and nothing cached, which is the shape a self-hosted endpoint takes.
+fn endpoint_row(name: &str, host: &str) -> serde_json::Value {
+    serde_json::json!({
+        "name": name,
+        "active": false,
+        "provider": "anthropic",
+        "tier": null,
+        "host": host,
+        "windows": {"kind": "third_party", "balance": null},
+    })
+}
+
+/// Both carriers spell one endpoint's locality the same way, off the one
+/// predicate. Each literal below carries the same bracket text, reached from
+/// different bytes — the `instructions` roster from a full base url, the
+/// `profiles` reply from an already-extracted host — so a carrier that grew a
+/// spelling of its own, or dropped the marker on one side only, reds on its own
+/// literal. That pair IS the agreement pin; a further equality check between the
+/// two rendered brackets could never be the failing assertion, since reaching it
+/// requires both literals to have already matched.
+///
+/// The `host_locality(url) == None` leg is the separate discriminator: handed the
+/// whole url, the predicate places nothing, so a carrier that skipped
+/// `base_url_host` renders bare and reds here.
+#[test]
+fn both_carriers_spell_a_local_endpoint_the_same_way() {
+    let url = "http://192.168.1.50:8080/anthropic";
+    assert_eq!(
+        host_locality(url),
+        None,
+        "the marker is derived from the host, never from the url around it",
+    );
+
+    let roster = roster_lines(&[endpoint_snapshot("lanbox", url)]);
+    assert_eq!(
+        roster,
+        "- lanbox [anthropic, 192.168.1.50:8080, local endpoint]\n",
+    );
+
+    let reply = list_profiles_prose(&serde_json::json!({
+        "profiles": [endpoint_row("lanbox", "192.168.1.50:8080")]
+    }));
+    assert_eq!(
+        reply,
+        "- lanbox [anthropic, 192.168.1.50:8080, local endpoint]: usage unknown",
+    );
+}
+
+/// The defect the marker closes: a loopback account and one clauth genuinely
+/// cannot read both render `usage unknown`, so the cheapest target on the roster
+/// read exactly like the most broken one. One call renders both rows, so the two
+/// readings cannot be pinned apart by accident. Deleting the predicate strips the
+/// marker off the first row; widening it to every host puts one on the second.
+#[test]
+fn a_local_endpoint_row_reads_apart_from_a_genuinely_unknown_one() {
+    let text = list_profiles_prose(&serde_json::json!({
+        "profiles": [
+            endpoint_row("litellm", "localhost:4000"),
+            endpoint_row("hosted", "ollama.com"),
+        ]
+    }));
+    assert_eq!(
+        text,
+        "- litellm [anthropic, localhost:4000, local endpoint]: usage unknown\n\
+         - hosted [anthropic, ollama.com]: usage unknown",
+    );
+}
+
+/// The predicate over the host spellings a `base_url` really produces. Positives
+/// and negatives in one table: deleting the predicate reds the first half,
+/// widening it to every host reds the second, and so does dropping the all-digits
+/// port guard in `authority_host` — which nothing red before, measured by a
+/// reviewer's mutation surviving the whole gate.
+///
+/// The negatives carry the refusal table for the accounting rule. Each entry is a
+/// string whose local-looking PREFIX once answered for a public host, so relaxing
+/// `authority_host` in any direction reds a named row rather than going quiet.
+#[test]
+fn host_locality_places_local_hosts_and_leaves_the_rest_bare() {
+    for host in [
+        "localhost",
+        "localhost:4000",
+        "LocalHost:4000",
+        "127.0.0.1:1234",
+        "127.5.6.7",
+        "[::1]:4000",
+        "[::1]",
+        "10.0.0.5:8000",
+        "172.16.0.1",
+        "172.31.255.254",
+        "192.168.1.50:8080",
+        "169.254.13.1",
+        "[fd00::1]:11434",
+        "[fe80::1]:4000",
+        // An empty port is a DEFAULTED port: `http://127.0.0.1:/v1` is legal, and
+        // `providers::url_matches_host` already accepts that spelling, so refusing
+        // it here would put two layers at odds over one string.
+        "127.0.0.1:",
+        // The one spelling a url authority can carry a zone id in. The bare
+        // `fe80::1%eth0` is a NEGATIVE below, with every other unbracketed IPv6.
+        "[fe80::1%25eth0]:4000",
+        "[::ffff:127.0.0.1]:4000",
+        // The unspecified address, which is what a local server PRINTS as its
+        // listen address and so the likeliest thing pasted into a `base_url`.
+        // These pin SEPARATE arms, which was measured rather than assumed:
+        // `to_canonical` folds only a MAPPED address, so `0.0.0.0` reaches the V4
+        // `is_unspecified` term and `[::]` reaches the V6 one. Dropping either
+        // term alone reds exactly its own half.
+        "0.0.0.0",
+        "0.0.0.0:4000",
+        "[::]:11434",
+    ] {
+        assert_eq!(
+            host_locality(host),
+            Some("local endpoint"),
+            "`{host}` names a machine on this box or this network",
+        );
+    }
+
+    for host in [
+        // Both edges of the /12: `is_private` owns them, and a hand-rolled
+        // `starts_with("172.")` would place the pair.
+        "172.15.0.1",
+        "172.32.0.1",
+        // Names that merely SPELL the loopback one.
+        "localhost.example.com",
+        "notlocalhost",
+        // Carrier-grade NAT: the block says nothing about who runs the box.
+        "100.64.0.1",
+        // Neighbour of the unspecified address: the widening is to that ADDRESS,
+        // not to a `0.` prefix.
+        "0.0.0.1",
+        // A port is a port only when it is all digits. Without that guard the
+        // first reads as `localhost` and the second as `127.0.0.1`, and a
+        // query-bearing base url really does reach here with no `/` to cut on.
+        "localhost:80a",
+        "127.0.0.1:4000?x=1",
+        // Names clauth would have to resolve, and it resolves nothing.
+        "ollama.com",
+        "api.deepseek.com",
+        "openrouter.ai",
+        "token-plan.ap-southeast-1.maas.aliyuncs.com",
+        "8.8.8.8:443",
+        "",
+        // ── the refusal table: every byte accounted for, or nothing placed ──
+        //
+        // Bytes discarded after `%`. Each names a PUBLIC host while its prefix
+        // reads local, and `url` percent-decodes the authority, so `%2E` becomes
+        // a real dot and the request goes to `127.0.0.1.evil.com`. No zone
+        // grammar can separate these: `.` is `unreserved`, so `2Eevil.com` is a
+        // syntactically legal zone id (RFC 6874).
+        "127.0.0.1%2Eevil.com",
+        "10.0.0.1%anything",
+        "::ffff:127.0.0.1%2Eevil.com",
+        "[::ffff:127.0.0.1%2Eevil.com]",
+        "[fe80::1%]:80",
+        // Bytes discarded after `]`. A closed bracket must be followed by
+        // nothing or `:digits`; anything else is a host the prefix does not
+        // answer for.
+        "[::1]@evil.com",
+        "[::1]xyz",
+        "[127.0.0.1]evil.com",
+        "[10.0.0.1]:80x",
+        "[::1",
+        // `[IPv4]` is not authority syntax — brackets carry IPv6 only.
+        "[127.0.0.1]",
+        // Userinfo. Per RFC 3986 everything before `@` is userinfo, so the real
+        // host is `evil.tld` and the local-looking text is attacker-chosen
+        // decoration. Splitting at `@` and keeping the LEFT side would place all
+        // of these; `providers::url_matches_host` documents the incident that
+        // taught this repo so, and the render layer refuses them by never
+        // treating a non-digit tail as a port.
+        "[::1]:4000@evil.tld",
+        "127.0.0.1:4000@evil.tld",
+        "127.0.0.1@evil.tld",
+        "localhost@evil.tld",
+        "192.168.1.1@evil.tld",
+        // Unbracketed IPv6, every spelling. RFC 3986 has no authority syntax for
+        // one, so clauth refuses rather than guessing which host was meant.
+        //
+        // DO NOT DELETE THESE AS UNREACHABLE. They are reachable, and measured so:
+        // `base_url_host` splits without validating, `Profile::base_url` is raw
+        // config text, and nothing in the crate parses a url, so `http://::1/v1`
+        // arrives as `::1` from a missing-brackets typo. They moved here from the
+        // positive table as a deliberate behaviour cut on a live input — an
+        // earlier draft of this comment called them impossible, which would have
+        // invited deleting the rows and left the refusal pinned by nothing.
+        "::1",
+        "::",
+        "fe80::1",
+        "fe80::1%eth0",
+        "fd00::1",
+    ] {
+        assert_eq!(
+            host_locality(host),
+            None,
+            "`{host}` is not a host clauth can place",
+        );
+    }
+}
+
 #[test]
 fn list_profiles_prose_handles_empty_roster_and_error_envelope() {
     assert_eq!(

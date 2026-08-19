@@ -210,9 +210,9 @@ fn profile_row(p: &Profile, config: &AppConfig, now: i64) -> serde_json::Value {
         "tier": tier_label(p),
         "windows": row_windows_payload(&profile_windows(p)),
     });
-    // Host, not the full endpoint: every profile of one provider repeats the
-    // same path, and the cost model only ever asks whether the host is
-    // loopback or LAN.
+    // Host, not the full endpoint: the host is the identifying half, and the path
+    // costs tokens on every row without adding to it. For which hosts then read
+    // as local, see `render::host_locality`.
     if let Some(url) = &p.base_url {
         row["host"] = serde_json::json!(render::base_url_host(url));
     }

@@ -429,8 +429,12 @@ fn a_generic_api_key_row_reports_its_own_figures_and_claims_no_anthropic_plan() 
 
     let row = lines(&call_profiles(None, None)).remove(0);
     assert_eq!(
-        row, "- litellm (active) [anthropic, 127.0.0.1:4000]: no 5h/7d limits; total: 31.45 CNY",
-        "the account's own cached figures, and no claim about a plan it cannot have",
+        row,
+        "- litellm (active) [anthropic, 127.0.0.1:4000, local endpoint]: \
+         no 5h/7d limits; total: 31.45 CNY",
+        "the account's own cached figures, no claim about a plan it cannot have, and the \
+         locality marker its loopback base url earns — pinned here on a row the production \
+         path built from a saved profile, rather than on a hand-written one",
     );
 }
 

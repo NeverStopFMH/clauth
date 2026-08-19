@@ -50,7 +50,7 @@
 //! once the last session of the profile has left; [`gc_stale_runtimes`] collects
 //! what a crashed session left behind, of either flavor and in either layout.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -3016,6 +3016,10 @@ fn copy_if_valid_creds(src: &Path, dst: &Path) -> Result<()> {
 /// never destroys data. Top-level `settings.json` / `.credentials.json` are
 /// skipped (settings is a rewritten copy; credentials has its own stricter
 /// mirror). Fake-symlink mode only.
+///
+/// The walk closes with one pass over [`AliasClasses`], which is what keeps two
+/// `~/.claude` names resolving to ONE file from letting sort order decide whose
+/// bytes survive.
 fn mirror_tree(claude_home: &Path, runtime: &Path) -> Result<()> {
     // `.claude.json` is a per-profile copy reconciled by `crate::claude_json`,
     // not part of the `~/.claude/` tree — skip it here so the tree mirror never
@@ -3023,13 +3027,145 @@ fn mirror_tree(claude_home: &Path, runtime: &Path) -> Result<()> {
     let skip_top: HashSet<&str> = ["settings.json", ".credentials.json", ".claude.json"]
         .into_iter()
         .collect();
+    // The one `canonicalize` this walk pays for: every entry below inherits it.
+    let root_key = claude_home.canonicalize().ok();
+    let mut classes = AliasClasses::default();
     for name in union_children(claude_home, runtime) {
         if name.to_str().is_some_and(|n| skip_top.contains(n)) {
             continue;
         }
-        merge_path(&claude_home.join(&name), &runtime.join(&name))?;
+        merge_path(
+            &claude_home.join(&name),
+            &runtime.join(&name),
+            root_key.as_deref(),
+            &mut classes,
+        )?;
     }
-    Ok(())
+    classes.converge()
+}
+
+/// Runtime copies grouped by the canonical file a mirror write to them lands on.
+///
+/// Two `~/.claude` names can resolve to ONE file — `CLAUDE.local.md` symlinked at
+/// `CLAUDE.md`, or two names reached through one linked directory. Real symlink
+/// mode has no such split: [`build_runtime_dir_with_active_env`] links each
+/// top-level entry, so both runtime names ARE that one file and the last write
+/// wins. Fake mode's two independent copies are the emulation gap, and merging
+/// them name by name lets `union_children`'s SORT ORDER decide which copy's bytes
+/// survive — the first name publishes onto the shared target and stamps it with
+/// mtime-now, which the next name then reads as a genuinely newer side. Nobody
+/// made that decision, so the class converges on the CLOCK instead, which is the
+/// closest fake-mode analogue of the single file real mode hands it.
+///
+/// Two limits, accepted rather than worked around: `canonicalize` does not
+/// collapse HARD links, so two hard-linked names stay two classes; and the map is
+/// per-walk, so a class first seen across a tick boundary converges on the next
+/// tick rather than this one.
+#[derive(Default)]
+struct AliasClasses {
+    classes: HashMap<PathBuf, AliasClass>,
+}
+
+/// One canonical file plus every runtime copy that aliased it during this walk.
+struct AliasClass {
+    /// The canonical side's clock, as the walk last DECIDED it — never a re-stat.
+    /// A sibling name's publish inside this same tick stamps the target with
+    /// mtime-now, and comparing against that would let it outrank every real
+    /// reading still to come.
+    owner_time: Option<SystemTime>,
+    copies: Vec<PathBuf>,
+}
+
+impl AliasClasses {
+    /// Record `copy` as an alias of `target`, seeding the class's clock from
+    /// `seed` the first time the walk reaches it. Returns the clock `copy` must
+    /// be compared against.
+    fn observe(
+        &mut self,
+        target: &Path,
+        copy: &Path,
+        seed: Option<SystemTime>,
+    ) -> Option<SystemTime> {
+        let class = self
+            .classes
+            .entry(target.to_path_buf())
+            .or_insert_with(|| AliasClass {
+                owner_time: seed,
+                copies: Vec::new(),
+            });
+        class.copies.push(copy.to_path_buf());
+        class.owner_time
+    }
+
+    /// The canonical side just took `copy`'s bytes, so it now carries its clock.
+    fn adopt_owner_time(&mut self, target: &Path, when: Option<SystemTime>) {
+        if let Some(class) = self.classes.get_mut(target) {
+            class.owner_time = when;
+        }
+    }
+
+    /// Give every copy in an ALIASED class the target's bytes. The per-name merge
+    /// above has already put the class's newest bytes on the target, so this is
+    /// what converges a copy the walk visited BEFORE the eventual winner — within
+    /// the same tick, rather than one tick per alias.
+    ///
+    /// It also decides one case the per-name merge deliberately declines: an
+    /// exact mtime tie with divergent bytes, which `mtime_newer`'s strict `>`
+    /// leaves untouched on both sides. Inside a class that would be a standing
+    /// disagreement between two spellings of ONE file, which has no resting
+    /// state, so the target's bytes win. Outside a class the tie is still left
+    /// alone, because two independent files are allowed to differ.
+    ///
+    /// Single-copy classes are the whole non-aliased tree and are skipped, so it
+    /// costs nothing beyond the map. An unreadable target skips its class, since
+    /// there is nothing to converge onto. A failed PUBLISH still fails the tick,
+    /// like every other publish in the walk — and `tick` runs `mirror_tree`
+    /// before `mirror_credentials`, so an error here also costs that tick its
+    /// credential reconcile.
+    fn converge(&self) -> Result<()> {
+        for (target, class) in &self.classes {
+            if class.copies.len() < 2 {
+                continue;
+            }
+            let Ok(bytes) = std::fs::read(target) else {
+                continue;
+            };
+            for copy in &class.copies {
+                if std::fs::read(copy).ok().as_deref() == Some(bytes.as_slice()) {
+                    continue;
+                }
+                copy_file(target, copy)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Identity of the canonical file a write aimed at `a` lands on, given the
+/// already-resolved identity of its parent directory and `a`'s own
+/// `symlink_metadata`. Every symlink component is resolved, but each one only
+/// once — a link resolves itself, and everything else inherits its parent's
+/// answer and appends its own name.
+///
+/// Resolving each entry independently is the obvious spelling and the expensive
+/// one: `canonicalize` walks the whole path per FILE rather than per directory,
+/// which cost a third of the walk on a large converged tree.
+///
+/// Inheriting is also what gives a stable identity to a canonical path that does
+/// not exist YET ([`merge_path`]'s `(None, Some(_))` arm, where `canonicalize`
+/// can answer nothing), and what catches the DIRECTORY spelling of the aliasing
+/// bug — two `~/.claude` names linked at one directory, reaching its files under
+/// leaf names that are not themselves links.
+fn child_key(
+    a: &Path,
+    parent_key: Option<&Path>,
+    a_meta: Option<&std::fs::Metadata>,
+) -> Option<PathBuf> {
+    if a_meta.is_some_and(|m| m.file_type().is_symlink()) {
+        return a.canonicalize().ok();
+    }
+    let name = a.file_name()?;
+    Some(parent_key?.join(name))
 }
 
 /// Unioned child-name set of two directories, minus the publishes in flight.
@@ -3061,9 +3197,53 @@ fn union_children(a: &Path, b: &Path) -> Vec<std::ffi::OsString> {
 
 /// Reconcile one path between canonical (`a`) and runtime (`b`) sides.
 /// Directories recurse via the same union-walk; files merge by mtime.
-fn merge_path(a: &Path, b: &Path) -> Result<()> {
+///
+/// `parent_key` is `a`'s parent directory with every symlink component already
+/// resolved, threaded down so [`child_key`] costs a join instead of a walk.
+/// `classes` is the walk-scoped alias bookkeeping — see [`AliasClasses`] for why
+/// the mtime comparisons below read the class's clock instead of re-stating `a`.
+fn merge_path(
+    a: &Path,
+    b: &Path,
+    parent_key: Option<&Path>,
+    classes: &mut AliasClasses,
+) -> Result<()> {
     let a_meta = a.symlink_metadata().ok();
     let b_meta = b.symlink_metadata().ok();
+
+    // An entry EITHER side has but nothing can follow costs this one name, never
+    // the tick. Its path is occupied — `symlink_metadata` sees it — while every
+    // read, write and stat through it fails, so each branch below misfires on it:
+    // `files_match` and `copy_file` read through it, and the directory branch
+    // sees `exists()` false and calls a recursive create that returns EEXIST
+    // rather than succeeding. One moved-aside `~/.claude` target would otherwise
+    // take down every reconcile pass on a copy-transport host.
+    //
+    // Skipped whole, never unlinked: the mirror is additive and "not yet seen"
+    // is already its vocabulary for a name it cannot merge. Canonical is the
+    // OPERATOR's tree, so a link there is their intent, and the runtime side's
+    // self-heal belongs to `prune_dangling_links` at build time.
+    //
+    // Two accepted limits, both PERMANENT rather than one-tick, because the skip
+    // is unconditional and mutates neither side, so nothing re-converges them:
+    //
+    // - a canonical dangling link with a real runtime FILE under the same name
+    //   strands that file. Real symlink mode would not: a write through a
+    //   dangling link creates the target and leaves the link a link (measured on
+    //   Linux), so fake mode diverges here rather than emulating.
+    // - a dangling canonical DIRECTORY link stalls that whole subtree, not one
+    //   name.
+    //
+    // Plus the soft edge `prune_dangling_links` documents: `Path::exists`
+    // swallows every stat error, so a live link over a dropped mount reads as
+    // unresolvable and is skipped for that tick.
+    if is_unresolvable_entry(a, a_meta.as_ref()) || is_unresolvable_entry(b, b_meta.as_ref()) {
+        return Ok(());
+    }
+
+    // Resolved once here and handed to the recursion, so every symlink component
+    // on the way down is resolved once per DIRECTORY rather than once per file.
+    let key = child_key(a, parent_key, a_meta.as_ref());
 
     // `Path::is_dir` follows symlinks, unlike the `symlink_metadata` file-type
     // above: a symlink/junction to a DIRECTORY must recurse like a real dir, or
@@ -3089,7 +3269,7 @@ fn merge_path(a: &Path, b: &Path) -> Result<()> {
                 .with_context(|| format!("failed to create {}", a.display()))?;
         }
         for name in union_children(a, b) {
-            merge_path(&a.join(&name), &b.join(&name))?;
+            merge_path(&a.join(&name), &b.join(&name), key.as_deref(), classes)?;
         }
         return Ok(());
     }
@@ -3122,15 +3302,35 @@ fn merge_path(a: &Path, b: &Path) -> Result<()> {
     let a_time = a.metadata().ok().and_then(|m| m.modified().ok());
     let b_time = b_meta.as_ref().and_then(|m| m.modified().ok());
 
+    // The clock to judge `b` against. `(None, None)` records nothing: a name
+    // neither side has must never enter a class, or `converge` would CREATE the
+    // runtime copy.
+    let owner_time = match (&a_meta, &b_meta) {
+        (None, None) => a_time,
+        _ => key
+            .as_deref()
+            .map_or(a_time, |k| classes.observe(k, b, a_time)),
+    };
+
     match (a_meta, b_meta) {
         (Some(_), Some(_)) => {
             if files_match(a, b)? {
+                // The class clock stays where it is. A copy byte-equal to the
+                // canonical target is overwhelmingly this mirror's OWN echo from
+                // an earlier tick, and an mtime move is not a write, so its
+                // clock is evidence of nothing. Advancing to it lets the echo
+                // outrank a sibling copy carrying a real edit, and the merge
+                // then publishes the old shared bytes over that edit — which
+                // `mirror_tree` promises never to do.
                 return Ok(());
             }
-            if mtime_newer(a_time, b_time) {
+            if mtime_newer(owner_time, b_time) {
                 copy_file(a, b)?;
-            } else if mtime_newer(b_time, a_time) {
+            } else if mtime_newer(b_time, owner_time) {
                 copy_file(b, &a_write)?;
+                if let Some(k) = key.as_deref() {
+                    classes.adopt_owner_time(k, b_time);
+                }
             }
         }
         (Some(_), None) => {
@@ -3138,6 +3338,9 @@ fn merge_path(a: &Path, b: &Path) -> Result<()> {
         }
         (None, Some(_)) => {
             copy_file(b, &a_write)?;
+            if let Some(k) = key.as_deref() {
+                classes.adopt_owner_time(k, b_time);
+            }
         }
         (None, None) => {}
     }
@@ -3153,14 +3356,29 @@ fn merge_path(a: &Path, b: &Path) -> Result<()> {
 /// leave both trees, which is correct for a link the operator made and wrong for
 /// one found in clauth's own copy; see [`merge_path`].
 ///
-/// A DANGLING link keeps its own path, so the write re-creates it as a regular
-/// file. That is the pre-existing outcome and not what this exists to change:
-/// the arm that reaches it reads the link first and fails the tick there.
+/// A link `canonicalize` cannot resolve falls back to `p` itself, so the write
+/// re-creates it as a regular file.
 fn write_target(p: &Path) -> PathBuf {
     match p.symlink_metadata() {
         Ok(m) if m.file_type().is_symlink() => p.canonicalize().unwrap_or_else(|_| p.to_path_buf()),
         _ => p.to_path_buf(),
     }
+}
+
+/// Does `p` name an entry that exists but cannot be followed? Takes the caller's
+/// already-taken `symlink_metadata` so the entry's presence and the
+/// follow-through `exists()` describe one stat pair rather than two.
+///
+/// Deliberately not "is this a dangling symlink". Four shapes answer yes, and
+/// [`merge_path`] fails identically on all four, so the predicate is written to
+/// the outcome rather than to one cause: a link whose target is gone, a link that
+/// loops (ELOOP), a regular file unlinked between the caller's
+/// `symlink_metadata` and this `exists()`, and a parent that lost `+x` in the
+/// same window. `mirror_tree` walks lockless by its own doc, so both races are
+/// ordinary. `Path::exists` swallowing every stat error is what folds EACCES and
+/// ELOOP in beside ENOENT.
+fn is_unresolvable_entry(p: &Path, meta: Option<&std::fs::Metadata>) -> bool {
+    meta.is_some() && !p.exists()
 }
 
 fn mtime_newer(a: Option<SystemTime>, b: Option<SystemTime>) -> bool {

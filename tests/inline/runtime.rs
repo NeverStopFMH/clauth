@@ -1003,6 +1003,524 @@ fn mirror_tree_does_not_write_through_a_runtime_side_symlink() {
     );
 }
 
+/// A dangling link on the CANONICAL side must cost that ONE name, not the tick.
+/// `symlink_metadata` stats the link and says the entry is there, so the
+/// `(Some, Some)` arm runs and `files_match` reads THROUGH the broken link for an
+/// ENOENT that propagates out of `mirror_tree` — every reconcile pass on a
+/// copy-transport host dies from then on, and nothing self-heals it because the
+/// operator's tree is where the moved-aside target lives. Ordinary trigger: the
+/// operator moves a `~/.claude` file aside while the runtime holds its copy.
+///
+/// The link itself must survive: `~/.claude` is the operator's tree, so a link
+/// there is their intent and the mirror never deletes.
+#[test]
+fn mirror_tree_survives_a_dangling_canonical_link() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let claude = tmp.path().join("claude");
+    let runtime = tmp.path().join("runtime");
+    for dir in [&claude, &runtime] {
+        fs::create_dir_all(dir).expect("mkdir");
+    }
+    // `notes.md` sorts before `todos.json`, so the broken name is walked first
+    // and a failing tick can never reach the ordinary file behind it.
+    if !pose_file_link(&claude.join("notes.md"), &tmp.path().join("moved-aside.md")) {
+        return;
+    }
+    fs::write(runtime.join("notes.md"), b"STALE COPY").expect("write runtime copy");
+    fs::write(claude.join("todos.json"), b"[]").expect("write canonical");
+
+    mirror_tree(&claude, &runtime).expect("one broken name must not fail the tick");
+
+    assert_eq!(
+        fs::read(runtime.join("todos.json")).expect("read runtime"),
+        b"[]",
+        "the rest of the tree still reconciles past a dangling name"
+    );
+    assert!(
+        claude
+            .join("notes.md")
+            .symlink_metadata()
+            .expect("canonical entry present")
+            .file_type()
+            .is_symlink(),
+        "the operator's link is their intent; the mirror never unlinks it"
+    );
+    assert_eq!(
+        fs::read(runtime.join("notes.md")).expect("read runtime copy"),
+        b"STALE COPY",
+        "and the runtime copy is left where it is, not published over the broken link"
+    );
+}
+
+/// The DIRECTORY shape of the same defect, which the file fixture cannot reach:
+/// a dangling canonical link whose runtime counterpart is a real directory takes
+/// the `b_is_dir` branch, where `a.exists()` is false through the broken link and
+/// `mkdir_700(a)` runs. A recursive create swallows EEXIST only when a follow-up
+/// stat says the path is a directory, and a dangling link answers neither, so it
+/// returns `File exists (os error 17)` and fails the tick.
+#[test]
+fn mirror_tree_survives_a_dangling_canonical_link_over_a_runtime_dir() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let claude = tmp.path().join("claude");
+    let runtime = tmp.path().join("runtime");
+    fs::create_dir_all(&claude).expect("mkdir claude");
+    fs::create_dir_all(runtime.join("skills")).expect("mkdir runtime skills");
+    fs::write(runtime.join("skills").join("skill.md"), b"skill body").expect("write skill");
+    // `skills` sorts before `todos.json`, same reason as the fixture above.
+    if !pose_file_link(&claude.join("skills"), &tmp.path().join("moved-aside")) {
+        return;
+    }
+    fs::write(claude.join("todos.json"), b"[]").expect("write canonical");
+
+    mirror_tree(&claude, &runtime).expect("one broken name must not fail the tick");
+
+    assert_eq!(
+        fs::read(runtime.join("todos.json")).expect("read runtime"),
+        b"[]",
+        "the rest of the tree still reconciles past a dangling name"
+    );
+    assert!(
+        claude
+            .join("skills")
+            .symlink_metadata()
+            .expect("canonical entry present")
+            .file_type()
+            .is_symlink(),
+        "the mirror must not have replaced the operator's link with a directory"
+    );
+}
+
+/// The RUNTIME side of the same predicate: a broken link there reads as an
+/// existing entry too, so `files_match` fails on the `b` read instead of the `a`
+/// one and takes the same tick down. Self-healing that side is
+/// [`prune_dangling_links`]'s job at build time; the mirror only has to keep
+/// walking.
+#[test]
+fn mirror_tree_survives_a_dangling_runtime_link() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let claude = tmp.path().join("claude");
+    let runtime = tmp.path().join("runtime");
+    for dir in [&claude, &runtime] {
+        fs::create_dir_all(dir).expect("mkdir");
+    }
+    if !pose_file_link(
+        &runtime.join("notes.md"),
+        &tmp.path().join("moved-aside.md"),
+    ) {
+        return;
+    }
+    fs::write(claude.join("notes.md"), b"CANON").expect("write canonical");
+    fs::write(claude.join("todos.json"), b"[]").expect("write canonical todos");
+
+    mirror_tree(&claude, &runtime).expect("one broken name must not fail the tick");
+
+    assert_eq!(
+        fs::read(runtime.join("todos.json")).expect("read runtime"),
+        b"[]",
+        "the rest of the tree still reconciles past a dangling name"
+    );
+    assert!(
+        runtime
+            .join("notes.md")
+            .symlink_metadata()
+            .expect("runtime entry present")
+            .file_type()
+            .is_symlink(),
+        "the mirror never unlinks either side; prune_dangling_links owns that repair"
+    );
+}
+
+/// The skip predicate is written to the OUTCOME, not to symlinks. A regular file
+/// unlinked between `merge_path`'s `symlink_metadata` and its follow-through
+/// answers the same "present but unfollowable" shape, and `mirror_tree` walks
+/// lockless by its own doc, so a file vanishing mid-walk is ordinary rather than
+/// exotic. Narrow the predicate back to `is_symlink` and this pair reaches
+/// `files_match`, which fails the whole tick on an ENOENT — the exact class the
+/// guard exists to close.
+///
+/// Driven as a unit because the race cannot be posed as a static fixture: the
+/// two stats have to straddle the unlink, which is what this reproduces exactly.
+#[test]
+fn an_entry_that_vanished_mid_walk_reads_as_unresolvable() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let victim = tmp.path().join("vanishes.json");
+    fs::write(&victim, b"{}").expect("write victim");
+
+    // The stat the walk already took, before the unlink it cannot see.
+    let meta = victim.symlink_metadata().expect("stat before the unlink");
+    assert!(
+        !meta.file_type().is_symlink(),
+        "fixture poses nothing unless the entry is a REGULAR file"
+    );
+    fs::remove_file(&victim).expect("unlink under the walk");
+
+    assert!(
+        is_unresolvable_entry(&victim, Some(&meta)),
+        "a file unlinked between the two stats must be skipped, not merged"
+    );
+}
+
+/// A symlink LOOP is the third shape the predicate's doc names: `symlink_metadata`
+/// succeeds on the link, and `exists()` is false because `Path::exists` swallows
+/// ELOOP the same way it swallows ENOENT. Pins the doc's claim rather than a
+/// branch — the wide predicate and the old narrow one both catch this one.
+#[cfg(unix)]
+#[test]
+fn a_symlink_loop_reads_as_unresolvable() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let a = tmp.path().join("a");
+    let b = tmp.path().join("b");
+    std::os::unix::fs::symlink("b", &a).expect("symlink a -> b");
+    std::os::unix::fs::symlink("a", &b).expect("symlink b -> a");
+
+    let meta = a.symlink_metadata().expect("the link itself stats fine");
+    assert!(
+        !a.exists(),
+        "fixture poses nothing unless the loop is unfollowable"
+    );
+    assert!(is_unresolvable_entry(&a, Some(&meta)));
+}
+
+/// Two `~/.claude` names resolving to ONE file must converge on the CLOCK, not on
+/// filename sort order. `union_children` sorts, so the first name's runtime copy
+/// is published onto the shared target and stamps it with mtime-now; the second
+/// name then reads that fresh stamp as the newer side and the divergent bytes it
+/// was carrying are overwritten and gone. Which name survives is alphabetical,
+/// which is not a decision anyone made.
+///
+/// Real symlink mode has no such split — each runtime entry IS the one file, so
+/// last write wins — and fake mode's two independent copies are the emulation
+/// gap. Newest-mtime-wins is its closest analogue, so ONE tick must leave the
+/// target and both copies holding the newest bytes.
+#[test]
+fn mirror_tree_converges_two_names_on_one_target_by_clock() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let claude = tmp.path().join("claude");
+    let runtime = tmp.path().join("runtime");
+    let real = tmp.path().join("dotfiles");
+    for dir in [&claude, &runtime, &real] {
+        fs::create_dir_all(dir).expect("mkdir");
+    }
+    let target = real.join("shared.md");
+    fs::write(&target, b"ORIGINAL").expect("write target");
+    // `alias-a.md` sorts first, so on the pre-fix walk it is the one that wins.
+    if !pose_file_link(&claude.join("alias-a.md"), &target) {
+        return;
+    }
+    if !pose_file_link(&claude.join("alias-b.md"), &target) {
+        return;
+    }
+    fs::write(runtime.join("alias-a.md"), b"SORTS-FIRST").expect("write runtime a");
+    fs::write(runtime.join("alias-b.md"), b"NEWEST").expect("write runtime b");
+
+    // All three in the PAST, which is what makes the loss reproducible: the
+    // publish onto the target stamps it with mtime-now, so a stale sibling's
+    // fresh stamp outranks every real reading still to come.
+    let now = SystemTime::now();
+    set_mtime(&target, now - Duration::from_secs(600));
+    set_mtime(&runtime.join("alias-a.md"), now - Duration::from_secs(400));
+    set_mtime(&runtime.join("alias-b.md"), now - Duration::from_secs(200));
+
+    mirror_tree(&claude, &runtime).expect("mirror");
+
+    assert_eq!(
+        fs::read(&target).expect("read target"),
+        b"NEWEST",
+        "the newest copy in the class owns the shared target, not the first-sorted one"
+    );
+    assert_eq!(
+        fs::read(runtime.join("alias-b.md")).expect("read runtime b"),
+        b"NEWEST",
+        "the winner's own copy is left alone"
+    );
+    assert_eq!(
+        fs::read(runtime.join("alias-a.md")).expect("read runtime a"),
+        b"NEWEST",
+        "and a copy visited BEFORE the winner still converges within the same tick"
+    );
+}
+
+/// The other sort order, which the fixture above cannot reach: the newest copy
+/// is the one walked FIRST. Pre-fix this happened to come out right — the
+/// first-sorted copy publishes onto the target, and the mtime-now stamp it leaves
+/// then beats the older sibling — so it is a guard rather than a repro. It pins
+/// that the class ADOPTS the winning copy's clock: keep re-reading the seed
+/// instead and the second, strictly older copy outranks the target it was just
+/// given and publishes its stale bytes back over the winner's.
+#[test]
+fn mirror_tree_converges_two_names_when_the_first_sorted_is_newest() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let claude = tmp.path().join("claude");
+    let runtime = tmp.path().join("runtime");
+    let real = tmp.path().join("dotfiles");
+    for dir in [&claude, &runtime, &real] {
+        fs::create_dir_all(dir).expect("mkdir");
+    }
+    let target = real.join("shared.md");
+    fs::write(&target, b"ORIGINAL").expect("write target");
+    if !pose_file_link(&claude.join("alias-a.md"), &target) {
+        return;
+    }
+    if !pose_file_link(&claude.join("alias-b.md"), &target) {
+        return;
+    }
+    fs::write(runtime.join("alias-a.md"), b"NEWEST").expect("write runtime a");
+    fs::write(runtime.join("alias-b.md"), b"SORTS-SECOND").expect("write runtime b");
+
+    let now = SystemTime::now();
+    set_mtime(&target, now - Duration::from_secs(600));
+    set_mtime(&runtime.join("alias-a.md"), now - Duration::from_secs(200));
+    set_mtime(&runtime.join("alias-b.md"), now - Duration::from_secs(400));
+
+    mirror_tree(&claude, &runtime).expect("mirror");
+
+    assert_eq!(
+        fs::read(&target).expect("read target"),
+        b"NEWEST",
+        "an older sibling must not publish back over the copy that already won"
+    );
+    assert_eq!(
+        fs::read(runtime.join("alias-b.md")).expect("read runtime b"),
+        b"NEWEST",
+        "the loser converges onto the winner's bytes"
+    );
+}
+
+/// A copy byte-equal to the canonical target must NOT lend the class its clock.
+/// Such a copy is this mirror's own echo from an earlier tick and an mtime move
+/// is not a write, so a freshly-touched echo would outrank the sibling carrying a
+/// real edit and the merge would publish the old shared bytes back over it.
+///
+/// The fixture is the `CLAUDE.local.md` -> `CLAUDE.md` shape, on the exact clocks
+/// that make the echo look newest: the echo sorts first at now-100 while the edit
+/// sits at now-600 behind a canonical file from now-900. One tick must land the
+/// edit on the canonical file AND on both runtime copies —
+/// [`mirror_tree`]'s contract is that it never destroys data.
+#[test]
+fn mirror_tree_alias_echo_does_not_outrank_a_siblings_real_edit() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let claude = tmp.path().join("claude");
+    let runtime = tmp.path().join("runtime");
+    for dir in [&claude, &runtime] {
+        fs::create_dir_all(dir).expect("mkdir");
+    }
+    let memory = claude.join("CLAUDE.md");
+    fs::write(&memory, b"OLD SHARED").expect("write memory");
+    if !pose_file_link(&claude.join("CLAUDE.local.md"), &memory) {
+        return;
+    }
+    fs::write(runtime.join("CLAUDE.md"), b"OPERATOR EDIT").expect("write runtime memory");
+    fs::write(runtime.join("CLAUDE.local.md"), b"OLD SHARED").expect("write runtime echo");
+
+    let now = SystemTime::now();
+    set_mtime(&memory, now - Duration::from_secs(900));
+    set_mtime(
+        runtime.join("CLAUDE.md").as_path(),
+        now - Duration::from_secs(600),
+    );
+    set_mtime(
+        runtime.join("CLAUDE.local.md").as_path(),
+        now - Duration::from_secs(100),
+    );
+
+    mirror_tree(&claude, &runtime).expect("mirror");
+
+    assert_eq!(
+        fs::read(&memory).expect("read memory"),
+        b"OPERATOR EDIT",
+        "a touched echo must not beat the sibling holding the only real edit"
+    );
+    assert_eq!(
+        fs::read(runtime.join("CLAUDE.md")).expect("read runtime memory"),
+        b"OPERATOR EDIT",
+        "and the edit is certainly not overwritten in place"
+    );
+    assert_eq!(
+        fs::read(runtime.join("CLAUDE.local.md")).expect("read runtime echo"),
+        b"OPERATOR EDIT",
+        "the echo converges onto the edit within the same tick"
+    );
+}
+
+/// The DIRECTORY spelling of the same aliasing: two `~/.claude` names linked at
+/// one directory, reaching its files under leaf names that are not themselves
+/// links. `canonicalize` cannot identify the shared file while it is still
+/// runtime-only, which is exactly when the loss happens — the first name creates
+/// it and stamps it with mtime-now, and the second reads that stamp as newer.
+/// Resolving the PARENT and re-attaching the lexical tail is what gives the class
+/// its identity a tick early.
+#[test]
+fn mirror_tree_converges_two_directory_aliases_on_one_target() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let claude = tmp.path().join("claude");
+    let runtime = tmp.path().join("runtime");
+    let shared = tmp.path().join("dotfiles").join("shared");
+    for dir in [&claude, &runtime, &shared] {
+        fs::create_dir_all(dir).expect("mkdir");
+    }
+    pose_dir_link(&claude.join("link-a"), &shared);
+    pose_dir_link(&claude.join("link-b"), &shared);
+    fs::create_dir_all(runtime.join("link-a")).expect("mkdir runtime a");
+    fs::create_dir_all(runtime.join("link-b")).expect("mkdir runtime b");
+    fs::write(runtime.join("link-a").join("note.md"), b"SORTS-FIRST").expect("write runtime a");
+    fs::write(runtime.join("link-b").join("note.md"), b"NEWEST").expect("write runtime b");
+
+    let now = SystemTime::now();
+    set_mtime(
+        runtime.join("link-a").join("note.md").as_path(),
+        now - Duration::from_secs(400),
+    );
+    set_mtime(
+        runtime.join("link-b").join("note.md").as_path(),
+        now - Duration::from_secs(200),
+    );
+
+    mirror_tree(&claude, &runtime).expect("mirror");
+
+    assert_eq!(
+        fs::read(shared.join("note.md")).expect("read shared"),
+        b"NEWEST",
+        "a file two linked directories share is one class, seeded before it exists"
+    );
+    assert_eq!(
+        fs::read(runtime.join("link-a").join("note.md")).expect("read runtime a"),
+        b"NEWEST",
+        "and the copy walked first converges within the same tick"
+    );
+}
+
+/// An exact mtime tie with divergent bytes: `mtime_newer` is strict, so the
+/// per-name merge writes nothing and both sides keep what they hold. Inside an
+/// alias class that leaves two spellings of ONE file disagreeing with no resting
+/// state, so `converge` breaks the tie toward the shared target. Outside a class
+/// nothing breaks it, because two independent files are allowed to differ — both
+/// halves are pinned here, since the second is what bounds the first.
+#[test]
+fn mirror_tree_breaks_an_mtime_tie_only_inside_an_alias_class() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let claude = tmp.path().join("claude");
+    let runtime = tmp.path().join("runtime");
+    let real = tmp.path().join("dotfiles");
+    for dir in [&claude, &runtime, &real] {
+        fs::create_dir_all(dir).expect("mkdir");
+    }
+    let target = real.join("shared.md");
+    fs::write(&target, b"SHARED").expect("write target");
+    if !pose_file_link(&claude.join("alias-a.md"), &target) {
+        return;
+    }
+    if !pose_file_link(&claude.join("alias-b.md"), &target) {
+        return;
+    }
+    fs::write(runtime.join("alias-a.md"), b"DIVERGED").expect("write runtime a");
+    fs::write(runtime.join("alias-b.md"), b"SHARED").expect("write runtime b");
+    fs::write(claude.join("solo.md"), b"CANON SOLO").expect("write canon solo");
+    fs::write(runtime.join("solo.md"), b"RUNTIME SOLO").expect("write runtime solo");
+
+    let tie = SystemTime::now() - Duration::from_secs(300);
+    for p in [
+        target.as_path(),
+        &runtime.join("alias-a.md"),
+        &runtime.join("alias-b.md"),
+        &claude.join("solo.md"),
+        &runtime.join("solo.md"),
+    ] {
+        set_mtime(p, tie);
+    }
+    // The fixture poses nothing unless the stamps land EXACTLY equal: one
+    // filesystem tick of drift turns this into an ordinary newer-side merge.
+    let stamp = |p: &Path| p.metadata().expect("meta").modified().expect("mtime");
+    assert_eq!(
+        stamp(&target),
+        stamp(&runtime.join("alias-a.md")),
+        "aliased pair must be an exact tie"
+    );
+    assert_eq!(
+        stamp(&claude.join("solo.md")),
+        stamp(&runtime.join("solo.md")),
+        "solo pair must be an exact tie"
+    );
+
+    mirror_tree(&claude, &runtime).expect("mirror");
+
+    assert_eq!(
+        fs::read(runtime.join("alias-a.md")).expect("read runtime a"),
+        b"SHARED",
+        "an aliased tie has no resting state, so the shared target breaks it"
+    );
+    assert_eq!(
+        fs::read(&target).expect("read target"),
+        b"SHARED",
+        "and the tie never moves the target itself"
+    );
+    assert_eq!(
+        fs::read(claude.join("solo.md")).expect("read canon solo"),
+        b"CANON SOLO",
+        "a tie between two independent files is still left exactly alone"
+    );
+    assert_eq!(
+        fs::read(runtime.join("solo.md")).expect("read runtime solo"),
+        b"RUNTIME SOLO",
+        "both sides of it, in both directions"
+    );
+}
+
+/// The regression guard for the rule we did NOT pick. Skipping an aliased name
+/// would also stop sort order deciding, and it would strand the common shape:
+/// `CLAUDE.local.md` symlinked at `CLAUDE.md`, whose two runtime copies are
+/// byte-identical, so nothing is ever at risk of being lost. An operator edit to
+/// the target has to reach BOTH copies in one tick, exactly as it did before the
+/// alias class existed.
+///
+/// This one passes before the fix as well as after — it exists to fail a fix that
+/// buys convergence by refusing to merge.
+#[test]
+fn mirror_tree_still_seeds_both_copies_of_a_benign_alias() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let claude = tmp.path().join("claude");
+    let runtime = tmp.path().join("runtime");
+    for dir in [&claude, &runtime] {
+        fs::create_dir_all(dir).expect("mkdir");
+    }
+    let memory = claude.join("CLAUDE.md");
+    fs::write(&memory, b"OPERATOR EDIT").expect("write memory");
+    // `CLAUDE.local.md` sorts before `CLAUDE.md`, so the alias seeds the class.
+    if !pose_file_link(&claude.join("CLAUDE.local.md"), &memory) {
+        return;
+    }
+    fs::write(runtime.join("CLAUDE.md"), b"OLD").expect("write runtime memory");
+    fs::write(runtime.join("CLAUDE.local.md"), b"OLD").expect("write runtime alias");
+
+    let now = SystemTime::now();
+    set_mtime(
+        runtime.join("CLAUDE.md").as_path(),
+        now - Duration::from_secs(600),
+    );
+    set_mtime(
+        runtime.join("CLAUDE.local.md").as_path(),
+        now - Duration::from_secs(600),
+    );
+    set_mtime(&memory, now - Duration::from_secs(200));
+
+    mirror_tree(&claude, &runtime).expect("mirror");
+
+    assert_eq!(
+        fs::read(runtime.join("CLAUDE.md")).expect("read runtime memory"),
+        b"OPERATOR EDIT",
+        "the operator's edit must still reach the runtime copy"
+    );
+    assert_eq!(
+        fs::read(runtime.join("CLAUDE.local.md")).expect("read runtime alias"),
+        b"OPERATOR EDIT",
+        "and the aliased copy too — an alias class converges, it does not opt out of merging"
+    );
+    assert_eq!(
+        fs::read(&memory).expect("read memory"),
+        b"OPERATOR EDIT",
+        "the operator's own file is left alone"
+    );
+}
+
 #[test]
 fn copy_file_overwrites_existing_destination() {
     let tmp = tempfile::tempdir().expect("tempdir");

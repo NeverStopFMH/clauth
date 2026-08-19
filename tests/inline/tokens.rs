@@ -668,6 +668,92 @@ fn top_up_dedupes_idless_usage_lines_by_content() {
     );
 }
 
+/// One assistant-turn line as CC writes it during streaming: a distinct line
+/// uuid per delta, the same message.id, full input/cache, growing output.
+fn streamed_line(
+    timestamp: &str,
+    msg_id: &str,
+    uuid: &str,
+    model: &str,
+    input: u64,
+    output: u64,
+) -> String {
+    format!(
+        r#"{{"timestamp":"{timestamp}","uuid":"{uuid}","message":{{"id":"{msg_id}","role":"assistant","model":"{model}","usage":{{"input_tokens":{input},"output_tokens":{output},"cache_read_input_tokens":500,"cache_creation_input_tokens":0}}}}}}"#
+    )
+}
+
+#[test]
+fn top_up_counts_streamed_turn_by_completed_delta_not_first() {
+    // One assistant turn written as three streaming deltas sharing message.id:
+    // output 0 -> 0 -> 272 on distinct line uuids. Tokens must count the final
+    // 272 (not the first 0), and the turn must count as one message, not three.
+    let sb = HomeSandbox::new();
+    let claude_dir = make_claude_dir(&sb);
+    write_stats_cache(
+        &claude_dir,
+        r#"{
+            "lastComputedDate": "2026-06-10",
+            "totalSessions": 0, "totalMessages": 0,
+            "dailyActivity": [], "dailyModelTokens": [],
+            "modelUsage": {}, "hourCounts": {}
+        }"#,
+    );
+
+    let proj_dir = claude_dir.join("projects").join("p1");
+    std::fs::create_dir_all(&proj_dir).expect("create project dir");
+    let p = proj_dir.join("sess.jsonl");
+    let lines = [
+        streamed_line(
+            "2026-06-11T10:00:00+00:00",
+            "msg_1",
+            "u1",
+            "deepseek-v4-pro",
+            1000,
+            0,
+        ),
+        streamed_line(
+            "2026-06-11T10:00:01+00:00",
+            "msg_1",
+            "u2",
+            "deepseek-v4-pro",
+            1000,
+            0,
+        ),
+        streamed_line(
+            "2026-06-11T10:00:02+00:00",
+            "msg_1",
+            "u3",
+            "deepseek-v4-pro",
+            1000,
+            272,
+        ),
+    ];
+    std::fs::write(&p, lines.join("\n")).expect("write");
+    set_mtime(&p, SystemTime::now());
+
+    let stats = load(&claude_dir).expect("load");
+
+    // The completed delta's output, not the first delta's 0.
+    let day = stats
+        .daily
+        .iter()
+        .find(|d| d.date == "2026-06-11")
+        .expect("2026-06-11 must be in daily");
+    assert_eq!(day.tokens, 1000 + 272);
+    let model = stats
+        .models
+        .iter()
+        .find(|m| m.model == "deepseek-v4-pro")
+        .expect("model");
+    assert_eq!(model.input, 1000);
+    assert_eq!(model.output, 272);
+    assert_eq!(model.cache_read, 500);
+
+    // One turn = one message, not three deltas.
+    assert_eq!(stats.total_messages, 1);
+}
+
 /// A role/uuid/session message line with no token usage — drives the
 /// message/session/hour reconstruction without touching token totals.
 fn jsonl_msg_line(timestamp: &str, uuid: &str, session: &str, role: &str) -> String {

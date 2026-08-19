@@ -708,6 +708,18 @@ struct LineRec {
     tool_calls: u64,
 }
 
+impl LineRec {
+    /// Full token footprint of one line. This is the discriminator that picks a
+    /// turn's completed streaming delta: input/cache are constant across the
+    /// deltas, only output grows, so the max-total delta is the final one.
+    fn total(&self) -> u64 {
+        self.input
+            .saturating_add(self.output)
+            .saturating_add(self.cache_read)
+            .saturating_add(self.cache_create)
+    }
+}
+
 struct FileContrib {
     mtime: SystemTime,
     recs: Vec<LineRec>,
@@ -997,9 +1009,11 @@ fn merge_topup(
     base.topped_up_through = max_date;
 }
 
-/// Parse one JSONL transcript into per-line contribution records. Pure read —
-/// the cutoff/today split happens later in [`merge_topup`], so an advancing
-/// `last_computed_date` never forces a re-read. Silently skips parse errors.
+/// Parse one JSONL transcript into per-line contribution records, collapsing
+/// each turn's streaming deltas into its completed line (see
+/// [`collapse_streamed_turns`]). The cutoff/today split happens later in
+/// [`merge_topup`], so an advancing `last_computed_date` never forces a re-read.
+/// Silently skips parse errors.
 fn parse_file(path: &Path) -> Vec<LineRec> {
     let file = match std::fs::File::open(path) {
         Ok(f) => f,
@@ -1095,27 +1109,48 @@ fn parse_file(path: &Path) -> Vec<LineRec> {
             tool_calls,
         });
     }
-    out
+    collapse_streamed_turns(out)
 }
 
-/// Fold one transcript file into per-model token sums for a per-session annotation
-/// (see [`crate::sessions`]). Deduped WITHIN the file by each usage line's
-/// `tok_key` (`message.id`, or the content composite `parse_file` derives when it
-/// is absent): a resumed or branched session copies its parent's history forward
-/// into the new file, so the same response can appear twice in one transcript —
-/// without this dedup a per-session total double-counts every carried-forward
-/// line. Same token-dedup discipline as [`merge_topup`], scoped to a single file
-/// instead of across the whole sweep. Fail-soft: an unreadable file yields `[]`.
+/// Collapse one assistant turn's streaming deltas into its completed line.
+///
+/// CC writes a turn several times as output streams in: the lines share
+/// `message.id` (the `tok_key`) and carry the same input/cache counts, but
+/// output grows from 0 to the final value on distinct line uuids. Deduping on
+/// the id at merge time would keep the first (output=0) partial, so collapse
+/// here to the occurrence with the largest total footprint. This also makes the
+/// message/session/hour counters see one turn instead of every delta.
+fn collapse_streamed_turns(recs: Vec<LineRec>) -> Vec<LineRec> {
+    let mut best: HashMap<String, LineRec> = HashMap::new();
+    let mut plain: Vec<LineRec> = Vec::new();
+    for rec in recs {
+        if !rec.has_usage {
+            plain.push(rec);
+            continue;
+        }
+        let key = rec.tok_key.clone();
+        let keep = best
+            .get(&key)
+            .is_some_and(|prev| prev.total() >= rec.total());
+        if !keep {
+            best.insert(key, rec);
+        }
+    }
+    plain.extend(best.into_values());
+    plain
+}
+
+/// Fold one transcript file into per-model token sums for a per-session
+/// annotation (see [`crate::sessions`]). `parse_file` already collapses each
+/// turn's streaming deltas to its completed line and dedupes a carried-forward
+/// response within the file (same `message.id`, identical usage), so each
+/// token-bearing line here is one distinct response and can be summed directly.
+/// Fail-soft: an unreadable file yields `[]`.
 pub(crate) fn file_model_tokens(path: &Path) -> Vec<ModelTokens> {
     let recs = parse_file(path);
-    let mut seen_tok: HashSet<&str> = HashSet::new();
     let mut by_model: HashMap<&str, ModelTokens> = HashMap::new();
     for r in &recs {
         if !r.has_usage {
-            continue;
-        }
-        // An empty tok_key can't be keyed, so it counts as-is (matches merge_topup).
-        if !r.tok_key.is_empty() && !seen_tok.insert(r.tok_key.as_str()) {
             continue;
         }
         let e = by_model

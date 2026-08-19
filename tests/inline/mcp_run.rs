@@ -4164,6 +4164,44 @@ fn the_plugin_probes_own_child_registers_no_bare_marker() {
     ));
 }
 
+/// One tool's whole ENTRY as whitespace-collapsed text: its
+/// `#[tool(description = ...)]` plus every argument's rendered schema
+/// description.
+///
+/// The unit is the entry, not the description. rmcp renders a JSON Schema
+/// `description` per argument off each field's doc comment, and both halves ship
+/// in the same entry and load together. Measured 2026-08-19 on `delegate`: 584
+/// tokens of description against 947 of argument docs, so pinning only the
+/// description watched the smaller half. A phrase asserted through this helper
+/// is required SOMEWHERE in the entry, which leaves which half owns it a
+/// placement decision the next sweep can revisit without redding a test.
+///
+/// Collapsed because a doc comment's wrap column is a formatting artifact
+/// `cargo fmt` can move, and schemars preserves it as a newline in the rendered
+/// description: a pinned phrase would otherwise red purely for spanning a line
+/// break. The pins built on this assert content, not layout.
+fn tool_entry_text(name: &str) -> String {
+    let tools = ClauthServer::new().tool_router.list_all();
+    let tool = tools
+        .iter()
+        .find(|t| t.name == name)
+        .unwrap_or_else(|| panic!("`{name}` tool is registered"));
+    let mut text = tool.description.as_deref().unwrap_or_default().to_string();
+    let props = tool
+        .input_schema
+        .get("properties")
+        .and_then(|p| p.as_object());
+    for (arg, spec) in props.unwrap_or_else(|| panic!("`{name}` takes arguments")) {
+        let doc = spec
+            .get("description")
+            .and_then(|d| d.as_str())
+            .unwrap_or_else(|| panic!("`{name}` argument `{arg}` has no description"));
+        text.push('\n');
+        text.push_str(doc);
+    }
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
 /// The load-bearing warnings `delegate`'s description must keep, per the
 /// slice-1 replacement text (plan §5's kept list: what a delegate is, that it
 /// spends, blindness to this conversation, the four cost shapes, the
@@ -4172,40 +4210,7 @@ fn the_plugin_probes_own_child_registers_no_bare_marker() {
 /// reaching it, so dropping one during a prose edit would otherwise be silent.
 #[test]
 fn the_delegate_description_keeps_its_load_bearing_warnings() {
-    let tools = ClauthServer::new().tool_router.list_all();
-    let delegate = tools
-        .iter()
-        .find(|t| t.name == "delegate")
-        .expect("delegate tool is registered");
-    // The unit is the whole tool ENTRY, not the description. rmcp renders a
-    // JSON Schema `description` per argument off each field's doc comment, and
-    // both halves ship in the same entry and load together. Measured 2026-08-19
-    // on this tool: 584 tokens of description against 947 of argument docs, so
-    // pinning only the description watched the smaller half. Every phrase below
-    // is required SOMEWHERE in the entry; which half owns it is a placement
-    // decision the sweep is free to revisit without redding this test.
-    let mut text = delegate
-        .description
-        .as_deref()
-        .unwrap_or_default()
-        .to_string();
-    let props = delegate
-        .input_schema
-        .get("properties")
-        .and_then(|p| p.as_object());
-    for (name, spec) in props.expect("delegate takes arguments") {
-        let doc = spec
-            .get("description")
-            .and_then(|d| d.as_str())
-            .unwrap_or_else(|| panic!("argument `{name}` has no description"));
-        text.push('\n');
-        text.push_str(doc);
-    }
-    // A doc comment's wrap column is a formatting artifact `cargo fmt` can move,
-    // and schemars preserves it as a newline in the rendered description, so a
-    // pinned phrase would red purely for spanning a line break. Match on
-    // whitespace-collapsed text: the phrases below assert content, not layout.
-    let text: String = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let text = tool_entry_text("delegate");
     let text = text.as_str();
 
     for phrase in [
@@ -4277,20 +4282,52 @@ fn the_delegate_description_keeps_its_load_bearing_warnings() {
 
 /// `which` folded into `profiles({scope: "session"})`, and the old
 /// `source`-value enumeration went with it: the reply carries `source` in
-/// plain text, so pre-teaching four variant names buys nothing. What the
-/// description must still name is the scope that reaches it.
+/// plain text, so pre-teaching four variant names buys nothing. What the ENTRY
+/// must still name is both scopes — M12 moved them out of the description and
+/// into `scope`'s own doc comment, where the parameter that owns them lives —
+/// plus the two facts no single parameter can own.
 #[test]
-fn the_profiles_description_names_the_session_scope() {
-    let tools = ClauthServer::new().tool_router.list_all();
-    let profiles = tools
-        .iter()
-        .find(|t| t.name == "profiles")
-        .expect("profiles tool is registered");
-    let text = profiles.description.as_deref().unwrap_or_default();
-    assert!(
-        text.contains("scope: \"session\""),
-        "`profiles` description must name the session scope: {text}",
-    );
+fn the_profiles_entry_names_both_scopes_and_the_reply_shape() {
+    let text = tool_entry_text("profiles");
+    let text = text.as_str();
+
+    for phrase in [
+        // Both arms, per the param-led rule: a reader who meets only `session`
+        // has to infer `all`.
+        "`scope: \"all\"` (default)",
+        "`scope: \"session\"`",
+        // What the call costs, which is the whole reason a model may reach for
+        // it freely.
+        "zero quota",
+        // The reply-shape facts. No parameter owns them, so the description is
+        // the only half that can carry them, and without them the largest
+        // payload clauth puts in front of a model arrives unexplained.
+        //
+        // These are the words `profile_line` RENDERS, not the JSON keys behind
+        // them: `format` was deleted from every tool in slice 1, so every
+        // `profiles` return is `list_profiles_prose`, and a caller never
+        // receives `utilization_pct`, `keyless` or `auth_broken` in any reply.
+        // `mcp_profiles_tool.rs` pins these same three spellings on whole
+        // roster lines, so both halves are owned by `render.rs` and cannot
+        // drift apart.
+        //
+        // Backticked deliberately: `disabled` is an ordinary English word and a
+        // bare needle for it passed a mutant that deleted the key and left the
+        // word standing. The three are pinned individually because each one
+        // separately means `delegate` refuses that account, and `mcp_run.rs`
+        // reds a refusal test per state.
+        "`disabled`",
+        "`login expired`",
+        "`no api key`",
+        // The direction of the percentage. A caller reading it backwards picks
+        // the most-spent account.
+        "less headroom",
+    ] {
+        assert!(
+            text.contains(phrase),
+            "`profiles` entry dropped {phrase:?}: {text}",
+        );
+    }
 }
 
 /// The roster's sort key. `roster_lines` is pinned on the value, so nothing else
@@ -6450,24 +6487,25 @@ fn the_cli_listing_and_the_state_mode_listing_report_the_same_store() {
     assert!(mcp.contains("job `d-three-0` running"), "{mcp}");
 }
 
-/// `monitor`'s description has to teach the listing, because a caller cannot be
+/// `monitor`'s entry has to teach the listing, because a caller cannot be
 /// refused into discovering a mode that exists to answer "what ids are there".
 ///
 /// The interrupted-delegate sentence is the load-bearing half: without it a
 /// model that just lost a blocking call has no reason to believe the run is
 /// still going, so it re-runs the prompt and spends the window twice.
 #[test]
-fn the_monitor_description_names_the_listing_and_the_interrupted_delegate() {
-    let tools = ClauthServer::new().tool_router.list_all();
-    let monitor = tools
-        .iter()
-        .find(|t| t.name == "monitor")
-        .expect("monitor tool is registered");
-    let text = monitor.description.as_deref().unwrap_or_default();
+fn the_monitor_entry_names_the_listing_and_the_interrupted_delegate() {
+    let text = tool_entry_text("monitor");
+    let text = text.as_str();
 
     for phrase in [
         "no `job_ids`",
-        "list the delegates clauth holds",
+        // The object, not the verb. M12 rewrote `list the delegates clauth
+        // holds` as `lists ...` and this pin redded over the `s`; what the pin
+        // exists for is WHICH set gets listed, so it holds the noun phrase and
+        // leaves the sentence free. Same lesson as `ignored` -> `dropped` on
+        // `delegate`.
+        "the delegates clauth holds",
         // What it puts FIRST, which is what a caller hunting an id needs and
         // what the rows actually do since they band.
         "live runs first",
@@ -6477,17 +6515,104 @@ fn the_monitor_description_names_the_listing_and_the_interrupted_delegate() {
     ] {
         assert!(
             text.contains(phrase),
-            "`monitor` description dropped {phrase:?}: {text}"
+            "`monitor` entry dropped {phrase:?}: {text}"
         );
     }
     // It lists at most `LISTING_MAX`, so it must not claim completeness. A pin
     // that only asserted the presence of a phrase locked the overclaim in once
-    // already.
+    // already. Swept over the whole entry rather than the description alone:
+    // the listing is a description-owned fact today, and running the ban wider
+    // than its owner is what stops a later move from smuggling it into an
+    // argument doc.
+    //
+    // Lowercased first: a case-sensitive ban passed a mutant that appended
+    // "Every delegate is listed." to the description, and sentence-initial is
+    // exactly where this shape lands — `profiles`' own description opens "Every
+    // clauth account" one screen up.
+    //
+    // The limit, recorded rather than papered over: a ban list transfers only
+    // to the tokens it names, so `each delegate`, `the full set` and `nothing
+    // left out` all pass. Read a pass as "these three spellings have not
+    // returned", never as "no completeness claim can ship".
+    let lowered = text.to_lowercase();
     for overclaim in ["every delegate", "all delegates", "every job"] {
         assert!(
-            !text.contains(overclaim),
-            "`monitor` description claims completeness it does not deliver \
+            !lowered.contains(overclaim),
+            "`monitor` entry claims completeness it does not deliver \
              ({overclaim:?}, bounded at {LISTING_MAX}): {text}"
+        );
+    }
+}
+
+/// `wait_secs`' own `default 0 = reply instantly` is false on a `cancel: true`
+/// call, which sits for a fixed grace while the kill lands — a real wall to a
+/// caller deciding whether a cancel fits in this turn.
+///
+/// Pinned as a STRUCTURAL claim rather than a wording one: the promise and its
+/// exception belong to one parameter, so any honest `wait_secs` doc has to name
+/// the parameter that suspends it. A rewrite is free, dropping the disclosure
+/// is not. Same shape as `delegate`'s deadline pair, and the same reason — the
+/// grace lives in `effective_wait`, which no reply and no refusal announces.
+///
+/// The needle is the LITERAL `cancel: true`, not the word `cancel`. A bare
+/// `cancel` needle passed a mutant that deleted the disclosure and left "the
+/// wait ends early when the client cancels the request" behind: this tool's
+/// vocabulary is saturated with `cancelled` / `cancels` / `cancellation`, so
+/// only the parameter-and-value form distinguishes the promise's exception from
+/// request cancellation. `delegate`'s deadline pair gets this for free by
+/// pinning whole distinctive identifiers.
+#[test]
+fn the_wait_parameter_discloses_the_cancel_exception_to_its_default() {
+    let tools = ClauthServer::new().tool_router.list_all();
+    let monitor = tools
+        .iter()
+        .find(|t| t.name == "monitor")
+        .expect("monitor tool is registered");
+    let raw = monitor.input_schema["properties"]["wait_secs"]["description"]
+        .as_str()
+        .expect("`wait_secs` carries a description");
+    // Collapsed for the same reason `tool_entry_text` collapses: the literal
+    // sits one word off a wrap boundary, so a raw match reds the moment `cargo
+    // fmt` reflows the doc comment.
+    let text = raw.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(
+        text.contains("`cancel: true`"),
+        "`wait_secs` promises an instant reply at 0, so it must name the \
+         parameter and value that suspend that promise: {raw}",
+    );
+}
+
+/// `switch_profile`'s argument doc was the thin half of its entry. The handler
+/// resolves `name` through `config.canonical_name`, so a wrong-case spelling
+/// works, and `profiles.names` and `delegate.profiles` both disclosed that
+/// while this one did not.
+///
+/// The unknown-name refusal is deliberately NOT pinned: the handler refuses it
+/// by name before any mutation, and a rule the boundary refuses does not need
+/// teaching up front.
+///
+/// That cut carries a debt the boundary has not paid. Rule 4's corollary is
+/// that the refusal then names the fix the way a good CLI error does, and
+/// `profile not found: {name}` names none and points at no tool — where the
+/// sibling refusal in `profiles` already does. The same sentence is built at
+/// five other sites, `delegate`'s single-target and fan-out arms included, so
+/// changing one spelling here would split the server's refusal vocabulary. It
+/// is raised as a follow-up rather than patched where only this test can see
+/// it.
+///
+/// The pre-commit pointer is the other half. `mcp_switch_tool.rs` pins that the
+/// REPLY carries the session-effect note; this pins the one call that answers
+/// the same question BEFORE the credentials move, which is the half a caller
+/// can still act on.
+#[test]
+fn the_switch_profile_entry_discloses_case_insensitivity_and_the_pre_commit_check() {
+    let text = tool_entry_text("switch_profile");
+    let text = text.as_str();
+
+    for phrase in ["case-insensitive", "profiles({scope:\"session\"})"] {
+        assert!(
+            text.contains(phrase),
+            "`switch_profile` entry dropped {phrase:?}: {text}"
         );
     }
 }

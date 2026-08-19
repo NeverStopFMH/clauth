@@ -472,19 +472,21 @@ pub(crate) struct ClauthServer {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub(crate) struct SwitchArgs {
-    /// Profile name to relink the global active credentials to.
+    /// Name of the account to relink the global active credentials to
+    /// (case-insensitive).
     name: String,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub(crate) struct ProfilesArgs {
-    /// Restrict the roster to these profiles (case-insensitive). Omit it, or
-    /// pass an empty list, for every profile.
+    /// Restrict the reply to these accounts (case-insensitive). Omit it, or
+    /// pass an empty list, to leave `scope` to decide what comes back.
     names: Option<Vec<String>>,
-    /// `all` (default): every profile. `session`: the one account this
-    /// session's own credentials belong to, with `source` saying how that
-    /// resolved — not always the configured active one. `names` filters the
-    /// `all` scope only: it cannot combine with `session` (refused by name).
+    /// `scope: "all"` (default): every account.
+    ///
+    /// `scope: "session"`: the one account THIS session's own credentials
+    /// belong to, with `source` saying how that resolved. That account can
+    /// differ from the configured active one.
     scope: Option<String>,
 }
 
@@ -563,21 +565,29 @@ pub(crate) struct DelegateArgs {
 pub(crate) struct MonitorArgs {
     /// Job ids returned by `delegate({background: true})`: one id checks or
     /// collects that job, several collect in one call (one result per id, in
-    /// the order given, capped at 256).
+    /// the order given).
     job_ids: Option<Vec<String>>,
-    /// Seconds to long-poll before returning (0..=3600, default 0 = reply
-    /// instantly), clamped to 1500 on a client that cannot receive progress
-    /// notifications. Exactly one mode per call: with `job_ids` this bounds the
-    /// wait for a job to finish; with none it bounds the wait on clauth's own
-    /// state, which is the mode `job_ids` cannot name.
+    /// Seconds to long-poll before returning (max: 3600, default 0 = reply
+    /// instantly).
+    ///
+    /// Clamped to 1500 on a client that cannot receive progress notifications.
+    ///
+    /// With `job_ids` it bounds the wait for a job to finish; with none it
+    /// bounds the wait on clauth's own state.
+    ///
+    /// A `cancel: true` call waits up to 10 seconds for the kill to land, even
+    /// at 0.
     wait_secs: Option<u64>,
-    /// `any` (the default) returns as soon as one named job finishes; `all`
-    /// waits for the slowest. Needs `job_ids` — it orders a set of jobs, so
-    /// naming it without them is refused.
+    /// `return_on: "any"` (default): return as soon as one named job finishes.
+    ///
+    /// `return_on: "all"`: wait for the slowest. This is also the default under
+    /// `cancel: true`.
     return_on: Option<String>,
-    /// Ask the named jobs to stop, keeping whatever they produced. The reply
-    /// carries how far each got before it did, so it is usually the only call
-    /// needed.
+    /// `cancel: true`: ask the named jobs to stop, keeping whatever they
+    /// produced. The reply carries how far each got before it did.
+    ///
+    /// `cancel: false` (default): the call checks and collects, and never stops
+    /// a running job.
     cancel: Option<bool>,
 }
 
@@ -617,12 +627,10 @@ impl ClauthServer {
     }
 
     #[tool(
-        description = "Every clauth account, from disk cache: zero quota, no network. Call it \
-before picking a `delegate` target, and pass `names` to re-check one account instead of the whole \
-roster. `scope: \"session\"` answers which account THIS session's own credentials belong to, with \
-`source` saying how that resolved; the configured active account can differ. In a row, higher \
-`utilization_pct` means less headroom, and `keyless`, `disabled` or `auth_broken` appear only when \
-true; each means `delegate` refuses that target."
+        description = "clauth's accounts with their cached headroom: zero quota, no network. Call \
+it before picking a `delegate` target. A window's percentage is how much of it is already used, \
+so higher means less headroom. A row marked `disabled`, `login expired` or `no api key` is an \
+account `delegate` refuses."
     )]
     async fn profiles(
         &self,
@@ -680,7 +688,7 @@ true; each means `delegate` refuses that target."
                     let payload = serde_json::json!({
                         "ok": false,
                         "reason": format!(
-                            "profile not found: {}; omit `names` for the full roster",
+                            "profile not found: {}; omit `names` for every account",
                             missing.join(", ")
                         ),
                     });
@@ -1333,14 +1341,12 @@ Delegating spends the target account, so pick the account with `profiles` first.
     }
 
     #[tool(
-        description = "Check, collect or stop a backgrounded `delegate`, or — with no `job_ids` — \
-list the delegates clauth holds, live runs first, and wait on clauth's own state. A running job reports its \
-account, elapsed time, how long until each deadline kills it, and its latest output, so a check is \
-worth the turn it costs; a finished one returns the delegate envelope. An interrupted blocking \
-`delegate` keeps running as a background job; the listing is where you find its id. \
-`wait_secs` blocks until one named job finishes, or until clauth's state moves when you name none. \
-`return_on: \"all\"` waits for the slowest job instead of the first. `cancel: true` stops the \
-named jobs and keeps whatever they produced."
+        description = "Check, collect or stop a backgrounded `delegate`, or wait on clauth's own \
+state. One of the two per call, decided by whether you name `job_ids`.\n\n\
+With `job_ids`: a running job reports its account, elapsed time, how long it has before a \
+deadline kills it, and its latest output. A finished one hands back its result.\n\n\
+With no `job_ids`: the reply lists the delegates clauth holds, live runs first. An interrupted \
+blocking `delegate` keeps running as a background job, and that listing is where you find its id."
     )]
     async fn monitor(
         &self,

@@ -71,104 +71,96 @@ fn apply_spawn_cwd_none_inherits_process_cwd() {
     assert_eq!(resolved, std::env::current_dir().ok());
 }
 
-// ── auto-rescue: the effective-decision + isolated-store teardown ──
+// ── rescue: the isolated-store teardown every isolated run gets ──
 
-/// The pure effective-decision: a per-run `--rescue`/`--no-rescue` override
-/// (`Some`) beats the persisted `auto_rescue` toggle; with no override the
-/// toggle decides. This is the whole gate `run` composes with `isolation ==
-/// Isolated` at teardown.
+/// A bare `clauth start --isolated`, with no flag and no config key asked for,
+/// lifts both legs into the global store: the transcript becomes resumable
+/// (mirrored `<slug>/<id>.jsonl`) and the session sidecars follow it, each moved
+/// rather than copied — the isolated tree is discarded right after.
 #[test]
-fn rescue_effective_override_beats_toggle() {
-    // No per-run flag → the persisted toggle decides.
-    assert!(
-        !rescue_effective(None, false),
-        "default OFF stays off (discard)"
-    );
-    assert!(rescue_effective(None, true), "toggle ON rescues");
-    // A per-run flag overrides the toggle either way.
-    assert!(
-        !rescue_effective(Some(false), true),
-        "--no-rescue beats a true toggle"
-    );
-    assert!(
-        rescue_effective(Some(true), false),
-        "--rescue beats a false toggle"
-    );
-}
-
-/// Bit-identical guard: with rescue OFF (default toggle, no flag) the teardown
-/// gate never invokes the store move, so the isolated transcript is left for the
-/// runtime GC to discard and the global store stays empty.
-#[test]
-fn rescue_off_leaves_isolated_store_to_discard() {
+fn an_isolated_teardown_moves_the_session_into_the_global_store() {
     let sb = HomeSandbox::new();
-    let iso = sb
-        .home()
-        .join(".clauth/profiles/iso/runtime-isolated/projects");
-    let global = sb.home().join(".claude/projects");
-    let src = iso.join("-w-iso/s1.jsonl");
+    let iso = sb.home().join(".clauth/profiles/iso/runtime-isolated");
+    let claude_home = sb.home().join(".claude");
+    let src = iso.join("projects/-w-iso/s1.jsonl");
     fs::create_dir_all(src.parent().unwrap()).unwrap();
     fs::write(&src, "transcript").unwrap();
+    let snap = iso.join("shell-snapshots/snap.sh");
+    fs::create_dir_all(snap.parent().unwrap()).unwrap();
+    fs::write(&snap, "iso shell").unwrap();
 
-    // Mirror teardown exactly: decide via the real fn, only move when true.
-    let moved = if rescue_effective(None, false) {
-        crate::sessions::rescue_isolated_store(&iso, &global)
-    } else {
-        0
-    };
-
-    assert_eq!(moved, 0, "default OFF must not rescue");
-    assert!(
-        src.exists(),
-        "the isolated transcript is left to be discarded"
+    assert_eq!(
+        teardown(&iso, &claude_home),
+        (1, 1),
+        "an isolated run rescues both legs with nothing asked for"
     );
-    assert!(
-        !global.join("-w-iso/s1.jsonl").exists(),
-        "the global store stays empty — stock discard behavior"
-    );
-}
 
-/// Rescue ON (via the toggle) lifts the isolated transcript into the global
-/// store: it becomes resumable (mirrored `<slug>/<id>.jsonl`) and the source is
-/// moved, not copied.
-#[test]
-fn rescue_on_moves_isolated_transcript_into_global_store() {
-    let sb = HomeSandbox::new();
-    let iso = sb
-        .home()
-        .join(".clauth/profiles/iso/runtime-isolated/projects");
-    let global = sb.home().join(".claude/projects");
-    let src = iso.join("-w-iso/s1.jsonl");
-    fs::create_dir_all(src.parent().unwrap()).unwrap();
-    fs::write(&src, "transcript").unwrap();
-
-    let moved = if rescue_effective(None, true) {
-        crate::sessions::rescue_isolated_store(&iso, &global)
-    } else {
-        0
-    };
-
-    assert_eq!(moved, 1, "toggle ON rescues the one transcript");
-    let landed = global.join("-w-iso/s1.jsonl");
-    assert!(
-        landed.exists(),
+    let landed = claude_home.join("projects/-w-iso/s1.jsonl");
+    assert_eq!(
+        fs::read(&landed).unwrap(),
+        b"transcript",
         "the transcript lands in the resumable global store"
     );
-    assert_eq!(fs::read(&landed).unwrap(), b"transcript");
     assert!(!src.exists(), "source moved, not copied");
+    assert_eq!(
+        fs::read_to_string(claude_home.join("shell-snapshots/snap.sh")).unwrap(),
+        "iso shell",
+        "the sidecar state a resumed session needs follows it"
+    );
+    assert!(!snap.exists(), "the sidecar moved too");
 }
 
-/// The gate `run` applies plus the production teardown, so a change to either
+/// `run`'s rescue leg cannot be driven without a real `claude` child, which this
+/// crate never fakes, so it is pinned over the source: the teardown tests own
+/// whether the move works, and this owns what stands between the stamp leg and
+/// the end of the teardown region.
+///
+/// An EQUALITY rather than a `contains`, because a needle that only looks for the
+/// condition is blind to every spelling that leaves the condition's own bytes
+/// intact — a shadowing `let isolated = isolated && <key>;` hoisted above it, an
+/// outer `if` wrapping the leg, an early return between the two. Each disables
+/// the rescue for a stock user. Measured over the real source text: the
+/// `contains` form this replaced caught 2 of 5 mutation spellings, the equality
+/// catches 5 of 5 and does not red the code as it stands.
+///
+/// What it cannot decide, stated because a scan reads stronger than it is: an
+/// early `return` or `?` placed BEFORE the stamp leg, i.e. above this window. A
+/// window pin never sees above its own window, and nothing else here covers it.
+#[test]
+fn the_start_teardown_tail_is_the_rescue_leg_gated_on_isolation_alone() {
+    let src = include_str!("../../src/start.rs");
+    let body = src
+        .split_once("pub(crate) fn run(")
+        .expect("run is defined")
+        .1;
+    // Bounded at the drop that discards the tree, i.e. the end of the teardown
+    // legs: past it lies the exit-code tail this test has no business reading.
+    let legs = body
+        .split_once("drop(runtime);")
+        .expect("the runtime is dropped after the teardown legs")
+        .0;
+    let dense: String = legs
+        .lines()
+        .filter(|l| !l.trim_start().starts_with("//"))
+        .flat_map(str::chars)
+        .filter(|c| !c.is_whitespace())
+        .collect();
+    let tail = dense
+        .rsplit_once("run_start);}")
+        .expect("the stamp leg precedes the rescue leg")
+        .1;
+    assert_eq!(
+        tail,
+        "ifisolated&&letOk(claude_home)=crate::profile::claude_dir(){\
+         rescue_teardown(runtime.config_dir(),runtime.sessions_dir(),&claude_home);}",
+        "between the stamp leg and the end of the teardown region there must be \
+         the rescue leg and nothing else, gated on the isolation alone"
+    );
+}
+
+/// The production teardown plus the sessions dir it reads, so a change to either
 /// shows up here. A fresh sessions dir holds one live marker: this session's.
-fn teardown(
-    rescue_override: Option<bool>,
-    auto_rescue: bool,
-    iso_root: &std::path::Path,
-    claude_home: &std::path::Path,
-) -> (usize, usize) {
-    if !rescue_effective(rescue_override, auto_rescue) {
-        return (0, 0);
-    }
+fn teardown(iso_root: &std::path::Path, claude_home: &std::path::Path) -> (usize, usize) {
     let sessions = iso_root.with_file_name("sessions-isolated");
     fs::create_dir_all(&sessions).unwrap();
     let _self_marker = live_marker(&sessions.join("1234-0"));
@@ -230,31 +222,6 @@ fn rescue_moves_nothing_while_a_sibling_session_is_live() {
     assert_eq!(rescue_teardown(&iso, &sessions, &claude_home), (1, 1));
 }
 
-/// Bit-identical guard, sidecar half: with rescue OFF nothing at all leaves the
-/// isolated tree — the sidecars are left for the runtime GC alongside the
-/// transcripts.
-#[test]
-fn rescue_off_leaves_sidecars_to_discard() {
-    let sb = HomeSandbox::new();
-    let iso = sb.home().join(".clauth/profiles/iso/runtime-isolated");
-    let claude_home = sb.home().join(".claude");
-    fs::create_dir_all(iso.join("shell-snapshots")).unwrap();
-    fs::write(iso.join("shell-snapshots/snap.sh"), "iso shell").unwrap();
-    fs::create_dir_all(iso.join("projects/-w-iso")).unwrap();
-    fs::write(iso.join("projects/-w-iso/s1.jsonl"), "transcript").unwrap();
-
-    assert_eq!(
-        teardown(None, false, &iso, &claude_home),
-        (0, 0),
-        "default OFF rescues neither leg"
-    );
-    assert!(iso.join("shell-snapshots/snap.sh").exists());
-    assert!(
-        !claude_home.join("shell-snapshots").exists(),
-        "the global store stays untouched — stock discard behavior"
-    );
-}
-
 /// A sidecar entry that cannot move (its global parent is occupied by a FILE)
 /// is logged and skipped: teardown still completes, the rest of the sidecars
 /// move, and the transcript leg's result is untouched.
@@ -273,7 +240,7 @@ fn sidecar_failure_leaves_teardown_and_transcript_rescue_intact() {
     fs::create_dir_all(claude_home.join("file-history")).unwrap();
     fs::write(claude_home.join("file-history/sess-a"), "in the way").unwrap();
 
-    let (transcripts, sidecars) = teardown(None, true, &iso, &claude_home);
+    let (transcripts, sidecars) = teardown(&iso, &claude_home);
 
     assert_eq!(
         (transcripts, sidecars),
@@ -642,7 +609,7 @@ fn run_applies_the_chain_gate_only_to_an_opted_in_start() {
     let mut loner = chain_ready_config("wired");
     loner.state.fallback_chain.clear();
 
-    let err = run(&loner, "wired", &[], Isolation::Shared, None, None, true)
+    let err = run(&loner, "wired", &[], Isolation::Shared, None, true)
         .expect_err("an opted-in start must be gated");
     // WHICH gate answers is platform-decided, since `run` passes
     // `cfg!(target_os = "macos")` in and the unsupported-host arm precedes the
@@ -660,7 +627,7 @@ fn run_applies_the_chain_gate_only_to_an_opted_in_start() {
         }
     );
 
-    let err = run(&loner, "wired", &[], Isolation::Shared, None, None, false)
+    let err = run(&loner, "wired", &[], Isolation::Shared, None, false)
         .expect_err("the sandbox has no ~/.claude to launch against");
     assert_eq!(
         err.to_string(),

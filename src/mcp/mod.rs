@@ -3135,43 +3135,35 @@ fn elapsed_ms(start: Instant) -> u64 {
 /// nothing about the other two exits makes it less true. Three copies of the
 /// clause rule is how they drift.
 ///
-/// `resumable` is whether the run's transcript outlives its runtime tree (see
-/// [`transcript_survives`]). All three cases say where they stand: a handle, a
-/// transcript that went with the runtime, or a run that ended before any event
-/// named a session. The silent third arm was finding 18 — a description
+/// The handle turns on the session id alone: a shared run's transcript is already
+/// in the global store, and an isolated one's is lifted into it on teardown. That
+/// lift is best-effort and this builder cannot observe it — see
+/// [`crate::start::rescue_teardown`], which defers to a live sibling — so the
+/// reply hands back the handle and never tells a caller its transcript is gone.
+/// Both cases say where they stand: a handle, or a run that ended before any
+/// event named a session. The silent second arm was finding 18 — a description
 /// promising a handle, answered with nothing.
 fn salvage_envelope(
     profile: &str,
     mut reason: String,
     capture: &StreamCapture,
-    resumable: bool,
 ) -> serde_json::Value {
     let partial = capture.partial_text();
     if !partial.is_empty() {
         reason.push_str(". the text it had written is in `partial_result`");
     }
     // The clause and the field it promises are decided together, so a reply can
-    // never offer a handle it did not attach.
-    //
-    // The session question is answered FIRST. No id means no handle whatever the
-    // isolation was, and the transcript clause only means anything when an id
-    // exists: reaching it on `(None, false)` told a run that died in 200ms with
-    // no session that auto-rescue had eaten a transcript clauth never saw.
-    let handle = match (&capture.session_id, resumable) {
-        (None, _) => {
+    // never offer a handle it did not attach. No id means no handle, whatever
+    // the isolation was: a run that died in 200ms without one has no transcript
+    // clauth ever saw, so it is told that and nothing else.
+    let handle = match &capture.session_id {
+        None => {
             reason.push_str(". no session id ever reached clauth, so there is no resume handle");
             None
         }
-        (Some(id), true) => {
+        Some(id) => {
             reason.push_str(". pick the run back up with `resume: \"<session_id>\"`");
             Some(id.clone())
-        }
-        (Some(_), false) => {
-            reason.push_str(
-                ". its transcript went with the isolated runtime, so it cannot be resumed; \
-                 `clauth config` auto-rescue keeps one",
-            );
-            None
         }
     };
     let mut payload = serde_json::json!({
@@ -3196,7 +3188,6 @@ fn timeout_envelope(
     elapsed: Duration,
     limit: Duration,
     capture: &StreamCapture,
-    resumable: bool,
 ) -> serde_json::Value {
     let elapsed_secs = elapsed.as_secs();
     let limit_secs = limit.as_secs();
@@ -3216,7 +3207,7 @@ fn timeout_envelope(
             ),
         ),
     };
-    let mut payload = salvage_envelope(profile, reason, capture, resumable);
+    let mut payload = salvage_envelope(profile, reason, capture);
     payload["timed_out"] = serde_json::json!(kind);
     payload["elapsed_secs"] = serde_json::json!(elapsed_secs);
     payload
@@ -3237,21 +3228,11 @@ fn cancelled_envelope(
     reason: String,
     elapsed: Duration,
     capture: &StreamCapture,
-    resumable: bool,
 ) -> serde_json::Value {
-    let mut payload = salvage_envelope(profile, reason, capture, resumable);
+    let mut payload = salvage_envelope(profile, reason, capture);
     payload["cancelled"] = serde_json::json!(true);
     payload["elapsed_secs"] = serde_json::json!(elapsed.as_secs());
     payload
-}
-
-/// Whether a delegate's transcript outlives its runtime tree, which decides
-/// whether the run can ever be resumed. A shared runtime's `projects/` is a
-/// symlink into the global store, so its transcript is already there; an
-/// isolated one writes to a throwaway tree `ProfileRuntime::drop` removes, and
-/// only the opt-in rescue lifts it out first.
-fn transcript_survives(isolation: Isolation, auto_rescue: bool) -> bool {
-    isolation != Isolation::Isolated || auto_rescue
 }
 
 /// Resolve a `resume` id to the workspace its transcript was recorded under.
@@ -3334,9 +3315,10 @@ fn apply_delegate_env(
 /// the refusals BEFORE the spawn, which carry no capture; the caller wraps one
 /// in an `is_error` envelope.
 /// Records observed throughput / rate-limit hits as a side effect, and runs
-/// `start::run`'s own transcript-stamp and opt-in isolated-rescue legs on the way
-/// out so a delegate's sessions are attributable and (with the toggle on)
-/// resumable. Never bubbles a transport-level error.
+/// `start::run`'s own transcript-stamp and isolated-rescue legs on the way out:
+/// the stamp makes a delegate's sessions attributable, and the rescue lifts an
+/// isolated one's transcript into the global store where a resume can reach it.
+/// Never bubbles a transport-level error.
 fn run_delegate(opts: DelegateOpts<'_>) -> std::result::Result<serde_json::Value, String> {
     // Anchors the pre-spawn arm's `elapsed_secs`, which measures the time spent
     // getting to a spawn rather than the run's own: nothing has run yet.
@@ -3389,7 +3371,6 @@ fn run_delegate(opts: DelegateOpts<'_>) -> std::result::Result<serde_json::Value
     let runtime = ProfileRuntime::acquire(target, opts.isolation, &active_env_keys, false)
         .map_err(|e| format!("failed to acquire runtime: {e}"))?;
 
-    let resumable = transcript_survives(opts.isolation, config.state.auto_rescue);
     // The acquire above is the longest thing that can happen before a child
     // exists, and the supervision loop that reads this flag does not exist until
     // one does: `RotationGuard::acquire` BLOCKS behind a live `clauth start`
@@ -3411,7 +3392,6 @@ fn run_delegate(opts: DelegateOpts<'_>) -> std::result::Result<serde_json::Value
             ),
             waited,
             &StreamCapture::default(),
-            resumable,
         ));
     }
 
@@ -3574,9 +3554,8 @@ fn run_delegate(opts: DelegateOpts<'_>) -> std::result::Result<serde_json::Value
     // Mirrors `start::run`'s own teardown legs, in the same window: the child has
     // exited and the guard is still alive, so the tree is there to read. Stamp
     // this run's transcripts with the profile that produced them, then (isolated
-    // + opt-in) lift the throwaway store into the global one before
-    // `drop(runtime)` discards it. Best-effort; a completed delegate never fails
-    // on either.
+    // only) lift the throwaway store into the global one before `drop(runtime)`
+    // discards it. Best-effort; a completed delegate never fails on either.
     let isolated = opts.isolation == Isolation::Isolated;
     let projects_dir = if isolated {
         Some(runtime.config_dir().join("projects"))
@@ -3588,11 +3567,7 @@ fn run_delegate(opts: DelegateOpts<'_>) -> std::result::Result<serde_json::Value
     if let Some(projects_dir) = projects_dir {
         crate::sessions::stamp_run_sessions(opts.profile, &projects_dir, isolated, run_start);
     }
-    let auto_rescue = config.state.auto_rescue;
-    if isolated
-        && auto_rescue
-        && let Ok(claude_home) = crate::profile::claude_dir()
-    {
+    if isolated && let Ok(claude_home) = crate::profile::claude_dir() {
         crate::start::rescue_teardown(runtime.config_dir(), runtime.sessions_dir(), &claude_home);
     }
 
@@ -3607,7 +3582,6 @@ fn run_delegate(opts: DelegateOpts<'_>) -> std::result::Result<serde_json::Value
                 format!("delegate cancelled after {}s", ran_for.as_secs()),
                 ran_for,
                 &capture,
-                resumable,
             ));
         }
         Err(WaitEnd::Expired(expiry)) => {
@@ -3624,12 +3598,11 @@ fn run_delegate(opts: DelegateOpts<'_>) -> std::result::Result<serde_json::Value
                 start.elapsed(),
                 limit,
                 &capture,
-                resumable,
             ));
         }
     };
     let now = now_epoch_secs();
-    match classify_run(status, &stderr_bytes, &capture, opts.profile, resumable) {
+    match classify_run(status, &stderr_bytes, &capture, opts.profile) {
         RunOutcome::Exited {
             envelope,
             throttle_scan,
@@ -3696,7 +3669,6 @@ fn classify_run(
     stderr_bytes: &[u8],
     capture: &StreamCapture,
     profile: &str,
-    resumable: bool,
 ) -> RunOutcome {
     let stdout = capture.envelope_src();
     if !status.success() {
@@ -3713,15 +3685,13 @@ fn classify_run(
             truncate(stderr.trim(), 2000)
         );
         return RunOutcome::Exited {
-            envelope: salvage_envelope(profile, reason, capture, resumable),
+            envelope: salvage_envelope(profile, reason, capture),
             throttle_scan,
         };
     }
     match parse_delegate_envelope(stdout.trim()) {
         Ok(envelope) => RunOutcome::Envelope(envelope),
-        Err(reason) => {
-            RunOutcome::Unparseable(salvage_envelope(profile, reason, capture, resumable))
-        }
+        Err(reason) => RunOutcome::Unparseable(salvage_envelope(profile, reason, capture)),
     }
 }
 

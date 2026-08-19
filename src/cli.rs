@@ -320,17 +320,11 @@ pub(crate) enum Command {
 pub(crate) struct StartArgs {
     /// Inject the profile's credentials into a clean throwaway runtime,
     /// dropping operator memory, plugins, and hooks. Run it in a clean cwd for
-    /// a blind session.
+    /// a blind session. The run's transcripts and session state are lifted into
+    /// the global store before the runtime is discarded, so the session stays
+    /// resumable and its tokens are counted.
     #[arg(long)]
     pub(crate) isolated: bool,
-    /// Lift the run's transcripts + session sidecar state into the global
-    /// store, overriding the profile's auto_rescue setting.
-    #[arg(long, requires = "isolated", overrides_with = "no_rescue")]
-    pub(crate) rescue: bool,
-    /// Discard the run's isolated store, overriding the profile's auto_rescue
-    /// setting.
-    #[arg(long, requires = "isolated", overrides_with = "rescue")]
-    pub(crate) no_rescue: bool,
     /// Follow the fallback chain, moving to the next account as each runs out
     ///
     /// The session starts on this profile and swaps onto the next chain member
@@ -362,17 +356,6 @@ impl StartArgs {
             Isolation::Isolated
         } else {
             Isolation::Shared
-        }
-    }
-
-    /// `--rescue`/`--no-rescue` override the profile's auto_rescue setting;
-    /// neither flag leaves it alone. clap's mutual `overrides_with` means the
-    /// last one on the command line is the one that survives.
-    pub(crate) fn rescue_override(&self) -> Option<bool> {
-        match (self.rescue, self.no_rescue) {
-            (true, _) => Some(true),
-            (_, true) => Some(false),
-            _ => None,
         }
     }
 }

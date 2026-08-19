@@ -129,17 +129,15 @@ pub(crate) fn run_resume(target: &str, profile_flag: Option<&str>) -> Result<()>
 
     let resume_args = vec!["--resume".to_string(), session.id];
     // Shared isolation: a resume adopts the chosen account against the shared
-    // store, the same lifecycle a bare `clauth start <name>` uses. Rescue is
-    // isolated-only, so `None` (no per-run override) never rescues here, and a
-    // resume never opts into the fallback chain — there is no `--with-fallback`
-    // on this surface to ask for it.
+    // store, the same lifecycle a bare `clauth start <name>` uses. A resume never
+    // opts into the fallback chain — there is no `--with-fallback` on this
+    // surface to ask for it.
     crate::start::run(
         &config,
         &canonical,
         &resume_args,
         Isolation::Shared,
         Some(&workspace),
-        None,
         false,
     )
 }
@@ -335,7 +333,7 @@ fn shadowing_hold(target: &str, found: Option<&SessionRef>) -> Option<IsolatedHo
 
 /// The refusal for a target a live isolated run holds. Names the run's profile
 /// and how the session becomes reachable, since "wait for it" is only actionable
-/// if the operator knows the rescue is what moves it.
+/// if the operator knows the run ending is what moves it.
 fn held_refusal(target: &str, hold: &IsolatedHold) -> anyhow::Error {
     let what = if target == "latest" {
         format!("the newest session ('{}')", hold.session.id)
@@ -345,9 +343,7 @@ fn held_refusal(target: &str, hold: &IsolatedHold) -> anyhow::Error {
     anyhow::anyhow!(
         "can't resume '{target}': {what} belongs to a live isolated run under profile '{}', \
          whose store a resume can't read\n\
-         it moves into the shared store when that run ends with rescue on \
-         (`clauth start {} --isolated --rescue`, or the auto_rescue setting)",
-        hold.profile,
+         it moves into the shared store when that run ends",
         hold.profile,
     )
 }

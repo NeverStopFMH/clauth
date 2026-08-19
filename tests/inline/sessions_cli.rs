@@ -380,8 +380,12 @@ fn resume_refuses_an_isolated_held_session_without_calling_it_missing() {
         "a listed session is not missing: {msg}"
     );
     assert!(
-        msg.contains("--rescue"),
-        "and must say what makes it reachable: {msg}"
+        msg.contains("it moves into the shared store when that run ends"),
+        "and must say what makes it reachable — waiting, with nothing to turn on: {msg}"
+    );
+    assert!(
+        !msg.contains("rescue") && !msg.contains("auto_rescue"),
+        "the rescue is unconditional, so the refusal names no switch: {msg}"
     );
     assert_eq!(crate::exit_code(Err(err)), 1);
 }

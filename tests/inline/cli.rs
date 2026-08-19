@@ -89,25 +89,23 @@ fn start_forwards_claude_args_verbatim_including_leading_hyphens() {
     assert_eq!(a.profile, "acme");
     assert_eq!(a.claude_args, ["-p", "hi", "--model", "opus"]);
     assert_eq!(a.isolation(), Isolation::Shared);
-    assert_eq!(a.rescue_override(), None);
 }
 
 /// Where clauth's half of the grammar actually ends, pinned because it MOVED in
 /// the clap port and the difference is silent. The hand-rolled parser stopped at
 /// the profile name and forwarded every later token; clap keeps recognizing
 /// `start`'s own flags past it, and only hands over on a token `start` does not
-/// declare. `claude` has no `--isolated`/`--rescue`/`--no-rescue`, so the only
-/// spelling this reaches in practice is `--help`, and `--` forwards even that.
+/// declare. `claude` has no `--isolated`/`--with-fallback`, so the only spelling
+/// this reaches in practice is `--help`, and `--` forwards even that.
 #[test]
 fn clauths_own_start_flags_are_still_recognized_after_the_profile_name() {
-    let Command::Start(a) = command(&["start", "acme", "--isolated", "--rescue"]) else {
+    let Command::Start(a) = command(&["start", "acme", "--isolated"]) else {
         panic!("start must parse");
     };
     assert!(
         a.isolated,
         "clap keeps parsing start's own flags past the name"
     );
-    assert_eq!(a.rescue_override(), Some(true));
     assert!(a.claude_args.is_empty());
 
     // A token `start` does not declare hands over, and everything behind it
@@ -155,39 +153,7 @@ fn start_isolated_flag_precedes_the_name() {
     };
     assert_eq!(a.profile, "acme");
     assert_eq!(a.isolation(), Isolation::Isolated);
-    assert_eq!(a.rescue_override(), None);
     assert_eq!(a.claude_args, ["-p", "hi"]);
-}
-
-#[test]
-fn start_rescue_flags_override_in_any_order() {
-    let Command::Start(on) = command(&["start", "--rescue", "--isolated", "acme"]) else {
-        panic!("must parse");
-    };
-    assert_eq!(on.rescue_override(), Some(true));
-    assert_eq!(on.isolation(), Isolation::Isolated);
-
-    let Command::Start(off) = command(&["start", "--isolated", "--no-rescue", "acme"]) else {
-        panic!("must parse");
-    };
-    assert_eq!(off.rescue_override(), Some(false));
-}
-
-/// Both rescue spellings on one line is last-one-wins, not a rejection — the
-/// hand-rolled parser's behavior, preserved by clap's mutual `overrides_with`.
-#[test]
-fn start_last_rescue_spelling_wins() {
-    let Command::Start(a) = command(&["start", "--isolated", "--rescue", "--no-rescue", "acme"])
-    else {
-        panic!("must parse");
-    };
-    assert_eq!(a.rescue_override(), Some(false));
-
-    let Command::Start(b) = command(&["start", "--isolated", "--no-rescue", "--rescue", "acme"])
-    else {
-        panic!("must parse");
-    };
-    assert_eq!(b.rescue_override(), Some(true));
 }
 
 /// `--with-fallback` is the whole opt-in: it is the only thing that sets a
@@ -230,20 +196,25 @@ fn start_with_fallback_conflicts_with_isolated() {
     }
 }
 
-/// Rescue lifts a throwaway isolated store into the global one; a shared start
-/// already writes there, so the flags without `--isolated` are a user error,
-/// rejected rather than silently no-op'd.
+/// Every isolated run rescues now, so the pair that used to decide it is gone
+/// from the grammar. Refused, not accepted-and-ignored: a flag that parses and
+/// changes nothing is how a `--no-rescue` in someone's shell alias keeps reading
+/// as a working opt-out long after it stopped being one. `--isolated` is on the
+/// second half because that was the accepted spelling, so it is the one a script
+/// carries.
 #[test]
-fn start_rescue_requires_isolated() {
+fn start_no_longer_takes_the_removed_rescue_flags() {
     for args in [
         ["start", "--rescue", "acme"].as_slice(),
         ["start", "--no-rescue", "acme"].as_slice(),
+        ["start", "--isolated", "--rescue", "acme"].as_slice(),
+        ["start", "--isolated", "--no-rescue", "acme"].as_slice(),
     ] {
-        let err = parse(args).expect_err("a rescue flag without --isolated must be refused");
-        assert_eq!(err.exit_code(), 2, "a bad flag combination exits 2");
+        let err = parse(args).expect_err("a removed rescue flag must be refused");
+        assert_eq!(err.exit_code(), 2, "an unknown flag exits 2");
         assert!(
-            err.to_string().contains("--isolated"),
-            "the error must name the missing flag, got: {err}"
+            err.to_string().contains("rescue"),
+            "the error must name the flag it does not know, got: {err}"
         );
     }
 }
@@ -258,7 +229,7 @@ fn start_requires_a_profile_name() {
     for args in [
         ["start"].as_slice(),
         ["start", "--isolated"].as_slice(),
-        ["start", "--isolated", "--rescue"].as_slice(),
+        ["start", "--with-fallback"].as_slice(),
     ] {
         assert_eq!(
             parse_exit_code(args),
@@ -268,31 +239,26 @@ fn start_requires_a_profile_name() {
     }
 }
 
-/// `--isolated` alone still needs no rescue decision, and the accessor pair is
-/// what `dispatch` hands `start::run`.
+/// `isolation()` is the whole of what `dispatch` derives from `StartArgs` before
+/// handing it to `start::run`, and the runtime flavor it picks is what the
+/// teardown's rescue leg reads.
 #[test]
 fn start_args_accessors_map_flags_to_the_runtime_types() {
     let shared = StartArgs {
         isolated: false,
-        rescue: false,
-        no_rescue: false,
         with_fallback: false,
         profile: "acme".into(),
         claude_args: Vec::new(),
     };
     assert_eq!(shared.isolation(), Isolation::Shared);
-    assert_eq!(shared.rescue_override(), None);
 
     let isolated = StartArgs {
         isolated: true,
-        rescue: true,
-        no_rescue: false,
         with_fallback: false,
         profile: "acme".into(),
         claude_args: Vec::new(),
     };
     assert_eq!(isolated.isolation(), Isolation::Isolated);
-    assert_eq!(isolated.rescue_override(), Some(true));
 }
 
 // ── login ───────────────────────────────────────────────────────────────────
@@ -868,7 +834,7 @@ fn per_subcommand_help_carries_that_commands_prose() {
         .render_long_help()
         .to_string();
     assert!(
-        start.contains("--isolated") && start.contains("--no-rescue"),
+        start.contains("--isolated") && start.contains("--with-fallback"),
         "start --help must document its own flags"
     );
     assert!(
@@ -878,6 +844,32 @@ fn per_subcommand_help_carries_that_commands_prose() {
     assert!(
         !start.contains("completions"),
         "start --help must not reprint the root command list"
+    );
+}
+
+/// The one fact `--isolated`'s help has to carry now that every isolated run is
+/// rescued: the runtime tree is thrown away, the session is not. No flag and no
+/// config key says so any more, so this copy is where a reader learns it up
+/// front — `sessions_cli::held_refusal` says it too, for the narrower case of a
+/// resume blocked on a live isolated run. Matched over whitespace-normalized output,
+/// because clap rewraps the paragraph to the terminal it renders for — and
+/// without the final period, which clap strips off an arg's last sentence.
+#[test]
+fn the_isolated_help_says_the_session_outlives_the_runtime() {
+    let mut start = Cli::command();
+    let help = start
+        .find_subcommand_mut("start")
+        .expect("start subcommand")
+        .render_long_help()
+        .to_string();
+    let flat = help.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(
+        flat.contains(
+            "The run's transcripts and session state are lifted into the global \
+             store before the runtime is discarded, so the session stays \
+             resumable and its tokens are counted"
+        ),
+        "--isolated's help must say the session survives its runtime: {flat}"
     );
 }
 
@@ -993,7 +985,7 @@ mod disabled_target_refusal {
         let home = HomeSandbox::new();
         seed_disabled_profile("off");
 
-        let err = cmd_start("off", &[], crate::runtime::Isolation::Shared, None, false)
+        let err = cmd_start("off", &[], crate::runtime::Isolation::Shared, false)
             .expect_err("a disabled target must be refused");
         assert_eq!(
             err.to_string(),

@@ -49,14 +49,14 @@ fn every_shell_completes_start_isolated_flag() {
 #[test]
 fn every_shell_completes_start_with_fallback_flag() {
     let cases = [
-        (BASH, "--isolated --rescue --no-rescue --with-fallback"),
+        (BASH, "--isolated --with-fallback"),
         // Anchored on the preceding sibling INSIDE the backslash-continued
         // block. zsh's describe entry is position-free on its own, so a needle
         // made only of it stays green while the line is moved under another
         // subcommand's branch and the flag stops being offered under `start`.
         (
             ZSH,
-            "'--no-rescue[isolated only: discard the isolated store]' \\\n            \
+            "'--isolated[clean isolated runtime; drops operator config]' \\\n            \
              '--with-fallback[follow the fallback chain",
         ),
         (
@@ -76,11 +76,28 @@ fn every_shell_completes_start_with_fallback_flag() {
     }
 }
 
+/// The flag pair that used to decide the isolated rescue is gone from the
+/// grammar, so a script still offering it completes a spelling clap refuses —
+/// the one shell surface where a removal is silent, since nothing here parses.
+/// Whole-word, so a hit is a completion entry rather than these letters sitting
+/// inside some longer token — the two spellings cannot hide inside each other,
+/// which is a property of this pair and not of the check.
+#[test]
+fn no_shell_offers_the_removed_rescue_flags() {
+    for (shell, script) in [("bash", BASH), ("zsh", ZSH), ("fish", FISH)] {
+        for flag in ["--rescue", "--no-rescue"] {
+            assert!(
+                !offers_token(script, flag),
+                "{shell} must not complete the removed {flag}",
+            );
+        }
+    }
+}
+
 /// `clauth start --with-fallback <TAB>` is the canonical shape — clap only sees
 /// the flag before the profile name — so the profile list has to follow it in the
-/// two position-sensitive shells. `--rescue`/`--no-rescue` set no precedent here:
-/// both `requires = "isolated"`, so neither is ever the only flag before the name.
-/// fish matches on the subcommand alone and is unaffected.
+/// two position-sensitive shells. fish matches on the subcommand alone and is
+/// unaffected.
 #[test]
 fn bash_and_zsh_complete_a_profile_after_start_with_fallback() {
     assert!(
@@ -340,8 +357,10 @@ fn subcommand_branch_isolates_one_subcommand_or_reports_none() {
     }
 }
 
-/// Whether `script` offers `token` as a whole word. `--rescue` must not match on
-/// `--no-rescue`, nor `start` on `--setup-token`.
+/// Whether `script` offers `token` as a whole word: a hyphen, letter, digit or
+/// underscore on either side disqualifies the hit, so `standby` does not match
+/// inside `--no-standby` nor `--standby` inside `--standby-mode`, while `start`
+/// still matches inside `-W "start login"`.
 fn offers_token(script: &str, token: &str) -> bool {
     let boundary = |c: char| !(c.is_ascii_alphanumeric() || c == '-' || c == '_');
     script.match_indices(token).any(|(i, _)| {
@@ -354,10 +373,24 @@ fn offers_token(script: &str, token: &str) -> bool {
     })
 }
 
+/// Both boundary sides, each fed an input the predicate is what rejects.
+///
+/// The two flag-pair cases below them are kept for the shapes they document, but
+/// neither can fail on its own: `--no-standby` does not CONTAIN `--standby` (one
+/// hyphen, not two) and `'--setup-token[x]'` does not contain `start`, so a
+/// plain `str::contains` answers them identically. Measured — reducing
+/// `boundary` to `|_| true` left the whole gate green until the first two lines
+/// existed.
 #[test]
 fn offers_token_does_not_match_inside_a_longer_flag() {
-    assert!(offers_token("a --rescue b", "--rescue"));
-    assert!(!offers_token("a --no-rescue b", "--rescue"));
+    // `standby` IS inside `--no-standby`, preceded by a hyphen: the left
+    // boundary is the only thing that can reject it.
+    assert!(!offers_token("a --no-standby b", "standby"));
+    // `--standby` IS inside `--standby-mode`, followed by a hyphen: likewise on
+    // the right, which no other case here exercises.
+    assert!(!offers_token("a --standby-mode b", "--standby"));
+    assert!(offers_token("a --standby b", "--standby"));
+    assert!(!offers_token("a --no-standby b", "--standby"));
     assert!(!offers_token("'--setup-token[x]'", "start"));
     assert!(offers_token("-W \"start login\"", "start"));
 }

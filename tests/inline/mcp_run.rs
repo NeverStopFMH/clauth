@@ -3105,7 +3105,6 @@ fn a_delegate_killed_mid_block_still_returns_the_text_it_wrote() {
         Duration::from_secs(612),
         Duration::from_secs(300),
         &capture,
-        true,
     );
     assert_eq!(envelope["is_error"], true);
     assert_eq!(envelope["timed_out"], "idle");
@@ -3133,54 +3132,57 @@ fn a_delegate_killed_before_writing_anything_carries_no_partial_key() {
         Duration::from_secs(3600),
         Duration::from_secs(3600),
         &super::StreamCapture::default(),
-        true,
     );
     assert_eq!(envelope["timed_out"], "wall_clock");
     assert!(envelope.get("partial_result").is_none());
     assert!(envelope.get("session_id").is_none());
 }
 
-/// An isolated run without auto-rescue loses its transcript to the runtime
-/// teardown. Handing back a session id there would be a handle to nothing, so the
-/// envelope says why instead.
+/// The isolation never reaches this builder now, so it is the id alone that is
+/// varied — both of the match's arms. The arm that used to answer an id with "it
+/// cannot be resumed" is gone, and neither surviving arm may refuse a resume: an
+/// isolated run's transcript is lifted into the global store on teardown, and
+/// whether that lift landed is not something an envelope can know.
 #[test]
-fn an_unrescuable_killed_run_offers_no_resume_handle() {
+fn a_killed_run_offers_the_resume_handle_whenever_a_session_id_exists() {
     let mut capture = super::StreamCapture::default();
     for line in STREAM.lines().take(4) {
         capture.push_line(line);
     }
-    let envelope = super::timeout_envelope(
-        "work",
-        super::Expiry::Idle,
-        Duration::from_secs(400),
-        Duration::from_secs(300),
-        &capture,
-        false,
-    );
-    assert!(
-        envelope.get("session_id").is_none(),
-        "no handle for a transcript that is already gone"
+    let killed = |capture: &super::StreamCapture| {
+        super::timeout_envelope(
+            "work",
+            super::Expiry::Idle,
+            Duration::from_secs(400),
+            Duration::from_secs(300),
+            capture,
+        )
+    };
+
+    let envelope = killed(&capture);
+    assert_eq!(
+        envelope["session_id"], "s1",
+        "an id off the stream is a handle, whatever the runtime was"
     );
     assert_eq!(
         envelope["partial_result"], "alpha",
         "the salvage still comes back"
     );
-    let reason = envelope["result"].as_str().expect("reason");
-    assert!(
-        reason.contains("auto-rescue"),
-        "the operator learns about the toggle here, not by losing a second run: {reason}"
-    );
-}
 
-/// Which runs are resumable at all: the shared tree writes straight into the
-/// global store, the isolated one needs the opt-in rescue to survive its own
-/// teardown.
-#[test]
-fn only_a_shared_or_rescued_runtime_leaves_a_transcript_behind() {
-    assert!(super::transcript_survives(Isolation::Shared, false));
-    assert!(super::transcript_survives(Isolation::Shared, true));
-    assert!(!super::transcript_survives(Isolation::Isolated, false));
-    assert!(super::transcript_survives(Isolation::Isolated, true));
+    let idless = killed(&super::StreamCapture::default());
+    assert!(
+        idless.get("session_id").is_none(),
+        "no id, no handle — the only reason a reply withholds one"
+    );
+
+    for envelope in [&envelope, &idless] {
+        let reason = envelope["result"].as_str().expect("reason");
+        assert!(
+            !reason.contains("cannot be resumed") && !reason.contains("auto-rescue"),
+            "neither arm may say the transcript cannot be resumed, nor name the \
+             removed setting: {reason}"
+        );
+    }
 }
 
 /// Claude Code finds a session only under its own workspace, so a `cwd` that
@@ -4470,18 +4472,17 @@ fn a_two_wallet_profile_ranks_on_the_first_currency_listed() {
 
 // ---- slice 5: salvage on every lossy exit, and cancel ----
 
-/// Finding 18: a resumable run that never captured a session id used to append
-/// nothing at all, so the envelope read as silence against a description that
-/// promises a resume handle. The other two arms both say where they stand.
+/// Finding 18: a run that never captured a session id used to append nothing at
+/// all, so the envelope read as silence against a description that promises a
+/// resume handle. Both arms say where they stand.
 #[test]
-fn a_resumable_run_with_no_session_id_says_why_there_is_no_handle() {
+fn a_run_with_no_session_id_says_why_there_is_no_handle() {
     let envelope = super::timeout_envelope(
         "work",
         super::Expiry::Wall,
         Duration::from_secs(3600),
         Duration::from_secs(3600),
         &super::StreamCapture::default(),
-        true,
     );
     assert!(
         envelope.get("session_id").is_none(),
@@ -4566,7 +4567,6 @@ fn a_non_zero_exit_still_hands_back_what_the_run_produced() {
         b"boom: auth failed\n",
         &capture,
         "work",
-        true,
     );
     let super::RunOutcome::Exited {
         envelope,
@@ -4616,13 +4616,7 @@ fn an_unparseable_envelope_still_hands_back_what_the_run_produced() {
         super::parse_delegate_envelope(capture.envelope_src().trim()).is_err(),
         "the precondition: this run's stdout is not an envelope"
     );
-    let outcome = super::classify_run(
-        std::process::ExitStatus::from_raw(0),
-        b"",
-        &capture,
-        "work",
-        true,
-    );
+    let outcome = super::classify_run(std::process::ExitStatus::from_raw(0), b"", &capture, "work");
     let super::RunOutcome::Unparseable(envelope) = outcome else {
         panic!("a clean exit with unreadable output classifies as unparseable");
     };
@@ -4801,7 +4795,6 @@ fn a_cancelled_run_finalizes_as_a_done_error_rather_than_stranding() {
         "delegate cancelled after 42s".to_string(),
         Duration::from_secs(42),
         &capture,
-        true,
     );
     assert_eq!(envelope["is_error"], true);
     assert_eq!(envelope["cancelled"], true);
@@ -4990,18 +4983,16 @@ fn a_reserved_job_records_a_deadline_pair_a_reader_can_tell_apart() {
     assert_eq!(record.idle_secs, None, "and the idle leg is off");
 }
 
-/// `(None, false)` used to land in the isolated-transcript arm and tell a run
-/// that never had a session its transcript was lost to auto-rescue — two things
-/// clauth did not observe. The session question is answered FIRST: no id means
-/// no handle whatever the isolation, and the transcript clause only means
-/// something when an id exists.
+/// A run with no id used to land in the isolated-transcript arm and be told its
+/// transcript was lost to auto-rescue — two things clauth did not observe. The
+/// id is the whole question now, and the answer to "no id" is still its own
+/// absence rather than a claim about a transcript nobody saw.
 #[test]
 fn a_run_with_no_session_never_claims_a_lost_transcript() {
     let envelope = super::salvage_envelope(
         "work",
         "claude exited with 1: boom".to_string(),
         &super::StreamCapture::default(),
-        false,
     );
     let reason = envelope["result"].as_str().expect("reason");
     assert!(
@@ -5045,6 +5036,44 @@ fn run_delegate_reads_the_cancel_flag_between_the_acquire_and_the_spawn() {
         window.contains("\n    if handoff.as_ref().is_some_and(|h| h.is_cancelled()) {\n"),
         "the cancel guard between the acquire and the spawn must be the whole \
          condition, unqualified: {window}"
+    );
+}
+
+/// The delegate's own half of the isolated rescue, pinned the same way and for
+/// the same reason as its `start.rs` twin
+/// (`the_start_teardown_tail_is_the_rescue_leg_gated_on_isolation_alone`, which
+/// carries the full argument for the equality and for what a window pin cannot
+/// see above its own window). A delegate that stopped rescuing would strand
+/// every isolated run's transcript in a tree `drop(runtime)` deletes, and the
+/// reply would still carry a resume handle.
+#[test]
+fn the_delegate_teardown_tail_is_the_rescue_leg_gated_on_isolation_alone() {
+    let src = include_str!("../../src/mcp/mod.rs");
+    let body = src
+        .split_once("fn run_delegate(")
+        .expect("run_delegate is defined")
+        .1;
+    // Bounded at the outcome match, i.e. the end of the teardown legs.
+    let legs = body
+        .split_once("let status = match outcome {")
+        .expect("the run's outcome is read after the teardown legs")
+        .0;
+    let dense: String = legs
+        .lines()
+        .filter(|l| !l.trim_start().starts_with("//"))
+        .flat_map(str::chars)
+        .filter(|c| !c.is_whitespace())
+        .collect();
+    let tail = dense
+        .rsplit_once("run_start);}")
+        .expect("the stamp leg precedes the rescue leg")
+        .1;
+    assert_eq!(
+        tail,
+        "ifisolated&&letOk(claude_home)=crate::profile::claude_dir(){\
+         crate::start::rescue_teardown(runtime.config_dir(),runtime.sessions_dir(),&claude_home);}",
+        "between the stamp leg and the end of the teardown region there must be \
+         the rescue leg and nothing else, gated on the isolation alone"
     );
 }
 
@@ -5117,7 +5146,6 @@ fn the_throttle_scan_carries_every_source_a_rate_limit_hides_in() {
         b"stderr-marker",
         &capture,
         "work",
-        true,
     );
     let super::RunOutcome::Exited { throttle_scan, .. } = outcome else {
         panic!("a non-zero exit classifies as an exit");

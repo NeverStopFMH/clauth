@@ -31,15 +31,6 @@ struct ChildOutcome {
     signal: Option<i32>,
 }
 
-/// Whether an isolated run's transcripts get lifted into the global store on
-/// teardown. A per-run `--rescue`/`--no-rescue` override (`Some`) beats the
-/// persisted `auto_rescue` toggle; with no override the toggle decides. The
-/// caller still gates this on `isolation == Isolated` — a shared start never
-/// rescues, since its transcripts already live in the global store.
-pub(crate) fn rescue_effective(rescue_override: Option<bool>, auto_rescue: bool) -> bool {
-    rescue_override.unwrap_or(auto_rescue)
-}
-
 /// Lift an exiting isolated session's state into the global store: the
 /// transcripts under `projects/`, then Claude Code's own session sidecar state
 /// (shell snapshots, file history, tasks/plans, …) from the rest of the runtime
@@ -56,7 +47,7 @@ pub(crate) fn rescue_effective(rescue_override: Option<bool>, auto_rescue: bool)
 /// this session alone and the guard never fires. It DOES fire on a fake-symlink
 /// host, where the profile's isolated sessions share one tree: the first out
 /// rescues nothing and the last out rescues everything, since the shared tree
-/// holds every session's transcripts. The consequence is that auto-rescue becomes
+/// holds every session's transcripts. The consequence is that the rescue becomes
 /// all-or-nothing on the last session's clean exit — SIGKILL the last one and GC
 /// discards the tree with every session's transcripts in it. Not separable while
 /// the tree is shared: the sidecar trees carry no per-session attribution.
@@ -179,7 +170,6 @@ pub(crate) fn run(
     claude_args: &[String],
     isolation: Isolation,
     workspace: Option<&Path>,
-    rescue_override: Option<bool>,
     follows_chain: bool,
 ) -> Result<()> {
     // Authoritative "never a live session for a disabled account" gate — every
@@ -273,14 +263,11 @@ pub(crate) fn run(
         crate::sessions::stamp_run_sessions(name, &projects_dir, isolated, run_start);
     }
 
-    // Auto-rescue (isolated only, opt-in): the throwaway isolated store is
-    // discarded on `drop(runtime)`, taking the session's state with it. When
-    // enabled, lift it into the global store first. OFF is a no-op, leaving
-    // teardown byte-for-byte the stock discard path.
-    if isolated
-        && rescue_effective(rescue_override, config.state.auto_rescue)
-        && let Ok(claude_home) = crate::profile::claude_dir()
-    {
+    // Rescue (isolated only): the throwaway isolated store is discarded on
+    // `drop(runtime)`, taking the session's state with it, so lift it into the
+    // global store first. A shared start needs nothing here — its transcripts
+    // already live in the global store.
+    if isolated && let Ok(claude_home) = crate::profile::claude_dir() {
         rescue_teardown(runtime.config_dir(), runtime.sessions_dir(), &claude_home);
     }
 

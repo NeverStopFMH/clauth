@@ -203,30 +203,25 @@ fn preemptive_rotation_defaults_true_and_an_explicit_off_survives_a_round_trip()
     );
 }
 
-// `auto_rescue` (isolated-transcript rescue) shares `preemptive_rotation`'s
-// serde contract exactly: absent from old state files → false (stock discards
-// an isolated store on teardown), on renders explicitly, off is omitted.
+// `auto_rescue` was the opt-in behind the isolated-transcript rescue, which every
+// isolated run now gets unconditionally. `AppState` carries no
+// `deny_unknown_fields`, so a profiles.toml written while the key existed still
+// loads — the key is ignored rather than refused, and nothing renders it back.
+// The load half is the one that matters: refusing it would lock an operator out
+// of every account on the first launch after an upgrade.
 #[test]
-fn auto_rescue_defaults_false_and_round_trips() {
-    let state: AppState = toml::from_str("profiles = []\n").expect("parse state");
-    assert!(!state.auto_rescue);
-
-    let on = AppState {
-        auto_rescue: true,
-        ..AppState::default()
-    };
-    let rendered_on = toml::to_string_pretty(&on).expect("render on state");
+fn a_profiles_toml_carrying_the_removed_auto_rescue_key_still_loads() {
+    let state: AppState = toml::from_str("profiles = []\nauto_rescue = true\n")
+        .expect("a state file from before the key was removed must still parse");
     assert!(
-        rendered_on.contains("auto_rescue = true"),
-        "on must render explicitly, got:\n{rendered_on}"
+        state.active_profile.is_none() && state.profiles.is_empty(),
+        "the rest of the file loads as it always did"
     );
-    let reparsed: AppState = toml::from_str(&rendered_on).expect("reparse on state");
-    assert!(reparsed.auto_rescue);
 
-    let rendered_off = toml::to_string_pretty(&AppState::default()).expect("render default state");
+    let rendered = toml::to_string_pretty(&state).expect("render state");
     assert!(
-        !rendered_off.contains("auto_rescue"),
-        "off (default) must be omitted, got:\n{rendered_off}"
+        !rendered.contains("auto_rescue"),
+        "the key is dropped on the next save, not carried forward: \n{rendered}"
     );
 }
 

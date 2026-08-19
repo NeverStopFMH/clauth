@@ -61,7 +61,7 @@ clauth list           # account table with cached usage, no network
 |---------|-------|------|
 | `clauth` | | open the TUI |
 | `clauth <profile>` | | switch to that profile and exit |
-| `clauth start <profile> [claude args…]` | `--isolated`, `--rescue`, `--no-rescue`, `--with-fallback` | run `claude` under that profile's own config dir |
+| `clauth start <profile> [claude args…]` | `--isolated`, `--with-fallback` | run `claude` under that profile's own config dir |
 | `clauth login <profile>` | `--base-url`, `--api-key`, `--setup-token`, `--yes`, `--model` | add an account, or re-authenticate one in place |
 | `clauth rolling-token <profile>` | | serve the profile's sessions a rolling token re-stamped from its usage chain |
 | `clauth static-token <profile>` | `--clear`, `--yes` | bare: restore the preserved mint a rolling token superseded; `--clear` removes the long-lived token entirely |
@@ -87,7 +87,7 @@ clauth list           # account table with cached usage, no network
 
 - **`start` argument order.** clauth's own flags go before the profile name. Anything clauth does not recognize is forwarded to `claude` verbatim, leading hyphens included. Use `--` for a spelling both programs own, like `--help`.
 - **`start --with-fallback`** hands the session its own fallback chain. It is refused, by name, when combined with `--isolated`, on macOS, on Windows without symlink privilege, for a non-OAuth account, for an account outside the chain, when the chain has no other member, or when no `clauth daemon` is running.
-- **`start --rescue` / `--no-rescue`** require `--isolated`. They override the profile's `auto_rescue` setting for that run, which decides whether the throwaway runtime's transcripts get lifted into your global store before teardown.
+- **`start --isolated` keeps the session.** Its transcripts and session state are lifted into your global store before the throwaway runtime is discarded, so the run stays resumable and its tokens are counted. A hard kill (SIGKILL) skips that teardown and the store goes with the runtime. The `--rescue`/`--no-rescue` flags and the `auto_rescue` setting that used to decide this are gone; there is nothing to opt into and no way to opt out.
 - **`delete` and `disable` want a TTY.** Both prompt `[y/N]`; on a non-TTY stdin they refuse unless you pass `--yes`. `--force` is the only way past `delete`'s live-session guard, and `--yes` alone does not override it.
 - **`login <existing>`** re-authenticates in place. The chain slot, env block, and model settings survive; the credentials are replaced after a confirm.
 - **`login <alibaba account>`** opens the Alibaba Model Studio console instead, because that plan's usage figures run on a console session its api key cannot stand in for. It replaces that session and nothing else: endpoint, api key and model settings all stay put. There is no confirm either, since re-running it is the routine repair. The window it captures is measured from your aliyun console sign-in ([Configuration](Configuration#the-alibaba-console-session)). Passing `--base-url` or `--api-key` still takes the ordinary api-key path. Starting one from nothing is two steps for that reason: give the account a Model Studio endpoint first (a Qwen preset on the Setup tab, or `--base-url` here), then run a bare `clauth login <name>`. The console a session comes from is read off the endpoint, so a name that has none yet has no console to open.

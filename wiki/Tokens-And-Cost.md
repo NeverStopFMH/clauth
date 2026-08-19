@@ -12,7 +12,7 @@ The Tokens tab is a dashboard over Claude Code's own token history on this machi
 
 Claude Code prunes old transcripts and its rollup freezes at a date, so clauth keeps its own ledger of finalized days. That ledger is what lets the dashboard keep advancing once the transcripts behind it are gone. Days already pruned before the ledger existed are unrecoverable.
 
-The figures cover **every account sharing this machine's home directory**, since that is what Claude Code's store covers. A `clauth start --isolated` session writes into its own throwaway store and is not counted.
+The figures cover **every account sharing this machine's home directory**, since that is what Claude Code's store covers. A `clauth start --isolated` session writes into its own throwaway store, so its usage arrives here only once the run ends and its transcripts are lifted into the global store.
 
 ## Period lens
 

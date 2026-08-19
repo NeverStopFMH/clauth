@@ -129,7 +129,6 @@ If the messages limiter is blocking Claude Code, a live 5h window will not clear
 | `wrap_off` | bool | `false` | switch off all accounts once the chain is out of quota |
 | `spend_budget_switching` | bool | `false` | master switch for pay-as-you-go fallback |
 | `switch_off_when_budget_spent` | bool | `true` | switch off once the spend ceiling is used up |
-| `auto_rescue` | bool | `false` | lift an isolated run's transcripts into the global store before teardown |
 | `default_divergence` | string | none | auto-resolve a credential mismatch: `Overwrite`, `NewProfile`, `Discard` |
 | `theme` | string | auto | `full` or `compatible` |
 | `reset_display` | string | `relative` | `relative`, `clock`, `both` |

@@ -50,7 +50,7 @@
 //! once the last session of the profile has left; [`gc_stale_runtimes`] collects
 //! what a crashed session left behind, of either flavor and in either layout.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -3016,6 +3016,10 @@ fn copy_if_valid_creds(src: &Path, dst: &Path) -> Result<()> {
 /// never destroys data. Top-level `settings.json` / `.credentials.json` are
 /// skipped (settings is a rewritten copy; credentials has its own stricter
 /// mirror). Fake-symlink mode only.
+///
+/// The walk closes with one pass over [`AliasClasses`], which is what keeps two
+/// `~/.claude` names resolving to ONE file from letting sort order decide whose
+/// bytes survive.
 fn mirror_tree(claude_home: &Path, runtime: &Path) -> Result<()> {
     // `.claude.json` is a per-profile copy reconciled by `crate::claude_json`,
     // not part of the `~/.claude/` tree — skip it here so the tree mirror never
@@ -3023,13 +3027,128 @@ fn mirror_tree(claude_home: &Path, runtime: &Path) -> Result<()> {
     let skip_top: HashSet<&str> = ["settings.json", ".credentials.json", ".claude.json"]
         .into_iter()
         .collect();
+    let mut classes = AliasClasses::default();
     for name in union_children(claude_home, runtime) {
         if name.to_str().is_some_and(|n| skip_top.contains(n)) {
             continue;
         }
-        merge_path(&claude_home.join(&name), &runtime.join(&name))?;
+        merge_path(&claude_home.join(&name), &runtime.join(&name), &mut classes)?;
     }
-    Ok(())
+    classes.converge()
+}
+
+/// Runtime copies grouped by the canonical file a mirror write to them lands on.
+///
+/// Two `~/.claude` names can resolve to ONE file — `CLAUDE.local.md` symlinked at
+/// `CLAUDE.md`, or two names reached through one linked directory. Real symlink
+/// mode has no such split: [`build_runtime_dir_with_active_env`] links each
+/// top-level entry, so both runtime names ARE that one file and the last write
+/// wins. Fake mode's two independent copies are the emulation gap, and merging
+/// them name by name lets `union_children`'s SORT ORDER decide which copy's bytes
+/// survive — the first name publishes onto the shared target and stamps it with
+/// mtime-now, which the next name then reads as a genuinely newer side. Nobody
+/// made that decision, so the class converges on the CLOCK instead, which is the
+/// closest fake-mode analogue of the single file real mode hands it.
+///
+/// Two limits, accepted rather than worked around: `canonicalize` does not
+/// collapse HARD links, so two hard-linked names stay two classes; and the map is
+/// per-walk, so a class first seen across a tick boundary converges on the next
+/// tick rather than this one.
+#[derive(Default)]
+struct AliasClasses {
+    classes: HashMap<PathBuf, AliasClass>,
+}
+
+/// One canonical file plus every runtime copy that aliased it during this walk.
+struct AliasClass {
+    /// The canonical side's clock, as the walk last DECIDED it — never a re-stat.
+    /// A sibling name's publish inside this same tick stamps the target with
+    /// mtime-now, and comparing against that would let it outrank every real
+    /// reading still to come.
+    owner_time: Option<SystemTime>,
+    copies: Vec<PathBuf>,
+}
+
+impl AliasClasses {
+    /// Record `copy` as an alias of `target`, seeding the class's clock from
+    /// `seed` the first time the walk reaches it. Returns the clock `copy` must
+    /// be compared against.
+    fn observe(
+        &mut self,
+        target: &Path,
+        copy: &Path,
+        seed: Option<SystemTime>,
+    ) -> Option<SystemTime> {
+        let class = self
+            .classes
+            .entry(target.to_path_buf())
+            .or_insert_with(|| AliasClass {
+                owner_time: seed,
+                copies: Vec::new(),
+            });
+        class.copies.push(copy.to_path_buf());
+        class.owner_time
+    }
+
+    /// The canonical side just took `copy`'s bytes, so it now carries its clock.
+    fn adopt_owner_time(&mut self, target: &Path, when: Option<SystemTime>) {
+        if let Some(class) = self.classes.get_mut(target) {
+            class.owner_time = when;
+        }
+    }
+
+    /// A copy holding the target's bytes is the same content observed LATER, so
+    /// it is the freshest evidence FOR that content: advance the clock to it,
+    /// never back. `Option<SystemTime>` orders `None` below every `Some`, so a
+    /// first-ever reading lands here too.
+    fn bump_owner_time(&mut self, target: &Path, when: Option<SystemTime>) {
+        if let Some(class) = self.classes.get_mut(target) {
+            class.owner_time = class.owner_time.max(when);
+        }
+    }
+
+    /// Give every copy in an ALIASED class the target's bytes. The per-name merge
+    /// above has already put the class's newest bytes on the target, so this is
+    /// what converges a copy the walk visited BEFORE the eventual winner — within
+    /// the same tick, rather than one tick per alias.
+    ///
+    /// Single-copy classes are the whole non-aliased tree and are skipped, so it
+    /// costs nothing beyond the map. An unreadable target skips its class rather
+    /// than failing the tick: the merge is additive and the next tick re-tries.
+    fn converge(&self) -> Result<()> {
+        for (target, class) in &self.classes {
+            if class.copies.len() < 2 {
+                continue;
+            }
+            let Ok(bytes) = std::fs::read(target) else {
+                continue;
+            };
+            for copy in &class.copies {
+                if std::fs::read(copy).ok().as_deref() == Some(bytes.as_slice()) {
+                    continue;
+                }
+                copy_file(target, copy)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Identity of the canonical file a write aimed at `p` lands on, with EVERY
+/// symlink component resolved rather than just the leaf.
+///
+/// The parent-plus-lexical-tail fallback is load-bearing twice over: it gives a
+/// stable identity to a canonical path that does not exist yet (`merge_path`'s
+/// `(None, Some(_))` arm), and it catches the DIRECTORY spelling of the aliasing
+/// bug — two `~/.claude` names linked at one directory, reaching its files under
+/// leaf names that are not themselves links.
+fn resolved_key(p: &Path) -> Option<PathBuf> {
+    if let Ok(c) = p.canonicalize() {
+        return Some(c);
+    }
+    let parent = p.parent()?;
+    let name = p.file_name()?;
+    Some(parent.canonicalize().ok()?.join(name))
 }
 
 /// Unioned child-name set of two directories, minus the publishes in flight.
@@ -3061,7 +3180,10 @@ fn union_children(a: &Path, b: &Path) -> Vec<std::ffi::OsString> {
 
 /// Reconcile one path between canonical (`a`) and runtime (`b`) sides.
 /// Directories recurse via the same union-walk; files merge by mtime.
-fn merge_path(a: &Path, b: &Path) -> Result<()> {
+///
+/// `classes` is the walk-scoped alias bookkeeping — see [`AliasClasses`] for why
+/// the mtime comparisons below read the class's clock instead of re-stating `a`.
+fn merge_path(a: &Path, b: &Path, classes: &mut AliasClasses) -> Result<()> {
     let a_meta = a.symlink_metadata().ok();
     let b_meta = b.symlink_metadata().ok();
 
@@ -3109,7 +3231,7 @@ fn merge_path(a: &Path, b: &Path) -> Result<()> {
                 .with_context(|| format!("failed to create {}", a.display()))?;
         }
         for name in union_children(a, b) {
-            merge_path(&a.join(&name), &b.join(&name))?;
+            merge_path(&a.join(&name), &b.join(&name), classes)?;
         }
         return Ok(());
     }
@@ -3142,15 +3264,32 @@ fn merge_path(a: &Path, b: &Path) -> Result<()> {
     let a_time = a.metadata().ok().and_then(|m| m.modified().ok());
     let b_time = b_meta.as_ref().and_then(|m| m.modified().ok());
 
+    // Which canonical file this pair actually lands on, and the clock to judge
+    // `b` against. `(None, None)` records nothing: a name neither side has must
+    // never enter a class, or `converge` would CREATE the runtime copy.
+    let key = resolved_key(a);
+    let owner_time = match (&a_meta, &b_meta) {
+        (None, None) => a_time,
+        _ => key
+            .as_deref()
+            .map_or(a_time, |k| classes.observe(k, b, a_time)),
+    };
+
     match (a_meta, b_meta) {
         (Some(_), Some(_)) => {
             if files_match(a, b)? {
+                if let Some(k) = key.as_deref() {
+                    classes.bump_owner_time(k, b_time);
+                }
                 return Ok(());
             }
-            if mtime_newer(a_time, b_time) {
+            if mtime_newer(owner_time, b_time) {
                 copy_file(a, b)?;
-            } else if mtime_newer(b_time, a_time) {
+            } else if mtime_newer(b_time, owner_time) {
                 copy_file(b, &a_write)?;
+                if let Some(k) = key.as_deref() {
+                    classes.adopt_owner_time(k, b_time);
+                }
             }
         }
         (Some(_), None) => {
@@ -3158,6 +3297,9 @@ fn merge_path(a: &Path, b: &Path) -> Result<()> {
         }
         (None, Some(_)) => {
             copy_file(b, &a_write)?;
+            if let Some(k) = key.as_deref() {
+                classes.adopt_owner_time(k, b_time);
+            }
         }
         (None, None) => {}
     }

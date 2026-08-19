@@ -1301,6 +1301,66 @@ fn today_hour_buckets_dedupe_like_the_flat_fields() {
     assert_eq!(t.model_hours[0].hours[0].output, 0);
 }
 
+/// A response mirrored into two transcripts with differing timestamps lands in
+/// the path-sorted first file's hour — the cross-file dedup winner is pinned by
+/// file order, not by whatever HashMap order a run happens to produce (which
+/// would flip the hour, and with it the peak/off-peak cost, between runs).
+#[test]
+fn cross_file_duplicate_lands_in_the_path_sorted_winners_hour() {
+    let sb = HomeSandbox::new();
+    let claude_dir = make_claude_dir(&sb);
+    write_stats_cache(
+        &claude_dir,
+        r#"{
+            "lastComputedDate": "2026-06-10",
+            "totalSessions": 0, "totalMessages": 0,
+            "dailyActivity": [], "dailyModelTokens": [],
+            "modelUsage": {}, "hourCounts": {}
+        }"#,
+    );
+
+    let proj_dir = claude_dir.join("projects").join("p1");
+    std::fs::create_dir_all(&proj_dir).expect("create project dir");
+    // Same message.id, identical usage, hour 12 in `a.jsonl` (path-sorted
+    // first) and hour 13 in `b.jsonl`.
+    let line_a = jsonl_line_with_ids(
+        "2026-06-11T12:00:00+00:00",
+        "req_1",
+        "msg_1",
+        "claude-opus-4",
+        100,
+        50,
+    );
+    let line_b = jsonl_line_with_ids(
+        "2026-06-11T13:00:00+00:00",
+        "req_1",
+        "msg_1",
+        "claude-opus-4",
+        100,
+        50,
+    );
+    for (name, line) in [("a.jsonl", &line_a), ("b.jsonl", &line_b)] {
+        let f = proj_dir.join(name);
+        std::fs::write(&f, format!("{line}\n")).expect("write");
+        set_mtime(&f, SystemTime::now());
+    }
+
+    let stats = load(&claude_dir).expect("load");
+    let day = stats
+        .daily_models
+        .iter()
+        .find(|d| d.date == "2026-06-11")
+        .expect("day row");
+    assert_eq!(day.in_out, 150, "counted once");
+    let hours = day.hours.expect("hours");
+    assert_eq!(
+        hours[12].input, 100,
+        "the path-sorted first copy's hour wins"
+    );
+    assert_eq!(hours[12].output, 50);
+    assert_eq!(hours[13].input, 0, "the later copy's hour stays empty");
+}
+
 /// `period_models` carries one [`PeriodDay`] row per split-bearing day, in
 /// date order regardless of input order, with the hours passed through when
 /// the source row carried them. Days without a split keep the existing

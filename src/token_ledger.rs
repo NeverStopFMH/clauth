@@ -53,10 +53,11 @@ struct WireModel {
     output: u64,
     cache_read: u64,
     cache_create: u64,
-    /// Per-hour buckets, index = hour 0..23. `#[serde(default)]` keeps a v1
-    /// file loading (`None` — that day prices at the default tier);
-    /// `skip_serializing_if` keeps a v1 day's wire shape byte-for-byte v1 on
-    /// save, so the file only gains `hours` entries as new days are recorded.
+    /// Per-hour buckets, index = hour 0..23. A v1 file (no `hours` key) loads
+    /// with `None` — serde leaves an absent `Option` field `None`; the explicit
+    /// `default` is belt-and-braces per the schema contract. `skip_serializing_if`
+    /// keeps a v1 day's wire shape byte-for-byte v1 on save, so the file only
+    /// gains `hours` entries as new days are recorded.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     hours: Option<[WireHour; 24]>,
 }

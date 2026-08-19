@@ -924,7 +924,14 @@ fn merge_topup(
     let mut seen_uuid: HashSet<&str> = HashSet::new();
     let mut max_date: Option<String> = None;
 
-    for fc in cache.files.values() {
+    // Merge files in path-sorted order: the cross-file dedup winner is
+    // first-seen, and `cache.files` is a HashMap whose iteration order is
+    // random per process — with per-hour buckets the winner's hour is
+    // observable (peak/off-peak), so an unseeded winner would price one
+    // response in two different buckets across runs.
+    let mut files: Vec<_> = cache.files.iter().collect();
+    files.sort_unstable_by_key(|(a, _)| *a);
+    for (_, fc) in files {
         for r in &fc.recs {
             // Message / hour / session counting (user+assistant), deduped by uuid.
             // An empty uuid can't be keyed, so it counts as-is.
@@ -958,8 +965,10 @@ fn merge_topup(
             // winning line's own hour carries its whole turn (within a file
             // that is the earliest max-total delta, so a turn spanning an hour
             // boundary lands in its final delta's hour; across files the
-            // first-seen copy wins) — the same first-wins rule the flat fields
-            // apply, so buckets and flat totals always agree whichever copy won.
+            // path-sorted first copy wins — the file order is pinned above, so
+            // the winner and its hour are deterministic) — the same first-wins
+            // rule the flat fields apply, so buckets and flat totals always
+            // agree whichever copy won.
             if r.has_usage && (r.tok_key.is_empty() || seen_tok.insert(r.tok_key.as_str())) {
                 if r.date == today_date {
                     today_acc.input = today_acc.input.saturating_add(r.input);

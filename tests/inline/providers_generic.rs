@@ -73,17 +73,23 @@ fn humanize_label_handles_cases() {
     assert_eq!(humanize_label("total_balance"), "total balance");
 }
 
-/// A loopback listener answering up to `n` requests with 401, idling out two
-/// seconds after the last one. The request count pins the probe's walk (an
-/// early abort leaves requests unserved); the deadline is what lets a wrong
-/// abort FAIL the test instead of hanging it — a blocking accept would hold
-/// the join forever once the probe stops before `n`.
+/// A loopback listener answering up to `n` requests with 401. The request count
+/// pins the probe's walk (an early abort leaves requests unserved); the deadline
+/// is what lets a wrong abort FAIL the test instead of hanging it — a blocking
+/// accept would hold the join forever once the probe stops before `n`.
+///
+/// The deadline is a HANG GUARD, not a correctness bound: it must outlive the
+/// client's own 4 s connect + 8 s recv timeouts. On a loaded Windows runner the
+/// server thread can be starved past 2 s, the client then walks the candidates
+/// against a closed listener, and the test reddens with `got Status` for a probe
+/// that was never wrong. 30 s covers the client's worst case with margin; a real
+/// early abort still fails, just after this delay instead of hanging the suite.
 fn serve_401s(n: usize) -> (String, std::thread::JoinHandle<()>) {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
     let addr = format!("http://{}", listener.local_addr().expect("local addr"));
     let server = std::thread::spawn(move || {
         listener.set_nonblocking(true).expect("nonblocking accept");
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
         let mut served = 0;
         while served < n && std::time::Instant::now() < deadline {
             match listener.accept() {

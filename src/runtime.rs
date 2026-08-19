@@ -3089,28 +3089,62 @@ fn merge_path(a: &Path, b: &Path) -> Result<()> {
         return Ok(());
     }
 
+    // A symlink to a FILE is followed for both the CLOCK and the WRITE, the same
+    // rule the directory branch above takes. `a_meta`/`b_meta` stay
+    // `symlink_metadata`, because the match below asks only "does this entry
+    // exist", which a dangling link answers yes to.
+    //
+    // The clock: a symlink carries its OWN mtime, and writing its target never
+    // moves it. So the link side loses every comparison once the other side has
+    // been written even once, and the mirror copies STALE bytes back over an
+    // edit the operator just made. It also disagrees with Claude Code, whose
+    // own re-read gate stats THROUGH a link at the target ("an mtime-preserving
+    // swap is invisible", `docs/domain-knowledge.md`).
+    //
+    // The write: `copy_file` publishes by rename, which replaces the link itself
+    // with a regular file, stranding the operator's real file where nothing
+    // reads it. Both halves destroy data, which this mirror's contract says it
+    // never does.
+    let a_write = write_target(a);
+    let b_write = write_target(b);
+    let a_time = a.metadata().ok().and_then(|m| m.modified().ok());
+    let b_time = b.metadata().ok().and_then(|m| m.modified().ok());
+
     match (a_meta, b_meta) {
-        (Some(am), Some(bm)) => {
-            let a_time = am.modified().ok();
-            let b_time = bm.modified().ok();
+        (Some(_), Some(_)) => {
             if files_match(a, b)? {
                 return Ok(());
             }
             if mtime_newer(a_time, b_time) {
-                copy_file(a, b)?;
+                copy_file(a, &b_write)?;
             } else if mtime_newer(b_time, a_time) {
-                copy_file(b, a)?;
+                copy_file(b, &a_write)?;
             }
         }
         (Some(_), None) => {
-            copy_file(a, b)?;
+            copy_file(a, &b_write)?;
         }
         (None, Some(_)) => {
-            copy_file(b, a)?;
+            copy_file(b, &a_write)?;
         }
         (None, None) => {}
     }
     Ok(())
+}
+
+/// Where a write aimed at `p` must actually land: `p` itself, or what it points
+/// at when `p` is a symlink that still resolves. Answers the write question
+/// only — "does this entry exist" stays `symlink_metadata`'s, and "is this a
+/// directory to traverse" stays `Path::is_dir`'s.
+///
+/// A DANGLING link keeps its own path, so the write re-creates it as a regular
+/// file. That is the pre-existing outcome and not what this exists to change:
+/// the arm that reaches it reads the link first and fails the tick there.
+fn write_target(p: &Path) -> PathBuf {
+    match p.symlink_metadata() {
+        Ok(m) if m.file_type().is_symlink() => p.canonicalize().unwrap_or_else(|_| p.to_path_buf()),
+        _ => p.to_path_buf(),
+    }
 }
 
 fn mtime_newer(a: Option<SystemTime>, b: Option<SystemTime>) -> bool {

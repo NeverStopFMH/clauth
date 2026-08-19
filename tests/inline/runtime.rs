@@ -844,6 +844,122 @@ fn mirror_tree_follows_a_directory_link_on_the_runtime_side() {
     );
 }
 
+/// Pose a FILE link at `link` pointing at `target`. Unlike a directory link
+/// there is no unprivileged Windows shape — a junction points at directories
+/// only — so this reports refusal instead of failing on its own fixture. CI's
+/// Windows runner holds `SeCreateSymbolicLinkPrivilege` (`docs/todo.md`), so the
+/// coverage is real there; a Developer-Mode-off box skips, out loud, because a
+/// silent skip reads as a pass.
+fn pose_file_link(link: &Path, target: &Path) -> bool {
+    #[cfg(unix)]
+    let posed = std::os::unix::fs::symlink(target, link);
+    #[cfg(windows)]
+    let posed = std::os::windows::fs::symlink_file(target, link);
+    #[cfg(not(any(unix, windows)))]
+    let posed: std::io::Result<()> = Err(std::io::Error::other("no symlink support"));
+    match posed {
+        Ok(()) => true,
+        Err(e) => {
+            eprintln!("SKIP: this host cannot pose a file symlink ({e})");
+            false
+        }
+    }
+}
+
+/// The mirror must read a canonical-side symlink's TARGET, not the link. A
+/// symlink's own mtime never moves when its target is written, so once the
+/// runtime copy has been written even once it wins every later comparison and
+/// the mirror copies its STALE bytes back — discarding the operator's edit, and
+/// with `copy_file`'s rename the link along with it. `mirror_tree`'s own
+/// contract is that it never destroys data.
+#[test]
+fn mirror_tree_reads_a_canonical_symlinks_target_not_the_link() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let claude = tmp.path().join("claude");
+    let runtime = tmp.path().join("runtime");
+    let real = tmp.path().join("dotfiles");
+    for dir in [&claude, &runtime, &real] {
+        fs::create_dir_all(dir).expect("mkdir");
+    }
+    let target = real.join("notes.md");
+    fs::write(&target, b"OPERATOR-V2").expect("write target");
+    if !pose_file_link(&claude.join("notes.md"), &target) {
+        return;
+    }
+    fs::write(runtime.join("notes.md"), b"OPERATOR-V1").expect("write runtime copy");
+
+    // The link's own mtime is its creation time, which nothing here can set —
+    // and that is exactly the point. Both real files are stamped past it, the
+    // operator's target newest, so the canonical side can only win on the
+    // TARGET's clock.
+    let now = SystemTime::now();
+    set_mtime(&runtime.join("notes.md"), now + Duration::from_secs(300));
+    set_mtime(&target, now + Duration::from_secs(600));
+
+    mirror_tree(&claude, &runtime).expect("mirror");
+
+    assert!(
+        claude
+            .join("notes.md")
+            .symlink_metadata()
+            .expect("canonical entry present")
+            .file_type()
+            .is_symlink(),
+        "the operator's link must survive the tick"
+    );
+    assert_eq!(
+        fs::read(runtime.join("notes.md")).expect("read runtime"),
+        b"OPERATOR-V2",
+        "the newer TARGET reaches the runtime; the link's stale clock must not win"
+    );
+    assert_eq!(
+        fs::read(&target).expect("read target"),
+        b"OPERATOR-V2",
+        "and the operator's own file is left alone"
+    );
+}
+
+/// The other direction of the same rule: a genuinely newer RUNTIME side must
+/// write THROUGH the link onto its target, not rename over the link and strand
+/// the operator's real file where nothing reads it.
+#[test]
+fn mirror_tree_writes_through_a_canonical_symlink() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let claude = tmp.path().join("claude");
+    let runtime = tmp.path().join("runtime");
+    let real = tmp.path().join("dotfiles");
+    for dir in [&claude, &runtime, &real] {
+        fs::create_dir_all(dir).expect("mkdir");
+    }
+    let target = real.join("notes.md");
+    fs::write(&target, b"OPERATOR-V1").expect("write target");
+    if !pose_file_link(&claude.join("notes.md"), &target) {
+        return;
+    }
+    fs::write(runtime.join("notes.md"), b"CC-WROTE-V2").expect("write runtime copy");
+
+    let now = SystemTime::now();
+    set_mtime(&target, now + Duration::from_secs(300));
+    set_mtime(&runtime.join("notes.md"), now + Duration::from_secs(600));
+
+    mirror_tree(&claude, &runtime).expect("mirror");
+
+    assert!(
+        claude
+            .join("notes.md")
+            .symlink_metadata()
+            .expect("canonical entry present")
+            .file_type()
+            .is_symlink(),
+        "the write must land on the target, leaving the link itself in place"
+    );
+    assert_eq!(
+        fs::read(&target).expect("read target"),
+        b"CC-WROTE-V2",
+        "the runtime edit reaches the operator's real file, not a regular file shadowing it"
+    );
+}
+
 #[test]
 fn copy_file_overwrites_existing_destination() {
     let tmp = tempfile::tempdir().expect("tempdir");

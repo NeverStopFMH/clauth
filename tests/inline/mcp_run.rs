@@ -4238,7 +4238,10 @@ fn the_delegate_description_keeps_its_load_bearing_warnings() {
         // warn about: an unresolved `@`-mention is dropped with no error, and a
         // mistyped type that matches a path is read in as a file instead
         "(agent)",
-        "ignored with no error",
+        // Pinned as `with no error` rather than the full clause: the flattening
+        // pass changed `ignored` to `dropped`, and the silence is the
+        // load-bearing half. The verb is free, the missing error is not.
+        "with no error",
     ] {
         assert!(
             text.contains(phrase),
@@ -4254,6 +4257,14 @@ fn the_delegate_description_keeps_its_load_bearing_warnings() {
     // servers push the session over Claude Code's tool-deferral threshold, so
     // dropping them re-emits every built-in tool schema in full). A description
     // is per-user text, so neither the claim nor its inverse may ship here.
+    // These three literals fence the exact sentence that shipped and was
+    // measured false, NOT the class of claim it belongs to. `bill less`,
+    // `costs less`, `uses less input` and `lighter on tokens` all pass this
+    // check. Widening the list does not fix that: a ban list transfers only to
+    // the tokens it names (`prompt-writing`, "constraining style"), so more
+    // literals buy confidence rather than coverage. Read a pass here as "the
+    // known-false sentence has not returned", never as "no cost claim about
+    // `isolated` can ship".
     for banned in ["fewer tokens", "cheaper", "bills less"] {
         assert!(
             !text.contains(banned),

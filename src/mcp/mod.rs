@@ -495,16 +495,18 @@ pub(crate) struct DelegateArgs {
     /// case-insensitive.
     profiles: Option<Vec<String>>,
     /// The task for the delegate, as plain text. This is the only thing it knows
-    /// about the job. To run the delegate as one of your `Agent` types, start
-    /// `prompt` with `@"{type} (agent)"`. This needs `isolated: false`. Type the
-    /// name exactly as the `Agent` tool lists it: a name that does not match is
-    /// ignored with no error, and if it matches a file path that file gets read
-    /// in instead.
+    /// about the job.
+    ///
+    /// To run the delegate as one of your `Agent` types, make
+    /// `@"{type} (agent)"` the start of `prompt`. Needs `isolated: false`.
+    ///
+    /// Spell the type exactly as the `Agent` tool lists it. An unknown type is
+    /// dropped with no error; one that matches a file path pulls that file in
+    /// instead.
     prompt: Option<String>,
     /// Use a txt/md file as the prompt instead of passing it inline. Path is
     /// relative to `cwd`. Best for a prompt you reuse across turns, or one that
-    /// changes only slightly between delegates. Pass exactly one of `prompt` or
-    /// `prompt_file`.
+    /// changes only slightly between delegates.
     prompt_file: Option<String>,
     /// `isolated: false` (default): the delegate loads your `CLAUDE.md`, plugins,
     /// hooks, skills, MCP servers and tools the same as a normal session or a
@@ -529,7 +531,7 @@ pub(crate) struct DelegateArgs {
     cwd: Option<String>,
     /// Continue a delegate by `session_id`, and `prompt` becomes the next message
     /// in that conversation. clauth resumes it in the directory the session was
-    /// running in, so `cwd` is not needed here (refuses if it varies).
+    /// running in, so `cwd` is not needed here (refuses if it disagrees).
     resume: Option<String>,
     /// Kill the delegate if it produces no output at all for this many seconds
     /// (max: 3600, default 300). It returns any text it had and a `session_id`
@@ -545,8 +547,9 @@ pub(crate) struct DelegateArgs {
     /// still producing output keeps running.
     timeout_secs: Option<u64>,
     /// Extra env vars to pass to the delegate session, e.g.
-    /// `CLAUDE_CODE_MAX_OUTPUT_TOKENS`. `CLAUDE_CONFIG_DIR` and its own depth
-    /// guard are clauth-managed, which you cannot override.
+    /// `CLAUDE_CODE_MAX_OUTPUT_TOKENS`. clauth sets `CLAUDE_CONFIG_DIR` and its
+    /// own depth guard after yours, so a value you pass for either is
+    /// discarded.
     env: Option<HashMap<String, String>>,
     /// Extra CLI arguments that go after clauth's own `claude -p` invocation and
     /// streaming flags, after `--strict-mcp-config` on an isolated run, and after

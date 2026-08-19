@@ -438,6 +438,38 @@ fn a_generic_api_key_row_reports_its_own_figures_and_claims_no_anthropic_plan() 
     );
 }
 
+/// The same refusal on the PRODUCTION path: a `base_url` carrying credentials
+/// reaches the roster through `save_profile` -> `profile_row` -> `profile_line`,
+/// and the rendered row must name the real host with no userinfo riding on it.
+/// The unit table pins `base_url_host` itself; this pins that the row a model
+/// actually receives is built from its output.
+#[test]
+fn a_userinfo_base_url_puts_no_credentials_on_the_profiles_row() {
+    let _home = HomeSandbox::new();
+    save_profile(&Profile::new(
+        "proxy".to_string(),
+        Some("http://admin:hunter2@evil.tld/v1".to_string()),
+        Some("sk-fixture".to_string()),
+    ))
+    .expect("save userinfo-bearing profile");
+    save_app_state(&AppState {
+        active_profile: Some("proxy".into()),
+        profiles: vec!["proxy".into()],
+        ..Default::default()
+    })
+    .expect("save state");
+
+    let row = lines(&call_profiles(None, None)).remove(0);
+    assert!(
+        row.contains("[anthropic, evil.tld]"),
+        "the row names the host the request resolves to: {row}",
+    );
+    assert!(
+        !row.contains("hunter2") && !row.contains("admin") && !row.contains('@'),
+        "no userinfo on a model-facing row: {row}",
+    );
+}
+
 /// Finding 11: the retired `which` prose mapped a null tier to `unknown`
 /// unconditionally, while `profile_line` guards the same null on
 /// `provider == "anthropic"` — a third-party account has no plan tier to lose.

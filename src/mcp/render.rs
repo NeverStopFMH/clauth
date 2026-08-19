@@ -42,13 +42,42 @@ pub(crate) enum RosterRank {
     Unknown,
 }
 
-/// Host (and port) of a base url. Every profile of one provider carries the same
-/// endpoint path, so both the roster and `profiles` print the identifying
-/// half only. Shared so the two can never disagree on what a profile's endpoint
-/// is called.
+/// Host (and port) of a base url — the HOST, never the whole authority. Every
+/// profile of one provider carries the same endpoint path, so both the roster and
+/// `profiles` print the identifying half only. Shared so the two can never
+/// disagree on what a profile's endpoint is called.
+///
+/// Userinfo is dropped, and dropping it is the whole point rather than tidying:
+/// per RFC 3986 an authority is `[ userinfo "@" ] host [ ":" port ]`, so
+/// `https://api.deepseek.com:443@evil.tld` has host `evil.tld` and an authority
+/// that READS as DeepSeek. Returning the authority named the wrong host on every
+/// consumer and printed any basic-auth credentials in it onto two model-facing
+/// surfaces. [`crate::providers::url_matches_host`] carries the incident that
+/// taught this repo the same lesson at the fetch layer, where it cost an api key;
+/// this is that fix arriving at the render layer.
+///
+/// Split at the LAST `@`, not the first. Neither `userinfo` nor `host` admits a
+/// bare `@` (userinfo wants `%40`, and `host` is `IP-literal / IPv4address /
+/// reg-name`, none of which allow it), so a well-formed authority holds at most
+/// one and the two directions agree. They differ only on malformed input, and
+/// there the first-`@` answer still contains an `@` and so cannot be a host at
+/// all, while the last-`@` answer at least can be.
+///
+/// The authority ends at the FIRST of `/`, `?` or `#`, and it is cut BEFORE the
+/// userinfo. Both halves of that are load-bearing and each was wrong once. Cut
+/// after the userinfo and `http://evil.tld/a@b` reports host `b`, since a path
+/// may legally hold an `@`. Cut on `/` alone and query or fragment text stays
+/// inside the authority, so `http://evil.tld?x=a@127.0.0.1` reports host
+/// `127.0.0.1` and renders a PUBLIC endpoint as local — the same
+/// discard-before-validating defect [`authority_host`] closes downstream,
+/// reintroduced one function upstream. `url`'s own authority scan breaks on all
+/// three delimiters.
 pub(super) fn base_url_host(url: &str) -> &str {
     let rest = url.split_once("://").map_or(url, |(_, rest)| rest);
-    rest.split('/').next().unwrap_or(rest)
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or(rest);
+    authority
+        .rsplit_once('@')
+        .map_or(authority, |(_userinfo, host)| host)
 }
 
 /// The word a host [`host_locality`] places earns. Returned by that function

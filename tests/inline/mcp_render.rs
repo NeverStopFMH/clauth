@@ -623,6 +623,105 @@ fn a_local_endpoint_row_reads_apart_from_a_genuinely_unknown_one() {
     );
 }
 
+/// `base_url_host` names the HOST, which per RFC 3986 is what follows the
+/// userinfo rather than the whole authority. `host` is `IP-literal /
+/// IPv4address / reg-name` and `reg-name` admits no `@`; `userinfo` admits none
+/// either (it wants `%40`). So a well-formed authority carries at most one `@`,
+/// where both split directions agree — they diverge only on malformed input, and
+/// there `rsplit` is the only direction that CAN yield a legal host, since
+/// splitting at the first `@` leaves a remainder still holding one.
+#[test]
+fn base_url_host_returns_the_host_not_the_authority() {
+    for (url, host) in [
+        // The incident `providers::url_matches_host` documents: the authority
+        // reads as DeepSeek and the host it resolves to is `evil.tld`.
+        ("https://api.deepseek.com:443@evil.tld/v1", "evil.tld"),
+        ("http://user:pw@127.0.0.1:4000/v1", "127.0.0.1:4000"),
+        ("http://127.0.0.1@evil.tld/v1", "evil.tld"),
+        ("http://[::1]:4000@evil.tld/v1", "evil.tld"),
+        ("http://localhost@evil.tld", "evil.tld"),
+        // Malformed, two `@`: the LAST wins. A host cannot contain `@`, so the
+        // first-`@` answer is guaranteed not to be one.
+        ("http://a@b@evil.tld/v1", "evil.tld"),
+        // No userinfo: every one of these is unchanged by the split.
+        ("https://api.deepseek.com/anthropic", "api.deepseek.com"),
+        ("http://localhost:4000/v1", "localhost:4000"),
+        ("http://[::1]:4000/v1", "[::1]:4000"),
+        ("http://127.0.0.1:4000", "127.0.0.1:4000"),
+        ("api.deepseek.com", "api.deepseek.com"),
+        // The authority ends at the FIRST of `/`, `?` or `#`, and it is cut
+        // BEFORE the userinfo. Any of those bytes may legally hold an `@`, so
+        // cutting on `/` alone leaves query or fragment text inside the
+        // "authority" and the `@` split then returns a suffix of the QUERY as
+        // the host — naming a local address for a public endpoint.
+        ("http://evil.tld/a@b", "evil.tld"),
+        ("http://user@evil.tld/a@b", "evil.tld"),
+        ("http://evil.tld?x=a@127.0.0.1", "evil.tld"),
+        ("http://evil.tld#a@127.0.0.1", "evil.tld"),
+        ("http://evil.tld:443?x=a@10.0.0.1", "evil.tld:443"),
+        ("http://evil.tld#f@[::1]", "evil.tld"),
+        ("http://evil.tld?x=a@b", "evil.tld"),
+        // And the benign twin: a query on a genuinely local host stops making
+        // the string unparseable.
+        ("http://127.0.0.1:4000?x=1", "127.0.0.1:4000"),
+    ] {
+        assert_eq!(base_url_host(url), host, "`{url}` has host `{host}`");
+    }
+}
+
+/// A `base_url` carrying basic-auth credentials puts NONE of them on either
+/// model-facing surface, and both name the real host. The two carriers reach
+/// `base_url_host` by different routes — the roster from the url, the `profiles`
+/// reply from the host `profile_row` already extracted — so this drives the one
+/// producer into each consumer rather than asserting on the producer twice.
+#[test]
+fn a_userinfo_base_url_leaks_no_credentials_into_either_carrier() {
+    let url = "http://admin:hunter2@evil.tld/v1";
+
+    let roster = roster_lines(&[endpoint_snapshot("proxy", url)]);
+    assert_eq!(roster, "- proxy [anthropic, evil.tld]\n");
+
+    let reply = list_profiles_prose(&serde_json::json!({
+        "profiles": [endpoint_row("proxy", base_url_host(url))]
+    }));
+    assert_eq!(reply, "- proxy [anthropic, evil.tld]: usage unknown");
+
+    // The composition changes as well as the spelling: with userinfo gone,
+    // `host_locality` judges the host the request actually resolves to. A public
+    // real host stays bare above; a loopback real host now EARNS the marker it
+    // was denied while the `@` was still making the string unparseable.
+    // A query-borne `@` must not make a PUBLIC host read local: the authority
+    // ends before the `?`, so `127.0.0.1` here is query text, not a host.
+    assert_eq!(
+        roster_lines(&[endpoint_snapshot(
+            "querybait",
+            "http://evil.tld?x=a@127.0.0.1"
+        )]),
+        "- querybait [anthropic, evil.tld]\n",
+    );
+
+    let local = "http://admin:hunter2@127.0.0.1:4000/v1";
+    assert_eq!(
+        roster_lines(&[endpoint_snapshot("behind-auth", local)]),
+        "- behind-auth [anthropic, 127.0.0.1:4000, local endpoint]\n",
+    );
+
+    for surface in [&roster, &reply] {
+        assert!(
+            !surface.contains("hunter2"),
+            "a password reached a model-facing surface: {surface}",
+        );
+        assert!(
+            !surface.contains("admin"),
+            "a username reached a model-facing surface: {surface}",
+        );
+        assert!(
+            !surface.contains('@'),
+            "the userinfo delimiter survived: {surface}",
+        );
+    }
+}
+
 /// The predicate over the host spellings a `base_url` really produces. Positives
 /// and negatives in one table: deleting the predicate reds the first half,
 /// widening it to every host reds the second, and so does dropping the all-digits

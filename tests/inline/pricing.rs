@@ -169,6 +169,33 @@ fn rate_bare_id_resolves_to_official_namespace() {
 }
 
 #[test]
+fn rate_bare_qwen_resolves_to_dashscope() {
+    // 'qwen3.8-max' has no bare key and no 'qwen/' namespace; the feed lists it
+    // under Alibaba's 'dashscope/'.
+    let t = table(&[("dashscope/qwen3.8-max", 2e-6, 6e-6, 0.0, 0.0)]);
+    assert_eq!(t.rate("qwen3.8-max").map(|r| r.input), Some(2e-6));
+}
+
+#[test]
+fn rate_bare_kimi_resolves_to_moonshot() {
+    let t = table(&[("moonshot/kimi-k2.5", 1e-6, 4e-6, 0.0, 0.0)]);
+    assert_eq!(t.rate("kimi-k2.5").map(|r| r.input), Some(1e-6));
+}
+
+#[test]
+fn rate_bare_grok_resolves_to_xai() {
+    let t = table(&[("xai/grok-4", 3e-6, 15e-6, 0.0, 0.0)]);
+    assert_eq!(t.rate("grok-4").map(|r| r.input), Some(3e-6));
+}
+
+#[test]
+fn rate_dotted_qwen_rewrites_to_dashscope() {
+    // 'qwen.qwen3-coder-next' is a bedrock_converse key; rewrite to dashscope.
+    let t = table(&[("dashscope/qwen3-coder-next", 2e-6, 6e-6, 0.0, 0.0)]);
+    assert_eq!(t.rate("qwen.qwen3-coder-next").map(|r| r.input), Some(2e-6));
+}
+
+#[test]
 fn rate_org_branded_fallback_picks_lowest_official() {
     // glm-5.2 has no 'zai/glm-5.2' entry. The only zai-org-branded entry is
     // the Cloudflare-hosted one. Resellers are absent or filtered.

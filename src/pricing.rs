@@ -247,31 +247,36 @@ impl PriceTable {
 
 /// Rewrite a dotted provider prefix to a path-style namespace: `zai.glm-4.7`
 /// → `zai/glm-4.7`. This routes dotted ids to the official feed entry, never the
-/// bedrock_converse variant (`zai.glm-4.7` in the feed is an AWS entry).
+/// bedrock_converse variant (`zai.glm-4.7` in the feed is an AWS entry). The
+/// dotted prefix and the official namespace differ for some providers, so each
+/// pair maps `(prefix, namespace)`: `qwen.qwen3-…` is bedrock, the official
+/// namespace is `dashscope/…`.
 fn rewrite_dotted(model: &str) -> Option<String> {
-    const PROVIDERS: &[&str] = &[
-        "zai",
-        "anthropic",
-        "deepseek",
-        "minimax",
-        "openai",
-        "gemini",
-        "qwen",
-        "moonshotai",
-        "x-ai",
-        "nvidia",
+    const PROVIDERS: &[(&str, &str)] = &[
+        ("zai", "zai"),
+        ("anthropic", "anthropic"),
+        ("deepseek", "deepseek"),
+        ("minimax", "minimax"),
+        ("openai", "openai"),
+        ("gemini", "gemini"),
+        ("qwen", "dashscope"),
+        ("moonshotai", "moonshot"),
+        ("xai", "xai"),
     ];
-    for &p in PROVIDERS {
-        if let Some(rest) = model.strip_prefix(p).and_then(|s| s.strip_prefix('.')) {
-            return Some(format!("{p}/{rest}"));
+    for &(prefix, namespace) in PROVIDERS {
+        if let Some(rest) = model.strip_prefix(prefix).and_then(|s| s.strip_prefix('.')) {
+            return Some(format!("{namespace}/{rest}"));
         }
     }
     None
 }
 
 /// Map a bare model id to its official LiteLLM provider namespace via family
-/// prefix: `glm` → `zai`, `claude` → `anthropic`, `deepseek` → `deepseek`, …
-/// Returns the longest matching prefix's provider.
+/// prefix. Values are the provider's own namespace in the feed (`dashscope/`,
+/// `moonshot/`, `xai/`), not a guessed string: `qwen/`, `moonshotai/`, and
+/// `x-ai/` do not exist. `nemotron` is omitted because the feed lists it only
+/// as a bedrock_converse dotted key with no first-party namespace. Longest
+/// matching prefix wins.
 fn family_provider(id: &str) -> Option<&'static str> {
     const MAP: &[(&str, &str)] = &[
         ("glm", "zai"),
@@ -280,10 +285,9 @@ fn family_provider(id: &str) -> Option<&'static str> {
         ("minimax", "minimax"),
         ("gpt", "openai"),
         ("gemini", "gemini"),
-        ("qwen", "qwen"),
-        ("kimi", "moonshotai"),
-        ("grok", "x-ai"),
-        ("nemotron", "nvidia"),
+        ("qwen", "dashscope"),
+        ("kimi", "moonshot"),
+        ("grok", "xai"),
     ];
     MAP.iter()
         .filter(|(prefix, _)| id.starts_with(prefix))

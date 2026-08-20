@@ -155,7 +155,7 @@ clauth is the only one of these that pairs account switching with a live usage m
 
 **Can I run Claude Code with multiple accounts at the same time?** Yes. `clauth start <profile>` launches `claude` in an isolated `CLAUDE_CONFIG_DIR`, so parallel sessions don't share identity, settings, or billing caches.
 
-**How do I run Claude Code without my global `CLAUDE.md`, plugins, or hooks?** `clauth start --isolated <profile>` keeps the account's auth but drops your operator memory, plugins, and hooks, leaving a clean session for headless work or blind evals. The MCP `delegate` tool takes `isolated: true` for the same thing.
+**How do I run Claude Code without my global `CLAUDE.md`, plugins, or hooks?** `clauth start --isolated <profile>` keeps the account's auth but drops your `CLAUDE.md`, plugins, hooks, skills, MCP servers and tools, leaving a clean session for headless work or blind evals. The MCP `delegate` tool takes `isolated: true` for the same thing.
 
 **Can Claude Code switch accounts automatically when I hit the 5-hour limit?** Yes: put accounts in the fallback chain and clauth switches to the next member with headroom the moment the active one crosses its threshold. It runs in the TUI or headless via `clauth daemon`.
 

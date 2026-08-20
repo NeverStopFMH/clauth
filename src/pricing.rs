@@ -461,7 +461,8 @@ fn parse_hhmm(s: &str) -> Option<(u8, u8)> {
 pub(crate) enum PricingEvent {
     /// A fresh or cached table is available.
     Loaded(Box<PriceTable>),
-    /// A fetch failed and no cache was available. UI keeps showing `—`.
+    /// A fetch failed and no cache was available. The app flags the cost lens,
+    /// which reads `rates unavailable` instead of `rates loading`.
     Failed,
 }
 

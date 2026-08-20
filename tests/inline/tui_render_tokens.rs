@@ -778,6 +778,7 @@ fn model_detail_total_floors_mixed_priced_days() {
             Some(&row),
             20_000,
             Some(&table),
+            false,
             TokenPeriod::Weekly,
         );
     })
@@ -786,6 +787,98 @@ fn model_detail_total_floors_mixed_priced_days() {
     assert!(
         out.contains("$0.010+"),
         "the total renders as a floor over the priced day, got: {out}"
+    );
+}
+
+#[test]
+fn cost_lens_reads_rates_unavailable_after_a_failed_fetch() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = app_with_stats(TokenPeriod::Lifetime);
+    app.token_view = crate::tui::app::TokenView::Models;
+    // The fetch failed before any table landed: the flag is set, the table
+    // absent, so the cost lens must not claim it is still loading.
+    app.price_failed = true;
+    let out = render_dashboard(&app, 100, 44);
+    assert!(out.contains("rates unavailable"), "got: {out}");
+}
+
+#[test]
+fn cost_lens_reads_rates_loading_before_any_pricing_result() {
+    let row = period_row("m", vec![unhoured_day("2026-08-15", "m", 10_000, 0)]);
+    let mut term = Terminal::new(TestBackend::new(60, 24)).unwrap();
+    term.draw(|f| {
+        super::draw_model_detail(
+            f,
+            f.area(),
+            Some(&row),
+            10_000,
+            None,
+            false,
+            TokenPeriod::Weekly,
+        );
+    })
+    .unwrap();
+    let out = crate::testutil::buffer_rows(term.backend().buffer()).concat();
+    assert!(out.contains("rates loading"), "got: {out}");
+}
+
+#[test]
+fn price_failed_clears_on_loaded() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = App::new(AppConfig {
+        state: AppState::default(),
+        profiles: Vec::new(),
+    });
+    // Nothing must spawn a bootstrap thread out of this tick.
+    app.bootstrap_started = true;
+    app.price_failed = true;
+    // The test build drops the pricing worker's sender, so wire a live channel
+    // in for the `Loaded` to reach the tick drain.
+    let (tx, rx) = std::sync::mpsc::channel();
+    app.pricing_events = rx;
+    tx.send(crate::pricing::PricingEvent::Loaded(Box::new(table_of(
+        vec![],
+    ))))
+    .unwrap();
+    crate::tui::app::on_tick(&mut app);
+    assert!(!app.price_failed, "any Loaded clears the failure flag");
+    assert!(app.price_table.is_some(), "the table lands");
+}
+
+#[test]
+fn price_failed_sets_on_failed_without_a_table() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = App::new(AppConfig {
+        state: AppState::default(),
+        profiles: Vec::new(),
+    });
+    app.bootstrap_started = true;
+    let (tx, rx) = std::sync::mpsc::channel();
+    app.pricing_events = rx;
+    tx.send(crate::pricing::PricingEvent::Failed).unwrap();
+    crate::tui::app::on_tick(&mut app);
+    assert!(
+        app.price_failed,
+        "a failed fetch with no table sets the flag"
+    );
+}
+
+#[test]
+fn price_failed_keeps_the_last_good_table_on_a_transient_failure() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = App::new(AppConfig {
+        state: AppState::default(),
+        profiles: Vec::new(),
+    });
+    app.bootstrap_started = true;
+    app.price_table = Some(table_of(vec![]));
+    let (tx, rx) = std::sync::mpsc::channel();
+    app.pricing_events = rx;
+    tx.send(crate::pricing::PricingEvent::Failed).unwrap();
+    crate::tui::app::on_tick(&mut app);
+    assert!(
+        !app.price_failed,
+        "a transient failure mid-session never blanks the cached table's flag"
     );
 }
 

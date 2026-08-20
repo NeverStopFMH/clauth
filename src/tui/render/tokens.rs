@@ -1468,6 +1468,7 @@ fn draw_models(frame: &mut Frame<'_>, area: Rect, app: &App) {
             None,
             0,
             app.price_table.as_ref(),
+            app.price_failed,
             app.token_period,
         );
         return;
@@ -1493,6 +1494,7 @@ fn draw_models(frame: &mut Frame<'_>, area: Rect, app: &App) {
         grouped.get(sel),
         period_grand(app),
         app.price_table.as_ref(),
+        app.price_failed,
         app.token_period,
     );
 }
@@ -1525,6 +1527,7 @@ fn draw_model_detail(
     model: Option<&PeriodModel>,
     grand: u64,
     prices: Option<&PriceTable>,
+    rates_failed: bool,
     period: TokenPeriod,
 ) {
     let title = model
@@ -1598,7 +1601,14 @@ fn draw_model_detail(
         Line::from(vec![key(label), Span::styled(value, money_style())])
     };
     match prices {
-        None => lines.push(Line::from(Span::styled("rates loading", theme::faint()))),
+        None => {
+            let label = if rates_failed {
+                "rates unavailable"
+            } else {
+                "rates loading"
+            };
+            lines.push(Line::from(Span::styled(label, theme::faint())));
+        }
         Some(p) => match model_detail_cost(p, m) {
             None => lines.push(Line::from(Span::styled(
                 "no rate for this model",

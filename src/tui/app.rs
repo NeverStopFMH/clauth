@@ -1598,6 +1598,10 @@ pub(crate) struct App {
     /// Model price table for the Tokens tab's API-equivalent cost lens; `None`
     /// until the pricing loader posts a result (and `—` is shown meanwhile).
     pub(crate) price_table: Option<crate::pricing::PriceTable>,
+    /// Set when the pricing loader reported a failure and no table is cached —
+    /// the cost lens reads `rates unavailable` instead of a perpetual
+    /// `rates loading`.
+    pub(crate) price_failed: bool,
     /// Pricing load results from the background loader; drained in `on_tick`.
     pub(crate) pricing_events: std::sync::mpsc::Receiver<crate::pricing::PricingEvent>,
     /// Manual-refresh signal to the pricing loader; a `()` triggers a refetch.
@@ -1932,6 +1936,7 @@ impl App {
             tokens_events,
             tokens_refresh,
             price_table: None,
+            price_failed: false,
             pricing_events,
             pricing_refresh,
             last_reload_fp: reload_fingerprint(),
@@ -8332,8 +8337,15 @@ fn drain_pricing_events(app: &mut App) {
         match ev {
             crate::pricing::PricingEvent::Loaded(table) => {
                 app.price_table = Some(*table);
+                app.price_failed = false;
             }
-            crate::pricing::PricingEvent::Failed => {}
+            // Surface failure only when there is nothing to show — a transient
+            // fetch error mid-session keeps the last good table.
+            crate::pricing::PricingEvent::Failed => {
+                if app.price_table.is_none() {
+                    app.price_failed = true;
+                }
+            }
         }
     }
 }

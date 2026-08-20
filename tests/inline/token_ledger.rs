@@ -348,3 +348,287 @@ fn load_missing_is_empty() {
     assert!(l.recorded_through.is_none());
     assert!(l.days.is_empty());
 }
+
+// ── backfill (slice E) ─────────────────────────────────────────────────────────
+
+/// A v1 ledger file (no `backfill_done` key) loads with the flag `false`, so
+/// the one-shot hourly backfill is still owed — the serde default is what
+/// makes every pre-upgrade ledger backfill exactly once.
+#[test]
+fn v1_ledger_without_flag_loads_backfill_pending() {
+    let sb = crate::testutil::HomeSandbox::new();
+    let dir = sb.home().join(".clauth");
+    std::fs::create_dir_all(&dir).expect("mkdir .clauth");
+    std::fs::write(
+        dir.join("token_ledger.json"),
+        r#"{
+            "recorded_through": "2026-06-16",
+            "days": {
+                "2026-06-15": {
+                    "claude-opus-4": {
+                        "input": 100, "output": 50,
+                        "cache_read": 20, "cache_create": 10
+                    }
+                }
+            }
+        }"#,
+    )
+    .expect("write v1 ledger");
+
+    let ledger = Ledger::load(&dir);
+    assert!(!ledger.backfill_done, "an absent flag reads false");
+    // A pre-today hours-less day arms the pass up to the watermark.
+    assert_eq!(
+        ledger.backfill_through("2026-06-20").as_deref(),
+        Some("2026-06-16")
+    );
+    // Only days strictly before `today` arm it.
+    assert_eq!(ledger.backfill_through("2026-06-15").as_deref(), None);
+
+    // The flag survives a save/reload round trip.
+    ledger.save(&dir);
+    assert!(!Ledger::load(&dir).backfill_done);
+
+    // A pre-today day whose rows ALL carry hours does not arm the pass
+    // either — the sweep could fill nothing.
+    let mut done = Ledger {
+        recorded_through: Some("2026-06-16".into()),
+        ..Default::default()
+    };
+    done.days.insert(
+        "2026-06-15".into(),
+        HashMap::from([(
+            "claude-opus-4".into(),
+            WireModel {
+                input: 100,
+                output: 50,
+                cache_read: 20,
+                cache_create: 10,
+                hours: Some(
+                    [WireHour {
+                        input: 100,
+                        output: 50,
+                        cache_read: 20,
+                        cache_create: 10,
+                    }; 24],
+                ),
+            },
+        )]),
+    );
+    assert_eq!(
+        done.backfill_through("2026-06-20"),
+        None,
+        "a fully-hours pre-today day does not arm the pass"
+    );
+    // And an empty ledger never does.
+    assert_eq!(
+        Ledger::default().backfill_through("2026-06-20"),
+        None,
+        "an empty ledger does not arm the pass"
+    );
+}
+
+/// The fill rule, exact-or-absent: a row gains hour buckets only when the
+/// re-derived flat totals equal the stored ones on all four fields. A
+/// mismatching row (pruned transcripts) keeps `None` and its stored flat
+/// totals — v1 data is never lowered — so a day whose rows do not all fill
+/// keeps its v1 shape forever. The flag is set either way, so the one-shot
+/// corpus sweep never re-runs.
+#[test]
+fn backfill_hours_fills_only_exact_matches() {
+    // A v2-shaped row whose stored buckets differ from the derived ones, to
+    // pin the never-rewrite guard.
+    let mut v2h = [WireHour {
+        input: 0,
+        output: 0,
+        cache_read: 0,
+        cache_create: 0,
+    }; 24];
+    v2h[3] = WireHour {
+        input: 1,
+        output: 1,
+        cache_read: 1,
+        cache_create: 1,
+    };
+    let mut ledger = Ledger {
+        recorded_through: Some("2026-06-16".into()),
+        ..Default::default()
+    };
+    ledger.days.insert(
+        "2026-06-15".into(),
+        HashMap::from([
+            (
+                "claude-opus-4".into(),
+                WireModel {
+                    input: 100,
+                    output: 50,
+                    cache_read: 20,
+                    cache_create: 10,
+                    hours: None,
+                },
+            ),
+            (
+                "gpt-5".into(),
+                WireModel {
+                    input: 7,
+                    output: 3,
+                    cache_read: 0,
+                    cache_create: 0,
+                    hours: None,
+                },
+            ),
+            // One stored row per equality field: each derived twin below
+            // matches on three fields and misses exactly one, so dropping
+            // that field's comparison alone must leave the row v1.
+            (
+                "gpt-out".into(),
+                WireModel {
+                    input: 7,
+                    output: 3,
+                    cache_read: 0,
+                    cache_create: 0,
+                    hours: None,
+                },
+            ),
+            (
+                "gpt-cr".into(),
+                WireModel {
+                    input: 7,
+                    output: 3,
+                    cache_read: 0,
+                    cache_create: 0,
+                    hours: None,
+                },
+            ),
+            (
+                "gpt-cc".into(),
+                WireModel {
+                    input: 7,
+                    output: 3,
+                    cache_read: 0,
+                    cache_create: 0,
+                    hours: None,
+                },
+            ),
+            (
+                "v2-model".into(),
+                WireModel {
+                    input: 9,
+                    output: 9,
+                    cache_read: 0,
+                    cache_create: 0,
+                    hours: Some(v2h),
+                },
+            ),
+        ]),
+    );
+
+    let mut h09 = [HourTokens::default(); 24];
+    h09[9] = HourTokens {
+        input: 100,
+        output: 50,
+        cache_read: 20,
+        cache_create: 10,
+    };
+    let mut h07 = [HourTokens::default(); 24];
+    h07[7] = HourTokens {
+        input: 9,
+        output: 9,
+        cache_read: 0,
+        cache_create: 0,
+    };
+    let mut derived: HashMap<(String, String), crate::tokens::ModelDayAcc> = HashMap::new();
+    // Exact match on all four fields: fills.
+    derived.insert(
+        ("2026-06-15".into(), "claude-opus-4".into()),
+        crate::tokens::ModelDayAcc {
+            flat: split("claude-opus-4", 100, 50, 20, 10),
+            hours: h09,
+        },
+    );
+    // Input off by one (6 vs 7): must NOT fill.
+    derived.insert(
+        ("2026-06-15".into(), "gpt-5".into()),
+        crate::tokens::ModelDayAcc {
+            flat: split("gpt-5", 6, 3, 0, 0),
+            hours: [HourTokens::default(); 24],
+        },
+    );
+    // Output off by one (4 vs 3): must NOT fill.
+    derived.insert(
+        ("2026-06-15".into(), "gpt-out".into()),
+        crate::tokens::ModelDayAcc {
+            flat: split("gpt-out", 7, 4, 0, 0),
+            hours: [HourTokens::default(); 24],
+        },
+    );
+    // cache_read off by five (5 vs 0): must NOT fill.
+    derived.insert(
+        ("2026-06-15".into(), "gpt-cr".into()),
+        crate::tokens::ModelDayAcc {
+            flat: split("gpt-cr", 7, 3, 5, 0),
+            hours: [HourTokens::default(); 24],
+        },
+    );
+    // cache_create off by five (5 vs 0): must NOT fill.
+    derived.insert(
+        ("2026-06-15".into(), "gpt-cc".into()),
+        crate::tokens::ModelDayAcc {
+            flat: split("gpt-cc", 7, 3, 0, 5),
+            hours: [HourTokens::default(); 24],
+        },
+    );
+    // Equal flats on a row that ALREADY carries hours, with different
+    // buckets: the never-rewrite guard must keep the stored hours.
+    derived.insert(
+        ("2026-06-15".into(), "v2-model".into()),
+        crate::tokens::ModelDayAcc {
+            flat: split("v2-model", 9, 9, 0, 0),
+            hours: h07,
+        },
+    );
+    // A day the ledger does not hold: ignored.
+    derived.insert(
+        ("2026-06-14".into(), "m".into()),
+        crate::tokens::ModelDayAcc {
+            flat: split("m", 1, 1, 0, 0),
+            hours: [HourTokens::default(); 24],
+        },
+    );
+
+    ledger.backfill_hours(&derived);
+
+    assert!(
+        ledger.backfill_done,
+        "the flag is set even when rows did not fill"
+    );
+    let opus = &ledger.days["2026-06-15"]["claude-opus-4"];
+    assert_eq!(opus.input, 100, "flat totals never rewritten");
+    assert_eq!(opus.output, 50);
+    assert_eq!(opus.cache_read, 20);
+    assert_eq!(opus.cache_create, 10);
+    let hours = opus.hours.as_ref().expect("exact match fills");
+    assert_eq!(hours[9].input, 100);
+    assert_eq!(hours[9].output, 50);
+    assert_eq!(hours[9].cache_read, 20);
+    assert_eq!(hours[9].cache_create, 10);
+    assert_eq!(hours[0].output, 0);
+
+    for model in ["gpt-5", "gpt-out", "gpt-cr", "gpt-cc"] {
+        let row = &ledger.days["2026-06-15"][model];
+        assert!(
+            row.hours.is_none(),
+            "{model}: a one-field mismatch leaves the row v1"
+        );
+        assert_eq!(row.input, 7, "{model}: mismatched flat totals untouched");
+    }
+
+    let v2 = &ledger.days["2026-06-15"]["v2-model"];
+    let stored = v2.hours.as_ref().expect("stored hours survive");
+    assert_eq!(stored[3].input, 1, "the stored buckets are not rewritten");
+    assert_eq!(stored[7].input, 0, "the derived buckets do not land");
+    assert!(
+        !ledger.days.contains_key("2026-06-14"),
+        "a derived day the ledger does not hold is ignored"
+    );
+}

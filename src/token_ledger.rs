@@ -30,9 +30,13 @@
 //! # Schema
 //!
 //! v2 adds per-hour buckets ([`WireModel::hours`]), optional on the wire: a v1
-//! file (no `hours` key) loads with `None` and keeps `None` on save, so days
-//! recorded before the hourly axis keep their v1 shape until a new day is
-//! recorded beside them — v1 days price at the default tier.
+//! file (no `hours` key) loads with `None` and keeps `None` on save. A one-shot
+//! backfill ([`Ledger::backfill_hours`], driven from the tokens worker) fills
+//! those buckets from the transcript corpus where the stored flat totals still
+//! match exactly; the `backfill_done` flag (absent → `false` in pre-backfill
+//! files) makes that sweep run at most once per ledger. Days the corpus no
+//! longer fully covers keep their v1 shape forever and price at the default
+//! tier.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -40,7 +44,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::pricing::HourTokens;
-use crate::tokens::{DayModelTokens, DayTokens, ModelTokens, TokenStats};
+use crate::tokens::{DayModelTokens, DayTokens, ModelDayAcc, ModelTokens, TokenStats};
 use crate::usage::{epoch_secs_to_iso, iso_to_epoch_secs};
 
 const LEDGER_FILE: &str = "token_ledger.json";
@@ -104,6 +108,13 @@ pub(crate) struct Ledger {
     recorded_through: Option<String>,
     /// `date -> model -> split`.
     days: HashMap<String, HashMap<String, WireModel>>,
+    /// Set once the one-shot v1→v2 hourly backfill pass has run (whether it
+    /// filled anything or not), so the transcript corpus is swept at most
+    /// once per ledger. Absent in files written before the backfill;
+    /// `serde(default)` reads it `false`, which is what makes every
+    /// pre-upgrade ledger owe exactly one pass.
+    #[serde(default)]
+    backfill_done: bool,
 }
 
 impl Ledger {
@@ -247,6 +258,55 @@ impl Ledger {
             changed = true;
         }
         changed
+    }
+
+    /// The watermark date the one-shot hourly backfill may sweep up to, when
+    /// that pass still has work: the flag unset AND at least one day strictly
+    /// before `today` holding `hours: None` rows (every row a pre-v2 ledger
+    /// recorded qualifies, so an upgraded ledger owes exactly one pass; after
+    /// the pass the flag makes this `None` even when rows did not fill, since
+    /// transcripts only ever shrink and a re-sweep could never fill more).
+    /// Also `None` when there is no watermark to derive a cutoff from.
+    pub(crate) fn backfill_through(&self, today: &str) -> Option<String> {
+        if self.backfill_done {
+            return None;
+        }
+        let owed = self.days.iter().any(|(date, models)| {
+            date.as_str() < today && models.values().any(|w| w.hours.is_none())
+        });
+        owed.then(|| self.recorded_through.clone()).flatten()
+    }
+
+    /// Fill hour buckets on the ledger's v1 rows from a re-derived transcript
+    /// corpus ([`crate::tokens::backfill_corpus`]), exact-or-absent: a row's
+    /// `hours` is set ONLY when the corpus totals equal the stored flat totals
+    /// on all four fields. Any mismatch means the transcripts no longer fully
+    /// cover the day (pruned), and the row is left untouched — stored v1 flat
+    /// data is never lowered or rewritten (the equal case is equal by
+    /// construction), so a day whose rows do not all fill keeps its v1 shape
+    /// forever. Marks [`Ledger::backfill_done`] either way: the sweep runs at
+    /// most once per ledger, and a re-sweep could never fill what the first
+    /// one left unmatched.
+    pub(crate) fn backfill_hours(&mut self, derived: &HashMap<(String, String), ModelDayAcc>) {
+        for ((date, model), acc) in derived {
+            let Some(day) = self.days.get_mut(date) else {
+                continue;
+            };
+            let Some(w) = day.get_mut(model) else {
+                continue;
+            };
+            if w.hours.is_some() {
+                continue; // already on the hourly axis — never rewritten
+            }
+            if acc.flat.input == w.input
+                && acc.flat.output == w.output
+                && acc.flat.cache_read == w.cache_read
+                && acc.flat.cache_create == w.cache_create
+            {
+                w.hours = Some(acc.hours.map(WireHour::from));
+            }
+        }
+        self.backfill_done = true;
     }
 }
 

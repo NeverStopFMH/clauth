@@ -1509,3 +1509,542 @@ fn file_hourly_model_tokens_splits_by_model_and_day() {
     assert_eq!(gpt.hours[22].output, 3);
     assert_eq!(gpt.hours[10].input, 0);
 }
+
+// ── 8. ledger backfill (slice E) ─────────────────────────────────────────────
+
+/// Write a v1-shaped ledger (flat totals, no `hours`, no `backfill_done`)
+/// holding one (day, model) row from `m`'s flat fields.
+fn write_v1_ledger(
+    clauth_dir: &std::path::Path,
+    recorded_through: &str,
+    day: &str,
+    m: &ModelTokens,
+) {
+    std::fs::create_dir_all(clauth_dir).expect("create .clauth");
+    let json = format!(
+        r#"{{"recorded_through":"{recorded_through}","days":{{"{day}":{{"{}":{{"input":{},"output":{},"cache_read":{},"cache_create":{}}}}}}}}}"#,
+        m.model, m.input, m.output, m.cache_read, m.cache_create
+    );
+    std::fs::write(clauth_dir.join("token_ledger.json"), json).expect("write ledger");
+}
+
+/// 00:00 UTC of a "YYYY-MM-DD" date as a `SystemTime`, for mtime fixtures.
+fn epoch_day(date: &str) -> SystemTime {
+    let secs =
+        crate::usage::iso_to_epoch_secs(&format!("{date}T00:00:00+00:00")).expect("parse date");
+    UNIX_EPOCH + Duration::from_secs(secs as u64)
+}
+
+/// A v1 ledger day whose corpus reproduces the stored flat totals exactly
+/// gains hour buckets through the worker's own gate, with the flat totals
+/// untouched — the day now prices peak/off-peak exactly.
+#[test]
+fn backfill_fills_hours_when_corpus_totals_match() {
+    let sb = HomeSandbox::new();
+    let claude_dir = make_claude_dir(&sb);
+    let clauth_dir = sb.home().join(".clauth");
+    write_v1_ledger(
+        &clauth_dir,
+        "2026-06-16",
+        "2026-06-15",
+        &ModelTokens {
+            model: "claude-opus-4".into(),
+            input: 300,
+            output: 100,
+            cache_read: 20,
+            cache_create: 10,
+        },
+    );
+
+    let proj_dir = claude_dir.join("projects").join("p1");
+    std::fs::create_dir_all(&proj_dir).expect("create project dir");
+    let p = proj_dir.join("sess.jsonl");
+    let line = jsonl_line(
+        "2026-06-15T10:30:00+00:00",
+        "claude-opus-4",
+        300,
+        100,
+        20,
+        10,
+    );
+    std::fs::write(&p, format!("{line}\n")).expect("write");
+    // mtime before the recorded_through cutoff (00:00 UTC 2026-06-16), so the
+    // backfill owns the file (the top-up owns anything newer).
+    set_mtime(&p, epoch_day("2026-06-15") + Duration::from_secs(60));
+    // A file the mtime guard must exclude: touched after the widened
+    // end-of-watermark-day bound (00:00 UTC of the day after the watermark),
+    // holding a pre-cutoff line that would push the derived totals past the
+    // stored ones (and thereby block the fill) if the guard ever stopped
+    // filtering.
+    let late = proj_dir.join("late.jsonl");
+    let late_line = jsonl_line("2026-06-15T11:00:00+00:00", "claude-opus-4", 50, 10, 0, 0);
+    std::fs::write(&late, format!("{late_line}\n")).expect("write");
+    set_mtime(&late, epoch_day("2026-06-17") + Duration::from_secs(1));
+
+    let today = today_date();
+    let mut ledger = crate::token_ledger::Ledger::load(&clauth_dir);
+    assert!(
+        ledger.backfill_through(&today).is_some(),
+        "a pre-today v1 row arms the pass"
+    );
+    assert!(run_backfill(&claude_dir, &mut ledger, &today, |_, _| {}));
+    ledger.save(&clauth_dir);
+
+    // The filled row reaches the render path with hours and unchanged flats.
+    let mut base = TokenStats::default();
+    ledger.apply_to_base(&mut base, Some("2026-06-01"));
+    let row = base
+        .daily_models
+        .iter()
+        .find(|d| d.date == "2026-06-15" && d.model == "claude-opus-4")
+        .expect("ledger day folded");
+    assert_eq!(row.in_out, 400, "flat totals unchanged");
+    let split = row.split.as_ref().expect("split");
+    assert_eq!(split.input, 300);
+    assert_eq!(split.output, 100);
+    assert_eq!(split.cache_read, 20);
+    assert_eq!(split.cache_create, 10);
+    let hours = row.hours.expect("hours filled");
+    assert_eq!(hours[10].input, 300);
+    assert_eq!(hours[10].output, 100);
+    assert_eq!(hours[10].cache_read, 20);
+    assert_eq!(hours[10].cache_create, 10);
+    assert_eq!(hours[9].input, 0);
+
+    // The flag + hours survive the save/reload round trip. Pinned on the
+    // file bytes because the filled hours alone already make
+    // `backfill_through` None — only the persisted flag proves the pass was
+    // marked done (the state that stops the mismatch case re-sweeping).
+    let raw = std::fs::read_to_string(clauth_dir.join("token_ledger.json")).expect("read ledger");
+    assert!(
+        raw.contains("\"backfill_done\":true"),
+        "the done flag persists: {raw}"
+    );
+    let reloaded = crate::token_ledger::Ledger::load(&clauth_dir);
+    assert_eq!(reloaded.backfill_through(&today), None);
+}
+
+/// When the corpus no longer reproduces the stored totals (a pruned
+/// transcript), the row keeps its v1 shape — hours stay `None`, the flat
+/// totals are untouched — and the pass still marks itself done, so the
+/// one-shot sweep never re-runs.
+#[test]
+fn backfill_leaves_mismatched_rows_untouched_and_marks_done() {
+    let sb = HomeSandbox::new();
+    let claude_dir = make_claude_dir(&sb);
+    let clauth_dir = sb.home().join(".clauth");
+    write_v1_ledger(
+        &clauth_dir,
+        "2026-06-16",
+        "2026-06-15",
+        &ModelTokens {
+            model: "claude-opus-4".into(),
+            input: 300,
+            output: 100,
+            cache_read: 20,
+            cache_create: 10,
+        },
+    );
+
+    // The corpus holds only part of the day (the rest was pruned): the
+    // re-derived totals no longer match the stored ones.
+    let proj_dir = claude_dir.join("projects").join("p1");
+    std::fs::create_dir_all(&proj_dir).expect("create project dir");
+    let p = proj_dir.join("sess.jsonl");
+    let line = jsonl_line("2026-06-15T10:30:00+00:00", "claude-opus-4", 100, 50, 0, 0);
+    std::fs::write(&p, format!("{line}\n")).expect("write");
+    set_mtime(&p, epoch_day("2026-06-15") + Duration::from_secs(60));
+
+    let today = today_date();
+    let mut ledger = crate::token_ledger::Ledger::load(&clauth_dir);
+    assert!(run_backfill(&claude_dir, &mut ledger, &today, |_, _| {}));
+    ledger.save(&clauth_dir);
+
+    let mut base = TokenStats::default();
+    ledger.apply_to_base(&mut base, Some("2026-06-01"));
+    let row = base
+        .daily_models
+        .iter()
+        .find(|d| d.date == "2026-06-15" && d.model == "claude-opus-4")
+        .expect("ledger day folded");
+    assert!(row.hours.is_none(), "a mismatch never fills");
+    let split = row.split.as_ref().expect("split");
+    assert_eq!(split.input, 300, "stored v1 totals untouched");
+    assert_eq!(split.output, 100);
+    assert_eq!(split.cache_read, 20);
+    assert_eq!(split.cache_create, 10);
+    assert_eq!(
+        ledger.backfill_through(&today),
+        None,
+        "the pass is done even when nothing filled — the still-hours-less row would re-arm it otherwise"
+    );
+}
+
+/// A file touched ON the recorded_through day contributes by LINE date:
+/// lines dated the day before, ON, and after the watermark route to their
+/// own dates — the post-cutoff line is dropped (the regular top-up owns
+/// it), the on-cutoff line still counts.
+#[test]
+fn backfill_routes_crossing_cutoff_lines_by_line_date() {
+    let sb = HomeSandbox::new();
+    let claude_dir = make_claude_dir(&sb);
+    let clauth_dir = sb.home().join(".clauth");
+    std::fs::create_dir_all(&clauth_dir).expect("create .clauth");
+    std::fs::write(
+        clauth_dir.join("token_ledger.json"),
+        r#"{
+            "recorded_through": "2026-06-16",
+            "days": {
+                "2026-06-14": {
+                    "claude-opus-4": {"input": 5, "output": 2, "cache_read": 0, "cache_create": 0}
+                },
+                "2026-06-15": {
+                    "claude-opus-4": {"input": 100, "output": 50, "cache_read": 0, "cache_create": 0}
+                },
+                "2026-06-16": {
+                    "claude-opus-4": {"input": 7, "output": 3, "cache_read": 0, "cache_create": 0}
+                }
+            }
+        }"#,
+    )
+    .expect("write v1 ledger");
+
+    let proj_dir = claude_dir.join("projects").join("p1");
+    std::fs::create_dir_all(&proj_dir).expect("create project dir");
+    let p = proj_dir.join("sess.jsonl");
+    let before = jsonl_line("2026-06-15T22:00:00+00:00", "claude-opus-4", 100, 50, 0, 0);
+    let on_cutoff = jsonl_line("2026-06-16T08:00:00+00:00", "claude-opus-4", 7, 3, 0, 0);
+    let after = jsonl_line("2026-06-17T10:00:00+00:00", "claude-opus-4", 999, 999, 0, 0);
+    std::fs::write(&p, format!("{before}\n{on_cutoff}\n{after}\n")).expect("write");
+    // mtime ON the watermark day (noon 2026-06-16): admitted by the widened
+    // end-of-watermark-day bound, and exactly the case that bound exists for
+    // — a file touched on the watermark day whose pre-watermark lines the
+    // stored v1 totals include. An 00:00-instant bound would exclude it and
+    // leave both days unfilled forever.
+    set_mtime(&p, epoch_day("2026-06-16") + Duration::from_secs(12 * 3600));
+    // A second file whose mtime sits EXACTLY at the end-of-watermark-day
+    // instant (00:00 UTC 2026-06-17 == the widened bound): admitted by the
+    // `>` comparison. Flipping it to `>=` would exclude this file and leave
+    // day 06-14 unfilled.
+    let boundary = proj_dir.join("boundary.jsonl");
+    let b_line = jsonl_line("2026-06-14T14:00:00+00:00", "claude-opus-4", 5, 2, 0, 0);
+    std::fs::write(&boundary, format!("{b_line}\n")).expect("write");
+    set_mtime(&boundary, epoch_day("2026-06-17"));
+
+    let sweep = backfill_corpus(&claude_dir, "2026-06-16", |_, _| {}).expect("cutoff parseable");
+    assert_eq!(sweep.files_parsed, 2);
+    let day14 = sweep
+        .derived
+        .get(&("2026-06-14".to_owned(), "claude-opus-4".to_owned()))
+        .expect("the boundary-instant file is admitted");
+    assert_eq!(day14.flat.input, 5);
+    assert_eq!(day14.hours[14].input, 5);
+    let day15 = sweep
+        .derived
+        .get(&("2026-06-15".to_owned(), "claude-opus-4".to_owned()))
+        .expect("pre-cutoff line aggregated under its own date");
+    assert_eq!(day15.flat.input, 100);
+    assert_eq!(
+        day15.hours[22].input, 100,
+        "the line's hour wins over the file mtime's day"
+    );
+    let day16 = sweep
+        .derived
+        .get(&("2026-06-16".to_owned(), "claude-opus-4".to_owned()))
+        .expect("the on-cutoff line counts under its own date");
+    assert_eq!(day16.flat.input, 7);
+    assert_eq!(day16.hours[8].input, 7);
+    assert!(
+        !sweep.derived.keys().any(|(date, _)| date == "2026-06-17"),
+        "the post-cutoff line is dropped — the top-up owns it"
+    );
+
+    // End to end: each line's day gains hours in its own line's hour.
+    let today = today_date();
+    let mut ledger = crate::token_ledger::Ledger::load(&clauth_dir);
+    assert!(run_backfill(&claude_dir, &mut ledger, &today, |_, _| {}));
+    let mut base = TokenStats::default();
+    ledger.apply_to_base(&mut base, Some("2026-06-01"));
+    let row14 = base
+        .daily_models
+        .iter()
+        .find(|d| d.date == "2026-06-14" && d.model == "claude-opus-4")
+        .expect("ledger day folded");
+    let hours14 = row14.hours.expect("hours filled");
+    assert_eq!(hours14[14].input, 5);
+    let row15 = base
+        .daily_models
+        .iter()
+        .find(|d| d.date == "2026-06-15" && d.model == "claude-opus-4")
+        .expect("ledger day folded");
+    let hours15 = row15.hours.expect("hours filled");
+    assert_eq!(hours15[22].input, 100);
+    assert_eq!(hours15[10].input, 0);
+    let row16 = base
+        .daily_models
+        .iter()
+        .find(|d| d.date == "2026-06-16" && d.model == "claude-opus-4")
+        .expect("ledger day folded");
+    let hours16 = row16.hours.expect("hours filled");
+    assert_eq!(hours16[8].input, 7);
+}
+
+/// The cross-file dedup mirrors merge_topup: a tok_key mirrored into two
+/// files lands in the path-sorted first copy's hour, so a filled day equals
+/// what the top-up would have recorded.
+#[test]
+fn backfill_dedup_lands_in_the_path_sorted_winners_hour() {
+    let sb = HomeSandbox::new();
+    let claude_dir = make_claude_dir(&sb);
+    let clauth_dir = sb.home().join(".clauth");
+    write_v1_ledger(
+        &clauth_dir,
+        "2026-06-16",
+        "2026-06-15",
+        &ModelTokens {
+            model: "claude-opus-4".into(),
+            input: 100,
+            output: 50,
+            cache_read: 0,
+            cache_create: 0,
+        },
+    );
+
+    let proj_dir = claude_dir.join("projects").join("p1");
+    std::fs::create_dir_all(&proj_dir).expect("create project dir");
+    let line_a = jsonl_line_with_ids(
+        "2026-06-15T12:00:00+00:00",
+        "req_1",
+        "msg_1",
+        "claude-opus-4",
+        100,
+        50,
+    );
+    let line_b = jsonl_line_with_ids(
+        "2026-06-15T13:00:00+00:00",
+        "req_1",
+        "msg_1",
+        "claude-opus-4",
+        100,
+        50,
+    );
+    for (name, line) in [("a.jsonl", &line_a), ("b.jsonl", &line_b)] {
+        let f = proj_dir.join(name);
+        std::fs::write(&f, format!("{line}\n")).expect("write");
+        set_mtime(&f, epoch_day("2026-06-15") + Duration::from_secs(60));
+    }
+
+    let sweep = backfill_corpus(&claude_dir, "2026-06-16", |_, _| {}).expect("cutoff parseable");
+    assert_eq!(sweep.files_parsed, 2);
+    let acc = sweep
+        .derived
+        .get(&("2026-06-15".to_owned(), "claude-opus-4".to_owned()))
+        .expect("day row");
+    assert_eq!(acc.flat.input, 100, "counted once");
+    assert_eq!(acc.flat.output, 50);
+    assert_eq!(
+        acc.hours[12].input, 100,
+        "the path-sorted first copy's hour wins"
+    );
+    assert_eq!(acc.hours[13].input, 0, "the later copy's hour stays empty");
+}
+
+/// Once the pass persisted `backfill_done`, a second run visits nothing —
+/// the gate returns before any file is walked — and the ledger file stays
+/// byte-identical.
+#[test]
+fn backfill_runs_once_and_second_run_visits_nothing() {
+    let sb = HomeSandbox::new();
+    let claude_dir = make_claude_dir(&sb);
+    let clauth_dir = sb.home().join(".clauth");
+    write_v1_ledger(
+        &clauth_dir,
+        "2026-06-16",
+        "2026-06-15",
+        &ModelTokens {
+            model: "claude-opus-4".into(),
+            input: 300,
+            output: 100,
+            cache_read: 20,
+            cache_create: 10,
+        },
+    );
+
+    let proj_dir = claude_dir.join("projects").join("p1");
+    std::fs::create_dir_all(&proj_dir).expect("create project dir");
+    let p = proj_dir.join("sess.jsonl");
+    let line = jsonl_line(
+        "2026-06-15T10:30:00+00:00",
+        "claude-opus-4",
+        300,
+        100,
+        20,
+        10,
+    );
+    std::fs::write(&p, format!("{line}\n")).expect("write");
+    set_mtime(&p, epoch_day("2026-06-15") + Duration::from_secs(60));
+
+    let today = today_date();
+    let mut ledger = crate::token_ledger::Ledger::load(&clauth_dir);
+    let mut visited = 0usize;
+    assert!(run_backfill(&claude_dir, &mut ledger, &today, |_, _| {
+        visited += 1
+    }));
+    assert_eq!(visited, 1, "the sweep walked the one corpus file");
+    ledger.save(&clauth_dir);
+    let bytes_after_first =
+        std::fs::read(clauth_dir.join("token_ledger.json")).expect("read ledger");
+
+    // Second run, the way the worker gates it: the persisted flag ends the
+    // pass before a single file is visited, and nothing is re-saved.
+    let mut ledger2 = crate::token_ledger::Ledger::load(&clauth_dir);
+    assert_eq!(ledger2.backfill_through(&today), None);
+    let mut visited2 = 0usize;
+    assert!(!run_backfill(&claude_dir, &mut ledger2, &today, |_, _| {
+        visited2 += 1
+    }));
+    assert_eq!(visited2, 0, "the done flag skips the sweep entirely");
+    let bytes_after_second =
+        std::fs::read(clauth_dir.join("token_ledger.json")).expect("read ledger");
+    assert_eq!(bytes_after_first, bytes_after_second);
+}
+
+/// The backfill's save is independent of `record`'s: on an idle cycle
+/// (watermark already at yesterday, nothing new to record) the done flag and
+/// filled hours must still persist — otherwise the pass re-sweeps the whole
+/// corpus every 90s until a day records.
+#[test]
+fn backfill_persists_when_record_has_nothing_new() {
+    let sb = HomeSandbox::new();
+    let claude_dir = make_claude_dir(&sb);
+    let clauth_dir = sb.home().join(".clauth");
+    let today = today_date();
+    let yesterday = {
+        let iso = crate::usage::epoch_secs_to_iso(crate::usage::now_epoch_secs() - 86_400);
+        iso.get(..10).map(str::to_owned).unwrap_or(iso)
+    };
+    // A v1 ledger whose watermark is ALREADY at yesterday: record() has
+    // nothing to advance or write, so its own save never fires.
+    write_v1_ledger(
+        &clauth_dir,
+        &yesterday,
+        "2026-06-15",
+        &ModelTokens {
+            model: "claude-opus-4".into(),
+            input: 300,
+            output: 100,
+            cache_read: 20,
+            cache_create: 10,
+        },
+    );
+
+    let proj_dir = claude_dir.join("projects").join("p1");
+    std::fs::create_dir_all(&proj_dir).expect("create project dir");
+    let p = proj_dir.join("sess.jsonl");
+    let line = jsonl_line(
+        "2026-06-15T10:30:00+00:00",
+        "claude-opus-4",
+        300,
+        100,
+        20,
+        10,
+    );
+    std::fs::write(&p, format!("{line}\n")).expect("write");
+    set_mtime(&p, epoch_day("2026-06-15") + Duration::from_secs(60));
+
+    let mut ledger = crate::token_ledger::Ledger::load(&clauth_dir);
+    let base = TokenStats::default(); // nothing mergeable
+    assert!(
+        !ledger.record(&base, &today),
+        "fixture: record() must have nothing to do"
+    );
+    persist_ledger(
+        &claude_dir,
+        &mut ledger,
+        &clauth_dir,
+        &base,
+        &today,
+        |_, _| {},
+    );
+
+    // The flag and the filled hours landed on disk without any record.
+    let raw = std::fs::read_to_string(clauth_dir.join("token_ledger.json")).expect("read ledger");
+    assert!(
+        raw.contains("\"backfill_done\":true"),
+        "flag persisted without a record: {raw}"
+    );
+    let reloaded = crate::token_ledger::Ledger::load(&clauth_dir);
+    let mut fresh = TokenStats::default();
+    reloaded.apply_to_base(&mut fresh, Some("2026-06-01"));
+    let row = fresh
+        .daily_models
+        .iter()
+        .find(|d| d.date == "2026-06-15" && d.model == "claude-opus-4")
+        .expect("ledger day folded");
+    assert_eq!(
+        row.hours.expect("hours persisted without a record")[10].input,
+        300
+    );
+}
+
+/// The zero-fill persistence leg end to end: a pass that fills nothing (the
+/// corpus no longer matches the stored day) still persists `backfill_done`
+/// to disk through `persist_ledger` — otherwise the next cycle re-sweeps
+/// the corpus forever.
+#[test]
+fn backfill_persists_flag_on_disk_when_nothing_fills() {
+    let sb = HomeSandbox::new();
+    let claude_dir = make_claude_dir(&sb);
+    let clauth_dir = sb.home().join(".clauth");
+    let today = today_date();
+    let yesterday = {
+        let iso = crate::usage::epoch_secs_to_iso(crate::usage::now_epoch_secs() - 86_400);
+        iso.get(..10).map(str::to_owned).unwrap_or(iso)
+    };
+    write_v1_ledger(
+        &clauth_dir,
+        &yesterday,
+        "2026-06-15",
+        &ModelTokens {
+            model: "claude-opus-4".into(),
+            input: 300,
+            output: 100,
+            cache_read: 20,
+            cache_create: 10,
+        },
+    );
+
+    // The corpus holds only part of the stored day: nothing fills.
+    let proj_dir = claude_dir.join("projects").join("p1");
+    std::fs::create_dir_all(&proj_dir).expect("create project dir");
+    let p = proj_dir.join("sess.jsonl");
+    let line = jsonl_line("2026-06-15T10:30:00+00:00", "claude-opus-4", 100, 50, 0, 0);
+    std::fs::write(&p, format!("{line}\n")).expect("write");
+    set_mtime(&p, epoch_day("2026-06-15") + Duration::from_secs(60));
+
+    let mut ledger = crate::token_ledger::Ledger::load(&clauth_dir);
+    persist_ledger(
+        &claude_dir,
+        &mut ledger,
+        &clauth_dir,
+        &TokenStats::default(),
+        &today,
+        |_, _| {},
+    );
+
+    // The flag reached disk even though the pass filled nothing.
+    let raw = std::fs::read_to_string(clauth_dir.join("token_ledger.json")).expect("read ledger");
+    assert!(
+        raw.contains("\"backfill_done\":true"),
+        "a zero-fill pass still persists the flag: {raw}"
+    );
+    let reloaded = crate::token_ledger::Ledger::load(&clauth_dir);
+    let mut fresh = TokenStats::default();
+    reloaded.apply_to_base(&mut fresh, Some("2026-06-01"));
+    let row = fresh
+        .daily_models
+        .iter()
+        .find(|d| d.date == "2026-06-15" && d.model == "claude-opus-4")
+        .expect("ledger day folded");
+    assert!(row.hours.is_none(), "nothing filled, nothing changed");
+}

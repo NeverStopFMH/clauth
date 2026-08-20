@@ -30,7 +30,12 @@
 //! ledger closes that: each finalized day's split is written once to
 //! `~/.clauth/token_ledger.json` and folded back on load, and its watermark
 //! becomes the sweep's effective cutoff — so a frozen base can't keep the
-//! cold-start read growing either.
+//! cold-start read growing either. Days recorded before the hourly axis carry
+//! no per-hour buckets; on the first run after an upgrade, a one-shot backfill
+//! ([`backfill_corpus`] + [`crate::token_ledger::Ledger::backfill_hours`])
+//! re-derives them from the pre-watermark corpus and fills the rows whose flat
+//! totals still match, so past days price peak/off-peak exactly where the
+//! transcripts still cover them.
 //!
 //! # Caveat
 //!
@@ -792,10 +797,14 @@ fn add_to_hour(bucket: &mut HourTokens, r: &LineRec) {
 
 /// One model's accumulation on one day during [`merge_topup`]: the flat split
 /// plus per-hour buckets, so a pushed [`DayModelTokens`] row and today's
-/// rollup both carry the hourly axis.
-struct ModelDayAcc {
-    flat: ModelTokens,
-    hours: [HourTokens; 24],
+/// rollup both carry the hourly axis. The backfill sweep ([`backfill_corpus`])
+/// accumulates into the same shape, so a day it fully covers re-derives
+/// exactly the split the top-up would have recorded — the equality
+/// [`crate::token_ledger::Ledger::backfill_hours`] fills on is against the
+/// top-up's own counting rules, not a parallel approximation.
+pub(crate) struct ModelDayAcc {
+    pub(crate) flat: ModelTokens,
+    pub(crate) hours: [HourTokens; 24],
 }
 
 struct FileContrib {
@@ -1276,6 +1285,163 @@ pub(crate) fn file_hourly_model_tokens(path: &Path) -> Vec<HourlyDayModel> {
     by_key.into_values().collect()
 }
 
+// ── One-shot ledger backfill (v1 days → hourly axis) ──────────────────────────
+
+/// One backfill sweep's output: the per-(day, model) re-derived totals plus
+/// how many transcript files were actually parsed. The worker ignores the
+/// count; tests use it to pin that a second run re-reads nothing.
+struct BackfillSweep {
+    derived: HashMap<(String, String), ModelDayAcc>,
+    /// Test-only: how many files the sweep actually parsed, so a test can
+    /// pin that a second run re-reads nothing. Not compiled into the
+    /// binary — production never reads the count.
+    #[cfg(test)]
+    files_parsed: usize,
+}
+
+/// One-shot transcript sweep behind the ledger backfill: re-derive the
+/// pre-watermark per-(day, model) totals and hour buckets from the
+/// `projects/` corpus for [`crate::token_ledger::Ledger::backfill_hours`].
+///
+/// Mirrors [`merge_topup`]'s aggregation rules exactly — the same recursive
+/// walk, `parse_file`'s streaming-delta collapse, and a path-sorted
+/// first-seen `tok_key` winner — so a day this corpus fully covers re-derives
+/// the split the top-up would have recorded for it. Files crossing the
+/// cutoff contribute by LINE date; lines dated after `recorded_through` are
+/// dropped because the regular top-up owns them. It never feeds the top-up's
+/// totals: the top-up merges only lines dated strictly after its own cutoff,
+/// so even a file both sweeps read cannot double-count.
+///
+/// Streams one file at a time — `parse_file`'s records die with each file,
+/// never accumulated the way [`TopUpCache`] persists per-file records (this
+/// pass is one-shot, so there is no second sweep to reuse them for). The
+/// operator corpus measures 19,673 files / 8.1 GB (migration-seam review,
+/// 2026-08-20), so per-file streaming plus owned dedup keys bounds peak
+/// memory at one transcript.
+///
+/// `None` when `recorded_through` yields no instant — never in practice (the
+/// watermark is clauth-written); the caller then skips the pass without
+/// marking it done, so a fixed file still gets its backfill.
+fn backfill_corpus(
+    claude_dir: &Path,
+    recorded_through: &str,
+    mut progress: impl FnMut(usize, usize),
+) -> Option<BackfillSweep> {
+    // End-of-watermark-day bound, not the 00:00 instant the top-up uses:
+    // files touched ON the watermark day still carry the pre-watermark lines
+    // the stored v1 totals include, so excluding them would leave those days
+    // failing the equality gate and v1 forever — lossless but
+    // over-conservative. Widening admits them; the exact-or-absent fill gate
+    // still protects correctness either way.
+    let cutoff = date_to_cutoff(recorded_through)? + Duration::from_secs(86_400);
+    let projects_dir = claude_dir.join("projects");
+    let mut paths: Vec<PathBuf> = Vec::new();
+    collect_jsonl(&projects_dir, 8, &mut paths);
+    // Path-sorted so the cross-file dedup winner is deterministic — the same
+    // pin merge_topup needs, because the winner's hour is observable (on the
+    // operator's corpus, 0/200 sampled duplicate ids differed in timestamp
+    // hour, so the winning copy's hour is faithful to the turn's own).
+    paths.sort_unstable();
+
+    let total = paths.len();
+    // Owned keys only: the dedup set spans the WHOLE pass (cross-file
+    // first-seen wins, matching merge_topup) and must not borrow from
+    // per-file records that drop immediately after their file. With 78% of
+    // usage ids appearing in 2+ files on the operator's corpus, this set is
+    // the pass's one corpus-wide allocation — everything else is per file.
+    let mut seen_tok: HashSet<String> = HashSet::new();
+    let mut derived: HashMap<(String, String), ModelDayAcc> = HashMap::new();
+    #[cfg(test)]
+    let mut files_parsed = 0usize;
+    for (done, path) in paths.into_iter().enumerate() {
+        progress(done + 1, total);
+        let Ok(mtime) = std::fs::metadata(&path).and_then(|m| m.modified()) else {
+            continue;
+        };
+        if mtime > cutoff {
+            continue; // the live top-up owns this file
+        }
+        for r in parse_file(&path) {
+            if !r.has_usage || r.date.as_str() > recorded_through {
+                continue; // post-watermark lines belong to the top-up
+            }
+            if r.tok_key.is_empty() || seen_tok.insert(r.tok_key.clone()) {
+                let acc = derived
+                    .entry((r.date.clone(), r.model.clone()))
+                    .or_insert_with(|| ModelDayAcc {
+                        flat: ModelTokens {
+                            model: r.model.clone(),
+                            ..Default::default()
+                        },
+                        hours: [HourTokens::default(); 24],
+                    });
+                acc.flat.input = acc.flat.input.saturating_add(r.input);
+                acc.flat.output = acc.flat.output.saturating_add(r.output);
+                acc.flat.cache_read = acc.flat.cache_read.saturating_add(r.cache_read);
+                acc.flat.cache_create = acc.flat.cache_create.saturating_add(r.cache_create);
+                add_to_hour(&mut acc.hours[r.hour as usize], &r);
+            }
+        }
+        #[cfg(test)]
+        {
+            files_parsed += 1;
+        }
+    }
+    Some(BackfillSweep {
+        derived,
+        #[cfg(test)]
+        files_parsed,
+    })
+}
+
+/// Run the one-shot v1→v2 hourly backfill when the ledger still owes it:
+/// sweep the pre-watermark corpus and hand it to
+/// [`crate::token_ledger::Ledger::backfill_hours`] (exact-or-absent fill),
+/// which also marks the pass done. Returns whether the pass ran — i.e.
+/// whether a save should follow. Called by the tokens worker after
+/// `record`, so the watermark is already at yesterday and the sweep's
+/// cutoff is the finalized-day boundary. Runs synchronously inside the
+/// worker's single tick, so the pass never overlaps the next 90s cycle —
+/// the polling loop serializes ticks by construction. The filled hours
+/// reach the UI on the NEXT tick: the current run's merged base was built
+/// before this pass, so a backfilled day's cost flips one 90s cycle later,
+/// unlabeled. Accepted for a one-shot.
+fn run_backfill(
+    claude_dir: &Path,
+    ledger: &mut crate::token_ledger::Ledger,
+    today: &str,
+    progress: impl FnMut(usize, usize),
+) -> bool {
+    let Some(through) = ledger.backfill_through(today) else {
+        return false;
+    };
+    let Some(sweep) = backfill_corpus(claude_dir, &through, progress) else {
+        return false;
+    };
+    ledger.backfill_hours(&sweep.derived);
+    true
+}
+
+/// Persist the ledger after a merge: record newly-finalized days, then run
+/// the one-shot backfill. The backfill's save is independent of whether
+/// `record` changed anything — the done flag must persist even on an idle
+/// cycle, or the corpus re-sweeps every 90s until a day records.
+fn persist_ledger(
+    claude_dir: &Path,
+    ledger: &mut crate::token_ledger::Ledger,
+    dir: &Path,
+    base: &TokenStats,
+    today: &str,
+    progress: impl FnMut(usize, usize),
+) {
+    if ledger.record(base, today) {
+        ledger.save(dir);
+    }
+    if run_backfill(claude_dir, ledger, today, progress) {
+        ledger.save(dir);
+    }
+}
+
 // ── Background thread ─────────────────────────────────────────────────────────
 
 /// Events emitted by the background loader thread.
@@ -1348,11 +1514,17 @@ pub(crate) fn spawn(
                 }
             });
             merge_topup(&mut base, cache, cutoff.as_deref(), &today);
-            // Persist any newly-finalized days before the transcripts can age out.
-            if let (Some(l), Some(dir)) = (ledger.as_mut(), clauth_dir.as_deref())
-                && l.record(&base, &today)
-            {
-                l.save(dir);
+            // Persist: newly-finalized days first, then the one-shot v1→v2
+            // backfill (which only ever adds hour buckets to v1 rows). Both
+            // legs run inside this one tick, so neither sweep overlaps the
+            // other or the next 90s cycle's. The backfill's save is
+            // independent of whether `record` had anything to write.
+            if let (Some(l), Some(dir)) = (ledger.as_mut(), clauth_dir.as_deref()) {
+                persist_ledger(&claude_dir, l, dir, &base, &today, |done, total| {
+                    if done % 25 == 0 || done == total {
+                        let _ = tx.send(TokensEvent::Progress { done, total });
+                    }
+                });
             }
             let _ = tx.send(TokensEvent::Loaded(Box::new(base)));
         };

@@ -374,6 +374,48 @@
   ]
  },
  {
+  "id": "google",
+  "models": [
+   {
+    "id": "claude-fable-5",
+    "match": {
+     "contains": "claude-fable-5"
+    },
+    "prices": {
+     "input_mtok": 3,
+     "output_mtok": 15
+    }
+   },
+   {
+    "id": "claude-opus-4-6",
+    "match": {
+     "or": [
+      {
+       "contains": "claude-4-6-opus"
+      },
+      {
+       "contains": "claude-opus-4-6"
+      }
+     ]
+    },
+    "prices": {
+     "input_mtok": 5,
+     "output_mtok": 25
+    }
+   },
+   {
+    "id": "gemini-3.7-flash",
+    "match": {
+     "equals": "gemini-3.7-flash"
+    },
+    "prices": {
+     "input_mtok": 0.1,
+     "output_mtok": 0.4
+    }
+   }
+  ]
+ },
+ {
   "id": "huggingface_together",
   "models": [
    {

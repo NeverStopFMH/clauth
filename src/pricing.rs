@@ -13,7 +13,10 @@
 //! exactly instead of being approximated by a flat table. Only first-party
 //! providers are kept; resellers (OpenRouter, AWS, Azure, Fireworks, Together,
 //! Novita, OVH, Hugging Face's hosted providers, …) are dropped, so a bare id
-//! never prices through a reseller's markup.
+//! never prices through a reseller's markup. Resold model rows inside a kept
+//! provider (google's Vertex claude listings) are dropped the same way — their
+//! CONTAINS clauses would price a local fine-tune whose name merely embeds a
+//! claude model id at Anthropic API rates.
 //!
 //! # Design (mirrors `status.rs`)
 //!
@@ -268,26 +271,55 @@ impl PriceTable {
     ///    is `None` or active is the pick, falling back to `prices[0]` when
     ///    nothing matches.
     ///
+    /// When no clause matches the primary form, derived forms retry in order —
+    /// colon strip, then up to two leading `id/` segment strips, then repeated
+    /// trailing `-<8 digits>` date-stamp strips — first match wins. Each form
+    /// re-enters the full clause walk, so a retry prices only what a clause
+    /// names; these restore the spellings the old LiteLLM walk's
+    /// colon/suffix strips priced (`minimax/minimax-m2.5:free`,
+    /// `anthropic/claude-opus-5`, `glm-4.7-flash-20250801`).
+    ///
     /// Rates come from the snapshot live on `date` (see
     /// [`PriceTable::snapshot_for`]); `None` when no model matches.
     pub(crate) fn rate_at(&self, model: &str, date: &str, hour: u8) -> Option<ModelRate> {
-        let lowered = strip_bracket_suffix(model).to_lowercase();
-        let priced = self
-            .models_for(date)?
-            .iter()
-            .find(|m| m.match_.matches(&lowered))?;
-        let entry = priced
-            .prices
-            .iter()
-            .rev()
-            .find(|e| e.active(date, hour))
-            .or_else(|| priced.prices.first())?;
-        Some(ModelRate {
-            input: entry.input,
-            output: entry.output,
-            cache_read: entry.cache_read,
-            cache_write: entry.cache_write,
-        })
+        let models = self.models_for(date)?;
+        // Primary form: the id as shipped. The bracket strip applies here and
+        // here only — a retried form is not re-stripped.
+        let mut candidate = strip_bracket_suffix(model);
+        if let Some(rate) = resolve(models, candidate, date, hour) {
+            return Some(rate);
+        }
+        // (a) Colon strip: `minimax/minimax-m2.5:free` → `minimax/minimax-m2.5`.
+        // The rest of the ladder continues from the stripped form, like the
+        // old walk's "retry exact, continue with the stripped id".
+        if let Some(idx) = candidate.find(':') {
+            candidate = &candidate[..idx];
+            if let Some(rate) = resolve(models, candidate, date, hour) {
+                return Some(rate);
+            }
+        }
+        // (b) Leading provider-segment strip: one `id/` segment at a time, up
+        // to two, retrying each intermediate (`openrouter/anthropic/
+        // claude-opus-5` → `anthropic/claude-opus-5` → `claude-opus-5`).
+        for _ in 0..2 {
+            let Some((_, rest)) = candidate.split_once('/') else {
+                break;
+            };
+            candidate = rest;
+            if let Some(rate) = resolve(models, candidate, date, hour) {
+                return Some(rate);
+            }
+        }
+        // (c) Trailing date-stamp strip: while the id ends in `-<8 digits>`,
+        // drop that group and retry (`glm-4.7-flash-20250801` →
+        // `glm-4.7-flash`; repeated for stacked stamps).
+        while let Some(head) = strip_date_stamp(candidate) {
+            candidate = head;
+            if let Some(rate) = resolve(models, candidate, date, hour) {
+                return Some(rate);
+            }
+        }
+        None
     }
 
     /// The models applicable to `date`: the newest snapshot with `captured <=
@@ -345,6 +377,38 @@ impl PriceTable {
 }
 
 // ── Resolution helpers ──────────────────────────────────────────────────────
+
+/// One candidate form through the full match walk: lowercase, first
+/// [`PricedModel`] in distilled order whose clause holds, then the
+/// reversed-entry price selection. Shared by [`PriceTable::rate_at`]'s primary
+/// form and every retry form.
+fn resolve(models: &[PricedModel], id: &str, date: &str, hour: u8) -> Option<ModelRate> {
+    let lowered = id.to_lowercase();
+    let priced = models.iter().find(|m| m.match_.matches(&lowered))?;
+    let entry = priced
+        .prices
+        .iter()
+        .rev()
+        .find(|e| e.active(date, hour))
+        .or_else(|| priced.prices.first())?;
+    Some(ModelRate {
+        input: entry.input,
+        output: entry.output,
+        cache_read: entry.cache_read,
+        cache_write: entry.cache_write,
+    })
+}
+
+/// Strip ONE trailing `-<exactly 8 digits>` date stamp (a `YYYYMMDD`):
+/// `glm-4.7-flash-20250801` → `glm-4.7-flash`. The caller repeats it for
+/// stacked stamps. A shorter numeric group (`...-250801`, `...-2508`) or a
+/// non-numeric suffix is a model variant name, not a date stamp, and is left
+/// alone — a loose `-<segment>` strip would walk past variant names into the
+/// family base id and price a different model than the id names.
+fn strip_date_stamp(id: &str) -> Option<&str> {
+    let (head, tail) = id.rsplit_once('-')?;
+    (tail.len() == 8 && tail.bytes().all(|b| b.is_ascii_digit())).then_some(head)
+}
 
 /// Strip a trailing `[<digits>k|m]` context suffix (case-insensitive):
 /// `deepseek-v4-pro[1m]` → `deepseek-v4-pro`. Anything else — no closing
@@ -507,7 +571,8 @@ fn fetch_models() -> anyhow::Result<Vec<PricedModel>> {
 /// fetch fails only when ZERO models survive (an empty table would price
 /// nothing and look like a healthy load). Only [`FIRST_PARTY_PROVIDERS`] are
 /// kept — resellers are dropped here, so no lookup path can land on a
-/// reseller's markup.
+/// reseller's markup; resold model rows inside a kept provider (a claude id
+/// under a non-anthropic provider) are dropped for the same reason.
 fn distill(json: &str) -> anyhow::Result<Vec<PricedModel>> {
     let root: serde_json::Value = serde_json::from_str(json).map_err(anyhow::Error::from)?;
     let providers = root
@@ -526,6 +591,20 @@ fn distill(json: &str) -> anyhow::Result<Vec<PricedModel>> {
             let Ok(model) = serde_json::from_value::<RawModel>(model) else {
                 continue; // malformed model — skip, don't fail the provider
             };
+            // A kept provider can still resell another vendor's models: google
+            // (Vertex) carries claude-* rows whose CONTAINS clauses price local
+            // fine-tune ids that merely EMBED a claude model name
+            // (`qwable-9b-claude-fable-5-shq8`) at Anthropic API rates — a
+            // false-positive class the reseller-provider drop alone cannot
+            // catch. Anthropic's own rows are the only legitimate claude rows.
+            if provider.id != "anthropic"
+                && model
+                    .id
+                    .get(..6)
+                    .is_some_and(|prefix| prefix.eq_ignore_ascii_case("claude"))
+            {
+                continue;
+            }
             if let Some(priced) = model.into_priced() {
                 models.push(priced);
             }

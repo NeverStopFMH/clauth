@@ -154,6 +154,52 @@ fn distill_keeps_first_party_drops_resellers() {
 }
 
 #[test]
+fn distill_drops_resold_claude_rows() {
+    // google (Vertex) resells anthropic's models; its claude rows carry
+    // CONTAINS clauses. The fixture keeps both google's `claude-opus-4-6`
+    // and anthropic's, so the drop must leave exactly ONE.
+    let models = distill(FIXTURE).expect("fixture distills");
+    let count = |id: &str| models.iter().filter(|m| m.id == id).count();
+    assert_eq!(count("claude-fable-5"), 0); // google-only in the fixture
+    assert_eq!(count("claude-opus-4-6"), 1); // anthropic's row survives
+    // The rule is claude-specific: google's own models stay.
+    assert_eq!(count("gemini-3.7-flash"), 1);
+}
+
+#[test]
+fn resold_claude_drop_unprices_local_fine_tunes() {
+    // google's resold rows priced local fine-tune names at Anthropic API
+    // rates (`claude-fable-5` contains, `claude-4-6-opus` contains). With
+    // them dropped, no kept clause matches these ids.
+    let t = PriceTable::capture(
+        distill(FIXTURE).expect("fixture distills"),
+        "2026-08-19".to_owned(),
+        0,
+        Vec::new(),
+    );
+    for id in [
+        "qwable-9b-claude-fable-5-shq8",
+        "qwable-9b-claude-fable-5",
+        "qwen3.5-2b-claude-4.6-opus-reasoning-distilled@q8_0",
+    ] {
+        assert!(t.rate_at(id, "2026-08-19", 0).is_none(), "{id}");
+    }
+}
+
+#[test]
+fn bare_claude_stays_unpriced() {
+    // `claude` itself names no priced model: no kept clause matches it and
+    // no retry derives a different name from it.
+    let t = PriceTable::capture(
+        distill(FIXTURE).expect("fixture distills"),
+        "2026-08-19".to_owned(),
+        0,
+        Vec::new(),
+    );
+    assert!(t.rate_at("claude", "2026-08-19", 0).is_none());
+}
+
+#[test]
 fn distill_parses_flat_and_conditional_prices() {
     // o3's real chain: an unconstrained entry then a start_date-constrained one.
     let json = r#"[
@@ -402,6 +448,116 @@ fn rate_strips_bracket_suffix_before_match() {
     assert!(t.rate_at("glm-5.2[xm]", "2026-08-19", 0).is_none());
     assert!(t.rate_at("glm-5.2[1x]", "2026-08-19", 0).is_none());
     assert!(t.rate_at("glm-5.2[]", "2026-08-19", 0).is_none());
+}
+
+// ── resolution retries ───────────────────────────────────────────────────────
+
+#[test]
+fn rate_retries_colon_strip_bare() {
+    let t = table(vec![eq_model("glm-4.7", 1.4e-6, 4.4e-6)]);
+    assert_eq!(
+        t.rate_at("glm-4.7:free", "2026-08-19", 0).map(|r| r.input),
+        Some(1.4e-6)
+    );
+}
+
+#[test]
+fn rate_retries_colon_strip_namespaced() {
+    // The colon-stripped form still carries its namespace and must match a
+    // clause on that full form.
+    let t = table(vec![eq_model("zai/glm-4.7", 1.4e-6, 4.4e-6)]);
+    assert_eq!(
+        t.rate_at("zai/glm-4.7:free", "2026-08-19", 0)
+            .map(|r| r.input),
+        Some(1.4e-6)
+    );
+}
+
+#[test]
+fn rate_retries_provider_strip_one_segment() {
+    let t = table(vec![eq_model("claude-opus-5", 5e-6, 25e-6)]);
+    assert_eq!(
+        t.rate_at("anthropic/claude-opus-5", "2026-08-19", 0)
+            .map(|r| r.input),
+        Some(5e-6)
+    );
+    // The bracket strip fires on the ORIGINAL form, so a bracketed
+    // namespaced id retries from its bracket-stripped self.
+    assert_eq!(
+        t.rate_at("anthropic/claude-opus-5[1m]", "2026-08-19", 0)
+            .map(|r| r.input),
+        Some(5e-6)
+    );
+}
+
+#[test]
+fn rate_retries_provider_strip_two_segments() {
+    // Each intermediate retries: with a clause on the ONE-segment form,
+    // that form must win before the bare id is ever tried.
+    let one_segment = eq_model("anthropic/claude-opus-5", 5e-6, 25e-6);
+    let bare = eq_model("claude-opus-5", 6e-6, 26e-6);
+    let t = table(vec![one_segment, bare]);
+    assert_eq!(
+        t.rate_at("openrouter/anthropic/claude-opus-5", "2026-08-19", 0)
+            .map(|r| r.input),
+        Some(5e-6)
+    );
+    // And when the intermediate has no clause, the second strip prices.
+    let t2 = table(vec![eq_model("claude-opus-5", 6e-6, 26e-6)]);
+    assert_eq!(
+        t2.rate_at("openrouter/anthropic/claude-opus-5", "2026-08-19", 0)
+            .map(|r| r.input),
+        Some(6e-6)
+    );
+}
+
+#[test]
+fn rate_retries_date_stamp_strip() {
+    let t = table(vec![eq_model("glm-4.7-flash", 1e-6, 2e-6)]);
+    assert_eq!(
+        t.rate_at("glm-4.7-flash-20250801", "2026-08-19", 0)
+            .map(|r| r.input),
+        Some(1e-6)
+    );
+    // Only a trailing group of EXACTLY 8 digits is a date stamp; a shorter
+    // (even all-numeric) or non-numeric group is a variant name and must
+    // not strip.
+    assert!(t.rate_at("glm-4.7-flash-250801", "2026-08-19", 0).is_none());
+    assert!(t.rate_at("glm-4.7-flash-2508", "2026-08-19", 0).is_none());
+    assert!(t.rate_at("glm-4.7-flash-fast", "2026-08-19", 0).is_none());
+}
+
+#[test]
+fn rate_retries_date_stamp_strip_repeated() {
+    // `m-20250801-20250802` strips BOTH trailing groups, retrying each
+    // intermediate; only the fully-stripped `m` has a clause here.
+    let t = table(vec![eq_model("m", 1e-6, 2e-6)]);
+    assert_eq!(
+        t.rate_at("m-20250801-20250802", "2026-08-19", 0)
+            .map(|r| r.input),
+        Some(1e-6)
+    );
+}
+
+#[test]
+fn rate_retries_colon_before_provider_strip() {
+    // `x/y:z` colon-strips to `x/y` AND (if reached) provider-strips to
+    // `y`; the colon-stripped form must resolve first.
+    let colon_form = eq_model("x/y", 1e-6, 2e-6);
+    let provider_form = eq_model("y", 3e-6, 4e-6);
+    let t = table(vec![colon_form, provider_form]);
+    assert_eq!(
+        t.rate_at("x/y:z", "2026-08-19", 0).map(|r| r.input),
+        Some(1e-6)
+    );
+}
+
+#[test]
+fn rate_bracket_strip_applies_to_original_only() {
+    // The bracket strip is part of the PRIMARY form; a retried form is not
+    // re-stripped, so `m[1k]:x` colon-strips to `m[1k]` and misses `m`.
+    let t = table(vec![eq_model("m", 1e-6, 2e-6)]);
+    assert!(t.rate_at("m[1k]:x", "2026-08-19", 0).is_none());
 }
 
 // ── constraint resolution ────────────────────────────────────────────────────

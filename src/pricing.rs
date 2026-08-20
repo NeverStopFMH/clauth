@@ -277,7 +277,9 @@ impl PriceTable {
     /// re-enters the full clause walk, so a retry prices only what a clause
     /// names; these restore the spellings the old LiteLLM walk's
     /// colon/suffix strips priced (`minimax/minimax-m2.5:free`,
-    /// `anthropic/claude-opus-5`, `glm-4.7-flash-20250801`).
+    /// `anthropic/claude-opus-5`). A stripped form whose spelling no clause
+    /// names stays unpriced: `glm-4.7-flash-20250801` strips to
+    /// `glm-4.7-flash`, which the feed carries no rate for today.
     ///
     /// Rates come from the snapshot live on `date` (see
     /// [`PriceTable::snapshot_for`]); `None` when no model matches.

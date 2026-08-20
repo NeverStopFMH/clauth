@@ -318,11 +318,11 @@ pub(crate) enum Command {
 /// `clauth start`'s flags, the profile, and the `claude` passthrough.
 #[derive(Args, Debug)]
 pub(crate) struct StartArgs {
-    /// Inject the profile's credentials into a clean throwaway runtime,
-    /// dropping operator memory, plugins, and hooks. Run it in a clean cwd for
-    /// a blind session. The run's transcripts and session state are lifted into
-    /// the global store before the runtime is discarded, so the session stays
-    /// resumable and its tokens are counted.
+    /// Uses a clean throwaway runtime, without your CLAUDE.md, plugins, hooks,
+    /// skills, MCP servers or tools. Run it in a clean cwd for a blind session.
+    /// Useful for testing or benchmarking. Transcripts and session state are
+    /// lifted into the global store as clauth start shuts down, so the session
+    /// stays resumable and its tokens counted. A hard kill skips that.
     #[arg(long)]
     pub(crate) isolated: bool,
     /// Follow the fallback chain, moving to the next account as each runs out

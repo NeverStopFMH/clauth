@@ -854,6 +854,17 @@ fn per_subcommand_help_carries_that_commands_prose() {
 /// resume blocked on a live isolated run. Matched over whitespace-normalized output,
 /// because clap rewraps the paragraph to the terminal it renders for — and
 /// without the final period, which clap strips off an arg's last sentence.
+///
+/// Narrowed 2026-08-20 from the whole sentence to its two load-bearing halves,
+/// after the owner's copy pass reworded it. A full-sentence needle reds on every
+/// rewrite regardless of whether the claim survived, which is the failure this
+/// file's sibling pins already learned once.
+///
+/// The third needle is the HEDGE, and it is pinned as hard as the promise. The
+/// lift runs in `start::run`'s teardown after `child.wait()` returns, so a hard
+/// kill of `clauth start` itself skips it and the store goes with the runtime.
+/// A help that promises the lift without that clause is the flat overclaim this
+/// entry's reviewzy constraint was filed against.
 #[test]
 fn the_isolated_help_says_the_session_outlives_the_runtime() {
     let mut start = Cli::command();
@@ -863,14 +874,17 @@ fn the_isolated_help_says_the_session_outlives_the_runtime() {
         .render_long_help()
         .to_string();
     let flat = help.split_whitespace().collect::<Vec<_>>().join(" ");
-    assert!(
-        flat.contains(
-            "The run's transcripts and session state are lifted into the global \
-             store before the runtime is discarded, so the session stays \
-             resumable and its tokens are counted"
-        ),
-        "--isolated's help must say the session survives its runtime: {flat}"
-    );
+    for phrase in [
+        "lifted into the global store",
+        "stays resumable",
+        "A hard kill skips that",
+    ] {
+        assert!(
+            flat.contains(phrase),
+            "--isolated's help must say the session survives its runtime \
+             ({phrase:?}): {flat}"
+        );
+    }
 }
 
 /// A multi-word unrecognized invocation is a usage error (exit 2), not the old

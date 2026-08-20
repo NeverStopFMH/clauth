@@ -395,6 +395,12 @@
       },
       {
        "contains": "claude-opus-4-6"
+      },
+      {
+       "contains": "claude-4.6-opus"
+      },
+      {
+       "contains": "claude-opus-4.6"
       }
      ]
     },

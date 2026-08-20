@@ -597,6 +597,10 @@ fn distill(json: &str) -> anyhow::Result<Vec<PricedModel>> {
             // (`qwable-9b-claude-fable-5-shq8`) at Anthropic API rates — a
             // false-positive class the reseller-provider drop alone cannot
             // catch. Anthropic's own rows are the only legitimate claude rows.
+            // The drop is keyed on the model ID prefix: a resold row whose id
+            // does not start with `claude` but whose clause patterns embed one
+            // (none in the current feed, verified 2026-08-20) would slip
+            // through.
             if provider.id != "anthropic"
                 && model
                     .id

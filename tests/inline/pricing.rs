@@ -154,6 +154,24 @@ fn distill_keeps_first_party_drops_resellers() {
 }
 
 #[test]
+fn distill_drops_capitalized_resold_claude_rows() {
+    // The prefix check is case-insensitive; a capitalized resold id must
+    // drop exactly like its lowercase twin. The current feed carries none —
+    // defensive pin against upstream casing drift.
+    let json = r#"[
+        {"id": "google", "models": [
+            {"id": "Claude-3-5-Sonnet", "match": {"contains": "Claude-3-5-Sonnet"},
+             "prices": {"input_mtok": 3, "output_mtok": 15}},
+            {"id": "gemini-3.7-flash", "match": {"equals": "gemini-3.7-flash"},
+             "prices": {"input_mtok": 0.1, "output_mtok": 0.4}}
+        ]}
+    ]"#;
+    let models = distill(json).expect("distill ok");
+    let ids: Vec<&str> = models.iter().map(|m| m.id.as_str()).collect();
+    assert_eq!(ids, ["gemini-3.7-flash"]);
+}
+
+#[test]
 fn distill_drops_resold_claude_rows() {
     // google (Vertex) resells anthropic's models; its claude rows carry
     // CONTAINS clauses. The fixture keeps both google's `claude-opus-4-6`
@@ -169,7 +187,7 @@ fn distill_drops_resold_claude_rows() {
 #[test]
 fn resold_claude_drop_unprices_local_fine_tunes() {
     // google's resold rows priced local fine-tune names at Anthropic API
-    // rates (`claude-fable-5` contains, `claude-4-6-opus` contains). With
+    // rates (`claude-fable-5` contains, `claude-4.6-opus` contains). With
     // them dropped, no kept clause matches these ids.
     let t = PriceTable::capture(
         distill(FIXTURE).expect("fixture distills"),
@@ -558,6 +576,47 @@ fn rate_bracket_strip_applies_to_original_only() {
     // re-stripped, so `m[1k]:x` colon-strips to `m[1k]` and misses `m`.
     let t = table(vec![eq_model("m", 1e-6, 2e-6)]);
     assert!(t.rate_at("m[1k]:x", "2026-08-19", 0).is_none());
+}
+
+#[test]
+fn rate_retries_propagate_date_and_hour() {
+    // The retry ladder must hand its (date, hour) through to entry selection
+    // unchanged: an id that matches ONLY after a strip still prices
+    // peak/off-peak and dated entries by the queried (date, hour).
+    let m = PricedModel {
+        id: "m".to_owned(),
+        match_: MatchClause::Equals("m".to_owned()),
+        prices: vec![
+            entry(0.2175e-6, 0.435e-6), // off-peak fallback
+            PriceEntry {
+                input: 0.435e-6,
+                output: 0.87e-6,
+                cache_read: 0.0,
+                cache_write: 0.0,
+                constraint: Some(Constraint::TimeWindow {
+                    start: "01:00Z".to_owned(),
+                    end: "04:00Z".to_owned(),
+                }),
+            },
+        ],
+    };
+    let t = table(vec![m]);
+    // `m:free` matches only via the colon strip, so the hour used comes
+    // from the RETRY call, not the primary walk.
+    let input = |hour: u8| t.rate_at("m:free", "2026-08-19", hour).map(|r| r.input);
+    assert_eq!(input(2), Some(0.435e-6)); // peak
+    assert_eq!(input(4), Some(0.2175e-6)); // off-peak (04:00 half-open)
+
+    // Date propagation: o3's start_date chain through a colon retry.
+    let ft = PriceTable::capture(
+        distill(FIXTURE).expect("fixture distills"),
+        "2026-08-19".to_owned(),
+        0,
+        Vec::new(),
+    );
+    let o3 = |date: &str| ft.rate_at("o3:free", date, 0).map(|r| r.input);
+    assert_eq!(o3("2025-01-01"), Some(10e-6)); // before the cut: fallback
+    assert_eq!(o3("2026-08-19"), Some(2e-6)); // after: start_date entry
 }
 
 // ── constraint resolution ────────────────────────────────────────────────────

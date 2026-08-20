@@ -472,58 +472,57 @@ pub(crate) struct ClauthServer {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub(crate) struct SwitchArgs {
-    /// Name of the account to relink the global active credentials to
-    /// (case-insensitive).
+    /// Account to re-link the global credentials to.
     name: String,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub(crate) struct ProfilesArgs {
-    /// Restrict the reply to these accounts (case-insensitive). Omit it, or
-    /// pass an empty list, to leave `scope` to decide what comes back.
+    /// Filter the reply to these accounts. Omit it or pass an empty list, to
+    /// leave `scope` as the only filter.
     names: Option<Vec<String>>,
-    /// `scope: "all"` (default): every account.
+    /// `scope: "all"` (default): all accounts.
     ///
-    /// `scope: "session"`: the one account THIS session's own credentials
-    /// belong to, with `source` saying how that resolved. That account can
-    /// differ from the configured active one.
+    /// `scope: "session"`: the account THIS session is running on, with
+    /// `source` saying how that resolved. This can change throughout the
+    /// session.
     scope: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub(crate) struct DelegateArgs {
-    /// Which accounts to run on. One name runs one delegate. Several names run
-    /// one delegate per account, all at the same time. Names are
-    /// case-insensitive.
+    /// Which account(s) to use. One or multiple; one delegate per account, all
+    /// run in parallel with the same prompt.
     profiles: Option<Vec<String>>,
-    /// The task for the delegate, as plain text. This is the only thing it knows
-    /// about the job.
+    /// The task for the delegate in plain text. Works the same way as prompting
+    /// Claude Code; mention a file with `@path/file` to pull it directly into
+    /// delegate's context, `/skill` to invoke a skill, and so on.
+    /// This is the only thing it receives from you.
     ///
     /// To run the delegate as one of your `Agent` types, make
     /// `@"{type} (agent)"` the start of `prompt`. Needs `isolated: false`.
     ///
     /// Spell the type exactly as the `Agent` tool lists it. An unknown type is
-    /// dropped with no error; one that matches a file path pulls that file in
-    /// instead.
+    /// dropped with no error.
     prompt: Option<String>,
-    /// Use a txt/md file as the prompt instead of passing it inline. Path is
-    /// relative to `cwd`. Best for a prompt you reuse across turns, or one that
-    /// changes only slightly between delegates.
+    /// Passes a txt/md file as the prompt (path relative to `cwd`). Best for a
+    /// prompt you reuse across turns, or one that changes only slightly between
+    /// delegates.
     prompt_file: Option<String>,
     /// `isolated: false` (default): the delegate loads your `CLAUDE.md`, plugins,
     /// hooks, skills, MCP servers and tools the same as a normal session or a
     /// native agent. Use this for real work.
     ///
-    /// `isolated: true`: none of that loads. The delegate starts blank, so only
-    /// `prompt` steers it. Use this to test what a stock `claude` does.
+    /// `isolated: true`: none of that loads, only its `prompt` steers it. Use
+    /// this to test what a stock `claude` does.
     isolated: Option<bool>,
     /// `background: false` (default): the call waits for the delegate to finish
-    /// and returns its output. With several `profiles`, it waits for all of them.
+    /// and returns its result. With multiple `profiles`, it waits for all of
+    /// them before returning the results.
     ///
-    /// `background: true`: the call returns a `{job_id}` instead of the output,
-    /// and the delegate keeps running. Its result is delivered to you
-    /// automatically when it finishes. You can check, collect or stop it with
-    /// `monitor`.
+    /// `background: true`: the call returns a `{job_id}` and the delegate keeps
+    /// running. Its result is delivered to you automatically when it finishes.
+    /// You can check, collect or stop it with `monitor`.
     background: Option<bool>,
     /// Model for the delegated session. Unset = default model for that profile.
     model: Option<String>,
@@ -531,62 +530,61 @@ pub(crate) struct DelegateArgs {
     /// session started. The delegate reads `CLAUDE.md` from its cwd
     /// unconditionally.
     cwd: Option<String>,
-    /// Continue a delegate by `session_id`, and `prompt` becomes the next message
-    /// in that conversation. clauth resumes it in the directory the session was
-    /// running in, so `cwd` is not needed here (refuses if it disagrees).
+    /// Continue a session by `session_id`, with `prompt` as the next message,
+    /// in the session's original working directory. `cwd` is optional.
+    /// `delegate` refuses to resume if it differs from the original directory.
     resume: Option<String>,
     /// Kill the delegate if it produces no output at all for this many seconds
     /// (max: 3600, default 300). It returns any text it had and a `session_id`
-    /// you can pass to `resume`. This is the only time limit on a normal run: a
-    /// delegate that keeps producing output runs to completion, however long it
-    /// takes. Raise it only when the task makes one slow tool call, such as a
-    /// long build. If `args` pins its own `--output-format`, this stops killing
-    /// on silence and works the same as `timeout_secs`.
+    /// you can pass to `resume`. This is the only time limit on a normal run.
+    ///
+    /// A delegate that keeps producing output runs to completion, no matter how
+    /// long it takes. Raise it only when the task is expected to make a slow
+    /// tool call (e.g. a long build).
+    ///
+    /// If `args` pins its own `--output-format`, this stops killing on silence
+    /// and works the same as `timeout_secs`.
     idle_secs: Option<u64>,
-    /// Wall-clock limit in seconds (max: 3600). It applies only when `args` pins
-    /// its own `--output-format`; leave it unset there and `idle_secs` supplies
-    /// the figure instead. On every other run it is ignored: a delegate that is
-    /// still producing output keeps running.
+    /// Wall-clock limit in seconds (max: 3600). Applies only when `args` pins
+    /// its own `--output-format`; leave it unset there for `idle_secs` to
+    /// supply the limit instead. Ignored on any other run (a delegate that is
+    /// still producing output keeps running).
     timeout_secs: Option<u64>,
-    /// Extra env vars to pass to the delegate session, e.g.
-    /// `CLAUDE_CODE_MAX_OUTPUT_TOKENS`. clauth sets `CLAUDE_CONFIG_DIR` and its
-    /// own depth guard after yours, so a value you pass for either is
-    /// discarded.
+    /// Additional environment variables passed to the delegate session. clauth
+    /// sets `CLAUDE_CONFIG_DIR` and its own depth guard after your values. Read
+    /// `code.claude.com/docs/en/env-vars.md` to see what Claude Code supports.
     env: Option<HashMap<String, String>>,
-    /// Extra CLI arguments that go after clauth's own `claude -p` invocation and
-    /// streaming flags, after `--strict-mcp-config` on an isolated run, and after
-    /// `--model` when `model` is set. Pinning `--output-format` here replaces
-    /// clauth's, which turns off the idle limit and leaves `timeout_secs` as the
-    /// only guard.
+    /// Extra CLI arguments that go after the `claude -p` clauth invokes. They
+    /// go after streaming flags clauth adds, `--strict-mcp-config` on an
+    /// isolated run, and after `--model` when `model` is set.
+    ///
+    /// Pinning `--output-format` here replaces clauth's own, which turns off
+    /// the idle limit and leaves `timeout_secs` as the only guard.
     args: Option<Vec<String>>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub(crate) struct MonitorArgs {
-    /// Job ids returned by `delegate({background: true})`: one id checks or
-    /// collects that job, several collect in one call (one result per id, in
-    /// the order given).
+    /// Job ids to work with.
     job_ids: Option<Vec<String>>,
-    /// Seconds to long-poll before returning (max: 3600, default 0 = reply
-    /// instantly).
+    /// Seconds to poll for job result before returning (max: 3600, default 0 =
+    /// instant).
     ///
     /// Clamped to 1500 on a client that cannot receive progress notifications.
     ///
     /// With `job_ids` it bounds the wait for a job to finish; with none it
     /// bounds the wait on clauth's own state.
-    ///
-    /// A `cancel: true` call waits up to 10 seconds for the kill to land, even
-    /// at 0.
     wait_secs: Option<u64>,
-    /// `return_on: "any"` (default): return as soon as one named job finishes.
+    /// `return_on: "any"` (default): return as soon as one of the named jobs
+    /// finishes.
     ///
-    /// `return_on: "all"`: wait for the slowest. This is also the default under
+    /// `return_on: "all"`: wait for the slowest. The default under
     /// `cancel: true`.
     return_on: Option<String>,
-    /// `cancel: true`: ask the named jobs to stop, keeping whatever they
-    /// produced. The reply carries how far each got before it did.
+    /// `cancel: true`: ask the named jobs to stop. Keeps whatever they produced
+    /// and tells how far each one got.
     ///
-    /// `cancel: false` (default): the call checks and collects, and never stops
+    /// `cancel: false` (default): the call checks and collects. It never stops
     /// a running job.
     cancel: Option<bool>,
 }
@@ -627,10 +625,9 @@ impl ClauthServer {
     }
 
     #[tool(
-        description = "clauth's accounts with their cached headroom: zero quota, no network. Call \
-it before picking a `delegate` target. A window's percentage is how much of it is already used, \
-so higher means less headroom. A row marked `disabled`, `login expired` or `no api key` is an \
-account `delegate` refuses."
+        description = "List of clauth accounts with their cached usage headrooms. A window's \
+percentage is how much of it is already used. Call it before picking a `delegate` target. \
+`delegate` refuses `disabled`, `login expired` or `no api key` accounts."
     )]
     async fn profiles(
         &self,
@@ -1341,12 +1338,14 @@ Delegating spends the target account, so pick the account with `profiles` first.
     }
 
     #[tool(
-        description = "Check, collect or stop a backgrounded `delegate`, or wait on clauth's own \
-state. One of the two per call, decided by whether you name `job_ids`.\n\n\
-With `job_ids`: a running job reports its account, elapsed time, how long it has before a \
-deadline kills it, and its latest output. A finished one hands back its result.\n\n\
-With no `job_ids`: the reply lists the delegates clauth holds, live runs first. An interrupted \
-blocking `delegate` keeps running as a background job, and that listing is where you find its id."
+        description = "Check, collect, or stop a background `delegate` by providing `job_ids`. \
+With no `job_ids` it blocks until clauth's own state moves: the active account, that account's \
+usage cache, or the credentials on disk.\n\n\
+With `job_ids`: a running job reports its account, elapsed time, how long before deadline kills \
+it, and its latest output. A finished job also hands back its result.\n\n\
+Without `job_ids`: lists at most 10 delegates clauth holds, live runs first. An interrupted \
+blocking `delegate` (its caller walked away mid-run) keeps running as a background job, and that \
+listing is where you find its id."
     )]
     async fn monitor(
         &self,

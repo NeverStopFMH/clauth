@@ -4232,7 +4232,10 @@ fn the_delegate_description_keeps_its_load_bearing_warnings() {
         "`isolated: false` (default)",
         "`isolated: true`",
         "Use this for real work",
-        "only `prompt` steers it",
+        // `only ` dropped from the needle 2026-08-20: the load-bearing claim is
+        // that the prompt is the isolated run's ONLY steer, and the owner's copy
+        // spells it `only its `prompt` steers it`. The determiner is free.
+        "`prompt` steers it",
         // both `background` arms, same reason
         "`background: false` (default)",
         "`background: true`",
@@ -4240,7 +4243,13 @@ fn the_delegate_description_keeps_its_load_bearing_warnings() {
         // caller reading `timeout_secs` as one would size a run against a limit
         // that is not applied
         "the only time limit on a normal run",
-        "It applies only when `args` pins its own `--output-format`",
+        // Needle trimmed to the CONDITION 2026-08-20, after the owner's copy
+        // pass opened the sentence on the verb (`It applies` -> `Applies`).
+        // Trimmed rather than lowercased: `contains` is case-sensitive, so a
+        // needle carrying the first word reds on a sentence-initial capital, and
+        // `applies` would red the same way the next time the clause moves
+        // mid-sentence. The condition is what the pin is for.
+        "only when `args` pins its own `--output-format`",
         // the mention grammar clauth teaches, and the silent failure it has to
         // warn about: an unresolved `@`-mention is dropped with no error, and a
         // mistyped type that matches a path is read in as a file instead
@@ -4296,9 +4305,13 @@ fn the_profiles_entry_names_both_scopes_and_the_reply_shape() {
         // has to infer `all`.
         "`scope: \"all\"` (default)",
         "`scope: \"session\"`",
-        // What the call costs, which is the whole reason a model may reach for
-        // it freely.
-        "zero quota",
+        // The `zero quota` pin was REMOVED 2026-08-20, not reworded: the owner
+        // declined restoring the cost fact to this description, ruling that the
+        // `instructions` router already carries it. Recorded here rather than
+        // deleted silently, because placement rule 1 says a client may drop that
+        // block, so nothing loaded on every client states this call is free.
+        // Restoring the fact is a copy decision, not a test decision.
+        //
         // The reply-shape facts. No parameter owns them, so the description is
         // the only half that can carry them, and without them the largest
         // payload clauth puts in front of a model arrives unexplained.
@@ -4320,8 +4333,10 @@ fn the_profiles_entry_names_both_scopes_and_the_reply_shape() {
         "`login expired`",
         "`no api key`",
         // The direction of the percentage. A caller reading it backwards picks
-        // the most-spent account.
-        "less headroom",
+        // the most-spent account. Relaxed 2026-08-20 from `less headroom` to the
+        // clause the owner's copy states it with: the direction is what matters,
+        // and either spelling carries it.
+        "already used",
     ] {
         assert!(
             text.contains(phrase),
@@ -6504,8 +6519,10 @@ fn the_monitor_entry_names_the_listing_and_the_interrupted_delegate() {
         // holds` as `lists ...` and this pin redded over the `s`; what the pin
         // exists for is WHICH set gets listed, so it holds the noun phrase and
         // leaves the sentence free. Same lesson as `ignored` -> `dropped` on
-        // `delegate`.
-        "the delegates clauth holds",
+        // `delegate`. The leading `the ` went the same way 2026-08-20, over
+        // `lists at most 10 delegates clauth holds` — third reword, same pin,
+        // so the needle now holds only the words that name the set.
+        "delegates clauth holds",
         // What it puts FIRST, which is what a caller hunting an id needs and
         // what the rows actually do since they band.
         "live runs first",
@@ -6518,6 +6535,15 @@ fn the_monitor_entry_names_the_listing_and_the_interrupted_delegate() {
             "`monitor` entry dropped {phrase:?}: {text}"
         );
     }
+    // The bound, DERIVED rather than spelled: the copy states the cap as a
+    // number, so the two sides live in different files and a `LISTING_MAX`
+    // change would otherwise leave the description quietly false. Asserting the
+    // literal `10` here would pass while the copy said 20. The ban below is the
+    // other half — this catches a stale figure, that catches no figure at all.
+    assert!(
+        text.contains(&format!("at most {LISTING_MAX}")),
+        "`monitor` entry must state its listing cap as `at most {LISTING_MAX}`: {text}"
+    );
     // It lists at most `LISTING_MAX`, so it must not claim completeness. A pin
     // that only asserted the presence of a phrase locked the overclaim in once
     // already. Swept over the whole entry rather than the description alone:
@@ -6544,48 +6570,29 @@ fn the_monitor_entry_names_the_listing_and_the_interrupted_delegate() {
     }
 }
 
-/// `wait_secs`' own `default 0 = reply instantly` is false on a `cancel: true`
-/// call, which sits for a fixed grace while the kill lands — a real wall to a
-/// caller deciding whether a cancel fits in this turn.
+/// The cancel-grace disclosure this file used to pin on `wait_secs` was DELETED
+/// from the copy on 2026-08-20, owner ruling: a caller cannot act on a 10-second
+/// floor, so it does not earn description tokens. The pin went with it rather
+/// than being relaxed, because there is no weaker form of "name the exception"
+/// that still means anything.
 ///
-/// Pinned as a STRUCTURAL claim rather than a wording one: the promise and its
-/// exception belong to one parameter, so any honest `wait_secs` doc has to name
-/// the parameter that suspends it. A rewrite is free, dropping the disclosure
-/// is not. Same shape as `delegate`'s deadline pair, and the same reason — the
-/// grace lives in `effective_wait`, which no reply and no refusal announces.
+/// The grace is real and still unannounced. `effective_wait` floors a
+/// `cancel: true` call at `CANCEL_GRACE_SECS`, and no reply, refusal or doc says
+/// so now. The owner's replacement is a reply-side line naming the outcome per
+/// job (`killed {id} after {n}s` / `failed to kill {id} after {n}s`), which is
+/// the half a caller can act on; it is filed in `docs/todo.md` and NOT built
+/// yet. Re-pin against the REPLY when it lands, never back onto `wait_secs`.
 ///
-/// The needle is the LITERAL `cancel: true`, not the word `cancel`. A bare
-/// `cancel` needle passed a mutant that deleted the disclosure and left "the
-/// wait ends early when the client cancels the request" behind: this tool's
-/// vocabulary is saturated with `cancelled` / `cancels` / `cancellation`, so
-/// only the parameter-and-value form distinguishes the promise's exception from
-/// request cancellation. `delegate`'s deadline pair gets this for free by
-/// pinning whole distinctive identifiers.
-#[test]
-fn the_wait_parameter_discloses_the_cancel_exception_to_its_default() {
-    let tools = ClauthServer::new().tool_router.list_all();
-    let monitor = tools
-        .iter()
-        .find(|t| t.name == "monitor")
-        .expect("monitor tool is registered");
-    let raw = monitor.input_schema["properties"]["wait_secs"]["description"]
-        .as_str()
-        .expect("`wait_secs` carries a description");
-    // Collapsed for the same reason `tool_entry_text` collapses: the literal
-    // sits one word off a wrap boundary, so a raw match reds the moment `cargo
-    // fmt` reflows the doc comment.
-    let text = raw.split_whitespace().collect::<Vec<_>>().join(" ");
-    assert!(
-        text.contains("`cancel: true`"),
-        "`wait_secs` promises an instant reply at 0, so it must name the \
-         parameter and value that suspend that promise: {raw}",
-    );
-}
-
-/// `switch_profile`'s argument doc was the thin half of its entry. The handler
-/// resolves `name` through `config.canonical_name`, so a wrong-case spelling
-/// works, and `profiles.names` and `delegate.profiles` both disclosed that
-/// while this one did not.
+/// `switch_profile`'s `case-insensitive` pin went the same day for the same
+/// kind of reason: the owner declined restoring the word to `name`'s doc, ruling
+/// it inferrable at the call site. The handler still resolves through
+/// `config.canonical_name`, so a wrong-case spelling still works, and nothing in
+/// the entry says so.
+///
+/// What survives here is the pre-commit pointer. `mcp_switch_tool.rs` pins that
+/// the REPLY carries the session-effect note; this pins the one call that
+/// answers the same question BEFORE the credentials move, which is the half a
+/// caller can still act on.
 ///
 /// The unknown-name refusal is deliberately NOT pinned: the handler refuses it
 /// by name before any mutation, and a rule the boundary refuses does not need
@@ -6599,20 +6606,13 @@ fn the_wait_parameter_discloses_the_cancel_exception_to_its_default() {
 /// changing one spelling here would split the server's refusal vocabulary. It
 /// is raised as a follow-up rather than patched where only this test can see
 /// it.
-///
-/// The pre-commit pointer is the other half. `mcp_switch_tool.rs` pins that the
-/// REPLY carries the session-effect note; this pins the one call that answers
-/// the same question BEFORE the credentials move, which is the half a caller
-/// can still act on.
 #[test]
-fn the_switch_profile_entry_discloses_case_insensitivity_and_the_pre_commit_check() {
+fn the_switch_profile_entry_points_at_the_pre_commit_check() {
     let text = tool_entry_text("switch_profile");
     let text = text.as_str();
 
-    for phrase in ["case-insensitive", "profiles({scope:\"session\"})"] {
-        assert!(
-            text.contains(phrase),
-            "`switch_profile` entry dropped {phrase:?}: {text}"
-        );
-    }
+    assert!(
+        text.contains("profiles({scope:\"session\"})"),
+        "`switch_profile` entry dropped its pre-commit pointer: {text}"
+    );
 }

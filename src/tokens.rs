@@ -539,8 +539,7 @@ pub(crate) fn load_base(claude_dir: &Path) -> Option<TokenStats> {
         }
     }
 
-    // Off `models`, which already carries every `model_usage` row: one pass over
-    // a built Vec rather than four over the map.
+    // Off `models`, which already carries every `model_usage` row.
     let (total_input, total_output, total_cache_read, total_cache_create) = models.iter().fold(
         (0u64, 0u64, 0u64, 0u64),
         |(input, output, read, create), m| {

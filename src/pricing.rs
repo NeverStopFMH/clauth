@@ -241,6 +241,7 @@ struct Memo {
     by_date: HashMap<String, HashMap<String, Option<usize>>>,
     /// Cold walks performed. The memo's only observable, so the tests that pin
     /// "once per (model, date)" have something to count.
+    #[cfg(test)]
     walks: usize,
 }
 
@@ -310,29 +311,33 @@ impl PriceTable {
     /// Rates come from the snapshot live on `date` (see
     /// [`PriceTable::models_for`]); `None` when no model matches.
     pub(crate) fn rate_at(&self, model: &str, date: &str, hour: u8) -> Option<ModelRate> {
-        let models = self.models_for(date)?;
-        let priced = models.get(self.matched_index(models, model, date)?)?;
-        entry_rate(priced, date, hour)
+        entry_rate(self.matched(model, date)?, date, hour)
     }
 
-    /// Which [`PricedModel`] of `models` the candidate ladder picks for `model`,
-    /// answered from [`Memo`] when the same `(id, date)` has been asked before.
-    /// A poisoned memo walks rather than failing a price — it holds derived
-    /// state and nothing else.
-    fn matched_index(&self, models: &[PricedModel], model: &str, date: &str) -> Option<usize> {
+    /// The [`PricedModel`] that prices `model` on `date`, answered from [`Memo`]
+    /// when the pair has been asked before. The memoized index is only ever
+    /// resolved against the slice this same call took from
+    /// [`PriceTable::models_for`], so the index and its date cannot be paired up
+    /// wrongly by a caller. A poisoned memo walks rather than failing a price —
+    /// it holds derived state and nothing else.
+    fn matched(&self, model: &str, date: &str) -> Option<&PricedModel> {
+        let models = self.models_for(date)?;
         let Ok(mut memo) = self.memo.lock() else {
-            return ladder_index(models, model);
+            return models.get(ladder_index(models, model)?);
         };
         if let Some(hit) = memo.by_date.get(date).and_then(|by_id| by_id.get(model)) {
-            return *hit;
+            return models.get((*hit)?);
         }
         let found = ladder_index(models, model);
-        memo.walks += 1;
+        #[cfg(test)]
+        {
+            memo.walks += 1;
+        }
         memo.by_date
             .entry(date.to_owned())
             .or_default()
             .insert(model.to_owned(), found);
-        found
+        models.get(found?)
     }
 
     /// Cold match walks performed so far — what pins the memo, since a warm
@@ -384,8 +389,7 @@ impl PriceTable {
         date: &str,
         hours: &[HourTokens; 24],
     ) -> Option<f64> {
-        let models = self.models_for(date)?;
-        let priced = models.get(self.matched_index(models, model, date)?)?;
+        let priced = self.matched(model, date)?;
         let mut total = 0.0;
         for (hour, h) in hours.iter().enumerate() {
             let r = entry_rate(priced, date, hour as u8)?;
@@ -444,9 +448,9 @@ fn ladder_index(models: &[PricedModel], id: &str) -> Option<usize> {
 }
 
 /// One candidate form through the match walk: lowercase, then the first
-/// [`PricedModel`] in distilled order whose clause holds. A match carrying no
-/// price entries prices nothing, so it fails the form and the ladder moves on —
-/// what the rate-returning walk did when its entry pick came back empty-handed.
+/// [`PricedModel`] in distilled order whose clause holds. An empty `prices` list
+/// can price nothing, so a model carrying one is not a match and the ladder
+/// moves on to the next form.
 fn form_index(models: &[PricedModel], id: &str) -> Option<usize> {
     let lowered = id.to_lowercase();
     let idx = models.iter().position(|m| m.match_.matches(&lowered))?;

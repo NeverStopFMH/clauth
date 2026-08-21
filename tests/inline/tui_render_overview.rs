@@ -1514,18 +1514,8 @@ fn live_row(
     follows_chain: bool,
 ) -> crate::live_sessions::LiveSession {
     crate::live_sessions::LiveSession {
-        session_id: session_id.to_string(),
-        start_profile: member.to_string(),
-        pid: 4242,
-        started_at: 1_700_000_000_000,
-        cwd: None,
-        isolated: false,
         follows_chain,
-        intended_member: None,
-        chain_cursor: None,
-        current_member: None,
-        last_swap_at: None,
-        launch_store: None,
+        ..crate::testutil::live_row(session_id, member)
     }
 }
 

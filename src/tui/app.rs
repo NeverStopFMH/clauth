@@ -3255,13 +3255,6 @@ fn recompute_plugin_checks(app: &mut App, refresh_version: bool) {
 
     app.plugin.error = None;
 
-    // `r` means re-probe everything, so the fleet tally the runtime row folds in
-    // is re-collected here instead of read at whatever age the tick left it.
-    if refresh_version {
-        app.last_live_sessions_refresh = None;
-        poll_live_sessions(app);
-    }
-
     // CC version is cached; a tab switch reuses it, only `r` re-probes. Skipped
     // under test so the suite never spawns the real `claude` binary.
     if refresh_version || app.plugin.cc_version.is_none() {
@@ -3506,8 +3499,8 @@ fn recompute_plugin_checks(app: &mut App, refresh_version: bool) {
 
     // runtime — fold every profile's live sessions / credential link / token
     // freshness into one summary row. Snapshot the names under the config lock,
-    // then drop it before the FS reads (the live tally,
-    // `classify_credentials_link`) so no lock is held across I/O.
+    // then drop it before the FS reads (`classify_credentials_link`) so no lock
+    // is held across I/O.
     struct Snap {
         name: String,
         active: bool,
@@ -3541,10 +3534,18 @@ fn recompute_plugin_checks(app: &mut App, refresh_version: bool) {
     let mut active_fix: Option<PluginFix> = None;
     let mut active_bad = false; // diverged / missing / unknown link
 
-    // The tick's fleet tally, never a second sweep: this row and the Overview's
-    // `live` column answer one question, and two independent reads of it can
-    // disagree inside a frame. Up to one `poll_live_sessions` interval stale,
-    // which `r` closes by re-collecting above.
+    // `r` means re-probe everything, so it re-collects rather than rendering the
+    // age the tick left. Sited next to the read, not at the top: the version
+    // probe above spawns `claude`, and a tally taken before that is already as
+    // stale as the subprocess is slow.
+    if refresh_version {
+        app.last_live_sessions_refresh = None;
+        poll_live_sessions(app);
+    }
+
+    // Otherwise the tick's fleet tally, never a second sweep: this row and the
+    // Overview's `live` column answer one question, and two independent reads of
+    // it can disagree inside a frame.
     let tally = &app.live_sessions;
     for snap in snaps {
         let instances = tally.member(&snap.name).sessions;
@@ -8641,11 +8642,12 @@ fn poll_daemon_health(app: &mut App) {
     app.daemon_health = crate::daemon::daemon_health();
 }
 
-/// Re-tally the live-session registry for the Overview `active` column and the
-/// Fallback tab, at most once a second — a readdir plus an `open` + `try_lock`
-/// per row is cheap but not per-frame cheap, and a session starting or exiting
-/// is a human-timescale event. Ungated by tab: two tabs read it, and a snapshot
-/// a second stale on arrival would show the wrong fleet for that second.
+/// Re-tally the live-session registry for the Overview `live` column, the
+/// Fallback member card and the Plugin tab's `runtime` row, at most once a
+/// second — a readdir plus an `open` + `try_lock` per row is cheap but not
+/// per-frame cheap, and a session starting or exiting is a human-timescale
+/// event. Ungated by tab: all three read it, and a snapshot a second stale on
+/// arrival would show the wrong fleet for that second.
 fn poll_live_sessions(app: &mut App) {
     const LIVE_SESSIONS_INTERVAL: Duration = Duration::from_secs(1);
     if app

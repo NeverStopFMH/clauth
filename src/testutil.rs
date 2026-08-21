@@ -19,9 +19,14 @@ pub(crate) struct HomeSandbox {
     _tmp: tempfile::TempDir,
     _guard: crate::lockorder::RankedGuard<'static, ()>,
     home: PathBuf,
+    prev_config_dir: Option<std::ffi::OsString>,
 }
 
 impl HomeSandbox {
+    #[expect(
+        unsafe_code,
+        reason = "env mutation is unsafe in Rust 2024; serialized by HOME_TEST_LOCK, acquired above"
+    )]
     pub(crate) fn new() -> Self {
         // Untracked HOME_TEST_LOCK acquired first; no RankedMutex/flock is held.
         let guard = crate::profile::HOME_TEST_LOCK
@@ -30,10 +35,22 @@ impl HomeSandbox {
         let tmp = tempfile::tempdir().expect("create home sandbox");
         let home = tmp.path().to_path_buf();
         crate::profile::set_home_override(home.clone());
+        // `home_override` does not reach `CLAUDE_CONFIG_DIR`, and the operator's
+        // own value names a runtime OUTSIDE this tempdir: `which::session_auth`
+        // and `which::resolve_active` honor it, so a test run from inside a
+        // `clauth start` session resolves the real `~/.claude/.credentials.json`
+        // and reads a file it never staged. Clearing it here makes the sandbox
+        // the only answer, the rule `profile::home_dir` already states for the
+        // home. A test that WANTS one pins it with [`ConfigDirSandbox`], which
+        // borrows this guard and so always sets it after this clear.
+        let prev_config_dir = std::env::var_os("CLAUDE_CONFIG_DIR");
+        // SAFETY: test-only, serialized by `HOME_TEST_LOCK`, restored on drop.
+        unsafe { std::env::remove_var("CLAUDE_CONFIG_DIR") };
         Self {
             _tmp: tmp,
             _guard: guard,
             home,
+            prev_config_dir,
         }
     }
 
@@ -44,6 +61,10 @@ impl HomeSandbox {
 }
 
 impl Drop for HomeSandbox {
+    #[expect(
+        unsafe_code,
+        reason = "env mutation is unsafe in Rust 2024; serialized by HOME_TEST_LOCK, still held here"
+    )]
     fn drop(&mut self) {
         // Join BEFORE clearing the override, not after and not per-test. A
         // detached worker still running when `HOME_OVERRIDE` clears resolves
@@ -58,6 +79,14 @@ impl Drop for HomeSandbox {
         crate::tui::join_test_workers();
         join_background_tasks();
         crate::profile::clear_home_override();
+        // Restore the operator's own value, after the joins above for the same
+        // reason the home override is cleared there: a still-running worker that
+        // sees it back resolves outside the sandbox.
+        // SAFETY: test-only, serialized by `HOME_TEST_LOCK`, still held.
+        match self.prev_config_dir.take() {
+            Some(prev) => unsafe { std::env::set_var("CLAUDE_CONFIG_DIR", prev) },
+            None => unsafe { std::env::remove_var("CLAUDE_CONFIG_DIR") },
+        }
     }
 }
 

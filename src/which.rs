@@ -75,8 +75,16 @@ pub(crate) fn resolve_active(config: &AppConfig) -> Option<(String, Source)> {
 /// The config dir THIS process's session reads. One derivation so a caller that
 /// wants the INPUT to [`resolve_active`] cannot read a different env than the
 /// resolution does.
+///
+/// An empty value is treated as unset, matching [`session_auth`]. Without that
+/// filter the two disagreed: `session_auth` read `CLAUDE_CONFIG_DIR=""` as
+/// Global while this resolved a CWD-RELATIVE `.credentials.json`, so a bare
+/// session with the variable exported empty attributed itself off a file in
+/// whatever directory it happened to be started from.
 fn session_config_dir() -> Option<PathBuf> {
-    std::env::var_os("CLAUDE_CONFIG_DIR").map(PathBuf::from)
+    std::env::var_os("CLAUDE_CONFIG_DIR")
+        .filter(|dir| !dir.is_empty())
+        .map(PathBuf::from)
 }
 
 /// The credentials file [`resolve_active`] reads for this process's session.

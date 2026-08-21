@@ -255,7 +255,7 @@ impl StateLock {
 /// [`LOCK_POLL_INTERVAL`] until it is free or `timeout` elapses. A `WouldBlock`
 /// past the deadline returns [`StateLockTimeout`] (logged once so a wedge is
 /// diagnosable); a real IO error propagates as-is.
-fn lock_file_with_timeout(file: &File, timeout: Duration) -> Result<()> {
+pub(crate) fn lock_file_with_timeout(file: &File, timeout: Duration) -> Result<()> {
     let deadline = Instant::now() + timeout;
     loop {
         match file.try_lock() {

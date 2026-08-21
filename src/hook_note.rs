@@ -20,23 +20,42 @@
 //!   After a swap the directory keeps the profile the session LAUNCHED on while
 //!   the credential link points elsewhere, so a path-derived name answers "which
 //!   directory" rather than "which account".
-//! - **A stat gates the resolution.** This runs on every tool call, so the
-//!   record carries the stamp of the two inputs the answer is taken from and
-//!   skips the resolution behind them when neither moved. The measured spawn
-//!   floor is ~1.25 ms (20 `clauth --version` spawns in 25 ms, 2026-08-20) and
-//!   the gate is what keeps a real subcommand near it.
+//! - **A stat gates the resolution, and a TTL bounds what the stat misses.**
+//!   This runs on every tool call, so the record carries a stamp of the
+//!   resolution's inputs and skips it when nothing moved. The stamp is the
+//!   credential store plus a hash of [`crate::profile::reload_fingerprint`],
+//!   which is the crate's own predicate for "could a config reload change the
+//!   answer" and covers every per-profile `config.toml` that two hand-rolled
+//!   stats did not. [`RESOLUTION_TTL`] is the correctness backstop rather than
+//!   an optimisation: it turns anything the fingerprint still misses from an
+//!   unbounded miss into a bounded one. Two costs, and the doc used to price
+//!   only the first (both measured by review, 2026-08-21, debug build):
+//!   a fire that OPENS the gate runs `load_config`, which chmod-walks the whole
+//!   `~/.clauth` tree, so this process mutates the filesystem when it resolves
+//!   (~3.1 ms at 0 entries, ~5.9 ms at 2000, against a ~2.2 ms spawn floor);
+//!   and `reload_fingerprint` runs on EVERY fire, open or closed, at a readdir
+//!   plus two stats per profile (+342 µs at 2 profiles, +523 at 30, +651 at 60).
+//!   The second is the price of the gate being sound at all, and it scales with
+//!   profile count rather than with anything this module controls.
 //! - **One record per SCOPE, not per conversation.** A `PostToolUse` fired
 //!   inside a subagent carries `agent_id`; a single shared told-flag would let
 //!   the first subagent to fire consume the note while the main thread never
-//!   hears it. Separate files also mean the concurrent fires of a fan-out never
-//!   read-modify-write the same bytes, so no lock is needed for it.
+//!   hears it. Separate files keep two SCOPES off each other's bytes, and that
+//!   is all they do: every main-thread parallel tool call fires with no
+//!   `agent_id` and so shares one record, which is why the read-modify-write
+//!   below is flock-held (measured by review: 4 concurrent fires emitted the
+//!   note 2-4 times in 30 of 30 trials before the lock).
 //!
-//! Every failure is silence at exit 0. A hook that errors on a tool call breaks
-//! the conversation it exists to inform.
+//! A failure is silence at exit 0 wherever this module can make it one, because
+//! a hook that errors on a tool call breaks the conversation it exists to
+//! inform. The one path it does not own is [`crate::out`]: a stdout write error
+//! that is not `BrokenPipe` panics there by that module's deliberate contract,
+//! which exits 101.
 
+use std::hash::{Hash as _, Hasher as _};
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
@@ -47,17 +66,46 @@ use crate::profile::atomic_write_600;
 /// Dir under `~/.clauth` holding one record per conversation scope.
 const RECORDS_DIR: &str = "conversations";
 
-/// How long a record with no transcript to test it by survives the sweep. Only
-/// a payload that carried no `transcript_path` lands here, so this is the
-/// backstop rather than the rule.
-const ORPHAN_RECORD_MAX_AGE: std::time::Duration =
-    std::time::Duration::from_secs(30 * 24 * 60 * 60);
+/// How long a record whose transcript is not on disk survives the sweep.
+///
+/// The grace belongs on THIS branch, not on the ageing one below: a baseline
+/// recorded at `SessionStart` can land before Claude Code has created the
+/// transcript file, and a bare `!exists()` then lets any `clauth` invocation on
+/// the box reap a live conversation's record — after which its next real account
+/// move is absorbed as a fresh baseline and never announced.
+///
+/// It is measured from the record's MTIME, so the quantity it bounds is time
+/// since this scope last WROTE, not time since the transcript went missing. A
+/// conversation still opening the gate keeps rewriting the record and so never
+/// elapses it, which is the intent; the two only coincide for a scope that has
+/// gone quiet.
+const MISSING_TRANSCRIPT_GRACE: Duration = Duration::from_secs(60 * 60);
+
+/// How long a record that never carried a `transcript_path` survives. Nothing
+/// can test such a record for liveness, so it ages out instead.
+const ORPHAN_RECORD_MAX_AGE: Duration = Duration::from_secs(30 * 24 * 60 * 60);
+
+/// How long a resolution may be reused before it is retaken regardless of the
+/// stamp. The stamp is an optimisation and this is the correctness bound: any
+/// input `reload_fingerprint` does not cover (a per-profile `credentials.json`
+/// write that never touches the live link) costs at most this much staleness
+/// rather than an unbounded miss.
+const RESOLUTION_TTL: Duration = Duration::from_secs(60);
+
+/// Longest stdin this will read. `PostToolUse` embeds a whole `tool_response`,
+/// and the hook manifest's `timeout` bounds TIME rather than memory: reading an
+/// unbounded stream reached 28.4 GB RSS in review. Matches the 10 MB cap
+/// `update.rs` already puts on a downloaded asset.
+const MAX_PAYLOAD_BYTES: u64 = 10 * 1024 * 1024;
 
 /// The two spellings, behind one renderer so they cannot drift apart.
 ///
-/// The noun is "conversation" and never "session": every existing "session" in
-/// clauth's model-facing copy names the process, while this names the transcript
-/// that outlives it.
+/// The noun is "session", by owner ruling on 2026-08-21, superseding an earlier
+/// one here that said "conversation" and never "session". Carry the cost that
+/// ruling turned on rather than deleting it: every other "session" in
+/// model-facing clauth copy names the PROCESS, so after a swap the MCP block's
+/// runtime-paths note and this note both say "session" about two things that
+/// disagree. Do not resolve that by mutating the block, which is settled against.
 enum Note<'a> {
     /// A new Claude Code process picked this conversation up on another account.
     Resumed { now: &'a str, before: &'a str },
@@ -72,7 +120,7 @@ impl Note<'_> {
                 "clauth note: session resumed under `{now}`; earlier turns ran under `{before}`."
             ),
             Note::Switched { from, to } => format!(
-                "clauth note: the active profile for this conversation switched from `{from}` to `{to}`."
+                "clauth note: the active profile for this session switched from `{from}` to `{to}`."
             ),
         }
     }
@@ -88,7 +136,11 @@ struct Payload {
     /// Present only on a fire from inside a subagent, which is what makes it the
     /// per-call scope key.
     agent_id: Option<String>,
-    /// `SessionStart` only: `startup | resume | clear | compact`.
+    /// `SessionStart` only. Claude Code documents five: `startup`, `resume`,
+    /// `clear`, `compact`, `fork`. Anything this does not recognise rebaselines
+    /// silently, because every source Claude Code has added so far marks a
+    /// context boundary, and announcing a switch about turns a fresh context
+    /// never held is the worse failure.
     source: Option<String>,
     /// Recorded so the sweep can reap a record whose conversation is gone.
     transcript: Option<PathBuf>,
@@ -107,30 +159,83 @@ struct NoteRecord {
     /// `source: "compact"` fire re-announces.
     #[serde(default)]
     last_note: Option<String>,
-    /// Stamp of the resolution's inputs when `resolved` was taken. `None` means
-    /// nothing has been resolved yet, which is what keeps a cached `resolved` of
-    /// `None` distinguishable from never having asked.
+    /// Stamp of the resolution's inputs when `resolved` was taken.
+    ///
+    /// Written ONLY when the resolution attributed an account. Caching a `None`
+    /// here would bank the very stamp move that opened the gate, and nothing
+    /// moves it again — so the note would be lost rather than deferred, for the
+    /// life of the conversation. An ordinary rotation reaches that: it writes
+    /// the live file (stamped) and then the profile store (not).
     #[serde(default)]
     watch: Option<Watch>,
-    /// What the last resolution answered, cached behind `watch`.
+    /// What the last resolution answered, cached behind `watch` + [`resolved_at`].
+    /// Never `Some(None)` in effect: an unattributed read is not cached at all.
     #[serde(default)]
     resolved: Option<String>,
+    /// When `resolved` was taken, for [`RESOLUTION_TTL`].
+    #[serde(default)]
+    resolved_at: Option<SystemTime>,
     /// This conversation's transcript, for the sweep.
     #[serde(default)]
     transcript: Option<PathBuf>,
 }
 
-/// The inputs the attributed account is taken from. Both are stat'd, never read:
-/// the point is to skip the read.
+impl NoteRecord {
+    /// Whether the cached resolution still answers for `watch`: an account was
+    /// attributed, the stamped inputs have not moved, and the answer is younger
+    /// than [`RESOLUTION_TTL`]. All three, because the stamp alone has been
+    /// measured to miss an input and a miss it cannot see is unbounded.
+    /// Whether the record already holds an observation at least as new as
+    /// `taken_at` — and one taken in the PAST.
+    ///
+    /// Both halves earn their place. Without the first, a fire that resolved
+    /// before a peer overwrites the fresher verdict and announces the reversal.
+    /// Without the second, one backward clock step (chrony/timesyncd stepping a
+    /// large offset, a VM snapshot restore, a suspend/resume — all of which land
+    /// exactly when sessions start) leaves `resolved_at` in the future and every
+    /// later fire defers to it, discarding correct answers for the size of the
+    /// step. [`RESOLUTION_TTL`] cannot bound that: this runs on the path
+    /// [`cache_holds`] has already rejected, which is why the fire resolved.
+    ///
+    /// `>=` rather than `>`: on a tie both fires would otherwise cache and the
+    /// later ARRIVER would win regardless of who observed first (measured at
+    /// ~0.0095% of simultaneous stamp pairs). A fire stamps exactly once, so it
+    /// can never tie with its own prior write.
+    fn holds_a_newer_observation_than(&self, taken_at: SystemTime) -> bool {
+        self.resolved_at
+            .is_some_and(|held| held >= taken_at && held <= SystemTime::now())
+    }
+
+    fn cache_holds(&self, watch: &Watch) -> bool {
+        self.resolved.is_some()
+            && self.watch.as_ref() == Some(watch)
+            && self.resolved_at.is_some_and(|at| {
+                SystemTime::now()
+                    .duration_since(at)
+                    .is_ok_and(|age| age < RESOLUTION_TTL)
+            })
+    }
+}
+
+/// The inputs the attributed account is taken from, as far as a stat can see
+/// them. Deliberately not a complete account of `load_config`'s reads — see
+/// [`RESOLUTION_TTL`] for what bounds the remainder.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct Watch {
     /// The credential store this conversation's Claude Code loads. Followed
     /// through the link, since a swap repoints it and stamps the TARGET.
     creds: Option<Stamp>,
-    /// `profiles.toml` — which account is active and which accounts exist. It is
-    /// what moves when a switch lands between two accounts that store no
-    /// credentials of their own, where the file above is absent either side.
-    state: Option<Stamp>,
+    /// Hash of [`crate::profile::reload_fingerprint`], the crate's own predicate
+    /// for "could a config reload change the answer". It covers `profiles.toml`
+    /// AND every per-profile `config.toml` and `session-token.json` — the ones a
+    /// hand-rolled pair of stats missed, which let a `disabled = true` flip
+    /// change the attributed account behind a closed gate.
+    ///
+    /// Hashed rather than stored whole because the record is JSON and the
+    /// fingerprint is not a serde type. A hasher change across releases shifts
+    /// every stored value at once, which opens the gate one extra time per
+    /// conversation and costs one resolution.
+    config: u64,
 }
 
 /// Mtime and length of one watched file, `None` when it is absent. Length rides
@@ -150,17 +255,18 @@ fn stamp(path: &Path) -> Option<Stamp> {
     })
 }
 
-/// Stat both inputs. Fails soft: an unresolvable path contributes `None`, which
-/// compares equal to itself and so gates exactly like an absent file.
+/// Stamp both inputs. Fails soft: an unresolvable credential path contributes
+/// `None`, which compares equal to itself and so gates exactly like an absent
+/// file. `reload_fingerprint` fails soft on its own terms (a stat error
+/// contributes the empty value).
 fn watch_now() -> Watch {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    crate::profile::reload_fingerprint().hash(&mut hasher);
     Watch {
         creds: crate::which::active_credentials_path()
             .as_deref()
             .and_then(stamp),
-        state: crate::profile::app_state_path()
-            .ok()
-            .as_deref()
-            .and_then(stamp),
+        config: hasher.finish(),
     }
 }
 
@@ -173,7 +279,13 @@ fn resolve_account() -> Option<String> {
 
 pub(crate) fn run() -> Result<()> {
     let mut input = String::new();
-    let _ = std::io::stdin().read_to_string(&mut input);
+    // Bounded, not because a hostile payload is expected but because the host
+    // supplies it and an unbounded read has no ceiling but RAM. A truncated
+    // payload fails to parse and the fire goes silent, which is the same
+    // outcome as any other malformed input.
+    let _ = std::io::stdin()
+        .take(MAX_PAYLOAD_BYTES)
+        .read_to_string(&mut input);
     let Some(payload) = parse_payload(&input) else {
         return Ok(());
     };
@@ -209,15 +321,26 @@ fn parse_payload(input: &str) -> Option<Payload> {
     if !is_bare_id(&session_id) {
         return None;
     }
-    let agent_id = match value.get("agent_id").and_then(serde_json::Value::as_str) {
-        // An agent id that cannot spell a filename must not fall back to the
-        // main thread's record: that is the one scope it would then consume.
-        Some(id) if !is_bare_id(id) => return None,
-        Some(id) => Some(id.to_string()),
-        None => None,
+    // Keyed on the field being ABSENT, never on `as_str()` succeeding. A
+    // present-but-unusable value (a number, a bool, an object, or a string that
+    // cannot spell a filename) belongs to a subagent whose scope cannot be
+    // named, and treating it as absent consumes the main thread's record — the
+    // one scope it must never touch. `as_str()` alone read a `12345` as absent.
+    let agent_id = match value.get("agent_id") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(present) => match present.as_str() {
+            Some(id) if is_bare_id(id) => Some(id.to_string()),
+            _ => return None,
+        },
     };
+    // The event name is echoed into the envelope, so it is bounded. Unbounded, a
+    // 1 MB `hook_event_name` came back as 1 MB on stdout.
+    let event = value.get("hook_event_name")?.as_str()?;
+    if !is_echoable_event(event) {
+        return None;
+    }
     Some(Payload {
-        event: value.get("hook_event_name")?.as_str()?.to_string(),
+        event: event.to_string(),
         session_id,
         agent_id,
         source: value
@@ -227,6 +350,11 @@ fn parse_payload(input: &str) -> Option<Payload> {
         transcript: value
             .get("transcript_path")
             .and_then(serde_json::Value::as_str)
+            // Absolute and non-empty, or it is not a path the SWEEP can test for
+            // liveness. `Path::new("").exists()` is false, which reaped live
+            // records; a relative one resolves against the sweeping process's
+            // cwd (a daemon, a `clauth start`), never the hook's.
+            .filter(|p| !p.is_empty() && Path::new(p).is_absolute())
             .map(PathBuf::from),
     })
 }
@@ -239,6 +367,18 @@ fn is_bare_id(s: &str) -> bool {
         && s.len() <= 64
         && s.bytes()
             .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+}
+
+/// Whether `s` is safe to echo back as `hookEventName`.
+///
+/// Deliberately looser than [`is_bare_id`], and separate from it, because this
+/// value never reaches a filename — it only has to be bounded and free of
+/// anything that could break the envelope for a reader. Sharing the id charset
+/// would take the hook silently offline for any event Claude Code ever
+/// namespaces (`a.b`, `a:b`), with the failure looking like the feature simply
+/// not firing.
+fn is_echoable_event(s: &str) -> bool {
+    !s.is_empty() && s.len() <= 64 && !s.chars().any(char::is_control)
 }
 
 fn records_dir() -> Result<PathBuf> {
@@ -277,6 +417,29 @@ fn note_for(
     resolve: &dyn Fn() -> Option<String>,
 ) -> Option<String> {
     let path = record_path(&payload.session_id, payload.agent_id.as_deref()).ok()?;
+
+    // Peek UNLOCKED, only to decide whether the slow half is needed. `resolve`
+    // goes through `load_config`, which chmod-walks the whole `~/.clauth` tree,
+    // and that must never run inside the hold below.
+    let fresh = match load_record(&path) {
+        Some(peek) if peek.cache_holds(watch) => None,
+        // Stamped BEFORE the resolve, never after it and never at write time.
+        // The observation is no fresher than the moment it began, and both
+        // later instants overstate it: the lock wait sits after the resolve,
+        // and the resolve itself is milliseconds during which a peer can
+        // observe and land. Understating is the safe direction — it makes this
+        // fire DEFER to the record, which can only ever suppress a note, while
+        // overstating lets a stale reading announce the reversal.
+        _ => {
+            let taken_at = SystemTime::now();
+            Some((resolve(), taken_at))
+        }
+    };
+
+    let _hold = ScopeLock::acquire();
+    // Re-read INSIDE the hold. The peek above may be another writer's stale
+    // bytes: a scope is not one writer, since every main-thread parallel tool
+    // call fires with no `agent_id` and lands here.
     let stored = load_record(&path);
     let mut record = stored.clone().unwrap_or_else(|| NoteRecord {
         // A scope with no record of its own inherits the conversation's
@@ -289,19 +452,92 @@ fn note_for(
     if payload.transcript.is_some() {
         record.transcript = payload.transcript.clone();
     }
-    let current = if record.watch.as_ref() == Some(watch) {
-        record.resolved.clone()
-    } else {
-        let resolved = resolve();
-        record.watch = Some(watch.clone());
-        record.resolved = resolved.clone();
-        resolved
+    let current = match fresh {
+        // The cache still answers, and the copy under the lock outranks the peek.
+        None => record.resolved.clone(),
+        // A fire whose observation PREDATES the one already recorded is carrying
+        // the staler reading, whatever order the two reached the lock in:
+        // resolving happens outside the hold, so arrival order says nothing
+        // about observation order, and the 2 s lock wait widens that gap rather
+        // than closing it. Defer to the record, exactly as the cache-hit branch
+        // above does. Overwriting instead let a slow fire announce the reversal
+        // (`switched from cld to kerry` for a switch that never happened) and
+        // cache its stale answer for the whole TTL.
+        Some((_, taken_at)) if record.holds_a_newer_observation_than(taken_at) => {
+            record.resolved.clone()
+        }
+        Some((answer, taken_at)) => {
+            // Only an ATTRIBUTED answer is cached. See `NoteRecord::watch`.
+            if answer.is_some() {
+                record.watch = Some(watch.clone());
+                record.resolved = answer.clone();
+                record.resolved_at = Some(taken_at);
+            }
+            answer
+        }
     };
     let note = decide(payload, &mut record, current.as_deref());
-    if stored.as_ref() != Some(&record) {
-        let _ = store_record(&path, &record);
+    if stored.as_ref() != Some(&record) && store_record(&path, &record).is_err() {
+        // The record IS the suppression mechanism, so a note that cannot be
+        // remembered is re-emitted on every tool call for the life of the
+        // conversation. Keyed on the write failing at all rather than on any one
+        // cause: a full disk and a read-only tree reach this the same way.
+        // The log FILE, not `logline!`. This runs once per tool call, so a
+        // persistent failure through the routed sink lands on a hook's
+        // (non-terminal) stderr once per fire — the same unbounded flood this
+        // suppression exists to prevent, moved onto the channel Claude Code
+        // shows the user. The file is size-rotated; stderr is not.
+        crate::logline::to_logfile(format_args!(
+            "hook-note: cannot persist {}; staying silent",
+            path.display()
+        ));
+        return None;
     }
     note
+}
+
+/// An exclusive hold over the records dir for one read-modify-write.
+///
+/// A LEAF in the lock order: nothing is acquired while it is held, and the
+/// resolution that would reach `~/.clauth`'s own state lock runs before it. One
+/// lock file for the whole dir rather than one per scope, because the hold is a
+/// read plus a rename and the only contention is a fan-out's own fires, so
+/// per-scope granularity would buy nothing and add a second file to reap.
+///
+/// Failing to take it degrades to the pre-lock behaviour (a possible duplicate
+/// note) rather than to silence: a hook must not block a tool call on a lock.
+/// The deadline is also what keeps a NESTED acquisition soft — `flock` blocks a
+/// second fd in the same process, so a future caller that takes this around
+/// something already holding it degrades after the wait instead of hanging.
+/// Today there is no such nesting: `note_for` and `gc_conversation_records` are
+/// the only holders and neither reaches the other.
+struct ScopeLock {
+    /// Held open for the guard's lifetime and never read: closing the fd is what
+    /// releases the flock, so the binding IS the lock. Named like `StateLock`'s
+    /// own guards for the same reason.
+    _held: Option<std::fs::File>,
+}
+
+impl ScopeLock {
+    fn acquire() -> Self {
+        const WAIT: Duration = Duration::from_secs(2);
+        let held = (|| {
+            let dir = records_dir().ok()?;
+            crate::profile::mkdir_700(&dir).ok()?;
+            let file = crate::profile::open_state_file(&dir.join(".lock")).ok()?;
+            if let Err(e) = crate::lock::lock_file_with_timeout(&file, WAIT) {
+                // Never swallowed: proceeding unlocked is duplicate notes
+                // coming back, and without this the only diagnostic that
+                // exists is discarded and the degradation is silent.
+                crate::logline::to_logfile(format_args!(
+                    "hook-note: proceeding without the scope lock: {e}"
+                ));
+                return None;
+            }
+            Some(file)
+        })();
+        Self { _held: held }
+    }
 }
 
 /// What a scope firing for the first time treats as its starting account: the
@@ -323,12 +559,6 @@ fn decide(payload: &Payload, record: &mut NoteRecord, current: Option<&str>) -> 
     let current = current?;
     if payload.event == "SessionStart" {
         match payload.source.as_deref() {
-            // A fresh or cleared context carries no earlier turns to correct.
-            Some("startup" | "clear") => {
-                record.told = Some(current.to_string());
-                record.last_note = None;
-                return None;
-            }
             Some("resume") => {
                 return match record.told.as_deref() {
                     Some(before) if before != current => {
@@ -339,7 +569,21 @@ fn decide(payload: &Payload, record: &mut NoteRecord, current: Option<&str>) -> 
                         .render();
                         Some(tell(record, current, note))
                     }
-                    Some(_) => None,
+                    Some(_) => {
+                        // Same account across the restart. Drop whatever the
+                        // PREVIOUS process emitted, or a later compaction
+                        // re-announces a switch belonging to a process this
+                        // context never saw — and re-announces it every time.
+                        //
+                        // Rests on an UNVERIFIED premise: that hook-injected
+                        // `additionalContext` is not replayed into the resumed
+                        // context. If Claude Code does replay it, the context
+                        // did see that note and re-announcing was right. Nobody
+                        // has measured which; the behaviour is pinned either way
+                        // by `a_resume_on_the_same_account_drops_the_previous_processes_note`.
+                        record.last_note = None;
+                        None
+                    }
                     None => {
                         record.told = Some(current.to_string());
                         None
@@ -359,10 +603,27 @@ fn decide(payload: &Payload, record: &mut NoteRecord, current: Option<&str>) -> 
                         .render();
                         Some(tell(record, current, note))
                     }
-                    _ => record.last_note.clone(),
+                    Some(_) => record.last_note.clone(),
+                    None => {
+                        // A compaction before anything was ever told. There is
+                        // nothing to re-announce, and returning without setting
+                        // `told` would leave the scope baseline-less for another
+                        // fire.
+                        record.told = Some(current.to_string());
+                        None
+                    }
                 };
             }
-            _ => {}
+            // `startup`, `clear`, `fork`, and anything Claude Code adds later.
+            // A fresh context holds no earlier turns to correct, and every
+            // source added so far marks a context boundary — so an unrecognised
+            // one rebaselines rather than announcing a switch about turns that
+            // never existed.
+            _ => {
+                record.told = Some(current.to_string());
+                record.last_note = None;
+                return None;
+            }
         }
     }
     match record.told.as_deref() {
@@ -400,19 +661,58 @@ pub(crate) fn gc_conversation_records() {
     let Ok(dir) = records_dir() else {
         return;
     };
+    // Peek BEFORE locking, the way `gc_bare_markers` does and for the same
+    // reason: this runs at every `clauth mcp` boot and every `clauth start`, so
+    // nothing to sweep must not pay an acquisition. It also keeps the
+    // acquisition's `mkdir_700` off a box where the hook has never fired, which
+    // would otherwise grow a records dir and a lock file from a sweep alone.
+    let Ok(mut peek) = std::fs::read_dir(&dir) else {
+        return;
+    };
+    if peek.next().is_none() {
+        return;
+    }
+    // Under the same hold the writers take. Without it the sweep unlinks the
+    // very files `ScopeLock` serialises, so a reap landing inside a fire's
+    // read-modify-write drops that write on the floor.
+    //
+    // What the lock does NOT cover, measured rather than reasoned: the reap
+    // costs a live scope its baseline with ZERO concurrency involved
+    // (baseline, move, sweep, fire — the fire finds no record and rebaselines,
+    // swallowing that one account change). 40 concurrent trials against a
+    // fresh record announced 40/40; against a reap-eligible one, 0/40. So the
+    // loss is caused by the reap predicate and not by any interleave, and the
+    // deletion is self-undoing — the fire recreates the record immediately. The
+    // real guard belongs on the predicate (`docs/todo.md`); this lock was never
+    // going to cover it.
+    let _hold = ScopeLock::acquire();
     let Ok(entries) = std::fs::read_dir(&dir) else {
         return;
     };
     for entry in entries.flatten() {
         let path = entry.path();
-        let reap = match load_record(&path).and_then(|r| r.transcript) {
-            Some(transcript) => !transcript.exists(),
-            None => entry
+        // Records only. The dir also holds the `.lock` file and, for an instant,
+        // an `atomic_write_600` temp; reaping either would be a sweep deleting
+        // live machinery.
+        if path.extension().is_none_or(|ext| ext != "json") {
+            continue;
+        }
+        let age = || {
+            entry
                 .metadata()
                 .and_then(|m| m.modified())
                 .ok()
                 .and_then(|m| SystemTime::now().duration_since(m).ok())
-                .is_some_and(|age| age > ORPHAN_RECORD_MAX_AGE),
+        };
+        let reap = match load_record(&path).and_then(|r| r.transcript) {
+            // Grace, not a bare `!exists()`: a baseline recorded at
+            // `SessionStart` can land before Claude Code creates the transcript,
+            // and reaping it there loses the baseline, so the conversation's next
+            // real move is absorbed as a first fire and never announced.
+            Some(transcript) => {
+                !transcript.exists() && age().is_some_and(|a| a > MISSING_TRANSCRIPT_GRACE)
+            }
+            None => age().is_some_and(|a| a > ORPHAN_RECORD_MAX_AGE),
         };
         if reap {
             let _ = std::fs::remove_file(&path);

@@ -1096,7 +1096,11 @@ pub(crate) fn app_state_mtime() -> Option<SystemTime> {
 /// mtime-preserving restore, two edits within one coarse mtime tick). The
 /// `(name, None)` entries make a config.toml appearing/vanishing, or a whole
 /// profile dir being added/removed, shift it too.
-#[derive(Clone, PartialEq, Eq, Debug)]
+/// `Hash` is for a caller that must PERSIST this cheaply — `hook_note` stores it
+/// in a JSON record and this is not a serde type. Hashing is sound for that use
+/// because every consumer asks the same question the `Eq` impl does, "did any of
+/// this move", and never reads a component back.
+#[derive(Clone, PartialEq, Eq, Debug, Hash)]
 pub(crate) struct ReloadFingerprint {
     profiles_toml_mtime: Option<SystemTime>,
     /// `(profile dir name, config.toml mtime, session-token.json write time)`,
@@ -1155,7 +1159,7 @@ fn profiles_root() -> Result<PathBuf> {
     Ok(clauth_dir()?.join("profiles"))
 }
 
-pub(crate) fn app_state_path() -> Result<PathBuf> {
+fn app_state_path() -> Result<PathBuf> {
     Ok(clauth_dir()?.join("profiles.toml"))
 }
 

@@ -19,7 +19,7 @@ To wire the server by hand instead, add this to `mcpServers` in `~/.claude.json`
 "clauth": { "type": "stdio", "command": "clauth", "args": ["mcp"] }
 ```
 
-The TUI's Plugin tab writes exactly that entry for you with <kbd>f</kbd>. The manual route gives you the same four tools, minus the bundled hook that delivers backgrounded `delegate` results on its own: without the plugin, the session has to call `monitor`.
+The TUI's Plugin tab writes exactly that entry for you with <kbd>f</kbd>. The manual route gives you the same four tools, minus the bundled hooks. Without the plugin, a backgrounded `delegate` result has to be collected with `monitor`, and a conversation is never told when the account behind it changes.
 
 ## Tools
 
@@ -43,6 +43,16 @@ A `switch_profile` that runs never carries the digest for its own switch: the re
 `profiles({scope:"session"})` is the authority on which account owns the current session. The all-scope roster reads a cache and can lag it.
 
 `profiles` answers for every profile by default, and `names` narrows it to the ones you ask for. Six fields appear only when they have something to say: the live-session flag when a clauth-managed session already owns that profile, the throughput rows when a model there is degraded or was recently rate-limited, then `disabled`, `login expired` and `no api key`, the three states a `delegate` on that account is refused for, printed together so they read as one group. Last comes `subscription canceled`, which is not a refusal: it tells you the account dropped to whatever the free plan allows. An account whose endpoint sits on your own machine or your own network carries `local endpoint` in its bracket. The word says where the endpoint is, never who pays for it or whether it is your cheapest target. On a 27-profile fleet that reply is just over half the size it would otherwise be, which matters because the model is told to call it at the start of every session.
+
+### When the account behind a conversation changes
+
+A conversation can end up on a different account three ways, and none of them is visible from inside it. You resume it under another profile, which keeps the same conversation and appends to the same transcript. A `clauth switch` lands while a global session is working. A `clauth start --with-fallback` session swaps credentials mid-run. The first case has cost a real session a round of reasoning spent working out which account it was on.
+
+With the plugin installed, clauth says so. A resume reads ``clauth note: session resumed under `DS4`; earlier turns ran under `z.ai`.`` A move under a live conversation reads ``clauth note: the active profile for this conversation switched from `kerry` to `cld`.`` It arrives on the next prompt or the next tool call, whichever comes first, and separately for each subagent running at the time. It comes back once more after a compaction, which drops it along with everything else clauth injected.
+
+Nothing is said while the account holds still, so the usual cost is a stat of two files per tool call. clauth stays quiet when it cannot tell which of your accounts the loaded credentials belong to, rather than naming one it is guessing at.
+
+Where the connect brief names a `clauth start` session's runtime directory, it keeps naming the profile you launched on. That is the directory's name and it does not move. The note is what answers which account you are spending.
 
 ## `switch_profile` inside a session
 

@@ -37,7 +37,7 @@ Most account tools do one half. clauth pairs instant **switching between multipl
 - 📊 **Monitor** live 5h / 7d rate-limit bars, a global token dashboard with API-equivalent cost, plus a live Claude status-incident feed
 - 🤖 **Auto-switch** down a fallback chain the moment an account hits its limit, with weekly-window and spend-ceiling gates so a long run never stalls and never surprises you with a bill
 - 🧩 **Run in parallel**: several accounts at once in isolated config dirs, or a clean headless session with none of your global memory, plugins, or hooks
-- 🔌 **From inside Claude**: an MCP plugin lets a live session list, switch, or delegate a whole prompt (even headless) to another account
+- 🔌 **From inside Claude**: an MCP plugin lets a live session list, switch, or delegate a whole prompt (even headless) to another account, and tells a conversation when the account behind it changed
 - 🖥️ **Headless**: `clauth daemon` runs the refresh and auto-switch loop with no TUI and publishes `status.json` for a menu-bar app to read
 - 🛠️ **Quality-of-life**: browse and resume past sessions under any account, per-profile model routing, shell completions, signed self-updates, multi-instance safe
 

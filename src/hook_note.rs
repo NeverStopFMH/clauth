@@ -181,10 +181,6 @@ struct NoteRecord {
 }
 
 impl NoteRecord {
-    /// Whether the cached resolution still answers for `watch`: an account was
-    /// attributed, the stamped inputs have not moved, and the answer is younger
-    /// than [`RESOLUTION_TTL`]. All three, because the stamp alone has been
-    /// measured to miss an input and a miss it cannot see is unbounded.
     /// Whether the record already holds an observation at least as new as
     /// `taken_at` — and one taken in the PAST.
     ///
@@ -206,6 +202,10 @@ impl NoteRecord {
             .is_some_and(|held| held >= taken_at && held <= SystemTime::now())
     }
 
+    /// Whether the cached resolution still answers for `watch`: an account was
+    /// attributed, the stamped inputs have not moved, and the answer is younger
+    /// than [`RESOLUTION_TTL`]. All three, because the stamp alone has been
+    /// measured to miss an input and a miss it cannot see is unbounded.
     fn cache_holds(&self, watch: &Watch) -> bool {
         self.resolved.is_some()
             && self.watch.as_ref() == Some(watch)
@@ -424,12 +424,23 @@ fn note_for(
     let fresh = match load_record(&path) {
         Some(peek) if peek.cache_holds(watch) => None,
         // Stamped BEFORE the resolve, never after it and never at write time.
-        // The observation is no fresher than the moment it began, and both
-        // later instants overstate it: the lock wait sits after the resolve,
-        // and the resolve itself is milliseconds during which a peer can
-        // observe and land. Understating is the safe direction — it makes this
-        // fire DEFER to the record, which can only ever suppress a note, while
-        // overstating lets a stale reading announce the reversal.
+        // Both later instants overstate the observation: the lock wait sits
+        // after the resolve, and the resolve itself is milliseconds during
+        // which a peer can observe and land.
+        //
+        // NOT a total guarantee, and do not read it as one. `taken_at` means
+        // "when I started looking" and is only a PROXY for "when I looked". It
+        // is right for the shape that matters — a fire that started earlier and
+        // finished later now defers — but inverts when two fires start together
+        // and read opposite sides of a switch landing inside their resolve
+        // windows, where the staler reading can carry the later stamp and still
+        // announce the reversal. Measured only as a MECHANISM, since the rate a
+        // harness reports for it tracks its own spawn order rather than
+        // production. The exposure is the resolve window (~1.5-3 ms) against the
+        // up-to-2 s lock wait this replaced, and it self-corrects at the TTL.
+        // Closing it means stamping inside `resolve_account` around the
+        // credential read, which is more invasive than the residual deserves
+        // (`docs/todo.md`).
         _ => {
             let taken_at = SystemTime::now();
             Some((resolve(), taken_at))
@@ -666,6 +677,10 @@ pub(crate) fn gc_conversation_records() {
     // nothing to sweep must not pay an acquisition. It also keeps the
     // acquisition's `mkdir_700` off a box where the hook has never fired, which
     // would otherwise grow a records dir and a lock file from a sweep alone.
+    //
+    // The early return covers a VIRGIN tree only: `.lock` is permanent once any
+    // hook has fired, so a box with zero records still counts one entry and
+    // still pays. Sub-ms uncontended, and the same shape the sibling has.
     let Ok(mut peek) = std::fs::read_dir(&dir) else {
         return;
     };

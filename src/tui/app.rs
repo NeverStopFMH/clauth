@@ -3255,6 +3255,13 @@ fn recompute_plugin_checks(app: &mut App, refresh_version: bool) {
 
     app.plugin.error = None;
 
+    // `r` means re-probe everything, so the fleet tally the runtime row folds in
+    // is re-collected here instead of read at whatever age the tick left it.
+    if refresh_version {
+        app.last_live_sessions_refresh = None;
+        poll_live_sessions(app);
+    }
+
     // CC version is cached; a tab switch reuses it, only `r` re-probes. Skipped
     // under test so the suite never spawns the real `claude` binary.
     if refresh_version || app.plugin.cc_version.is_none() {
@@ -3534,14 +3541,11 @@ fn recompute_plugin_checks(app: &mut App, refresh_version: bool) {
     let mut active_fix: Option<PluginFix> = None;
     let mut active_bad = false; // diverged / missing / unknown link
 
-    // One registry read for the whole fleet. `runtime::live_session_count`
-    // cannot answer this: it dedupes markers by name WITHIN a profile but not
-    // across them, so a session that swapped A→B is counted under both and named
-    // twice — and A is a wrong answer, not a changed one, since nothing
-    // authenticates as it (`docs/plan/multi-session-fallback.md` §14). Its other
-    // consumers ask "does a session own this account's chain", which stays true
-    // under both markers.
-    let tally = crate::live_sessions::LiveTally::collect(&app.config());
+    // The tick's fleet tally, never a second sweep: this row and the Overview's
+    // `live` column answer one question, and two independent reads of it can
+    // disagree inside a frame. Up to one `poll_live_sessions` interval stale,
+    // which `r` closes by re-collecting above.
+    let tally = &app.live_sessions;
     for snap in snaps {
         let instances = tally.member(&snap.name).sessions;
         live_sessions += instances;
@@ -8615,8 +8619,10 @@ pub(crate) fn on_tick(app: &mut App) {
     maybe_spawn_bootstrap(app);
 
     poll_credentials_divergence(app);
-    poll_plugin_refresh(app);
+    // Before the plugin refresh, which folds the tally into its runtime row and
+    // would otherwise render this tick against the previous one's fleet.
     poll_live_sessions(app);
+    poll_plugin_refresh(app);
     poll_daemon_health(app);
 
     update_banner(app);

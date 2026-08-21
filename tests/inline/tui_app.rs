@@ -327,6 +327,10 @@ fn runtime_check_summarizes_profiles() {
 /// counts therefore reports one child as two sessions and names an account
 /// nothing authenticates as — A is the wrong answer, not a changed one. Only the
 /// registry can tell the two apart.
+///
+/// Driven through `r` (`refresh_version`), the one path that re-collects the
+/// fleet tally instead of folding in whatever the tick last left in
+/// `app.live_sessions` — so this also pins that `r` re-reads the registry.
 #[test]
 fn runtime_check_counts_a_swapped_session_once_on_the_member_it_moved_to() {
     use crate::profile::{AppConfig, AppState, Profile};
@@ -340,20 +344,9 @@ fn runtime_check_counts_a_swapped_session_once_on_the_member_it_moved_to() {
     });
 
     let sid = "4242-0";
-    let row = crate::live_sessions::LiveSession {
-        session_id: sid.to_string(),
-        start_profile: "swap-a".to_string(),
-        pid: 4242,
-        started_at: 1_700_000_000_000,
-        cwd: None,
-        isolated: false,
-        follows_chain: true,
-        intended_member: None,
-        chain_cursor: None,
-        current_member: Some("swap-b".to_string()),
-        last_swap_at: Some(1_700_000_060_000),
-        launch_store: None,
-    };
+    let mut row = crate::testutil::live_row(sid, "swap-a");
+    row.current_member = Some("swap-b".to_string());
+    row.last_swap_at = Some(1_700_000_060_000);
     crate::live_sessions::register(&row).expect("register row");
     // Both markers, exactly as a swapped session holds them.
     let _launch = crate::runtime::hold_session_row_marker("swap-a", false, sid)
@@ -361,7 +354,7 @@ fn runtime_check_counts_a_swapped_session_once_on_the_member_it_moved_to() {
     let _landed = crate::runtime::hold_session_row_marker("swap-b", false, sid)
         .expect("hold the swapped-onto member's marker");
 
-    super::recompute_plugin_checks(&mut app, false);
+    super::recompute_plugin_checks(&mut app, true);
 
     let check = app
         .plugin
@@ -387,6 +380,46 @@ fn runtime_check_counts_a_swapped_session_once_on_the_member_it_moved_to() {
     assert!(
         !check.detail.iter().any(|l| l == "  swap-a"),
         "nothing authenticates as the launch member any more, got {:?}",
+        check.detail
+    );
+}
+
+/// The runtime row folds in the tally the tick already collected, never a sweep
+/// of its own: `LiveTally::collect` is two readdirs plus an `open` + `try_lock`
+/// per row plus a credential read, and the render thread ran it once a second
+/// for an answer `poll_live_sessions` had put in `app.live_sessions` the same
+/// tick. Two independent derivations of one number can also disagree inside a
+/// frame, which no amount of caching fixes.
+///
+/// The seeded fleet is one the registry does NOT hold, so a recompute that
+/// collects again reports an empty fleet and reds here.
+#[test]
+fn the_runtime_check_reads_the_ticks_tally_rather_than_sweeping_again() {
+    use crate::profile::{AppConfig, AppState, Profile};
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = App::new(AppConfig {
+        state: AppState::default(),
+        profiles: vec![Profile::new("acct".to_string(), None, None)],
+    });
+    app.live_sessions =
+        crate::live_sessions::LiveTally::of([crate::testutil::live_row("4242-0", "acct")]);
+
+    super::recompute_plugin_checks(&mut app, false);
+
+    let check = app
+        .plugin
+        .checks
+        .iter()
+        .find(|c| c.label == "runtime")
+        .expect("runtime check");
+    assert_eq!(
+        check
+            .detail
+            .iter()
+            .find(|l| l.starts_with("live:"))
+            .map(String::as_str),
+        Some("live: 1 across 1 account"),
+        "the row renders the tick's tally, got {:?}",
         check.detail
     );
 }
@@ -6502,7 +6535,8 @@ fn runtime_check_names_a_multi_session_account_with_its_count() {
         );
     }
 
-    super::recompute_plugin_checks(&mut app, false);
+    // `r`, the one path that re-collects the fleet tally these rows seed.
+    super::recompute_plugin_checks(&mut app, true);
 
     let check = app
         .plugin
@@ -6564,7 +6598,8 @@ fn runtime_check_says_one_account_when_every_live_session_shares_it() {
         );
     }
 
-    super::recompute_plugin_checks(&mut app, false);
+    // `r`, the one path that re-collects the fleet tally these rows seed.
+    super::recompute_plugin_checks(&mut app, true);
 
     let check = app
         .plugin

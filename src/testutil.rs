@@ -645,6 +645,26 @@ pub(crate) const ALIBABA_NO_BARS_CACHE_BYTES: &str = r#"{"is_available":true,"ro
 /// every bar carries the same five fields parses this one wrong.
 pub(crate) const THIRD_PARTY_BARS_CACHE_BYTES: &str = r#"{"is_available":true,"rows":[{"label":"30d","value":"","kind":"heading"},{"label":"search-prime","value":"12 / 100","kind":"body"},{"label":"web-reader","value":"3 / 100","kind":"body"},{"label":"zread","value":"0 / 50","kind":"body"},{"label":"7d tokens","value":"","kind":"heading"},{"label":"GLM-5.3","value":"80.1M","kind":"body"},{"label":"GLM-5.2","value":"40.2M","kind":"body"},{"label":"GLM-4.7","value":"3.1M","kind":"body"},{"label":"total","value":"123.4M  (1.2k calls)","kind":"faint"}],"bars":[{"label":"5h","pct":12.5,"resets_at":"2026-08-15T12:00:00Z"},{"label":"7d","pct":48.0,"resets_at":"2026-08-20T00:00:00Z"},{"label":"30d","pct":3.0,"resets_at":"2026-09-01T00:00:00Z","used":123.4,"total":4000.0}],"plan":"pro","best_effort":false}"#;
 
+/// A live-session registry row with every field a fixture rarely varies already
+/// filled: one non-isolated, chain-following session of `profile` that has never
+/// swapped. Callers override the fields their case is actually about.
+pub(crate) fn live_row(session_id: &str, profile: &str) -> crate::live_sessions::LiveSession {
+    crate::live_sessions::LiveSession {
+        session_id: session_id.to_owned(),
+        start_profile: profile.to_owned(),
+        pid: 4242,
+        started_at: 1_700_000_000_000,
+        cwd: None,
+        isolated: false,
+        follows_chain: true,
+        intended_member: None,
+        chain_cursor: None,
+        current_member: None,
+        last_swap_at: None,
+        launch_store: None,
+    }
+}
+
 /// Overwrite a file's modification time — for cache-staleness / tie-break tests.
 pub(crate) fn set_mtime(path: &Path, when: SystemTime) {
     let file = std::fs::OpenOptions::new()

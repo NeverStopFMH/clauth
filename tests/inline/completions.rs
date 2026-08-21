@@ -553,7 +553,7 @@ fn lint_failure(shell: &str, bin: &str, script: &str, out: &std::process::Output
          This ships verbatim — `clauth completions install {shell}` writes it and sources it \
          from the user's rc, so a parse error here kills completion for the ENTIRE clauth \
          command, not just the new verb.\n{bin} said:\n{}\n",
-        out.status.code().map_or(-1, |c| c),
+        out.status.code().unwrap_or(-1),
         String::from_utf8_lossy(&out.stderr),
     );
     if shell == "zsh" {

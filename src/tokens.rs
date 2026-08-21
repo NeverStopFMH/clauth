@@ -539,18 +539,19 @@ pub(crate) fn load_base(claude_dir: &Path) -> Option<TokenStats> {
         }
     }
 
-    let total_input: u64 = wire.model_usage.values().map(|u| u.input_tokens).sum();
-    let total_output: u64 = wire.model_usage.values().map(|u| u.output_tokens).sum();
-    let total_cache_read: u64 = wire
-        .model_usage
-        .values()
-        .map(|u| u.cache_read_input_tokens)
-        .sum();
-    let total_cache_create: u64 = wire
-        .model_usage
-        .values()
-        .map(|u| u.cache_creation_input_tokens)
-        .sum();
+    // Off `models`, which already carries every `model_usage` row: one pass over
+    // a built Vec rather than four over the map.
+    let (total_input, total_output, total_cache_read, total_cache_create) = models.iter().fold(
+        (0u64, 0u64, 0u64, 0u64),
+        |(input, output, read, create), m| {
+            (
+                input + m.input,
+                output + m.output,
+                read + m.cache_read,
+                create + m.cache_create,
+            )
+        },
+    );
 
     let stats = TokenStats {
         models,

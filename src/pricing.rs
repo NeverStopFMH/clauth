@@ -41,8 +41,10 @@
 //! Tokens tab's `count_cache` display toggle. Models with no matching rate
 //! (unknown / unpriced providers) contribute nothing and are surfaced as such.
 
+use std::collections::HashMap;
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 use std::sync::mpsc::{Receiver, Sender};
 use std::time::Duration;
 
@@ -212,14 +214,34 @@ pub(crate) struct HourTokens {
 /// Resolved price table: the newest snapshot's models, the full snapshot
 /// history (oldest first), and the wall-clock time the feed was fetched (for a
 /// freshness badge).
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub(crate) struct PriceTable {
     /// Latest snapshot's models — the working set for "today" queries.
     models: Vec<PricedModel>,
-    /// Oldest-first snapshot history; [`PriceTable::snapshot_for`] picks the
+    /// Oldest-first snapshot history; [`PriceTable::models_for`] picks the
     /// one applicable to a query date.
     history: Vec<RateSnapshot>,
     pub(crate) fetched_at_ms: u64,
+    /// Memoized match walks (see [`Memo`]). A table is immutable once built, so
+    /// a remembered index cannot go stale.
+    memo: Mutex<Memo>,
+}
+
+/// Match walks already done, `date → model id → index into the slice
+/// [`PriceTable::models_for`] serves that date`.
+///
+/// A walk lowercases the id and scans every model's clause once per candidate
+/// form, and the cost lens asks for the same `(id, date)` at all 24 hours of a
+/// day on every frame — the weekly lens measured `days × 24` walks per model per
+/// frame on 2026-08-20. The pick is hour-independent (a clause chooses the
+/// MODEL, an entry's constraint chooses that model's RATE), so one walk answers
+/// every hour, and the memo carries it across frames.
+#[derive(Debug, Default)]
+struct Memo {
+    by_date: HashMap<String, HashMap<String, Option<usize>>>,
+    /// Cold walks performed. The memo's only observable, so the tests that pin
+    /// "once per (model, date)" have something to count.
+    walks: usize,
 }
 
 impl PriceTable {
@@ -257,6 +279,7 @@ impl PriceTable {
             models,
             history,
             fetched_at_ms,
+            memo: Mutex::default(),
         }
     }
 
@@ -281,47 +304,42 @@ impl PriceTable {
     /// names stays unpriced: `glm-4.7-flash-20250801` strips to
     /// `glm-4.7-flash`, which the feed carries no rate for today.
     ///
+    /// Steps 1-2 and the retry ladder are [`ladder_index`], memoized per
+    /// `(id, date)`; step 3 is [`entry_rate`], the only half the hour reaches.
+    ///
     /// Rates come from the snapshot live on `date` (see
-    /// [`PriceTable::snapshot_for`]); `None` when no model matches.
+    /// [`PriceTable::models_for`]); `None` when no model matches.
     pub(crate) fn rate_at(&self, model: &str, date: &str, hour: u8) -> Option<ModelRate> {
         let models = self.models_for(date)?;
-        // Primary form: the id as shipped. The bracket strip applies here and
-        // here only — a retried form is not re-stripped.
-        let mut candidate = strip_bracket_suffix(model);
-        if let Some(rate) = resolve(models, candidate, date, hour) {
-            return Some(rate);
+        let priced = models.get(self.matched_index(models, model, date)?)?;
+        entry_rate(priced, date, hour)
+    }
+
+    /// Which [`PricedModel`] of `models` the candidate ladder picks for `model`,
+    /// answered from [`Memo`] when the same `(id, date)` has been asked before.
+    /// A poisoned memo walks rather than failing a price — it holds derived
+    /// state and nothing else.
+    fn matched_index(&self, models: &[PricedModel], model: &str, date: &str) -> Option<usize> {
+        let Ok(mut memo) = self.memo.lock() else {
+            return ladder_index(models, model);
+        };
+        if let Some(hit) = memo.by_date.get(date).and_then(|by_id| by_id.get(model)) {
+            return *hit;
         }
-        // (a) Colon strip: `minimax/minimax-m2.5:free` → `minimax/minimax-m2.5`.
-        // The rest of the ladder continues from the stripped form, like the
-        // old walk's "retry exact, continue with the stripped id".
-        if let Some(idx) = candidate.find(':') {
-            candidate = &candidate[..idx];
-            if let Some(rate) = resolve(models, candidate, date, hour) {
-                return Some(rate);
-            }
-        }
-        // (b) Leading provider-segment strip: one `id/` segment at a time, up
-        // to two, retrying each intermediate (`openrouter/anthropic/
-        // claude-opus-5` → `anthropic/claude-opus-5` → `claude-opus-5`).
-        for _ in 0..2 {
-            let Some((_, rest)) = candidate.split_once('/') else {
-                break;
-            };
-            candidate = rest;
-            if let Some(rate) = resolve(models, candidate, date, hour) {
-                return Some(rate);
-            }
-        }
-        // (c) Trailing date-stamp strip: while the id ends in `-<8 digits>`,
-        // drop that group and retry (`glm-4.7-flash-20250801` →
-        // `glm-4.7-flash`; repeated for stacked stamps).
-        while let Some(head) = strip_date_stamp(candidate) {
-            candidate = head;
-            if let Some(rate) = resolve(models, candidate, date, hour) {
-                return Some(rate);
-            }
-        }
-        None
+        let found = ladder_index(models, model);
+        memo.walks += 1;
+        memo.by_date
+            .entry(date.to_owned())
+            .or_default()
+            .insert(model.to_owned(), found);
+        found
+    }
+
+    /// Cold match walks performed so far — what pins the memo, since a warm
+    /// answer is otherwise indistinguishable from a repeated walk.
+    #[cfg(test)]
+    fn walks(&self) -> usize {
+        self.memo.lock().expect("memo lock").walks
     }
 
     /// The models applicable to `date`: the newest snapshot with `captured <=
@@ -366,9 +384,11 @@ impl PriceTable {
         date: &str,
         hours: &[HourTokens; 24],
     ) -> Option<f64> {
+        let models = self.models_for(date)?;
+        let priced = models.get(self.matched_index(models, model, date)?)?;
         let mut total = 0.0;
         for (hour, h) in hours.iter().enumerate() {
-            let r = self.rate_at(model, date, hour as u8)?;
+            let r = entry_rate(priced, date, hour as u8)?;
             total += h.input as f64 * r.input
                 + h.output as f64 * r.output
                 + h.cache_read as f64 * r.cache_read
@@ -380,13 +400,63 @@ impl PriceTable {
 
 // ── Resolution helpers ──────────────────────────────────────────────────────
 
-/// One candidate form through the full match walk: lowercase, first
-/// [`PricedModel`] in distilled order whose clause holds, then the
-/// reversed-entry price selection. Shared by [`PriceTable::rate_at`]'s primary
-/// form and every retry form.
-fn resolve(models: &[PricedModel], id: &str, date: &str, hour: u8) -> Option<ModelRate> {
+/// The candidate-form ladder: which [`PricedModel`] of `models` prices `id`.
+/// Hour-independent, which is what lets [`Memo`] answer for all 24 hours of a
+/// day; [`PriceTable::rate_at`] documents the ladder itself.
+fn ladder_index(models: &[PricedModel], id: &str) -> Option<usize> {
+    // Primary form: the id as shipped. The bracket strip applies here and here
+    // only — a retried form is not re-stripped.
+    let mut candidate = strip_bracket_suffix(id);
+    if let Some(i) = form_index(models, candidate) {
+        return Some(i);
+    }
+    // (a) Colon strip: `minimax/minimax-m2.5:free` → `minimax/minimax-m2.5`.
+    // The rest of the ladder continues from the stripped form, like the old
+    // walk's "retry exact, continue with the stripped id".
+    if let Some(idx) = candidate.find(':') {
+        candidate = &candidate[..idx];
+        if let Some(i) = form_index(models, candidate) {
+            return Some(i);
+        }
+    }
+    // (b) Leading provider-segment strip: one `id/` segment at a time, up to
+    // two, retrying each intermediate (`openrouter/anthropic/claude-opus-5` →
+    // `anthropic/claude-opus-5` → `claude-opus-5`).
+    for _ in 0..2 {
+        let Some((_, rest)) = candidate.split_once('/') else {
+            break;
+        };
+        candidate = rest;
+        if let Some(i) = form_index(models, candidate) {
+            return Some(i);
+        }
+    }
+    // (c) Trailing date-stamp strip: while the id ends in `-<8 digits>`, drop
+    // that group and retry (`glm-4.7-flash-20250801` → `glm-4.7-flash`;
+    // repeated for stacked stamps).
+    while let Some(head) = strip_date_stamp(candidate) {
+        candidate = head;
+        if let Some(i) = form_index(models, candidate) {
+            return Some(i);
+        }
+    }
+    None
+}
+
+/// One candidate form through the match walk: lowercase, then the first
+/// [`PricedModel`] in distilled order whose clause holds. A match carrying no
+/// price entries prices nothing, so it fails the form and the ladder moves on —
+/// what the rate-returning walk did when its entry pick came back empty-handed.
+fn form_index(models: &[PricedModel], id: &str) -> Option<usize> {
     let lowered = id.to_lowercase();
-    let priced = models.iter().find(|m| m.match_.matches(&lowered))?;
+    let idx = models.iter().position(|m| m.match_.matches(&lowered))?;
+    (!models.get(idx)?.prices.is_empty()).then_some(idx)
+}
+
+/// What one matched model charges at `(date, hour)`: entries in REVERSE order,
+/// the first whose constraint is `None` or active, falling back to `prices[0]`.
+/// The only half of resolution the hour reaches.
+fn entry_rate(priced: &PricedModel, date: &str, hour: u8) -> Option<ModelRate> {
     let entry = priced
         .prices
         .iter()
@@ -830,6 +900,7 @@ fn load_cache(path: &Path) -> Option<PriceTable> {
         models,
         history: cache.history,
         fetched_at_ms: cache.fetched_at_ms,
+        memo: Mutex::default(),
     })
 }
 

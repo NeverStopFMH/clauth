@@ -44,6 +44,7 @@ fn table(models: Vec<PricedModel>) -> PriceTable {
             models,
         }],
         fetched_at_ms: 0,
+        memo: Mutex::default(),
     }
 }
 
@@ -715,6 +716,7 @@ fn snapshot_picks_rate_live_on_date() {
         models: history[1].models.clone(),
         history,
         fetched_at_ms: 0,
+        memo: Mutex::default(),
     };
     let input = |date: &str| t.rate_at("m", date, 0).map(|r| r.input);
     assert_eq!(input("2026-05-31"), Some(1e-6)); // day before the change
@@ -812,6 +814,7 @@ fn cache_round_trip_preserves_history() {
         models: history[1].models.clone(),
         history,
         fetched_at_ms: 12345,
+        memo: Mutex::default(),
     };
     let path = sandbox
         .home()
@@ -1001,6 +1004,7 @@ fn cost_at_uses_dated_rate() {
         models: history[1].models.clone(),
         history,
         fetched_at_ms: 0,
+        memo: Mutex::default(),
     };
     let m = model("m", 1_000_000, 0, 0, 0);
     assert!((t.cost_at(&m, "2026-05-01", 0).expect("priced") - 1.0).abs() < 1e-9);
@@ -1023,4 +1027,108 @@ fn cost_day_prices_each_hour_at_its_rate() {
 
     // An unpriced model is None even with tokens on the clock.
     assert!(t.cost_day("unknown", "2026-08-19", &hours).is_none());
+}
+
+// ── memo ─────────────────────────────────────────────────────────────────────
+
+#[test]
+fn the_cost_lens_walks_each_model_and_date_once() {
+    // The weekly lens' shape: `render::tokens::day_cost_split` prices each of a
+    // day's 24 hours through `rate_at`, for every model, every day, on every
+    // frame. The match walk is hour-independent, so a week of that is one walk
+    // per (model, date) however many hours and frames ask for it.
+    let models = || vec![two_window_model(), eq_model("m", 1e-6, 2e-6)];
+    let ids = ["deepseek-v4-pro", "m"];
+    let week: Vec<String> = (19..=25).map(|d| format!("2026-08-{d}")).collect();
+    let frame = |t: &PriceTable| -> f64 {
+        let mut usd = 0.0;
+        for date in &week {
+            for id in ids {
+                for hour in 0..24u8 {
+                    usd += t.rate_at(id, date, hour).expect("priced").input;
+                }
+            }
+        }
+        usd
+    };
+
+    let t = table(models());
+    let first = frame(&t);
+    assert_eq!(t.walks(), 14, "one walk per (model, date), never per hour");
+    let second = frame(&t);
+    assert_eq!(t.walks(), 14, "and the next frame walks nothing at all");
+    assert!((first - second).abs() < 1e-15, "{first} vs {second}");
+
+    // The figures a table that remembers nothing produces, one query at a time.
+    let mut cold = 0.0;
+    for date in &week {
+        for id in ids {
+            for hour in 0..24u8 {
+                cold += table(models())
+                    .rate_at(id, date, hour)
+                    .expect("priced")
+                    .input;
+            }
+        }
+    }
+    assert!((first - cold).abs() < 1e-15, "{first} vs {cold}");
+
+    // And `cost_day`, which resolves the model once and prices 24 hours off it,
+    // lands on the same total as 24 separate `rate_at` calls.
+    let mut hours = [HourTokens::default(); 24];
+    for h in &mut hours {
+        h.input = 1_000_000;
+    }
+    let mut day = 0.0;
+    let mut per_hour = 0.0;
+    for id in ids {
+        day += t.cost_day(id, &week[0], &hours).expect("priced");
+        for hour in 0..24u8 {
+            per_hour += t.rate_at(id, &week[0], hour).expect("priced").input * 1_000_000.0;
+        }
+    }
+    assert!((day - per_hour).abs() < 1e-9, "{day} vs {per_hour}");
+}
+
+#[test]
+fn an_unpriced_id_is_remembered_as_unpriced() {
+    // A miss costs the FULL ladder — every candidate form against every clause —
+    // so it is the walk least worth repeating. Unpriced ids reach the lens on
+    // every frame too: a local fine-tune the feed carries no rate for.
+    let t = table(vec![eq_model("m", 1e-6, 2e-6)]);
+    assert!(t.rate_at("qwable-9b", "2026-08-19", 0).is_none());
+    assert_eq!(t.walks(), 1);
+    assert!(t.rate_at("qwable-9b", "2026-08-19", 7).is_none());
+    assert_eq!(t.walks(), 1, "the miss is remembered, not re-walked");
+}
+
+#[test]
+fn the_memo_keys_on_the_date_so_two_snapshots_do_not_bleed() {
+    // The same id sits at a different offset in each era's snapshot. Remembering
+    // it by id alone would price the June query at January's offset, which here
+    // is a different model at 9× the rate.
+    let history = vec![
+        RateSnapshot {
+            captured: "2026-01-01".to_owned(),
+            models: vec![eq_model("m", 1e-6, 2e-6)],
+        },
+        RateSnapshot {
+            captured: "2026-06-01".to_owned(),
+            models: vec![eq_model("other", 9e-6, 9e-6), eq_model("m", 2e-6, 4e-6)],
+        },
+    ];
+    let t = PriceTable {
+        models: history[1].models.clone(),
+        history,
+        fetched_at_ms: 0,
+        memo: Mutex::default(),
+    };
+    let input = |date: &str| t.rate_at("m", date, 0).map(|r| r.input);
+    assert_eq!(input("2026-05-31"), Some(1e-6));
+    assert_eq!(input("2026-06-01"), Some(2e-6));
+    assert_eq!(
+        t.walks(),
+        2,
+        "one walk per date, since the snapshots differ"
+    );
 }

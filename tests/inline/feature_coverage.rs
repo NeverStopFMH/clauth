@@ -103,9 +103,12 @@ const FEATURE_MAP: &[(&str, &[&str])] = &[
         ],
     ),
     (
-        // the MCP server's tools, plus the Plugin tab that proves the wiring.
+        // the MCP server's tools, the bundled hooks, plus the Plugin tab that
+        // proves the wiring.
         "From inside Claude",
         &[
+            "every_bundled_hook_command_parses_as_a_subcommand",
+            "the_first_fire_is_a_baseline_and_a_move_is_announced_once",
             "installed_records",
             "marketplace_known",
             "manual_mcp_wiring",

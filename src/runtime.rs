@@ -709,12 +709,14 @@ pub(crate) fn live_bare_sessions() -> Option<usize> {
 /// mid-acquire holding the lock — is never collected.
 ///
 /// The marker sweeps are siblings of the tree sweep rather than its tail: an
-/// unreadable `profiles/` says nothing about a registry row or a bare session's
-/// marker, and folding them in would have skipped both on that return.
+/// unreadable `profiles/` says nothing about a registry row, a bare session's
+/// marker, or a conversation record, and folding them in would have skipped
+/// every one of them on that return.
 pub(crate) fn gc_stale_runtimes() {
     gc_runtime_trees();
     gc_live_session_rows();
     gc_bare_markers();
+    crate::hook_note::gc_conversation_records();
 }
 
 fn gc_runtime_trees() {

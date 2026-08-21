@@ -8,6 +8,7 @@ mod daemon;
 mod fallback;
 mod format;
 mod herdr;
+mod hook_note;
 mod jobs_cli;
 mod jsonsync;
 // macOS-only: Claude Code reads its login from the Keychain, not the credentials
@@ -188,6 +189,7 @@ fn dispatch(cli: Cli) -> Result<()> {
         } => daemon::status_oneshot(all || disabled),
         Command::Mcp => mcp::serve(),
         Command::McpAwaitJob => mcp::await_job(),
+        Command::HookProfileChangedNote => hook_note::run(),
         Command::Complete => {
             completions::print_profile_names();
             Ok(())

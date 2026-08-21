@@ -301,6 +301,12 @@ pub(crate) enum Command {
     #[command(hide = true)]
     McpAwaitJob,
 
+    /// The bundled UserPromptSubmit / PostToolUse / SessionStart hook body: read
+    /// the hook payload on stdin and tell the conversation when the account
+    /// behind it changed.
+    #[command(hide = true)]
+    HookProfileChangedNote,
+
     /// Not a command. Kept only to redirect anyone who guesses it.
     #[command(hide = true)]
     Run {

@@ -69,8 +69,24 @@ pub(crate) fn run(json: bool) -> Result<()> {
 /// profile, returning an owned name plus the branch that matched, or `None` when
 /// nothing matched. Shared by `clauth which` and the MCP `which` tool.
 pub(crate) fn resolve_active(config: &AppConfig) -> Option<(String, Source)> {
-    let config_dir = std::env::var_os("CLAUDE_CONFIG_DIR").map(PathBuf::from);
-    resolve_at(config, config_dir.as_deref())
+    resolve_at(config, session_config_dir().as_deref())
+}
+
+/// The config dir THIS process's session reads. One derivation so a caller that
+/// wants the INPUT to [`resolve_active`] cannot read a different env than the
+/// resolution does.
+fn session_config_dir() -> Option<PathBuf> {
+    std::env::var_os("CLAUDE_CONFIG_DIR").map(PathBuf::from)
+}
+
+/// The credentials file [`resolve_active`] reads for this process's session.
+///
+/// Exposed so a caller can stat the resolution's input instead of redoing the
+/// resolution: the swap executor moves that file's mtime by construction
+/// (`runtime::touch_store` — Claude Code re-reads only when it moves), so an
+/// unmoved stamp is evidence the attributed account cannot have changed with it.
+pub(crate) fn active_credentials_path() -> Option<PathBuf> {
+    credentials_path(session_config_dir().as_deref()).ok()
 }
 
 /// Which profile owns the GLOBAL `~/.claude/.credentials.json` — the file a bare

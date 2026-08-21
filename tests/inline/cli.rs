@@ -748,14 +748,20 @@ fn theme_accepts_both_spellings_ahead_of_a_subcommand() {
 
 // ── the hidden entry points ─────────────────────────────────────────────────
 
-/// The three internal entry points must still dispatch when invoked directly
-/// (CC's `apiKeyHelper`, the bundled `asyncRewake` hook, and the completion
-/// scripts' name shellout all run them by name) while staying out of every
-/// help surface.
+/// The four internal entry points must still dispatch when invoked directly
+/// (CC's `apiKeyHelper`, the bundled `asyncRewake` hook, the bundled
+/// profile-change note hook, and the completion scripts' name shellout all run
+/// them by name) while staying out of every help surface. The spelling is the
+/// contract: `plugins/hooks/hooks.json` invokes two of them by the exact string
+/// clap derives from the variant name.
 #[test]
 fn hidden_entry_points_parse_but_never_appear_in_help() {
     assert!(matches!(command(&["__complete"]), Command::Complete));
     assert!(matches!(command(&["mcp-await-job"]), Command::McpAwaitJob));
+    assert!(matches!(
+        command(&["hook-profile-changed-note"]),
+        Command::HookProfileChangedNote
+    ));
     match command(&["__api-key", "acme"]) {
         Command::ApiKey { profile } => assert_eq!(profile, "acme"),
         other => panic!("__api-key must parse, got {other:?}"),
@@ -764,7 +770,12 @@ fn hidden_entry_points_parse_but_never_appear_in_help() {
 
     let help = Cli::command().render_help().to_string();
     let long = Cli::command().render_long_help().to_string();
-    for hidden in ["__complete", "__api-key", "mcp-await-job"] {
+    for hidden in [
+        "__complete",
+        "__api-key",
+        "mcp-await-job",
+        "hook-profile-changed-note",
+    ] {
         assert!(
             !help.contains(hidden) && !long.contains(hidden),
             "{hidden} must stay out of both help surfaces"
@@ -774,6 +785,38 @@ fn hidden_entry_points_parse_but_never_appear_in_help() {
         !help.contains("\n  run "),
         "the `run` redirect must stay out of the command table"
     );
+}
+
+/// The bundled plugin manifest spells clauth subcommands as strings, and a
+/// rename on either side is silent: the hook keeps being registered and just
+/// exits non-zero on every fire. Derives both sides and compares, rather than
+/// asserting one side's spelling.
+#[test]
+fn every_bundled_hook_command_parses_as_a_subcommand() {
+    let manifest =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("plugins/hooks/hooks.json");
+    let text = std::fs::read_to_string(&manifest)
+        .unwrap_or_else(|e| panic!("read {}: {e}", manifest.display()));
+    let json: serde_json::Value = serde_json::from_str(&text).expect("hooks.json must be JSON");
+
+    let mut seen = 0;
+    for (event, matchers) in json["hooks"]
+        .as_object()
+        .expect("hooks.json must carry a `hooks` object")
+    {
+        for entry in matchers.as_array().expect("each event holds an array") {
+            for hook in entry["hooks"].as_array().expect("each entry holds hooks") {
+                let command = hook["command"].as_str().expect("each hook has a command");
+                let argv: Vec<&str> = command.split_whitespace().collect();
+                assert_eq!(argv.first(), Some(&"clauth"), "{event}: {command}");
+                parse(&argv[1..]).unwrap_or_else(|e| {
+                    panic!("{event} runs `{command}`, which no longer parses: {e}")
+                });
+                seen += 1;
+            }
+        }
+    }
+    assert!(seen >= 4, "expected the bundled hooks, found {seen}");
 }
 
 /// Every command a user is meant to reach is in the root table, so a resync of

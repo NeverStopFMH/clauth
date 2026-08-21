@@ -1155,7 +1155,7 @@ fn profiles_root() -> Result<PathBuf> {
     Ok(clauth_dir()?.join("profiles"))
 }
 
-fn app_state_path() -> Result<PathBuf> {
+pub(crate) fn app_state_path() -> Result<PathBuf> {
     Ok(clauth_dir()?.join("profiles.toml"))
 }
 

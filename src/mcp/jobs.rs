@@ -14,7 +14,7 @@
 //! file through the same code — but it is NOT delivered the same way, and the
 //! paragraph above does not reach it. Measured on Claude Code 2.1.233: a tool
 //! call the client cancelled or timed out dispatches `PostToolUseFailure`, never
-//! `PostToolUse`, so the bundled hook never runs for it; and the reply carrying
+//! `PostToolUse`, so the bundled delivery hook never runs for it; and the reply carrying
 //! the minted id is dropped by rmcp before it reaches the transport, so the
 //! model never learns the id from the call it was minted for. So the record is
 //! written to keep the spent window's result rather than to answer that caller,

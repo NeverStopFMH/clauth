@@ -135,11 +135,13 @@ pub(crate) enum Cause {
     /// not that arm: the holder's own path usually re-stamps the sidecar itself,
     /// and the scan retries in minutes against an hours-wide horizon either way.
     ///
-    /// Its rendered sentence is shared verbatim with
-    /// `actions::rotation_guard_for_mutation`'s refusal, deliberately: one
-    /// condition an operator can hit from two surfaces read as one condition,
-    /// and two spellings sent someone looking for two. The two sides are
-    /// compared in a test rather than trusted to match.
+    /// Its rendered sentence is shared with every other surface refusing on a
+    /// busy rotation lock — `actions::rotation_guard_for_mutation` and the
+    /// TUI's session-token clear — deliberately: one condition an operator can
+    /// hit from three surfaces reads as one condition, where three spellings
+    /// sent someone looking for three. The clear and its test render this arm
+    /// directly; the actions' `bail!` is the one restatement, and a test
+    /// compares the two rather than trusting them to match.
     RotationLockHeld(String),
     /// CLA-ROLL: the usage chain's RECORDED grant cannot be told from a
     /// setup-token mint (no scope beyond the setup pair, no plan stamp), so

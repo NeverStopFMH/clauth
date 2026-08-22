@@ -1883,9 +1883,12 @@ fn clear_session_token_refuses_while_a_rotation_holds_the_profile() {
     let p = crate::profile::load_profile("held").expect("reload");
     assert!(p.rolling_token, "a refused clear disarms nothing");
     assert!(
-        app.toasts
-            .iter()
-            .any(|t| t.body.contains("rotation is in flight")),
+        app.toasts.iter().any(|t| t.body
+            == crate::format::Transient::new(
+                crate::format::Cause::RotationLockHeld("held".to_string()),
+                crate::format::Retry::Stated,
+            )
+            .text()),
         "the refusal is loud, got {:?}",
         app.toasts
     );

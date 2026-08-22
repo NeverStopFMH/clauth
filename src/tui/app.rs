@@ -6188,9 +6188,16 @@ fn perform_clear_session_token(app: &mut App, name: &str) {
     let _guard = match crate::runtime::RotationGuard::try_acquire(name) {
         Ok(Some(guard)) => guard,
         Ok(None) => {
+            // Rendered from the shared cause, not spelled here: one condition
+            // reaching an operator from a third surface in a third wording is
+            // what sends someone looking for three different problems.
             app.toast(
                 ToastKind::Danger,
-                format!("a rotation is in flight for '{name}' · try again in a moment"),
+                crate::format::Transient::new(
+                    crate::format::Cause::RotationLockHeld(name.to_string()),
+                    crate::format::Retry::Stated,
+                )
+                .text(),
             );
             return;
         }

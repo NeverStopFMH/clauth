@@ -2235,16 +2235,24 @@ fn guard_acquire_failure_names_the_filesystem_cause() {
         Some("rt-ok"),
         Some(past_expiry()),
     )));
-    // A regular file where the profile DIRECTORY belongs: `acquire` creates
-    // `<profile>/rotation.lock`, so its `mkdir_700` of the parent fails.
+    // A regular file where the lock's PARENT directory belongs, so `acquire`'s
+    // `mkdir_700` of it fails. Aimed via `rotation_lock_path` rather than at the
+    // profile dir: the lock no longer lives there, so occupying the profile dir
+    // stopped denying the guard at all.
     #[allow(clippy::expect_used, reason = "test")]
-    let dir = crate::profile::profile_dir(name).expect("profile dir");
-    if let Some(parent) = dir.parent() {
-        #[allow(clippy::expect_used, reason = "test")]
-        std::fs::create_dir_all(parent).expect("profile parent");
-    }
+    let lock = crate::runtime::rotation_lock_path(name).expect("rotation lock path");
     #[allow(clippy::expect_used, reason = "test")]
-    std::fs::write(&dir, b"not a directory").expect("occupy the profile dir path");
+    let locks_dir = lock.parent().expect("lock parent");
+    #[allow(clippy::expect_used, reason = "test")]
+    std::fs::create_dir_all(locks_dir.parent().expect("clauth dir")).expect("clauth dir");
+    #[allow(clippy::expect_used, reason = "test")]
+    std::fs::write(locks_dir, b"not a directory").expect("occupy the locks dir path");
+    #[allow(clippy::expect_used, reason = "test")]
+    let denied = crate::runtime::RotationGuard::acquire(name).is_err();
+    assert!(
+        denied,
+        "the fixture must actually deny the guard, or this proves nothing"
+    );
 
     let AuthGate::Transient(t) = ensure_installable(&handle, name, never_refresh) else {
         panic!("an unacquirable rotation guard must refuse transiently");
@@ -2273,16 +2281,22 @@ fn the_unavailable_lock_has_one_spelling_across_both_legs() {
     use std::sync::mpsc;
     let _home = HomeSandbox::new();
     let name = "rotate-lock-unavailable";
-    // Same fixture as the gate pin: a regular file where the profile DIRECTORY
-    // belongs, so `RotationGuard::acquire`'s `mkdir_700` fails.
+    // Same fixture as the gate pin: a regular file where the lock's PARENT
+    // directory belongs, so `RotationGuard::acquire`'s `mkdir_700` fails.
     #[allow(clippy::expect_used, reason = "test")]
-    let dir = crate::profile::profile_dir(name).expect("profile dir");
-    if let Some(parent) = dir.parent() {
-        #[allow(clippy::expect_used, reason = "test")]
-        std::fs::create_dir_all(parent).expect("profile parent");
-    }
+    let lock = crate::runtime::rotation_lock_path(name).expect("rotation lock path");
     #[allow(clippy::expect_used, reason = "test")]
-    std::fs::write(&dir, b"not a directory").expect("occupy the profile dir path");
+    let locks_dir = lock.parent().expect("lock parent");
+    #[allow(clippy::expect_used, reason = "test")]
+    std::fs::create_dir_all(locks_dir.parent().expect("clauth dir")).expect("clauth dir");
+    #[allow(clippy::expect_used, reason = "test")]
+    std::fs::write(locks_dir, b"not a directory").expect("occupy the locks dir path");
+    #[allow(clippy::expect_used, reason = "test")]
+    let denied = crate::runtime::RotationGuard::acquire(name).is_err();
+    assert!(
+        denied,
+        "the fixture must actually deny the guard, or this proves nothing"
+    );
 
     let config = Arc::new(RankedMutex::new(oauth_config(
         name,
@@ -3328,7 +3342,7 @@ fn rolling_gate_dead_chain_with_expired_backup_stays_broken() {
 }
 
 /// The scheduler's re-stamp leg must never park behind a held rotation lock:
-/// it runs inline on the tick thread and `rotation.lock` has no timeout, so a
+/// it runs inline on the tick thread and the rotation lock has no timeout, so a
 /// `clauth start` holding the lock across its recursive copy would stall
 /// every account's poll. With the lock held, the gate answers Transient
 /// promptly (the NoWait path) instead of blocking until release.
@@ -3378,10 +3392,17 @@ fn restamp_never_parks_behind_a_held_rotation_lock() {
         .expect("a held lock answers Transient, never Ready and never a wait");
     // The HELD copy, not the UNAVAILABLE one: this is genuine contention, and
     // the arm whose copy upstream corrected in round 1 describes a filesystem
-    // fault that is not what happened here.
-    assert!(
-        text.contains("an in-flight rotation holds"),
-        "a held lock renders as contention: {text}"
+    // fault that is not what happened here. Derived from the renderer rather
+    // than re-spelled: the two arms render different sentences, so a swap still
+    // reds, and the literal stays pinned once, in `format`'s copy table.
+    assert_eq!(
+        text,
+        crate::format::Transient::new(
+            crate::format::Cause::RotationLockHeld(name.to_string()),
+            crate::format::Retry::Stated,
+        )
+        .text(),
+        "a held lock renders as contention, not as the filesystem-fault arm"
     );
 }
 
@@ -3391,7 +3412,7 @@ fn restamp_never_parks_behind_a_held_rotation_lock() {
 /// arm that widened last. The scenario that defeats it: a mis-filled sidecar,
 /// an EXPIRED preserved mint (so the heal has nothing live to restore), an
 /// expiring chain (so the vanilla gate would proceed to its blocking
-/// acquire), and a `clauth start` holding `rotation.lock`. The tick's leg
+/// acquire), and a `clauth start` holding the rotation lock. The tick's leg
 /// must answer Transient with the mis-fill's own cause, promptly, touching
 /// neither the refresher nor the evidence on disk.
 #[test]

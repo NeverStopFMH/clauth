@@ -2419,7 +2419,7 @@ fn tick(state: &SchedulerState) {
     // (one slow account stalling every other account's poll, every tick) has
     // no analogue here. What makes inline SAFE is `LockWait::NoWait`: the
     // gate's rotation-lock acquisition is a try-lock on this leg, because
-    // `rotation.lock` itself has no timeout of any kind and a `clauth start`
+    // the rotation lock itself has no timeout of any kind and a `clauth start`
     // holding it across its recursive `~/.claude` copy would otherwise park
     // this thread — and with it every account's poll — while the heartbeat
     // (stamped in the main loop, not here) kept reading fresh. What remains

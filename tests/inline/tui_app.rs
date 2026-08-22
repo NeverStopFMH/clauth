@@ -950,6 +950,35 @@ fn perform_delete_with_live_session_arms_a_confirm_modal() {
     );
 }
 
+/// The rename commit takes its rotation guard OUTSIDE the config lock, the way
+/// the delete path above does. ROTATION ranks outside `Config`, so acquiring it
+/// under `app.config()` is the inversion `lockorder`'s `debug_assert!` fires on
+/// — and until this test existed nothing drove `commit_rename` at all, so that
+/// comment was enforced by nothing: inverting the two lines reddened zero of
+/// 2563 tests.
+///
+/// Ordering only. It asserts the rename landed, and the lock-order assert is
+/// what makes an inverted acquisition a panic rather than a pass.
+#[test]
+fn committing_a_rename_takes_its_guard_outside_the_config_lock() {
+    use super::{ConfigRow, build_draft_existing, commit_config_field};
+    use crate::profile::Profile;
+    let _home = crate::testutil::HomeSandbox::new();
+
+    let mut app = app_with(vec![Profile::new("before".to_string(), None, None)]);
+    app.profile_cursor = 0;
+    let mut draft = build_draft_existing(&app, "before");
+    draft.name = super::InputState::new("after");
+    app.config_draft = Some(draft);
+
+    commit_config_field(&mut app, ConfigRow::Name);
+
+    assert!(
+        app.config().find("after").is_some() && app.config().find("before").is_none(),
+        "the rename must land under the account's new name"
+    );
+}
+
 /// No live session: the delete must land immediately, bit-identical to the
 /// pre-existing behavior, with no confirm modal in the way.
 #[test]
@@ -2213,10 +2242,19 @@ fn confirming_a_rotate_under_a_live_session_is_refused_on_macos() {
             super::ROTATE_LIVE_SESSION_TOAST
         )
     );
+    // Asked for, not spelled: the lock lives outside the profile directory, so
+    // a hand-built profile-dir path would assert the absence of something never
+    // there. What makes this absence capable of failing is that an acquire
+    // MATERIALIZES the file, carried on THIS host by
+    // `actions::tests::a_delete_does_not_release_the_lock_it_is_holding`, whose
+    // second-thread `try_acquire` can only answer `None` against a file the
+    // first acquire created and locked. The positive twin through this same TUI
+    // path, `confirming_a_rotate_under_a_live_session_reaches_the_rotate`, is
+    // `cfg(not(macos))` and so is compiled out exactly where this assertion
+    // lives.
     assert!(
-        !home
-            .home()
-            .join(".clauth/profiles/busy/rotation.lock")
+        !crate::runtime::rotation_lock_path("busy")
+            .expect("rotation lock path")
             .exists(),
         "the refusal must land BEFORE the rotate worker is spawned"
     );
@@ -2255,10 +2293,13 @@ fn confirming_a_rotate_under_a_live_session_reaches_the_rotate() {
         (ToastKind::Info, "rotating 'busy'"),
         "a live session must not turn the rotate into a refusal"
     );
-    // The worker ran to completion inside the sandbox, so its guard landed there.
+    // The worker ran to completion inside the sandbox, so its guard landed
+    // there. This is the positive leg of the pair: it fires only if acquiring a
+    // rotation guard still leaves this file behind, which is what makes the
+    // negative assertion in the refusal test above capable of failing.
     assert!(
-        home.home()
-            .join(".clauth/profiles/busy/rotation.lock")
+        crate::runtime::rotation_lock_path("busy")
+            .expect("rotation lock path")
             .exists(),
         "the rotate must have taken its guard under the SANDBOX home"
     );

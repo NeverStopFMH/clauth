@@ -6,6 +6,25 @@ use super::*;
 use crate::profile::AppState;
 use crate::testutil::HomeSandbox;
 
+/// The rotation guard every account mutation takes. Uncontended inside a
+/// sandbox, so this is the fixture spelling of "no rotation is in flight" — the
+/// contended direction is what the two refusal tests below drive.
+fn rotation_guard(name: &str) -> crate::runtime::RotationGuard {
+    rotation_guard_for_mutation(name).expect("uncontended rotation lock")
+}
+
+/// A locked handle on `name`'s rotation lock from a separate fd, standing in for
+/// another process mid-rotation (`flock(2)` binds to the open file description,
+/// so this genuinely contends). Creates the locks directory the way
+/// `try_acquire` does, since a real holder made it on its way in.
+fn hold_rotation_lock(name: &str) -> std::fs::File {
+    let path = crate::runtime::rotation_lock_path(name).expect("rotation lock path");
+    crate::profile::mkdir_700(path.parent().expect("lock parent")).expect("locks dir");
+    let holder = crate::profile::open_state_file(&path).expect("open holder handle");
+    holder.lock().expect("hold the rotation lock");
+    holder
+}
+
 fn acct_config() -> AppConfig {
     AppConfig {
         state: AppState::default(),
@@ -1062,7 +1081,7 @@ fn delete_profile_expires_the_profile_ttl_clock() {
     let t0 = 1_000_000_000_000u64;
     let mut config = inactive_config(armed_ttl_profile("ttl-del", t0));
 
-    delete_profile(&mut config, "ttl-del", false).expect("delete");
+    delete_profile(&mut config, "ttl-del", false, &rotation_guard("ttl-del")).expect("delete");
 
     // `remove_dir_all` took the durable stamp; only the memo could survive here,
     // and it would mute the first /profile of a same-name relogin in this process.
@@ -1078,7 +1097,13 @@ fn rename_profile_expires_the_old_names_ttl_clock_and_carries_the_stamp() {
     let t0 = 1_000_000_000_000u64;
     let mut config = inactive_config(armed_ttl_profile("ttl-ren-old", t0));
 
-    rename_profile(&mut config, "ttl-ren-old", "ttl-ren-new").expect("rename");
+    rename_profile(
+        &mut config,
+        "ttl-ren-old",
+        "ttl-ren-new",
+        &rotation_guard("ttl-ren-old"),
+    )
+    .expect("rename");
 
     assert!(
         crate::usage::take_profile_fetch("ttl-ren-old", false, t0 + 120_000),
@@ -1384,7 +1409,8 @@ fn delete_active_api_profile_unwires_settings_endpoint() {
         "precondition: active api key is wired into settings.json"
     );
 
-    delete_profile(&mut config, "api-acct", false).expect("delete active api profile");
+    delete_profile(&mut config, "api-acct", false, &rotation_guard("api-acct"))
+        .expect("delete active api profile");
 
     let after = crate::claude::read_claude_endpoint_config().expect("read endpoint");
     assert_eq!(
@@ -1425,7 +1451,7 @@ fn delete_refuses_live_session_unless_forced() {
     let pid = crate::runtime::open_pid_file(&sessions.join("99999")).expect("open pid");
     pid.lock().expect("lock pid");
 
-    let err = delete_profile(&mut config, "busy", false)
+    let err = delete_profile(&mut config, "busy", false, &rotation_guard("busy"))
         .expect_err("a live session must block an unforced delete");
     // Exact, and worded off the same `live session` noun as the `disable`
     // sibling below: one predicate (`has_live_session`) refusing in two nouns
@@ -1439,10 +1465,310 @@ fn delete_refuses_live_session_unless_forced() {
         "the refused delete must leave the profile record intact"
     );
 
-    delete_profile(&mut config, "busy", true).expect("force overrides the live-session guard");
+    delete_profile(&mut config, "busy", true, &rotation_guard("busy"))
+        .expect("force overrides the live-session guard");
     assert!(
         config.find("busy").is_none(),
         "force must remove the profile despite the live session"
+    );
+}
+
+/// A delete landing inside a rotation's HTTP window raced it: both took only
+/// the state flock, so nothing serialized them. The delete now takes the
+/// rotation lock first and refuses on busy — ahead of the credentials unwire,
+/// which is the first write in the closure and the one a late refusal would
+/// leave half-applied.
+///
+/// This is the ROTATION-FIRST direction. Its twin below drives delete-first,
+/// which is the ordering that used to unlink the held lock inode.
+#[test]
+fn delete_refuses_while_a_rotation_holds_the_lock() {
+    let _home = HomeSandbox::new();
+
+    let mut config = AppConfig {
+        state: AppState::default(),
+        profiles: Vec::new(),
+    };
+    create_blank_profile(
+        &mut config,
+        "rotating".to_string(),
+        Some("https://api.example.com".to_string()),
+        Some("sk-secret".to_string()),
+        None,
+    )
+    .expect("create api profile");
+    // Active, so the delete's unwire leg is armed: an api key in the live
+    // settings.json is a write the refusal has to land ahead of.
+    config.state.active_profile = Some("rotating".into());
+    let profile = config.find("rotating").expect("profile present").clone();
+    crate::claude::apply_profile_to_claude_settings(&profile, &[]).expect("seed settings.json");
+
+    let holder = hold_rotation_lock("rotating");
+
+    // The caller's own sequence, both production call sites included: guard
+    // first, mutation only if it was granted. Composed rather than asserted on
+    // the helper alone, so a guard handed out under contention lets the delete
+    // run and the untouched-state assertions below are what catch it.
+    let outcome = rotation_guard_for_mutation("rotating")
+        .and_then(|rotation| delete_profile(&mut config, "rotating", false, &rotation));
+
+    // Untouched-state first, error second: a guard handed out under contention
+    // runs the whole delete, and asserting the error first would abort the body
+    // here and leave every line below unexercised.
+    assert!(
+        config.find("rotating").is_some(),
+        "the refused delete must leave the profile record intact"
+    );
+    assert!(
+        profile_dir("rotating").expect("profile dir").exists(),
+        "the refused delete must leave the profile directory in place"
+    );
+    assert_eq!(
+        crate::claude::read_claude_endpoint_config()
+            .expect("read endpoint")
+            .api_key
+            .as_deref(),
+        Some("sk-secret"),
+        "the refusal must land ahead of the unwire — settings.json is untouched"
+    );
+    assert_eq!(
+        outcome
+            .expect_err("an in-flight rotation must block the delete")
+            .to_string(),
+        "'rotating' has a token rotation in progress, retry in a moment"
+    );
+    // The row's own hazard, stated as a property rather than a story: while the
+    // holder is alive, nothing else can hold this lock. Pre-guard the delete had
+    // already unlinked the inode by here, so a relogin's acquire minted a second
+    // holder against a rotation still spending the old refresh token. Driving
+    // production's own acquire also proves the handle above locks the same path.
+    assert!(
+        crate::runtime::RotationGuard::try_acquire("rotating")
+            .expect("try_acquire")
+            .is_none(),
+        "a same-name relogin must not mint a second holder while the rotation runs"
+    );
+
+    // Direction 2: the refusal is contention, not a permanent gate.
+    drop(holder);
+    delete_profile(&mut config, "rotating", false, &rotation_guard("rotating"))
+        .expect("the delete goes through once the rotation releases");
+    assert!(
+        config.find("rotating").is_none(),
+        "a released lock must let the same delete complete"
+    );
+}
+
+/// The rename half of the same race: `fs::rename` moves the directory holding
+/// the lock inode out from under the rotation, whose persist then resolves the
+/// profile by NAME and drops the freshly-minted pair — leaving the renamed
+/// account on a refresh token the server has already killed.
+#[test]
+fn rename_refuses_while_a_rotation_holds_the_lock() {
+    let _home = HomeSandbox::new();
+
+    let mut config = AppConfig {
+        state: AppState::default(),
+        profiles: Vec::new(),
+    };
+    create_blank_profile(&mut config, "ren-old".to_string(), None, None, None)
+        .expect("create profile");
+
+    let holder = hold_rotation_lock("ren-old");
+
+    // Composed the way both production call sites are, for the reason the
+    // delete twin states.
+    let outcome = rotation_guard_for_mutation("ren-old")
+        .and_then(|rotation| rename_profile(&mut config, "ren-old", "ren-new", &rotation));
+
+    // Untouched-state first, for the reason the delete twin states.
+    assert!(
+        config.find("ren-old").is_some() && config.find("ren-new").is_none(),
+        "the refused rename must leave the record under its old name"
+    );
+    assert!(
+        profile_dir("ren-old").expect("old dir").exists()
+            && !profile_dir("ren-new").expect("new dir").exists(),
+        "the refused rename must leave the directory where it was"
+    );
+    assert_eq!(
+        outcome
+            .expect_err("an in-flight rotation must block the rename")
+            .to_string(),
+        "'ren-old' has a token rotation in progress, retry in a moment"
+    );
+
+    drop(holder);
+    rename_profile(
+        &mut config,
+        "ren-old",
+        "ren-new",
+        &rotation_guard("ren-old"),
+    )
+    .expect("the rename goes through once the rotation releases");
+    assert!(
+        config.find("ren-new").is_some(),
+        "a released lock must let the same rename complete"
+    );
+}
+
+/// DELETE-FIRST, the direction the row's own premise describes and the one the
+/// rotation-first twin above cannot reach. The delete used to `remove_dir_all`
+/// the directory its own `rotation.lock` sat in, so it unlinked the inode it was
+/// holding; an arriving acquire then found no file, was granted a SECOND holder
+/// of one profile's lock, and recreated the profile directory to put it in.
+///
+/// The lock now lives outside the profile tree, so the delete cannot unlink it.
+/// This closes the same-version race only: an older clauth still locks the old
+/// path, and the two do not serialize against each other.
+#[test]
+fn a_delete_does_not_release_the_lock_it_is_holding() {
+    let _home = HomeSandbox::new();
+    let mut config = AppConfig {
+        state: AppState::default(),
+        profiles: Vec::new(),
+    };
+    create_blank_profile(&mut config, "victim".to_string(), None, None, None).expect("create");
+
+    // Bound to a `let`, so the guard outlives the delete the way `cmd_delete`'s
+    // does — it drops at end of scope, well after `remove_dir_all`.
+    let own = rotation_guard("victim");
+    delete_profile(&mut config, "victim", false, &own).expect("delete");
+
+    assert!(
+        !profile_dir("victim").expect("dir").exists(),
+        "the delete still removes the profile directory"
+    );
+    // A second THREAD: a fresh rank stack, the way another process arrives. The
+    // same-thread form re-enters ROTATION and trips the rank assert instead —
+    // `try_lock` runs before `RankGuard::enter`, so it would mint the holder and
+    // only then panic, which is evidence nobody can read.
+    let minted = std::thread::spawn(|| {
+        crate::runtime::RotationGuard::try_acquire("victim")
+            .expect("try_acquire")
+            .is_some()
+    })
+    .join()
+    .expect("join");
+    assert!(
+        !minted,
+        "the delete's own guard must still be the only holder of 'victim'"
+    );
+    assert!(
+        !profile_dir("victim").expect("dir").exists(),
+        "and no arriving acquire may resurrect the deleted profile directory"
+    );
+}
+
+/// The fault arm — the lock cannot be created or opened at all — speaks the
+/// same vocabulary as its `oauth` siblings rather than surfacing a raw errno,
+/// and keeps the io error underneath so the chain still says which path failed.
+#[test]
+fn an_unopenable_rotation_lock_refuses_in_the_fault_vocabulary() {
+    let _home = HomeSandbox::new();
+    let mut config = AppConfig {
+        state: AppState::default(),
+        profiles: Vec::new(),
+    };
+    create_blank_profile(&mut config, "broken".to_string(), None, None, None).expect("create");
+
+    // A regular file where the locks DIRECTORY belongs, so `mkdir_700` fails.
+    let lock = crate::runtime::rotation_lock_path("broken").expect("rotation lock path");
+    let locks_dir = lock.parent().expect("lock parent");
+    std::fs::create_dir_all(locks_dir.parent().expect("clauth dir")).expect("clauth dir");
+    std::fs::write(locks_dir, b"not a directory").expect("occupy the locks dir path");
+
+    let err = match rotation_guard_for_mutation("broken") {
+        Ok(_) => panic!("an unopenable lock must refuse"),
+        Err(e) => e,
+    };
+    assert_eq!(
+        err.to_string(),
+        crate::format::Transient::new(
+            crate::format::Cause::RotationLockUnavailable("broken".to_string()),
+            crate::format::Retry::Stated,
+        )
+        .text(),
+        "the fault arm names the fix, in the same words its oauth siblings use"
+    );
+    assert!(
+        err.chain().count() > 1,
+        "the io error stays underneath rather than being replaced"
+    );
+}
+
+/// Re-spelling an account's own name in another case is not a collision with
+/// itself — `validate_profile_name` clears it through its `exclude`, so the
+/// duplicate guard on `rename_profile` has to carry that exclusion too. A bare
+/// "no account resolves to `new`" fires here, since `canonical_name` folds.
+#[test]
+fn a_case_only_rename_is_not_a_collision_with_itself() {
+    let _home = HomeSandbox::new();
+    let mut config = AppConfig {
+        state: AppState::default(),
+        profiles: Vec::new(),
+    };
+    create_blank_profile(&mut config, "work".to_string(), None, None, None).expect("create");
+
+    rename_profile(&mut config, "work", "Work", &rotation_guard("work"))
+        .expect("an account may be re-spelled in another case");
+
+    assert!(
+        config.find("Work").is_some(),
+        "the new spelling is the one on record"
+    );
+}
+
+/// Renaming onto a case VARIANT of a different account is the collision the
+/// guard exists for: `canonical_name` folds at every resolution site, so
+/// `work2` and `WORK2` are one account holding two directories, and which one
+/// answers depends on the `profiles` vec's order. A case-exact guard passes this
+/// and is why the assert derives its predicate from the folding resolver.
+#[cfg(debug_assertions)]
+#[test]
+#[should_panic(expected = "already names an account")]
+fn a_rename_onto_a_case_variant_of_another_account_is_refused() {
+    let _home = HomeSandbox::new();
+    let mut config = AppConfig {
+        state: AppState::default(),
+        profiles: Vec::new(),
+    };
+    create_blank_profile(&mut config, "work".to_string(), None, None, None).expect("create");
+    create_blank_profile(&mut config, "work2".to_string(), None, None, None).expect("create");
+
+    let _ = rename_profile(&mut config, "work", "WORK2", &rotation_guard("work"));
+}
+
+/// The refusal an operator meets from `clauth delete` / the TUI and the one the
+/// scheduler's re-stamp leg logs are ONE condition, so they are one sentence.
+/// Derived from both sides rather than spelled twice: the literal lives in the
+/// `format` copy table alone.
+#[test]
+fn the_mutation_refusal_matches_the_rotation_lock_held_copy() {
+    let _home = HomeSandbox::new();
+    let mut config = AppConfig {
+        state: AppState::default(),
+        profiles: Vec::new(),
+    };
+    create_blank_profile(&mut config, "shared".to_string(), None, None, None).expect("create");
+
+    // Bound, not discarded: `let _ =` would drop the handle and release the
+    // flock before the refusal under test is even attempted.
+    let _holder = hold_rotation_lock("shared");
+
+    // `RotationGuard` is not `Debug`, so match rather than `expect_err`.
+    let refusal = match rotation_guard_for_mutation("shared") {
+        Ok(_) => panic!("a held rotation lock must refuse"),
+        Err(e) => e,
+    };
+    assert_eq!(
+        refusal.to_string(),
+        crate::format::Transient::new(
+            crate::format::Cause::RotationLockHeld("shared".to_string()),
+            crate::format::Retry::Stated,
+        )
+        .text(),
+        "one condition reads as one condition on every surface"
     );
 }
 
@@ -1641,7 +1967,7 @@ fn delete_active_unwire_failure_keeps_profile_retryable() {
     let settings = home.home().join(".claude").join("settings.json");
     std::fs::create_dir_all(&settings).expect("settings.json as dir");
 
-    let result = delete_profile(&mut config, "api-acct", false);
+    let result = delete_profile(&mut config, "api-acct", false, &rotation_guard("api-acct"));
     assert!(
         result.is_err(),
         "a failed settings unwire must fail the whole delete"

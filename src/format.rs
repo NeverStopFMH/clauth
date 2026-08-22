@@ -127,12 +127,19 @@ pub(crate) enum Cause {
     /// locked and nothing is broken. The next step is the operator's, and it is
     /// specific enough that a generic retry hint would be wrong.
     LiveSessionOnRotatingChain(String),
-    /// CLA-ROLL: another holder has the profile's rotation lock and the caller
-    /// runs on a thread that must not park behind it (the scheduler's re-stamp
-    /// leg). Genuine contention — the opposite claim from
-    /// [`Self::RotationLockUnavailable`], which is why it is not that arm: the
-    /// holder's own path usually re-stamps the sidecar itself, and the scan
-    /// retries in minutes against an hours-wide horizon either way.
+    /// Another holder has the profile's rotation lock and the caller must not
+    /// park behind it — the scheduler's CLA-ROLL re-stamp leg, which runs on a
+    /// thread that cannot wait, and the account-mutation refusals, which decline
+    /// rather than block on a lock carrying no timeout. Genuine contention — the
+    /// opposite claim from [`Self::RotationLockUnavailable`], which is why it is
+    /// not that arm: the holder's own path usually re-stamps the sidecar itself,
+    /// and the scan retries in minutes against an hours-wide horizon either way.
+    ///
+    /// Its rendered sentence is shared verbatim with
+    /// `actions::rotation_guard_for_mutation`'s refusal, deliberately: one
+    /// condition an operator can hit from two surfaces read as one condition,
+    /// and two spellings sent someone looking for two. The two sides are
+    /// compared in a test rather than trusted to match.
     RotationLockHeld(String),
     /// CLA-ROLL: the usage chain's RECORDED grant cannot be told from a
     /// setup-token mint (no scope beyond the setup pair, no plan stamp), so
@@ -183,10 +190,7 @@ impl Cause {
                 )
             }
             Self::RotationLockHeld(profile) => {
-                format!(
-                    "an in-flight rotation holds '{profile}' · the re-stamp retries on its \
-                     next scan"
-                )
+                format!("'{profile}' has a token rotation in progress, retry in a moment")
             }
             Self::RollingGrantUnrecorded(profile) => {
                 format!(

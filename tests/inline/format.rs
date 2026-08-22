@@ -169,7 +169,7 @@ fn every_transient_cause_renders_its_own_copy() {
         ),
         (
             Cause::RotationLockHeld("work".to_string()),
-            "an in-flight rotation holds 'work' · the re-stamp retries on its next scan",
+            "'work' has a token rotation in progress, retry in a moment",
         ),
         (
             Cause::RollingGrantUnrecorded("work".to_string()),

@@ -435,9 +435,12 @@ pub(crate) fn rotation_fixture_config(name: &str) -> crate::profile::ConfigHandl
 /// goes through `atomic_write_600`, whose `rename(tmp, credentials.json)` is
 /// `EISDIR` once a DIRECTORY sits at that path.
 ///
-/// Aimed at `credentials.json` rather than the profile dir on purpose — a broken
-/// profile dir fails `RotationGuard::acquire` first (`rotation.lock` lives there),
-/// so the leg would bail long before reaching the persist under test.
+/// Aimed at `credentials.json` rather than the profile dir on purpose: it denies
+/// exactly the write under test and nothing else, so the leg reaches its persist
+/// and fails there. Breaking the whole profile dir would also deny `config.toml`
+/// and every session path, making which write failed unattributable. (It used to
+/// fail `RotationGuard::acquire` outright, when the rotation lock still lived in
+/// that directory; the lock has since moved out of it.)
 ///
 /// Gated with its callers: both are non-macOS tests, and an ungated helper with
 /// no macOS caller is a dead-code error that reds that leg on clippy

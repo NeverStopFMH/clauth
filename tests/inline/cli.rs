@@ -2207,18 +2207,21 @@ mod static_token_clear {
     /// With all three pieces absent the clear is a quiet no-op success, not an
     /// error — the requested end state already holds. The early return is
     /// pinned by a side-effect the fall-through path cannot avoid: the full
-    /// path acquires the rotation guard, which materializes
-    /// `rotation.lock` in the profile dir, so the lock file's absence is what
-    /// proves the no-op branch ran rather than a false "cleared" printing
-    /// through the whole body.
+    /// path acquires the rotation guard, which materializes this profile's
+    /// lock file, so its absence is what proves the no-op branch ran rather
+    /// than a false "cleared" printing through the whole body. The path is
+    /// asked for rather than spelled — the lock lives outside the profile
+    /// directory, and a hand-built profile-dir path would assert the absence
+    /// of something that is never there whichever branch ran.
     #[test]
     fn nothing_to_clear_is_a_noop_success() {
         let _home = HomeSandbox::new();
         cleared_profile("cl-none", false, true);
         cmd_static_token_clear("cl-none", true).expect("nothing to clear is success");
-        let dir = crate::profile::profile_dir("cl-none").expect("dir");
         assert!(
-            !dir.join("rotation.lock").exists(),
+            !crate::runtime::rotation_lock_path("cl-none")
+                .expect("rotation lock path")
+                .exists(),
             "the no-op branch returns before the rotation guard — a lock file \
              here means the full clear body ran against nothing"
         );
@@ -2262,4 +2265,59 @@ mod static_token_clear {
             "the rotating pair is moved aside as evidence, never plain-deleted"
         );
     }
+}
+
+/// The CLI delete refuses while a rotation holds the profile's lock, driven
+/// through the real grammar so the guard is taken for the name `cmd_delete`
+/// RESOLVED rather than the raw argument.
+///
+/// Pinned at this surface because nothing else can: `cmd_delete` holds no
+/// ranked lock, so no `debug_assert` watches its ordering, and a guard taken
+/// for the wrong profile leaves every other test in the tree green.
+#[test]
+fn cli_delete_refuses_while_a_rotation_holds_the_lock() {
+    let _home = crate::testutil::HomeSandbox::new();
+
+    let mut config = crate::profile::AppConfig {
+        state: crate::profile::AppState::default(),
+        profiles: Vec::new(),
+    };
+    crate::actions::create_blank_profile(&mut config, "cli-held".to_string(), None, None, None)
+        .expect("create profile");
+
+    // Another process mid-rotation: a locked handle on a separate fd.
+    let lock_path = crate::runtime::rotation_lock_path("cli-held").expect("rotation lock path");
+    crate::profile::mkdir_700(lock_path.parent().expect("lock parent")).expect("locks dir");
+    let holder = crate::profile::open_state_file(&lock_path).expect("open holder handle");
+    holder.lock().expect("hold the rotation lock");
+
+    // Spelled in a case `canonical_name` has to fold, so the argument and the
+    // resolved name DIFFER: guarding the raw argument locks a path nothing
+    // holds, and this is the only fixture shape that can tell the two apart.
+    // `--yes` only skips the confirm prompt; it is not a rotation override.
+    let outcome = dispatch(
+        Cli::try_parse_from(["clauth", "delete", "CLI-HELD", "--yes"]).expect("delete must parse"),
+    );
+
+    // Untouched state first: a guard taken for the wrong profile deletes the
+    // account, and asserting the error first would abort before these run.
+    assert!(
+        crate::profile::profile_dir("cli-held")
+            .expect("profile dir")
+            .exists(),
+        "a refused delete leaves the profile directory on disk"
+    );
+    assert!(
+        load_config()
+            .expect("reload state")
+            .find("cli-held")
+            .is_some(),
+        "a refused delete leaves the profile record in the persisted state"
+    );
+    assert_eq!(
+        outcome
+            .expect_err("an in-flight rotation must block the CLI delete")
+            .to_string(),
+        "'cli-held' has a token rotation in progress, retry in a moment"
+    );
 }

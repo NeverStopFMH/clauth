@@ -1779,7 +1779,7 @@ enum LockWait {
     /// `acquire`'s blocking is what makes their pre/post-guard re-reads exact.
     Block,
     /// Never park. The scheduler's re-stamp leg runs INLINE on the tick
-    /// thread, and `rotation.lock` has no timeout of any kind — a `clauth
+    /// thread, and the rotation lock has no timeout of any kind — a `clauth
     /// start` holding it across its recursive `~/.claude` copy would stall
     /// every account's poll while the heartbeat (stamped in the main loop)
     /// stays fresh. A held lock returns Transient instead; the holder's own

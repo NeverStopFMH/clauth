@@ -23,6 +23,7 @@ use crate::profile::{
     Profile, profile_dir, save_app_state, save_profile,
 };
 use crate::providers::Provider;
+use crate::runtime::RotationGuard;
 use crate::spinner::Spinner;
 
 /// ASCII alphanumeric + `-_.@+`, not leading-dot, not empty, not a duplicate
@@ -570,7 +571,65 @@ pub(crate) fn classify_env_key(
         .then_some(EnvKeyCollision::BaseSettings)
 }
 
-pub(crate) fn rename_profile(config: &mut AppConfig, old: &str, new: &str) -> Result<()> {
+/// Take `name`'s rotation lock for an account mutation, or refuse.
+///
+/// A rotation holds this lock for its whole OAuth round trip and resolves the
+/// profile by NAME when it persists, so a delete or rename landing inside that
+/// window either resurrects the directory the delete removed or strands the
+/// spent refresh token on the renamed account. Refused rather than queued
+/// because the lock carries no timeout: a stuck round trip would park the
+/// command instead of failing it.
+///
+/// Creates `~/.clauth/rotation-locks/` and this profile's lock file when they
+/// are absent (`RotationGuard::try_acquire` does), so it is a write rather than
+/// a pure read and the name does not say so. It creates no profile directory —
+/// which is what lets `delete_profile` and `rename_profile` below keep their
+/// `dir.exists()` branches meaningful.
+///
+/// Handed to [`delete_profile`] / [`rename_profile`] rather than taken inside
+/// them: the TUI holds the `config` guard across both calls, and ROTATION ranks
+/// outside `Config`, so the acquisition has to happen before the config lock. The
+/// guard parameter makes a caller with no lock a compile error; what makes a
+/// caller who takes it in the wrong ORDER fail is `lockorder`'s assertion.
+pub(crate) fn rotation_guard_for_mutation(name: &str) -> Result<RotationGuard> {
+    match RotationGuard::try_acquire(name) {
+        Ok(Some(guard)) => Ok(guard),
+        Ok(None) => bail!("'{name}' has a token rotation in progress, retry in a moment"),
+        // The fault arm speaks the same vocabulary as its two siblings in
+        // `oauth`: the typed copy names the fix, which a raw errno does not.
+        // Added as context rather than replacing the io error, so the chain
+        // still carries which path failed and why.
+        Err(e) => Err(e.context(
+            crate::format::Transient::new(
+                crate::format::Cause::RotationLockUnavailable(name.to_string()),
+                crate::format::Retry::Stated,
+            )
+            .text(),
+        )),
+    }
+}
+
+/// `_rotation` is [`rotation_guard_for_mutation`]'s guard for `old`: a second
+/// acquisition at the same rank is a lock-order violation whichever profile it
+/// names, so `new` cannot carry one of its own.
+pub(crate) fn rename_profile(
+    config: &mut AppConfig,
+    old: &str,
+    new: &str,
+    _rotation: &RotationGuard,
+) -> Result<()> {
+    // Asserted rather than stated in prose: every caller today rejects a
+    // duplicate `new` first, and a future one that forgets renames onto a live
+    // account — under a guard held for `old`, which would not serialize it.
+    //
+    // Folding, and excluding `old` the way `validate_profile_name` does. A
+    // case-EXACT check is the wrong question here: every resolution site reaches
+    // an account through `canonical_name`, which folds, so `work` and `WORK`
+    // resolve to one account while occupying two directories.
+    debug_assert!(
+        config.canonical_name(new).is_none_or(|n| n == old),
+        "rename target '{new}' already names an account"
+    );
     with_state_lock(|| {
         let old_dir = profile_dir(old)?;
         if old_dir.exists() {
@@ -597,7 +656,15 @@ pub(crate) fn rename_profile(config: &mut AppConfig, old: &str, new: &str) -> Re
     Ok(())
 }
 
-pub(crate) fn delete_profile(config: &mut AppConfig, name: &str, force: bool) -> Result<()> {
+/// `_rotation` is [`rotation_guard_for_mutation`]'s guard for `name`, and
+/// `force` does not waive it: `force` waives the live-session gate below, while
+/// an in-flight rotation is a different hazard that no confirmation makes safe.
+pub(crate) fn delete_profile(
+    config: &mut AppConfig,
+    name: &str,
+    force: bool,
+    _rotation: &RotationGuard,
+) -> Result<()> {
     with_state_lock(|| {
         // Refuse to pull an account out from under a running `clauth start`
         // session (either flavor), checked before any removal so a refused

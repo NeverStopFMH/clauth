@@ -4033,8 +4033,8 @@ fn has_live_session_sees_a_per_session_dir_of_either_flavor() {
 }
 
 /// The gate's fail-open must not cover the ENUMERATION step. `<profile>/` exists
-/// for every configured profile (it holds `config.toml`, `credentials.json`,
-/// `rotation.lock`), so its unreadability is not the idle case — a transient
+/// for every configured profile (it holds `config.toml`, `credentials.json` and
+/// the session dirs), so its unreadability is not the idle case — a transient
 /// EMFILE/EACCES reading as "no sessions" would unblock a rotation against a live
 /// session. Only a genuinely absent dir is idle.
 #[cfg(unix)]
@@ -5516,7 +5516,10 @@ fn gc_keeps_a_swapped_row_after_its_launch_profile_is_force_deleted() {
             },
             profiles: vec![launch, intended],
         };
-        crate::actions::delete_profile(&mut config, "rowgc-a", true).expect("force-delete");
+        let rotation = crate::actions::rotation_guard_for_mutation("rowgc-a")
+            .expect("uncontended rotation lock");
+        crate::actions::delete_profile(&mut config, "rowgc-a", true, &rotation)
+            .expect("force-delete");
         assert!(
             !crate::profile::profile_dir("rowgc-a")
                 .expect("profile dir")

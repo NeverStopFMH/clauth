@@ -932,8 +932,36 @@ fn canonical_credentials(name: &str) -> Result<PathBuf> {
     crate::claude::install_source_path(name)
 }
 
-fn rotation_lock_path(name: &str) -> Result<PathBuf> {
-    profile_subpath(name, "rotation.lock")
+/// Where `name`'s rotation lock lives: `~/.clauth/rotation-locks/<name>.lock`,
+/// deliberately OUTSIDE the profile directory.
+///
+/// Inside it, `actions::delete_profile`'s `remove_dir_all` unlinked the very
+/// inode the deleting process was holding, and the next acquire — finding no
+/// file at that path — was granted a second holder of the same profile's lock
+/// and recreated the profile directory to put it in.
+///
+/// `validate_profile_name` bounds a name to ASCII alphanumerics plus `-_.@+`
+/// with no leading dot, so `<name>.lock` is always one flat component; the same
+/// bound `profiles/<name>` already relies on. `pub(crate)` so a test names this
+/// path by calling it rather than rebuilding the spelling.
+///
+/// Nothing reaps these files: a deleted profile, and the old name of a renamed
+/// one, each leave a zero-byte lock behind for good. Deliberate, and it is the
+/// shape the bug above demands — the only code positioned to unlink one is the
+/// delete, which would be unlinking a lock it is itself holding. A stale file is
+/// inert (`open_state_file` is `O_CREAT` without truncate, so a later profile of
+/// the same name locks the same inode and nothing carries over), and the ceiling
+/// is one empty file per name ever used. Its cost is one `symlink_metadata` per
+/// orphan on each unix `load_config`, which walks the whole tree through
+/// `enforce_clauth_perms` — that is the syscall the code makes, read off it and
+/// not timed, so treat the magnitude as unmeasured. If it ever matters, the
+/// upgrade is a sweep over this directory keyed on names absent from state,
+/// taking each lock before unlinking it — never a reap inside the delete, which
+/// would unlink a lock its own caller is holding.
+pub(crate) fn rotation_lock_path(name: &str) -> Result<PathBuf> {
+    Ok(clauth_dir()?
+        .join("rotation-locks")
+        .join(format!("{name}.lock")))
 }
 
 /// Cross-process advisory lock serializing a token rotation against a
@@ -970,8 +998,9 @@ pub(crate) struct RotationGuard {
 
 impl RotationGuard {
     /// Acquire the per-profile rotation lock, blocking until any in-flight
-    /// rotation or acquire for this profile releases it. Creates the profile
-    /// directory if missing (a profile that was never started has none).
+    /// rotation or acquire for this profile releases it. Creates the
+    /// rotation-locks directory if missing; it creates no profile directory,
+    /// so a caller that needs one makes it itself.
     pub(crate) fn acquire(name: &str) -> Result<Self> {
         let path = rotation_lock_path(name)?;
         if let Some(parent) = path.parent() {
@@ -1018,7 +1047,8 @@ impl RotationGuard {
 /// tracking via flock. `O_CREAT` without truncate preserves any existing lock
 /// held by a sibling that raced us to create the file. Owner-only (0o600) via
 /// [`crate::profile::open_state_file`], the shared opener for every `~/.clauth`
-/// lock (this also covers `rotation.lock`, opened through here).
+/// lock (this also covers the rotation lock at [`rotation_lock_path`], opened
+/// through here).
 pub(crate) fn open_pid_file(path: &Path) -> std::io::Result<File> {
     crate::profile::open_state_file(path)
 }

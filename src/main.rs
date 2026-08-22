@@ -968,7 +968,8 @@ fn cmd_delete(name: &str, yes: bool, force: bool) -> Result<()> {
         }
     }
     let was_active = config.is_active(&canonical);
-    actions::delete_profile(&mut config, &canonical, force)?;
+    let rotation = actions::rotation_guard_for_mutation(&canonical)?;
+    actions::delete_profile(&mut config, &canonical, force, &rotation)?;
     if was_active {
         outln!("clauth: deleted profile '{canonical}' (was active; live credentials cleared).");
     } else {

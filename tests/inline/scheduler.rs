@@ -6021,8 +6021,9 @@ fn a_failed_retry_keeps_the_pair_and_queues_a_refetch() {
 
 /// The rotation lock is unavailable, so the leg may not touch the credentials at
 /// all: it bails to cache without reaching the token endpoint. Forced by putting
-/// a DIRECTORY at `rotation.lock`, which is `EISDIR` when `open_pid_file` opens it
-/// read-write — one of the IO failures `acquire` returns `Err` for in production.
+/// a DIRECTORY at the path `rotation_lock_path` returns, which is `EISDIR` when
+/// `open_pid_file` opens it read-write — one of the IO failures `acquire`
+/// returns `Err` for in production.
 #[cfg(not(target_os = "macos"))]
 #[test]
 fn an_unacquirable_rotation_guard_bails_without_spending_the_chain() {
@@ -6044,7 +6045,7 @@ fn an_unacquirable_rotation_guard_bails_without_spending_the_chain() {
     let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
     let config = crate::testutil::rotation_fixture_config(name);
     seed_usage_cache(name);
-    let lock_path = crate::profile::profile_subpath(name, "rotation.lock").expect("lock path");
+    let lock_path = crate::runtime::rotation_lock_path(name).expect("lock path");
     std::fs::create_dir_all(&lock_path).expect("block the rotation lock");
     assert!(
         crate::runtime::RotationGuard::acquire(name).is_err(),

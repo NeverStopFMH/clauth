@@ -25,8 +25,8 @@ use crate::actions::{
     clear_profile_api_key, clear_profile_credentials, create_blank_profile,
     create_profile_from_login, delete_profile, duplicate_profile, edit_profile_endpoint,
     edit_profile_env, edit_profile_model, edit_profile_preset, find_matching_oauth_profile,
-    overwrite_captured_profile, rename_profile, reorder_profile, switch_off, switch_profile,
-    validate_profile_name,
+    overwrite_captured_profile, rename_profile, reorder_profile, rotation_guard_for_mutation,
+    switch_off, switch_profile, validate_profile_name,
 };
 use crate::claude::{
     LinkState, adopt_first_login, classify_credentials_link, claude_settings_env_keys,
@@ -7045,10 +7045,13 @@ fn commit_rename(app: &mut App) {
         app.toast(ToastKind::Danger, format!("{e}"));
         return;
     }
-    let result = {
+    // The rotation guard is taken BEFORE `app.config()`: ROTATION ranks outside
+    // `Config`, so acquiring it under the config guard is the inversion
+    // `lockorder` asserts on.
+    let result = rotation_guard_for_mutation(&old).and_then(|rotation| {
         let mut cfg = app.config();
-        rename_profile(&mut cfg, &old, &new)
-    };
+        rename_profile(&mut cfg, &old, &new, &rotation)
+    });
     match result {
         Ok(()) => {
             app.refresh_tokens();
@@ -7200,10 +7203,11 @@ fn perform_delete(app: &mut App, name: &str) {
 }
 
 fn finish_delete(app: &mut App, name: &str, force: bool) {
-    let result = {
+    // Before `app.config()`, for the reason the rename path states.
+    let result = rotation_guard_for_mutation(name).and_then(|rotation| {
         let mut cfg = app.config();
-        delete_profile(&mut cfg, name, force)
-    };
+        delete_profile(&mut cfg, name, force, &rotation)
+    });
     match result {
         Ok(()) => {
             app.refresh_tokens();

@@ -20,7 +20,7 @@ use crate::oauth;
 use crate::out::{out, outln};
 use crate::profile::{
     AccountId, AppConfig, ClaudeCredentials, ConsoleCredential, DivergenceChoice, ModelSettings,
-    Profile, profile_dir, save_app_state, save_profile,
+    Profile, load_app_state, profile_dir, save_app_state, save_profile,
 };
 use crate::providers::Provider;
 use crate::runtime::RotationGuard;
@@ -74,6 +74,16 @@ pub(crate) fn validate_profile_name(
 /// pre-lock check in a CLI/MCP wrapper is a friendly early error at best,
 /// never the authoritative one.
 fn ensure_switch_target_ok(config: &AppConfig, name: &str) -> Result<()> {
+    // Fresh membership, not just the in-memory list: a caller can hold a config
+    // older than a concurrent CLI delete/rename (the daemon reloads once a
+    // tick). This must run FIRST — `switch_profile` then calls
+    // `force_link_profile_credentials`, which tears the live slot down before
+    // `finish_switch` could notice the ghost — so a vanished target bounces
+    // here, before any side effect. Runs under the state flock, which makes the
+    // on-disk read stable.
+    if !crate::profile::is_configured(name)? {
+        bail!("profile '{name}' not found");
+    }
     let Some(profile) = config.find(name) else {
         bail!("profile '{name}' not found");
     };
@@ -346,7 +356,12 @@ pub(crate) fn switch_off(config: &mut AppConfig) -> Result<()> {
         // stale identity block is just as wrong once creds are cleared.
         crate::claude_json::strip_home_oauth_account()?;
         config.state.active_profile = None;
-        save_app_state(&config.state)
+        // Same fresh-state rule as `finish_switch`: only the active marker is
+        // this leg's change, so write it onto the current on-disk state rather
+        // than a possibly-stale in-memory list.
+        let mut state = load_app_state()?;
+        state.active_profile = None;
+        save_app_state(&state)
     })
 }
 
@@ -366,7 +381,14 @@ fn finish_switch(config: &mut AppConfig, name: &str) -> Result<()> {
     // the wrong account until its next `/login`.
     crate::claude_json::strip_home_oauth_account()?;
     config.state.active_profile = Some(name.into());
-    save_app_state(&config.state)
+    // Fresh state, not the whole in-memory list: a daemon drain may hold a
+    // config older than a concurrent CLI delete/rename/login, and re-serializing
+    // it would resurrect a deleted row or rewind an edit. Only the active marker
+    // is this leg's own change, so read the current profiles.toml and change
+    // that one field.
+    let mut state = load_app_state()?;
+    state.active_profile = Some(name.into());
+    save_app_state(&state)
 }
 
 pub(crate) fn edit_profile_endpoint(

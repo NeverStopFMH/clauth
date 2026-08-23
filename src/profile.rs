@@ -591,6 +591,27 @@ pub(crate) struct AppState {
 }
 
 impl AppState {
+    /// Whether `name` is on the persisted quarantine list.
+    pub(crate) fn is_auth_broken(&self, name: &str) -> bool {
+        self.auth_broken.iter().any(|n| n.as_str() == name)
+    }
+
+    /// Mark or clear `name`'s auth-broken flag in this state. Returns `true`
+    /// when the list actually changed. Pure in-memory mutation — the caller
+    /// decides what to persist.
+    pub(crate) fn set_auth_broken(&mut self, name: &str, broken: bool) -> bool {
+        let present = self.is_auth_broken(name);
+        if broken && !present {
+            self.auth_broken.push(name.into());
+            true
+        } else if !broken && present {
+            self.auth_broken.retain(|n| n.as_str() != name);
+            true
+        } else {
+            false
+        }
+    }
+
     /// The effective reset-countdown shape (unset = the stock relative form).
     pub(crate) fn reset_display(&self) -> ResetDisplay {
         self.reset_display.unwrap_or_default()
@@ -760,23 +781,14 @@ impl AppConfig {
     /// True when `name`'s last OAuth refresh was rejected as revoked/invalid
     /// (AUTH-1). Such a profile is skipped by the fallback chain walk.
     pub(crate) fn is_auth_broken(&self, name: &str) -> bool {
-        self.state.auth_broken.iter().any(|n| n.as_str() == name)
+        self.state.is_auth_broken(name)
     }
 
     /// Mark or clear `name`'s auth-broken flag. Returns `true` when the set
     /// actually changed, so the caller can skip a redundant `save_app_state`.
     /// Pure in-memory mutation — the caller persists via `save_app_state`.
     pub(crate) fn set_auth_broken(&mut self, name: &str, broken: bool) -> bool {
-        let present = self.is_auth_broken(name);
-        if broken && !present {
-            self.state.auth_broken.push(name.into());
-            true
-        } else if !broken && present {
-            self.state.auth_broken.retain(|n| n.as_str() != name);
-            true
-        } else {
-            false
-        }
+        self.state.set_auth_broken(name, broken)
     }
 
     pub(crate) fn find(&self, name: &str) -> Option<&Profile> {
@@ -1530,6 +1542,14 @@ pub(crate) fn active_profile_name() -> Option<ProfileName> {
 /// deliberately so — an unparseable account list propagates `Err`, because a
 /// record that cannot be read is not a record a session should be started
 /// against. Case-exact, matching [`AppConfig::find`].
+///
+/// Residual (name-keyed, deliberate): this answers "is a profile by this name
+/// on disk", which cannot tell "still present" from "deleted, then re-logged-in
+/// under the same name". A stale-chain gate consulting it can therefore act on
+/// the NEW same-name account (e.g. a rotation/adopt persisting a pair minted
+/// from the old chain). Only a full [`reload_fingerprint`] drift check closes
+/// that, and no caller has needed the extra read; treat it as a documented
+/// boundary, not an oversight.
 pub(crate) fn is_configured(name: &str) -> Result<bool> {
     Ok(load_app_state()?
         .profiles
@@ -1537,7 +1557,7 @@ pub(crate) fn is_configured(name: &str) -> Result<bool> {
         .any(|n| n.as_str() == name))
 }
 
-fn load_app_state() -> Result<AppState> {
+pub(crate) fn load_app_state() -> Result<AppState> {
     let path = app_state_path()?;
     if !path.exists() {
         return Ok(AppState::default());
@@ -1568,6 +1588,34 @@ pub(crate) fn save_app_state(state: &AppState) -> Result<()> {
         mkdir_700(&clauth_dir()?)?;
         atomic_write_600(&app_state_path()?, toml::to_string_pretty(state)?)
             .context("failed to write profiles.toml")
+    })
+}
+
+/// Set or clear `name`'s persisted `auth_broken` flag against the CURRENT
+/// on-disk state, not an in-memory snapshot. A daemon leg that holds a stale
+/// `AppConfig` (a CLI delete/rename/login landed since its last reload) must
+/// not re-serialize the whole stale list over the change: reading profiles.toml
+/// fresh and writing only the flag back preserves every concurrent account
+/// mutation and can never resurrect a deleted profile's row.
+///
+/// A `broken` set for a name the on-disk list no longer carries is a no-op —
+/// nothing is quarantined that does not exist. Returns whether the flag
+/// actually changed on disk.
+///
+/// Same name-keyed residual as [`is_configured`]: this cannot distinguish a
+/// profile that is still present from one deleted and re-logged-in under the
+/// same name.
+pub(crate) fn set_auth_broken_persisted(name: &str, broken: bool) -> Result<bool> {
+    with_state_lock(|| {
+        let mut state = load_app_state()?;
+        if broken && !state.profiles.iter().any(|n| n.as_str() == name) {
+            return Ok(false);
+        }
+        if !state.set_auth_broken(name, broken) {
+            return Ok(false);
+        }
+        save_app_state(&state)?;
+        Ok(true)
     })
 }
 

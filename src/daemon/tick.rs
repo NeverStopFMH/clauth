@@ -102,12 +102,11 @@ impl super::Daemon {
         // queue holds a raw name this process alone owns) is DROPPED, not
         // retried: no re-login can resurrect a profile that no longer exists,
         // and attempting it would run `switch_profile`'s side effects against
-        // a ghost. The logline keeps the drop observable.
-        let target_exists = self
-            .config
-            .lock()
-            .map(|c| c.find(&target).is_some())
-            .unwrap_or(false);
+        // a ghost. Read off DISK, not the in-memory config: the reload that
+        // would have seen the delete runs only at the top of this tick, so a
+        // delete landing after it leaves the in-memory list stale here. The
+        // logline keeps the drop observable.
+        let target_exists = crate::profile::is_configured(&target).unwrap_or(false);
         if !target_exists {
             logline!(
                 "clauth daemon: dropping queued switch to '{target}': profile no longer exists (deleted?)"
@@ -222,6 +221,9 @@ impl super::Daemon {
             // log names the two apart without threading the cause through the
             // switch action.
             let returning = cfg.find(&target).is_some_and(|p| p.preferred);
+            // A delete landing between the early drop above and this hold is
+            // caught by `switch_profile`'s own fresh membership gate
+            // (`ensure_switch_target_ok`), which runs inside this same flock.
             crate::lock::with_state_lock(|| {
                 switch_profile(&mut cfg, &target)?;
                 Ok((reload_fingerprint(), returning))

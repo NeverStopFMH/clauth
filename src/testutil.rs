@@ -427,6 +427,7 @@ pub(crate) fn rotation_fixture_config(name: &str) -> crate::profile::ConfigHandl
     };
     config.state.profiles.push(name.into());
     config.state.active_profile = Some(name.into());
+    crate::profile::save_app_state(&config.state).expect("save app state");
     std::sync::Arc::new(crate::lockorder::RankedMutex::new(config))
 }
 

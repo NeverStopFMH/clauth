@@ -3487,7 +3487,7 @@ fn divergence_default_never_captures_a_sibling_owned_login() {
         play.credentials = Some(creds_ra("rt-play", "at-play"));
         save_profile(&play).expect("save play");
         write_live_creds(&creds_ra("rt-play", "at-play"));
-        App::new(AppConfig {
+        let config = AppConfig {
             state: AppState {
                 active_profile: Some("work".into()),
                 profiles: vec!["work".into(), "play".into()],
@@ -3495,7 +3495,9 @@ fn divergence_default_never_captures_a_sibling_owned_login() {
                 ..AppState::default()
             },
             profiles: vec![work, play],
-        })
+        };
+        crate::profile::save_app_state(&config.state).expect("persist state");
+        App::new(config)
     };
 
     // Overwrite default + sibling-owned login: no capture, banner instead.
@@ -3560,7 +3562,7 @@ fn divergence_default_never_captures_a_sibling_owned_login() {
     work.credentials = Some(creds_ra("rt-work", "at-work"));
     save_profile(&work).expect("save work");
     write_live_creds(&creds_ra("rt-fresh", "at-fresh"));
-    let mut app = App::new(AppConfig {
+    let config = AppConfig {
         state: AppState {
             active_profile: Some("work".into()),
             profiles: vec!["work".into()],
@@ -3568,7 +3570,9 @@ fn divergence_default_never_captures_a_sibling_owned_login() {
             ..AppState::default()
         },
         profiles: vec![work],
-    });
+    };
+    crate::profile::save_app_state(&config.state).expect("persist state");
+    let mut app = App::new(config);
     force_poll(&mut app);
     assert_eq!(
         app.config().find("work").and_then(|p| p.refresh_token()),
@@ -5603,6 +5607,7 @@ fn tui_switch_gate_refuses_a_dead_target_before_its_flag_is_set() {
 fn tui_switch_gate_passes_a_healthy_target_through() {
     let _home = crate::testutil::HomeSandbox::new();
     let mut app = app_with_unlinked_profiles(vec![stored_oauth_profile("healthy", far_future())]);
+    crate::profile::save_app_state(&app.config().state).expect("persist state");
 
     super::spawn_switch_gate(&mut app, "healthy".to_string(), |_, _| {
         panic!("a healthy target must not spend a refresh")
@@ -5652,6 +5657,7 @@ fn tui_switch_gate_transient_failure_refuses_without_quarantine() {
 fn tui_switch_gate_recovers_a_flagged_target() {
     let _home = crate::testutil::HomeSandbox::new();
     let mut app = app_with_unlinked_profiles(vec![stored_oauth_profile("flagged", far_future())]);
+    crate::profile::save_app_state(&app.config().state).expect("persist state");
     app.config().set_auth_broken("flagged", true);
 
     super::spawn_switch_gate(&mut app, "flagged".to_string(), |_, _| {
@@ -5686,6 +5692,7 @@ fn tui_switch_gate_pending_blocks_switches_and_waits_for_modals() {
         stored_oauth_profile("first", far_future()),
         stored_oauth_profile("second", far_future()),
     ]);
+    crate::profile::save_app_state(&app.config().state).expect("persist state");
 
     super::spawn_switch_gate(&mut app, "first".to_string(), |_, _| {
         panic!("healthy target: no refresh")
@@ -6171,7 +6178,7 @@ fn bootstrap_app(_home: &crate::testutil::HomeSandbox, status: FetchStatus) -> A
     // uncaptured login to strand, so a decided switch actually lands.
     write_live_creds(spent.credentials.as_ref().expect("spent credentials"));
 
-    let mut app = App::new(AppConfig {
+    let config = AppConfig {
         state: AppState {
             active_profile: Some(BOOT_SPENT.into()),
             profiles: vec![BOOT_SPENT.into(), BOOT_SPARE.into()],
@@ -6179,7 +6186,9 @@ fn bootstrap_app(_home: &crate::testutil::HomeSandbox, status: FetchStatus) -> A
             ..AppState::default()
         },
         profiles: vec![spent, spare],
-    });
+    };
+    crate::profile::save_app_state(&config.state).expect("persist state");
+    let mut app = App::new(config);
 
     #[allow(clippy::expect_used, reason = "mutex poisoning is unrecoverable")]
     {

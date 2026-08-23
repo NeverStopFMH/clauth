@@ -338,6 +338,7 @@ fn seed_relogin_scenario(
     };
     config.state.active_profile = Some(name.into());
     config.state.profiles = vec![name.into()];
+    crate::profile::save_app_state(&config.state).expect("persist state");
     config
 }
 
@@ -954,6 +955,7 @@ fn snapshot_skips_shell_on_blank_profile_and_preserves_live_file() {
     };
     config.state.active_profile = Some("blank-active".into());
     config.state.profiles = vec!["blank-active".into()];
+    crate::profile::save_app_state(&config.state).expect("persist state");
 
     let live = claude_credentials_path().expect("creds path");
     std::fs::create_dir_all(live.parent().expect("parent")).expect("mkdir .claude");
@@ -1008,6 +1010,7 @@ fn force_snapshot_skips_an_absent_live_file() {
     };
     config.state.active_profile = Some("absent-active".into());
     config.state.profiles = vec!["absent-active".into()];
+    crate::profile::save_app_state(&config.state).expect("persist state");
 
     // No live `.credentials.json` written at all: `claude_credentials_path()`
     // does not exist, matching a TOCTOU delete or a dangling symlink.
@@ -1337,6 +1340,7 @@ fn switch_installs_session_token_not_usage_oauth() {
     };
     config.state.profiles = vec!["a".into(), "b".into()];
     config.state.active_profile = Some("a".into());
+    crate::profile::save_app_state(&config.state).expect("persist state");
     force_link_profile_credentials("a").expect("link a");
 
     crate::actions::switch_profile(&mut config, "b").expect("switch to b");
@@ -3695,5 +3699,58 @@ fn restore_quarantines_a_misfilled_sidecar_before_overwriting_it() {
     assert!(
         quarantined,
         "the overwritten pair survives as evidence, same as every other repair path"
+    );
+}
+
+// ── stale-config persist gate (lock-race row 3) ───────────────────────────────
+
+/// The force-capture sink writes a whole profile, so it must not recreate the
+/// directory of an active profile deleted by the CLI while a stale config held
+/// the pre-delete snapshot. The live mirror file stays (the delete runs on a
+/// config where the profile is not active), so the sink reaches its capture
+/// branch rather than the absent-file skip.
+#[test]
+fn force_snapshot_does_not_resurrect_a_deleted_profile() {
+    let _home = HomeSandbox::new();
+    let mut profile = crate::profile::Profile::new("gone".to_string(), None, None);
+    profile.credentials = Some(creds("stored-access", Some("stored-refresh")));
+    crate::profile::save_profile(&profile).expect("save profile");
+
+    let mut config = AppConfig {
+        state: crate::profile::AppState::default(),
+        profiles: vec![profile],
+    };
+    config.state.active_profile = Some("gone".into());
+    config.state.profiles = vec!["gone".into()];
+    crate::profile::save_app_state(&config.state).expect("persist state");
+
+    // The leg's config is a snapshot taken BEFORE the delete.
+    let mut stale = config.clone();
+
+    let live = claude_credentials_path().expect("creds path");
+    std::fs::create_dir_all(live.parent().expect("parent")).expect("mkdir .claude");
+    std::fs::write(
+        &live,
+        serde_json::to_vec(&creds("relogin-access", Some("relogin-refresh"))).expect("ser"),
+    )
+    .expect("write live");
+
+    // CLI account mutation on a config where `gone` is NOT active, so the delete
+    // leaves the live file alone.
+    let mut disk = crate::profile::load_config().expect("load disk config");
+    disk.state.active_profile = None;
+    let guard = crate::runtime::RotationGuard::acquire("gone").expect("rotation guard");
+    crate::actions::delete_profile(&mut disk, "gone", false, &guard).expect("delete");
+    drop(guard);
+    assert!(
+        !crate::profile::profile_dir("gone").expect("dir").exists(),
+        "fixture precondition: the delete removed the directory"
+    );
+
+    force_snapshot_active_credentials(&mut stale).expect("force snapshot");
+
+    assert!(
+        !crate::profile::profile_dir("gone").expect("dir").exists(),
+        "a deleted profile's directory must not be resurrected by the capture sink"
     );
 }

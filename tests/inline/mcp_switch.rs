@@ -94,6 +94,7 @@ fn seed_diverged(
     };
     config.state.active_profile = Some(active.into());
     config.state.profiles = vec![active.into(), target.into()];
+    crate::profile::save_app_state(&config.state).expect("persist state");
     config
 }
 
@@ -399,14 +400,16 @@ fn non_diverged_switch_takes_plain_path() {
     // Link the live path to the active profile so it classifies as LinkedTo.
     crate::claude::force_link_profile_credentials("active").expect("link active");
 
-    let config = handle(AppConfig {
+    let config = AppConfig {
         state: AppState {
             active_profile: Some("active".into()),
             profiles: vec!["active".into(), "target".into()],
             ..Default::default()
         },
         profiles: vec![active_profile, target_profile],
-    });
+    };
+    crate::profile::save_app_state(&config.state).expect("persist state");
+    let config = handle(config);
 
     assert_eq!(
         classify_credentials_link("active").expect("classify"),
@@ -631,14 +634,16 @@ fn switch_to_the_active_profile_never_gates() {
     let active_profile = stored_profile("active", Some(creds_expired("live-a", "live-r")));
     crate::claude::force_link_profile_credentials("active").expect("link active");
 
-    let config = handle(AppConfig {
+    let config = AppConfig {
         state: AppState {
             active_profile: Some("active".into()),
             profiles: vec!["active".into()],
             ..Default::default()
         },
         profiles: vec![active_profile],
-    });
+    };
+    crate::profile::save_app_state(&config.state).expect("persist state");
+    let config = handle(config);
 
     let revoked = |_: &str, _: Option<&str>| {
         Err(crate::oauth::RefreshError::Invalid(

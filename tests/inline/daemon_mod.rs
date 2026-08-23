@@ -937,3 +937,128 @@ fn redundant_reason_names_the_pid_for_the_default_and_the_queue_for_standby() {
         "the --standby redundant reason must mention the full queue, got {standby:?}"
     );
 }
+
+// ── stale-config persist gates (lock-race row 3) ─────────────────────────────
+
+/// A queued switch whose target is deleted out-of-process AFTER the daemon's
+/// in-memory config was loaded must be dropped on the fresh membership read,
+/// not switched to. The pre-fix drain read the vanished guard off the in-memory
+/// list, so the delete (landing between the tick's reload and the drain) was
+/// invisible and `switch_profile` ran against a ghost.
+#[test]
+fn drain_pending_switch_drops_a_target_deleted_after_enqueue() {
+    let _home = HomeSandbox::new();
+    let config = persist(
+        vec![
+            profile_with_creds("alpha", "at-alpha"),
+            profile_with_creds("beta", "at-beta"),
+        ],
+        Some("alpha"),
+        90_000,
+    );
+    link_active_clean("alpha");
+    let mut daemon = daemon_for(config);
+
+    stage_switch(&daemon, "beta");
+
+    let mut disk = crate::profile::load_config().expect("load disk config");
+    let guard = crate::runtime::RotationGuard::acquire("beta").expect("rotation guard");
+    crate::actions::delete_profile(&mut disk, "beta", false, &guard).expect("delete");
+    drop(guard);
+
+    daemon.drain_pending_switch();
+
+    assert_eq!(
+        active_of(&daemon).as_deref(),
+        Some("alpha"),
+        "a deleted target must not be switched to"
+    );
+    assert!(
+        queued_targets(&daemon).is_empty(),
+        "a deleted target is dropped, not re-queued"
+    );
+    assert!(
+        !crate::profile::profile_dir("beta").expect("dir").exists(),
+        "the deleted target's directory must stay deleted"
+    );
+}
+
+/// A switch's whole-state save must not re-list an unrelated profile deleted by
+/// the CLI after the daemon's config was loaded. The switch still lands on the
+/// (still-existing) target; only the deleted row stays gone.
+#[test]
+fn drain_pending_switch_does_not_resurrect_a_deleted_row() {
+    let _home = HomeSandbox::new();
+    let config = persist(
+        vec![
+            profile_with_creds("alpha", "at-alpha"),
+            profile_with_creds("beta", "at-beta"),
+            profile_with_creds("gamma", "at-gamma"),
+        ],
+        Some("alpha"),
+        90_000,
+    );
+    link_active_clean("alpha");
+    let mut daemon = daemon_for(config);
+
+    stage_switch(&daemon, "beta");
+
+    let mut disk = crate::profile::load_config().expect("load disk config");
+    let guard = crate::runtime::RotationGuard::acquire("gamma").expect("rotation guard");
+    crate::actions::delete_profile(&mut disk, "gamma", false, &guard).expect("delete");
+    drop(guard);
+
+    daemon.drain_pending_switch();
+
+    assert_eq!(
+        active_of(&daemon).as_deref(),
+        Some("beta"),
+        "the switch to beta still lands"
+    );
+    let reloaded = crate::profile::load_config().expect("reload");
+    assert!(
+        reloaded.find("gamma").is_none(),
+        "the deleted profile's row must not come back through the switch's state save"
+    );
+}
+
+/// The wrap-off's whole-state save is the same shape as the switch's: it must
+/// not re-list a profile deleted out from under the daemon while it turns
+/// everything off.
+#[test]
+fn drain_pending_switch_off_does_not_resurrect_a_deleted_row() {
+    let _home = HomeSandbox::new();
+    let config = persist(
+        vec![
+            profile_with_creds("alpha", "at-alpha"),
+            profile_with_creds("gamma", "at-gamma"),
+        ],
+        Some("alpha"),
+        90_000,
+    );
+    link_active_clean("alpha");
+    let mut daemon = daemon_for(config);
+
+    *daemon
+        .pending_switch_off
+        .lock()
+        .expect("pending_switch_off") = true;
+
+    let mut disk = crate::profile::load_config().expect("load disk config");
+    let guard = crate::runtime::RotationGuard::acquire("gamma").expect("rotation guard");
+    crate::actions::delete_profile(&mut disk, "gamma", false, &guard).expect("delete");
+    drop(guard);
+
+    daemon.drain_pending_switch_off();
+
+    assert_eq!(
+        active_of(&daemon).as_deref(),
+        None,
+        "the wrap-off turned everything off"
+    );
+    let reloaded = crate::profile::load_config().expect("reload");
+    assert!(
+        reloaded.find("gamma").is_none(),
+        "the deleted profile's row must not come back through the switch-off state save"
+    );
+}

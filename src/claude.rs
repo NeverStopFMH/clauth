@@ -1935,6 +1935,15 @@ fn snapshot_active_credentials_unchecked(config: &mut AppConfig, active: &str) -
     if has_session_token(active) {
         return Ok(());
     }
+    // Fresh, not just the in-memory active marker: the active profile may have
+    // been deleted or renamed out-of-process since this caller's config was
+    // loaded (a daemon switch/switch-off holds a stale config between reloads).
+    // `save_profile` would recreate the deleted directory, so consult the
+    // on-disk list before writing. Callers run this under the state flock, so
+    // the read is stable.
+    if !crate::profile::is_configured(active)? {
+        return Ok(());
+    }
     let credentials = read_claude_credentials()?;
     // Only a real live login is captured. A logged-out shell (blank tokens) OR an
     // absent live file (a TOCTOU delete in the modal-confirm window, or a

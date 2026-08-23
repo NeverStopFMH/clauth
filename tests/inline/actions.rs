@@ -131,7 +131,9 @@ fn switch_replaces_active_account_mirror_without_refusing() {
         state: AppState::default(),
         profiles: vec![active, target],
     };
+    config.state.profiles = vec!["cl-ax".into(), "xfx".into()];
     config.state.active_profile = Some("cl-ax".into());
+    crate::profile::save_app_state(&config.state).expect("persist state");
 
     // Must NOT bail — the live file is the active account's captured mirror.
     switch_profile(&mut config, "xfx").expect("switch replaces the active-account mirror");
@@ -196,6 +198,77 @@ fn switch_to_a_missing_profile_bails_before_touching_the_live_link() {
     assert!(stored.exists(), "keeper's stored credentials survive");
 }
 
+/// The fresh-membership gate in `ensure_switch_target_ok` (not the in-memory
+/// `find`) is what bounces a target deleted on disk while a caller holds a
+/// stale config. It runs BEFORE `force_link_profile_credentials`, so the live
+/// slot is never torn down for a ghost — the failure mode a `finish_switch`-only
+/// gate would leave open.
+#[test]
+fn switch_profile_refuses_a_target_deleted_on_disk() {
+    let _home = HomeSandbox::new();
+
+    let mk = |name: &str, access: &str| {
+        let mut p = Profile::new(name.to_string(), None, None);
+        p.credentials = Some(crate::profile::ClaudeCredentials {
+            claude_ai_oauth: Some(crate::profile::OAuthToken {
+                access_token: access.to_string(),
+                refresh_token: Some(format!("{access}-refresh")),
+                expires_at: None,
+                scopes: None,
+                subscription_type: None,
+            }),
+        });
+        save_profile(&p).expect("save profile");
+        p
+    };
+    let active = mk("keeper", "keeper-access");
+    let victim = mk("victim", "victim-access");
+
+    let live_path = crate::profile::claude_dir()
+        .unwrap()
+        .join(".credentials.json");
+    std::fs::create_dir_all(live_path.parent().unwrap()).unwrap();
+    std::fs::write(
+        &live_path,
+        serde_json::to_vec(active.credentials.as_ref().unwrap()).unwrap(),
+    )
+    .unwrap();
+
+    let config = AppConfig {
+        state: AppState {
+            active_profile: Some("keeper".into()),
+            profiles: vec!["keeper".into(), "victim".into()],
+            ..AppState::default()
+        },
+        profiles: vec![active, victim],
+    };
+    save_app_state(&config.state).expect("persist state");
+
+    // The leg's snapshot predates the delete.
+    let mut stale = config.clone();
+
+    // CLI account mutation: delete victim out from under the stale snapshot.
+    // `victim` is not active on the delete config, so the live file survives and
+    // the gate under test is what refuses, not a missing live slot.
+    let mut disk = crate::profile::load_config().expect("load disk config");
+    disk.state.active_profile = None;
+    let guard = rotation_guard("victim");
+    delete_profile(&mut disk, "victim", false, &guard).expect("delete");
+    drop(guard);
+
+    let err = switch_profile(&mut stale, "victim").expect_err("a deleted target must be refused");
+    assert_eq!(err.to_string(), "profile 'victim' not found");
+    assert!(stale.is_active("keeper"), "the active profile is unchanged");
+    assert!(
+        live_path.exists(),
+        "the live credentials file must survive (the gate fires before force-link)"
+    );
+    assert!(
+        !profile_dir("victim").expect("dir").exists(),
+        "the deleted target's directory must stay deleted"
+    );
+}
+
 /// The disabled gate is the shared locked action, not a CLI wrapper:
 /// `switch_profile` itself — no `cmd_switch`, no MCP tool — refuses a
 /// disabled target and leaves `active_profile` untouched. Covers #1/#4/#6:
@@ -217,6 +290,7 @@ fn switch_profile_refuses_a_disabled_target_and_leaves_active_unchanged() {
         },
         profiles: vec![active, target],
     };
+    crate::profile::save_app_state(&config.state).expect("persist state");
 
     let err = switch_profile(&mut config, "target").expect_err("a disabled target must be refused");
     assert_eq!(
@@ -288,6 +362,7 @@ fn auto_switch_if_needed_walks_off_a_broken_active() {
         },
         profiles: vec![a, b],
     };
+    crate::profile::save_app_state(&config.state).expect("persist state");
 
     let action = auto_switch_if_needed(&mut config, None).expect("auto switch");
     assert_eq!(
@@ -364,6 +439,7 @@ fn auto_switch_if_needed_hops_off_a_scoped_blocked_active() {
         },
         profiles: vec![a, b],
     };
+    crate::profile::save_app_state(&config.state).expect("persist state");
 
     let action = auto_switch_if_needed(&mut config, None).expect("auto switch");
     assert_eq!(

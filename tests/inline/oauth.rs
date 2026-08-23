@@ -365,6 +365,7 @@ fn oauth_config(name: &str, refresh_token: Option<&str>, expires_at: Option<i64>
         profiles: vec![profile],
     };
     config.state.profiles.push(name.into());
+    crate::profile::save_app_state(&config.state).expect("persist state");
     config
 }
 
@@ -928,6 +929,7 @@ mod adopt_live_rotation {
         };
         config.state.profiles = vec![name.into()];
         config.state.active_profile = Some(name.into());
+        crate::profile::save_app_state(&config.state).expect("persist state");
         let live = crate::profile::claude_dir()
             .unwrap()
             .join(".credentials.json");
@@ -1288,6 +1290,36 @@ mod adopt_live_rotation {
         assert_eq!(
             after["mcpOAuth"]["linear"]["accessToken"], "mock-linear",
             "the MCP-server login survives the post-adopt relink"
+        );
+    }
+
+    /// The adopt persists a whole profile, so it must not recreate the directory
+    /// of a profile deleted while the rotation guard was held across the identity
+    /// HTTP window. `name` stays active on the stale handle but is already gone
+    /// on disk; the fresh membership read refuses before `save_profile`.
+    #[test]
+    fn adopt_does_not_resurrect_a_deleted_profile() {
+        let _home = HomeSandbox::new();
+        let name = "adopt-resurrect";
+        let handle = setup(name, future_expiry(), future_expiry() + 3_600_000);
+
+        // CLI account mutation on a config where `name` is NOT active, so the
+        // delete leaves the live mirror file alone (the adopt's classify gate
+        // still reads it as Diverged rather than Missing).
+        let mut disk = crate::profile::load_config().expect("load disk config");
+        disk.state.active_profile = None;
+        let rotation = guard(name);
+        crate::actions::delete_profile(&mut disk, name, false, &rotation).expect("delete");
+        assert!(
+            !crate::profile::profile_dir(name).expect("dir").exists(),
+            "fixture precondition: the delete removed the directory"
+        );
+
+        let adopted = try_adopt_live_rotation(&handle, name, &rotation, &|_| Some("uuid-1".into()));
+        assert_eq!(adopted, None, "a deleted profile must not be adopted");
+        assert!(
+            !crate::profile::profile_dir(name).expect("dir").exists(),
+            "the deleted profile's directory must stay deleted"
         );
     }
 }
@@ -3543,5 +3575,107 @@ fn rolling_gate_unrecorded_grant_still_installs_a_live_mint() {
     assert_eq!(
         oauth.access_token, "sk-ant-oat01-live-mint",
         "mint untouched"
+    );
+}
+
+// ── stale-config persist gates (lock-race row 3) ─────────────────────────────
+//
+// A daemon leg persists a whole profile/state from an in-memory config that a
+// concurrent CLI delete/rename can have already moved past. Each test deletes a
+// profile through the CLI action while a separate handle holds the pre-delete
+// snapshot, then drives the persist leg and asserts the deleted profile stays
+// gone.
+
+/// A rotation that lands after the profile was deleted must not recreate its
+/// directory: `save_profile` opens with `mkdir_700`, so the pre-fix leg
+/// resurrected the account's whole directory tree.
+#[test]
+fn rotated_tokens_do_not_resurrect_a_deleted_profile() {
+    let _home = HomeSandbox::new();
+    let name = "rotate-resurrect";
+    let mut profile = Profile::new(name.to_string(), None, None);
+    profile.credentials = Some(ClaudeCredentials {
+        claude_ai_oauth: Some(OAuthToken {
+            access_token: "at-old".to_string(),
+            refresh_token: Some("rt-old".to_string()),
+            expires_at: Some(future_expiry()),
+            scopes: None,
+            subscription_type: None,
+        }),
+    });
+    crate::profile::save_profile(&profile).expect("save profile");
+    let mut config = AppConfig {
+        state: AppState {
+            profiles: vec![name.into()],
+            ..AppState::default()
+        },
+        profiles: vec![profile],
+    };
+    crate::profile::save_app_state(&config.state).expect("persist state");
+
+    // The leg's handle is a snapshot taken BEFORE the delete.
+    let stale = Arc::new(RankedMutex::new(config.clone()));
+
+    let guard = crate::runtime::RotationGuard::acquire(name).expect("rotation guard");
+    crate::actions::delete_profile(&mut config, name, false, &guard).expect("delete");
+    drop(guard);
+    assert!(
+        !crate::profile::profile_dir(name).expect("dir").exists(),
+        "fixture precondition: the delete removed the directory"
+    );
+
+    let tok = TokenResponse {
+        access_token: "at-new".to_string(),
+        refresh_token: "rt-new".to_string(),
+        expires_in: 3600,
+        scope: None,
+    };
+    assert!(
+        apply_rotated_tokens_locked(&stale, name, tok).is_err(),
+        "a persist to a deleted profile must refuse"
+    );
+    assert!(
+        !crate::profile::profile_dir(name).expect("dir").exists(),
+        "the deleted profile's directory must stay deleted"
+    );
+}
+
+/// The quarantine write re-serializes the whole profile list, so it used to
+/// restore a deleted profile's ROW in `profiles.toml` (not only its directory).
+/// It must write only the flag onto the current on-disk state.
+#[test]
+fn mark_auth_broken_does_not_resurrect_a_deleted_profiles_row() {
+    let _home = HomeSandbox::new();
+    let mk = |n: &str| {
+        let p = Profile::new(n.to_string(), None, None);
+        crate::profile::save_profile(&p).expect("save profile");
+        p
+    };
+    let kept = mk("kept-row");
+    let victim = mk("victim-row");
+    let mut config = AppConfig {
+        state: AppState {
+            profiles: vec!["kept-row".into(), "victim-row".into()],
+            ..AppState::default()
+        },
+        profiles: vec![kept, victim],
+    };
+    crate::profile::save_app_state(&config.state).expect("persist state");
+    let stale = Arc::new(RankedMutex::new(config.clone()));
+
+    let guard = crate::runtime::RotationGuard::acquire("victim-row").expect("rotation guard");
+    crate::actions::delete_profile(&mut config, "victim-row", false, &guard).expect("delete");
+    drop(guard);
+
+    mark_auth_broken(&stale, "victim-row", true);
+
+    let reloaded = crate::profile::load_config().expect("reload");
+    assert!(
+        reloaded.find("victim-row").is_none(),
+        "a deleted profile's row must not come back through the quarantine write"
+    );
+    assert!(
+        reloaded.find("kept-row").is_some(),
+        "the surviving profile's row is untouched"
     );
 }

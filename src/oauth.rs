@@ -1207,6 +1207,14 @@ pub(crate) fn apply_rotated_tokens_locked(
     #[cfg(target_os = "macos")]
     let mut mirror: Option<crate::profile::ClaudeCredentials> = None;
     with_state_lock(|| {
+        // The profile may have been deleted or renamed out-of-process since this
+        // caller's config was loaded (the single-fetcher holds a stale config
+        // between reloads). `save_profile` and the stage below would recreate its
+        // directory, so ask the on-disk list — under the flock, the one stable
+        // answer — before either write.
+        if !crate::profile::is_configured(name).unwrap_or(false) {
+            return Err(anyhow::anyhow!("failed to persist rotated tokens"));
+        }
         let Some(profile) = cfg.find_mut(name) else {
             return Err(anyhow::anyhow!("failed to persist rotated tokens"));
         };
@@ -1528,6 +1536,14 @@ pub(crate) fn try_adopt_live_rotation(
         if !cfg.is_active(name) {
             return Ok(false);
         }
+        // Fresh, not just the in-memory active marker: the profile may have been
+        // deleted or renamed after this caller loaded its config but before the
+        // rotation guard was acquired (a delete/rename takes the same guard, so
+        // it cannot land while this leg holds it). `save_profile` would recreate
+        // its directory, so consult the on-disk list before writing.
+        if !crate::profile::is_configured(name).unwrap_or(false) {
+            return Ok(false);
+        }
         let Some(profile) = cfg.find_mut(name) else {
             return Ok(false);
         };
@@ -1553,7 +1569,10 @@ pub(crate) fn try_adopt_live_rotation(
     // switch target until a manual `clauth login`.
     if cfg.set_auth_broken(name, false) {
         logline!("clauth: '{name}' re-authenticated: auth_broken cleared");
-        let _ = crate::profile::save_app_state(&cfg.state);
+        // Persist against fresh disk state (see `set_auth_broken_persisted`):
+        // the adopt just proved the chain is alive, but this process's config
+        // may be older than a concurrent CLI account mutation.
+        let _ = crate::profile::set_auth_broken_persisted(name, false);
     }
     write_profile_cache(name, ACCOUNT_ID_CACHE_FILE, &live_id);
     logline!(
@@ -2397,25 +2416,33 @@ fn gate_under_guard(
 
 /// Set or clear a profile's persisted `auth_broken` flag and save. Best-effort:
 /// a failed save leaves the in-memory flag as set for this run (re-applied on the
-/// next attempt). Locks `config` (outer) then `save_app_state` takes the state
-/// flock (inner) — the established save order.
+/// next attempt). Locks `config` (outer) then the state flock (inner) — the
+/// established save order.
+///
+/// The save goes through [`crate::profile::set_auth_broken_persisted`] rather
+/// than re-serializing the whole in-memory `AppState`: a daemon leg can hold a
+/// config older than a concurrent CLI delete/rename/login, and writing the full
+/// stale list would resurrect a deleted profile's row or rewind an edit to some
+/// other profile in the same file.
 pub(crate) fn mark_auth_broken(config: &crate::profile::ConfigHandle, name: &str, broken: bool) {
-    if let Ok(mut cfg) = config.lock()
-        && cfg.set_auth_broken(name, broken)
-    {
-        // Log the transition only — guarded by `set_auth_broken`'s changed-return
-        // (pinned by `set_auth_broken_reports_transitions_and_is_idempotent`) so a
-        // dropped login leaves one stderr line, never a per-tick repeat.
-        if broken {
-            logline!(
-                "clauth: {} (flagged auth_broken)",
-                crate::format::login_expired(name).line()
-            );
-        } else {
-            logline!("clauth: '{name}' re-authenticated: auth_broken cleared");
-        }
-        let _ = crate::profile::save_app_state(&cfg.state);
+    let Ok(mut cfg) = config.lock() else {
+        return;
+    };
+    if !cfg.set_auth_broken(name, broken) {
+        return;
     }
+    // Log the transition only — guarded by `set_auth_broken`'s changed-return
+    // (pinned by `set_auth_broken_reports_transitions_and_is_idempotent`) so a
+    // dropped login leaves one stderr line, never a per-tick repeat.
+    if broken {
+        logline!(
+            "clauth: {} (flagged auth_broken)",
+            crate::format::login_expired(name).line()
+        );
+    } else {
+        logline!("clauth: '{name}' re-authenticated: auth_broken cleared");
+    }
+    let _ = crate::profile::set_auth_broken_persisted(name, broken);
 }
 
 #[cfg(test)]

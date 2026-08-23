@@ -746,7 +746,9 @@ fn threshold_of(app: &app::App, name: &str) -> Option<f64> {
 #[test]
 fn demo_data_drives_all_actions() {
     let _home = ShowcaseHome::new();
-    let mut app = app::App::new(demo_config());
+    let config = demo_config();
+    crate::profile::save_app_state(&config.state).expect("persist state");
+    let mut app = app::App::new(config);
     seed_usage(&app);
     seed_timers(&app);
     seed_history(&app);

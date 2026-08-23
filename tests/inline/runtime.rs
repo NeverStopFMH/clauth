@@ -1838,6 +1838,30 @@ fn make_profile(name: &str) -> crate::profile::Profile {
     crate::profile::Profile::new(name.to_string(), None, None)
 }
 
+/// [`make_profile`] plus the on-disk record `ProfileRuntime::acquire` re-reads
+/// under the state flock. Every acquire fixture needs it: an unregistered name
+/// IS the deleted-account state `refuse_if_unconfigured` refuses, so a fixture
+/// without it would pin that gate instead of whatever the test is about.
+/// Read-modify-write, so one fixture can register several. Call INSIDE
+/// [`with_fake_home`] — it writes into `~/.clauth`.
+fn configured_profile(name: &str) -> crate::profile::Profile {
+    let profile = make_profile(name);
+    register_profile(&profile);
+    profile
+}
+
+/// Put an already-built profile on disk and into the profile list. Split from
+/// [`configured_profile`] for the fixtures that mint their own [`Profile`]
+/// (credentials, endpoint, disabled flag) before registering it.
+fn register_profile(profile: &Profile) {
+    crate::profile::save_profile(profile).expect("save profile");
+    let mut state = crate::profile::load_config().expect("load config").state;
+    if !state.profiles.iter().any(|n| n == &profile.name) {
+        state.profiles.push(profile.name.as_str().into());
+    }
+    crate::profile::save_app_state(&state).expect("save app state");
+}
+
 /// The `<sid>` keying a live session's dirs, read back off its runtime path.
 fn sid_of(runtime: &Path) -> String {
     runtime
@@ -2672,7 +2696,7 @@ fn acquire_creates_runtime_and_pid_file() {
             return;
         }
         fake_claude_home(tmp.path());
-        let profile = make_profile("lifecycle");
+        let profile = configured_profile("lifecycle");
 
         let rt = ProfileRuntime::acquire(&profile, Isolation::Shared, &[], false).expect("acquire");
 
@@ -2725,6 +2749,181 @@ fn acquire_creates_runtime_and_pid_file() {
     });
 }
 
+/// The window row 2 of the lock-race backlog names: a caller loads config,
+/// `RotationGuard::acquire` BLOCKS, a delete lands, and the acquire then rebuilds
+/// a whole session for an account nothing configures.
+///
+/// Driven single-threaded and through the REAL `actions::delete_profile`,
+/// because the seam is between two statements of the CALLER rather than inside
+/// `acquire`: `start::run` reads `config.find(name)` and hands the borrow down,
+/// so a test that deletes between those two statements occupies exactly the
+/// window. A second thread would add a scheduler to the fixture without moving
+/// the seam, and could not land the delete inside `acquire`'s own hold anyway —
+/// the delete takes the same flock. Driving the real action rather than
+/// hand-unlinking keeps the fixture honest if the delete's order changes.
+///
+/// What this does NOT separate: the gate sitting inside the state-flock hold
+/// from the gate sitting just before it. The delete here has already finished,
+/// so both placements refuse. That half is
+/// `acquire_refuses_a_record_removed_without_a_rotation_lock`.
+#[test]
+fn acquire_refuses_a_profile_deleted_after_the_config_load() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        fake_claude_home(tmp.path());
+        // The borrow `start::run` hands down, taken while the account still exists.
+        let profile = configured_profile("vanishes");
+
+        let mut config = crate::profile::load_config().expect("load config");
+        assert!(
+            config.find("vanishes").is_some(),
+            "fixture must start from a configured account, or the gate below \
+             proves nothing"
+        );
+        let guard = RotationGuard::acquire("vanishes").expect("rotation guard");
+        crate::actions::delete_profile(&mut config, "vanishes", false, &guard).expect("delete");
+        drop(guard);
+        assert!(
+            crate::profile::load_config()
+                .expect("reload config")
+                .find("vanishes")
+                .is_none(),
+            "fixture must have removed the record it is about to start against"
+        );
+
+        // Mapped away because `ProfileRuntime` is not `Debug`; an Ok here also
+        // tears the session down before the panic reports it.
+        let err = ProfileRuntime::acquire(&profile, Isolation::Shared, &[], false)
+            .map(|_| ())
+            .expect_err("a start for a deleted account must fail loudly");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("vanishes") && msg.contains("clauth list"),
+            "the refusal must name the account and the way out, got: {msg}"
+        );
+
+        // The gate precedes every write this hold does, so none of the acquire's
+        // own side effects ran. It reaches wider than M2's placement claim: the
+        // legs that run BEFORE the gate (`arm_rolling_from_disk` -> `load_profile`
+        // -> `maybe_rewrite_config_toml`) are inert for a cleanly deleted name
+        // only by CONVENTION — `effective_base_url(None, false, None)` returning
+        // `None` and the default render round-tripping — and `atomic_write_600`
+        // creates the missing parent. Should either drift, `load_profile` becomes
+        // a resurrector sitting ahead of the gate and this assertion is what
+        // reds. Do not weaken it to match the narrower claim it reads as.
+        assert!(
+            !crate::profile::profile_dir("vanishes")
+                .expect("profile dir")
+                .exists(),
+            "a refused start must not put the deleted profile directory back"
+        );
+        assert!(
+            crate::live_sessions::list().is_empty(),
+            "a refused start must register no live row"
+        );
+    });
+}
+
+/// The mixed-version actor: a record removal that holds NO rotation lock,
+/// landing between `acquire`'s rotation guard and its state flock.
+///
+/// This does NOT pin where the gate sits relative to the flock. The seam fires
+/// before the flock acquisition, so a gate moved just below the seam reads the
+/// same post-removal record and refuses identically. `refuse_if_unconfigured`'s
+/// `debug_assert!` on `rank::State` is what pins the placement. What this pins
+/// is that the actor exists and is refused at all, which no other test poses.
+///
+/// No SAME-VERSION mutation can pose this window, and that is why a gate placed
+/// outside the hold survives the whole suite. `acquire` holds its `RotationGuard`
+/// to the end of the function, and every mutation call site takes its own
+/// through `actions::rotation_guard_for_mutation`, which is a `try_acquire` and
+/// REFUSES rather than queues. The rotation guard is doing that work, not the
+/// flock.
+///
+/// What the flock placement buys is the mutation holding NO rotation lock: a
+/// clauth predating the guard witness on `actions::delete_profile`, where the
+/// state flock is the only serialization point the two versions share. That is a
+/// live mixed-version state, not a hypothetical, and the seam is what makes it
+/// deterministic — no threads, no sleeps, nothing to schedule.
+#[test]
+fn acquire_refuses_a_record_removed_without_a_rotation_lock() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        fake_claude_home(tmp.path());
+        let profile = configured_profile("mixedver");
+
+        let err = ProfileRuntime::acquire_synced(&profile, Isolation::Shared, &[], false, || {
+            // A record removal taking no rotation lock — the shape a clauth
+            // predating the witness ships. Its own body still runs under
+            // `with_state_lock`, which is the serialization this gate's
+            // placement rests on.
+            let mut config = crate::profile::load_config().expect("load config");
+            assert!(
+                config.find("mixedver").is_some(),
+                "the seam must fire while the account is still configured, \
+                     or it poses nothing"
+            );
+            config.remove("mixedver");
+            crate::profile::save_app_state(&config.state).expect("save app state");
+            std::fs::remove_dir_all(crate::profile::profile_dir("mixedver").expect("profile dir"))
+                .expect("remove the profile dir");
+        })
+        .map(|_| ())
+        .expect_err("a record removed inside the window must still refuse");
+
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("mixedver") && msg.contains("was deleted or renamed"),
+            "the refusal must be the gate's own, got: {msg}"
+        );
+        assert!(
+            crate::live_sessions::list().is_empty(),
+            "a refused start must register no live row"
+        );
+    });
+}
+
+/// The gate reads the RECORD, and the profile DIRECTORY is the neighbouring
+/// question that fails here: `unsupported_swap_transport` — `start::run`'s last
+/// `--with-fallback` gate — sits inside this same window and `mkdir_700`s the
+/// profile root, so a delete's leftovers are back on disk before the acquire
+/// runs. A directory-existence gate would pass this and rebuild the ghost.
+#[test]
+fn acquire_refuses_a_deleted_account_whose_directory_came_back() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        fake_claude_home(tmp.path());
+        let profile = configured_profile("resurrected");
+
+        let mut config = crate::profile::load_config().expect("load config");
+        let guard = RotationGuard::acquire("resurrected").expect("rotation guard");
+        crate::actions::delete_profile(&mut config, "resurrected", false, &guard).expect("delete");
+        drop(guard);
+
+        // The transport probe every `--with-fallback` start runs, verbatim.
+        unsupported_swap_transport("resurrected").expect("probe the transport");
+        assert!(
+            crate::profile::profile_dir("resurrected")
+                .expect("profile dir")
+                .exists(),
+            "fixture must have put the directory back, or it poses nothing"
+        );
+
+        let err = ProfileRuntime::acquire(&profile, Isolation::Shared, &[], false)
+            .map(|_| ())
+            .expect_err("a start must follow the record, not the leftover directory");
+        // The gate's own sentence, not just the name: every failure path in
+        // `acquire` interpolates a path carrying the profile name, so a future
+        // change that fails at `mkdir_700` instead would keep a name-only
+        // assertion green with the gate gone.
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("resurrected") && msg.contains("was deleted or renamed"),
+            "the refusal must be the gate's own, got: {msg}"
+        );
+    });
+}
+
 /// Black-box `clauth start` isolation: a full `acquire` must build the runtime
 /// tree from the profile's OWN canonical credentials and never leak the live
 /// `~/.claude/.credentials.json` (a different account's tokens) into it. Also
@@ -2741,7 +2940,7 @@ fn acquire_isolates_credentials_from_real_home() {
 
         // Pre-stage the profile's own canonical credentials (what `clauth start`
         // restores for this profile) with a DISTINCT token chain.
-        let profile = make_profile("isolated");
+        let profile = configured_profile("isolated");
         let canonical = tmp
             .path()
             .join(".clauth")
@@ -2820,7 +3019,7 @@ fn acquire_builds_the_runtime_partition_the_mcp_note_describes() {
 
         // Pre-stage the profile's canonical credentials: without them the
         // runtime's `.credentials.json` has no per-profile target to link to.
-        let profile = make_profile("partition");
+        let profile = configured_profile("partition");
         let canonical = tmp
             .path()
             .join(".clauth")
@@ -2911,7 +3110,7 @@ fn acquire_twice_same_process_counts_two_sessions() {
     let tmp = tempfile::tempdir().expect("tempdir");
     with_fake_home(tmp.path(), || {
         fake_claude_home(tmp.path());
-        let profile = make_profile("concurrent");
+        let profile = configured_profile("concurrent");
 
         let rt1 = ProfileRuntime::acquire(&profile, Isolation::Shared, &[], false)
             .expect("first acquire");
@@ -2953,7 +3152,7 @@ fn two_shared_sessions_get_independent_trees() {
             return;
         }
         fake_claude_home(tmp.path());
-        let profile = make_profile("twin");
+        let profile = configured_profile("twin");
 
         let a = ProfileRuntime::acquire(&profile, Isolation::Shared, &[], false)
             .expect("first acquire");
@@ -3016,7 +3215,7 @@ fn acquire_stamps_the_pre_upgrade_liveness_marker_for_both_flavors() {
             ("upgrade-shared", Isolation::Shared, "sessions"),
             ("upgrade-iso", Isolation::Isolated, "sessions-isolated"),
         ] {
-            let profile = make_profile(name);
+            let profile = configured_profile(name);
             let rt = ProfileRuntime::acquire(&profile, isolation, &[], false).expect("acquire");
             let sid = live_sid(&rt);
 
@@ -3098,7 +3297,7 @@ fn a_foreign_holder_of_our_own_marker_never_blocks_acquire() {
 
             let (tx, rx) = std::sync::mpsc::channel();
             std::thread::spawn(move || {
-                let profile = make_profile("collide");
+                let profile = configured_profile("collide");
                 let claimed =
                     ProfileRuntime::acquire(&profile, Isolation::Shared, &[], false).map(|rt| {
                         // Read the dir while the session still holds its marker:
@@ -3195,7 +3394,7 @@ fn teardown_leaves_a_pre_upgrade_marker_it_never_owned() {
         let held = open_pid_file(&foreign_marker).expect("open foreign marker");
         held.lock().expect("lock foreign marker");
 
-        let profile = make_profile("foreign");
+        let profile = configured_profile("foreign");
         let rt = ProfileRuntime::acquire(&profile, Isolation::Shared, &[], false).expect("acquire");
         assert_eq!(
             live_sid(&rt),
@@ -3231,7 +3430,7 @@ fn the_pre_upgrade_marker_dir_survives_until_the_last_session_leaves() {
             return;
         }
         fake_claude_home(tmp.path());
-        let profile = make_profile("upgrade-twin");
+        let profile = configured_profile("upgrade-twin");
         let legacy = tmp
             .path()
             .join(".clauth")
@@ -3278,7 +3477,7 @@ fn dropping_one_shared_session_leaves_the_sibling_intact() {
             return;
         }
         fake_claude_home(tmp.path());
-        let profile = make_profile("survivor");
+        let profile = configured_profile("survivor");
 
         let a = ProfileRuntime::acquire(&profile, Isolation::Shared, &[], false)
             .expect("first acquire");
@@ -3389,7 +3588,7 @@ fn fake_mode_shares_one_tree_across_two_sessions() {
     with_fake_home(tmp.path(), || {
         with_link_mode(LinkMode::Fake, || {
             fake_claude_home(tmp.path());
-            let profile = make_profile("faketwin");
+            let profile = configured_profile("faketwin");
 
             let a = ProfileRuntime::acquire(&profile, Isolation::Shared, &[], false)
                 .expect("first acquire");
@@ -3440,7 +3639,7 @@ fn fake_mode_second_session_does_not_rebuild_the_tree() {
     with_fake_home(tmp.path(), || {
         with_link_mode(LinkMode::Fake, || {
             let claude_home = fake_claude_home(tmp.path());
-            let profile = make_profile("fakecopy");
+            let profile = configured_profile("fakecopy");
 
             let a = ProfileRuntime::acquire(&profile, Isolation::Shared, &[], false)
                 .expect("first acquire");
@@ -3496,7 +3695,7 @@ fn fake_mode_liveness_counts_both_shared_sessions() {
     with_fake_home(tmp.path(), || {
         with_link_mode(LinkMode::Fake, || {
             fake_claude_home(tmp.path());
-            let profile = make_profile("fakegate");
+            let profile = configured_profile("fakegate");
 
             let a = ProfileRuntime::acquire(&profile, Isolation::Shared, &[], false)
                 .expect("first acquire");
@@ -3539,7 +3738,7 @@ fn fake_mode_registry_row_survives_gc() {
     with_fake_home(tmp.path(), || {
         with_link_mode(LinkMode::Fake, || {
             fake_claude_home(tmp.path());
-            let profile = make_profile("fakerow");
+            let profile = configured_profile("fakerow");
 
             let rt =
                 ProfileRuntime::acquire(&profile, Isolation::Shared, &[], false).expect("acquire");
@@ -3583,7 +3782,7 @@ fn fake_mode_stamps_no_second_compat_marker() {
                 ("fakecompat-shared", Isolation::Shared, "sessions"),
                 ("fakecompat-iso", Isolation::Isolated, "sessions-isolated"),
             ] {
-                let profile = make_profile(name);
+                let profile = configured_profile(name);
                 let rt = ProfileRuntime::acquire(&profile, isolation, &[], false).expect("acquire");
 
                 assert_eq!(
@@ -4489,7 +4688,7 @@ fn acquire_registers_a_row_and_teardown_removes_it() {
     let tmp = tempfile::tempdir().expect("tempdir");
     with_fake_home(tmp.path(), || {
         fake_claude_home(tmp.path());
-        let profile = make_profile("registered");
+        let profile = configured_profile("registered");
 
         let rt = ProfileRuntime::acquire(&profile, Isolation::Shared, &[], false).expect("acquire");
         // `live_sid`, not `sid_of`: the subject here is the ROW, which a host
@@ -4550,7 +4749,7 @@ fn session_teardown_holds_the_state_flock_once() {
     let tmp = tempfile::tempdir().expect("tempdir");
     with_fake_home(tmp.path(), || {
         fake_claude_home(tmp.path());
-        let profile = make_profile("teardown-count");
+        let profile = configured_profile("teardown-count");
 
         let rt = ProfileRuntime::acquire(&profile, Isolation::Shared, &[], false).expect("acquire");
 
@@ -4641,9 +4840,12 @@ fn member(name: &str) -> Profile {
     profile
 }
 
-/// Persist `profile` and return the store a swap onto it repoints the link at.
+/// Register `profile` and return the store a swap onto it repoints the link at.
+/// Through [`register_profile`] rather than `save_profile` alone: a chain member
+/// is a configured account, and a launch member an `acquire` runs against has to
+/// be in the record that acquire re-reads.
 fn member_store(profile: &Profile) -> PathBuf {
-    crate::profile::save_profile(profile).expect("save member");
+    register_profile(profile);
     crate::claude::install_source_path(profile.name.as_str()).expect("install source")
 }
 
@@ -4726,7 +4928,7 @@ fn the_with_fallback_flag_reaches_the_row_only_where_a_swap_can_land() {
     let tmp = tempfile::tempdir().expect("tempdir");
     with_fake_home(tmp.path(), || {
         fake_claude_home(tmp.path());
-        let profile = make_profile("optin-flag");
+        let profile = configured_profile("optin-flag");
 
         let opted =
             ProfileRuntime::acquire(&profile, Isolation::Shared, &[], true).expect("acquire");
@@ -4774,7 +4976,7 @@ fn a_fake_mode_host_never_registers_a_session_as_following_the_chain() {
     let tmp = tempfile::tempdir().expect("tempdir");
     with_fake_home(tmp.path(), || {
         fake_claude_home(tmp.path());
-        let profile = make_profile("optin-fake");
+        let profile = configured_profile("optin-fake");
         with_link_mode(LinkMode::Fake, || {
             let rt = ProfileRuntime::acquire(&profile, Isolation::Shared, &[], true)
                 .expect("acquire under the shared fake-mode tree");
@@ -6471,7 +6673,7 @@ fn a_relogin_reaches_a_sibling_session_without_waiting_for_the_fallback() {
     let tmp = tempfile::tempdir().expect("tempdir");
     with_fake_home(tmp.path(), || {
         fake_claude_home(tmp.path());
-        let profile = make_profile("evented");
+        let profile = configured_profile("evented");
         let canonical = tmp
             .path()
             .join(".clauth")

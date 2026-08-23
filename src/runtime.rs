@@ -1818,12 +1818,107 @@ pub(crate) struct ProfileRuntime {
     watchdog_handle: Option<JoinHandle<()>>,
 }
 
+/// Refuse a session for a name the on-disk record no longer carries.
+///
+/// Every caller hands [`ProfileRuntime::acquire`] a `&Profile` borrowed from a
+/// config loaded earlier, and `RotationGuard::acquire` BLOCKS, so an
+/// `actions::delete_profile` or `actions::rename_profile` can land in between —
+/// leaving the acquire to re-create the profile dir, build a tree, stamp markers
+/// and register a live row for an account nothing configures.
+///
+/// Called as the first act of the acquire's state-flock hold — before the
+/// profile directory is re-created, though not before every side effect: the
+/// rotation lock file is already open by then, and it is never reaped.
+///
+/// TWO mechanisms keep the window shut and they are not interchangeable. A
+/// SAME-VERSION mutation cannot reach it at all: `acquire` holds its
+/// `RotationGuard` to the end of the function, and all three mutation call sites
+/// take their own through `actions::rotation_guard_for_mutation`, a
+/// `try_acquire` that REFUSES rather than queues. That is the rotation guard's
+/// doing, not the flock's — against that actor this gate's placement changes no
+/// outcome at all. What the flock placement buys is the mutation holding NO
+/// rotation lock: a clauth predating the guard witness on
+/// `actions::delete_profile`, where the state flock is the only serialization
+/// point the two versions share.
+///
+/// That actor is posed by `acquire_refuses_a_record_removed_without_a_rotation_lock`
+/// through the [`ProfileRuntime::acquire_synced`] seam, which separates a gate
+/// moved ABOVE the seam and nothing below it: the seam fires before the flock
+/// acquisition, so a gate sitting just outside the hold reads the same
+/// post-removal record and refuses identically — measured, it survives a full
+/// release run. The `debug_assert!` below is what pins the placement, and it
+/// kills both spellings loudly, 27 tests on the DEBUG leg and none on the
+/// release one, which is the whole of its reach.
+///
+/// So do not shorten either scope on the strength of the other.
+///
+/// It asks the RECORD, not the profile directory. The directory answers a
+/// neighbouring question: `unsupported_swap_transport` runs inside this same
+/// window on the `--with-fallback` path and `mkdir_700`s the profile root, so a
+/// directory-existence gate is satisfied by a start's own leftovers moments
+/// after the delete removed them.
+///
+/// Read through [`crate::profile::is_configured`], which reads the profile list
+/// and writes nothing — see there for the ruling that keeps `load_config` out of
+/// a flock hold. This reached for `load_config` first, on the argument that both
+/// production callers ran it moments earlier so its adopt and rewrite legs were
+/// already converged. That argument is refuted one paragraph up: the guard
+/// BLOCKS behind a rotation, and a rotation is precisely what stages a
+/// `credentials.json.pending` sidecar for the next load to adopt.
+fn refuse_if_unconfigured(name: &str) -> Result<()> {
+    // Deliberately NOT the `cfg!(test) ||` form its two neighbours in this file
+    // carry. Their escape exists because their unit tests drive them with no home
+    // sandbox, so demanding the flock would lock the operator's real `~/.clauth`.
+    // This has one call site, inside the hold, and no test drives it as a unit —
+    // so the flock is already held by construction and the escape would only make
+    // the assert dead in the debug test leg, the one place a misplacement gets
+    // planted. Debug-only, like every rank check: see `lockorder::holds`.
+    debug_assert!(
+        crate::lockorder::holds::<crate::lockorder::rank::State>(),
+        "the account-record re-read must happen under the state flock, or a \
+         mutation holding no rotation lock can land between the read and the hold"
+    );
+    if !crate::profile::is_configured(name)
+        .with_context(|| format!("failed to re-read the account list while starting '{name}'"))?
+    {
+        anyhow::bail!(
+            "'{name}' was deleted or renamed while this session was starting, \
+             run `clauth list` to see the accounts that are left"
+        );
+    }
+    Ok(())
+}
+
 impl ProfileRuntime {
     pub(crate) fn acquire(
         profile: &Profile,
         isolation: Isolation,
         active_env_keys: &[String],
         follows_chain: bool,
+    ) -> Result<Self> {
+        Self::acquire_synced(profile, isolation, active_env_keys, follows_chain, || {})
+    }
+
+    /// The injected closure runs after `RotationGuard::acquire` and immediately
+    /// before the state flock — a sync point for the regression test that
+    /// removes the account's record there, so "the gate reads the record from
+    /// INSIDE the hold" is pinned by construction rather than by a thread race
+    /// nothing can schedule. Production passes a no-op, the same shape
+    /// `claude::arm_rolling_from_disk_synced` already uses.
+    ///
+    /// It poses ONE window — a record removal between the rotation guard and the
+    /// flock acquisition — and a second thread cannot pose that one, because a
+    /// same-version mutation is refused by the rotation guard rather than queued
+    /// behind it (see `refuse_if_unconfigured`). It says nothing about the
+    /// narrower window on the other side of the flock acquisition; that one wants
+    /// a thread holding the flock, and the `debug_assert!` in
+    /// `refuse_if_unconfigured` is what covers it today.
+    fn acquire_synced(
+        profile: &Profile,
+        isolation: Isolation,
+        active_env_keys: &[String],
+        follows_chain: bool,
+        pre_lock_done: impl FnOnce(),
     ) -> Result<Self> {
         let name = &profile.name;
         let claude_home = claude_dir()?;
@@ -1841,8 +1936,12 @@ impl ProfileRuntime {
         // the marker flock only needs the marker itself, but the guard costs
         // nothing to keep and a shorter scope would need re-proving.
         let _rotation_guard = RotationGuard::acquire(name)?;
+        pre_lock_done();
 
         let (session, paths, pid_lock, legacy_lock, mode) = with_state_lock(|| {
+            // Inside the hold, and ahead of every write this closure does — see
+            // `refuse_if_unconfigured` for which mechanism each half buys.
+            refuse_if_unconfigured(name)?;
             // The transport is probed FIRST: under `LinkMode::Fake` the tree is
             // shared under the bare stem, so the mode decides every path below.
             // The profile dir is the probe site because it exists independently

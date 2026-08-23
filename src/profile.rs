@@ -1509,6 +1509,34 @@ pub(crate) fn active_profile_name() -> Option<ProfileName> {
     load_app_state().ok().and_then(|s| s.active_profile)
 }
 
+/// Whether the on-disk profile list still carries `name`, read from
+/// `profiles.toml` alone and writing nothing.
+///
+/// For a caller that must ask this while holding the state flock. [`load_config`]
+/// answers the same question, but per profile it adopts a pending credential
+/// sidecar and rewrites `config.toml`, and it chmod-walks the whole `~/.clauth`
+/// tree first. The standing ruling that rules it out there is not a cost
+/// argument: the state flock is a cross-process serialization point nothing
+/// holds across IO. That is why [`crate::lockorder::rank::ProfileTtl`] ranks
+/// OUTSIDE the flock rather than inside it, and why `hook_note::ScopeLock` runs
+/// its own `load_config` half BEFORE acquiring rather than under the hold —
+/// same call, same question, already answered twice.
+///
+/// It deliberately does NOT agree with `load_config` everywhere, because the
+/// file is what decides membership: a listed name whose `config.toml` is
+/// unreadable fails `load_config` outright and answers `true` here. So a
+/// PER-PROFILE read failure never turns into a refusal downstream, which is the
+/// direction a refusal gate wants. `profiles.toml` itself is the opposite and
+/// deliberately so — an unparseable account list propagates `Err`, because a
+/// record that cannot be read is not a record a session should be started
+/// against. Case-exact, matching [`AppConfig::find`].
+pub(crate) fn is_configured(name: &str) -> Result<bool> {
+    Ok(load_app_state()?
+        .profiles
+        .iter()
+        .any(|n| n.as_str() == name))
+}
+
 fn load_app_state() -> Result<AppState> {
     let path = app_state_path()?;
     if !path.exists() {

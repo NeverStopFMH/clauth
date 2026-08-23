@@ -3417,6 +3417,125 @@ fn teardown_leaves_a_pre_upgrade_marker_it_never_owned() {
     });
 }
 
+/// A wedged peer holds the state flock past the deadline, then releases it:
+/// teardown's first acquisition times out and its bounded retry — the SAME hold,
+/// never a split — re-acquires and removes the session's own files. The deadline
+/// is shortened via `set_state_lock_timeout_override` so the wedge poses without
+/// a real 25 s wait, and the release is wired to `on_teardown_acquire_timeout`
+/// so the first timeout deterministically precedes the retry rather than racing
+/// it. Both overrides are thread-local, so they die with this test's thread.
+#[test]
+fn teardown_racing_a_wedged_peer_removes_its_own_files_within_one_retry() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        fake_claude_home(tmp.path());
+        let profile = configured_profile("wedged");
+        crate::lock::set_state_lock_timeout_override(Some(Duration::from_millis(150)));
+
+        let rt = ProfileRuntime::acquire(&profile, Isolation::Shared, &[], false).expect("acquire");
+        let runtime = rt.config_dir().to_path_buf();
+        let sessions = rt.sessions_dir().to_path_buf();
+
+        // A wedged peer: a second open file description holding the flock, which
+        // conflicts with the state flock exactly as a second process would.
+        let lock_path = crate::profile::clauth_dir()
+            .expect("clauth dir")
+            .join(crate::lock::LOCK_FILENAME);
+        let holder = std::sync::Arc::new(std::sync::Mutex::new(Some(
+            crate::profile::open_state_file(&lock_path).expect("open holder"),
+        )));
+        holder
+            .lock()
+            .expect("holder mutex")
+            .as_ref()
+            .expect("holder file")
+            .lock()
+            .expect("hold the flock");
+
+        // Release the wedge on the first teardown-acquire timeout, so the retry
+        // is the acquisition that succeeds.
+        let holder_for_hook = std::sync::Arc::clone(&holder);
+        set_teardown_timeout_hook(Some(Box::new(move || {
+            *holder_for_hook.lock().expect("holder mutex") = None;
+        })));
+
+        // Full drop: the pre-teardown sync legs fail fast under the shortened
+        // deadline, then teardown's first acquire times out, the hook releases
+        // the wedge, and the retry acquires the same hold and cleans up.
+        drop(rt);
+
+        assert!(
+            !runtime.exists(),
+            "teardown must remove its own runtime tree within one retry"
+        );
+        assert!(
+            !sessions.exists(),
+            "teardown must remove its own marker dir within one retry"
+        );
+        assert_eq!(
+            live_session_count("wedged"),
+            0,
+            "teardown must release every liveness marker within one retry"
+        );
+        assert!(
+            holder.lock().expect("holder mutex").is_none(),
+            "the first teardown acquire must time out and release the wedge via the retry hook"
+        );
+
+        set_teardown_timeout_hook(None);
+        crate::lock::set_state_lock_timeout_override(None);
+    });
+}
+
+/// The retry is bounded, not infinite: a wedge held past the whole retry budget
+/// makes teardown give up after retrying, logging rather than hanging. Pins the
+/// bound by COUNTING the timed-out acquires. The expected count is a LITERAL,
+/// not `TEARDOWN_ACQUIRE_RETRIES`: re-tuning the bound (down to zero included)
+/// must red this test and force a conscious re-derivation, where an assertion
+/// keyed on the constant would silently track the change.
+#[test]
+fn teardown_retries_a_persistent_wedge_then_gives_up() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        fake_claude_home(tmp.path());
+        let profile = configured_profile("stuck");
+        crate::lock::set_state_lock_timeout_override(Some(Duration::from_millis(50)));
+
+        let rt = ProfileRuntime::acquire(&profile, Isolation::Shared, &[], false).expect("acquire");
+        let runtime = rt.config_dir().to_path_buf();
+
+        let lock_path = crate::profile::clauth_dir()
+            .expect("clauth dir")
+            .join(crate::lock::LOCK_FILENAME);
+        let holder = crate::profile::open_state_file(&lock_path).expect("open holder");
+        holder.lock().expect("hold the flock");
+
+        let timeouts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let count = std::sync::Arc::clone(&timeouts);
+        set_teardown_timeout_hook(Some(Box::new(move || {
+            count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        })));
+
+        // The wedge never releases: every acquisition (1 + RETRIES) times out and
+        // teardown gives up, leaving the tree for the next run's GC.
+        drop(rt);
+
+        assert_eq!(
+            timeouts.load(std::sync::atomic::Ordering::SeqCst) as u32,
+            2,
+            "teardown must retry exactly the bounded number of times before giving up"
+        );
+        assert!(
+            runtime.exists(),
+            "a wedge that never releases must leave the tree for the next run's GC"
+        );
+
+        drop(holder);
+        set_teardown_timeout_hook(None);
+        crate::lock::set_state_lock_timeout_override(None);
+    });
+}
+
 /// Two same-profile sessions share the one compat dir, so it may only go when
 /// the last of them releases.
 #[test]

@@ -2186,6 +2186,67 @@ impl ProfileRuntime {
     }
 }
 
+/// How many additional state-flock acquisitions teardown makes after its first
+/// timed out. A timed-out acquire here is a wedged peer holding the flock past
+/// the deadline, not a permissions fault, so retrying the SAME hold is the
+/// recovery and splitting it is not. The daemon's watchdog aborts a wedged main
+/// loop within 30 s of the wedge — inside the second 25 s acquire — so the FIRST
+/// retry is the common recovery. Two retries covers a slow abort without holding
+/// the exiting session open past ~75 s, after which the next run's GC is the
+/// fallback.
+const TEARDOWN_ACQUIRE_RETRIES: u32 = 2;
+
+/// Take the state flock for teardown, retrying a
+/// [`crate::lock::StateLockTimeout`] up to [`TEARDOWN_ACQUIRE_RETRIES`]
+/// additional times. Only the timeout is retried: it names a wedged peer, which
+/// heals when that peer is killed or its hold ends; an IO error (permissions, a
+/// broken tree) does not heal and propagates on the first failure. The caller
+/// runs the whole teardown body once inside the returned guard, so the
+/// single-hold invariant in `Drop` holds across the retry — the body is never
+/// split across two acquisitions.
+fn acquire_state_lock_for_teardown() -> Result<crate::lock::StateLock> {
+    let mut retries = 0u32;
+    loop {
+        match crate::lock::StateLock::acquire_with_timeout(crate::lock::state_lock_timeout()) {
+            Ok(guard) => return Ok(guard),
+            Err(e)
+                if retries < TEARDOWN_ACQUIRE_RETRIES
+                    && e.downcast_ref::<crate::lock::StateLockTimeout>().is_some() =>
+            {
+                #[cfg(test)]
+                on_teardown_acquire_timeout();
+                retries += 1;
+                continue;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+// Test seam: fires once per timed-out teardown acquire, BEFORE the retry, so a
+// test can release a held flock between the first timeout and the retry (posing
+// "a wedged peer released") or count the retries (pinning the bound) without
+// sleeping the real 25 s. `cfg(test)`-only; no production path sets it.
+#[cfg(test)]
+thread_local! {
+    static TEARDOWN_TIMEOUT_HOOK: std::cell::RefCell<Option<Box<dyn FnMut()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn on_teardown_acquire_timeout() {
+    TEARDOWN_TIMEOUT_HOOK.with(|hook| {
+        if let Some(hook) = hook.borrow_mut().as_mut() {
+            hook();
+        }
+    });
+}
+
+#[cfg(test)]
+fn set_teardown_timeout_hook(hook: Option<Box<dyn FnMut()>>) {
+    TEARDOWN_TIMEOUT_HOOK.with(|h| *h.borrow_mut() = hook);
+}
+
 impl Drop for ProfileRuntime {
     fn drop(&mut self) {
         // Before the signal, not after: the watchdog may be mid-tick, and a swap
@@ -2215,51 +2276,54 @@ impl Drop for ProfileRuntime {
         // One hold for the whole teardown. `unregister` takes the state lock
         // itself, so calling it out here would be a second top-level acquisition
         // — two 25s-bounded flock waits back to back, with a window between them
-        // where the row is gone but the marker is not.
+        // where the row is gone but the marker is not. A timed-out acquire is a
+        // wedged peer, not a permissions fault, so the SAME hold is retried
+        // (bounded, via `acquire_state_lock_for_teardown`) rather than split:
+        // the retry re-enters the same flock for the same body.
         let legacy_lock = self.legacy_lock.take();
-        if let Err(e) = with_state_lock(|| {
-            if let Err(e) = crate::live_sessions::unregister(self.swap.session.as_str()) {
-                logline!("clauth: unregistering the live session failed: {e}");
-            }
-            if let Err(e) = std::fs::remove_file(&self.pid_file)
-                && e.kind() != std::io::ErrorKind::NotFound
-            {
-                logline!("clauth: remove pid file failed: {e}");
-            }
-            // A `None` marker is a session whose own `pid_file` IS the compat
-            // path, already unlinked above — there is no second file, so this
-            // whole leg is skipped rather than special-cased inside it.
-            if let Some(legacy_marker) = self.legacy_marker.as_deref() {
-                // Only unlink a marker this session actually owns. `legacy_lock`
-                // is `None` when `try_lock` lost to a live process that minted
-                // the same sid — unlinking there would delete a FOREIGN session's
-                // liveness signal, which is the same rotation-burn this marker
-                // exists to prevent. Release before unlinking, so a sibling's
-                // `prune_stale_sessions` never reads a removed path.
-                if legacy_lock.is_some() {
-                    drop(legacy_lock);
-                    let _ = std::fs::remove_file(legacy_marker);
+        match acquire_state_lock_for_teardown() {
+            Ok(_guard) => {
+                if let Err(e) = crate::live_sessions::unregister(self.swap.session.as_str()) {
+                    logline!("clauth: unregistering the live session failed: {e}");
                 }
-                // The compat dir is shared by every session of this
-                // profile+flavor, so it goes only once the last has released.
-                if let Some(legacy_dir) = legacy_marker.parent()
-                    && prune_stale_sessions(legacy_dir).unwrap_or(1) == 0
+                if let Err(e) = std::fs::remove_file(&self.pid_file)
+                    && e.kind() != std::io::ErrorKind::NotFound
                 {
-                    let _ = std::fs::remove_dir(legacy_dir);
+                    logline!("clauth: remove pid file failed: {e}");
+                }
+                // A `None` marker is a session whose own `pid_file` IS the compat
+                // path, already unlinked above — there is no second file, so this
+                // whole leg is skipped rather than special-cased inside it.
+                if let Some(legacy_marker) = self.legacy_marker.as_deref() {
+                    // Only unlink a marker this session actually owns. `legacy_lock`
+                    // is `None` when `try_lock` lost to a live process that minted
+                    // the same sid — unlinking there would delete a FOREIGN session's
+                    // liveness signal, which is the same rotation-burn this marker
+                    // exists to prevent. Release before unlinking, so a sibling's
+                    // `prune_stale_sessions` never reads a removed path.
+                    if legacy_lock.is_some() {
+                        drop(legacy_lock);
+                        let _ = std::fs::remove_file(legacy_marker);
+                    }
+                    // The compat dir is shared by every session of this
+                    // profile+flavor, so it goes only once the last has released.
+                    if let Some(legacy_dir) = legacy_marker.parent()
+                        && prune_stale_sessions(legacy_dir).unwrap_or(1) == 0
+                    {
+                        let _ = std::fs::remove_dir(legacy_dir);
+                    }
+                }
+                // Every member a swap moved this session onto holds markers of its
+                // own, in both layouts. A dead session that keeps one blocks rotation
+                // on an account nothing is using.
+                self.swap.release_swapped_markers();
+                let still_active = prune_stale_sessions(&self.sessions).unwrap_or(1);
+                if still_active == 0 {
+                    let _ = std::fs::remove_dir_all(&self.swap.runtime);
+                    let _ = std::fs::remove_dir(&self.sessions);
                 }
             }
-            // Every member a swap moved this session onto holds markers of its
-            // own, in both layouts. A dead session that keeps one blocks rotation
-            // on an account nothing is using.
-            self.swap.release_swapped_markers();
-            let still_active = prune_stale_sessions(&self.sessions).unwrap_or(1);
-            if still_active == 0 {
-                let _ = std::fs::remove_dir_all(&self.swap.runtime);
-                let _ = std::fs::remove_dir(&self.sessions);
-            }
-            Ok::<_, anyhow::Error>(())
-        }) {
-            logline!("clauth: drop cleanup failed: {e}");
+            Err(e) => logline!("clauth: drop cleanup failed: {e}"),
         }
     }
 }

@@ -30,7 +30,7 @@ use anyhow::{Context, Result};
 use crate::logline::logline;
 use crate::profile::clauth_dir;
 
-const LOCK_FILENAME: &str = ".lock";
+pub(crate) const LOCK_FILENAME: &str = ".lock";
 
 /// Deadline for taking the cross-process state flock before giving up with a
 /// [`StateLockTimeout`]. Sized to sit between two hard bounds: the macOS switch
@@ -43,6 +43,19 @@ const LOCK_FILENAME: &str = ".lock";
 /// ever held across sub-millisecond disk writes, so only a genuine wedge ever
 /// reaches this deadline.
 const STATE_LOCK_TIMEOUT: Duration = Duration::from_secs(25);
+
+/// The flock deadline [`StateLock::acquire`] waits out: [`STATE_LOCK_TIMEOUT`],
+/// or a shorter value a test poses a wedge under. The one source of the deadline
+/// so a test can shrink the whole wait — the pre-teardown sync legs included —
+/// without sleeping 25 s per acquisition. Production never sets the override, so
+/// the deadline is [`STATE_LOCK_TIMEOUT`] everywhere outside `cfg(test)`.
+pub(crate) fn state_lock_timeout() -> Duration {
+    #[cfg(test)]
+    if let Some(t) = STATE_LOCK_TIMEOUT_OVERRIDE.with(|c| c.get()) {
+        return t;
+    }
+    STATE_LOCK_TIMEOUT
+}
 
 /// Wall-clock ceiling on everything ONE state-lock hold may spend in
 /// subprocesses, shared across every call it makes rather than granted per call.
@@ -166,6 +179,21 @@ thread_local! {
     pub(crate) static OUTERMOST_ACQUISITIONS: Cell<u64> = const { Cell::new(0) };
 }
 
+// Test seam shortening `state_lock_timeout` so a wedge can be posed without a
+// real 25 s wait. `None` is the production deadline. Thread-local, so a test
+// that shortens it only ever affects the thread it drops the runtime on.
+#[cfg(test)]
+thread_local! {
+    static STATE_LOCK_TIMEOUT_OVERRIDE: Cell<Option<Duration>> = const { Cell::new(None) };
+}
+
+/// Set or clear the test-only deadline override. `None` restores
+/// [`STATE_LOCK_TIMEOUT`].
+#[cfg(test)]
+pub(crate) fn set_state_lock_timeout_override(timeout: Option<Duration>) {
+    STATE_LOCK_TIMEOUT_OVERRIDE.with(|c| c.set(timeout));
+}
+
 #[must_use]
 pub(crate) struct StateLock {
     // Non-None only for the outermost acquisition on this thread.
@@ -181,7 +209,7 @@ impl StateLock {
     /// Acquire the state lock, bounding the cross-process flock wait by
     /// [`STATE_LOCK_TIMEOUT`]. A timeout surfaces as a [`StateLockTimeout`].
     pub(crate) fn acquire() -> Result<Self> {
-        Self::acquire_with_timeout(STATE_LOCK_TIMEOUT)
+        Self::acquire_with_timeout(state_lock_timeout())
     }
 
     /// [`acquire`](Self::acquire) with an explicit flock deadline. Split out so

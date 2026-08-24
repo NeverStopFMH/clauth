@@ -560,6 +560,11 @@ pub(crate) struct DelegateArgs {
     ///
     /// Pinning `--output-format` here replaces clauth's own, which turns off
     /// the idle limit and leaves `timeout_secs` as the only guard.
+    ///
+    /// A delegate that must write files needs
+    /// `args: ["--dangerously-skip-permissions"]`; without it the session
+    /// starts in a mode that refuses edits and it spends the run hunting for a
+    /// writable path.
     args: Option<Vec<String>>,
 }
 

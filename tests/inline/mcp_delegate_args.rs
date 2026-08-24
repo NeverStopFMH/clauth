@@ -571,6 +571,183 @@ fn fanout_reserve_failure_is_refused_by_name() {
     assert_refusal(&result, &["failed to record job"]);
 }
 
+// ── resume infers the account from the conversation record ──────────────────
+
+/// Seed `~/.clauth/conversations/<id>.json` carrying `told`, written through
+/// the crate's own atomic 0600 writer so the fixture is exactly the bytes the
+/// hook itself writes.
+fn seed_conversation_record(home: &std::path::Path, id: &str, told: Option<&str>) {
+    let dir = home.join(".clauth").join("conversations");
+    std::fs::create_dir_all(&dir).expect("records dir");
+    let path = dir.join(format!("{id}.json"));
+    let bytes = serde_json::to_vec(&serde_json::json!({ "told": told })).expect("record json");
+    crate::profile::atomic_write_600(&path, bytes).expect("record write");
+}
+
+/// `resume` without `profiles` infers the account from the conversation record
+/// the profile-change hook keeps. The refusal naming `solo` proves the record's
+/// `told` resolved, was canonicalized (seeded as `SOLO`), and reached the same
+/// pre-flight an explicit name gets.
+#[test]
+fn a_resume_without_profiles_resolves_the_account_from_the_conversation_record() {
+    let home = HomeSandbox::new();
+    seed_profiles(&["solo"], true);
+    seed_conversation_record(home.home(), "conv-1", Some("SOLO"));
+
+    let result = call_delegate(DelegateArgs {
+        resume: Some("conv-1".to_string()),
+        prompt: Some("hi".to_string()),
+        background: Some(true),
+        ..base()
+    });
+    assert_refusal(&result, &["profile is disabled: solo"]);
+}
+
+/// An id no record exists for cannot be attributed: the refusal names the fix,
+/// carrying the whole lesson per placement rule 4's corollary.
+#[test]
+fn a_resume_with_no_record_refuses_naming_profiles() {
+    let _home = HomeSandbox::new();
+    let result = call_delegate(DelegateArgs {
+        resume: Some("nope".to_string()),
+        prompt: Some("hi".to_string()),
+        background: Some(true),
+        ..base()
+    });
+    assert_refusal(
+        &result,
+        &[
+            "can't tell which account session 'nope' ran on",
+            "pass `profiles`",
+        ],
+    );
+}
+
+/// A record that never established a baseline (`told: null`) is as
+/// unattributable as a missing one: same refusal, same fix.
+#[test]
+fn a_resume_whose_record_has_no_told_refuses_naming_profiles() {
+    let home = HomeSandbox::new();
+    seed_conversation_record(home.home(), "conv-null", None);
+
+    let result = call_delegate(DelegateArgs {
+        resume: Some("conv-null".to_string()),
+        prompt: Some("hi".to_string()),
+        background: Some(true),
+        ..base()
+    });
+    assert_refusal(
+        &result,
+        &[
+            "can't tell which account session 'conv-null' ran on",
+            "pass `profiles`",
+        ],
+    );
+}
+
+/// An explicit `profiles` with a `resume` behaves exactly as before: the name
+/// wins over whatever the record says. The record names `solo`, the call names
+/// `other`, and the refusal must prove `other` was the resolved target.
+#[test]
+fn an_explicit_profiles_wins_over_the_record_for_a_resume() {
+    let home = HomeSandbox::new();
+    seed_profiles(&["solo", "other"], true);
+    seed_conversation_record(home.home(), "conv-1", Some("solo"));
+
+    let result = call_delegate(DelegateArgs {
+        profiles: Some(vec!["other".to_string()]),
+        resume: Some("conv-1".to_string()),
+        prompt: Some("hi".to_string()),
+        background: Some(true),
+        ..base()
+    });
+    assert_refusal(&result, &["profile is disabled: other"]);
+    assert!(
+        !first_text(&result).contains("solo"),
+        "the record's account is not consulted: {}",
+        first_text(&result)
+    );
+}
+
+/// The record's `told` names an account clauth does not hold: the existing
+/// not-found refusal, the same path an explicit unknown name takes.
+#[test]
+fn a_resume_record_naming_an_unknown_account_refuses_profile_not_found() {
+    let home = HomeSandbox::new();
+    seed_conversation_record(home.home(), "conv-g", Some("ghost"));
+
+    let result = call_delegate(DelegateArgs {
+        resume: Some("conv-g".to_string()),
+        prompt: Some("hi".to_string()),
+        background: Some(true),
+        ..base()
+    });
+    assert_refusal(&result, &["profile not found: ghost"]);
+}
+
+/// The resume id reaches a filename (the record path), so a path-shaped id is
+/// refused at that boundary rather than read: the hook only ever writes records
+/// for bare ids, and joining an unchecked id would escape the records dir.
+#[test]
+fn a_path_shaped_resume_id_is_refused_not_read() {
+    let home = HomeSandbox::new();
+    seed_profiles(&["solo"], true);
+    // The bare-id check is the only thing between this id and the join, so
+    // make the traversal physically reachable: `conversations/..` resolves
+    // through the dir, and the kernel walk cannot pass a missing component.
+    std::fs::create_dir_all(home.home().join(".clauth").join("conversations"))
+        .expect("records dir");
+    // Decoy at the traversal destination: with the bare-id check dropped,
+    // `record_path` joins `conversations/../escape.json`, which resolves to
+    // exactly this file — so the drop resolves the target and this test reds
+    // on the wrong refusal instead of passing on a silent read failure.
+    let decoy = home.home().join(".clauth").join("escape.json");
+    let bytes = serde_json::to_vec(&serde_json::json!({ "told": "solo" })).expect("decoy json");
+    crate::profile::atomic_write_600(&decoy, bytes).expect("decoy write");
+
+    let result = call_delegate(DelegateArgs {
+        resume: Some("../escape".to_string()),
+        prompt: Some("hi".to_string()),
+        background: Some(true),
+        ..base()
+    });
+    assert_refusal(
+        &result,
+        &[
+            "can't tell which account session '../escape' ran on",
+            "pass `profiles`",
+        ],
+    );
+}
+
+/// The refusal echoes the id, and this arm fires precisely for ids the record
+/// check refused — unbounded length included. The echo is truncated so a huge
+/// id cannot inflate the reply: the truncated prefix appears, the tail never
+/// does.
+#[test]
+fn an_overlong_resume_id_is_echoed_bounded() {
+    let _home = HomeSandbox::new();
+    let result = call_delegate(DelegateArgs {
+        resume: Some("a".repeat(100)),
+        prompt: Some("hi".to_string()),
+        background: Some(true),
+        ..base()
+    });
+    let text = first_text(&result);
+    assert!(
+        text.contains(&format!(
+            "can't tell which account session '{}…' ran on",
+            "a".repeat(64)
+        )),
+        "the refusal shows the truncated id: {text}"
+    );
+    assert!(
+        !text.contains(&"a".repeat(70)),
+        "the full id never reaches the reply: {text}"
+    );
+    assert!(text.contains("pass `profiles`"), "the fix is named: {text}");
+}
+
 // ── background pre-flight guards ─────────────────────────────────────────────
 
 /// Seed `name` as a keyless third-party profile: a real DeepSeek endpoint with

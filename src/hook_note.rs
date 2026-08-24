@@ -407,6 +407,28 @@ fn store_record(path: &Path, record: &NoteRecord) -> Result<()> {
     Ok(())
 }
 
+/// The account a conversation's main scope was last told about — the durable
+/// `told` baseline the hook maintains. This is the read the `delegate` resume
+/// inference takes: `resolved` is deliberately not it, being a TTL-bounded
+/// cache that only ever holds the last ATTRIBUTED answer, while `told` is the
+/// baseline a conversation carries across processes.
+///
+/// `None` when the id cannot name a record (the hook only ever writes records
+/// for bare ids, so a path- or dot-shaped id has none by construction), when
+/// no record exists, or when the record never established a baseline. A plain
+/// file read under no lock: writers replace the record atomically (temp +
+/// rename), so a racing read parses the old or the new bytes whole, and a
+/// failed parse answers `None` rather than a wrong account.
+pub(crate) fn told_account(session_id: &str) -> Option<String> {
+    // The id reaches a filename in `record_path`, so it is checked at this
+    // boundary the same way the hook checks the one in its own payload.
+    if !is_bare_id(session_id) {
+        return None;
+    }
+    let path = record_path(session_id, None).ok()?;
+    load_record(&path)?.told
+}
+
 /// Decide what this fire says and store what it learned.
 ///
 /// `resolve` is taken by reference so a test can count how often the gate lets it

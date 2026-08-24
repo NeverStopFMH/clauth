@@ -533,6 +533,10 @@ pub(crate) struct DelegateArgs {
     /// Continue a session by `session_id`, with `prompt` as the next message,
     /// in the session's original working directory. `cwd` is optional.
     /// `delegate` refuses to resume if it differs from the original directory.
+    ///
+    /// Without `profiles`, the delegate runs on the account this session last
+    /// ran on (from the conversation record); name `profiles` to spend a
+    /// different one.
     resume: Option<String>,
     /// Kill the delegate if it produces no output at all for this many seconds
     /// (max: 3600, default 300). It returns any text it had and a `session_id`
@@ -943,9 +947,40 @@ Delegating spends the target account, so pick the account with `profiles` first.
             };
             Target::One(name)
         } else if raw.is_empty() {
-            return Ok(delegate_refusal(
-                "`profiles` is empty: name at least one profile",
-            ));
+            // With no name given, a `resume` can still name one: the
+            // profile-change hook's per-conversation record carries the account
+            // the session was last told about (`told`, the durable baseline),
+            // and a resume is exactly "keep spending where this session ran".
+            // The inferred name takes the same `Target::One` path an explicit
+            // one does, so canonicalization and preflight stay shared. No
+            // `resume`, or none attributable, refuses — with the fix named,
+            // since the reader is a model that can run it.
+            match resume.as_deref() {
+                Some(id) => match crate::hook_note::told_account(id) {
+                    Some(name) => {
+                        let Some(name) = config.canonical_name(&name) else {
+                            return Ok(delegate_refusal(&format!("profile not found: {name}")));
+                        };
+                        Target::One(name)
+                    }
+                    None => {
+                        // The id is echoed into the refusal and used nowhere
+                        // else, and this arm fires exactly for ids the record
+                        // check refused — unbounded length included. Bound the
+                        // echo the way every other error payload is bounded.
+                        return Ok(delegate_refusal(&format!(
+                            "can't tell which account session '{}' ran on; pass `profiles` \
+                             naming the account to spend",
+                            truncate(id, 64)
+                        )));
+                    }
+                },
+                None => {
+                    return Ok(delegate_refusal(
+                        "`profiles` is empty: name at least one profile",
+                    ));
+                }
+            }
         } else {
             match resolve_fanout(&config, &raw) {
                 Ok(names) => Target::Many(names),

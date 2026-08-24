@@ -77,8 +77,8 @@ pub(crate) enum LinkMode {
     Fake,
 }
 
-/// The transport an EXISTING runtime tree was built with, read off an entry the
-/// tree shares with `~/.claude` (`CLAUDE.md`, then `skills`). A link means
+/// The transport an EXISTING runtime tree was built with, read off the entries
+/// the tree shares with `~/.claude` (`CLAUDE.md` and `skills`). A link means
 /// [`LinkMode::Real`], a plain file or dir means [`LinkMode::Fake`], and neither
 /// entry existing means the probe cannot answer. The sibling of the acquire-time
 /// privilege probe [`detect_link_mode`], which tests what THIS process may
@@ -86,20 +86,36 @@ pub(crate) enum LinkMode {
 /// MCP instructions block states the probe's answer instead of spelling both
 /// transports every session. Costs two stats at most, so callers re-run it per
 /// reply rather than caching.
+///
+/// Both entries must agree, or the probe answers nothing: the real-mode watchdog
+/// repairs only `.credentials.json`, so a rename-replace edit of `CLAUDE.md`
+/// (atomic-save editors, the model's own tooling — the note itself invites
+/// editing it) permanently swaps that entry's link for a plain file on a symlink
+/// host. A probe trusting the first entry would then state the wrong transport
+/// and the wrong new-file rule. Disagreement falls back to the both-transports
+/// prose, which is true under either. With one entry present, its verdict
+/// stands: there is nothing else to check it against.
 pub(crate) fn link_mode_of(config_dir: Option<&Path>) -> Option<LinkMode> {
     let dir = config_dir?;
+    let mut verdict: Option<LinkMode> = None;
     for entry in ["CLAUDE.md", "skills"] {
         let Ok(meta) = std::fs::symlink_metadata(dir.join(entry)) else {
             continue;
         };
-        if meta.file_type().is_symlink() {
-            return Some(LinkMode::Real);
-        }
-        if meta.is_file() || meta.is_dir() {
-            return Some(LinkMode::Fake);
+        let seen = if meta.file_type().is_symlink() {
+            LinkMode::Real
+        } else if meta.is_file() || meta.is_dir() {
+            LinkMode::Fake
+        } else {
+            continue;
+        };
+        match verdict {
+            None => verdict = Some(seen),
+            Some(prev) if prev == seen => {}
+            Some(_) => return None,
         }
     }
-    None
+    verdict
 }
 
 /// Whether a session inherits the operator's full `~/.claude/` (memory,

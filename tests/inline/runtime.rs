@@ -1780,6 +1780,24 @@ fn link_mode_of_reads_the_transport_off_the_existing_tree() {
         Some(LinkMode::Fake),
         "the skills slot answers when CLAUDE.md is absent",
     );
+
+    // Disagreement answers nothing: a rename-replace edit of CLAUDE.md on a
+    // symlink host leaves one link and one plain file, and trusting either
+    // would state the wrong transport. The fallback prose is true under both.
+    let mixed = tempfile::tempdir().expect("tempdir");
+    fs::write(mixed.path().join("CLAUDE.md"), b"x").expect("write copy entry");
+    #[cfg(unix)]
+    {
+        let target = mixed.path().join("skills-target");
+        fs::create_dir(&target).expect("create target dir");
+        std::os::unix::fs::symlink(&target, mixed.path().join("skills")).expect("link skills");
+        assert_eq!(
+            link_mode_of(Some(mixed.path())),
+            None,
+            "one link plus one copy is undecidable",
+        );
+    }
+
     assert_eq!(link_mode_of(None), None, "no config dir answers nothing");
 }
 

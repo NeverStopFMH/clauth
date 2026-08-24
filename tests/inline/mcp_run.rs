@@ -4244,6 +4244,10 @@ fn the_delegate_description_keeps_its_load_bearing_warnings() {
         // caller reading `timeout_secs` as one would size a run against a limit
         // that is not applied
         "the only time limit on a normal run",
+        // the write-permission flag: this entry is the ONLY home of the fact
+        // since the 2026-08-24 dedup removed it from cc-agent-use.md, so a
+        // prose edit dropping it would be silent here too
+        "dangerously-skip-permissions",
         // Needle trimmed to the CONDITION 2026-08-20, after the owner's copy
         // pass opened the sentence on the verb (`It applies` -> `Applies`).
         // Trimmed rather than lowercased: `contains` is case-sensitive, so a

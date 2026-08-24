@@ -391,6 +391,10 @@ fn session_auth_variants_shape_switch_note_and_runtime_paths() {
         unknown_block.contains("recursive copy"),
         "the undecidable arm names both transports: {unknown_block}",
     );
+    assert!(
+        unknown_block.contains("reaches the global file"),
+        "the consequence stays in the fallback arm too: {unknown_block}",
+    );
 
     // The block's identity line and roster markers, resolved per tier: the
     // runtime profile gets `(this session)`, the globally relinked one
@@ -432,6 +436,37 @@ unaffected)"
             "only an isolated `clauth start` runtime may claim the runtime layout",
         );
     }
+
+    // The combined marker arm: the runtime profile IS the globally active one,
+    // so one name carries both markers. Unpinned, folding this arm into either
+    // single marker stays green, and the most common case (`clauth start
+    // <active profile>`) is exactly the one that would drift.
+    let both = instructions_block(
+        &[snapshot("work", true)],
+        &SessionAuth::IsolatedRuntime("work".into()),
+        None,
+    );
+    assert!(
+        both.contains("work (global active, this session)"),
+        "the combined arm must survive a marker edit: {both}",
+    );
+
+    // The custom tier's own arms: its identity line and its `(global active)`
+    // marker are the only claims a foreign `CLAUDE_CONFIG_DIR` makes, and no
+    // assertion above reaches them.
+    let custom = instructions_block(&profiles, &SessionAuth::IsolatedCustom, None);
+    assert!(
+        custom.contains("custom `CLAUDE_CONFIG_DIR`"),
+        "the custom header must survive a prose edit: {custom}",
+    );
+    assert!(
+        custom.contains("personal (global active)"),
+        "the custom tier marks the global link, never a session profile: {custom}",
+    );
+    assert!(
+        !custom.contains("(this session)"),
+        "a custom dir holds no clauth session profile: {custom}",
+    );
 
     // The bans that held the old two-mode note hold the new one too: the note
     // never constructs a runtime path, never names a path clauth does not build,

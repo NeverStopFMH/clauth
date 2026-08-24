@@ -515,7 +515,13 @@ fn profiles_unknown_is_refused_by_name() {
         background: Some(true),
         ..base()
     });
-    assert_refusal(&result, &["profile not found: ghost"]);
+    assert_refusal(
+        &result,
+        &[
+            "profile not found: ghost",
+            "call `profiles` for valid names",
+        ],
+    );
 }
 
 /// One name without `background` is the ordinary blocking single delegate. Two
@@ -545,7 +551,13 @@ fn a_blocking_single_delegate_is_not_a_fanout_and_a_fanout_resolves_members() {
         background: None,
         ..base()
     });
-    assert_refusal(&fanout, &["profile not found: vendor"]);
+    assert_refusal(
+        &fanout,
+        &[
+            "profile not found: vendor",
+            "call `profiles` for valid names",
+        ],
+    );
 }
 
 /// A reserve failure refuses before any spawn: with the jobs dir replaced by a
@@ -682,7 +694,13 @@ fn a_resume_record_naming_an_unknown_account_refuses_profile_not_found() {
         background: Some(true),
         ..base()
     });
-    assert_refusal(&result, &["profile not found: ghost"]);
+    assert_refusal(
+        &result,
+        &[
+            "profile not found: ghost",
+            "call `profiles` for valid names",
+        ],
+    );
 }
 
 /// The resume id reaches a filename (the record path), so a path-shaped id is
@@ -1137,7 +1155,10 @@ fn prose_refusals_read_as_a_sentence_and_stay_one_block() {
     });
     assert_prose_refusal(
         &blocking,
-        &["delegate failed: profile not found: solo, vendor"],
+        &[
+            "delegate failed: profile not found: solo, vendor",
+            "call `profiles` for valid names",
+        ],
     );
 }
 

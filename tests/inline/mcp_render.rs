@@ -1550,12 +1550,12 @@ fn switch_prose_renders_success_and_failure() {
 
     let err = serde_json::json!({
         "ok": false,
-        "reason": "profile not found: ghost",
+        "reason": "profile not found: ghost; call `profiles` for valid names",
         "live_usage": {"profile": null}
     });
     assert_eq!(
         switch_prose(&err),
-        "switch failed: profile not found: ghost; active profile none"
+        "switch failed: profile not found: ghost; call `profiles` for valid names; active profile none"
     );
 }
 

@@ -316,6 +316,30 @@ fn delegate_refusal(reason: &str) -> CallToolResult {
     CallToolResult::error(single_block(prose))
 }
 
+/// The one builder for every `profile not found` refusal: the caller's spelling
+/// leads, then the fix clause. Placement rule 4's corollary makes the refusal
+/// carry the whole lesson, and the clause is a closed set composed HERE so the
+/// call sites cannot split the server's refusal vocabulary.
+fn profile_not_found(names: &str, fix: ProfileNotFoundFix) -> String {
+    let clause = match fix {
+        ProfileNotFoundFix::CallProfiles => "call `profiles` for valid names",
+        ProfileNotFoundFix::OmitFilter => "omit `names` for every account",
+    };
+    format!("profile not found: {names}; {clause}")
+}
+
+/// The fix clause a [`profile_not_found`] refusal ends with. Closed, so the
+/// vocabulary lives in the builder: a call site composing its own clause is the
+/// split the builder exists to close.
+enum ProfileNotFoundFix {
+    /// The caller is outside the roster: the `profiles` tool is the source of
+    /// valid names.
+    CallProfiles,
+    /// The caller is INSIDE the `profiles` tool, filtering it: dropping the
+    /// filter shows every account.
+    OmitFilter,
+}
+
 /// The live-usage footer folded into a payload as data: which profile the
 /// figures describe, and that profile's own headroom — an OAuth account's 5h/7d
 /// share (null when uncached), or the balance a third-party account publishes in
@@ -693,9 +717,9 @@ percentage is how much of it is already used. Call it before picking a `delegate
                         unknown.into_iter().map(Result::unwrap_err).collect();
                     let payload = serde_json::json!({
                         "ok": false,
-                        "reason": format!(
-                            "profile not found: {}; omit `names` for every account",
-                            missing.join(", ")
+                        "reason": profile_not_found(
+                            &missing.join(", "),
+                            ProfileNotFoundFix::OmitFilter
                         ),
                     });
                     let prose = render::list_profiles_prose(&payload);
@@ -781,8 +805,10 @@ disturbing this session, use `delegate`."
         // live `.credentials.json` symlink and creates no replacement (it only errors
         // later at `finish_switch`), leaving the global session credential-less.
         let Some(name) = config.canonical_name(&name) else {
-            let payload =
-                serde_json::json!({ "ok": false, "reason": format!("profile not found: {name}") });
+            let payload = serde_json::json!({
+                "ok": false,
+                "reason": profile_not_found(&name, ProfileNotFoundFix::CallProfiles)
+            });
             // Refused before any mutation ran, so nothing of ours moved: this
             // arm reports like the session-scope roster does. The
             // post-mutation arms below reseed instead.
@@ -943,7 +969,10 @@ Delegating spends the target account, so pick the account with `profiles` first.
         let raw: Vec<String> = profiles.unwrap_or_default();
         let target = if raw.len() == 1 {
             let Some(name) = config.canonical_name(&raw[0]) else {
-                return Ok(delegate_refusal(&format!("profile not found: {}", raw[0])));
+                return Ok(delegate_refusal(&profile_not_found(
+                    &raw[0],
+                    ProfileNotFoundFix::CallProfiles,
+                )));
             };
             Target::One(name)
         } else if raw.is_empty() {
@@ -959,7 +988,10 @@ Delegating spends the target account, so pick the account with `profiles` first.
                 Some(id) => match crate::hook_note::told_account(id) {
                     Some(name) => {
                         let Some(name) = config.canonical_name(&name) else {
-                            return Ok(delegate_refusal(&format!("profile not found: {name}")));
+                            return Ok(delegate_refusal(&profile_not_found(
+                                &name,
+                                ProfileNotFoundFix::CallProfiles,
+                            )));
                         };
                         Target::One(name)
                     }
@@ -3373,7 +3405,7 @@ fn run_delegate(opts: DelegateOpts<'_>) -> std::result::Result<serde_json::Value
     let config = load_config().map_err(|e| format!("failed to load config: {e}"))?;
     let target = config
         .find(opts.profile)
-        .ok_or_else(|| format!("profile not found: {}", opts.profile))?;
+        .ok_or_else(|| profile_not_found(opts.profile, ProfileNotFoundFix::CallProfiles))?;
     // Mirrors `disable_profile`'s own live-session refusal from the other
     // direction: that guard stops disabling a profile mid-session, this one
     // stops opening a brand-new session on one already disabled. Also the
@@ -3825,7 +3857,10 @@ fn resolve_fanout(config: &AppConfig, raw: &[String]) -> std::result::Result<Vec
         }
     }
     if !missing.is_empty() {
-        return Err(format!("profile not found: {}", missing.join(", ")));
+        return Err(profile_not_found(
+            &missing.join(", "),
+            ProfileNotFoundFix::CallProfiles,
+        ));
     }
     // A member that cannot be spent on refuses the whole fan-out before the
     // first spawn, like an unknown name does: the spend has no undo. Same
@@ -3835,7 +3870,7 @@ fn resolve_fanout(config: &AppConfig, raw: &[String]) -> std::result::Result<Vec
     for name in &resolved {
         let profile = config
             .find(name)
-            .ok_or_else(|| format!("profile not found: {name}"))?;
+            .ok_or_else(|| profile_not_found(name, ProfileNotFoundFix::CallProfiles))?;
         preflight_target(profile, config, name)?;
     }
     Ok(resolved)

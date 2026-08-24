@@ -6606,14 +6606,10 @@ fn the_monitor_entry_names_the_listing_and_the_interrupted_delegate() {
 /// by name before any mutation, and a rule the boundary refuses does not need
 /// teaching up front.
 ///
-/// That cut carries a debt the boundary has not paid. Rule 4's corollary is
-/// that the refusal then names the fix the way a good CLI error does, and
-/// `profile not found: {name}` names none and points at no tool — where the
-/// sibling refusal in `profiles` already does. The same sentence is built at
-/// five other sites, `delegate`'s single-target and fan-out arms included, so
-/// changing one spelling here would split the server's refusal vocabulary. It
-/// is raised as a follow-up rather than patched where only this test can see
-/// it.
+/// Rule 4's corollary still binds the refusal itself: it names the fix. Every
+/// site composes the sentence through the shared `profile_not_found` builder in
+/// `src/mcp/mod.rs`, so a site that re-inlines its own spelling splits the
+/// refusal vocabulary the builder exists to hold together.
 #[test]
 fn the_switch_profile_entry_points_at_the_pre_commit_check() {
     let text = tool_entry_text("switch_profile");
@@ -6622,5 +6618,42 @@ fn the_switch_profile_entry_points_at_the_pre_commit_check() {
     assert!(
         text.contains("profiles({scope:\"session\"})"),
         "`switch_profile` entry dropped its pre-commit pointer: {text}"
+    );
+}
+
+/// One builder composes every `profile not found` refusal, fix clause included.
+/// Both clauses live HERE, at the builder level: the source scan below catches
+/// a site that re-inlines its own sentence, and each site's tool pin carries
+/// the clause that site's reply must keep.
+#[test]
+fn the_profile_not_found_builder_names_the_fix() {
+    assert_eq!(
+        profile_not_found("ghost", ProfileNotFoundFix::CallProfiles),
+        "profile not found: ghost; call `profiles` for valid names"
+    );
+    assert_eq!(
+        profile_not_found("ghost", ProfileNotFoundFix::OmitFilter),
+        "profile not found: ghost; omit `names` for every account"
+    );
+}
+
+/// The sentence is composed in ONE place: the builder. Scanning the source
+/// keeps a site that re-inlines its own spelling red — the defensive re-finds
+/// (`run_delegate` and `resolve_fanout`'s pre-flight) fire only on a re-find
+/// race no tool-level pin can drive, so without the scan a dropped pointer
+/// there reds nothing. Comment lines are out: the scanned contract is about
+/// code, and the docs around the builder name the refusal in prose.
+#[test]
+fn the_profile_not_found_sentence_is_composed_in_one_place() {
+    let src = include_str!("../../src/mcp/mod.rs");
+    let code = src
+        .lines()
+        .filter(|l| !l.trim_start().starts_with("//"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let hits = code.matches("profile not found").count();
+    assert_eq!(
+        hits, 1,
+        "the builder must be the one site composing the sentence: {hits} spellings in src/mcp/mod.rs"
     );
 }

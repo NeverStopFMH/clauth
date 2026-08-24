@@ -759,6 +759,70 @@ fn a_disabled_and_quarantined_target_refuses_as_disabled() {
     assert_eq!(err, "profile is disabled: both (run `clauth enable both`)");
 }
 
+/// Gate ORDER, second pinned case: a target that is quarantined AND a keyless
+/// third-party profile refuses as KEYLESS. The quarantine arm alone would hand
+/// it `login_expired`'s `clauth login <name>`, which on a third-party profile
+/// runs the browser flow and leaves the missing api key missing; `--api-key`
+/// clears the state it is actually in (a login clears the quarantine, AUTH-1).
+#[test]
+fn a_quarantined_and_keyless_third_party_target_refuses_as_keyless() {
+    let _home = HomeSandbox::new();
+    let mut config = crate::profile::AppConfig {
+        state: crate::profile::AppState::default(),
+        profiles: Vec::new(),
+    };
+    crate::actions::create_blank_profile(
+        &mut config,
+        "ds-both".to_string(),
+        Some("https://api.deepseek.com".to_string()),
+        None,
+        None,
+    )
+    .expect("create profile");
+    assert!(
+        config.set_auth_broken("ds-both", true),
+        "fixture control: the profile was not already quarantined",
+    );
+
+    let raw = vec!["ds-both".to_string()];
+    let err = resolve_fanout(&config, &raw)
+        .expect_err("a keyless third-party member refuses the whole fan-out");
+    assert_eq!(
+        err,
+        "profile has no api key: ds-both (run `clauth login ds-both --api-key <key>`)"
+    );
+}
+
+/// The `!has_inference_auth` leg of the combined arm, pinned because no
+/// keyless-shaped fixture can hold it: a third-party profile WITH a key that
+/// is quarantined must stay on the `auth_broken` arm (`login_expired`'s line),
+/// and a leg-drop turns this assertion into the keyless string.
+#[test]
+fn a_quarantined_keyed_third_party_target_stays_on_the_auth_broken_arm() {
+    let _home = HomeSandbox::new();
+    let mut config = crate::profile::AppConfig {
+        state: crate::profile::AppState::default(),
+        profiles: Vec::new(),
+    };
+    crate::actions::create_blank_profile(
+        &mut config,
+        "ds-keyq".to_string(),
+        Some("https://api.deepseek.com".to_string()),
+        Some("sk-test".to_string()),
+        None,
+    )
+    .expect("create profile");
+    assert!(
+        config.set_auth_broken("ds-keyq", true),
+        "fixture control: the profile was not already quarantined",
+    );
+
+    let raw = vec!["ds-keyq".to_string()];
+    let err =
+        resolve_fanout(&config, &raw).expect_err("a quarantined member refuses the whole fan-out");
+    assert_eq!(err, crate::format::login_expired("ds-keyq").line());
+}
+
 #[test]
 fn resolve_fanout_passes_when_every_member_is_delegable() {
     let _home = HomeSandbox::new();

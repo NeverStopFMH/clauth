@@ -3796,7 +3796,13 @@ fn classify_run(
 /// `AppState::auth_broken`, and it is deliberately NOT a refresh attempt: the
 /// MCP layer takes no rotation lock. It sits AFTER the disabled bail for the
 /// reason `switch` orders them the same way — a disabled, clock-expired target
-/// must be refused before anything can rotate its single-use refresh token.
+/// must be refused before anything can rotate its single-use refresh token —
+/// and a combined arm sits before it, refusing a target that is BOTH
+/// quarantined and keyless as keyless: the quarantine arm's `clauth login
+/// <name>` runs the browser flow on a third-party profile (OAuth for most
+/// providers, the console flow on Alibaba) and leaves the missing key missing,
+/// while the `--api-key` command clears the state it is actually in (a login
+/// clears the quarantine, AUTH-1 in `actions.rs`).
 ///
 /// Called from every path that refuses before a spawn: the single-background
 /// arm and `resolve_fanout` up front, and `run_delegate` as the blocking
@@ -3810,6 +3816,19 @@ fn preflight_target(
     if profile.is_disabled() {
         return Err(format!(
             "profile is disabled: {name} (run `clauth enable {name}`)"
+        ));
+    }
+    // The quarantine arm below would hand this target `login_expired`'s
+    // `clauth login <name>`, which on a third-party profile runs the browser
+    // flow (OAuth for most providers, the console flow on Alibaba) and leaves
+    // the missing key missing. The `--api-key` command clears the state it is
+    // actually in — a login clears the quarantine too (AUTH-1 in `actions.rs`).
+    if config.is_auth_broken(name)
+        && profile.is_third_party()
+        && !crate::claude::has_inference_auth(profile)
+    {
+        return Err(format!(
+            "profile has no api key: {name} (run `clauth login {name} --api-key <key>`)"
         ));
     }
     // Verbatim `switch`'s own refusal (`actions.rs`, its AUTH-1 arm), so the two

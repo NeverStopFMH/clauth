@@ -156,8 +156,7 @@ pub(crate) struct MemberSessions {
     /// How many of `sessions` the fallback chain is allowed to move.
     pub(crate) following: usize,
     /// The newest swap ONTO this account. `None` when no session here has ever
-    /// swapped, which is also what says no `current_member` pickup lag applies
-    /// (`docs/plan/multi-session-fallback.md` §12).
+    /// swapped, which is also what says no `current_member` pickup lag applies.
     pub(crate) last_swap_at: Option<u64>,
 }
 

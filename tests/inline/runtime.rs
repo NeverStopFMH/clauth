@@ -386,15 +386,14 @@ fn copy_tree_skips_a_publish_in_flight() {
 ///
 /// A junction because it is the directory link a fake-mode host can still be
 /// carrying — it needs no `SeCreateSymbolicLinkPrivilege`, and the absence of
-/// that privilege is what puts the host on the copy transport in the first place
-/// (`docs/domain-knowledge.md`). A directory SYMLINK reaches the same branch,
+/// that privilege is what puts the host on the copy transport in the first place.
+/// A directory SYMLINK reaches the same branch,
 /// measured identical on Windows 11, and is reachable too: Developer Mode or an
 /// elevated process can lay one down before an unprivileged run probes `Fake`.
 ///
 /// `mklink /J` because a junction has no std constructor — `symlink_dir` wants
 /// the privilege the host lacks, and `FSCTL_SET_REPARSE_POINT` wants a winapi
-/// dep plus `unsafe`. Its ceiling, since `docs/architecture.md`'s 2026-07-06
-/// entry says never to pass data args through `cmd /C`: `mklink` is a cmd
+/// dep plus `unsafe`. Its ceiling: `mklink` is a cmd
 /// builtin, so no shell-free route exists, and a `%` in either path would still
 /// reach cmd's variable expansion. Both paths here are tempdir-derived. Upgrade
 /// path is a junction crate, or the FSCTL behind a test-only dep.
@@ -847,7 +846,7 @@ fn mirror_tree_follows_a_directory_link_on_the_runtime_side() {
 /// Pose a FILE link at `link` pointing at `target`. Unlike a directory link
 /// there is no unprivileged Windows shape — a junction points at directories
 /// only — so this reports refusal instead of failing on its own fixture. CI's
-/// Windows runner holds `SeCreateSymbolicLinkPrivilege` (`docs/todo.md`), so the
+/// Windows runner holds `SeCreateSymbolicLinkPrivilege`, so the
 /// coverage is real there; a Developer-Mode-off box skips, out loud, because a
 /// silent skip reads as a pass.
 fn pose_file_link(link: &Path, target: &Path) -> bool {

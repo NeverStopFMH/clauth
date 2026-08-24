@@ -439,8 +439,7 @@ fn note_for(
         // production. The exposure is the resolve window (~1.5-3 ms) against the
         // up-to-2 s lock wait this replaced, and it self-corrects at the TTL.
         // Closing it means stamping inside `resolve_account` around the
-        // credential read, which is more invasive than the residual deserves
-        // (`docs/todo.md`).
+        // credential read, which is more invasive than the residual deserves.
         _ => {
             let taken_at = SystemTime::now();
             Some((resolve(), taken_at))
@@ -698,7 +697,7 @@ pub(crate) fn gc_conversation_records() {
     // fresh record announced 40/40; against a reap-eligible one, 0/40. So the
     // loss is caused by the reap predicate and not by any interleave, and the
     // deletion is self-undoing — the fire recreates the record immediately. The
-    // real guard belongs on the predicate (`docs/todo.md`); this lock was never
+    // real guard belongs on the predicate; this lock was never
     // going to cover it.
     let _hold = ScopeLock::acquire();
     let Ok(entries) = std::fs::read_dir(&dir) else {

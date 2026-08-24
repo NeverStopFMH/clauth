@@ -1268,7 +1268,7 @@ fn blind_fields_parse_defensively() {
 
 // ── get_json emits Claude Code's exact per-client header set (wire parity) ────
 //
-// Captured 2026-07-14 against CC 2.1.209 (docs/wire-parity.md): CC polls /usage
+// Captured 2026-07-14 against CC 2.1.209: CC polls /usage
 // with its claude-cli client (+anthropic-beta, no cache-control) and reads
 // /profile with a plain axios client (axios UA, Cache-Control: no-cache, no
 // beta). This drives the REAL get_json builder against a loopback listener and
@@ -1378,7 +1378,7 @@ fn get_json_emits_cc_per_client_wire_headers() {
 /// ureq 3 answers a non-2xx with `Err(Error::StatusCode)` by DEFAULT, which once
 /// turned every `status >= 400` branch on the `Ok` response into dead code here:
 /// the 401 → rotate leg and the 429 retry-after read never fired, and every HTTP
-/// error collapsed into `Network` (`docs/architecture.md`, 2026-06-07). The whole
+/// error collapsed into `Network` (2026-06-07). The whole
 /// fix is one builder flag on this agent, and nothing pinned it — dropping the
 /// flag, or rebuilding the agent without it, would strand rotation exactly the
 /// same way while every offline test in the tree kept passing, because no offline

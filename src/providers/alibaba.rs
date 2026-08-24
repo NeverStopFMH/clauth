@@ -20,7 +20,6 @@
 //! has no refresh path — it expires 48h after the operator's aliyun browser
 //! sign-in, which a re-login inherits rather than restarts — so retrying it on
 //! the cadence only burns requests.
-//! `docs/domain-knowledge.md` holds the provenance for all of it.
 
 use std::collections::HashMap;
 

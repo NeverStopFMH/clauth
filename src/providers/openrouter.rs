@@ -5,7 +5,7 @@
 //! is overdrawn — the state an inference call answers with `402 ... can only
 //! afford 0` (measured 2026-08-17). It answers for a REGULAR api key: the
 //! docs' "management key required" note is stale, verified on two regular keys
-//! the same day (`docs/domain-knowledge.md`).
+//! the same day.
 //!
 //! `/api/v1/key` is best-effort enrichment: the daily/weekly/monthly usage, the
 //! free-tier flag, and the key's own cap (`limit` / `limit_remaining`). A `null`

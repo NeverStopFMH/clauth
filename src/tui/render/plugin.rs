@@ -444,7 +444,7 @@ fn draw_delegates(frame: &mut Frame<'_>, area: Rect, rows: &[DelegateCells]) {
 /// overflow signal. This pane binds no key, so a scrollbar here would advertise
 /// a scroll that cannot happen; a count says the same thing and promises
 /// nothing. The reason lives here because it is the only written home it has —
-/// the `docs/tui-design.md` entry recording it is owed and not yet written.
+/// the design-doc entry recording it is owed and not yet written.
 fn delegate_lines(rows: &[DelegateCells], viewport: usize, width: usize) -> Vec<Line<'static>> {
     if viewport == 0 {
         return Vec::new();

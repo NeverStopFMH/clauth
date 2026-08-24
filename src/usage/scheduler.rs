@@ -558,7 +558,7 @@ const ROTATE_LEAD_FLOOR_MS: i64 = 900_000;
 ///
 /// Claude Code refreshes its own OAuth token once it is within **5 minutes**
 /// of expiry — one predicate gates its whole demand path, measured against its
-/// shipped bundle (`docs/domain-knowledge.md`). Rotating outside that window
+/// shipped bundle. Rotating outside that window
 /// means CC never has a reason to refresh, so clauth's stored pair stays the
 /// live one instead of lagging a chain CC advanced. Three poll intervals give
 /// multiple rotation opportunities before expiry whatever the cadence, and the
@@ -568,7 +568,7 @@ const ROTATE_LEAD_FLOOR_MS: i64 = 900_000;
 /// first — clauth downtime, a lost race — the poller ADOPTS CC's fresher pair
 /// rather than fighting for the chain (`oauth::try_adopt_live_rotation`).
 /// Losing is not free, though. Anthropic does not punish the double-spend — the
-/// pair the winner minted keeps working (`docs/domain-knowledge.md`) — but
+/// pair the winner minted keeps working — but
 /// clauth answers the `invalid_grant` its own loser gets with a LOCAL
 /// quarantine (`mark_auth_broken`), and only an adopt, a carry, or a
 /// `clauth login` lifts that. Rotating early is what keeps the chain off that
@@ -1838,7 +1838,7 @@ pub(crate) fn profile_credential_fingerprint(p: &crate::profile::Profile) -> Opt
 /// test [`collect_third_party_entries`] applies, hoisted so the RENDER layer
 /// reads the same rule instead of restating it. A profile this returns `false`
 /// for never gets a `fetch_status`, so the Usage tab must say so rather than
-/// spin on "loading" forever (`docs/providers.md`, issue #2).
+/// spin on "loading" forever.
 ///
 /// Disabled-ness is deliberately not part of it: that is a separate axis, and
 /// both callers already handle it themselves.
@@ -2757,8 +2757,7 @@ pub(crate) fn spawn_refresher(
     // so a restart mid-outage resumes the decayed retry clock instead of
     // hammering. Must happen here, not inside the spawned closure below:
     // nothing joins that thread, so a home-derived path resolved on it could
-    // outlive a test's `HOME_OVERRIDE` and read the operator's real home. See
-    // the 2026-06-06 convention in docs/architecture.md.
+    // outlive a test's `HOME_OVERRIDE` and read the operator's real home.
     let names: Vec<String> = tokens
         .lock()
         .map(|t| t.iter().map(|e| e.name.clone()).collect())

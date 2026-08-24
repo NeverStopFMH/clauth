@@ -1201,7 +1201,7 @@ const CARRIED_CREDENTIAL_KEYS: [&str; 1] = ["mcpOAuth"];
 /// The credential-store keys that belong to ONE Claude account, so a sign-out
 /// drops them and nothing carries them onto another account's login. Claude Code
 /// deletes exactly these five on logout and preserves everything else
-/// (`docs/domain-knowledge.md`, read out of its own logout path), which is the
+/// (read out of its own logout path), which is the
 /// other side of the line [`CARRIED_CREDENTIAL_KEYS`] draws.
 const ACCOUNT_SCOPED_CREDENTIAL_KEYS: [&str; 5] = [
     "claudeAiOauth",
@@ -1861,8 +1861,8 @@ pub(crate) fn build_claude_settings_json(
     // instead of `env.ANTHROPIC_AUTH_TOKEN` (cleared above). The key then
     // leaves the settings.json `env` block AND the spawned CC process's own
     // env: CC runs the helper per request through the system shell and sends
-    // its stdout as both `X-Api-Key` and `Authorization: Bearer` (see
-    // `docs/security.md`). The helper reads the key from `config.toml`
+    // its stdout as both `X-Api-Key` and `Authorization: Bearer`. The helper
+    // reads the key from `config.toml`
     // (0o600, the source of truth) via a hidden subcommand, so the raw key
     // never reaches the runtime settings.json. A profile with no api_key (a
     // whitespace-only or control-char-poisoned key is one `api_key_for_profile`

@@ -304,8 +304,7 @@ fn last_output_cell(row: &JobRow) -> String {
 /// pinned-`--output-format` one no idle guard — and a record written before the
 /// liveness fields carries neither because that server recorded nothing. The
 /// first is clauth knowing there is none, the second is clauth not knowing, and
-/// this column renders both as `-`. That split is the one `docs/plugin-mcp.md`
-/// holds the prose surfaces to, and `monitor` keeps it (`no wall clock` against
+/// this column renders both as `-`. That split `monitor` keeps (`no wall clock` against
 /// `liveness not recorded`); a table cell cannot, so it claims neither.
 fn kill_cell(row: &JobRow) -> String {
     let Some(live) = row.live else {

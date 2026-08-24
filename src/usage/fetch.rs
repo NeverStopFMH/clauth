@@ -930,7 +930,7 @@ pub(crate) fn cli_user_agent() -> &'static str {
 /// Which of Claude Code's two `api.anthropic.com` clients to imitate. CC polls
 /// `/usage` with its `claude-cli` client but reads `/profile` through a plain
 /// axios instance — different UA, and `/profile` carries `Cache-Control: no-cache`
-/// with no `anthropic-beta`. See `docs/wire-parity.md`.
+/// with no `anthropic-beta`.
 #[derive(Clone, Copy)]
 enum AuthClient {
     /// `/usage`: `claude-cli/<ver> (external, cli)` UA + `anthropic-beta`.

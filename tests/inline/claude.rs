@@ -530,7 +530,7 @@ fn build_settings_clears_stale_model_knobs() {
 // top-level `apiKeyHelper` when a profile carries an api_key, so the raw key
 // leaves the settings.json `env` block and the spawned CC process's env. CC
 // runs the helper per request and sends its stdout as both `X-Api-Key` and
-// `Authorization: Bearer` (see `docs/security.md`).
+// `Authorization: Bearer`.
 
 /// An api-key profile writes `apiKeyHelper` at the top level (NOT under `env`),
 /// keeps the raw key out of the rendered JSON, and clears `env.ANTHROPIC_AUTH_TOKEN`.
@@ -1835,8 +1835,8 @@ fn carrying_a_key_the_target_already_holds_reports_no_change() {
 }
 
 /// A sign-out drops exactly what belongs to one Claude account and keeps what
-/// belongs to none, which is the line Claude Code's own logout draws
-/// (`docs/domain-knowledge.md`). Every key is asserted by name: dropping one from
+/// belongs to none, which is the line Claude Code's own logout draws. Every key
+/// is asserted by name: dropping one from
 /// the list would otherwise leave the outgoing account's block serving the next.
 #[test]
 fn a_sign_out_drops_the_account_keys_and_keeps_the_mcp_logins() {

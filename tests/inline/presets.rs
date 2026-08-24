@@ -150,7 +150,7 @@ fn a_saved_preset_round_trips_and_joins_the_list_after_the_builtins() {
 }
 
 /// The whole preset tree lives under `~/.clauth`, so it is bound by the
-/// owner-only invariant in `docs/security.md` — dir 0o700, file 0o600, both
+/// owner-only invariant — dir 0o700, file 0o600, both
 /// born that way rather than repaired later.
 #[cfg(unix)]
 #[test]

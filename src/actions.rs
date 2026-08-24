@@ -1173,8 +1173,7 @@ pub(crate) fn overwrite_captured_profile(
             // third-party recapture stores none, so the carry no-ops and the
             // live slot's MCP logins go with it. Pre-existing wherever the slot
             // is a symlink (the guard never ran there either); this branch
-            // widens it to the hosts where the slot is a regular file. Open in
-            // `docs/todo.md`, and NOT the residual named above.
+            // widens it to the hosts where the slot is a regular file.
             force_link_profile_credentials(name)?;
             let profile = config.find(name).context("profile not found")?;
             let prev_env_keys: Vec<String> = profile.env.keys().cloned().collect();

@@ -135,7 +135,7 @@ pub(crate) fn home_oauth_account_uuid() -> Option<AccountId> {
 /// `~/.claude.json` on profile switch (issue #17). Claude Code trusts a
 /// cached identity block and does not re-derive it from a relinked
 /// credentials file on a normal startup; dropping the block instead lets it
-/// self-heal — probed on CC 2.1.201 (`docs/issue-17-oauthaccount.md`): an
+/// self-heal — probed on CC 2.1.201: an
 /// absent block re-derives the correct identity from the token within
 /// seconds, a present-but-wrong one never self-corrects.
 ///

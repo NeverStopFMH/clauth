@@ -725,7 +725,7 @@ fn token_parse_error_redacts_the_2xx_body() {
 /// without the confirmation takes a healthy account out of rotation, and when
 /// the cause is our own request shape it takes EVERY account at once. 401 stays
 /// terminal regardless of body (some proxies answer it for a dead token).
-/// Bodies are real bytes captured from the live endpoint (`docs/wire-parity.md`).
+/// Bodies are real bytes captured from the live endpoint.
 #[test]
 fn refresh_rejection_terminal_truth_table() {
     // Dead refresh token — the flat OAuth2 envelope.
@@ -765,7 +765,7 @@ fn refresh_rejection_terminal_truth_table() {
 // ── canonicalize_scopes (refresh `scope` byte-parity with Claude Code) ────────
 
 /// CC emits the refresh `scope` in a fixed order regardless of how the
-/// credential file stored the granted scopes (`docs/wire-parity.md`). Reorder to
+/// credential file stored the granted scopes. Reorder to
 /// that canonical order, preserving the exact granted set.
 #[test]
 fn canonicalize_scopes_matches_claude_code_order() {
@@ -1252,9 +1252,7 @@ mod adopt_live_rotation {
         );
     }
 
-    /// The adopt's relink is what closed `docs/todo.md`'s "post-adopt relink
-    /// drops unrelated keys" entry, so it gets the verify line that entry asked
-    /// for: a live file carrying `mcpOAuth` survives the adopt with that key
+    /// A live file carrying `mcpOAuth` survives the adopt with that key
     /// intact. Before the carry the relink pointed the live slot at a store
     /// holding the login alone, and Claude Code lost every MCP-server session on
     /// a leg that runs unattended roughly every 8 hours.
@@ -1569,7 +1567,7 @@ fn gate_under_guard_disk_adoption_lifts_a_stale_quarantine() {
 // ── token-endpoint request bodies (platform.claude.com wire parity) ──────────
 //
 // The exact JSON body CC's axios client posts to platform.claude.com/v1/oauth/
-// token, captured 2026-07-14 against CC 2.1.209 (docs/wire-parity.md). Field
+// token, captured 2026-07-14 against CC 2.1.209. Field
 // set is compared order-independently (a JSON body's key order is not a wire
 // signal); `scope` value + canonical order carry their own assertions.
 
@@ -1637,7 +1635,7 @@ fn token_endpoint_constants_match_cc_wire() {
 // ── kick emits Claude Code's /v1/messages client shape (wire parity) ─────────
 //
 // The window-priming POST carries CC's SDK instrumentation + full beta set
-// (captured 2026-07-14, CC 2.1.209, docs/wire-parity.md). Drives the REAL
+// (captured 2026-07-14, CC 2.1.209). Drives the REAL
 // kick_to builder against a loopback listener and asserts the emitted bytes.
 // Deliberately partial vs a real stainless client (no host-derived
 // arch/os/runtime-version, no per-session ids) — asserted here so the boundary

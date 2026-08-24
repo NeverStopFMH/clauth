@@ -413,8 +413,7 @@ fn reason_fix(reason: &BlockedReason, name: &str) -> String {
 /// caller's decision and stays consistent whether or not 5h data exists.
 ///
 /// Claude Code re-reads its credentials on its NEXT REQUEST, an mtime `stat` on
-/// the request path with no watcher behind it
-/// (`docs/plan/multi-session-fallback.md` §12), so a session that just swapped
+/// the request path with no watcher behind it, so a session that just swapped
 /// keeps authenticating as the old member until it next talks. `current_member`
 /// is therefore where clauth PUT the link, not who is being billed this second,
 /// and nothing in the registry can observe the pickup — hence a caveat rather

@@ -248,8 +248,8 @@ pub(crate) enum ConfigRow {
     /// it changes what every future switch installs and, on the active account,
     /// moves a running session's credentials.
     ClearSessionToken,
-    /// User-disabled account-action row (`Profile::disabled`, see
-    /// `docs/fallback.md`), same class as `Delete`: enabling fires the shared
+    /// User-disabled account-action row (`Profile::disabled`), same class as
+    /// `Delete`: enabling fires the shared
     /// `actions::enable_profile` immediately (harmless), disabling arms on the
     /// first Space/⏎ and confirms on the second, via `actions::disable_profile`.
     /// Dimmed and inert while the account is active or holds a live `clauth
@@ -4756,8 +4756,8 @@ pub(crate) fn chain_candidates(app: &App) -> Vec<String> {
 }
 
 /// Whether adding `name` to the fallback chain would mix api-key and oauth
-/// accounts. CC's env-var handling breaks the api-key → oauth switch direction
-/// (see docs/domain-knowledge.md), so a mixed chain can leave a running bare
+/// accounts. CC's env-var handling breaks the api-key → oauth switch direction,
+/// so a mixed chain can leave a running bare
 /// `claude` session stuck on the api-key account until restart. Fires only
 /// when a homogeneous chain would gain its other kind — silent on empty,
 /// already-mixed, and same-kind adds.

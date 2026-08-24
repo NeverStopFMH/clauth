@@ -1492,7 +1492,7 @@ fn live_column_present(app: &App, width: u16) -> bool {
 }
 
 /// Where the `live` column exists, exactly, as a function of name length and
-/// terminal width — the presence map `docs/tui-design.md` publishes.
+/// terminal width.
 ///
 /// The fit gate's own comparison had no pin: `<= total` → `< total` shifts every
 /// arrival by one column and the whole suite stayed green, because the only test

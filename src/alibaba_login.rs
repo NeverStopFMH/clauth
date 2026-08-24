@@ -30,8 +30,6 @@
 //! the operator's aliyun browser sign-in, so re-running `clauth login` inherits
 //! whatever is left — minutes, sometimes — rather than restarting it. Nothing
 //! here may promise a duration; only a fresh console sign-in buys a full window.
-//!
-//! `docs/domain-knowledge.md` holds the provenance.
 
 use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};

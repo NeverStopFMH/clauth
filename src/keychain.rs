@@ -9,7 +9,7 @@
 //! **Every write is a READ-MODIFY-WRITE.** Claude Code keeps ONE item holding
 //! ONE JSON object: the login `claudeAiOauth` beside `mcpOAuth` (the
 //! per-MCP-server logins, which belong to no Claude account) and four
-//! account-scoped keys (`docs/domain-knowledge.md`). `add-generic-password -U`
+//! account-scoped keys. `add-generic-password -U`
 //! replaces that whole object, so a write serializing the login alone signed the
 //! operator out of every MCP server on every switch. Which siblings survive is
 //! [`Keep`]'s decision, and it mirrors the two rules the file path already has:
@@ -224,7 +224,7 @@ pub(crate) fn enabled() -> bool {
 /// A previous note here claimed a *separate* item at `account = "unknown"` held
 /// `mcpOAuth`. That is wrong and was load-bearing for the wrong conclusion: CC
 /// keeps ONE item holding one JSON blob, and `mcpOAuth` is a sibling key of
-/// `claudeAiOauth` inside it (`docs/domain-knowledge.md`, traced on 2.1.210 and
+/// `claudeAiOauth` inside it (traced on 2.1.210 and
 /// 2.1.227), which is what makes the read-modify-write below necessary.
 fn account() -> Result<String> {
     std::env::var("USER")

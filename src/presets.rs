@@ -8,8 +8,7 @@
 //! The built-ins ship in the binary; the rest live one JSON file per preset
 //! under `~/.clauth/presets/`. The file NAME is the preset name, so it goes
 //! through [`crate::actions::validate_profile_name`] (the same charset that
-//! bounds a profile directory) before it ever reaches a path — see
-//! `docs/security.md`.
+//! bounds a profile directory) before it ever reaches a path.
 
 use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
@@ -236,7 +235,7 @@ pub(crate) fn save_preset(
         models: models.clone(),
     })?;
     // `atomic_write_600` creates a missing parent 0o700 itself, so the dir and
-    // the file are both born owner-only (`docs/security.md`).
+    // the file are both born owner-only.
     atomic_write_600(&path, format!("{body}\n"))?;
     Ok(())
 }

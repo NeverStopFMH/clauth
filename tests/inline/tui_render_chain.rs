@@ -511,7 +511,7 @@ fn disabled_and_canceled_share_the_marker_shape_and_split_on_hue() {
 }
 
 /// A disabled chain member — still configured in `fallback_chain` on disk,
-/// only the walk skips it (see `Profile::is_disabled` / `docs/fallback.md`)
+/// only the walk skips it (see `Profile::is_disabled`)
 /// — dims its name in the Fallback selector and carries the `⊖` blocked-reason
 /// marker, with the `[ disabled ]` label reaching the operator through the
 /// detail card's `reason_pill`. The add-picker exclusion (a disabled account
@@ -1522,7 +1522,7 @@ fn the_session_block_omits_the_qualifier_when_no_session_follows() {
 
 /// Once a session HAS swapped onto this member, `current_member` stops being an
 /// instantaneous fact: Claude Code re-reads its credentials on its next request
-/// and nothing observes the pickup (`docs/plan/multi-session-fallback.md` §12).
+/// and nothing observes the pickup.
 /// The card says so rather than inventing a "not yet picked up" state the
 /// registry cannot see.
 #[test]

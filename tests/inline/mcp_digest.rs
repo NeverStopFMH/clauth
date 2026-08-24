@@ -836,8 +836,8 @@ fn a_background_handle_reports_the_digest_once_and_consumes_it() {
 ///
 /// This repo has already shipped the per-row spelling once: nesting the digest
 /// inside each result put it on the first row only, left the renderer with
-/// nothing to print, consumed the delta and dropped it for good
-/// (`docs/plugin-mcp.md`, "Since-your-last-call digest"). A row-level fold is
+/// nothing to print, consumed the delta and dropped it for good. A row-level
+/// fold is
 /// silent in the prose, so nothing but a count can catch it.
 #[test]
 fn a_fanout_reply_carries_one_top_level_digest_and_no_row_carries_one() {

@@ -93,7 +93,7 @@ const REFRESH_SCOPES_FALLBACK: &str =
 
 /// Claude Code emits the refresh `scope` in this fixed order regardless of the
 /// order its credential file happens to store the granted scopes in (verified on
-/// the wire, `docs/wire-parity.md`). A profile's stored `scopes` array is often
+/// the wire). A profile's stored `scopes` array is often
 /// ordered differently, so reorder to this before sending to byte-match CC.
 const CANONICAL_SCOPE_ORDER: [&str; 6] = [
     "org:create_api_key",
@@ -137,7 +137,7 @@ const MESSAGES_ENDPOINT: &str = "https://api.anthropic.com/v1/messages?beta=true
 /// `/v1/messages`, distinct from the single `oauth-2025-04-20` on `/usage` and
 /// from the longer lists CC's real inference calls carry. Captured 2026-07-14
 /// against CC 2.1.209, re-verified unchanged 2026-07-24 against CC 2.1.219;
-/// drifts with CC's bundle, re-capture on a bump (`docs/wire-parity.md`).
+/// drifts with CC's bundle, re-capture on a bump.
 const KICK_ANTHROPIC_BETA: &str = "oauth-2025-04-20,interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05";
 
 /// anthropic-sdk-js (stainless) version CC bundles (2.1.209, still 0.94.0 at
@@ -335,7 +335,7 @@ impl RefreshError {
 
 /// The refresh request body CC's axios client posts to the token endpoint.
 /// Pure so the exact wire JSON (field set + canonical `scope` order) is
-/// golden-tested against the captured CC shape (`docs/wire-parity.md`).
+/// golden-tested against the captured CC shape.
 fn refresh_body(refresh_token: &str, scopes: Option<&str>) -> serde_json::Result<String> {
     serde_json::to_string(&serde_json::json!({
         "grant_type": "refresh_token",
@@ -506,7 +506,7 @@ fn describe_kick_failure(err: &KickError) -> String {
 /// the advertised retry ceiling — the later of
 /// `anthropic-ratelimit-unified-reset` and `retry-after` — and is an UPPER
 /// BOUND only: the limiter has been observed relenting 2.4h before its own
-/// advertised reset (2026-07-15, `docs/wire-parity.md`), so callers retry with
+/// advertised reset (2026-07-15), so callers retry with
 /// decay toward it, never sleep until it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct KickRateLimit {

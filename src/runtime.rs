@@ -518,7 +518,7 @@ pub(crate) fn has_live_session(name: &str) -> bool {
 /// mechanism is that clauth cannot reach the credential a `clauth start`
 /// session's Claude Code actually reads. That child runs with
 /// `CLAUDE_CONFIG_DIR=<runtime>`, and CC namespaces its Keychain item per config
-/// dir (`Claude Code-credentials-<sha256(dir)[0:8]>`, `docs/domain-knowledge.md`)
+/// dir (`Claude Code-credentials-<sha256(dir)[0:8]>`)
 /// while [`crate::keychain`] writes only the UNSUFFIXED `Claude Code-credentials`.
 /// So a rotation leaves that CC holding the old refresh token; its own
 /// re-read-and-compare sees its item unchanged and detects no race, and the
@@ -531,7 +531,7 @@ pub(crate) fn has_live_session(name: &str) -> bool {
 /// counts only `clauth start` sessions, so it already draws that line.
 ///
 /// This dissolves the moment [`crate::keychain`] derives the namespaced service
-/// name (`docs/todo.md`, "#1 macOS follow-ups"). Every site that refuses goes
+/// name. Every site that refuses goes
 /// through [`rotation_blocked_for`], so that fix is a one-line change here and
 /// nowhere else — keep it that way rather than re-deriving `cfg!(macos) &&
 /// has_live_session` at a call site.
@@ -1011,7 +1011,7 @@ pub(crate) fn rotation_lock_path(name: &str) -> Result<PathBuf> {
 /// A refresh token is single-use: once `oauth::refresh_result` spends it the server
 /// kills it, and a second refresh of the same token returns `invalid_grant`,
 /// costing the losing caller its token (not the account — the pair minted by
-/// the first spend survives, measured; see `docs/domain-knowledge.md`).
+/// the first spend survives, measured).
 /// The global state flock (`with_state_lock`) cannot guard this because
 /// it must be released across the network round trip; the per-PID session
 /// flocks only track liveness, not "a rotation is in flight". This lock is
@@ -2034,8 +2034,7 @@ impl ProfileRuntime {
             // holds a marker here, so its tree is never the one wiped.
             //
             // The converse does NOT hold, and two concurrent starts on one
-            // Windows host can land on different modes (what decides it is in
-            // `docs/domain-knowledge.md`). A live REAL
+            // Windows host can land on different modes. A live REAL
             // session's compat marker sits in this same shared dir, so it makes
             // `active` nonzero for a Fake acquire and suppresses the wipe of a
             // bare `runtime/` that session does not use. A stale pre-upgrade tree
@@ -3521,15 +3520,15 @@ fn merge_path(
     // comparison once the other side has been written even once and the mirror
     // copies STALE bytes back over an edit the operator just made. It also
     // disagrees with Claude Code, whose re-read gate stats THROUGH a link at the
-    // target ("an mtime-preserving swap is invisible",
-    // `docs/domain-knowledge.md`). The write: `copy_file` publishes by rename,
+    // target ("an mtime-preserving swap is invisible"). The write: `copy_file`
+    // publishes by rename,
     // which replaces the link itself with a regular file and strands the
     // operator's real file where nothing reads it.
     //
     // Runtime (`b`) is CLAUTH's tree, built by copy, and deliberately does not
     // follow. A link there is not the operator's intent, and following one would
-    // aim a mirror write at an arbitrary absolute path outside BOTH trees, past
-    // everything `docs/security.md`'s 0600/0700 invariant reaches; renaming a
+    // aim a mirror write at an arbitrary absolute path outside BOTH trees;
+    // renaming a
     // regular file over it instead restores the copy-of-canonical shape the tree
     // is meant to have. The DIRECTORY branch above still follows both sides,
     // because there the alternative is `copy_file` on a directory, which is a

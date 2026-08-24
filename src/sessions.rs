@@ -5,7 +5,7 @@
 //! store. The cost ceiling is deliberate: a session's first and last user
 //! message come from a bounded HEAD read and a seek-from-end TAIL read of each
 //! JSONL, never a full-transcript parse — the token subsystem already shows a
-//! full parse is too heavy to run per index build (see `docs/sessions-design.md`).
+//! full parse is too heavy to run per index build.
 //!
 //! This is the A1 foundation: the index core plus preview redaction. Later
 //! passes fill the remaining [`SessionInfo`] fields — A2 the per-session
@@ -93,10 +93,7 @@ pub(crate) struct SessionInfo {
     /// Last user message, redacted preview (`None` when the tail held none).
     pub(crate) last_message: Option<String>,
     /// Which store the transcript came from.
-    #[allow(
-        dead_code,
-        reason = "written at index time; read by the Sessions tab in docs/sessions-design.md §2"
-    )]
+    #[allow(dead_code, reason = "written at index time; read by the Sessions tab")]
     pub(crate) source: SessionSource,
     /// Per-session token total — A2 fills this; `None` = absent from stats.
     pub(crate) tokens: Option<u64>,
@@ -610,7 +607,7 @@ pub(crate) fn find_session(session_id: &str) -> Option<SessionRef> {
 /// against a UUID or a session title: handed a nested transcript's `agent-<hex>`
 /// stem it answers no-match, in `--print` as an error and interactively by
 /// dropping the operator into the session picker with nothing selected
-/// (observed on CC 2.1.221; see `docs/domain-knowledge.md`). So a store whose
+/// (observed on CC 2.1.221). So a store whose
 /// newest file is a subagent transcript resolves `latest` to the newest session
 /// under it, and the listing keeps naming that transcript first.
 pub(crate) fn newest_session() -> Option<SessionRef> {

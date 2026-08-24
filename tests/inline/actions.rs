@@ -1402,7 +1402,7 @@ fn overwriting_the_active_profile_replaces_a_regular_live_file() {
 ///
 /// Deliberately silent on `mcpOAuth`: the carry no-ops when the snapshot stored
 /// no file to carry into, so those logins go with the slot. That is a live
-/// defect (`docs/todo.md`), and a test asserting it here would pin it.
+/// defect, and a test asserting it here would pin it.
 #[test]
 fn overwriting_the_active_profile_with_no_credentials_clears_a_regular_live_file() {
     let _home = HomeSandbox::new();

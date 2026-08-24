@@ -503,8 +503,8 @@ fn run_delegate_does_not_refuse_an_oauth_profile() {
     );
 }
 
-/// The console session authenticates the QUOTA gateway only
-/// (`docs/providers.md`): inference on a keyless Alibaba profile needs the api
+/// The console session authenticates the QUOTA gateway only: inference on a
+/// keyless Alibaba profile needs the api
 /// key like every other provider. The guard refuses it rather than spending a
 /// window on a run that cannot authenticate.
 #[test]
@@ -6588,7 +6588,7 @@ fn the_monitor_entry_names_the_listing_and_the_interrupted_delegate() {
 /// `cancel: true` call at `CANCEL_GRACE_SECS`, and no reply, refusal or doc says
 /// so now. The owner's replacement is a reply-side line naming the outcome per
 /// job (`killed {id} after {n}s` / `failed to kill {id} after {n}s`), which is
-/// the half a caller can act on; it is filed in `docs/todo.md` and NOT built
+/// the half a caller can act on; NOT built
 /// yet. Re-pin against the REPLY when it lands, never back onto `wait_secs`.
 ///
 /// `switch_profile`'s `case-insensitive` pin went the same day for the same

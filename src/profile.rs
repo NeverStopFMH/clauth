@@ -943,7 +943,7 @@ impl ConsoleSite {
 /// (two tokens minted ~4h apart carry the same create/expire stamps). There is
 /// no refresh path, so its death is an ordinary state rather than an error, and
 /// a re-login is not guaranteed to buy much — see
-/// [`crate::usage::FetchStatus::AuthExpired`] and `docs/domain-knowledge.md`.
+/// [`crate::usage::FetchStatus::AuthExpired`].
 #[derive(Clone, PartialEq, Eq)]
 pub(crate) struct ConsoleCredential {
     /// Bearer token for the OneConsole gateway. Redacted from [`fmt::Debug`]

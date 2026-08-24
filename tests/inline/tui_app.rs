@@ -322,8 +322,8 @@ fn runtime_check_summarizes_profiles() {
 
 /// A session that swapped A→B holds BOTH accounts' liveness markers: B's
 /// because that is what it authenticates as, A's because the chain the child
-/// still holds in memory must not rotate underneath it
-/// (`docs/plan/multi-session-fallback.md` §14). Summing per-profile marker
+/// still holds in memory must not rotate underneath it. Summing per-profile
+/// marker
 /// counts therefore reports one child as two sessions and names an account
 /// nothing authenticates as — A is the wrong answer, not a changed one. Only the
 /// registry can tell the two apart.
@@ -5907,7 +5907,7 @@ fn parse_weekly_pct_pins_the_band_edges() {
     assert_eq!(parse_weekly_pct(""), None, "empty rejected");
 }
 
-// ── apply_usage Fresh-gate (docs/todo.md #1) ─────────────────────────────────
+// ── apply_usage Fresh-gate ─────────────────────────────────
 //
 // `App::apply_usage` is driven every tick over the shared usage stores. The
 // bell must ring ONLY when the per-profile status is `FetchStatus::Fresh` — a

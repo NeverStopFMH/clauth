@@ -81,7 +81,7 @@ pub(crate) fn state_lock_timeout() -> Duration {
 ///
 /// It bounds ONE hold, not one tick: the daemon drains `pending_switch` and
 /// `pending_switch_off` under two SEPARATE acquisitions, so a tick doing both can
-/// still spend 2 × this against `WATCHDOG_DEADLINE` (open in `docs/todo.md`).
+/// still spend 2 × this against `WATCHDOG_DEADLINE`.
 /// Arming a second budget for a wider scope needs an arm-if-not-armed rule that
 /// [`StateLock::acquire_with_timeout`] does not have today, since it is the only
 /// armer.

@@ -3546,8 +3546,8 @@ fn proactive_lead_scales_with_the_poll_interval_with_a_floor() {
 }
 
 /// The whole point of the floor: Claude Code refreshes its own OAuth token
-/// once it is within 5 MINUTES of expiry (`docs/domain-knowledge.md`,
-/// measured against CC's shipped bundle). At the SHIPPED 90 s cadence the
+/// once it is within 5 MINUTES of expiry (measured against CC's shipped
+/// bundle). At the SHIPPED 90 s cadence the
 /// `3 × interval` term is only 4.5 min, which loses that race every time —
 /// the floor is what carries it. Reds if anyone drops the floor back under
 /// `300_000` or lowers it below the shipped interval's own term.
@@ -4992,8 +4992,8 @@ fn scan_recovery_never_relinks_to_an_auth_broken_member() {
 /// `spawn_refresher`'s kick-block seed must run on the CALLING thread, not
 /// inside the spawned tick worker: nothing joins that worker, so a home-
 /// derived path resolved on it could outlive a test's `HOME_OVERRIDE` and read
-/// the operator's real home — live the moment the seed grows a write leg
-/// (docs/architecture.md's 2026-06-06 convention). Entering through
+/// the operator's real home — live the moment the seed grows a write leg.
+/// Entering through
 /// `spawn_refresher` itself (never `sync_kick_blocks_from_cache` directly) is
 /// the only way to pin WHERE the seed runs; asserting immediately after return,
 /// with no sleep or yield, is what makes the race decide against a broken

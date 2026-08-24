@@ -53,8 +53,7 @@
 //! own integration to report METADATA instead. `pane report-metadata` was
 //! measured applying on an anchored pane the same day, and it carries a
 //! `--ttl-ms` that would also retire the mid-delegate-death ceiling above.
-//! Moving onto it is tracked in `docs/todo.md`; until then the icon never moves
-//! on a pane an operator actually works in.
+//! Until then the icon never moves on a pane an operator actually works in.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};

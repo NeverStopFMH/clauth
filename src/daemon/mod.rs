@@ -96,7 +96,7 @@ const FETCH_LOCK_FILE: &str = "usage-fetch.lock";
 /// longer per-call: `lock::SUBPROCESS_BUDGET` caps everything ONE state-lock
 /// hold spends in `security` at 20s in aggregate. If it ever false-aborts,
 /// shrink THAT (the real fix), do NOT loosen this deadline — the lease's
-/// wedged-daemon recovery depends on it. Known residual, open in `docs/todo.md`:
+/// wedged-daemon recovery depends on it. Known residual:
 /// the budget is per HOLD, and `tick.rs` drains `pending_switch` then
 /// `pending_switch_off` under two separate holds, so one tick doing both can
 /// still spend 2 × 20s here.
@@ -105,7 +105,7 @@ const FETCH_LOCK_FILE: &str = "usage-fetch.lock";
 /// main loop. A wedged SCHEDULER thread (which is what actually holds the lease)
 /// keeps the main loop ticking and the feed fresh, so it trips nothing and the
 /// lease is never freed — pre-existing (the retired probe keyed on the same
-/// main-loop freshness), tracked in `docs/todo.md`. Do not read this deadline as
+/// main-loop freshness). Do not read this deadline as
 /// covering the fetch path itself.
 const WATCHDOG_DEADLINE: Duration = Duration::from_secs(30);
 /// How often the watchdog re-checks the tick heartbeat.

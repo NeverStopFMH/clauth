@@ -7,7 +7,7 @@
 //! `switch mode` = burn-aware, the burn-aware `burn floor`/`burn horizon`
 //! tunables it gates (issue #8 follow-up b), then the `quota spent` halt), then
 //! extra usage (`allow extra usage` opt-in + its own `extra usage spent` halt
-//! default — real money, see `docs/fallback.md`).
+//! default — real money).
 //! ↑↓ walks the rows; space cycles a row's value in place; ⏎ opens the
 //! refresh-interval and weekly-threshold custom-value editors and otherwise
 //! mirrors space. No left selector, no popups — settings are global.

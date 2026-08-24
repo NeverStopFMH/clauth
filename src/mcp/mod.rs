@@ -697,7 +697,8 @@ impl ClauthServer {
     #[tool(
         description = "List of clauth accounts with their cached usage headrooms. A window's \
 percentage is how much of it is already used. Call it before picking a `delegate` target. \
-`delegate` refuses `disabled`, `login expired` or `no api key` accounts."
+`delegate` refuses `disabled`, `login expired` or `no api key` accounts. `subscription \
+canceled` does not mean a refusal."
     )]
     async fn profiles(
         &self,

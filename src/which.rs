@@ -327,8 +327,11 @@ fn emit_json(config: &AppConfig, resolved: Option<(String, Source)>) {
 /// claims a tier or that the profile carries a RECOGNISED third-party provider,
 /// and an unrecognised endpoint (a local proxy, a self-hosted router) reports an
 /// Anthropic tier off its stored pair while routing elsewhere entirely. `oauth`
-/// is the field that answers routing — it is exactly `base_url.is_none()`, so
-/// `oauth: false` means requests leave Anthropic whatever `tier` says.
+/// answers the MANAGED half of routing: it is exactly `base_url.is_none()`, the
+/// managed field alone. An operator-authored `[env] ANTHROPIC_BASE_URL` routes
+/// the account even when `base_url` is empty, so `oauth: true` does not
+/// guarantee requests reach Anthropic. A caller asking where requests go asks
+/// `crate::profile::stored_endpoint`, which reads both sources.
 ///
 /// `tier` goes through `profile_json::tier_label`, the same helper `status.json`
 /// and the MCP tools call, so one account cannot read a different tier depending
@@ -339,9 +342,10 @@ fn emit_json(config: &AppConfig, resolved: Option<(String, Source)>) {
 /// carried by no refresh response — and report a canceled account's
 /// pre-cancellation plan forever.
 ///
-/// `base_url` carries the endpoint the profile routes to, spelled as
-/// `status.json` publishes it, so a reader gets the destination without a second
-/// call.
+/// `base_url` carries the managed endpoint half, spelled as
+/// `status.json` publishes it, so a reader gets the managed field without a
+/// second call. It reads neither the profile's `[env]` block nor anything
+/// else; the routing answer is `crate::profile::stored_endpoint`.
 fn json_view(config: &AppConfig, resolved: Option<&(String, Source)>) -> serde_json::Value {
     let profile = resolved.and_then(|(name, _)| config.find(name));
     serde_json::json!({

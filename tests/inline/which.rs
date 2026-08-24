@@ -851,3 +851,24 @@ fn resolve_global_ignores_claude_config_dir_in_the_readers_env() {
         "the global credential link's owner does not depend on who is asking"
     );
 }
+
+/// The `--json` doc names which half of the endpoint question its fields
+/// answer. `oauth` and `base_url` read the MANAGED field alone; a doc that
+/// reads as the whole routing rule is what routed readers to the wrong
+/// answer, so this pins the wording in source.
+#[test]
+fn json_view_doc_names_the_managed_half_and_points_at_the_routing_answer() {
+    let src = include_str!("../../src/which.rs");
+    let doc = &src[..src.find("fn json_view(").expect("json_view is defined")];
+    let doc = &doc[doc
+        .rfind("/// The `--json` payload")
+        .expect("the doc opens with its subject")..];
+    assert!(
+        doc.contains("MANAGED half of routing"),
+        "the doc names the half: {doc}"
+    );
+    assert!(
+        doc.contains("crate::profile::stored_endpoint"),
+        "the doc points at the reader that answers both halves: {doc}"
+    );
+}

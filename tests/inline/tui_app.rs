@@ -2654,6 +2654,10 @@ fn a_committed_relogin_anchors_the_profile_it_swapped_onto() {
     work.credentials = Some(login_creds("old"));
     let mut app = App::new(AppConfig {
         state: AppState {
+            // `overwrite_captured_profile` persists `state` mid-apply, and the
+            // record it writes is what the anchor seed's cache-write gate reads
+            // — so the state must name the profile, as a loaded config does.
+            profiles: vec!["work".into()],
             default_divergence: Some(DivergenceChoice::Overwrite),
             ..AppState::default()
         },
@@ -2661,6 +2665,7 @@ fn a_committed_relogin_anchors_the_profile_it_swapped_onto() {
     });
     // A reauth that swapped a DIFFERENT account onto the name: the stale anchor
     // must be replaced, or identity would keep proving the old account.
+    crate::testutil::register_names(&["work"]);
     crate::usage::seed_login_anchor(
         "work",
         Some(&crate::profile::AccountId::from(
@@ -2706,10 +2711,17 @@ fn a_gated_relogin_anchors_only_once_the_user_confirms() {
     let mut work = Profile::new("work".to_string(), None, None);
     work.credentials = Some(login_creds("old"));
     let mut app = App::new(AppConfig {
-        state: AppState::default(), // unset divergence default → ask first
+        state: AppState {
+            // Same reason as the committed-relogin sibling: the confirmed
+            // commit persists `state` mid-apply, and the record it writes is
+            // what the anchor seed's cache-write gate reads.
+            profiles: vec!["work".into()],
+            ..AppState::default() // unset divergence default → ask first
+        },
         profiles: vec![work],
     });
     // A reauth swapping a DIFFERENT account onto the name.
+    crate::testutil::register_names(&["work"]);
     crate::usage::seed_login_anchor(
         "work",
         Some(&crate::profile::AccountId::from(

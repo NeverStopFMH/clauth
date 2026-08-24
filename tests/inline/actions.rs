@@ -977,6 +977,9 @@ fn overwrite_captured_profile_does_not_auto_activate_a_disabled_profile() {
 /// Save `name` as an ANCHORED profile — the anchor is what makes the durable half
 /// of its clock count — and arm the clock exactly as a live fetch would.
 fn armed_ttl_profile(name: &str, t0: u64) -> Profile {
+    // The cache writes below are gated on the on-disk record, which
+    // `save_profile` does not touch; the arm is a live fetch's arm.
+    crate::testutil::register_names(&[name]);
     let profile = Profile::new(name.to_string(), None, None);
     save_profile(&profile).expect("save profile");
     crate::profile_cache::write_profile_cache(
@@ -1090,6 +1093,8 @@ fn capture_into_profile_anchors_the_account_it_committed() {
 #[test]
 fn a_snapshot_with_no_proven_identity_leaves_the_anchor_alone() {
     let _home = HomeSandbox::new();
+    // The seed below is a cache write, gated on the on-disk record.
+    crate::testutil::register_names(&["unproven"]);
     let target = Profile::new("unproven".to_string(), None, None);
     save_profile(&target).expect("save target");
     let mut config = inactive_config(target);
@@ -1685,6 +1690,144 @@ fn rename_refuses_while_a_rotation_holds_the_lock() {
     assert!(
         config.find("ren-new").is_some(),
         "a released lock must let the same rename complete"
+    );
+}
+
+/// A profile held by a live `clauth start` session must not be renamed — the
+/// rename moves the whole profile directory, which holds the session's runtime
+/// tree, markers and env paths, and nothing rekeys the live-session registry
+/// rows. Same predicate and copy as the disable sibling.
+#[test]
+fn rename_refuses_a_live_session() {
+    let home = HomeSandbox::new();
+
+    let mut config = AppConfig {
+        state: AppState::default(),
+        profiles: Vec::new(),
+    };
+    create_blank_profile(&mut config, "busy".to_string(), None, None, None)
+        .expect("create profile");
+
+    // Simulate a live session: a locked pid file in the profile's sessions dir
+    // reads as alive via `has_live_session` (the probe's `try_lock` on a
+    // separate fd fails while this fd holds the flock).
+    let sessions = home
+        .home()
+        .join(".clauth")
+        .join("profiles")
+        .join("busy")
+        .join("sessions");
+    std::fs::create_dir_all(&sessions).expect("mkdir sessions");
+    let pid = crate::runtime::open_pid_file(&sessions.join("99999")).expect("open pid");
+    pid.lock().expect("lock pid");
+
+    let err = rename_profile(&mut config, "busy", "calm", &rotation_guard("busy"))
+        .expect_err("a live session must refuse the rename");
+    assert_eq!(err.to_string(), "'busy' has a live session, close it first");
+    assert!(
+        config.find("busy").is_some() && config.find("calm").is_none(),
+        "the refused rename must leave the record under its old name"
+    );
+    assert!(
+        profile_dir("busy").expect("old dir").exists(),
+        "the refused rename must leave the directory where it was"
+    );
+}
+
+/// The name check reads the RECORD; a directory can outlive it — a per-profile
+/// cache a stale-config fetch leg wrote after the account was deleted re-creates
+/// the dir. rename(2) onto that existing non-empty dir fails ENOTEMPTY, which
+/// reads as an internal failure; refuse with the actionable shape instead.
+#[test]
+fn rename_refuses_a_leftover_target_directory() {
+    let _home = HomeSandbox::new();
+
+    let mut config = AppConfig {
+        state: AppState::default(),
+        profiles: Vec::new(),
+    };
+    create_blank_profile(&mut config, "src".to_string(), None, None, None).expect("create profile");
+
+    // A leftover: the target's directory exists with a cache file in it, but no
+    // record names the target.
+    let leftover = profile_dir("taken").expect("target dir");
+    std::fs::create_dir_all(&leftover).expect("mkdir leftover");
+    std::fs::write(
+        leftover.join(crate::profile_cache::THIRD_PARTY_CACHE_FILE),
+        "{}",
+    )
+    .expect("write cache");
+
+    let err = rename_profile(&mut config, "src", "taken", &rotation_guard("src"))
+        .expect_err("a leftover target directory must refuse the rename");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("'taken' already has a directory at")
+            && msg.contains("with no account behind it"),
+        "the refusal must name the leftover and the way out, got: {msg}"
+    );
+    assert!(
+        config.find("src").is_some() && config.find("taken").is_none(),
+        "the refused rename must leave the record under its old name"
+    );
+}
+
+/// The other half a leftover-shaped directory can be: the dir under `new` was
+/// moved there BY a rename whose record write never landed (a kill or a failing
+/// save between the move and `save_app_state`). It holds the profile's own
+/// content, so the retry must complete the record rename — the pre-gate
+/// self-heal — rather than refuse and send the operator to delete it.
+#[test]
+fn rename_retry_completes_the_record_when_the_old_dir_is_already_moved() {
+    let _home = HomeSandbox::new();
+
+    let mut config = AppConfig {
+        state: AppState::default(),
+        profiles: Vec::new(),
+    };
+    create_blank_profile(&mut config, "mid-src".to_string(), None, None, None)
+        .expect("create profile");
+
+    // The crash window: the dir move happened, the record rename did not.
+    std::fs::rename(
+        profile_dir("mid-src").expect("old dir"),
+        profile_dir("mid-new").expect("new dir"),
+    )
+    .expect("simulate the stranded move");
+
+    rename_profile(
+        &mut config,
+        "mid-src",
+        "mid-new",
+        &rotation_guard("mid-src"),
+    )
+    .expect("a stranded dir holding the profile's own content must not refuse");
+    assert!(
+        config.find("mid-src").is_none() && config.find("mid-new").is_some(),
+        "the retry completes the record rename instead of refusing"
+    );
+    assert!(
+        profile_dir("mid-new").expect("new dir").exists(),
+        "the moved directory stays put under the name the record now carries"
+    );
+}
+
+/// The fetch legs hold a stale in-memory config for up to a tick, so a cache
+/// write for a name the record no longer carries used to re-create the deleted
+/// profile's directory. The writer now skips those names.
+#[test]
+fn a_cache_write_does_not_resurrect_a_deleted_profiles_directory() {
+    let _home = HomeSandbox::new();
+
+    crate::profile_cache::write_profile_cache(
+        "ghost",
+        crate::profile_cache::THIRD_PARTY_CACHE_FILE,
+        &serde_json::json!({"is_available": true}),
+    );
+
+    assert!(
+        !profile_dir("ghost").expect("ghost dir").exists(),
+        "a cache write must not create a directory for a name no record carries"
     );
 }
 
@@ -2562,6 +2705,9 @@ mod identify_live_login_owner {
     }
 
     fn anchor(name: &str, uuid: &str) {
+        // The cache write is gated on the on-disk record; pinning an anchor is
+        // this helper's whole job, and a skipped write would read as "no anchor".
+        crate::testutil::register_names(&[name]);
         crate::profile_cache::write_profile_cache(
             name,
             crate::profile_cache::ACCOUNT_ID_CACHE_FILE,

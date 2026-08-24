@@ -339,6 +339,7 @@ fn build_status_third_party_freshness_from_its_own_cache() {
     };
 
     // Warm third-party cache, no OAuth cache: the profile is fetched.
+    crate::testutil::register_names(&["zai"]);
     crate::profile_cache::write_profile_cache(
         "zai",
         crate::profile_cache::THIRD_PARTY_CACHE_FILE,
@@ -397,6 +398,7 @@ fn build_status_nulls_next_refresh_for_a_spent_skipped_account() {
         profiles: vec![oauth_profile("maxed")],
     };
     // Warm the OAuth usage cache with a live 100%-capped 5h window.
+    crate::testutil::register_names(&["maxed"]);
     crate::profile_cache::write_profile_cache(
         "maxed",
         crate::profile_cache::USAGE_CACHE_FILE,
@@ -629,6 +631,7 @@ fn build_status_reports_a_recorded_dead_credential_without_a_daemon() {
     };
 
     // A cache written just now: the mtime derivation calls this "Fresh".
+    crate::testutil::register_names(&["qwen"]);
     crate::profile_cache::write_profile_cache(
         "qwen",
         crate::profile_cache::THIRD_PARTY_CACHE_FILE,

@@ -2387,6 +2387,7 @@ fn a_folded_live_usage_clause_dates_the_figure_it_carries() {
     let cache_path =
         crate::profile_cache::profile_cache_path("work", USAGE_CACHE_FILE).expect("cache path");
 
+    crate::testutil::register_names(&["work"]);
     crate::profile_cache::write_profile_cache("work", USAGE_CACHE_FILE, &usage);
     crate::testutil::set_mtime(
         &cache_path,
@@ -4356,6 +4357,7 @@ fn roster_rank_reports_free_percent_from_the_best_known_window() {
     use crate::usage::{UsageInfo, UsageWindow};
 
     let _home = HomeSandbox::new();
+    crate::testutil::register_names(&["both", "weekly", "bars", "balance"]);
     let window = |utilization: f64| UsageWindow {
         utilization,
         resets_at: None,
@@ -4488,6 +4490,7 @@ fn a_two_wallet_profile_ranks_on_the_first_currency_listed() {
     use crate::providers::{DEEPSEEK_BALANCE_ROW_LABEL, StatRow, StatRowKind, ThirdPartyStats};
 
     let _home = HomeSandbox::new();
+    crate::testutil::register_names(&["both-wallets"]);
     let row = |label: &str, value: &str| StatRow {
         label: label.to_string(),
         value: value.to_string(),
@@ -5969,6 +5972,7 @@ fn the_blocking_delegate_folds_its_digest_on_the_abandoned_bit() {
 #[test]
 fn throughput_note_drops_the_prefix_and_the_default_placeholder() {
     let _home = HomeSandbox::new();
+    crate::testutil::register_names(&["defaulted", "blank", "spacey", "padded", "named"]);
     crate::throughput::record_rate_limit("defaulted", Some("default"), Some(10), 1_000);
     assert_eq!(
         throughput_note("defaulted", 1_000),

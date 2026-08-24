@@ -653,9 +653,46 @@ pub(crate) fn rename_profile(
         "rename target '{new}' already names an account"
     );
     with_state_lock(|| {
+        // Same gate delete and disable carry, same predicate and copy: a live
+        // session's runtime tree, markers and env paths all live under this
+        // directory, so moving it out from under the child breaks the session
+        // (the registry rows keep naming the old profile; nothing rekeys them).
+        if crate::runtime::has_live_session(old) {
+            bail!("'{old}' has a live session, close it first");
+        }
         let old_dir = profile_dir(old)?;
+        let new_dir = profile_dir(new)?;
+        // The name validation above checked the RECORD; a directory can outlive
+        // its record — a per-profile cache a stale-config fetch leg wrote after
+        // the account was deleted re-creates the dir (the writer is gated now,
+        // but leftovers predate it). rename(2) onto an existing non-empty dir
+        // fails ENOTEMPTY, which reads as an internal failure; refuse here with
+        // the actionable shape instead. Gated on `old_dir` existing: that is
+        // the only branch that renames, so it is the only one ENOTEMPTY can
+        // fire in — and with `old` absent, `new` present is the OTHER half of a
+        // rename this process (or a dead one) moved the dir for but never
+        // recorded: a SIGKILL or a failing save between the move and
+        // `save_app_state` below. That directory holds this profile's own
+        // content, so its retry must complete the record rename (the pre-gate
+        // recovery), never send the operator to delete it. A case-only rename
+        // (`d3` -> `D3`) resolves to ONE directory on a case-insensitive
+        // filesystem (the macOS default), so same-inode pairs are exempt.
+        if old_dir.exists() && new_dir.exists() {
+            let same_dir = old_dir
+                .canonicalize()
+                .ok()
+                .zip(new_dir.canonicalize().ok())
+                .is_some_and(|(a, b)| a == b);
+            if !same_dir {
+                bail!(
+                    "'{new}' already has a directory at {} with no account behind it, \
+                     delete the directory or pick another name",
+                    new_dir.display()
+                );
+            }
+        }
         if old_dir.exists() {
-            std::fs::rename(&old_dir, profile_dir(new)?)
+            std::fs::rename(&old_dir, &new_dir)
                 .with_context(|| format!("failed to rename profile directory to '{new}'"))?;
         }
 

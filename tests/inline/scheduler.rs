@@ -117,6 +117,7 @@ fn collect_oauth_seed_names_includes_disabled_and_bootstrap_seeds_its_cache() {
         }),
         ..UsageInfo::default()
     };
+    crate::testutil::register_names(&["off"]);
     write_profile_cache("off", USAGE_CACHE_FILE, &info);
 
     let store: super::UsageStore = Arc::new(RankedMutex::new(HashMap::new()));
@@ -982,6 +983,7 @@ fn cached_bail_overlays_a_fresh_plan_onto_store_and_disk() {
         ..Default::default()
     };
     store.lock().unwrap().insert("a".to_string(), prior.clone());
+    crate::testutil::register_names(&["a"]);
     super::write_profile_cache("a", super::USAGE_CACHE_FILE, &prior);
 
     let canceled = PlanInfo {
@@ -1039,6 +1041,7 @@ fn cold_bail_records_a_plan_only_canceled_entry() {
     let streaks: super::PollStreaks = Arc::new(RankedMutex::new(HashMap::new()));
 
     // No prior store entry and no usage_cache.json: `cached()` yields info=None.
+    crate::testutil::register_names(&["cold"]);
     let canceled = PlanInfo {
         tier: PlanTier::Free,
         subscription_status: Some("canceled".to_string()),
@@ -1428,6 +1431,7 @@ fn kick_block_persists_and_clears_by_outcome() {
     use crate::profile_cache::{KICK_BLOCK_CACHE_FILE, load_profile_cache};
 
     let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["kitty"]);
     let blocks: super::KickBlocks = Arc::new(RankedMutex::new(HashMap::new()));
     let now = 2_000_000;
     let rl = KickRateLimit {
@@ -2879,6 +2883,7 @@ fn try_seed_cache_seeds_any_cache_and_resumes_timer() {
     let status: StatusStore = Arc::new(RankedMutex::new(HashMap::new()));
     let last_fetched: LastFetchedAt = Arc::new(RankedMutex::new(HashMap::new()));
 
+    crate::testutil::register_names(&["idle", "stale"]);
     let now_secs = now_epoch_secs();
     let with_reset = |reset_secs: i64| UsageInfo {
         five_hour: Some(UsageWindow {
@@ -3165,6 +3170,7 @@ fn bootstrap_third_party_seeds_any_cache() {
         best_effort: false,
     };
     // Fresh cache (just written) seeds `Fresh`; a 2h-old cache seeds `Cached`.
+    crate::testutil::register_names(&["cached", "stale"]);
     write_profile_cache("cached", THIRD_PARTY_CACHE_FILE, &stats(12.0));
     write_profile_cache("stale", THIRD_PARTY_CACHE_FILE, &stats(20.0));
     let stale_path = profile_subpath("stale", "third_party_cache.json").expect("stale path");
@@ -3617,6 +3623,7 @@ fn standdown_hydrate_seeds_the_store_from_the_daemon_cache() {
         }),
         ..UsageInfo::default()
     };
+    crate::testutil::register_names(&["kitty"]);
     write_profile_cache("kitty", USAGE_CACHE_FILE, &info);
 
     let store: super::UsageStore = Arc::new(RankedMutex::new(HashMap::new()));
@@ -3695,6 +3702,7 @@ fn standdown_hydrate_follows_the_daemon_cache_forward() {
         )
     };
 
+    crate::testutil::register_names(&["kitty"]);
     write_profile_cache("kitty", USAGE_CACHE_FILE, &at(10.0));
     hydrate(&["kitty".to_string()]);
     write_profile_cache("kitty", USAGE_CACHE_FILE, &at(55.0));
@@ -3721,6 +3729,7 @@ fn standdown_tick_drains_forced_and_publishes_countdowns() {
     use std::sync::atomic::{AtomicBool, AtomicU64};
     let _home = crate::testutil::HomeSandbox::new();
 
+    crate::testutil::register_names(&["kitty"]);
     write_profile_cache("kitty", USAGE_CACHE_FILE, &UsageInfo::default());
 
     // The standby seed sources names from config (the display superset), so the
@@ -3884,6 +3893,7 @@ fn tick_stands_down_when_another_instance_holds_the_fetch_lease() {
     let other = crate::daemon::FetchLease::new();
     assert!(other.acquire(), "the first instance wins the lease");
 
+    crate::testutil::register_names(&["kitty"]);
     write_profile_cache("kitty", USAGE_CACHE_FILE, &UsageInfo::default());
     // The standby seed sources names from config (the display superset), so the
     // profile whose cache is hydrated must live there — as it does in production.
@@ -5003,6 +5013,7 @@ fn spawn_refresher_seeds_kick_blocks_before_returning() {
         until: Some(1_700_000_600),
         next_retry: 1_700_000_100,
     };
+    crate::testutil::register_names(&["kitty"]);
     write_profile_cache("kitty", KICK_BLOCK_CACHE_FILE, &cached);
 
     let config: crate::profile::ConfigHandle = Arc::new(RankedMutex::new(AppConfig {
@@ -5174,6 +5185,7 @@ fn a_cached_body_appends_no_sample() {
     let _home = crate::testutil::HomeSandbox::new();
     let (store, status, last_fetched, streaks) = history_stores();
     // A cached outcome loads its body off disk, so seed one to recycle.
+    crate::testutil::register_names(&["alice"]);
     write_profile_cache("alice", USAGE_CACHE_FILE, &history_sample(80.0));
 
     let outcome = FetchOutcome::cached("alice", FetchStatus::RateLimited, None, None);

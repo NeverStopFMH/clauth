@@ -28,6 +28,9 @@ fn oauth(name: &str) -> Profile {
 /// Warm `name`'s OAuth usage cache: a `Max 5x` plan and fixed 5h/7d utilization
 /// so the rounding and the plan label are pinned, not incidental.
 fn warm_usage(name: &str, five_h: f64, seven_d: f64) {
+    // The cache write is gated on the on-disk record; the row this warms is the
+    // test's pin, so the name has to exist in the record for the write to land.
+    crate::testutil::register_names(&[name]);
     write_profile_cache(
         name,
         USAGE_CACHE_FILE,
@@ -110,6 +113,7 @@ fn list_table_reveals_disabled_with_a_trailing_marker_when_included() {
 /// Warm `name`'s cache as a CANCELED account: the org has already dropped to
 /// `claude_free`, which is what makes the tier alone unable to carry the fact.
 fn warm_canceled(name: &str) {
+    crate::testutil::register_names(&[name]);
     write_profile_cache(
         name,
         USAGE_CACHE_FILE,
@@ -278,6 +282,7 @@ fn a_dead_credential_is_named_in_the_state_suffix() {
         profiles: vec![p],
     };
     let fp = crate::usage::profile_credential_fingerprint(&config.profiles[0]).unwrap();
+    crate::testutil::register_names(&["qwen"]);
     crate::profile_cache::write_auth_expired("qwen", fp);
 
     let body = crate::daemon::build_status(&config, 300_000, None, false);
@@ -312,6 +317,7 @@ fn a_profile_that_never_stored_a_session_is_told_it_needs_one() {
         profiles: vec![p],
     };
     let fp = crate::usage::profile_credential_fingerprint(&config.profiles[0]).unwrap();
+    crate::testutil::register_names(&["qwen"]);
     crate::profile_cache::write_auth_expired("qwen", fp);
 
     let body = crate::daemon::build_status(&config, 300_000, None, false);
@@ -344,6 +350,7 @@ fn a_dead_api_key_is_told_the_key_was_rejected() {
         profiles: vec![p],
     };
     let fp = crate::usage::profile_credential_fingerprint(&config.profiles[0]).unwrap();
+    crate::testutil::register_names(&["deepseek"]);
     crate::profile_cache::write_auth_expired("deepseek", fp);
 
     let body = crate::daemon::build_status(&config, 300_000, None, false);

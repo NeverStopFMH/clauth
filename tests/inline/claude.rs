@@ -1948,6 +1948,9 @@ fn carry_keeps_the_store_at_0600() {
 /// Returns the store path. Built through `save_profile` rather than hand-written
 /// so the file this parks out of is the one production writes.
 fn seed_store_with_mcp_logins(name: &str) -> std::path::PathBuf {
+    // The park the removal below writes is a cache write, gated on the on-disk
+    // record — which `save_profile` does not touch.
+    crate::testutil::register_names(&[name]);
     let mut profile = crate::profile::Profile::new(name.to_string(), None, None);
     profile.credentials = Some(creds("stored-access", Some("stored-refresh")));
     crate::profile::save_profile(&profile).expect("save profile");
@@ -2043,6 +2046,8 @@ fn a_carry_with_no_store_to_land_in_parks_instead() {
     .expect("write live");
     let absent = dir.path().join("credentials.json");
 
+    // The park the carry falls back to is a cache write, gated on the record.
+    crate::testutil::register_names(&["apikey"]);
     carry_live_extra_into(&live, &absent, "apikey").expect("carry");
 
     let parked: serde_json::Value =

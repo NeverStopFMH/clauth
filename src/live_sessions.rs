@@ -194,8 +194,9 @@ impl LiveTally {
     /// a global auto-switch repoints the link and Claude Code re-reads it.
     ///
     /// An unreadable marker dir counts as ZERO — the OPPOSITE direction to
-    /// [`crate::runtime::has_live_session`], which gates delete, disable and
-    /// rotation and so must read an unknown as live. This tally only renders, so
+    /// [`crate::runtime::has_live_session`], which gates delete, disable,
+    /// rename and rotation and so must read an unknown as live. This tally
+    /// only renders, so
     /// folding an unknown in as live would put a session on screen that nothing
     /// produced.
     fn add_bare_sessions(&mut self, config: &AppConfig) {

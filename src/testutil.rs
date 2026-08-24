@@ -609,6 +609,19 @@ pub(crate) fn blank_profile(name: &str) -> crate::profile::Profile {
     }
 }
 
+/// Put `names` in the on-disk profile list without creating profile content.
+/// For fixtures that drive legs which re-read the record — the cache-write
+/// gate, the acquire gate — but do not need per-profile files. Idempotent.
+pub(crate) fn register_names(names: &[&str]) {
+    let mut state = crate::profile::load_app_state().expect("load app state");
+    for name in names {
+        if !state.profiles.iter().any(|n| n == name) {
+            state.profiles.push((*name).into());
+        }
+    }
+    crate::profile::save_app_state(&state).expect("save app state");
+}
+
 // ── provider-cache fixtures ──────────────────────────────────────────────────
 //
 // A `third_party_cache.json` in each of the two SHAPES the provider legs really

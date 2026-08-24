@@ -113,6 +113,7 @@ fn disk_cache_roundtrips_stats() {
         endpoint: None,
         best_effort: false,
     };
+    crate::testutil::register_names(&["tp-cache-test"]);
     crate::profile_cache::write_profile_cache(
         "tp-cache-test",
         crate::profile_cache::THIRD_PARTY_CACHE_FILE,

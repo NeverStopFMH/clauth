@@ -544,6 +544,9 @@ fn oauth_profile_claiming(name: &str, refresh: &str, sub: &str) -> Profile {
 /// Persist a `/profile` plan for `name` — the on-disk cache every JSON surface
 /// resolves a tier through. Needs a live [`HomeSandbox`].
 fn cache_plan(name: &str, tier: PlanTier, status: Option<&str>) {
+    // The cache write is gated on the on-disk record; persisting this plan is
+    // the helper's whole job.
+    crate::testutil::register_names(&[name]);
     let usage = UsageInfo {
         plan: Some(PlanInfo {
             tier,

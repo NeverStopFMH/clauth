@@ -9,6 +9,8 @@ use crate::testutil::HomeSandbox;
 #[test]
 fn records_and_reads_back_pace() {
     let _home = HomeSandbox::new();
+    // The store write is a profile cache, gated on the on-disk record.
+    crate::testutil::register_names(&["p"]);
     // 1000 output tokens in 2000ms = 500 tok/s.
     record_success("p", Some("sonnet"), 1000, 2000, 100);
     let summary = summary("p", 100);
@@ -31,6 +33,7 @@ fn zero_tokens_or_duration_records_nothing() {
 #[test]
 fn degraded_when_recent_pace_far_below_best() {
     let _home = HomeSandbox::new();
+    crate::testutil::register_names(&["p"]);
     // Two fast runs set the best, then several slow runs drag the recent average
     // below half of it.
     record_success("p", Some("sonnet"), 1000, 1000, 1); // 1000 tok/s
@@ -49,6 +52,7 @@ fn degraded_when_recent_pace_far_below_best() {
 #[test]
 fn rate_limit_recorded_and_expires() {
     let _home = HomeSandbox::new();
+    crate::testutil::register_names(&["p"]);
     record_rate_limit("p", Some("opus"), Some(30), 1000);
 
     let recent = summary("p", 1000 + 60)
@@ -72,6 +76,7 @@ fn rate_limit_recorded_and_expires() {
 #[test]
 fn unspecified_model_keys_under_default() {
     let _home = HomeSandbox::new();
+    crate::testutil::register_names(&["p"]);
     record_success("p", None, 500, 1000, 5);
     let row = summary("p", 5).into_iter().next().expect("one model");
     assert_eq!(row.model, "default");

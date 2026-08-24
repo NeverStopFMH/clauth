@@ -185,7 +185,21 @@ pub(crate) fn load_profile_cache<T: DeserializeOwned>(name: &str, file: &str) ->
 /// (cache is best-effort): a missing parent is created at 0o700, the file at
 /// 0o600, via a tmp + rename so a torn write reads as no cache rather than a
 /// parse failure.
+///
+/// Skips names the on-disk record no longer carries: the fetch legs hold a
+/// stale in-memory config for up to a tick, and the parent creation above
+/// would re-create a deleted profile's directory. Fail-closed — an unreadable
+/// record skips the write too. The tick-driven callers (usage fetch,
+/// scheduler) retry on the next tick; one-shot writers degrade to their
+/// documented safe answers instead (a lost touch receipt yields the raw
+/// mtime, an unseeded anchor reads as unanchored). Cost: one read + TOML
+/// parse of `profiles.toml` per write — the record is small, and the same
+/// read already backs the oauth adopt gate and the daemon's switch-target
+/// existence check.
 pub(crate) fn write_profile_cache<T: Serialize>(name: &str, file: &str, value: &T) {
+    if !crate::profile::is_configured(name).unwrap_or(false) {
+        return;
+    }
     let Some(path) = profile_cache_path(name, file) else {
         return;
     };

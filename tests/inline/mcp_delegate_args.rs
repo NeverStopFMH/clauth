@@ -1171,6 +1171,7 @@ fn fold_fanout_rows_keeps_a_lost_member_in_its_own_slot() {
 #[test]
 fn fold_fanout_rows_ages_a_rate_limit_off_after_the_recent_window() {
     let _home = HomeSandbox::new();
+    crate::testutil::register_names(&["solo"]);
     crate::throughput::record_rate_limit("solo", Some("claude-opus"), Some(10), 1_000);
     let names = vec!["solo".to_string()];
     let envelope = || Ok(serde_json::json!({ "result": "boom" }));

@@ -29,6 +29,9 @@ fn seed_provider_cache(name: &str, age: Duration) {
 
 /// Write an OAuth usage cache for `name` and backdate it by `age`.
 fn seed_usage_cache(name: &str, usage: &UsageInfo, age: Duration) {
+    // The cache write is gated on the on-disk record; seeding this cache is the
+    // helper's whole job, and the mtime below panics over a skipped write.
+    crate::testutil::register_names(&[name]);
     write_profile_cache(name, USAGE_CACHE_FILE, usage);
     let path = profile_cache_path(name, USAGE_CACHE_FILE).unwrap();
     set_mtime(&path, SystemTime::now() - age);
@@ -162,6 +165,7 @@ fn a_figure_older_than_any_refresh_cadence_reads_stale() {
 #[test]
 fn a_future_cache_stamp_carries_no_age_at_all() {
     let _home = HomeSandbox::new();
+    crate::testutil::register_names(&["kerry"]);
     write_profile_cache("kerry", USAGE_CACHE_FILE, &five_hour_at(12.0));
     let path = profile_cache_path("kerry", USAGE_CACHE_FILE).unwrap();
     set_mtime(&path, SystemTime::now() + Duration::from_secs(3600));
@@ -187,6 +191,7 @@ fn a_future_cache_stamp_carries_no_age_at_all() {
 #[test]
 fn tier_label_reports_the_tier_of_a_canceled_account() {
     let _home = HomeSandbox::new();
+    crate::testutil::register_names(&["kerry"]);
     let profile = blank_profile("kerry");
     let usage = UsageInfo {
         plan: Some(PlanInfo {
@@ -208,6 +213,7 @@ fn tier_label_reports_the_tier_of_a_canceled_account() {
 #[test]
 fn tier_label_never_substitutes_canceled_for_a_paid_tier() {
     let _home = HomeSandbox::new();
+    crate::testutil::register_names(&["kerry"]);
     let profile = blank_profile("kerry");
     let usage = UsageInfo {
         plan: Some(PlanInfo {
@@ -226,6 +232,7 @@ fn tier_label_never_substitutes_canceled_for_a_paid_tier() {
 #[test]
 fn tier_label_reports_the_real_tier_when_not_canceled() {
     let _home = HomeSandbox::new();
+    crate::testutil::register_names(&["kerry"]);
     let profile = blank_profile("kerry");
     let usage = UsageInfo {
         plan: Some(PlanInfo {

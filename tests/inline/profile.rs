@@ -1012,6 +1012,8 @@ fn pending_sidecar_is_adopted_when_no_commit_exists_at_all() {
 fn a_bare_store_stamp_does_not_discard_a_sidecar_staged_before_it() {
     let _home = HomeSandbox::new();
     let name = "pending-stamped-store";
+    // The receipt below is a cache write, gated on the on-disk record.
+    crate::testutil::register_names(&[name]);
     let committed = pair("old-access", "old-refresh");
     seed_committed(name, &committed);
 
@@ -1083,6 +1085,7 @@ fn a_commit_landing_after_a_stamp_still_discards_the_sidecar() {
 fn a_touch_receipt_only_resolves_the_store_it_names() {
     let _home = HomeSandbox::new();
     let name = "receipt-scope";
+    crate::testutil::register_names(&[name]);
     seed_committed(name, &pair("access", "refresh"));
     let cred_path = profile_subpath(name, "credentials.json").expect("cred path");
     let sidecar = profile_subpath(name, "session-token.json").expect("sidecar path");
@@ -1230,6 +1233,9 @@ fn credential_and_cache_files_have_restricted_permissions() {
     // The swap executor's touch receipt: it holds no secret, but it is a writer
     // under `~/.clauth` and the invariant is the whole tree, so a future writer
     // swapped off the per-profile cache path has to fail here.
+    // Registered AFTER the empty `save_app_state` above, which rewrote the
+    // record the cache-write gate reads.
+    crate::testutil::register_names(&[name]);
     crate::profile_cache::write_touch_receipt(name, &cred_path, std::time::SystemTime::now(), None);
     let receipt_mode = std::fs::metadata(
         profile_subpath(name, crate::profile_cache::TOUCH_RECEIPT_FILE).expect("receipt path"),
@@ -1312,6 +1318,9 @@ fn usage_cache_write_creates_restricted_file_and_dir() {
 
     let _home = HomeSandbox::new();
     let name = "perm-test-usage-cache";
+    // The record carries the name, the dir does not — the write under test is
+    // the thing that has to create it.
+    crate::testutil::register_names(&[name]);
 
     // Fresh profile: its dir must not exist before the cache write.
     let dir = profile_dir(name).expect("profile_dir");
@@ -1740,6 +1749,8 @@ fn reload_fingerprint_catches_a_sidecar_write_no_expiry_can_see() {
 #[test]
 fn reload_fingerprint_ignores_a_bare_session_token_stamp() {
     let _home = crate::testutil::HomeSandbox::new();
+    // The receipt below is a cache write, gated on the on-disk record.
+    crate::testutil::register_names(&["p"]);
     save_profile(&crate::testutil::blank_profile("p")).expect("save_profile");
     crate::claude::write_session_token(
         "p",
@@ -2077,6 +2088,7 @@ fn the_auth_expired_record_is_owner_only() {
     use std::os::unix::fs::PermissionsExt as _;
 
     let _home = HomeSandbox::new();
+    crate::testutil::register_names(&["perm-auth-record"]);
     crate::profile_cache::write_auth_expired("perm-auth-record", 0x0123_4567_89ab_cdef);
     assert!(crate::profile_cache::auth_expired_matches(
         "perm-auth-record",

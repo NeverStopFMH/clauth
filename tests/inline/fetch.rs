@@ -124,6 +124,7 @@ fn spent_resume_in_secs_takes_the_latest_maxed_reset() {
 fn identity_anchor_backfills_only_when_missing() {
     use crate::profile_cache::{ACCOUNT_ID_CACHE_FILE, load_profile_cache};
     let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["acme"]);
 
     seed_identity_anchor("acme", &raw_profile(Some("uuid-live")));
     assert_eq!(
@@ -263,6 +264,7 @@ fn a_login_bodys_blank_uuid_reads_as_no_identity() {
 fn a_login_anchor_overwrites_the_previous_account() {
     use crate::profile_cache::{ACCOUNT_ID_CACHE_FILE, load_profile_cache};
     let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["acme"]);
 
     seed_login_anchor(
         "acme",
@@ -286,6 +288,7 @@ fn a_login_anchor_overwrites_the_previous_account() {
 fn a_login_anchor_write_ignores_an_absent_or_blank_uuid() {
     use crate::profile_cache::{ACCOUNT_ID_CACHE_FILE, load_profile_cache};
     let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["acme"]);
 
     // A failed probe (`None`) or shape drift must never mint an anchor…
     seed_login_anchor("acme", None);
@@ -886,6 +889,9 @@ fn take_profile_fetch_honors_ttl_force_and_expiry() {
 
 /// Give `name` an identity anchor, the gate that lets its durable stamp count.
 fn anchor(name: &str) {
+    // The cache write is gated on the on-disk record; an unlanded anchor would
+    // turn every durable-stamp test into its "unanchored" sibling.
+    crate::testutil::register_names(&[name]);
     write_profile_cache(name, ACCOUNT_ID_CACHE_FILE, &"uuid-anchored".to_string());
 }
 

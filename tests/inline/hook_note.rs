@@ -743,11 +743,25 @@ fn an_unusable_transcript_path_is_not_stored() {
         let parsed = parse_payload(payload_json).expect("the payload itself is fine");
         assert_eq!(parsed.transcript, None, "must drop {payload_json}");
     }
-    let good =
-        r#"{"hook_event_name":"PostToolUse","session_id":"ok-1","transcript_path":"/a/b.jsonl"}"#;
+    // One "good" fixture per platform: std documents `Path::is_absolute` as
+    // prefix-plus-root on Windows ("c:\windows is absolute, c:temp and \temp
+    // are not"), so `/a/b.jsonl` has no drive/UNC prefix and drops like the two
+    // bad legs there. Both drive the same assertion, so the absolute-positive
+    // pin stays covered where the semantics differ.
+    let (good, expected) = if cfg!(target_os = "windows") {
+        (
+            r#"{"hook_event_name":"PostToolUse","session_id":"ok-1","transcript_path":"C:\\a\\b.jsonl"}"#,
+            PathBuf::from(r"C:\a\b.jsonl"),
+        )
+    } else {
+        (
+            r#"{"hook_event_name":"PostToolUse","session_id":"ok-1","transcript_path":"/a/b.jsonl"}"#,
+            PathBuf::from("/a/b.jsonl"),
+        )
+    };
     assert_eq!(
         parse_payload(good).expect("parses").transcript,
-        Some(PathBuf::from("/a/b.jsonl")),
+        Some(expected),
     );
 }
 

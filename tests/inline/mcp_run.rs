@@ -2260,13 +2260,16 @@ fn monitor_batch_refuses_over_cap_and_empty_list() {
         cancel: None,
     });
     assert_eq!(over.is_error, Some(true), "a list over the cap is refused");
+    // Moved with the fix clause (placement rule 4's corollary): the refusal is the only
+    // place the lesson lives, so the pin holds the whole sentence and a
+    // dropped fix clause reds here instead of passing on the ceiling alone.
     assert_eq!(
         over.content
             .first()
             .and_then(|c| c.as_text())
             .map(|t| t.text.clone())
             .expect("refusal text"),
-        "error: `job_ids` capped at 256 ids; got 257"
+        "error: `job_ids` capped at 256 ids; got 257 — split the ids across calls of 256 or fewer"
     );
 
     // An empty `job_ids` is job mode with no ids, not the state-waiting mode:
@@ -4902,6 +4905,9 @@ fn a_refused_job_ids_list_cancels_nothing() {
         cancel: Some(true),
     });
     assert_eq!(result.is_error, Some(true));
+    // The pin holds the whole sentence, fix clause included, for the same
+    // placement rule 4's corollary reason as the batch cap test: the refusal is the whole
+    // reply here, so nothing else carries the lesson.
     assert_eq!(
         result
             .content
@@ -4909,7 +4915,7 @@ fn a_refused_job_ids_list_cancels_nothing() {
             .and_then(|c| c.as_text())
             .map(|t| t.text.clone())
             .expect("refusal text"),
-        "error: `job_ids` capped at 256 ids; got 257",
+        "error: `job_ids` capped at 256 ids; got 257 — split the ids across calls of 256 or fewer",
         "the refusal is the whole reply: nothing was cancelled to report"
     );
     assert!(

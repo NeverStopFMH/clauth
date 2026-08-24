@@ -2244,10 +2244,15 @@ fn job_ids_refusal(job_ids: &[String]) -> Option<String> {
     // `MAX_RETAINED` files, so a longer list could not resolve more ids, and the
     // bound keeps one response from growing without limit.
     if job_ids.len() > jobs::MAX_RETAINED {
+        // The fix clause names the split the caller can make, and formats the
+        // SAME `MAX_RETAINED` value the ceiling does, never a hardcoded
+        // literal: the two halves of the sentence cannot drift when the
+        // constant moves.
         return Some(format!(
-            "`job_ids` capped at {} ids; got {}",
+            "`job_ids` capped at {} ids; got {} — split the ids across calls of {} or fewer",
             jobs::MAX_RETAINED,
-            job_ids.len()
+            job_ids.len(),
+            jobs::MAX_RETAINED,
         ));
     }
     // An empty list passes every per-id check vacuously and would return a
@@ -3835,8 +3840,11 @@ fn resolve_fanout(config: &AppConfig, raw: &[String]) -> std::result::Result<Vec
         return Err("`profiles` is empty: name at least one profile".to_string());
     }
     if raw.len() > MAX_FANOUT {
+        // The fix clause names the split the caller can make, and formats the
+        // SAME `MAX_FANOUT` the ceiling does, never a hardcoded literal: the
+        // two halves of the sentence cannot drift when the constant moves.
         return Err(format!(
-            "`profiles` fan-out capped at {MAX_FANOUT} names; got {}",
+            "`profiles` fan-out capped at {MAX_FANOUT} names; got {} — split the names across calls of {MAX_FANOUT} or fewer",
             raw.len()
         ));
     }

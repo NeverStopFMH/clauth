@@ -484,7 +484,18 @@ fn profiles_over_cap_is_refused_by_name() {
         background: Some(true),
         ..base()
     });
-    assert_refusal(&result, &["fan-out capped at", "names; got"]);
+    // "fan-out capped at" / "names; got" pin the ceiling arm's wording; the
+    // fix clause is pinned verbatim, rendered cap included, for the
+    // placement rule 4's corollary reason: the refusal carries the whole lesson, so a reword
+    // that drops the fix reds here.
+    assert_refusal(
+        &result,
+        &[
+            "fan-out capped at",
+            "names; got",
+            "split the names across calls of 8 or fewer",
+        ],
+    );
 }
 
 #[test]

@@ -116,10 +116,23 @@ fn third_party_headline_unavailable_when_empty() {
 #[test]
 fn instructions_block_emits_stable_roster_router_and_safety_prose() {
     let profiles = vec![snapshot("work", true), snapshot("personal", false)];
-    let out = instructions_block(&profiles, &SessionAuth::Global);
+    let out = instructions_block(&profiles, &SessionAuth::Global, None);
 
-    // roster: identity only, with the active marker, and one line per bracket.
-    assert!(out.contains("- work (active), personal [anthropic, max]"));
+    // identity: a global session IS the global link, so the header names the
+    // active profile as the session's own account.
+    assert!(
+        out.contains("global active: `work`"),
+        "the global block names the active profile: {out}",
+    );
+
+    // the model-alias note is generic and renders in every block.
+    assert!(
+        out.contains("some providers alias claude model names to their own models"),
+        "the model-alias note renders everywhere: {out}",
+    );
+
+    // roster: identity only, with the combined marker, and one line per bracket.
+    assert!(out.contains("- work (global active, this session), personal [anthropic, max]"));
 
     // the roster is labelled a session-start snapshot with a live-refresh pointer.
     assert!(out.contains("Profiles, most headroom first (session-start snapshot"));
@@ -174,11 +187,13 @@ fn instructions_block_emits_stable_roster_router_and_safety_prose() {
         "no usage percentages in the boot block"
     );
 
-    // the session-aware switch note must survive a prose edit (Global variant
-    // here), under the same lead the `switch_profile` reply carries.
+    // the switch consequence lives in the router clause for the block, resolved
+    // per tier (Global here): the session reads the file the switch repoints, so
+    // it follows. The full sentence still rides the replies through
+    // `switch_effect_note`.
     assert!(
-        out.contains("switch_profile & this session:"),
-        "the `switch_profile` effect note must survive a prose edit",
+        out.contains("repoints the global `~/.claude` credentials; this session follows"),
+        "the global switch consequence must survive a prose edit: {out}",
     );
     assert!(
         out.contains("its next token refresh"),
@@ -195,7 +210,7 @@ fn roster_groups_identical_brackets_and_leads_with_most_headroom() {
         third_party_snapshot("unknown", url, RosterRank::Unknown),
         third_party_snapshot("fresh", url, RosterRank::Window(90.0)),
     ];
-    let out = roster_lines(&profiles);
+    let out = roster_lines(&profiles, &SessionAuth::Global);
 
     // One line per bracket, and the shared endpoint prints as a host: 14 same
     // provider profiles otherwise repeat one identical URL 14 times.
@@ -237,7 +252,7 @@ fn roster_ranks_wallets_within_a_currency_and_never_across_two() {
         wallet_snapshot("usd-big", "USD", 900.0),
         wallet_snapshot("cny-small", "CNY", 5.0),
     ];
-    let out = roster_lines(&profiles);
+    let out = roster_lines(&profiles, &SessionAuth::Global);
 
     assert_eq!(
         out, "- cny-big, cny-small, usd-big, usd-small, no-balance [DeepSeek, api.deepseek.com]\n",
@@ -262,7 +277,7 @@ fn a_spent_window_still_outranks_the_richest_wallet() {
         wallet_snapshot("rich", "CNY", 9999.0),
         third_party_snapshot("nearly-spent", url, RosterRank::Window(1.0)),
     ];
-    let out = roster_lines(&profiles);
+    let out = roster_lines(&profiles, &SessionAuth::Global);
     assert_eq!(out, "- nearly-spent, rich [DeepSeek, api.deepseek.com]\n");
 }
 
@@ -274,7 +289,7 @@ fn an_overdrawn_wallet_ranks_last_in_its_currency_group() {
         wallet_snapshot("overdrawn", "USD", -0.2),
         wallet_snapshot("healthy", "USD", 5.0),
     ];
-    let out = roster_lines(&profiles);
+    let out = roster_lines(&profiles, &SessionAuth::Global);
     assert_eq!(out, "- healthy, overdrawn [DeepSeek, api.deepseek.com]\n");
 }
 
@@ -301,59 +316,144 @@ fn session_auth_variants_shape_switch_note_and_runtime_paths() {
     // `CLAUDE_CONFIG_DIR` is somebody else's layout, so claiming the runtime
     // layout for either would send a model editing a path that does not exist,
     // or describe a foreign tree it has never read.
-    let profiles = vec![snapshot("work", true)];
-    let runtime_block = instructions_block(&profiles, &SessionAuth::IsolatedRuntime("work".into()));
+    //
+    // The note states the transport the caller probed (`runtime::link_mode_of`),
+    // one arm per mode plus a both-transports fallback. Each arm is pinned on
+    // its own literal so a reword cannot silently fold one transport into the
+    // other, and the consequence stays in every arm.
+    let profiles = vec![snapshot("work", false), snapshot("personal", true)];
+
+    // Symlink host: the shared entries are links, so existing-file edits land
+    // instantly and a fresh file stays local.
+    let runtime_block = instructions_block(
+        &profiles,
+        &SessionAuth::IsolatedRuntime("work".into()),
+        Some(crate::runtime::LinkMode::Real),
+    );
     assert!(
         runtime_block.contains("runtime paths:"),
         "the runtime-path note must reach the rendered block: {runtime_block}",
     );
     assert!(
-        runtime_block.contains("(`$CLAUDE_CONFIG_DIR`, profile `work`)"),
+        runtime_block.contains("`$CLAUDE_CONFIG_DIR` (profile `work`)"),
         "the note must name this session's profile and point at the env var \
          holding its real dir: the on-disk name carries a per-session suffix, so \
          any literal path spelled in the note would not exist",
     );
     assert!(
-        !runtime_block.contains("/runtime/"),
-        "no constructed runtime path: the real dir is `runtime-<pid>-<seq>`",
-    );
-    // The note may name `~/.claude/` and nothing beyond it. Where a `~/.claude/`
-    // entry chains on to is the operator's own layout, so a second destination
-    // spelled here is true on the box that wrote it and false everywhere else.
-    assert!(
-        !runtime_block.contains("~/.agents"),
-        "the note must not name a path clauth never builds: {runtime_block}",
-    );
-    // The transport must never read as one universal mechanism. On a copy-mode
-    // host (no symlink privilege) the tree is a recursive copy, so "mostly
-    // SYMLINKS", the gate-binding claim, and the `readlink -f` nudge were all
-    // false there. The note names both transports and the consequence instead.
-    assert!(
-        runtime_block.contains("watchdog"),
-        "the note must name the copy-host transport: {runtime_block}",
+        runtime_block.contains("this host symlinks"),
+        "the note must state the symlink transport: {runtime_block}",
     );
     assert!(
         runtime_block.contains("reaches the global file"),
         "the note must state the consequence under both transports: {runtime_block}",
     );
     assert!(
-        !runtime_block.contains("SYMLINKS"),
-        "the note must not spell the symlink forest as universal: {runtime_block}",
+        runtime_block.contains("die with the session"),
+        "a fresh file on a symlink host stays local: {runtime_block}",
     );
     assert!(
-        !runtime_block.contains("binds through"),
-        "the gate-binding claim is false on a copy host: {runtime_block}",
+        !runtime_block.contains("watchdog"),
+        "the symlink arm names no watchdog: {runtime_block}",
+    );
+
+    // Copy host: a fresh file DOES propagate there, so the arm carries no
+    // new-file clause and names the watchdog's cadence instead.
+    let copy_block = instructions_block(
+        &profiles,
+        &SessionAuth::IsolatedRuntime("work".into()),
+        Some(crate::runtime::LinkMode::Fake),
     );
     assert!(
-        !runtime_block.contains("readlink"),
-        "the readlink nudge resolves nothing on a copy host: {runtime_block}",
+        copy_block.contains("this host keeps a copy"),
+        "the note must state the copy transport: {copy_block}",
     );
-    for other in [SessionAuth::Global, SessionAuth::IsolatedCustom] {
-        assert!(runtime_paths_note(&other).is_none());
+    assert!(
+        copy_block.contains("watchdog"),
+        "the copy arm names the watchdog: {copy_block}",
+    );
+    assert!(
+        copy_block.contains("reaches the global file"),
+        "the note must state the consequence under both transports: {copy_block}",
+    );
+    assert!(
+        !copy_block.contains("die with the session"),
+        "a fresh file propagates on a copy host: {copy_block}",
+    );
+
+    // Undecidable: both transports, no mode-specific clause.
+    let unknown_block = instructions_block(
+        &profiles,
+        &SessionAuth::IsolatedRuntime("work".into()),
+        None,
+    );
+    assert!(
+        unknown_block.contains("recursive copy"),
+        "the undecidable arm names both transports: {unknown_block}",
+    );
+
+    // The block's identity line and roster markers, resolved per tier: the
+    // runtime profile gets `(this session)`, the globally relinked one
+    // `(global active)`, never the old bare `(active)`.
+    assert!(
+        runtime_block.contains("runtime profile: `work` (anthropic) · global active: `personal`"),
+        "the isolated header names the pinned profile and the global active one: {runtime_block}",
+    );
+    assert!(
+        runtime_block.contains("work (this session)"),
+        "the runtime profile carries the session marker: {runtime_block}",
+    );
+    assert!(
+        runtime_block.contains("personal (global active)"),
+        "the relinked account carries the global-active marker: {runtime_block}",
+    );
+    assert!(
+        !runtime_block.contains(" (active)"),
+        "the bare active marker is gone: {runtime_block}",
+    );
+
+    // The switch consequence lives in the router clause for the block, resolved
+    // per tier (isolated here): the session reads its own credentials.
+    assert!(
+        runtime_block.contains(
+            "`switch_profile` (repoints the global `~/.claude` credentials; this session is \
+unaffected)"
+        ),
+        "the isolated switch consequence must survive a prose edit: {runtime_block}",
+    );
+
+    for (other, mode) in [
+        (SessionAuth::Global, None),
+        (SessionAuth::IsolatedCustom, None),
+    ] {
+        assert!(runtime_paths_note(&other, mode).is_none());
         assert!(
-            !instructions_block(&profiles, &other).contains("runtime paths:"),
+            !instructions_block(&profiles, &other, mode).contains("runtime paths:"),
             "only an isolated `clauth start` runtime may claim the runtime layout",
         );
+    }
+
+    // The bans that held the old two-mode note hold the new one too: the note
+    // never constructs a runtime path, never names a path clauth does not build,
+    // and never spells a transport as universal.
+    for block in [&runtime_block, &copy_block, &unknown_block] {
+        assert!(
+            !block.contains("/runtime/"),
+            "no constructed runtime path: {block}"
+        );
+        assert!(
+            !block.contains("~/.agents"),
+            "no path clauth never builds: {block}"
+        );
+        assert!(
+            !block.contains("SYMLINKS"),
+            "no universal symlink claim: {block}"
+        );
+        assert!(
+            !block.contains("binds through"),
+            "no gate-binding claim: {block}"
+        );
+        assert!(!block.contains("readlink"), "no readlink nudge: {block}");
     }
 }
 
@@ -588,7 +688,7 @@ fn both_carriers_spell_a_local_endpoint_the_same_way() {
         "the marker is derived from the host, never from the url around it",
     );
 
-    let roster = roster_lines(&[endpoint_snapshot("lanbox", url)]);
+    let roster = roster_lines(&[endpoint_snapshot("lanbox", url)], &SessionAuth::Global);
     assert_eq!(
         roster,
         "- lanbox [anthropic, 192.168.1.50:8080, local endpoint]\n",
@@ -678,7 +778,7 @@ fn base_url_host_returns_the_host_not_the_authority() {
 fn a_userinfo_base_url_leaks_no_credentials_into_either_carrier() {
     let url = "http://admin:hunter2@evil.tld/v1";
 
-    let roster = roster_lines(&[endpoint_snapshot("proxy", url)]);
+    let roster = roster_lines(&[endpoint_snapshot("proxy", url)], &SessionAuth::Global);
     assert_eq!(roster, "- proxy [anthropic, evil.tld]\n");
 
     let reply = list_profiles_prose(&serde_json::json!({
@@ -693,16 +793,22 @@ fn a_userinfo_base_url_leaks_no_credentials_into_either_carrier() {
     // A query-borne `@` must not make a PUBLIC host read local: the authority
     // ends before the `?`, so `127.0.0.1` here is query text, not a host.
     assert_eq!(
-        roster_lines(&[endpoint_snapshot(
-            "querybait",
-            "http://evil.tld?x=a@127.0.0.1"
-        )]),
+        roster_lines(
+            &[endpoint_snapshot(
+                "querybait",
+                "http://evil.tld?x=a@127.0.0.1"
+            )],
+            &SessionAuth::Global,
+        ),
         "- querybait [anthropic, evil.tld]\n",
     );
 
     let local = "http://admin:hunter2@127.0.0.1:4000/v1";
     assert_eq!(
-        roster_lines(&[endpoint_snapshot("behind-auth", local)]),
+        roster_lines(
+            &[endpoint_snapshot("behind-auth", local)],
+            &SessionAuth::Global
+        ),
         "- behind-auth [anthropic, 127.0.0.1:4000, local endpoint]\n",
     );
 

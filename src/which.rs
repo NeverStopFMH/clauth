@@ -81,7 +81,7 @@ pub(crate) fn resolve_active(config: &AppConfig) -> Option<(String, Source)> {
 /// Global while this resolved a CWD-RELATIVE `.credentials.json`, so a bare
 /// session with the variable exported empty attributed itself off a file in
 /// whatever directory it happened to be started from.
-fn session_config_dir() -> Option<PathBuf> {
+pub(crate) fn session_config_dir() -> Option<PathBuf> {
     std::env::var_os("CLAUDE_CONFIG_DIR")
         .filter(|dir| !dir.is_empty())
         .map(PathBuf::from)

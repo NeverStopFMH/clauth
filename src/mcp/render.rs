@@ -9,6 +9,7 @@ use serde_json::Value;
 
 use crate::format::{format_pct, humanize_span};
 use crate::providers::ThirdPartyStats;
+use crate::runtime::LinkMode;
 use crate::usage::humanize_duration;
 use crate::which::SessionAuth;
 
@@ -259,12 +260,33 @@ fn cmp_key(a: (u8, usize, f64), b: (u8, usize, f64)) -> std::cmp::Ordering {
     a.0.cmp(&b.0).then(a.1.cmp(&b.1)).then(a.2.total_cmp(&b.2))
 }
 
+/// The roster marker a profile earns in THIS session's block. A `clauth start`
+/// runtime marks the profile the session is pinned to and the account the global
+/// link points at separately; a global session IS the global link, so the active
+/// profile carries both names; a custom config dir holds no clauth session
+/// profile, so only the global link gets a name. The old bare `(active)` read as
+/// "this session's account" where a `clauth start` session does not spend the
+/// active profile at all.
+fn marker(p: &ProfileSnapshot, auth: &SessionAuth) -> Option<&'static str> {
+    match auth {
+        SessionAuth::IsolatedRuntime(runtime) if p.name == *runtime && p.active => {
+            Some(" (global active, this session)")
+        }
+        SessionAuth::IsolatedRuntime(runtime) if p.name == *runtime => Some(" (this session)"),
+        SessionAuth::IsolatedRuntime(_) | SessionAuth::IsolatedCustom if p.active => {
+            Some(" (global active)")
+        }
+        SessionAuth::Global if p.active => Some(" (global active, this session)"),
+        SessionAuth::Global | SessionAuth::IsolatedRuntime(_) | SessionAuth::IsolatedCustom => None,
+    }
+}
+
 /// Roster body: one line per distinct bracket, names joined, most headroom first.
 /// A fleet of same-provider profiles otherwise repeats one identical endpoint on
 /// every line, which is pure token cost in a block every session loads. The
 /// ordering is a hint rather than a claim — it freezes at server start like the
 /// rest of the roster, which is why the header calls it a snapshot.
-fn roster_lines(profiles: &[ProfileSnapshot]) -> String {
+fn roster_lines(profiles: &[ProfileSnapshot], auth: &SessionAuth) -> String {
     let currencies = currency_order(profiles);
     let mut groups: Vec<(String, Vec<&ProfileSnapshot>)> = Vec::new();
     for p in profiles {
@@ -292,13 +314,7 @@ fn roster_lines(profiles: &[ProfileSnapshot]) -> String {
     for (bracket, members) in &groups {
         let names: Vec<String> = members
             .iter()
-            .map(|p| {
-                if p.active {
-                    format!("{} (active)", p.name)
-                } else {
-                    p.name.clone()
-                }
-            })
+            .map(|p| marker(p, auth).map_or_else(|| p.name.clone(), |m| format!("{}{m}", p.name)))
             .collect();
         out.push_str("- ");
         out.push_str(&names.join(", "));
@@ -366,9 +382,11 @@ unaffected. Only a later session on the global credentials adopts the change."
     }
 }
 
-/// [`switch_effect`] with its lead, in the exact shape both carriers hold it:
-/// the init `instructions` block and the `switch_profile` / session-scope
-/// replies (placement rule 3: one renderer, two carriers, no drift).
+/// [`switch_effect`] with its lead, carried by the `switch_profile` /
+/// session-scope replies. The block no longer holds the full sentence: its tool
+/// router carries the per-tier consequence clause alone
+/// ([`switch_router_clause`]), so a client that drops the block still gets the
+/// whole note from every reply.
 pub(crate) fn switch_effect_note(auth: &SessionAuth) -> String {
     format!("switch_profile & this session: {}", switch_effect(auth))
 }
@@ -376,15 +394,15 @@ pub(crate) fn switch_effect_note(auth: &SessionAuth) -> String {
 /// How this session's runtime tree maps onto the real global one, for the only
 /// tier that has such a tree. A `clauth start` runtime looks per-profile, so a
 /// model editing `CLAUDE.md` or `skills/…` under it may believe the edit is
-/// scoped. The note frames the consequence rather than the transport: a write
-/// under the dir reaches the global file every profile loads, directly on a
-/// symlink host and through the watchdog's newer-mtime mirror on a copy host.
-/// One text serves both, because pinning one mechanism is where the old note
-/// went false: a copy-mode host (Windows without symlink privilege) builds the
-/// tree by recursive copy, so "mostly symlinks" was false there and a
-/// `readlink -f` nudge had nothing to resolve. The dropped gate-binding claim
-/// fell the same way: on a copy the runtime path is not the gated path; the
-/// write reaches the gated file only once the mirror lands it there.
+/// scoped. The note frames the consequence, and now states the transport too:
+/// the caller probes the tree once (`runtime::link_mode_of`) and the note names
+/// the answer. Pinning one mechanism is where the old note went false: a copy
+/// host (Windows without symlink privilege) builds the tree by recursive copy,
+/// so "mostly symlinks" was false there and a `readlink -f` nudge had nothing to
+/// resolve. The two transports differ on new files too: a fresh file under a
+/// symlink host's tree stays local and dies with the session, while the copy
+/// mirror propagates one-sided files, so each mode states its own rule. With no
+/// shared entry to probe, the note falls back to naming both transports.
 ///
 /// The note names `$CLAUDE_CONFIG_DIR` rather than a constructed path: the real
 /// dir carries a per-session suffix (`runtime-<sid>`, the sid being `<pid>-<seq>`),
@@ -396,54 +414,132 @@ pub(crate) fn switch_effect_note(auth: &SessionAuth) -> String {
 ///
 /// `Global` has no runtime dir, and `IsolatedCustom` is a foreign
 /// `CLAUDE_CONFIG_DIR` whose layout clauth does not own, so neither may claim
-/// this layout. Pure mapping; the caller resolves the [`SessionAuth`].
-pub(crate) fn runtime_paths_note(auth: &SessionAuth) -> Option<String> {
+/// this layout. Pure mapping; the caller resolves the [`SessionAuth`] and probes
+/// the mode.
+pub(crate) fn runtime_paths_note(auth: &SessionAuth, mode: Option<LinkMode>) -> Option<String> {
+    let SessionAuth::IsolatedRuntime(name) = auth else {
+        return None;
+    };
+    let transport = match mode {
+        Some(LinkMode::Real) => {
+            "this host symlinks, so an edit to an existing file reaches the global file every \
+profile loads. files you create here stay here and die with the session."
+        }
+        Some(LinkMode::Fake) => {
+            "this host keeps a copy, so an edit reaches the global file at the watchdog's sync \
+cadence."
+        }
+        None => {
+            "symlinks where the host allows them, a recursive copy the watchdog reconciles where \
+it does not. so an edit reaches the global file every profile loads, instantly on a symlink \
+host, at the watchdog's cadence on a copy host."
+        }
+    };
+    Some(format!(
+        "runtime paths: `$CLAUDE_CONFIG_DIR` (profile `{name}`) mirrors the global `~/.claude`. \
+{transport} only `.claude.json`, `settings.json` and `.credentials.json` are this profile's own."
+    ))
+}
+
+/// The block's first line: who this session is, resolved per tier. A `clauth
+/// start` runtime names the profile it is pinned to and the account the global
+/// link points at; a global session IS the global link, so the active profile
+/// is the session's own account; a custom config dir names only the fact of
+/// itself. The profile's provider comes off the snapshot the roster already
+/// carries, so a reader meets one spelling per provider.
+fn identity_line(profiles: &[ProfileSnapshot], auth: &SessionAuth) -> Option<String> {
+    let active = profiles.iter().find(|p| p.active).map(|p| p.name.as_str());
     match auth {
-        SessionAuth::IsolatedRuntime(name) => Some(format!(
-            "runtime paths: this session's config dir (`$CLAUDE_CONFIG_DIR`, profile `{name}`) \
-mirrors the global `~/.claude/<same-name>`: symlinks onto it where the host allows them, a \
-recursive copy the watchdog reconciles where it does not. Only `.claude.json`, `settings.json` \
-and `.credentials.json` are per-profile. So a write under that dir reaches the global file every \
-profile and every future session loads. It lands directly on a symlink host. On a copy host it \
-lands via the watchdog's newer-mtime mirror, at its sync cadence."
-        )),
-        SessionAuth::Global | SessionAuth::IsolatedCustom => None,
+        SessionAuth::IsolatedRuntime(name) => {
+            let provider = profiles
+                .iter()
+                .find(|p| p.name == *name)
+                .map(|p| p.provider.as_str());
+            let mut line = match provider {
+                Some(p) => format!("runtime profile: `{name}` ({p})"),
+                None => format!("runtime profile: `{name}`"),
+            };
+            if let Some(active) = active {
+                line.push_str(&format!(" · global active: `{active}`"));
+            }
+            Some(line)
+        }
+        SessionAuth::Global => active.map(|a| format!("global active: `{a}`")),
+        SessionAuth::IsolatedCustom => Some("custom `CLAUDE_CONFIG_DIR`".to_string()),
     }
 }
 
-/// Init-time `instructions` block: identity intro, a one-line tool router, a
-/// session-aware `switch_profile` note, the runtime-path note that tier earns,
-/// then the grouped roster. This block is the only clauth text a session is
-/// guaranteed to hold: tool descriptions are deferred in some harnesses and
-/// unloaded until searched for, so the router line stays even though every tool
-/// carries its own description. Per-tool mechanics do NOT stay — they live in
-/// that tool's description, which is loaded by the time anyone can call it, and
-/// so does the `delegate` cost model. No usage percentage or reset timer is
-/// baked in; those rot within a turn, so they live in `profiles`.
-pub(crate) fn instructions_block(profiles: &[ProfileSnapshot], auth: &SessionAuth) -> String {
+/// The `switch_profile` parenthetical in the block's tool router, resolved per
+/// tier. A global session reads the very file the switch repoints, so it
+/// follows on its next token refresh; an isolated runtime and a custom config
+/// dir read their own credentials and are unaffected. The full consequence
+/// sentence still rides the replies through [`switch_effect_note`]; the router
+/// holds only this one clause.
+fn switch_router_clause(auth: &SessionAuth) -> &'static str {
+    match auth {
+        SessionAuth::Global => {
+            "repoints the global `~/.claude` credentials; this session follows on its next token \
+refresh"
+        }
+        SessionAuth::IsolatedRuntime(_) | SessionAuth::IsolatedCustom => {
+            "repoints the global `~/.claude` credentials; this session is unaffected"
+        }
+    }
+}
+
+/// One generic warning, every block: some providers answer a claude model name
+/// with their own model, so `opus` is a tier alias rather than a guarantee. The
+/// per-provider mapping is the operator's own workflow and stays out of the
+/// block (owner ruling 2026-08-24).
+const MODELS_NOTE: &str = "some providers alias claude model names to their own models \
+(deepseek: `opus` -> `deepseek-v4-pro`).";
+
+/// Init-time `instructions` block: identity intro, the session-resolved identity
+/// line, a generic model-alias note, the runtime-path note that tier earns, a
+/// one-line tool router, then the grouped roster. This block is the only clauth
+/// text a session is guaranteed to hold: tool descriptions are deferred in some
+/// harnesses and unloaded until searched for, so the router line stays even
+/// though every tool carries its own description. Per-tool mechanics do NOT
+/// stay — they live in that tool's description, which is loaded by the time
+/// anyone can call it, and so does the `delegate` cost model. The full
+/// session-effect sentence behind `switch_profile` rides the replies, not here:
+/// the router carries the per-tier consequence clause alone. No usage
+/// percentage or reset timer is baked in; those rot within a turn, so they live
+/// in `profiles`.
+pub(crate) fn instructions_block(
+    profiles: &[ProfileSnapshot],
+    auth: &SessionAuth,
+    mode: Option<LinkMode>,
+) -> String {
     let mut out = String::new();
     out.push_str(
         "clauth manages multiple Claude Code accounts (\"profiles\"): each an isolated \
 credential set / subscription. Use its tools to compare usage headroom across accounts, relink \
 the active account, or delegate a task to another account without spending this session's \
-window.\n\n\
-Tools: `profiles` (accounts + cached usage, zero quota; `scope:\"session\"` for this session's \
-own), `switch_profile` (relink the global active account), `delegate` (run a task on another \
-account; the only tool that spends), `monitor` (check, collect or stop a backgrounded delegate, \
-or wait on clauth's state).\n\n\
-",
+window.\n\n",
     );
-    out.push_str(&switch_effect_note(auth));
-    if let Some(note) = runtime_paths_note(auth) {
+    if let Some(line) = identity_line(profiles, auth) {
+        out.push_str(&line);
         out.push_str("\n\n");
-        out.push_str(&note);
     }
+    out.push_str(MODELS_NOTE);
+    out.push_str("\n\n");
+    if let Some(note) = runtime_paths_note(auth, mode) {
+        out.push_str(&note);
+        out.push_str("\n\n");
+    }
+    out.push_str(&format!(
+        "Tools: `profiles` (accounts + cached usage, zero quota; `scope:\"session\"` for this \
+session's own), `switch_profile` ({}), `delegate` (run a task on another account; the only tool \
+that spends), `monitor` (check, collect or stop a backgrounded delegate, or wait on clauth's \
+state).\n\n",
+        switch_router_clause(auth),
+    ));
     out.push_str(
-        "\n\n\
-Profiles, most headroom first (session-start snapshot; call `profiles` for live usage and \
-anything added since):\n",
+        "Profiles, most headroom first (session-start snapshot; call `profiles` for live usage \
+and anything added since):\n",
     );
-    out.push_str(&roster_lines(profiles));
+    out.push_str(&roster_lines(profiles, auth));
     out
 }
 

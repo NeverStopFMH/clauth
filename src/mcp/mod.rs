@@ -743,7 +743,8 @@ percentage is how much of it is already used. Call it before picking a `delegate
         let auth = crate::which::session_auth();
         prose.push_str("\n\n");
         prose.push_str(&render::switch_effect_note(&auth));
-        if let Some(note) = render::runtime_paths_note(&auth) {
+        let mode = crate::runtime::link_mode_of(crate::which::session_config_dir().as_deref());
+        if let Some(note) = render::runtime_paths_note(&auth, mode) {
             prose.push_str("\n\n");
             prose.push_str(&note);
         }
@@ -4720,7 +4721,9 @@ fn build_instructions() -> String {
         })
         .collect();
 
-    render::instructions_block(&snapshots, &crate::which::session_auth())
+    let auth = crate::which::session_auth();
+    let mode = crate::runtime::link_mode_of(crate::which::session_config_dir().as_deref());
+    render::instructions_block(&snapshots, &auth, mode)
 }
 
 /// Whether this `clauth mcp` process should hold a bare-session marker. Pure, so

@@ -68,13 +68,38 @@ use crate::profile::{
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum LinkMode {
+pub(crate) enum LinkMode {
     /// OS-level symlinks. Used on Unix unconditionally and on Windows when
     /// the process can create symlinks (developer mode or admin).
     Real,
     /// Bidirectional mtime-based mirror. Used on Windows when the OS denies
     /// symlink creation.
     Fake,
+}
+
+/// The transport an EXISTING runtime tree was built with, read off an entry the
+/// tree shares with `~/.claude` (`CLAUDE.md`, then `skills`). A link means
+/// [`LinkMode::Real`], a plain file or dir means [`LinkMode::Fake`], and neither
+/// entry existing means the probe cannot answer. The sibling of the acquire-time
+/// privilege probe [`detect_link_mode`], which tests what THIS process may
+/// create; this one observes the tree already in front of a later process. The
+/// MCP instructions block states the probe's answer instead of spelling both
+/// transports every session. Costs two stats at most, so callers re-run it per
+/// reply rather than caching.
+pub(crate) fn link_mode_of(config_dir: Option<&Path>) -> Option<LinkMode> {
+    let dir = config_dir?;
+    for entry in ["CLAUDE.md", "skills"] {
+        let Ok(meta) = std::fs::symlink_metadata(dir.join(entry)) else {
+            continue;
+        };
+        if meta.file_type().is_symlink() {
+            return Some(LinkMode::Real);
+        }
+        if meta.is_file() || meta.is_dir() {
+            return Some(LinkMode::Fake);
+        }
+    }
+    None
 }
 
 /// Whether a session inherits the operator's full `~/.claude/` (memory,

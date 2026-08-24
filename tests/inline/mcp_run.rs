@@ -4645,7 +4645,7 @@ fn the_profiles_entry_names_both_scopes_and_the_reply_shape() {
         //
         // These are the words `profile_line` RENDERS, not the JSON keys behind
         // them: `format` was deleted from every tool in slice 1, so every
-        // `profiles` return is `list_profiles_prose`, and a caller never
+        // `profiles` return is `profiles_prose`, and a caller never
         // receives `utilization_pct`, `keyless` or `auth_broken` in any reply.
         // `mcp_profiles_tool.rs` pins these same three spellings on whole
         // roster lines, so both halves are owned by `render.rs` and cannot

@@ -648,7 +648,7 @@ pub(crate) fn digest_prose(d: &Value) -> String {
 /// Self-labels `monitor` — the reply names the tool that can be called again,
 /// and a label naming a tool the handshake does not list sends the model
 /// searching for one.
-pub(crate) fn watch_prose(p: &Value) -> String {
+pub(crate) fn monitor_state_prose(p: &Value) -> String {
     let state = match p.get("status").and_then(Value::as_str) {
         Some("changed") => format!("monitor: {}", digest_prose(&p["since_your_last_call"])),
         Some("armed") => {
@@ -673,7 +673,7 @@ pub(crate) fn watch_prose(p: &Value) -> String {
 /// Empty rather than a "no jobs" line: a session that never delegated should
 /// pay nothing for a listing it has no use for, which is the only-when-true rule
 /// the roster flags already render by. Each line opens with ``job `<id>` `` —
-/// the same opener `delegate_result_batch_prose` uses — so the id a caller has
+/// the same opener `monitor_batch_prose` uses — so the id a caller has
 /// to copy out is always in the same place.
 ///
 /// One age per row and no tail, no quota and no deadline countdown: this
@@ -985,7 +985,7 @@ fn profile_line(row: &Value) -> String {
 /// THIS session resolves to, rendered through the same `profile_line` (so it
 /// inherits the roster's own guards), then how it resolved, then live usage and
 /// the digest.
-pub(crate) fn list_profiles_prose(p: &Value) -> String {
+pub(crate) fn profiles_prose(p: &Value) -> String {
     if p.get("ok").and_then(Value::as_bool) == Some(false) {
         return format!(
             "error: {}",
@@ -1048,9 +1048,9 @@ pub(crate) fn list_profiles_prose(p: &Value) -> String {
     rows.iter().map(profile_line).collect::<Vec<_>>().join("\n")
 }
 
-/// Prose for `switch`: the outcome, then the active profile's live usage, then
-/// the digest clause when the payload carries one.
-pub(crate) fn switch_prose(p: &Value) -> String {
+/// Prose for `switch_profile`: the outcome, then the active profile's live
+/// usage, then the digest clause when the payload carries one.
+pub(crate) fn switch_profile_prose(p: &Value) -> String {
     let live = live_usage_prose(&p["live_usage"], "active profile");
     let digest = digest_prose(&p["since_your_last_call"]);
     let digest = if digest.is_empty() {
@@ -1501,7 +1501,7 @@ pub(crate) fn delegate_fanout_results_prose(p: &Value) -> String {
 
 /// Prose for `monitor`'s one-id mode: the running status, the done envelope, or
 /// an invalid/unknown job_id refusal.
-pub(crate) fn delegate_result_prose(p: &Value) -> String {
+pub(crate) fn monitor_job_prose(p: &Value) -> String {
     if p.get("job_id").and_then(Value::as_str).is_some()
         && p.get("status").and_then(Value::as_str).is_some()
     {
@@ -1609,7 +1609,7 @@ fn escape_quoted(s: &str) -> String {
 /// jobs does not repeat one account's percentages per line. The running blocks
 /// do carry a quota clause, because a running check's whole job is to say
 /// whether the account it is spending still has headroom.
-pub(crate) fn delegate_result_batch_prose(p: &Value) -> String {
+pub(crate) fn monitor_batch_prose(p: &Value) -> String {
     let results = p
         .get("results")
         .and_then(Value::as_array)

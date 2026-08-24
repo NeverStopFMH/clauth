@@ -715,7 +715,7 @@ percentage is how much of it is already used. Call it before picking a `delegate
                     "unrecognized scope \"{raw}\": accepted \"all\" and \"session\""
                 ),
             });
-            let prose = render::list_profiles_prose(&payload);
+            let prose = render::profiles_prose(&payload);
             return Ok(CallToolResult::error(single_block(prose)));
         }
         if scope.as_deref() == Some("session") {
@@ -732,7 +732,7 @@ percentage is how much of it is already used. Call it before picking a `delegate
                     "reason": "`names` cannot combine with `scope: \"session\"`: the session \
                                scope answers the one account this session runs on; drop `names`",
                 });
-                let prose = render::list_profiles_prose(&payload);
+                let prose = render::profiles_prose(&payload);
                 return Ok(CallToolResult::error(single_block(prose)));
             }
             return self.profiles_session(&config);
@@ -759,7 +759,7 @@ percentage is how much of it is already used. Call it before picking a `delegate
                             ProfileNotFoundFix::OmitFilter
                         ),
                     });
-                    let prose = render::list_profiles_prose(&payload);
+                    let prose = render::profiles_prose(&payload);
                     return Ok(CallToolResult::error(single_block(prose)));
                 }
                 Some(
@@ -783,7 +783,7 @@ percentage is how much of it is already used. Call it before picking a `delegate
             .collect();
 
         let payload = serde_json::json!({ "profiles": profiles });
-        let prose = render::list_profiles_prose(&payload);
+        let prose = render::profiles_prose(&payload);
         Ok(CallToolResult::success(single_block(prose)))
     }
 
@@ -806,7 +806,7 @@ percentage is how much of it is already used. Call it before picking a `delegate
             config,
             DigestMode::Report(&self.digest),
         );
-        let mut prose = render::list_profiles_prose(&payload);
+        let mut prose = render::profiles_prose(&payload);
         // Session facts ride this reply through the same renderers the
         // instructions block uses (placement rule 3: one renderer, two
         // carriers), so a client that drops the block still sees them.
@@ -851,7 +851,7 @@ disturbing this session, use `delegate`."
             // post-mutation arms below reseed instead.
             let payload =
                 fold_active_live_usage(payload, &config, DigestMode::Report(&self.digest));
-            let mut prose = render::switch_prose(&payload);
+            let mut prose = render::switch_profile_prose(&payload);
             prose.push_str("\n\n");
             prose.push_str(&session_note);
             return Ok(CallToolResult::error(single_block(prose)));
@@ -894,7 +894,7 @@ disturbing this session, use `delegate`."
                     &config,
                     DigestMode::Reseed(&self.digest),
                 );
-                let mut prose = render::switch_prose(&payload);
+                let mut prose = render::switch_profile_prose(&payload);
                 prose.push_str("\n\n");
                 prose.push_str(&session_note);
                 Ok(CallToolResult::success(single_block(prose)))
@@ -908,7 +908,7 @@ disturbing this session, use `delegate`."
                     &config,
                     DigestMode::Reseed(&self.digest),
                 );
-                let mut prose = render::switch_prose(&payload);
+                let mut prose = render::switch_profile_prose(&payload);
                 prose.push_str("\n\n");
                 prose.push_str(&session_note);
                 Ok(CallToolResult::error(single_block(prose)))
@@ -1519,7 +1519,7 @@ listing is where you find its id."
         let refuse = |reason: &str| {
             let payload = serde_json::json!({ "is_error": true, "result": reason });
             Ok(CallToolResult::error(single_block(
-                render::delegate_result_prose(&payload),
+                render::monitor_job_prose(&payload),
             )))
         };
         let cancel = cancel == Some(true);
@@ -1589,7 +1589,7 @@ listing is where you find its id."
                 // minutes is told what the store holds now rather than what it
                 // held when the call arrived.
                 fold_jobs_listing(&mut payload, now_ms());
-                let prose = render::watch_prose(&payload);
+                let prose = render::monitor_state_prose(&payload);
                 Ok(CallToolResult::success(single_block(prose)))
             }
         };
@@ -2366,12 +2366,12 @@ async fn monitor_one(
                 "is_error": true,
                 "result": unknown_job_reason(&job_id, now_ms()),
             });
-            let prose = render::delegate_result_prose(&payload);
+            let prose = render::monitor_job_prose(&payload);
             Ok(CallToolResult::error(single_block(prose)))
         }
         WaitOutcome::Running(record) => {
             let payload = running_payload(&job_id, &record, now_ms());
-            let prose = render::delegate_result_prose(&payload);
+            let prose = render::monitor_job_prose(&payload);
             Ok(CallToolResult::success(single_block(prose)))
         }
         WaitOutcome::Done(record) => {
@@ -2454,7 +2454,7 @@ async fn monitor_batch(
     if let Some(delta) = DigestMode::Report(digest).folded() {
         payload["since_your_last_call"] = delta;
     }
-    let prose = render::delegate_result_batch_prose(&payload);
+    let prose = render::monitor_batch_prose(&payload);
     let blocks = single_block(prose);
     for id in delivered {
         jobs::remove(&id);
@@ -2507,7 +2507,7 @@ fn render_done_envelope(
     digest: &DigestTracker,
 ) -> (Vec<ContentBlock>, bool) {
     let (payload, is_error) = fold_done_envelope(&record, DigestMode::Report(digest));
-    let prose = render::delegate_result_prose(&payload);
+    let prose = render::monitor_job_prose(&payload);
     (single_block(prose), is_error)
 }
 

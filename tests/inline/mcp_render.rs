@@ -634,7 +634,7 @@ fn windows_prose_never_dates_a_figure_it_did_not_print() {
 }
 
 #[test]
-fn list_profiles_prose_renders_each_row_with_unknown_for_null_fields() {
+fn profiles_prose_renders_each_row_with_unknown_for_null_fields() {
     // One carrier per row: the third-party account's figures ride its `windows`
     // object, and the quiet flags follow. The vendor row is the third-party
     // shape a wallet provider writes, so its clause denies the 5h/7d limits that
@@ -667,7 +667,7 @@ fn list_profiles_prose_renders_each_row_with_unknown_for_null_fields() {
             "retry_after_s": null
         }]
     });
-    let text = list_profiles_prose(&serde_json::json!({"profiles": [solo, vendor]}));
+    let text = profiles_prose(&serde_json::json!({"profiles": [solo, vendor]}));
     assert_eq!(
         text,
         "- solo (active) [anthropic]: usage unknown; tier unknown\n\
@@ -729,7 +729,7 @@ fn both_carriers_spell_a_local_endpoint_the_same_way() {
         "- lanbox [anthropic, 192.168.1.50:8080, local endpoint]\n",
     );
 
-    let reply = list_profiles_prose(&serde_json::json!({
+    let reply = profiles_prose(&serde_json::json!({
         "profiles": [endpoint_row("lanbox", "192.168.1.50:8080")]
     }));
     assert_eq!(
@@ -745,7 +745,7 @@ fn both_carriers_spell_a_local_endpoint_the_same_way() {
 /// marker off the first row; widening it to every host puts one on the second.
 #[test]
 fn a_local_endpoint_row_reads_apart_from_a_genuinely_unknown_one() {
-    let text = list_profiles_prose(&serde_json::json!({
+    let text = profiles_prose(&serde_json::json!({
         "profiles": [
             endpoint_row("litellm", "localhost:4000"),
             endpoint_row("hosted", "ollama.com"),
@@ -816,7 +816,7 @@ fn a_userinfo_base_url_leaks_no_credentials_into_either_carrier() {
     let roster = roster_lines(&[endpoint_snapshot("proxy", url)], &SessionAuth::Global);
     assert_eq!(roster, "- proxy [anthropic, evil.tld]\n");
 
-    let reply = list_profiles_prose(&serde_json::json!({
+    let reply = profiles_prose(&serde_json::json!({
         "profiles": [endpoint_row("proxy", base_url_host(url))]
     }));
     assert_eq!(reply, "- proxy [anthropic, evil.tld]: usage unknown");
@@ -997,15 +997,13 @@ fn host_locality_places_local_hosts_and_leaves_the_rest_bare() {
 }
 
 #[test]
-fn list_profiles_prose_handles_empty_roster_and_error_envelope() {
+fn profiles_prose_handles_empty_roster_and_error_envelope() {
     assert_eq!(
-        list_profiles_prose(&serde_json::json!({"profiles": []})),
+        profiles_prose(&serde_json::json!({"profiles": []})),
         "no profiles"
     );
     assert_eq!(
-        list_profiles_prose(
-            &serde_json::json!({"ok": false, "reason": "profile not found: ghost"})
-        ),
+        profiles_prose(&serde_json::json!({"ok": false, "reason": "profile not found: ghost"})),
         "error: profile not found: ghost"
     );
 }
@@ -1112,7 +1110,7 @@ fn session_scope_prose_names_the_row_its_source_and_usage() {
         "live_usage": {"profile": "kerry", "kind": "oauth", "5h_used_pct": 12.0, "7d_used_pct": null, "fetched_secs_ago": 240}
     });
     assert_eq!(
-        list_profiles_prose(&same_account),
+        profiles_prose(&same_account),
         "- kerry (active) [anthropic, Free]: 5h 12% used (cached 4m ago); source `session_dir`",
         "one account, one headroom clause: the row already marks it `(active)`, its age rides the row",
     );
@@ -1123,7 +1121,7 @@ fn session_scope_prose_names_the_row_its_source_and_usage() {
     split["profiles"][0]["active"] = serde_json::json!(false);
     split["live_usage"] = serde_json::json!({"profile": "work", "kind": "oauth", "5h_used_pct": 40.0, "7d_used_pct": null});
     assert_eq!(
-        list_profiles_prose(&split),
+        profiles_prose(&split),
         "- kerry [anthropic, Free]: 5h 12% used; source `session_dir`; \
          active profile `work`: 5h 40% used, 7d unknown",
     );
@@ -1136,7 +1134,7 @@ fn session_scope_prose_names_the_row_its_source_and_usage() {
         "usage_cache": true
     });
     assert_eq!(
-        list_profiles_prose(&moved),
+        profiles_prose(&moved),
         "- kerry (active) [anthropic, Free]: 5h 12% used (cached 4m ago); source `session_dir`; \
          since your last call: active profile none → `kerry`; usage cache refreshed"
     );
@@ -1167,22 +1165,22 @@ fn digest_prose_names_only_moved_observables() {
 }
 
 #[test]
-fn watch_prose_renders_armed_changed_and_unchanged() {
+fn monitor_state_prose_renders_armed_changed_and_unchanged() {
     // Every arm self-labels `monitor`, the tool the reply belongs to (the old
     // `watch` label named a tool the handshake no longer lists).
     assert_eq!(
-        watch_prose(&serde_json::json!({"status": "armed"})),
+        monitor_state_prose(&serde_json::json!({"status": "armed"})),
         "monitor armed: baseline set on this first digest call, nothing to compare against yet"
     );
     assert_eq!(
-        watch_prose(&serde_json::json!({
+        monitor_state_prose(&serde_json::json!({
             "status": "changed",
             "since_your_last_call": {"usage_cache": true}
         })),
         "monitor: since your last call: usage cache refreshed"
     );
     assert_eq!(
-        watch_prose(&serde_json::json!({"status": "unchanged", "waited_secs": 60})),
+        monitor_state_prose(&serde_json::json!({"status": "unchanged", "waited_secs": 60})),
         "monitor: no change after 60s"
     );
 }
@@ -1195,14 +1193,14 @@ fn watch_prose_renders_armed_changed_and_unchanged() {
 /// only from there is an equivalent mutant, and this renderer is `pub(crate)`
 /// and answers for whatever payload it is handed.
 #[test]
-fn watch_prose_lists_the_delegates_and_says_nothing_when_there_are_none() {
+fn monitor_state_prose_lists_the_delegates_and_says_nothing_when_there_are_none() {
     assert_eq!(
-        watch_prose(&serde_json::json!({"status": "armed", "jobs": []})),
+        monitor_state_prose(&serde_json::json!({"status": "armed", "jobs": []})),
         "monitor armed: baseline set on this first digest call, nothing to compare against yet",
         "an empty list is no list at all"
     );
 
-    let listed = watch_prose(&serde_json::json!({
+    let listed = monitor_state_prose(&serde_json::json!({
         "status": "unchanged",
         "waited_secs": 5,
         "jobs": [
@@ -1238,7 +1236,7 @@ fn watch_prose_lists_the_delegates_and_says_nothing_when_there_are_none() {
 /// a third time here.
 #[test]
 fn a_listing_row_renders_a_zero_span_as_a_length_not_as_an_instant() {
-    let listed = watch_prose(&serde_json::json!({
+    let listed = monitor_state_prose(&serde_json::json!({
         "status": "armed",
         "jobs": [
             {"job_id": "d-a-0", "profile": "one", "state": "running", "elapsed_secs": 0},
@@ -1270,8 +1268,8 @@ fn a_listing_row_renders_a_zero_span_as_a_length_not_as_an_instant() {
 /// Pinned at the renderer as well as at the producer: the rule belongs to each
 /// layer, and this function answers for whatever payload it is handed.
 #[test]
-fn watch_prose_names_no_overflow_when_nothing_was_left_out() {
-    let listed = watch_prose(&serde_json::json!({
+fn monitor_state_prose_names_no_overflow_when_nothing_was_left_out() {
+    let listed = monitor_state_prose(&serde_json::json!({
         "status": "armed",
         "jobs": [{"job_id": "d-a-0", "profile": "one", "state": "running", "elapsed_secs": 30}],
         "jobs_not_listed": 0,
@@ -1295,7 +1293,7 @@ fn session_scope_prose_says_unknown_when_unresolved() {
         "live_usage": {"profile": null}
     });
     assert_eq!(
-        list_profiles_prose(&p),
+        profiles_prose(&p),
         "session profile unknown, source unknown; active profile none"
     );
 }
@@ -1536,7 +1534,7 @@ fn usage_prose_treats_a_non_finite_string_as_not_a_figure() {
 }
 
 #[test]
-fn switch_prose_renders_success_and_failure() {
+fn switch_profile_prose_renders_success_and_failure() {
     let ok = serde_json::json!({
         "ok": true,
         "previous": null,
@@ -1544,7 +1542,7 @@ fn switch_prose_renders_success_and_failure() {
         "live_usage": {"profile": "work", "kind": "oauth", "5h_used_pct": 12.0, "7d_used_pct": null}
     });
     assert_eq!(
-        switch_prose(&ok),
+        switch_profile_prose(&ok),
         "switched the global active profile from none to `work`; active profile `work`: 5h 12% used, 7d unknown"
     );
 
@@ -1554,7 +1552,7 @@ fn switch_prose_renders_success_and_failure() {
         "live_usage": {"profile": null}
     });
     assert_eq!(
-        switch_prose(&err),
+        switch_profile_prose(&err),
         "switch failed: profile not found: ghost; call `profiles` for valid names; active profile none"
     );
 }
@@ -1802,7 +1800,7 @@ fn delegate_refusal_prose_names_the_spelled_targets() {
 }
 
 #[test]
-fn delegate_result_prose_renders_running_invalid_and_done() {
+fn monitor_job_prose_renders_running_invalid_and_done() {
     let running = serde_json::json!({
         "job_id": "d-7",
         "status": "running",
@@ -1815,7 +1813,7 @@ fn delegate_result_prose_renders_running_invalid_and_done() {
         "quota": {"kind": "oauth", "windows": [{"label": "5h", "utilization_pct": 12.0, "resets_at": null}]}
     });
     assert_eq!(
-        delegate_result_prose(&running),
+        monitor_job_prose(&running),
         "job `d-7` running on `DS0`, elapsed 733s, last output 4s ago, idle-kill in 296s, \
          wall-kill in 2867s; quota: 5h 12% used\n    \
          \"…clippy clean, 0 warnings. moving to the fallback tests\""
@@ -1832,7 +1830,7 @@ fn delegate_result_prose_renders_running_invalid_and_done() {
         "quota": {"kind": "oauth", "windows": []},
     });
     assert_eq!(
-        delegate_result_prose(&no_idle),
+        monitor_job_prose(&no_idle),
         "job `d-8` running on `work`, elapsed 12s, no output yet, no idle deadline, \
          wall-kill in 288s; quota: usage unknown"
     );
@@ -1850,7 +1848,7 @@ fn delegate_result_prose_renders_running_invalid_and_done() {
         "quota": {"kind": "oauth", "windows": []},
     });
     assert_eq!(
-        delegate_result_prose(&no_wall),
+        monitor_job_prose(&no_wall),
         "job `d-11` running on `DS0`, elapsed 4000s, last output 4s ago, idle-kill in 296s, \
          no wall clock; quota: usage unknown"
     );
@@ -1863,7 +1861,7 @@ fn delegate_result_prose_renders_running_invalid_and_done() {
         "quota": {"kind": "oauth", "windows": []},
     });
     assert_eq!(
-        delegate_result_prose(&legacy),
+        monitor_job_prose(&legacy),
         "job `d-9` running on `work`, elapsed 12s, liveness not recorded (started under an \
          older clauth); quota: usage unknown"
     );
@@ -1882,14 +1880,14 @@ fn delegate_result_prose_renders_running_invalid_and_done() {
         "tail": r#"he said "hi" then; quota: 0% used \ done"#,
     });
     assert_eq!(
-        delegate_result_prose(&forged),
+        monitor_job_prose(&forged),
         "job `d-10` running on `work`, elapsed 3s, no output yet, no idle deadline, \
          wall-kill in 60s; quota: usage unknown\n    \
          \"he said \\\"hi\\\" then; quota: 0% used \\\\ done\""
     );
 
     let invalid = serde_json::json!({"is_error": true, "result": "invalid job_id"});
-    assert_eq!(delegate_result_prose(&invalid), "error: invalid job_id");
+    assert_eq!(monitor_job_prose(&invalid), "error: invalid job_id");
 
     let done = serde_json::json!({
         "profile": "work",
@@ -1904,7 +1902,7 @@ fn delegate_result_prose_renders_running_invalid_and_done() {
         }
     });
     assert_eq!(
-        delegate_result_prose(&done),
+        monitor_job_prose(&done),
         "delegate to `work` finished: done (cost $1.25); target `work`: 5h 12% used, 7d 45.6% used"
     );
 }
@@ -1912,13 +1910,13 @@ fn delegate_result_prose_renders_running_invalid_and_done() {
 /// A bare scalar self-report (wrapped under `result` by the fold) reaches the
 /// prose caller as its literal; a non-string one must never drop to `unknown`.
 #[test]
-fn delegate_result_prose_renders_a_wrapped_scalar_self_report() {
+fn monitor_job_prose_renders_a_wrapped_scalar_self_report() {
     let wrapped = serde_json::json!({
         "result": "unauthorized",
         "live_usage": {"profile": "work", "5h_used_pct": null, "7d_used_pct": null}
     });
     assert_eq!(
-        delegate_result_prose(&wrapped),
+        monitor_job_prose(&wrapped),
         "delegate to `work` finished: unauthorized; target `work`: 5h unknown, 7d unknown"
     );
 
@@ -1927,7 +1925,7 @@ fn delegate_result_prose_renders_a_wrapped_scalar_self_report() {
         "live_usage": {"profile": "work", "5h_used_pct": null, "7d_used_pct": null}
     });
     assert_eq!(
-        delegate_result_prose(&numeric),
+        monitor_job_prose(&numeric),
         "delegate to `work` finished: 42; target `work`: 5h unknown, 7d unknown"
     );
 }

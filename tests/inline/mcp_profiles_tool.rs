@@ -303,7 +303,7 @@ fn roster_flags_name_each_state_and_leave_a_clean_row_unchanged() {
 /// them through the line.
 #[test]
 fn the_three_refusal_markers_render_as_one_group() {
-    let line = render::list_profiles_prose(&serde_json::json!({
+    let line = render::profiles_prose(&serde_json::json!({
         "profiles": [{
             "name": "wreck",
             "active": false,

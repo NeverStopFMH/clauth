@@ -2,12 +2,13 @@
 #![allow(unsafe_code)]
 #![cfg(unix)]
 
-//! Pins for the herdr pane-status reports behind `delegate`: the `herdr pane
-//! report-agent` call shape, the working/idle pairing on every sync exit path,
-//! the background in-flight counter, and the gating. A SHIM herdr binary (a
-//! shell script pointed at by `HERDR_BIN_PATH`, or a bare name found on a
-//! pinned `PATH`) appends its argv to a log file, so every assertion reads the
-//! real spawned argv. Nothing here touches a live herdr socket.
+//! Pins for the herdr pane-state reports behind `delegate`: the `herdr pane
+//! report-metadata` call shape, the working/idle pairing on every sync exit
+//! path, the background in-flight counter, the refresh loop behind long runs,
+//! and the gating. A SHIM herdr binary (a shell script pointed at by
+//! `HERDR_BIN_PATH`, or a bare name found on a pinned `PATH`) appends its
+//! argv to a log file, so every assertion reads the real spawned argv.
+//! Nothing here touches a live herdr socket.
 //!
 //! unix-only: the shim is POSIX shell, which Windows cannot execute.
 
@@ -154,30 +155,34 @@ fn epoch_ms() -> u64 {
     .expect("epoch-ms fits u64")
 }
 
-/// The `--state` value of one recorded report line.
+/// The token VALUE of one recorded report line (`working`/`idle`).
 fn state_of(line: &str) -> Option<&str> {
     let tokens: Vec<&str> = line.split_whitespace().collect();
     tokens
         .iter()
-        .position(|t| *t == "--state")
-        .and_then(|i| tokens.get(i + 1).copied())
+        .position(|t| *t == "--token")
+        .and_then(|i| tokens.get(i + 1))
+        .and_then(|kv| kv.strip_prefix("clauth_delegate="))
 }
 
 /// Assert one recorded report line has the settled argv shape
-/// `pane report-agent <pane> --source clauth --agent claude --state <state>
-/// --seq <n>` and return its seq.
+/// `pane report-metadata <pane> --source clauth --token clauth_delegate=<state>
+/// --ttl-ms 60000 --seq <n>` and return its seq. The shape is the one the
+/// installed binary accepts (pane id first, herdr's parser takes args[0]),
+/// and the TTL literal is the shipped value, so a change to either reds here.
 fn assert_report_shape(line: &str, pane_id: &str, state: &str) -> u64 {
     let tokens: Vec<&str> = line.split_whitespace().collect();
     assert_eq!(
         &tokens[..5],
-        ["pane", "report-agent", pane_id, "--source", "clauth"],
+        ["pane", "report-metadata", pane_id, "--source", "clauth"],
         "argv order (pane id first, herdr's parser takes args[0]): {line}"
     );
     assert_eq!(
-        &tokens[5..9],
-        ["--agent", "claude", "--state", state],
+        &tokens[5..7],
+        ["--token", &format!("clauth_delegate={state}")],
         "argv: {line}"
     );
+    assert_eq!(&tokens[7..9], ["--ttl-ms", "60000"], "argv: {line}");
     assert_eq!(tokens[9], "--seq", "argv: {line}");
     tokens[10].parse::<u64>().expect("seq is numeric")
 }
@@ -623,6 +628,56 @@ fn a_same_millisecond_pair_still_separates() {
     assert!(
         seqs.windows(2).all(|w| w[1] > w[0]),
         "seq is strictly increasing inside one millisecond: {seqs:?}"
+    );
+}
+
+// ── refresh: long runs keep the working reading alive ────────────────────────
+
+#[test]
+fn a_long_run_refreshes_working_until_the_end() {
+    let home = HomeSandbox::new();
+    let shim = echo_shim(home.home(), "herdr");
+    let reporter = pinned_reporter(&home, "pane-9", &shim);
+    // The real interval never fires inside a test's run time, so a test-sized
+    // second refresher stands in for it.
+    reporter.spawn_refresher_for_test(Duration::from_millis(100));
+    reporter.begin();
+    // The initial working plus at least two refreshes: the reading is what
+    // re-reports, not the transition.
+    wait_for_lines(home.home(), 3, Duration::from_secs(10));
+    // The idle report rides the guard's drop, the way a run ends it.
+    drop(InFlightGuard::end_only(reporter));
+    // A refresh spawned just before the leave can still land its log line
+    // after the idle's; herdr drops it by seq, so the log is read in seq
+    // order, which is the order herdr reads it in. The pause also lets every
+    // straggler land before the counts below.
+    std::thread::sleep(Duration::from_millis(500));
+    let mut lines = report_lines(home.home());
+    lines.sort_by_key(|line| seq_of(line));
+    let states: Vec<Option<&str>> = lines.iter().map(|l| state_of(l)).collect();
+    assert_eq!(
+        states.last(),
+        Some(&Some("idle")),
+        "the last report in seq order is idle: {lines:?}"
+    );
+    assert!(
+        states[..states.len() - 1]
+            .iter()
+            .all(|s| *s == Some("working")),
+        "every report before the idle is working: {lines:?}"
+    );
+    let seqs: Vec<u64> = lines.iter().map(|l| seq_of(l)).collect();
+    assert!(
+        seqs.windows(2).all(|w| w[1] > w[0]),
+        "refresh seqs are strictly increasing, the final idle outranking the last refresh: {seqs:?}"
+    );
+    // And the refresher stops once the idle landed: nothing can follow it.
+    let after = report_lines(home.home()).len();
+    std::thread::sleep(Duration::from_millis(400));
+    assert_eq!(
+        report_lines(home.home()).len(),
+        after,
+        "no report after the final idle: {lines:?}"
     );
 }
 

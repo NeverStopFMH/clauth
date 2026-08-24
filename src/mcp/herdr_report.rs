@@ -1,21 +1,54 @@
-//! Best-effort herdr agents-panel state reports for the pane this MCP server
-//! runs in (`herdr pane report-agent`).
+//! Best-effort herdr pane metadata reports carrying the delegate state of the
+//! pane this MCP server runs in (`herdr pane report-metadata`).
 //!
 //! herdr injects `HERDR_PANE_ID` and `HERDR_BIN_PATH` into every pane process,
 //! so the server (a Claude Code child) inherits its pane id. While a
-//! `delegate` is in flight the pane's agent icon reports `working`; when the
-//! last in-flight delegate ends it reports `idle`. One process-local counter
-//! tracks sync and background delegates together, so a background job
-//! finalizing mid-run can never clear the icon while a sync delegate still
-//! runs.
+//! `delegate` is in flight the pane carries a `clauth_delegate` metadata token
+//! reading `working`; when the last in-flight delegate ends it reads `idle`.
+//! One process-local counter tracks sync and background delegates together, so
+//! a background job finalizing mid-run can never clear the reading while a
+//! sync delegate still runs.
+//!
+//! The token is the form picked for this API. `pane report-agent` is dropped
+//! on every pane herdr's own Claude Code integration has anchored (all
+//! operator panes; re-measured 2026-08-25 on herdr 0.8.2: exit 0, no state
+//! change), and metadata cannot move the agent-state icon there either — that
+//! icon is herdr's own lifecycle authority's, and a metadata report writes
+//! presentation only (tokens, title, display agent, state-label text;
+//! measured 2026-08-25 on 0.8.2: a report carrying `--state-label` and
+//! `--display-agent` applied at exit 0 and `agent_status` did not move).
+//! `--state-label` relabels states herdr itself computes instead of reporting
+//! one, so a background delegate — the case the counter exists for — could
+//! never light it: the pane's own agent is idle while the delegate runs. The
+//! token key `clauth_delegate` is distinct from the `clauth` key the
+//! herdr-plugin's profile tag owns; both spell `--source clauth`, and herdr
+//! 0.8.2 merges tokens per key and expires them per key (both measured
+//! 2026-08-25 on an anchored pane: a probe token applied beside the standing
+//! `clauth` tag, and a 20 s TTL cleared it on its own clock while the tag's
+//! watcher kept re-reporting beside it).
+//!
+//! The icon itself stays herdr's own: on a pane its integration has anchored
+//! the icon moves with the pane's agent's own activity, and a metadata report
+//! never moves it, so this module never tries. What the token does is carry
+//! the delegate state for the cases the icon cannot: a background delegate
+//! (the pane's own agent sits idle while the delegate spends), an unanchored
+//! pane, and a dead server (the TTL clears the stale `working`). herdr renders
+//! a token only where a sidebar row template names it — the same rule the
+//! profile tag lives under — and the row `clauth herdr install` writes
+//! (`herdr.rs`) names `$clauth` alone, the profile tag. So the state reads on
+//! the pane JSON (`pane get` / `pane list`), not on the pane row. Measured
+//! 2026-08-25 on 0.8.2: an applied token rendered nowhere on the agent row,
+//! and rendered `working` beside the account tag when a test template named
+//! the token.
 //!
 //! Every report is best-effort: a failed or hanging herdr spawn never fails a
 //! delegate. It does cost time, and the serve runtime is
 //! `new_current_thread()`, so the cost is the whole server's. Only the
-//! `working` half is charged to that thread now — it runs at commit-to-launch,
+//! `working` half is charged to that thread — it runs at commit-to-launch,
 //! before the delegate reaches `spawn_blocking` — while `idle` rides the run's
 //! own blocking task, where a hung herdr delays nothing but that task's own
-//! end. Failures are silent except for one `logline`
+//! end. The refresher below runs on its own detached thread, never the serve
+//! thread. Failures are silent except for one `logline`
 //! each (the MCP stdio channel carries only the JSON-RPC frame on stdout, and
 //! `logline` routes off it — to the log file on an interactive pane, stderr
 //! otherwise).
@@ -27,33 +60,25 @@
 //! path (`ClauthServer::with_herdr_pane`); a server built without it is a
 //! silent no-op.
 //!
-//! Ceiling: the counter is process-local, so a server that dies mid-delegate
-//! never reports idle (herdr reclaims the state when the pane's agent process
-//! exits). Two clauth servers sharing one pane have the same hole from the
-//! other side: herdr keys its high-water on `--source`, both spell `clauth`,
-//! and an epoch-ms seq is comparable across processes, so one session's `idle`
-//! can outrank the other's live `working` and clear the icon under it. Only two
+//! TTL and refresh: every report carries `--ttl-ms` [`STATE_TTL_MS`], so the
+//! token self-clears with no exit path running — a server that dies
+//! mid-delegate leaves a stale `working` for at most that long, where the old
+//! icon path relied on herdr reclaiming the state at agent exit. A delegate
+//! can run far longer than any single TTL, so while anything is in flight a
+//! refresher thread re-reports `working` every [`REFRESH_INTERVAL`] (four
+//! chances inside one TTL). It wakes on its own clock, mints each seq under
+//! the same [`Gate`] lock as the transitions — so the final `idle` always
+//! outranks the last refresh, and herdr's per-source high-water drops a stale
+//! `working` that lands after it — and holds the reporter through a `Weak`,
+//! so the thread ends once the last reporter clone drops. The `idle` report
+//! replaces `working` at once and then self-clears at the TTL.
+//!
+//! Ceiling (survives): two clauth servers sharing one pane both spell
+//! `--source clauth`, the token key is shared, and an epoch-ms seq is
+//! comparable across processes, so one session's `idle` can outrank the
+//! other's live `working` and clear the reading under it. Only two
 //! independent Claude Code sessions in one pane reach that; a delegate's own
 //! `claude` cannot, since the depth guard refuses it a second `delegate`.
-//!
-//! And on herdr 0.8.0 the report only moves an icon where herdr's own Claude
-//! Code integration has not already anchored that pane to a session:
-//! `set_hook_authority_at` drops a report on an owner conflict unless the
-//! foreground-takeover path recognizes the source, and `agent_resume::plan`
-//! recognizes only herdr's own `herdr:*` sources, which no clauth report can
-//! claim to be. That gate is the one clauth cannot pass by construction, never
-//! the only one: `session_identity_only_integration`, the recent-agent-exit
-//! check on `recent_agent_process_exit`, `route_full_lifecycle_hook_report`
-//! answering `Ignore`, and `known_agent_label_conflicts_with_detected_agent`
-//! each drop a report ahead of it, so an unclaimed pane can still swallow one.
-//!
-//! That limit is permanent, so this whole module is on a dead path. herdr keeps
-//! one lifecycle authority per pane by design and closed the ask to loosen it
-//! (`herdrdev/herdr#2824`, NOT_PLANNED), directing a hook that runs beside its
-//! own integration to report METADATA instead. `pane report-metadata` was
-//! measured applying on an anchored pane the same day, and it carries a
-//! `--ttl-ms` that would also retire the mid-delegate-death ceiling above.
-//! Until then the icon never moves on a pane an operator actually works in.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -64,8 +89,29 @@ use crate::logline::logline;
 
 /// How long one report may block its caller on a hung herdr before the child
 /// is killed and the report dropped. Bounds the worst-case delay a stuck herdr
-/// adds to a delegate (two reports per run).
+/// adds to a delegate (two reports per run) and the worst case of the
+/// refresher thread.
 const REPORT_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// The TTL every state report carries: the token self-clears this long after
+/// its report unless a fresher report replaces it first. Bounds the stale
+/// `working` a dead server leaves behind, and clears the `idle` reading once
+/// it has served its glimpse.
+const STATE_TTL_MS: u64 = 60_000;
+
+/// How often the refresher re-reports `working` while anything is in flight.
+const REFRESH_INTERVAL: Duration = Duration::from_secs(15);
+
+/// The ratio is the liveness margin: four chances inside one TTL, so three
+/// refreshes can fail before the reading lapses. Compile-time, so an edit
+/// cannot stretch the interval past that margin under a green gate.
+const _: () = assert!(STATE_TTL_MS >= REFRESH_INTERVAL.as_millis() as u64 * 4);
+
+/// The metadata token key carrying the state. Distinct from `clauth`, the key
+/// the herdr-plugin's profile tag owns (`report-profile.sh`); herdr merges
+/// tokens per key within one source, so a shared `--source clauth` lets the
+/// state read beside the profile tag instead of replacing it.
+const TOKEN_KEY: &str = "clauth_delegate";
 
 /// Process-local delegate tracking for one herdr pane. Cheap to clone: every
 /// handle shares the same counters.
@@ -84,7 +130,8 @@ struct Shared {
 /// per-source high-water seq and drops anything not newer, so two reports whose
 /// seqs order against their transitions leave the pane holding the loser's
 /// state. Deciding and minting apart cannot give that ordering, whatever each
-/// half is individually atomic over.
+/// half is individually atomic over. Refreshes mint here too, so the final
+/// `idle` always outranks the last `working` re-report.
 #[derive(Default)]
 struct Gate {
     /// In-flight delegates (sync and background). Reports fire on the 0→1
@@ -112,26 +159,26 @@ impl PaneReporter {
             return None;
         }
         let bin = resolve_bin()?;
-        Some(Self {
-            shared: Arc::new(Shared {
-                bin,
-                pane_id,
-                gate: Mutex::new(Gate::default()),
-            }),
-        })
+        let shared = Arc::new(Shared {
+            bin,
+            pane_id,
+            gate: Mutex::new(Gate::default()),
+        });
+        spawn_refresher(&shared, REFRESH_INTERVAL);
+        Some(Self { shared })
     }
 
     /// One in-flight delegate began: report `working` on the 0→1 transition.
     pub(crate) fn begin(&self) {
         if let Some(seq) = self.enter() {
-            self.report("working", seq);
+            report(&self.shared, "working", seq);
         }
     }
 
     /// One in-flight delegate ended: report `idle` on the →0 transition.
     fn end(&self) {
         if let Some(seq) = self.leave() {
-            self.report("idle", seq);
+            report(&self.shared, "idle", seq);
         }
     }
 
@@ -174,8 +221,8 @@ impl PaneReporter {
     /// observe the ordering these two promise.
     ///
     /// `unix` tracks the gate on the only suite that calls them: its shim herdr
-    /// is POSIX shell, so the whole module compiles out on the Windows leg and
-    /// an ungated helper reds that leg alone under `-D warnings`.
+    /// is POSIX shell, so the whole test module compiles out on the Windows leg
+    /// and an ungated helper reds that leg alone under `-D warnings`.
     #[cfg(all(test, unix))]
     pub(super) fn enter_for_test(&self) -> Option<u64> {
         self.enter()
@@ -186,57 +233,98 @@ impl PaneReporter {
         self.leave()
     }
 
-    /// One report to the pane: spawn `herdr pane report-agent` and wait up to
-    /// [`REPORT_TIMEOUT`]. Every failure is swallowed — the pane icon is
-    /// cosmetic, so a broken herdr must cost the delegate nothing.
-    fn report(&self, state: &str, seq: u64) {
-        // Pane id FIRST: herdr's hand-rolled parser reads it as args[0] and
-        // answers `unknown option` (exit 2) to anything else in that slot.
-        let mut cmd = Command::new(&self.shared.bin);
-        cmd.args(["pane", "report-agent"])
-            .arg(&self.shared.pane_id)
-            .args(["--source", "clauth", "--agent", "claude", "--state", state])
-            .arg("--seq")
-            .arg(seq.to_string())
-            // Never leak herdr's output into the MCP channel or the console.
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null());
-        let Ok(mut child) = cmd.spawn() else {
-            logline!(
-                "clauth: herdr pane report-agent spawn failed (pane state {state} not reported)"
-            );
-            return;
-        };
-        let deadline = Instant::now() + REPORT_TIMEOUT;
-        loop {
-            match child.try_wait() {
-                Ok(Some(status)) => {
-                    if !status.success() {
-                        logline!(
-                            "clauth: herdr pane report-agent exited {status} (pane state {state} not reported)"
-                        );
-                    }
-                    return;
+    /// The refresher with a test-sized interval, on top of the real one (which
+    /// never fires inside a test's run time). `unix` as above.
+    #[cfg(all(test, unix))]
+    pub(super) fn spawn_refresher_for_test(&self, interval: Duration) {
+        spawn_refresher(&self.shared, interval);
+    }
+}
+
+/// Detached re-reporter behind the `working` reading: sleeps `interval`, then
+/// re-reports `working` when anything is in flight. Its own thread with a
+/// `Weak` hold on the reporter: it can never stall the serve thread or the
+/// run's task, its worst case is its own [`REPORT_TIMEOUT`], and it ends once
+/// the last reporter clone drops.
+fn spawn_refresher(shared: &Arc<Shared>, interval: Duration) {
+    let weak = Arc::downgrade(shared);
+    let spawned = std::thread::Builder::new()
+        .name("clauth-herdr-refresh".to_string())
+        .spawn(move || {
+            loop {
+                std::thread::sleep(interval);
+                let Some(shared) = weak.upgrade() else {
+                    break;
+                };
+                let seq = {
+                    let mut gate = shared.gate.lock().unwrap_or_else(PoisonError::into_inner);
+                    (gate.in_flight > 0).then(|| gate.mint())
+                };
+                if let Some(seq) = seq {
+                    report(&shared, "working", seq);
                 }
-                Ok(None) if Instant::now() >= deadline => {
-                    let _ = child.kill();
-                    let _ = child.wait();
+            }
+        });
+    if spawned.is_err() {
+        logline!(
+            "clauth: herdr pane refresh thread failed to spawn (working reads will not refresh; the TTL still bounds staleness)"
+        );
+    }
+}
+
+/// One report to the pane: spawn `herdr pane report-metadata` and wait up to
+/// [`REPORT_TIMEOUT`]. Every failure is swallowed — the pane token is
+/// cosmetic, so a broken herdr must cost the delegate nothing.
+fn report(shared: &Shared, state: &str, seq: u64) {
+    // Pane id FIRST: herdr's hand-rolled parser reads it as args[0] and
+    // answers `unknown option` (exit 2) to anything else in that slot.
+    let token = format!("{TOKEN_KEY}={state}");
+    let mut cmd = Command::new(&shared.bin);
+    cmd.args(["pane", "report-metadata"])
+        .arg(&shared.pane_id)
+        .args(["--source", "clauth", "--token", &token])
+        .arg("--ttl-ms")
+        .arg(STATE_TTL_MS.to_string())
+        .arg("--seq")
+        .arg(seq.to_string())
+        // Never leak herdr's output into the MCP channel or the console.
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    let Ok(mut child) = cmd.spawn() else {
+        logline!(
+            "clauth: herdr pane report-metadata spawn failed (pane state {state} not reported)"
+        );
+        return;
+    };
+    let deadline = Instant::now() + REPORT_TIMEOUT;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                if !status.success() {
                     logline!(
-                        "clauth: herdr pane report-agent timed out (killed; pane state {state} not reported)"
+                        "clauth: herdr pane report-metadata exited {status} (pane state {state} not reported)"
                     );
-                    return;
                 }
-                Ok(None) => std::thread::sleep(Duration::from_millis(10)),
-                // `Child`'s drop detaches without waiting, so a failed
-                // `waitpid` (ECHILD, or EINTR on some libc paths) would leave
-                // a zombie for the life of the server. Reap here as every
-                // other arm does.
-                Err(_) => {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return;
-                }
+                return;
+            }
+            Ok(None) if Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                logline!(
+                    "clauth: herdr pane report-metadata timed out (killed; pane state {state} not reported)"
+                );
+                return;
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(10)),
+            // `Child`'s drop detaches without waiting, so a failed
+            // `waitpid` (ECHILD, or EINTR on some libc paths) would leave
+            // a zombie for the life of the server. Reap here as every
+            // other arm does.
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return;
             }
         }
     }

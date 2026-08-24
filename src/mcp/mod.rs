@@ -522,7 +522,7 @@ fn fold_delegate_live_usage(
 pub(crate) struct ClauthServer {
     tool_router: ToolRouter<Self>,
     /// `Some` only when the serve path resolved a herdr pane: `delegate` then
-    /// reports `working`/`idle` to herdr's agents panel. A server built
+    /// reports `working`/`idle` as a pane metadata token. A server built
     /// without it is a silent no-op.
     herdr_pane: Option<herdr_report::PaneReporter>,
     /// The since-your-last-call baseline every clone shares (rmcp clones the
@@ -1402,9 +1402,9 @@ Delegating spends the target account, so pick the account with `profiles` first.
             endpoint: endpoint.clone(),
         });
         // Commits to spawn: from here the delegate is in flight. `begin` reports
-        // `working` to herdr's agents panel; the task's own end-guard decrements
-        // on every exit path — clean result, deadline kill, non-zero exit,
-        // unparseable output, or a task panic — so the panel follows the run
+        // `working` as pane metadata; the task's own end-guard decrements on
+        // every exit path — clean result, deadline kill, non-zero exit,
+        // unparseable output, or a task panic — so the reading follows the run
         // rather than this call, which a hand-off can outlive.
         if let Some(pane) = &self.herdr_pane {
             pane.begin();

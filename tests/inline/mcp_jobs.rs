@@ -26,6 +26,7 @@ fn spec(job_id: &str, profile: &str, started_at: u64) -> RunningSpec {
         started_at,
         recorded_at: started_at,
         timeout_secs: 0,
+        endpoint: None,
         idle_secs: Some(300),
         kind: RecordKind::Collectable,
     }
@@ -62,7 +63,7 @@ fn write_read_roundtrip_running_then_done() {
     assert!(r.envelope.is_none());
 
     let env = serde_json::json!({ "is_error": false, "result": "ok" });
-    write_done(&id, "work", 1000, env.clone()).unwrap();
+    write_done(&id, "work", 1000, None, env.clone()).unwrap();
     let r = read(&id).expect("done record");
     assert_eq!(r.state, JobState::Done);
     assert_eq!(r.envelope, Some(env));
@@ -734,6 +735,7 @@ fn job_files_and_dir_are_owner_only() {
         &id,
         "work",
         1000,
+        None,
         serde_json::json!({"result": "secret output"}),
     )
     .unwrap();

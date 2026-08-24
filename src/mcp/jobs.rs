@@ -154,6 +154,16 @@ pub(crate) struct JobRecord {
     pub(crate) started_at: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) envelope: Option<serde_json::Value>,
+    /// Which endpoint this run's requests went to, in the roster's own host
+    /// spelling (`anthropic`, or the host the stored endpoint names). The
+    /// CALL's answer, resolved once when the call was made, because a caller
+    /// `env` override retargets one run without touching the profile and no
+    /// later name-keyed read can recover it. `None` on a record an older
+    /// server wrote or on one whose endpoint could not be resolved at the
+    /// call: the fold reads it as "cannot say" rather than asserting the
+    /// managed field's answer for a call that may have gone elsewhere.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) endpoint: Option<String>,
     /// The wall-clock ceiling this run actually launched under, resolved once by
     /// `resolve_deadlines`. `0` is never a run about to be killed: it means this
     /// run HAS no wall clock, which is the normal streaming case, or — paired
@@ -222,6 +232,10 @@ pub(crate) struct RunningSpec {
     pub(crate) recorded_at: u64,
     pub(crate) timeout_secs: u64,
     pub(crate) idle_secs: Option<u64>,
+    /// The call's resolved endpoint, carried through every heartbeat so a
+    /// hand-off and the final [`write_done`] record the same answer the mint
+    /// resolved once.
+    pub(crate) endpoint: Option<String>,
     /// Which spelling every write of this record lands under. A background job
     /// is `Collectable` from its reserve; a blocking one is `Liveness` until its
     /// caller walks away and [`promote`] renames it.
@@ -335,6 +349,7 @@ pub(crate) fn write_heartbeat(spec: &RunningSpec, last_output_at: u64, tail: &st
             envelope: None,
             timeout_secs: spec.timeout_secs,
             idle_secs: spec.idle_secs,
+            endpoint: spec.endpoint.clone(),
             last_output_at,
             recorded_at: spec.recorded_at,
             tail: tail.to_string(),
@@ -377,6 +392,7 @@ pub(crate) fn write_done(
     job_id: &str,
     profile: &str,
     started_at: u64,
+    endpoint: Option<String>,
     envelope: serde_json::Value,
 ) -> Result<()> {
     write_atomic(
@@ -386,6 +402,7 @@ pub(crate) fn write_done(
             state: JobState::Done,
             started_at,
             envelope: Some(envelope),
+            endpoint,
             timeout_secs: 0,
             idle_secs: None,
             last_output_at: 0,

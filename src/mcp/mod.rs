@@ -213,7 +213,13 @@ fn profile_row(p: &Profile, config: &AppConfig, now: i64) -> serde_json::Value {
     // Host, not the full endpoint: the host is the identifying half, and the path
     // costs tokens on every row without adding to it. For which hosts then read
     // as local, see `render::host_locality`.
-    if let Some(url) = &p.base_url {
+    //
+    // Both endpoint halves, not the managed field alone: an account routing
+    // through an operator-authored `[env] ANTHROPIC_BASE_URL` has no managed
+    // `base_url`; a row reading only the managed field renders it as an
+    // Anthropic account, which is exactly the read the cost model must not
+    // make. `Profile::routing_endpoint` names the producer's precedence.
+    if let Some(url) = p.routing_endpoint() {
         row["host"] = serde_json::json!(render::base_url_host(url));
     }
     // Both of these are absent unless they say something. Emitted
@@ -416,25 +422,27 @@ fn fold_active_live_usage(
     serde_json::Value::Object(map)
 }
 
-/// Which endpoint a delegate's requests actually WENT to, as the roster's own
-/// host spelling — `anthropic` only for an account routing through neither an
-/// `[env] ANTHROPIC_BASE_URL` nor an effective managed `base_url`. `None` when
-/// clauth cannot read that account's config, which the renderer treats as
-/// "cannot say" rather than as Anthropic.
+/// The profile half of a delegate call's endpoint, name-keyed: the target
+/// profile's stored endpoint in the roster's own host spelling, `anthropic`
+/// only for an account routing through neither an `[env] ANTHROPIC_BASE_URL`
+/// nor an effective managed `base_url`. `None` when clauth cannot read that
+/// account's config, which the renderer treats as "cannot say" rather than as
+/// Anthropic.
 ///
-/// The question is "where did this request go", so it reads `stored_endpoint`
-/// (both sources, env first) and not `is_third_party` (which answers "is the
-/// provider one clauth has a typed integration for"), not
-/// `usage_cache_is_third_party` (which answers "which cache holds this
-/// account's figures"), and not `Profile::is_oauth` (which reads the managed
-/// field alone). All four disagree somewhere, and only this one bounds what
-/// `total_cost_usd` may claim.
+/// The question is "where did this request go", so it reads
+/// [`crate::profile::stored_endpoint`] (both profile sources, env first) and
+/// not `is_third_party` (which answers "is the provider one clauth has a
+/// typed integration for"), not `usage_cache_is_third_party` (which answers
+/// "which cache holds this account's figures"), and not `Profile::is_oauth`
+/// (which reads the managed field alone). All four disagree somewhere, and
+/// only this one bounds what `total_cost_usd` may claim.
 ///
-/// Name-keyed rather than threaded from a resolved `Profile`, because
-/// `fold_done_envelope` holds only the job record's name and `load_profile`
-/// there would take the state flock on a read-only collect path. One spelling
-/// for every fold site is what keeps the blocking and collect replies from
-/// disagreeing about one account.
+/// [`delegate_call_endpoint`] layers the caller's own `env` override on top;
+/// a caller wanting one answer for the whole call starts there. Name-keyed
+/// rather than threaded from a resolved `Profile`, because `load_profile`
+/// recovers a staged rotation under the cross-process state flock
+/// (`rank::State`, 500), a serialization point no fold path should sit
+/// inside.
 fn target_endpoint(name: &str) -> Option<String> {
     match crate::profile::stored_endpoint(name) {
         crate::profile::StoredEndpoint::Anthropic => Some("anthropic".to_string()),
@@ -445,6 +453,27 @@ fn target_endpoint(name: &str) -> Option<String> {
     }
 }
 
+/// Which endpoint one delegate CALL routes its child to: the caller's own
+/// `env` entry first, then the target profile's stored endpoint. Resolved at
+/// call time so the answer can travel with the job: the caller authored the
+/// override in the same call; after the call ends nothing else can see it.
+///
+/// The caller half mirrors the producer's precedence: `apply_delegate_env`
+/// scrubs the inherited profile env and layers `caller_env` over it, so an
+/// explicit `ANTHROPIC_BASE_URL` there is what the spawned `claude` reads.
+/// An entry that is blank once trimmed is no override, the same test
+/// [`crate::profile::stored_endpoint`] applies to the profile half.
+fn delegate_call_endpoint(target: &str, caller_env: &HashMap<String, String>) -> Option<String> {
+    if let Some(url) = caller_env
+        .get("ANTHROPIC_BASE_URL")
+        .map(|v| v.trim())
+        .filter(|v| !v.is_empty())
+    {
+        return Some(render::base_url_host(url).to_string());
+    }
+    target_endpoint(target)
+}
+
 /// Fold the target profile's live usage into a delegate envelope (the sync
 /// `delegate` and `monitor` done-handoff paths share this). The
 /// envelope is whatever `claude` printed, so it may be ANY json shape:
@@ -452,9 +481,17 @@ fn target_endpoint(name: &str) -> Option<String> {
 /// wrapped under `result` (the documented self-report key) first — `serde_json`'s
 /// string-key `IndexMut` auto-vivifies only `Null` and panics on every other
 /// non-object, and the delegate's own output must survive the fold either way.
+///
+/// `endpoint` is the CALL's answer, resolved by the caller: the blocking and
+/// background handler arms resolve it at call time
+/// ([`delegate_call_endpoint`]), the collect and hook paths take it off the
+/// job record. `None` is "cannot say"; the endpoint key then stays absent
+/// rather than falling back to a name-keyed read of a profile the call may
+/// never have routed through.
 fn fold_delegate_live_usage(
     payload: serde_json::Value,
     profile: &str,
+    endpoint: Option<String>,
     now: i64,
     digest: DigestMode<'_>,
 ) -> serde_json::Value {
@@ -468,7 +505,7 @@ fn fold_delegate_live_usage(
     };
     let windows = profile_windows_for(profile);
     let mut live = live_usage_json(Some(profile), Some(&windows));
-    if let Some(endpoint) = target_endpoint(profile) {
+    if let Some(endpoint) = endpoint {
         live["endpoint"] = serde_json::Value::String(endpoint);
     }
     if let Some(note) = throughput_note(profile, now) {
@@ -1071,9 +1108,19 @@ Delegating spends the target account, so pick the account with `profiles` first.
                         isolation,
                         depth,
                     };
-                    let reserved =
-                        reserve_background_job(&name, timeout_secs, idle_secs, streaming)
-                            .map_err(|e| ErrorData::internal_error(e, None))?;
+                    // Resolved once, at call time, so the handle and the job
+                    // record agree with each other and with where the child
+                    // actually routes. A later profile edit changes none of
+                    // the three.
+                    let endpoint = delegate_call_endpoint(&name, &opts.env);
+                    let reserved = reserve_background_job(
+                        &name,
+                        timeout_secs,
+                        idle_secs,
+                        streaming,
+                        endpoint.clone(),
+                    )
+                    .map_err(|e| ErrorData::internal_error(e, None))?;
                     let job_id = reserved.spec.job_id.clone();
                     let started_at = reserved.spec.started_at;
                     // Commits to launch: the job file is reserved and the task
@@ -1100,6 +1147,7 @@ Delegating spends the target account, so pick the account with `profiles` first.
                             "status": "running",
                         }),
                         &name,
+                        endpoint,
                         now_epoch_secs(),
                         DigestMode::Report(&self.digest),
                     );
@@ -1129,7 +1177,13 @@ Delegating spends the target account, so pick the account with `profiles` first.
                     // drop them and keep the all-or-nothing contract.
                     let mut reserved = Vec::with_capacity(names.len());
                     for name in &names {
-                        match reserve_background_job(name, timeout_secs, idle_secs, streaming) {
+                        match reserve_background_job(
+                            name,
+                            timeout_secs,
+                            idle_secs,
+                            streaming,
+                            delegate_call_endpoint(name, &opts.env),
+                        ) {
                             Ok(job) => reserved.push(job),
                             Err(reason) => {
                                 for job in reserved {
@@ -1147,6 +1201,10 @@ Delegating spends the target account, so pick the account with `profiles` first.
                         }
                         let job_id = job.spec.job_id.clone();
                         let started_at = job.spec.started_at;
+                        // The reservation's own answer, so a row agrees with
+                        // the record it names rather than re-resolving and
+                        // hoping nothing moved.
+                        let endpoint = job.spec.endpoint.clone();
                         launch_background_delegate(
                             name.clone(),
                             opts.clone(),
@@ -1166,6 +1224,7 @@ Delegating spends the target account, so pick the account with `profiles` first.
                                 "status": "running",
                             }),
                             name,
+                            endpoint,
                             now,
                             DigestMode::Skip,
                         ));
@@ -1219,6 +1278,7 @@ Delegating spends the target account, so pick the account with `profiles` first.
                         timeout_secs,
                         idle_secs,
                         streaming,
+                        endpoint: delegate_call_endpoint(name, &opts.env),
                     });
                     handles.push(spawn_delegate(
                         name.clone(),
@@ -1248,7 +1308,7 @@ Delegating spends the target account, so pick the account with `profiles` first.
                 let now = now_epoch_secs();
                 match joined {
                     JoinedAll::Ran { values, abandoned } => {
-                        let rows = fold_fanout_rows(&names, values, now);
+                        let rows = fold_fanout_rows(&names, &opts.env, values, now);
                         let is_error = fanout_is_error(&rows);
                         let mut payload = serde_json::json!({ "results": rows });
                         // One digest for the whole call, top-level beside
@@ -1294,6 +1354,7 @@ Delegating spends the target account, so pick the account with `profiles` first.
                                         "status": "running",
                                     }),
                                     &profile,
+                                    delegate_call_endpoint(&profile, &opts.env),
                                     now,
                                     DigestMode::Skip,
                                 )
@@ -1312,16 +1373,6 @@ Delegating spends the target account, so pick the account with `profiles` first.
         // mints this run's job file from the OUTSIDE and `resolve_deadlines`
         // forks on it.
         let streaming = !sets_output_format(&extra_args);
-        let started_at = now_ms();
-        // A blocking run owns no job file yet. It gets one the moment its caller
-        // walks away from a child that is already spending.
-        let handoff = Handoff::blocking(MintSpec {
-            profile: target.clone(),
-            started_at,
-            timeout_secs,
-            idle_secs,
-            streaming,
-        });
         let opts = BackgroundOpts {
             prompt,
             model,
@@ -1334,6 +1385,21 @@ Delegating spends the target account, so pick the account with `profiles` first.
             isolation,
             depth,
         };
+        // Resolved once, at call time, so the blocking reply and a job file
+        // minted by a hand-off carry the same answer. A caller `env` override
+        // retargets this one run without touching the profile.
+        let endpoint = delegate_call_endpoint(&target, &opts.env);
+        let started_at = now_ms();
+        // A blocking run owns no job file yet. It gets one the moment its caller
+        // walks away from a child that is already spending.
+        let handoff = Handoff::blocking(MintSpec {
+            profile: target.clone(),
+            started_at,
+            timeout_secs,
+            idle_secs,
+            streaming,
+            endpoint: endpoint.clone(),
+        });
         // Commits to spawn: from here the delegate is in flight. `begin` reports
         // `working` to herdr's agents panel; the task's own end-guard decrements
         // on every exit path — clean result, deadline kill, non-zero exit,
@@ -1395,6 +1461,7 @@ Delegating spends the target account, so pick the account with `profiles` first.
         let payload = fold_delegate_live_usage(
             envelope,
             &target,
+            endpoint,
             now_epoch_secs(),
             delegate_digest_mode(&self.digest, abandoned),
         );
@@ -1967,6 +2034,7 @@ fn delegate_digest_mode(digest: &DigestTracker, abandoned: bool) -> DigestMode<'
 /// so a reversed pairing reds a test instead of rendering two identical rows.
 fn fold_fanout_rows(
     names: &[String],
+    caller_env: &HashMap<String, String>,
     values: Vec<std::result::Result<serde_json::Value, String>>,
     now: i64,
 ) -> Vec<serde_json::Value> {
@@ -1982,7 +2050,13 @@ fn fold_fanout_rows(
                     "result": reason,
                 }),
             };
-            fold_delegate_live_usage(envelope, name, now, DigestMode::Skip)
+            fold_delegate_live_usage(
+                envelope,
+                name,
+                delegate_call_endpoint(name, caller_env),
+                now,
+                DigestMode::Skip,
+            )
         })
         .collect()
 }
@@ -2412,6 +2486,11 @@ fn fold_done_envelope(
             })
         }),
         &record.profile,
+        // The call's own answer, recorded at the mint. Absent on a record an
+        // older server wrote, which the fold reads as "cannot say": a
+        // name-keyed read would assert the managed field's answer for a call
+        // that may have been retargeted by its own `env` argument.
+        record.endpoint.clone(),
         now_epoch_secs(),
         digest,
     );
@@ -2680,9 +2759,11 @@ async fn wait_for_batch(
 
 /// `clauth mcp-await-job` — the body of the bundled PostToolUse `asyncRewake`
 /// hook. Reads the hook payload on stdin, finds every background `job_id` in it,
-/// waits for each, prints the delivered envelopes to stdout, and exits 2 to wake
-/// the model. A sync `delegate` (no `job_id` in the payload) is a no-op (exit 0).
-/// On its own deadline it exits 2 with a nudge to call `monitor` instead.
+/// waits for each, prints each delivered envelope's prose (prefixed with the
+/// account it spent, the same opener the collect reply uses) to stdout, and
+/// exits 2 to wake the model. A sync `delegate` (no `job_id` in the payload)
+/// is a no-op (exit 0). On its own deadline it exits 2 with a nudge to call
+/// `monitor` instead.
 pub(crate) fn await_job() -> ! {
     use std::io::Read;
     let mut input = String::new();
@@ -2702,7 +2783,18 @@ pub(crate) fn await_job() -> ! {
     let (delivered, pending) =
         await_job_outcomes(&job_ids, Duration::from_secs(AWAIT_JOB_DEADLINE_SECS));
     for envelope in &delivered {
-        outln!("{envelope}");
+        // One line per delivered envelope, each opening with its account: a
+        // fan-out delivers N lines in one hook run; a bare cost figure names
+        // nobody to charge it to.
+        let profile = envelope
+            .get("live_usage")
+            .and_then(|lu| lu.get("profile"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown");
+        outln!(
+            "delegate to `{profile}` {}",
+            render::envelope_prose(envelope)
+        );
     }
     if delivered.is_empty() {
         std::process::exit(0); // every id already gone: nothing was delivered
@@ -2720,8 +2812,10 @@ pub(crate) fn await_job() -> ! {
 }
 
 /// Poll every id in `job_ids` until each is `done` or gone, or `deadline`
-/// passes. Returns the delivered envelopes and the ids still `running` at the
-/// deadline. An absent id is dropped silently (its file was GC'd or already
+/// passes. Returns the delivered envelopes, folded the way every collect
+/// folds them ([`fold_done_envelope`]: live-usage footer, cost endpoint, and
+/// the no-envelope fallback), plus the ids still `running` at the deadline.
+/// An absent id is dropped silently (its file was GC'd or already
 /// collected). Blocking; the hook calls it directly on its own thread.
 fn await_job_outcomes(
     job_ids: &[String],
@@ -2733,13 +2827,7 @@ fn await_job_outcomes(
     loop {
         pending.retain(|id| match jobs::read(id) {
             Some(r) if r.state == jobs::JobState::Done => {
-                let envelope = r.envelope.unwrap_or_else(|| {
-                    serde_json::json!({
-                        "profile": r.profile,
-                        "is_error": true,
-                        "result": "job finished without an envelope",
-                    })
-                });
+                let (envelope, _is_error) = fold_done_envelope(&r, DigestMode::Skip);
                 delivered.push(envelope);
                 false
             }
@@ -4061,6 +4149,9 @@ struct MintSpec {
     timeout_secs: Option<u64>,
     idle_secs: Option<u64>,
     streaming: bool,
+    /// The call's resolved endpoint, so a record minted at the hand-off carries
+    /// the same answer the blocking reply folded with.
+    endpoint: Option<String>,
 }
 
 /// Record ONE background job's `running` file and return the reservation. This
@@ -4081,6 +4172,7 @@ fn reserve_background_job(
     timeout_secs: Option<u64>,
     idle_secs: Option<u64>,
     streaming: bool,
+    endpoint: Option<String>,
 ) -> std::result::Result<ReservedJob, String> {
     reserve_job(
         &MintSpec {
@@ -4089,6 +4181,7 @@ fn reserve_background_job(
             timeout_secs,
             idle_secs,
             streaming,
+            endpoint,
         },
         std::sync::Arc::new(AtomicBool::new(false)),
     )
@@ -4119,6 +4212,7 @@ fn mint_spec(mint: &MintSpec, kind: jobs::RecordKind) -> jobs::RunningSpec {
         // Without the event stream the idle leg is off entirely, so there is no
         // such deadline to count down to rather than an unknown one.
         idle_secs: mint.streaming.then_some(idle.as_secs()),
+        endpoint: mint.endpoint.clone(),
         kind,
     }
 }
@@ -4392,6 +4486,7 @@ impl Handoff {
                 &spec.job_id,
                 &spec.profile,
                 spec.started_at,
+                spec.endpoint.clone(),
                 envelope.clone(),
             );
             // Deregistered only now, AFTER the result is on disk: a cancel

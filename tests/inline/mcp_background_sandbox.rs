@@ -30,7 +30,7 @@ fn detached_task_still_running_at_teardown_never_touches_the_real_home() {
     let release_gate = arm_detach_gate();
 
     let reserved =
-        reserve_background_job(&profile, None, None, true).expect("reserve background job");
+        reserve_background_job(&profile, None, None, true, None).expect("reserve background job");
     let job_id = reserved.spec.job_id.clone();
     // `spawn_blocking` needs an entered Tokio runtime; the runtime itself must
     // outlive the spawn (dropping it can wait on outstanding blocking tasks,
@@ -236,6 +236,7 @@ fn a_job_left_running_fails_the_finalized_assertion() {
         started_at: 1,
         recorded_at: 1,
         timeout_secs: 60,
+        endpoint: None,
         idle_secs: None,
         kind: jobs::RecordKind::Collectable,
     })

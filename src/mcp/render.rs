@@ -1276,7 +1276,7 @@ fn denial_names(denials: Option<&Value>) -> Option<String> {
 /// out`), the self-report, cost and tokens, then the kill/resume markers. The
 /// raw envelope may carry more of claude's own fields; those stay in the JSON
 /// spelling, and this names the fields clauth documents.
-fn envelope_prose(e: &Value) -> String {
+pub(crate) fn envelope_prose(e: &Value) -> String {
     let mut out = String::new();
     let ran_for = || {
         e.get("elapsed_secs")
@@ -1319,21 +1319,19 @@ fn envelope_prose(e: &Value) -> String {
         //
         // Three readings, kept apart for the same reason `live_usage_prose`
         // keeps its three: only a POSITIVE `anthropic` earns the bare clause;
-        // a named other endpoint is known NOT to be Anthropic's; and an
-        // unfolded envelope, or a target clauth could not classify, knows
-        // neither — saying `not this endpoint's` there would assert an endpoint
-        // nobody read.
+        // a named other endpoint earns the equivalence clause, which states the
+        // figure is the Anthropic-card price; an unfolded envelope, or a target
+        // clauth could not classify, knows no name, so it keeps the clause and
+        // adds `endpoint unknown`.
         match e
             .get("live_usage")
             .and_then(|lu| lu.get("endpoint"))
             .and_then(Value::as_str)
         {
             Some("anthropic") => out.push_str(&format!(" (cost ${cost_s})")),
-            Some(_) => out.push_str(&format!(
-                " (cost ${cost_s} at Anthropic rates, not this endpoint's)"
-            )),
+            Some(_) => out.push_str(&format!(" (equivalent Anthropic API rate cost: ${cost_s})")),
             None => out.push_str(&format!(
-                " (cost ${cost_s} at Anthropic rates, endpoint unknown)"
+                " (equivalent Anthropic API rate cost: ${cost_s}, endpoint unknown)"
             )),
         }
     }

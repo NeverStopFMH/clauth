@@ -314,10 +314,30 @@ impl Profile {
     /// reads the two live files independently; setting an endpoint never drops
     /// stored credentials), and on such a hybrid the pair is the thing a log out
     /// has to clear — otherwise a live token sits on disk behind a logged-out
-    /// UI. Endpoint routing stays on [`Profile::is_oauth`]: a `base_url` decides
-    /// where requests go regardless of what else is stored.
+    /// UI. Endpoint routing is a different question and no method here answers
+    /// it: [`Profile::is_oauth`] reads the managed `base_url` field alone; an
+    /// operator-authored `[env] ANTHROPIC_BASE_URL` routes requests even with
+    /// no `base_url` set. A caller asking where requests go asks
+    /// [`stored_endpoint`], which reads both sources, or
+    /// [`Profile::routing_endpoint`] for a profile already in hand.
     pub(crate) fn login_is_oauth(&self) -> bool {
         self.credentials.is_some() || self.is_oauth()
+    }
+
+    /// The endpoint a LOADED profile routes its requests to, env half first:
+    /// the same two sources and the same precedence [`stored_endpoint`] reads
+    /// off disk, answered off the profile in hand. The order mirrors the
+    /// producer: `build_claude_settings_json` writes the managed `base_url`
+    /// into the settings env block and applies `profile.env` last, so an
+    /// explicit `ANTHROPIC_BASE_URL` there is what the spawned `claude` reads.
+    /// An entry that is blank once trimmed is no override, the same test
+    /// [`stored_endpoint`] applies.
+    pub(crate) fn routing_endpoint(&self) -> Option<&str> {
+        self.env
+            .get("ANTHROPIC_BASE_URL")
+            .map(|v| v.trim())
+            .filter(|v| !v.is_empty())
+            .or(self.base_url.as_deref())
     }
 
     /// Whether this account's endpoint is one clauth has a TYPED integration
@@ -1803,7 +1823,9 @@ pub(crate) fn stored_provider(name: &str) -> Option<Provider> {
 /// Nor is it [`Profile::is_oauth`], which reads the managed `base_url` field
 /// alone: an account routes through an operator-authored
 /// `[env] ANTHROPIC_BASE_URL` too, and does so even when the managed field is
-/// empty. This type answers over BOTH sources.
+/// empty. This type answers over BOTH sources. A caller holding a loaded
+/// [`Profile`] asks [`Profile::routing_endpoint`] instead, which answers the
+/// same question over the same two sources in the same order.
 pub(crate) enum StoredEndpoint {
     /// Requests go to Anthropic's own endpoint: no `[env] ANTHROPIC_BASE_URL`
     /// and no effective managed `base_url`.

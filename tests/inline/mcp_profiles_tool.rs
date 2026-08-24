@@ -470,6 +470,39 @@ fn a_userinfo_base_url_puts_no_credentials_on_the_profiles_row() {
     );
 }
 
+/// The roster's `host` reads both endpoint halves. An account whose endpoint
+/// exists only as an operator-authored `[env] ANTHROPIC_BASE_URL` has no
+/// managed `base_url`, and a row reading the managed field alone renders it
+/// as a plain Anthropic account with no host at all, which is the one place
+/// the cost model asks whether the host is loopback or LAN.
+#[test]
+fn an_env_authored_endpoint_renders_its_host_in_the_roster_row() {
+    let _home = HomeSandbox::new();
+    let mut envhost = Profile::new("envhost".to_string(), None, None);
+    envhost.env.insert(
+        "ANTHROPIC_BASE_URL".to_string(),
+        "http://localhost:4000/v1".to_string(),
+    );
+    save_profile(&envhost).expect("save env-endpoint profile");
+    save_app_state(&AppState {
+        active_profile: Some("envhost".into()),
+        profiles: vec!["envhost".into()],
+        ..Default::default()
+    })
+    .expect("save state");
+
+    let rows = lines(&call_profiles(None, None));
+    assert_eq!(
+        rows,
+        vec![
+            "- envhost (active) [anthropic, localhost:4000, local endpoint]: \
+             usage unknown; tier unknown"
+                .to_string()
+        ],
+        "the env-authored host renders in the row, locality marker included",
+    );
+}
+
 /// Finding 11: the retired `which` prose mapped a null tier to `unknown`
 /// unconditionally, while `profile_line` guards the same null on
 /// `provider == "anthropic"` — a third-party account has no plan tier to lose.

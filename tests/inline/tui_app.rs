@@ -134,6 +134,7 @@ fn the_delegates_pane_reads_the_store_in_banded_order() {
                 started_at: now - 900_000,
                 recorded_at: now - 900_000,
                 timeout_secs: 0,
+                endpoint: None,
                 idle_secs: Some(300),
                 kind: jobs::RecordKind::Collectable,
             },

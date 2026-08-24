@@ -1723,7 +1723,7 @@ fn the_cost_clause_is_bare_only_for_an_anthropic_target() {
     );
     assert_eq!(
         delegate_prose(&envelope("api.deepseek.com")),
-        "delegate to `t` finished: ok (cost $2.06 at Anthropic rates, not this endpoint's); \
+        "delegate to `t` finished: ok (equivalent Anthropic API rate cost: $2.06); \
          target `t`: 5h unknown, 7d unknown",
         "a base_url target's cost names its basis",
     );
@@ -1747,7 +1747,7 @@ fn a_cost_with_no_endpoint_to_read_is_qualified_never_bare() {
     });
     assert!(
         delegate_prose(&unfolded)
-            .contains("finished: ok (cost $2.06 at Anthropic rates, endpoint unknown)"),
+            .contains("finished: ok (equivalent Anthropic API rate cost: $2.06, endpoint unknown)"),
         "no `live_usage` at all still qualifies the figure, without claiming to \
          know the endpoint: {}",
         delegate_prose(&unfolded),
@@ -1762,7 +1762,7 @@ fn a_cost_with_no_endpoint_to_read_is_qualified_never_bare() {
     });
     assert!(
         delegate_prose(&unclassified)
-            .contains("finished: ok (cost $2.06 at Anthropic rates, endpoint unknown)"),
+            .contains("finished: ok (equivalent Anthropic API rate cost: $2.06, endpoint unknown)"),
         "a folded payload with no endpoint key qualifies too",
     );
 }
@@ -2010,8 +2010,8 @@ fn delegate_prose_shrinks_the_finished_envelope() {
     });
     assert_eq!(
         delegate_prose(&envelope),
-        "delegate to `DS8` finished: <the delegate's answer> (cost $3.411 at Anthropic rates, \
-         not this endpoint's), usage: input 83930 tokens, `cache_read_input_tokens` 3948672, \
+        "delegate to `DS8` finished: <the delegate's answer> (equivalent Anthropic API rate \
+         cost: $3.411), usage: input 83930 tokens, `cache_read_input_tokens` 3948672, \
          output 40681 tokens, `service_tier` standard, `speed` standard; resume with session id \
          `d44b2c9c-...`; permission denials: Bash; target `DS8`: no 5h/7d limits; \
          api balance: 1044.41 CNY (cached 35s ago)"

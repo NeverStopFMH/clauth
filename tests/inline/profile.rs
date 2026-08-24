@@ -2242,3 +2242,61 @@ fn resolving_a_home_with_no_sandbox_held_panics() {
         "the panic must name the fix, got: {message}"
     );
 }
+
+/// `login_is_oauth` answers credential typing; its doc must say so rather
+/// than claiming the routing question for the managed field. Pinned in
+/// source: a doc that reads as the whole routing rule is what routed
+/// readers to the wrong answer.
+#[test]
+fn login_is_oauth_doc_names_the_managed_half_and_points_at_the_routing_answer() {
+    let src = include_str!("../../src/profile.rs");
+    let before = &src[..src
+        .find("pub(crate) fn login_is_oauth(")
+        .expect("login_is_oauth is defined")];
+    let doc = &before[before
+        .rfind("/// Credential typing")
+        .expect("the doc opens with its subject")..];
+    assert!(
+        doc.contains("managed `base_url` field alone"),
+        "the doc names the half: {doc}"
+    );
+    assert!(
+        doc.contains("[`stored_endpoint`]"),
+        "the doc points at the reader that answers both halves: {doc}"
+    );
+}
+
+/// `routing_endpoint` reads both halves in the producer's order: an explicit
+/// env entry wins over the managed field, and a blank one is no override.
+/// Pinned because the blank test is what keeps an empty
+/// `ANTHROPIC_BASE_URL` from rerouting a roster row and a cost clause to
+/// nothing.
+#[test]
+fn routing_endpoint_reads_env_first_and_a_blank_entry_is_no_override() {
+    let mut p = Profile::new(
+        "p".to_string(),
+        Some("https://api.deepseek.com/anthropic".to_string()),
+        None,
+    );
+    assert_eq!(
+        p.routing_endpoint(),
+        Some("https://api.deepseek.com/anthropic"),
+        "the managed field alone answers when no env entry exists"
+    );
+    p.env.insert(
+        "ANTHROPIC_BASE_URL".to_string(),
+        "http://localhost:4000".to_string(),
+    );
+    assert_eq!(
+        p.routing_endpoint(),
+        Some("http://localhost:4000"),
+        "an explicit env entry wins, the producer's own order"
+    );
+    p.env
+        .insert("ANTHROPIC_BASE_URL".to_string(), "   ".to_string());
+    assert_eq!(
+        p.routing_endpoint(),
+        Some("https://api.deepseek.com/anthropic"),
+        "a blank entry is no override"
+    );
+}

@@ -1259,6 +1259,7 @@ fn fold_fanout_rows_pairs_each_envelope_with_its_own_account() {
     let names = vec!["solo".to_string(), "vendor".to_string()];
     let rows = fold_fanout_rows(
         &names,
+        &std::collections::HashMap::new(),
         vec![
             Ok(serde_json::json!({ "result": "solo-out" })),
             Ok(serde_json::json!({ "result": "vendor-out" })),
@@ -1296,6 +1297,7 @@ fn fold_fanout_rows_turns_one_members_error_into_its_own_row() {
     let names = vec!["solo".to_string(), "vendor".to_string()];
     let rows = fold_fanout_rows(
         &names,
+        &std::collections::HashMap::new(),
         vec![
             Ok(serde_json::json!({ "result": "fine" })),
             Err("delegate task panicked: task 0 panicked".to_string()),
@@ -1339,6 +1341,7 @@ fn fold_fanout_rows_keeps_a_lost_member_in_its_own_slot() {
     ];
     let rows = fold_fanout_rows(
         &names,
+        &std::collections::HashMap::new(),
         vec![
             Ok(serde_json::json!({ "result": "solo-out" })),
             Err("delegate result lost".to_string()),
@@ -1384,7 +1387,12 @@ fn fold_fanout_rows_ages_a_rate_limit_off_after_the_recent_window() {
     crate::throughput::record_rate_limit("solo", Some("claude-opus"), Some(10), 1_000);
     let names = vec!["solo".to_string()];
     let envelope = || Ok(serde_json::json!({ "result": "boom" }));
-    let fresh = fold_fanout_rows(&names, vec![envelope()], 1_000);
+    let fresh = fold_fanout_rows(
+        &names,
+        &std::collections::HashMap::new(),
+        vec![envelope()],
+        1_000,
+    );
     assert!(
         fresh[0]["live_usage"]["throughput_warning"]
             .as_str()
@@ -1392,7 +1400,12 @@ fn fold_fanout_rows_ages_a_rate_limit_off_after_the_recent_window() {
         "a rate-limit inside the recent window is flagged: {}",
         fresh[0]["live_usage"],
     );
-    let stale = fold_fanout_rows(&names, vec![envelope()], 2_000);
+    let stale = fold_fanout_rows(
+        &names,
+        &std::collections::HashMap::new(),
+        vec![envelope()],
+        2_000,
+    );
     assert!(
         stale[0]["live_usage"].get("throughput_warning").is_none(),
         "a rate-limit past the recent window ages off: {}",

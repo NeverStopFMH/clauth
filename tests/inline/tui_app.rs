@@ -347,8 +347,18 @@ fn the_install_fix_runs_agentgear_user_scope_install() {
     let tree_arg = add
         .trim_start_matches("plugin marketplace add ")
         .trim_end_matches(" --scope user");
+    // Derive the expectation from the same resolution agentgear uses: on linux
+    // `dirs::data_dir()` honors the XDG_DATA_HOME pin, on macOS it derives from
+    // `$HOME` (pinned by the harness) and ignores XDG_DATA_HOME, so a
+    // hardcoded data dir could only hold on one platform.
+    let data_dir = dirs::data_dir().expect("the data dir resolves under the pins");
     assert!(
-        std::path::Path::new(tree_arg).starts_with(fake.data()),
+        data_dir.starts_with(home.home()),
+        "the data dir must resolve inside the sandbox, got: {}",
+        data_dir.display()
+    );
+    assert!(
+        std::path::Path::new(tree_arg).starts_with(data_dir.join("clauth")),
         "the marketplace source must be the materialized tree under the \
          hermetic data dir, got: {tree_arg}"
     );

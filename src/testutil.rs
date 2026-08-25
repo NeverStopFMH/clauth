@@ -589,7 +589,8 @@ exit 0
 "#;
 
 /// A stateful fake `claude` on a PATH prefix, plus the hermetic env pins the
-/// agentgear lifecycle needs (data dir, runtime dir, the shim's own vars). It
+/// agentgear lifecycle needs (home, data dir, runtime dir, the shim's own
+/// vars). It
 /// mutates process-global env, so it BORROWS the [`HomeSandbox`] whose
 /// `HOME_TEST_LOCK` serializes every other env pin in the suite (the
 /// `ConfigDirSandbox` pattern). The prefix keeps the original PATH behind it,
@@ -601,8 +602,8 @@ pub(crate) struct FakeClaude<'a> {
     _home: std::marker::PhantomData<&'a HomeSandbox>,
     _tmp: tempfile::TempDir,
     log: std::path::PathBuf,
-    data: std::path::PathBuf,
     prev_path: std::ffi::OsString,
+    prev_home: Option<std::ffi::OsString>,
     prev_data: Option<std::ffi::OsString>,
     prev_runtime: Option<std::ffi::OsString>,
     prev_tree: Option<std::ffi::OsString>,
@@ -664,6 +665,11 @@ impl<'a> FakeClaude<'a> {
         // SAFETY: test-only, serialized by HOME_TEST_LOCK, restored on drop.
         unsafe { std::env::set_var("PATH", path) };
         let prev_data = pin("XDG_DATA_HOME", &data);
+        // The home pin is what keeps `dirs`-based resolution inside the sandbox
+        // on macOS: there `data_dir()` derives from `$HOME` alone and ignores
+        // `XDG_DATA_HOME`, so the data pin above is a no-op for agentgear's
+        // tree root.
+        let prev_home = pin("HOME", home.home());
         let prev_runtime = pin("XDG_RUNTIME_DIR", &run);
         let prev_tree = pin("CLAUDE_SHIM_TREE", &tree);
         let prev_state = pin("CLAUDE_SHIM_STATE", &tmp.path().join("state"));
@@ -673,8 +679,8 @@ impl<'a> FakeClaude<'a> {
             _home: std::marker::PhantomData,
             _tmp: tmp,
             log,
-            data,
             prev_path,
+            prev_home,
             prev_data,
             prev_runtime,
             prev_tree,
@@ -685,10 +691,6 @@ impl<'a> FakeClaude<'a> {
 
     pub(crate) fn log(&self) -> String {
         std::fs::read_to_string(&self.log).unwrap_or_default()
-    }
-
-    pub(crate) fn data(&self) -> &std::path::Path {
-        &self.data
     }
 }
 
@@ -704,6 +706,7 @@ impl Drop for FakeClaude<'_> {
             std::env::set_var("PATH", &self.prev_path);
             for (key, value) in [
                 ("XDG_DATA_HOME", &self.prev_data),
+                ("HOME", &self.prev_home),
                 ("XDG_RUNTIME_DIR", &self.prev_runtime),
                 ("CLAUDE_SHIM_TREE", &self.prev_tree),
                 ("CLAUDE_SHIM_STATE", &self.prev_state),

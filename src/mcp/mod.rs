@@ -3797,8 +3797,8 @@ fn run_delegate(opts: DelegateOpts<'_>) -> std::result::Result<serde_json::Value
             // A non-zero exit can be a throttle; record it so `profiles` can flag
             // the model as rate-limited (clauth never sees inference 429s any
             // other way).
-            if let Some(retry_after) = rate_limit_hint(&throttle_scan) {
-                crate::throughput::record_rate_limit(opts.profile, opts.model, retry_after, now);
+            if let RateLimit::Yes { retry_after_s } = rate_limit_hint(&throttle_scan) {
+                crate::throughput::record_rate_limit(opts.profile, opts.model, retry_after_s, now);
             }
             Ok(envelope)
         }
@@ -3813,11 +3813,11 @@ fn run_delegate(opts: DelegateOpts<'_>) -> std::result::Result<serde_json::Value
                 .and_then(serde_json::Value::as_bool)
                 .unwrap_or(false)
             {
-                if let Some(retry_after) = rate_limit_hint(&envelope.to_string()) {
+                if let RateLimit::Yes { retry_after_s } = rate_limit_hint(&envelope.to_string()) {
                     crate::throughput::record_rate_limit(
                         opts.profile,
                         opts.model,
-                        retry_after,
+                        retry_after_s,
                         now,
                     );
                 }
@@ -4768,17 +4768,25 @@ fn record_throughput_from_envelope(
     crate::throughput::record_success(profile, model, output_tokens, duration_ms, now);
 }
 
-/// Detect a rate-limit / 429 signature in a delegate's output. `Some(retry)`
-/// when it looks rate-limited (inner `None` = no Retry-After hint found),
-/// `None` when it doesn't.
-fn rate_limit_hint(text: &str) -> Option<Option<u64>> {
+/// What a delegate-output scan found: whether it carries a rate-limit / 429
+/// signature, and any Retry-After hint it named.
+enum RateLimit {
+    /// No rate-limit / 429 signature.
+    No,
+    /// Rate-limited. `retry_after_s` is `None` when the output carried no
+    /// Retry-After hint.
+    Yes { retry_after_s: Option<u64> },
+}
+
+/// Detect a rate-limit / 429 signature in a delegate's output.
+fn rate_limit_hint(text: &str) -> RateLimit {
     let lower = text.to_lowercase();
     let limited = lower.contains("rate limit")
         || lower.contains("rate_limit")
         || lower.contains("429")
         || lower.contains("overloaded");
     if !limited {
-        return None;
+        return RateLimit::No;
     }
     let retry_after = lower.find("retry").and_then(|i| {
         lower[i..]
@@ -4786,7 +4794,9 @@ fn rate_limit_hint(text: &str) -> Option<Option<u64>> {
             .find(|s| !s.is_empty())
             .and_then(|s| s.parse::<u64>().ok())
     });
-    Some(retry_after)
+    RateLimit::Yes {
+        retry_after_s: retry_after,
+    }
 }
 
 /// One-line throughput warning folded into a delegate payload's `live_usage`

@@ -637,11 +637,11 @@ fn json_tier_reports_a_canceled_accounts_real_tier_not_its_login_claim() {
 /// One account, one tier, on both surfaces reachable from here. `status.json` is
 /// driven through its own builder, so this is a real cross-surface check.
 ///
-/// The MCP tools are NOT asserted here and cannot be: `ClauthServer::which` is
-/// private to `src/mcp/mod.rs`, so only a test mod inside that module can drive
-/// it. That pin lives in `tests/inline/mcp_which_tool.rs`. Recomputing
-/// `tier_label` in this test instead would re-evaluate the very expression
-/// `json_view` runs internally and assert a value against itself.
+/// The MCP `profiles` surface is NOT asserted here: it resolves tiers through
+/// `which::resolve_active`, and its tier pins live in
+/// `tests/inline/mcp_profiles_tool.rs`. Recomputing `tier_label` in this test
+/// instead would re-evaluate the very expression `json_view` runs internally and
+/// assert a value against itself.
 #[test]
 fn json_tier_agrees_with_the_status_json_surface() {
     let _home = HomeSandbox::new();

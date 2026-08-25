@@ -101,9 +101,8 @@ fn model_display_name(model: &str) -> Option<&str> {
 
 /// One roster throughput row, shared by [`throughput_warnings`] so every
 /// surface describes a model the same way. The `model` field is absent when
-/// the store held the placeholder non-name ([`model_display_name`]): the
-/// prose reader renders the rate alone, the same nameless reading the
-/// delegate warning gives.
+/// the store held the placeholder non-name ([`model_display_name`]); how a
+/// nameless row then renders is `render::throughput_prose`'s rule.
 fn throughput_row(m: crate::throughput::ModelSummary) -> serde_json::Value {
     let mut row = serde_json::Map::new();
     if let Some(model) = model_display_name(&m.model) {
@@ -249,9 +248,8 @@ fn profile_row(p: &Profile, config: &AppConfig, now: i64) -> serde_json::Value {
     }
     // A third-party profile with no inference auth source is a delegate target
     // that refuses at the spawn gate, so this flags it before the picker spends
-    // the call. `has_inference_auth` is the delegate guard's own predicate,
-    // not the usage predicate `third_party_credentialed` (which wrongly
-    // exempts Alibaba's console session).
+    // the call. The predicate is the delegate guard's own, not the usage
+    // predicate — see `preflight_target`.
     if p.is_third_party() && !crate::claude::has_inference_auth(p) {
         row["keyless"] = serde_json::json!(true);
     }
@@ -309,9 +307,9 @@ fn roster_rank(name: &str) -> RosterRank {
 /// `"31.45 USD"` → `("USD", 31.45)`: one finite amount plus one 2-5 letter
 /// ASCII currency code. The narrowness is the point: a balance row carrying
 /// anything else (z.ai's `123.4M  (1.2k calls)`, a second word, `nan`/`inf`)
-/// describes no wallet. A loose parse would invent one to rank on. Taking the
-/// FIRST such row is also what lands a profile holding two wallets in exactly
-/// one currency group.
+/// describes no wallet. A loose parse would invent one to rank on.
+/// `roster_rank` takes the FIRST such row, which is what lands a profile
+/// holding two wallets in exactly one currency group.
 fn parse_balance(value: &str) -> Option<(String, f64)> {
     let mut parts = value.split_whitespace();
     let amount: f64 = parts.next()?.parse().ok()?;
@@ -410,8 +408,7 @@ fn single_block(prose: String) -> Vec<ContentBlock> {
 /// The same fold is where the since-your-last-call digest belongs: beside
 /// `live_usage`, under `since_your_last_call`, present only when something
 /// moved since the last reply that reported one. `digest` decides whether this
-/// reply reports (consuming the delta) or silently reseeds (`switch`'s own
-/// write must not echo as news).
+/// reply reports or reseeds — see `digest::DigestMode`.
 fn fold_active_live_usage(
     payload: serde_json::Value,
     config: &AppConfig,
@@ -853,18 +850,17 @@ disturbing this session, use `delegate`."
         let session_note = render::switch_effect_note(&crate::which::session_auth());
 
         // Resolve the raw tool argument to a stored profile (case-insensitive)
-        // BEFORE any mutation — the same guard the CLI applies. Skipping it lets an
-        // unknown/wrong-case name reach `link_profile_credentials`, which strips the
-        // live `.credentials.json` symlink and creates no replacement (it only errors
-        // later at `finish_switch`), leaving the global session credential-less.
+        // BEFORE any mutation, so the refusal keeps the uniform
+        // `profile_not_found` envelope. The authoritative gate — and the
+        // half-switched hazard a late refusal guards against — is
+        // `actions::ensure_switch_target_ok`.
         let Some(name) = config.canonical_name(&name) else {
             let payload = serde_json::json!({
                 "ok": false,
                 "reason": profile_not_found(&name, ProfileNotFoundFix::CallProfiles)
             });
-            // Refused before any mutation ran, so nothing of ours moved: this
-            // arm reports like the session-scope roster does. The
-            // post-mutation arms below reseed instead.
+            // Refused before any mutation ran, so nothing of ours moved:
+            // report like the session-scope roster does (`DigestMode::Report`).
             let payload =
                 fold_active_live_usage(payload, &config, DigestMode::Report(&self.digest));
             let mut prose = render::switch_profile_prose(&payload);
@@ -874,11 +870,12 @@ disturbing this session, use `delegate`."
         };
         let on_divergence = config.state.default_divergence;
 
-        // `switch_profile_noninteractive` can block on the macOS keychain deadline
-        // (up to 20s) and may refresh the target over HTTP (its AUTH-1 gate);
-        // keep it off the async worker so neither stalls the runtime. Mirrors
-        // `delegate`'s `spawn_blocking`. The shared-handle wrap is what the
-        // gate's refresh path requires (it must lock/unlock around HTTP).
+        // It can block — a `security` subprocess against its deadline, its
+        // AUTH-1 refresh over HTTP — so keep it off the async worker so
+        // neither stalls the runtime. Mirrors `delegate`'s `spawn_blocking`.
+        // The blocking contract and the shared-handle wrap the refresh path
+        // needs are `actions::switch_profile_noninteractive`'s; the deadline
+        // constant is `keychain.rs`'s `SECURITY_TIMEOUT`.
         let (config, outcome) = tokio::task::spawn_blocking(move || {
             let config = std::sync::Arc::new(crate::lockorder::RankedMutex::new(config));
             let outcome = crate::actions::switch_profile_noninteractive(
@@ -896,11 +893,7 @@ disturbing this session, use `delegate`."
 
         match outcome {
             Ok((previous, active)) => {
-                // The mutation ran: reseed silently. The reply's own
-                // `previous`/`active` is the report of what this switch did —
-                // reporting its write as `since_your_last_call` news from
-                // elsewhere would be a false attribution, and leaving the
-                // baseline stale would echo it on the next call instead.
+                // The mutation ran: reseed silently (`DigestMode::Reseed`).
                 let payload = fold_active_live_usage(
                     serde_json::json!({
                         "ok": true,
@@ -917,8 +910,7 @@ disturbing this session, use `delegate`."
             }
             Err(e) => {
                 // Failed AFTER the mutation ran, so it may have written on the
-                // way out (a stripped or repointed link): same reseed, so a
-                // partial write of ours never surfaces as external news.
+                // way out: same reseed (`DigestMode::Reseed`).
                 let payload = fold_active_live_usage(
                     serde_json::json!({ "ok": false, "reason": e.to_string() }),
                     &config,
@@ -1029,14 +1021,13 @@ Delegating spends the target account, so pick the account with `profiles` first.
             };
             Target::One(name)
         } else if raw.is_empty() {
-            // With no name given, a `resume` can still name one: the
-            // profile-change hook's per-conversation record carries the account
-            // the session was last told about (`told`, the durable baseline),
-            // and a resume is exactly "keep spending where this session ran".
-            // The inferred name takes the same `Target::One` path an explicit
-            // one does, so canonicalization and preflight stay shared. No
-            // `resume`, or none attributable, refuses — with the fix named,
-            // since the reader is a model that can run it.
+            // With no name given, a `resume` can still name one — see
+            // `hook_note::told_account` — and a resume is exactly "keep
+            // spending where this session ran". The inferred name takes the
+            // same `Target::One` path an explicit one does, so
+            // canonicalization and preflight stay shared. No `resume`, or
+            // none attributable, refuses — with the fix named, since the
+            // reader is a model that can run it.
             match resume.as_deref() {
                 Some(id) => match crate::hook_note::told_account(id) {
                     Some(name) => {
@@ -1140,9 +1131,8 @@ Delegating spends the target account, so pick the account with `profiles` first.
                     let job_id = reserved.spec.job_id.clone();
                     let started_at = reserved.spec.started_at;
                     // Commits to launch: the job file is reserved and the task
-                    // spawns next. `begin` reports `working` on the 0→1
-                    // transition; each task's end-guard decrements, and the
-                    // last one reports `idle`.
+                    // spawns next. `begin` marks one delegate in flight; the
+                    // matching `idle` is `herdr_report::InFlightGuard`'s.
                     if let Some(pane) = &self.herdr_pane {
                         pane.begin();
                     }
@@ -1229,9 +1219,9 @@ Delegating spends the target account, so pick the account with `profiles` first.
                         );
                         // Each row carries its OWN target's headroom: the
                         // caller just spent one window per account and decides
-                        // per account. `Skip`, never `Report` — reporting
-                        // CONSUMES the delta, so a per-row digest would spend
-                        // it N times and echo it N times.
+                        // per account. `Skip`, never `Report` — a per-row
+                        // report would consume the delta N times; see
+                        // `DigestMode`.
                         jobs.push(fold_delegate_live_usage(
                             serde_json::json!({
                                 "job_id": job_id,
@@ -1344,10 +1334,9 @@ Delegating spends the target account, so pick the account with `profiles` first.
                         // The caller abandoned the fan-out while at least one
                         // child was still spending; every member that handed off
                         // keeps running as a background job. This reply is never
-                        // sent, for the reason the single path's comment names,
-                        // so it is built for shape and `Skip` keeps the digest
-                        // from consuming a delta into a reply that does not
-                        // exist.
+                        // sent (see `jobs`), so it is built for shape and
+                        // `Skip` (`DigestMode`) keeps the digest from consuming
+                        // a delta into a reply that does not exist.
                         let names_and_ids = members
                             .iter()
                             .map(|m| format!("`{}` as job `{}`", m.profile, m.job_id))
@@ -1416,11 +1405,8 @@ Delegating spends the target account, so pick the account with `profiles` first.
             streaming,
             endpoint: endpoint.clone(),
         });
-        // Commits to spawn: from here the delegate is in flight. `begin` reports
-        // `working` as pane metadata; the task's own end-guard decrements on
-        // every exit path — clean result, deadline kill, non-zero exit,
-        // unparseable output, or a task panic — so the reading follows the run
-        // rather than this call, which a hand-off can outlive.
+        // Commits to spawn: from here the delegate is in flight. `begin` marks
+        // one in flight; the matching `idle` is `herdr_report::InFlightGuard`'s.
         if let Some(pane) = &self.herdr_pane {
             pane.begin();
         }
@@ -1457,9 +1443,10 @@ Delegating spends the target account, so pick the account with `profiles` first.
             // longer in that pool — "dropping response for cancelled request" —
             // before it reaches the transport. So it is built for shape rather
             // than for a reader: the background path's own handle payload, the
-            // honest answer if this ever does reach one, and `Skip` on the
-            // digest, which would otherwise consume a delta into a reply that
-            // does not exist. The id reaches an operator through the log line.
+            // honest answer if this ever does reach one, and `Skip`
+            // (`DigestMode`) on the digest, which would otherwise consume a
+            // delta into a reply that does not exist. The id reaches an
+            // operator through the log line.
             Joined::HandedOff(job_id) => {
                 logline!("clauth: abandoned delegate on `{target}` continues as job `{job_id}`");
                 let payload = serde_json::json!({
@@ -1586,9 +1573,9 @@ listing is where you find its id."
             }
             Some(ids) => monitor_batch(ids, wait, return_on, &self.digest, &mut progress).await,
             // No ids: the state-waiting mode absorbed from the old `watch`
-            // tool — the same digest, all three observables, no filter — plus
-            // the listing, which is the one thing `job_ids` cannot ask for
-            // because asking needs an id you do not have.
+            // tool — the same digest, all three observables (see `WatchSet`)
+            // — plus the listing, which is the one thing `job_ids` cannot ask
+            // for because asking needs an id you do not have.
             None => {
                 let outcome = self.digest.watch(WatchSet::ALL, wait, &mut progress).await;
                 let mut payload = match outcome {
@@ -2031,11 +2018,12 @@ fn hand_off_members(
 
 /// Which digest mode a blocking `delegate` reply gets.
 ///
-/// Reporting CONSUMES the delta, and a reply to an abandoned request is dropped
-/// by rmcp before the transport, so reporting into one spends news that no
-/// reader ever sees and leaves the next real reply missing it. Its own function
-/// for the reason `effective_wait` and `resolve_return_on` are: folded into the
-/// call site, deleting the condition was invisible to the whole suite.
+/// Reporting CONSUMES the delta (see `digest`), and a reply to an abandoned
+/// request is dropped by rmcp before the transport, so reporting into one
+/// spends news that no reader ever sees and leaves the next real reply missing
+/// it. Its own function for the reason `effective_wait` and `resolve_return_on`
+/// are: folded into the call site, deleting the condition was invisible to the
+/// whole suite.
 fn delegate_digest_mode(digest: &DigestTracker, abandoned: bool) -> DigestMode<'_> {
     if abandoned {
         DigestMode::Skip
@@ -2095,10 +2083,10 @@ fn fanout_is_error(rows: &[serde_json::Value]) -> bool {
 /// It is a budget, not a guarantee: the reply carries whatever the jobs reached
 /// inside it. Once a child exists the kill itself lands within one supervision
 /// tick ([`RUN_POLL_INTERVAL`], 50 ms) and this covers the teardown that follows
-/// — `stamp_run_sessions` walks the transcript store, an isolated rescue copies
-/// it. It bounds nothing on the other side of the spawn: a run still inside
-/// `ProfileRuntime::acquire` ends when that acquire returns, which is a live
-/// session's business, not this constant's.
+/// — `crate::sessions::stamp_run_sessions`, plus an isolated
+/// `crate::start::rescue_teardown`. It bounds nothing on the other side of the
+/// spawn: a run still inside `ProfileRuntime::acquire` ends when that acquire
+/// returns, which is a live session's business, not this constant's.
 const CANCEL_GRACE_SECS: u64 = 10;
 
 /// Process-local cancel registry: `job_id` → the flag that job's supervision
@@ -2183,9 +2171,9 @@ fn cancel_job(job_id: &str) -> bool {
 /// An id the registry does not hold is NAMED rather than left to come back as a
 /// plain `running` row, which reads as "the cancel did nothing". Its causes are
 /// hedged the way [`unknown_job_reason`] hedges its own, because nothing here
-/// can tell them apart: the run may already be finalizing (its entry drops
-/// after `write_done`), or it may belong to an earlier server process whose
-/// registry went with it.
+/// can tell them apart: the run may already be finalizing (its registry entry
+/// drops only after the result is on disk — [`Handoff::finalize`]), or it may
+/// belong to an earlier server process whose registry went with it.
 fn cancel_note(asked: &[String], unheld: &[String]) -> String {
     let list = |ids: &[String]| {
         ids.iter()
@@ -2369,10 +2357,8 @@ async fn monitor_one(
     // runs before this one and which refuses a one-id list that is not a safe
     // path component.
     debug_assert!(jobs::is_safe_job_id(&job_id));
-    // A collect is the other moment a corpse matters: a server that died
-    // mid-job leaves a file polling `running` forever, and `RUNNING_TTL_MS`
-    // already knows it is one. Corpses only — a reader that swept `done` files
-    // would delete the very envelope this call came for.
+    // A collect is the other moment a corpse matters — see
+    // `jobs::gc_running_corpses`.
     jobs::gc_running_corpses(now_ms());
     let outcome = wait_for_done(&job_id, wait, progress).await;
 
@@ -2464,9 +2450,9 @@ async fn monitor_batch(
     }
     let mut payload = serde_json::json!({ "results": results });
     // One digest for the whole call, top-level beside `results` where every
-    // other surface carries it: a batch IS one call, and a copy folded into
-    // each done result would consume the change into a place the prose
-    // spelling — the default one — never renders.
+    // other surface carries it: a batch IS one call, and the per-result folds
+    // run `DigestMode::Skip` because a per-result report would consume the
+    // change into a place the prose spelling never renders.
     if let Some(delta) = DigestMode::Report(digest).folded() {
         payload["since_your_last_call"] = delta;
     }
@@ -2652,9 +2638,9 @@ fn unknown_job_reason(job_id: &str, now: u64) -> String {
                     `d-<base36-ms>-<counter>`)";
     if now.saturating_sub(minted_at) > jobs::DONE_TTL_MS {
         // Collection leads even here. Every collect evicts through
-        // `jobs::remove`, while the hour-after-finish sweep runs at startup
-        // alone, so on a session that has been up a while the sweep is the
-        // rarer of the two rather than the likelier.
+        // `jobs::remove`; the hour-after-finish sweep runs at startup alone
+        // (`jobs::gc`), so on a session that has been up a while the sweep is
+        // the rarer of the two rather than the likelier.
         return format!(
             "unknown job_id: {job_id} — most likely {collected}; its stamp reads over an hour \
              old, so it may also have been swept an hour after it finished. {unminted}. check \
@@ -2915,9 +2901,9 @@ fn collect_job_ids(v: &serde_json::Value, out: &mut Vec<String>) {
         }
         serde_json::Value::String(s) => match serde_json::from_str::<serde_json::Value>(s) {
             Ok(parsed) => collect_job_ids(&parsed, out),
-            // Not JSON: the prose spelling. The fan-out prose has no `job_id`
-            // field at all, so its `d-<base36-ms>-<n>` tokens are the only way
-            // those jobs auto-arrive.
+            // Not JSON: the prose spelling. `render::delegate_fanout_prose`
+            // carries no `job_id` KEY, so the `d-<base36-ms>-<n>` tokens it
+            // prints are the only way those jobs auto-arrive.
             Err(_) => out.extend(scan_job_ids(s)),
         },
         _ => {}
@@ -3502,9 +3488,8 @@ fn apply_delegate_env(
 /// the refusals BEFORE the spawn, which carry no capture; the caller wraps one
 /// in an `is_error` envelope.
 /// Records observed throughput / rate-limit hits as a side effect, and runs
-/// `start::run`'s own transcript-stamp and isolated-rescue legs on the way out:
-/// the stamp makes a delegate's sessions attributable, and the rescue lifts an
-/// isolated one's transcript into the global store where a resume can reach it.
+/// `crate::sessions::stamp_run_sessions` and (isolated)
+/// `crate::start::rescue_teardown` on the way out.
 /// Never bubbles a transport-level error.
 fn run_delegate(opts: DelegateOpts<'_>) -> std::result::Result<serde_json::Value, String> {
     // Anchors the pre-spawn arm's `elapsed_secs`, which measures the time spent
@@ -3738,11 +3723,10 @@ fn run_delegate(opts: DelegateOpts<'_>) -> std::result::Result<serde_json::Value
         .unwrap_or_default();
     let stderr_bytes = join_reader(stderr_reader);
 
-    // Mirrors `start::run`'s own teardown legs, in the same window: the child has
-    // exited and the guard is still alive, so the tree is there to read. Stamp
-    // this run's transcripts with the profile that produced them, then (isolated
-    // only) lift the throwaway store into the global one before `drop(runtime)`
-    // discards it. Best-effort; a completed delegate never fails on either.
+    // Mirrors `start::run`'s own teardown legs, in the same window: the child
+    // has exited and the guard is still alive, so the tree is there to read.
+    // See `crate::sessions::stamp_run_sessions` and, on an isolated run,
+    // `crate::start::rescue_teardown`.
     let isolated = opts.isolation == Isolation::Isolated;
     let projects_dir = if isolated {
         Some(runtime.config_dir().join("projects"))
@@ -4566,13 +4550,12 @@ fn spawn_delegate(
         // instead of racing tokio's blocking-pool scheduler for that timing.
         #[cfg(test)]
         detach_test_gate();
-        // Decrements the pane's in-flight count on every exit path, panic
-        // included; the drop reports `idle` once nothing is left in flight.
-        // Created first so no early return can skip it. It sits in the TASK
-        // rather than beside the handler's `begin` because the panel follows the
-        // RUN: a handed-off delegate is still spending after its caller left,
-        // and a pane reading `idle` under a live run is wrong in the direction
-        // that matters.
+        // The decrement-and-`idle` rule, and the created-first placement, are
+        // `herdr_report::InFlightGuard`'s. What this site adds is the
+        // placement reason: the guard sits in the TASK rather than beside the
+        // handler's `begin` because a handed-off delegate is still spending
+        // after its caller left, and a pane reading `idle` under a live run is
+        // wrong in the direction that matters.
         let _pane_end = herdr_pane.map(herdr_report::InFlightGuard::end_only);
         // Catch a panic in the task: its handle may be dropped (a background
         // run, or a blocking one handed off), so an unwind would otherwise be

@@ -438,6 +438,72 @@ fn a_generic_api_key_row_reports_its_own_figures_and_claims_no_anthropic_plan() 
     );
 }
 
+/// A real z.ai quota response, captured 2026-08-25 from the operator's `glm`
+/// profile's `third_party_cache.json`. Parsed and re-written through the
+/// production paths only — the fixture is real bytes so the reader's
+/// assumptions are pinned by the wire shape, never hand-built.
+///
+/// The bars carry `resets_at` stamps, but they are inert on this path: the
+/// third-party rendering chain (`windows_payload` -> `third_party_headline`
+/// -> the third-party arm of `windows_prose`) never reads `resets_at`, and
+/// the only time-derived input it sees is the precomputed `stale` flag —
+/// which merely appends the suffix the contains form already tolerates — so
+/// the asserted substrings are a pure function of the stats. The countdown
+/// clause lives in `windows_prose`'s OAUTH arm only and is unreachable from
+/// a third-party row. The asserts stay contains-based on the plan label and
+/// each `label pct%` pair as belt-and-braces against any suffix the row gains
+/// later (a freshness clause, a tier), never against a countdown.
+const CAPTURED_GLM_CACHE: &str = r#"{"is_available":true,"rows":[{"label":"30d","value":"","kind":"heading"},{"label":"search-prime","value":"1","kind":"body"},{"label":"web-reader","value":"0","kind":"body"},{"label":"zread","value":"0","kind":"body"},{"label":"7d tokens","value":"","kind":"heading"},{"label":"GLM-5.3","value":"291.5M","kind":"body"},{"label":"GLM-5.2","value":"0","kind":"body"},{"label":"GLM-4.7","value":"174.4k","kind":"body"},{"label":"total","value":"291.3M  (2.8k calls)","kind":"faint"}],"bars":[{"label":"5h","pct":0.0},{"label":"7d","pct":97.0,"resets_at":"2026-08-28T19:31:30+00:00"},{"label":"30d","pct":1.0,"resets_at":"2026-09-19T19:31:30+00:00","used":1.0,"total":1000.0}],"plan":"pro","best_effort":false}"#;
+
+/// The bars arm of `windows_payload` on the ROSTER's real cache reader: a z.ai
+/// profile whose `third_party_cache.json` carries bars renders the headline
+/// those bars build — the shape the owner's example (`pro: 5h …, 7d …, 30d …`)
+/// is read in — and the `no 5h/7d limits` denial stays dropped. `windows_prose`
+/// is shared, so the unit level and the `monitor` quota path already pin the
+/// arm; this pins that the row a model receives goes `save_profile` ->
+/// `profile_row` -> the cache reader -> `third_party_headline` with no denial
+/// spliced in front of the figure.
+#[test]
+fn a_bars_carrying_z_ai_row_renders_the_headline_alone() {
+    let _home = HomeSandbox::new();
+    save_profile(&Profile::new(
+        "glm".to_string(),
+        Some("https://api.z.ai".to_string()),
+        Some("sk-fixture".to_string()),
+    ))
+    .expect("save glm");
+    save_app_state(&AppState {
+        active_profile: Some("glm".into()),
+        profiles: vec!["glm".into()],
+        ..Default::default()
+    })
+    .expect("save state");
+
+    let parsed = serde_json::from_str::<crate::providers::ThirdPartyStats>(CAPTURED_GLM_CACHE)
+        .expect("the captured z.ai cache parses");
+    crate::profile_cache::write_profile_cache(
+        "glm",
+        crate::profile_cache::THIRD_PARTY_CACHE_FILE,
+        &parsed,
+    );
+
+    let row = lines(&call_profiles(None, None)).remove(0);
+    assert!(
+        row.starts_with("- glm (active) [Z.ai, api.z.ai]: "),
+        "the row is the z.ai roster row: {row}",
+    );
+    assert!(
+        row.contains("pro: 5h 0%, 7d 97%, 30d 1%"),
+        "the headline renders the plan label and each bar pair from the real \
+         cache reader: {row}",
+    );
+    assert!(
+        !row.contains("no 5h/7d limits"),
+        "a bars-publishing provider HAS the limits, so the denial must not \
+         ride its figure: {row}",
+    );
+}
+
 /// The same refusal on the PRODUCTION path: a `base_url` carrying credentials
 /// reaches the roster through `save_profile` -> `profile_row` -> `profile_line`,
 /// and the rendered row must name the real host with no userinfo riding on it.

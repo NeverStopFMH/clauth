@@ -3671,9 +3671,10 @@ fn the_stdout_reader_throttles_the_heartbeat_sink() {
     );
 }
 
-/// A blocking `delegate` has no job file, so it passes no sink at all: that
-/// keeps `read_stdout` pure under test and makes "heartbeats are
-/// background-only" structural rather than a runtime branch.
+/// The sinkless arm is the purity seam this test needs, never a shape a
+/// server-produced delegate takes: every run passes a sink, and a run beats
+/// once it OWNS a record. Passing `None` here keeps `read_stdout` pure under
+/// test, the same rule `read_stdout`'s own doc states for the sink.
 #[test]
 fn a_sinkless_reader_never_beats() {
     let progress = super::AtomicU64::new(0);

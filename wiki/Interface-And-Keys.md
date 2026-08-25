@@ -130,4 +130,4 @@ Each row is a check on your Claude Code wiring: `clauth` on `PATH`, the `mcpServ
 | `repair credentials` | the active profile's stored login disagrees with the live one |
 | `relink credentials` | the active profile's credential link is missing while its stored credentials are intact |
 | `add the keybinding and sidebar row to herdr's config` | the herdr plugin is installed but its key is unbound or its sidebar row is untemplated |
-| `install plugin` | guidance only: the two `/plugin` commands to copy |
+| `install the clauth plugin` | the plugin row reads not installed, or installed project-local only; confirming runs the real `claude plugin` installer at user scope |

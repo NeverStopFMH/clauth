@@ -120,12 +120,7 @@ The active profile shows in orange. Usage bars are cached locally, so they stay 
 
 ## Claude Code plugin
 
-clauth ships a plugin that exposes your profiles to a live Claude Code session via MCP:
-
-```
-/plugin marketplace add uwuclxdy/clauth
-/plugin install clauth@clauth
-```
+clauth ships a plugin that exposes your profiles to a live Claude Code session via MCP. Install it from the TUI: Plugin tab, `plugin` row, <kbd>f</kbd>, confirm. The plugin's `SessionStart` hook self-heals a broken registration on every session start.
 
 | Tool | What it does | Quota |
 |------|--------------|-------|

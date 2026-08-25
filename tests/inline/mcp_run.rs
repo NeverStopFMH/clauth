@@ -968,9 +968,13 @@ fn background_fanout_refuses_a_keyless_member_before_writing_jobs() {
 //      from `claude -p --output-format stream-json --verbose
 //      --include-partial-messages`, and the child inherits `CLAUTH_MCP_DEPTH=1`
 //      + `--strict-mcp-config`.
-//   4. idle kill + salvage: `delegate` a prompt that writes a few paragraphs and
-//      then runs a `sleep` past `idle_secs: 30`; the envelope comes back
-//      `timed_out:"idle"` carrying those paragraphs in `partial_result`.
+//   4. idle kill + salvage: the idle guard fires on stream SILENCE — no stdout
+//      line for `idle_secs`, counted per line by `read_stdout` — so a child stuck
+//      in a long tool call is NOT idle. Measured 2026-08-25: a foreground
+//      `sleep 90` under `idle_secs: 30` finished normally, because the verbose
+//      stream kept emitting lines during the tool call and each reset the clock.
+//      Expect `timed_out:"idle"` + `partial_result` only for a child whose
+//      stream dies.
 
 // ---- delegate env composition (provider-routing isolation) ----
 

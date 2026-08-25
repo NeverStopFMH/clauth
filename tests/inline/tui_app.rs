@@ -221,7 +221,7 @@ fn plugin_check_ok_when_installed_globally() {
 }
 
 #[test]
-fn plugin_check_warns_and_suggests_global_when_project_local() {
+fn plugin_check_warns_and_offers_global_install_when_project_local() {
     let _home = crate::testutil::HomeSandbox::new();
     write_plugin_install("local");
     let mut app = bare_app();
@@ -233,12 +233,198 @@ fn plugin_check_warns_and_suggests_global_when_project_local() {
         "the project-local scope should surface in the readout, got {:?}",
         check.detail
     );
+    // The old shell copy-paste hint is gone; the row now offers the one-key
+    // user-scope install fix instead.
+    assert!(
+        check.fix.is_some(),
+        "non-global install should offer the install fix, got {:?}",
+        check.detail
+    );
+    assert!(
+        check.detail.iter().any(|line| line.starts_with("[f]")),
+        "the detail should show the install fix hint, got {:?}",
+        check.detail
+    );
+}
+
+#[test]
+fn plugin_check_offers_install_fix_when_missing() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = bare_app();
+    super::recompute_plugin_checks(&mut app, false);
+    let check = plugin_check(&app);
+    assert_eq!(check.health, super::Health::Warn);
     assert!(
         check
             .detail
             .iter()
-            .any(|line| line.contains("--scope user")),
-        "non-global install should suggest a user-scope install, got {:?}",
+            .any(|line| line.starts_with("installed: no")),
+        "an absent plugin should read not installed, got {:?}",
+        check.detail
+    );
+    assert!(
+        check.fix.is_some(),
+        "a missing plugin should offer the install fix, got {:?}",
+        check.detail
+    );
+    assert!(
+        check.detail.iter().any(|line| line.starts_with("[f]")),
+        "the detail should show the install fix hint, got {:?}",
+        check.detail
+    );
+}
+
+// ── the install fix drives agentgear at user scope ────────────────────────
+
+/// The confirm gate every mutating fix owes (tab spec: "confirm modal first,
+/// default choice = cancel"): `f` on the plugin row must open a
+/// [`ConfirmAction::InstallPlugin`] modal that defaults to cancel and runs
+/// nothing until confirmed.
+#[test]
+fn the_install_fix_opens_a_default_cancel_confirm_before_installing() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = bare_app();
+    super::recompute_plugin_checks(&mut app, false);
+    let idx = app
+        .plugin
+        .checks
+        .iter()
+        .position(|c| c.label == "plugin")
+        .expect("plugin check present");
+    app.plugin.cursor = idx;
+
+    super::apply_plugin_fix(&mut app);
+
+    let Some(super::Modal::Confirm(state)) = app.modals.last() else {
+        panic!(
+            "the install fix must open a confirm modal, got {:?}",
+            app.modals.last()
+        );
+    };
+    assert!(!state.choice, "the install confirm must default to cancel");
+    assert!(
+        matches!(state.on_confirm, super::ConfirmAction::InstallPlugin),
+        "the modal must run the install on confirm"
+    );
+    assert!(app.toasts.is_empty(), "arming the fix must run nothing yet");
+    assert!(
+        crate::plugin_probe::installed_records().is_empty(),
+        "nothing may be installed before the confirm"
+    );
+}
+
+/// The pin the whole install fix hangs on: `ConfirmAction::InstallPlugin` runs
+/// agentgear's `install(Scope::User, Source::Embedded)` — visible here as the
+/// exact `claude plugin` invocations the fake CLI records (user scope on both
+/// the marketplace add and the install, exactly one install per confirm), the
+/// materialized tree landing under the hermetic data dir, and the Plugin tab
+/// recomputing to `installed`.
+#[cfg(unix)]
+#[test]
+fn the_install_fix_runs_agentgear_user_scope_install() {
+    let home = crate::testutil::HomeSandbox::new();
+    let config = home.home().join(".claude-config");
+    std::fs::create_dir_all(&config).expect("config dir");
+    let _config = crate::testutil::ConfigDirSandbox::new(&home, &config);
+    let fake = crate::testutil::FakeClaude::new(&home);
+
+    let mut app = bare_app();
+    super::run_confirm_action(&mut app, super::ConfirmAction::InstallPlugin);
+
+    let log = fake.log();
+    assert!(
+        log.lines().any(|l| l == "--version"),
+        "agentgear gates the install on the CLI version floor, got:\n{log}"
+    );
+    let add = log
+        .lines()
+        .find(|l| l.starts_with("plugin marketplace add "))
+        .expect("the marketplace must be added");
+    assert!(
+        add.ends_with("--scope user"),
+        "the marketplace add must target user scope, got:\n{log}"
+    );
+    let tree_arg = add
+        .trim_start_matches("plugin marketplace add ")
+        .trim_end_matches(" --scope user");
+    assert!(
+        std::path::Path::new(tree_arg).starts_with(fake.data()),
+        "the marketplace source must be the materialized tree under the \
+         hermetic data dir, got: {tree_arg}"
+    );
+    let installs = log
+        .lines()
+        .filter(|l| *l == "plugin install clauth@clauth --scope user")
+        .count();
+    assert_eq!(
+        installs, 1,
+        "exactly one install at user scope per confirmed fix, got:\n{log}"
+    );
+    assert!(
+        log.lines().any(|l| l == "plugin list --json"),
+        "agentgear must verify the install through the registry, got:\n{log}"
+    );
+
+    assert!(
+        app.toasts
+            .iter()
+            .any(|t| t.kind == super::ToastKind::Success && t.body.contains("installed")),
+        "the confirmed install toasts success, got: {:?}",
+        app.toasts.iter().map(|t| &t.body).collect::<Vec<_>>()
+    );
+    let check = plugin_check(&app);
+    assert_eq!(
+        check.health,
+        super::Health::Ok,
+        "the recomputed row reads installed and healthy, got {:?}",
+        check.detail
+    );
+    assert!(
+        check.detail.iter().any(|l| l.starts_with("installed: yes")),
+        "the row reflects the user-scope install, got {:?}",
+        check.detail
+    );
+}
+
+/// A no-op install from a row that read "not installed" means the backend
+/// never ran (`claude` absent). The toast must say so as a warning, never a
+/// green success over a skipped install, and the row stays not-installed.
+#[cfg(unix)]
+#[test]
+fn the_install_fix_warns_when_claude_is_missing() {
+    let home = crate::testutil::HomeSandbox::new();
+    let config = home.home().join(".claude-config");
+    std::fs::create_dir_all(&config).expect("config dir");
+    let _config = crate::testutil::ConfigDirSandbox::new(&home, &config);
+    let _fake = crate::testutil::FakeClaude::new_without_claude(&home);
+
+    let mut app = bare_app();
+    super::run_confirm_action(&mut app, super::ConfirmAction::InstallPlugin);
+
+    assert!(
+        app.toasts
+            .iter()
+            .any(|t| t.kind == super::ToastKind::Warning && t.body.contains("no changes")),
+        "a skipped install toasts a warning naming the no-op, got: {:?}",
+        app.toasts.iter().map(|t| &t.body).collect::<Vec<_>>()
+    );
+    assert!(
+        !app.toasts
+            .iter()
+            .any(|t| t.kind == super::ToastKind::Success),
+        "no success toast over a skipped install, got: {:?}",
+        app.toasts.iter().map(|t| &t.body).collect::<Vec<_>>()
+    );
+    let check = plugin_check(&app);
+    assert_eq!(
+        check.health,
+        super::Health::Warn,
+        "the row must stay not-installed, got {:?}",
+        check.detail
+    );
+    assert!(
+        check.detail.iter().any(|l| l.starts_with("installed: no")),
+        "the row still reads not installed, got {:?}",
         check.detail
     );
 }

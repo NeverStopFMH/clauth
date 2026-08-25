@@ -748,12 +748,12 @@ fn theme_accepts_both_spellings_ahead_of_a_subcommand() {
 
 // ── the hidden entry points ─────────────────────────────────────────────────
 
-/// The four internal entry points must still dispatch when invoked directly
+/// The five internal entry points must still dispatch when invoked directly
 /// (CC's `apiKeyHelper`, the bundled `asyncRewake` hook, the bundled
-/// profile-change note hook, and the completion scripts' name shellout all run
-/// them by name) while staying out of every help surface. The spelling is the
-/// contract: `plugins/hooks/hooks.json` invokes two of them by the exact string
-/// clap derives from the variant name.
+/// profile-change note hook, the bundled SessionStart self-heal hook, and the
+/// completion scripts' name shellout all run them by name) while staying out
+/// of every help surface. The spelling is the contract: `plugins/hooks/hooks.json`
+/// invokes three of them by the exact string clap derives from the variant name.
 #[test]
 fn hidden_entry_points_parse_but_never_appear_in_help() {
     assert!(matches!(command(&["__complete"]), Command::Complete));
@@ -762,6 +762,7 @@ fn hidden_entry_points_parse_but_never_appear_in_help() {
         command(&["hook-profile-changed-note"]),
         Command::HookProfileChangedNote
     ));
+    assert!(matches!(command(&["self-heal"]), Command::SelfHeal));
     match command(&["__api-key", "acme"]) {
         Command::ApiKey { profile } => assert_eq!(profile, "acme"),
         other => panic!("__api-key must parse, got {other:?}"),
@@ -775,6 +776,7 @@ fn hidden_entry_points_parse_but_never_appear_in_help() {
         "__api-key",
         "mcp-await-job",
         "hook-profile-changed-note",
+        "self-heal",
     ] {
         assert!(
             !help.contains(hidden) && !long.contains(hidden),

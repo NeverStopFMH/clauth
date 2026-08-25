@@ -307,6 +307,12 @@ pub(crate) enum Command {
     #[command(hide = true)]
     HookProfileChangedNote,
 
+    /// The bundled SessionStart self-heal body: repair a broken plugin
+    /// registration through agentgear. Prints only when something changed, so a
+    /// healthy session start says nothing.
+    #[command(hide = true)]
+    SelfHeal,
+
     /// Not a command. Kept only to redirect anyone who guesses it.
     #[command(hide = true)]
     Run {

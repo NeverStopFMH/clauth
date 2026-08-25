@@ -25,6 +25,7 @@ mod oauth;
 mod oauth_login;
 mod out;
 mod platform;
+mod plugin_host;
 mod plugin_probe;
 mod poll;
 mod presets;
@@ -190,6 +191,11 @@ fn dispatch(cli: Cli) -> Result<()> {
         Command::Mcp => mcp::serve(),
         Command::McpAwaitJob => mcp::await_job(),
         Command::HookProfileChangedNote => hook_note::run(),
+        // The dispatch itself is one line and deliberately unpinned: a test
+        // that ran it would run the real lifecycle leg. The name is pinned by
+        // the parse pin in `tests/inline/cli.rs`, and the leg it points at is
+        // pinned hermetically by the fake-`claude` tests.
+        Command::SelfHeal => plugin_host::self_heal(),
         Command::Complete => {
             completions::print_profile_names();
             Ok(())

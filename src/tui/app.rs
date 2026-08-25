@@ -532,6 +532,10 @@ pub(crate) enum ConfirmAction {
     Acknowledge,
     /// Plugin tab: run `crate::herdr::heal` on the named config file.
     HealHerdrConfig(std::path::PathBuf),
+    /// Plugin tab: install the clauth plugin through agentgear at user scope.
+    /// A write into CC's plugin registry (driven via the `claude` CLI), so it
+    /// keeps the confirm modal like every other mutating fix.
+    InstallPlugin,
 }
 
 /// One-field name prompt shared by the Setup menu's two naming actions. The
@@ -1248,6 +1252,9 @@ pub(crate) enum PluginFix {
     /// Append the keybinding + sidebar row to herdr's config (the config half of
     /// `clauth herdr install`). `PathBuf` = the resolved config file.
     HealHerdrConfig(std::path::PathBuf),
+    /// Install the clauth plugin through agentgear (user scope, embedded tree).
+    /// Replaces the copy-paste `/plugin` hint the row used to show.
+    InstallPlugin,
 }
 
 /// A computed integration-check row (global, profile-independent).
@@ -3110,6 +3117,18 @@ fn apply_plugin_fix(app: &mut App) {
                 on_confirm: ConfirmAction::HealHerdrConfig(path),
             }));
         }
+        PluginFix::InstallPlugin => {
+            app.disarm_quit();
+            app.modals.push(Modal::Confirm(ConfirmState {
+                message: "install the clauth plugin into claude code?".to_string(),
+                detail: Some(
+                    "runs claude's own plugin installer at user scope; your other plugins and settings are untouched."
+                        .to_string(),
+                ),
+                choice: false,
+                on_confirm: ConfirmAction::InstallPlugin,
+            }));
+        }
     }
 }
 
@@ -3439,22 +3458,12 @@ fn recompute_plugin_checks(app: &mut App, refresh_version: bool) {
         } else {
             detail.push(String::new());
             detail.push("installed for this project only, not global".to_string());
-            detail.push("make it global (run in shell):".to_string());
-            if let Some(scope) = scope {
-                detail.push(format!(
-                    "  claude plugin uninstall {} --scope {scope}",
-                    probe::PLUGIN_ID
-                ));
-            }
-            detail.push(format!(
-                "  claude plugin install {} --scope user",
-                probe::PLUGIN_ID
-            ));
+            detail.push("[f] install globally (user scope)".to_string());
             Check {
                 label: "plugin",
                 health: Health::Warn,
                 detail,
-                fix: None,
+                fix: Some(PluginFix::InstallPlugin),
             }
         }
     } else {
@@ -3471,14 +3480,12 @@ fn recompute_plugin_checks(app: &mut App, refresh_version: bool) {
             detail.push(format!("marketplace: {repo}"));
         }
         detail.push(String::new());
-        detail.push("install (run in claude code):".to_string());
-        detail.push("  /plugin marketplace add uwuclxdy/clauth".to_string());
-        detail.push("  /plugin install clauth@clauth".to_string());
+        detail.push("[f] install the clauth plugin".to_string());
         Check {
             label: "plugin",
             health: Health::Warn,
             detail,
-            fix: None,
+            fix: Some(PluginFix::InstallPlugin),
         }
     };
     checks.push(plugin_check);
@@ -7892,6 +7899,29 @@ fn run_confirm_action(app: &mut App, action: ConfirmAction) {
                 Err(e) => app.toast(ToastKind::Danger, format!("herdr config fix failed\n{e}")),
             }
         }
+        ConfirmAction::InstallPlugin => match crate::plugin_host::install() {
+            // A no-op from a row that read "not installed" means the backend
+            // never ran — `claude` not on PATH is the reachable case (agentgear
+            // skips an undetected backend). A green success toast over a
+            // skipped install is a lie, so the warning names it instead.
+            Ok(agentgear::Outcome::NoOp) => {
+                app.toast(
+                    ToastKind::Warning,
+                    "plugin install made no changes\ninstall claude code first, then try again",
+                );
+                recompute_plugin_checks(app, false);
+            }
+            // Installed / Repaired / Adopted / Updated, or anything agentgear
+            // adds later: a real change happened, so the success toast is
+            // earned. (`Outcome` is #[non_exhaustive], so the wildcard is the
+            // contract, not a shortcut.)
+            Ok(outcome) => {
+                app.toast(ToastKind::Success, format!("clauth plugin {outcome}"));
+                // Reflect the fresh install in the rows without a version probe.
+                recompute_plugin_checks(app, false);
+            }
+            Err(e) => app.toast(ToastKind::Danger, format!("install failed\n{e}")),
+        },
         ConfirmAction::BlankCredentials(name) => {
             let result = {
                 let mut cfg = app.config();

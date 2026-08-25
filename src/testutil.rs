@@ -549,6 +549,175 @@ impl Drop for ConfigDirSandbox<'_> {
     }
 }
 
+/// The body of the fake `claude` the agentgear lifecycle pins stage.
+/// `@VERSION@` is substituted with the crate version at write time so the
+/// entry the shim reports is never stale against the embedded tree.
+#[cfg(unix)]
+const FAKE_CLAUDE_SHIM: &str = r#"#!/bin/sh
+printf '%s\n' "$*" >> "$CLAUDE_SHIM_LOG"
+case "$1" in
+  --version)
+    echo "2.1.220 (Claude Code)"
+    ;;
+  plugin)
+    case "$2" in
+      list)
+        # [] until an install happened, then the clauth entry with an existing
+        # installPath (agentgear's verify_present checks the path on disk).
+        if [ "$3" = "--json" ]; then
+          if [ -f "$CLAUDE_SHIM_STATE" ]; then
+            printf '[{"id":"clauth@clauth","version":"@VERSION@","enabled":true,"installPath":"%s"}]\n' "$CLAUDE_SHIM_TREE"
+          else
+            echo '[]'
+          fi
+        fi
+        ;;
+      marketplace)
+        if [ "$3" = "list" ]; then echo '[]'; fi
+        ;;
+      install)
+        : > "$CLAUDE_SHIM_STATE"
+        # The registry clauth's own probe reads: write the user-scope entry so
+        # the Plugin tab recompute after the install sees it.
+        mkdir -p "$CLAUDE_CONFIG_DIR/plugins"
+        printf '{"plugins":{"clauth@clauth":[{"scope":"user","version":"@VERSION@","installedAt":"2026-08-25T00:00:00.000Z","installPath":"%s"}]}}\n' "$CLAUDE_SHIM_TREE" > "$CLAUDE_CONFIG_DIR/plugins/installed_plugins.json"
+        ;;
+    esac
+    ;;
+esac
+exit 0
+"#;
+
+/// A stateful fake `claude` on a PATH prefix, plus the hermetic env pins the
+/// agentgear lifecycle needs (data dir, runtime dir, the shim's own vars). It
+/// mutates process-global env, so it BORROWS the [`HomeSandbox`] whose
+/// `HOME_TEST_LOCK` serializes every other env pin in the suite (the
+/// `ConfigDirSandbox` pattern). The prefix keeps the original PATH behind it,
+/// so concurrent tests that spawn `sh`/`true` still resolve them; only the
+/// FIRST `claude` hit changes, and nothing else in the test binary spawns
+/// `claude` (the version/hdr/mcp probes are all `cfg!(test)`-skipped).
+#[cfg(unix)]
+pub(crate) struct FakeClaude<'a> {
+    _home: std::marker::PhantomData<&'a HomeSandbox>,
+    _tmp: tempfile::TempDir,
+    log: std::path::PathBuf,
+    data: std::path::PathBuf,
+    prev_path: std::ffi::OsString,
+    prev_data: Option<std::ffi::OsString>,
+    prev_runtime: Option<std::ffi::OsString>,
+    prev_tree: Option<std::ffi::OsString>,
+    prev_state: Option<std::ffi::OsString>,
+    prev_log: Option<std::ffi::OsString>,
+}
+
+#[cfg(unix)]
+impl<'a> FakeClaude<'a> {
+    /// The full harness: the shim on a PATH prefix ahead of the operator's
+    /// own PATH.
+    pub(crate) fn new(home: &'a HomeSandbox) -> Self {
+        let prev_path = std::env::var_os("PATH").expect("PATH is set");
+        Self::stage(home, &prev_path, true)
+    }
+
+    /// The same pins with a claude-free PATH (empty shim dir + a minimal
+    /// tail), so agentgear's claude backend is undetected and the lifecycle
+    /// converges to `NoOp` without spawning anything.
+    pub(crate) fn new_without_claude(home: &'a HomeSandbox) -> Self {
+        Self::stage(home, std::ffi::OsStr::new("/usr/bin:/bin"), false)
+    }
+
+    #[expect(
+        unsafe_code,
+        reason = "env mutation is unsafe in Rust 2024; serialized by HOME_TEST_LOCK, held by the borrowed sandbox"
+    )]
+    fn stage(home: &'a HomeSandbox, path_tail: &std::ffi::OsStr, with_shim: bool) -> Self {
+        let tmp = tempfile::tempdir_in(home.home()).expect("shim dir");
+        let data = tmp.path().join("data");
+        let run = tmp.path().join("run");
+        let tree = tmp.path().join("install-tree");
+        for dir in [&data, &run, &tree] {
+            std::fs::create_dir_all(dir).expect("create dir");
+        }
+        if with_shim {
+            let shim = tmp.path().join("claude");
+            std::fs::write(
+                &shim,
+                FAKE_CLAUDE_SHIM.replace("@VERSION@", env!("CARGO_PKG_VERSION")),
+            )
+            .expect("write shim");
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&shim).expect("shim meta").permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&shim, perms).expect("chmod shim");
+        }
+
+        let pin = |key: &str, value: &std::path::Path| {
+            let prev = std::env::var_os(key);
+            // SAFETY: test-only, serialized by HOME_TEST_LOCK, restored on drop.
+            unsafe { std::env::set_var(key, value) };
+            prev
+        };
+        let prev_path = std::env::var_os("PATH").expect("PATH is set");
+        let mut path = std::ffi::OsString::from(tmp.path());
+        path.push(":");
+        path.push(path_tail);
+        // SAFETY: test-only, serialized by HOME_TEST_LOCK, restored on drop.
+        unsafe { std::env::set_var("PATH", path) };
+        let prev_data = pin("XDG_DATA_HOME", &data);
+        let prev_runtime = pin("XDG_RUNTIME_DIR", &run);
+        let prev_tree = pin("CLAUDE_SHIM_TREE", &tree);
+        let prev_state = pin("CLAUDE_SHIM_STATE", &tmp.path().join("state"));
+        let log = tmp.path().join("log");
+        let prev_log = pin("CLAUDE_SHIM_LOG", &log);
+        Self {
+            _home: std::marker::PhantomData,
+            _tmp: tmp,
+            log,
+            data,
+            prev_path,
+            prev_data,
+            prev_runtime,
+            prev_tree,
+            prev_state,
+            prev_log,
+        }
+    }
+
+    pub(crate) fn log(&self) -> String {
+        std::fs::read_to_string(&self.log).unwrap_or_default()
+    }
+
+    pub(crate) fn data(&self) -> &std::path::Path {
+        &self.data
+    }
+}
+
+#[cfg(unix)]
+impl Drop for FakeClaude<'_> {
+    #[expect(
+        unsafe_code,
+        reason = "env mutation is unsafe in Rust 2024; serialized by HOME_TEST_LOCK, held by the borrowed sandbox"
+    )]
+    fn drop(&mut self) {
+        // SAFETY: restore the prior values under the same lock the sandbox holds.
+        unsafe {
+            std::env::set_var("PATH", &self.prev_path);
+            for (key, value) in [
+                ("XDG_DATA_HOME", &self.prev_data),
+                ("XDG_RUNTIME_DIR", &self.prev_runtime),
+                ("CLAUDE_SHIM_TREE", &self.prev_tree),
+                ("CLAUDE_SHIM_STATE", &self.prev_state),
+                ("CLAUDE_SHIM_LOG", &self.prev_log),
+            ] {
+                match value {
+                    Some(v) => std::env::set_var(key, v),
+                    None => std::env::remove_var(key),
+                }
+            }
+        }
+    }
+}
+
 /// RAII tier pin: acquires `TIER_TEST_LOCK` and forces the process-global color
 /// tier for its lifetime, putting the previous pin back on drop (even on panic).
 /// Required for any test asserting on a tier-dependent style, since the tier is

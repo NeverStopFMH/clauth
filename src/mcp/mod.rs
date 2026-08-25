@@ -89,17 +89,32 @@ const PROMPT_FILE_CAP: u64 = 64 * 1024;
 /// undo, so a runaway list is bounded here.
 const MAX_FANOUT: usize = 8;
 
+/// A throughput cache key that names a model, or `None` for the non-name the
+/// store writes when the delegate named none: `default` is
+/// [`crate::throughput`]'s placeholder key, and an empty or whitespace-only
+/// key is the same non-name. Every surface shares this one rule, so a
+/// placeholder can never render as a model name anywhere.
+fn model_display_name(model: &str) -> Option<&str> {
+    let name = model.trim();
+    (!name.is_empty() && name != "default").then_some(name)
+}
+
 /// One roster throughput row, shared by [`throughput_warnings`] so every
-/// surface describes a model the same way.
+/// surface describes a model the same way. The `model` field is absent when
+/// the store held the placeholder non-name ([`model_display_name`]): the
+/// prose reader renders the rate alone, the same nameless reading the
+/// delegate warning gives.
 fn throughput_row(m: crate::throughput::ModelSummary) -> serde_json::Value {
-    serde_json::json!({
-        "model": m.model,
-        "tok_s": (m.tok_s * 10.0).round() / 10.0,
-        "samples": m.samples,
-        "degraded": m.degraded,
-        "rate_limited_recent": m.rate_limited_recent,
-        "retry_after_s": m.retry_after_s,
-    })
+    let mut row = serde_json::Map::new();
+    if let Some(model) = model_display_name(&m.model) {
+        row.insert("model".into(), model.into());
+    }
+    row.insert("tok_s".into(), ((m.tok_s * 10.0).round() / 10.0).into());
+    row.insert("samples".into(), m.samples.into());
+    row.insert("degraded".into(), m.degraded.into());
+    row.insert("rate_limited_recent".into(), m.rate_limited_recent.into());
+    row.insert("retry_after_s".into(), m.retry_after_s.into());
+    serde_json::Value::Object(row)
 }
 
 /// The subset of the per-model summary a roster is worth spending tokens on:
@@ -4781,14 +4796,9 @@ fn throughput_note(profile: &str, now: i64) -> Option<String> {
         .into_iter()
         .filter(|m| m.degraded || m.rate_limited_recent)
         .map(|m| {
-            // `default` is not a model, it is what `src/throughput.rs` writes
-            // when the delegate named none. An empty or whitespace-only model
-            // is the same non-name, so both drop from the warning.
-            let name = m.model.trim();
-            let name = if name.is_empty() || name == "default" {
-                String::new()
-            } else {
-                format!("{name} ")
+            let name = match model_display_name(&m.model) {
+                Some(name) => format!("{name} "),
+                None => String::new(),
             };
             if m.rate_limited_recent {
                 match m.retry_after_s {

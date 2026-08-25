@@ -1301,10 +1301,13 @@ fn session_scope_prose_says_unknown_when_unresolved() {
 /// A healthy row is the model's name and rate. `degraded` / `rate_limited_recent`
 /// / `samples` are payload fields a healthy row spells as `false` or noise, so
 /// none may reach the prose: a spelled-out `false` costs tokens for nothing.
+/// The named fixture uses a real model name: the row builder never emits the
+/// placeholder string any more, so a literal `default` here would pin a row
+/// shape that cannot exist.
 #[test]
 fn throughput_prose_healthy_row_is_name_and_rate_only() {
     let rows = vec![serde_json::json!({
-        "model": "default",
+        "model": "deepseek-chat",
         "tok_s": 64.5,
         "samples": 4,
         "degraded": false,
@@ -1312,7 +1315,7 @@ fn throughput_prose_healthy_row_is_name_and_rate_only() {
         "retry_after_s": null
     })];
     let out = throughput_prose(&rows);
-    assert_eq!(out, "`default` 64.5 tok/s");
+    assert_eq!(out, "`deepseek-chat` 64.5 tok/s");
     assert!(
         !out.contains("degraded")
             && !out.contains("rate_limited")
@@ -1320,6 +1323,21 @@ fn throughput_prose_healthy_row_is_name_and_rate_only() {
             && !out.contains("false"),
         "a healthy row must not spell its false flags or its sample count: {out}",
     );
+}
+
+/// A row whose store key was the `default` placeholder carries no `model`
+/// field at all, so the roster renders the rate alone — the same nameless
+/// reading the delegate warning gives.
+#[test]
+fn throughput_prose_renders_a_placeholder_row_without_a_model_name() {
+    let rows = vec![serde_json::json!({
+        "tok_s": 12.3,
+        "samples": 3,
+        "degraded": true,
+        "rate_limited_recent": false,
+        "retry_after_s": null
+    })];
+    assert_eq!(throughput_prose(&rows), "12.3 tok/s (degraded)");
 }
 
 /// Flags appear as words only when true, and the retry delay rides with the
@@ -1391,7 +1409,9 @@ fn usage_prose_drops_fields_without_a_figure_and_keeps_wire_order() {
 
 /// The same delegate's usage with each composite holding one non-zero leaf
 /// beside zero siblings. The lucky fixture above hid that composites dumped
-/// raw JSON; this one reds on the dotted-path rewrite.
+/// raw JSON; this one reds on the dotted-path rewrite. Its cache total
+/// (26800) equals the sum of its `cache_creation.*` leaves (0 + 26800), so
+/// the total drops and the leaf renders the figure once.
 const NONLUCKY_USAGE: &str = r#"{"input_tokens":83930,"cache_creation_input_tokens":26800,"cache_read_input_tokens":3948672,"output_tokens":40681,"output_tokens_details":{"thinking_tokens":5000},"server_tool_use":{"web_search_requests":2,"web_fetch_requests":0},"service_tier":"standard","cache_creation":{"ephemeral_1h_input_tokens":0,"ephemeral_5m_input_tokens":26800},"inference_geo":"","iterations":[],"speed":"standard"}"#;
 
 #[test]
@@ -1399,8 +1419,7 @@ fn usage_prose_renders_surviving_leaves_by_dotted_path() {
     let u: Value = serde_json::from_str(NONLUCKY_USAGE).unwrap();
     assert_eq!(
         usage_prose(&u),
-        "input 83930 tokens, `cache_creation_input_tokens` 26800, \
-         `cache_read_input_tokens` 3948672, output 40681 tokens, \
+        "input 83930 tokens, `cache_read_input_tokens` 3948672, output 40681 tokens, \
          `output_tokens_details.thinking_tokens` 5000, \
          `server_tool_use.web_search_requests` 2, `service_tier` standard, \
          `cache_creation.ephemeral_5m_input_tokens` 26800, `speed` standard"
@@ -1476,8 +1495,8 @@ fn usage_prose_drops_a_stringified_zero_and_keeps_a_stringified_figure() {
 }
 
 /// A pathological usage object is cut to the budget and ends with a single
-/// `…`, so it cannot dominate the reply. The cut walks characters, so it
-/// never lands mid-UTF-8.
+/// `…`, so it cannot dominate the reply. The cut walks Unicode scalars, so it
+/// never lands mid-scalar (a multi-byte char is taken whole or not at all).
 #[test]
 fn usage_prose_cuts_a_long_clause_and_ends_with_an_ellipsis() {
     let u = serde_json::json!({"s": "x".repeat(2000)});
@@ -1492,7 +1511,7 @@ fn usage_prose_cuts_a_long_clause_and_ends_with_an_ellipsis() {
 /// constant moves both sides together and the assertion follows it anywhere.
 /// This fixture is a fixed 330 characters, so a budget raised past it stops
 /// cutting and reds here. With the no-cut guard below pinning from underneath,
-/// the constant is bounded to (291, 330) rather than merely "some number".
+/// the constant is bounded to (254, 330) rather than merely "some number".
 #[test]
 fn usage_prose_cuts_a_clause_only_a_little_over_the_budget() {
     let u = serde_json::json!({"s": "x".repeat(326)});
@@ -1504,7 +1523,7 @@ fn usage_prose_cuts_a_clause_only_a_little_over_the_budget() {
     );
 }
 
-/// The composite-heavy envelope renders at 291 of the 320 budget and must not
+/// The composite-heavy envelope renders at 254 of the 320 budget and must not
 /// be cut. This is the regression guard on the budget: the day the constant
 /// drops below the observed envelope, or the wire grows a field, this exact
 /// string reds rather than silently gaining a trailing `…`.
@@ -1514,14 +1533,103 @@ fn usage_prose_does_not_cut_the_composite_heavy_envelope() {
     let prose = usage_prose(&u);
     assert_eq!(
         prose,
-        "input 83930 tokens, `cache_creation_input_tokens` 26800, \
-         `cache_read_input_tokens` 3948672, output 40681 tokens, \
+        "input 83930 tokens, `cache_read_input_tokens` 3948672, output 40681 tokens, \
          `output_tokens_details.thinking_tokens` 5000, \
          `server_tool_use.web_search_requests` 2, `service_tier` standard, \
          `cache_creation.ephemeral_5m_input_tokens` 26800, `speed` standard"
     );
-    assert_eq!(prose.chars().count(), 291, "{prose}");
+    assert_eq!(prose.chars().count(), 254, "{prose}");
     assert!(!prose.ends_with('…'), "{prose}");
+}
+
+/// Anthropic's cache total equals the sum of its breakdown leaves, so a
+/// single-TTL envelope shows the figure once: the leaf renders, the total
+/// drops.
+#[test]
+fn usage_prose_shows_a_single_ttl_cache_figure_once() {
+    let u = serde_json::json!({
+        "cache_creation_input_tokens": 26800,
+        "cache_creation": {
+            "ephemeral_1h_input_tokens": 0,
+            "ephemeral_5m_input_tokens": 26800,
+        },
+    });
+    assert_eq!(
+        usage_prose(&u),
+        "`cache_creation.ephemeral_5m_input_tokens` 26800"
+    );
+}
+
+/// A two-TTL envelope's total is still the sum, so both leaves render and the
+/// total does not repeat them.
+#[test]
+fn usage_prose_keeps_both_leaves_when_two_ttls_share_the_total() {
+    let u = serde_json::json!({
+        "cache_creation_input_tokens": 300,
+        "cache_creation": {
+            "ephemeral_1h_input_tokens": 100,
+            "ephemeral_5m_input_tokens": 200,
+        },
+    });
+    assert_eq!(
+        usage_prose(&u),
+        "`cache_creation.ephemeral_1h_input_tokens` 100, \
+         `cache_creation.ephemeral_5m_input_tokens` 200"
+    );
+}
+
+/// A total that disagrees with its breakdown is not the same figure, so both
+/// render; a total with no breakdown at all renders alone. A stringified
+/// total counts as its numeric twin.
+#[test]
+fn usage_prose_keeps_a_cache_total_that_disagrees_with_its_breakdown() {
+    let partial = serde_json::json!({
+        "cache_creation_input_tokens": 300,
+        "cache_creation": {"ephemeral_5m_input_tokens": 100},
+    });
+    assert_eq!(
+        usage_prose(&partial),
+        "`cache_creation_input_tokens` 300, `cache_creation.ephemeral_5m_input_tokens` 100"
+    );
+    let no_breakdown = serde_json::json!({"cache_creation_input_tokens": "300"});
+    assert_eq!(
+        usage_prose(&no_breakdown),
+        "`cache_creation_input_tokens` 300"
+    );
+    let empty_breakdown = serde_json::json!({
+        "cache_creation_input_tokens": 300,
+        "cache_creation": {},
+    });
+    assert_eq!(
+        usage_prose(&empty_breakdown),
+        "`cache_creation_input_tokens` 300"
+    );
+}
+
+/// An empty usage key renders `(unnamed)` rather than a blank span, so the
+/// figure stays visible with a name a reader can act on; a nested empty key
+/// reads the same in its path, and a string figure takes the marker too.
+#[test]
+fn usage_prose_names_an_empty_key_rather_than_rendering_empty_backticks() {
+    assert_eq!(usage_prose(&serde_json::json!({"": 5})), "`(unnamed)` 5");
+    assert_eq!(
+        usage_prose(&serde_json::json!({"a": {"": 5}})),
+        "`a.(unnamed)` 5"
+    );
+    assert_eq!(usage_prose(&serde_json::json!({"": "x"})), "`(unnamed)` x");
+}
+
+/// The cut walks scalars, not bytes: a multi-byte char at the boundary is
+/// taken whole or not at all. A budget of 0 collapses any non-empty clause to
+/// the marker alone, so no budget value can panic the subtraction, and an
+/// empty clause stays empty at any budget.
+#[test]
+fn truncate_clause_walks_scalars_and_a_zero_budget_collapses_to_the_marker() {
+    assert_eq!(truncate_clause("ééé".into(), 2), "é…");
+    assert_eq!(truncate_clause("abc".into(), 0), "…");
+    assert_eq!(truncate_clause(String::new(), 0), "");
+    // Two scalars at the budget is a whole combining sequence, not a cut.
+    assert_eq!(truncate_clause("e\u{301}".into(), 2), "e\u{301}");
 }
 
 /// `f64::from_str` accepts `"NaN"` and `"inf"`, but neither is a number
@@ -2016,8 +2124,8 @@ fn delegate_prose_shrinks_the_finished_envelope() {
     );
 }
 
-/// Repeated names count as `N times`, nameless entries read `N unnamed` after
-/// the named ones, and first-seen order holds.
+/// Repeated names count as `N times`, nameless entries read `N unnamed
+/// entries` after the named ones, and first-seen order holds.
 #[test]
 fn denial_names_counts_repeats_and_unnamed_entries() {
     let denials = serde_json::json!([
@@ -2030,7 +2138,24 @@ fn denial_names_counts_repeats_and_unnamed_entries() {
     ]);
     assert_eq!(
         denial_names(Some(&denials)),
-        Some("Bash 3 times, Read, 2 unnamed".to_string())
+        Some("Bash 3 times, Read, 2 unnamed entries".to_string())
+    );
+}
+
+/// The nameless group pluralizes like every other count in the reply: one
+/// reads `1 unnamed entry`, two or more `N unnamed entries`, alone or after
+/// named tools.
+#[test]
+fn denial_names_pluralizes_the_unnamed_group() {
+    let one = serde_json::json!([{"tool_use_id": "x"}]);
+    assert_eq!(
+        denial_names(Some(&one)),
+        Some("1 unnamed entry".to_string())
+    );
+    let mixed = serde_json::json!([{"tool_name": "Bash"}, {"tool_use_id": "x"}]);
+    assert_eq!(
+        denial_names(Some(&mixed)),
+        Some("Bash, 1 unnamed entry".to_string())
     );
 }
 

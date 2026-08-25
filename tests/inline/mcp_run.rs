@@ -6343,6 +6343,37 @@ fn throughput_note_drops_the_prefix_and_the_default_placeholder() {
     );
 }
 
+/// The roster row applies the same placeholder rule the warning does: a
+/// `default`, empty, or whitespace-only store key carries no `model` field at
+/// all, and a padded real name renders trimmed.
+#[test]
+fn throughput_row_omits_the_placeholder_non_name_and_keeps_real_names() {
+    let row = |model: &str| {
+        throughput_row(crate::throughput::ModelSummary {
+            model: model.to_string(),
+            tok_s: 12.3,
+            samples: 3,
+            degraded: true,
+            rate_limited_recent: false,
+            retry_after_s: None,
+        })
+    };
+    for placeholder in ["default", "", "   "] {
+        let out = row(placeholder);
+        assert!(
+            out.get("model").is_none(),
+            "the placeholder {placeholder:?} renders no model name: {out}",
+        );
+        assert_eq!(out["tok_s"], serde_json::json!(12.3), "{out}");
+    }
+    let named = row("  deepseek-chat  ");
+    assert_eq!(
+        named.get("model").and_then(serde_json::Value::as_str),
+        Some("deepseek-chat"),
+        "{named}",
+    );
+}
+
 // ---- the state mode's listing (M10) ----
 
 /// Drive `monitor`'s state mode — no `job_ids` — and return its prose.

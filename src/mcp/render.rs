@@ -858,11 +858,14 @@ fn windows_prose(windows: &Value) -> String {
 /// A healthy row is the model's name and rate; `degraded` and the rate-limit
 /// flag appear as words only when true, the retry delay with them. The sample
 /// count is clauth's own confidence telemetry, not a figure a reader acts on,
-/// so it stays in the JSON spelling.
+/// so it stays in the JSON spelling. A row whose store key was the `default`
+/// placeholder carries no `model` field at all (`throughput_row` omits it) and
+/// renders the rate alone — the same nameless reading the delegate warning
+/// gives.
 fn throughput_prose(rows: &[Value]) -> String {
     rows.iter()
         .map(|m| {
-            let model = m.get("model").and_then(Value::as_str).unwrap_or("unknown");
+            let named = m.get("model").and_then(Value::as_str);
             let tok_s = m
                 .get("tok_s")
                 .and_then(Value::as_f64)
@@ -880,7 +883,10 @@ fn throughput_prose(rows: &[Value]) -> String {
                     flags.push(format!("retry in {r}s"));
                 }
             }
-            let mut s = format!("`{model}` {tok_s} tok/s");
+            let mut s = match named {
+                Some(model) => format!("`{model}` {tok_s} tok/s"),
+                None => format!("{tok_s} tok/s"),
+            };
             if !flags.is_empty() {
                 s.push_str(&format!(" ({})", flags.join(", ")));
             }
@@ -1082,7 +1088,7 @@ pub(crate) fn switch_profile_prose(p: &Value) -> String {
 }
 
 /// The whole usage clause renders within this many characters. The real
-/// envelope renders 117 and the composite-heavy one 291, while the pre-change
+/// envelope renders 117 and the composite-heavy one 254, while the pre-change
 /// line ran ~700 characters of mostly zeros; 320 sits far above every
 /// envelope this project has observed and cuts only pathological ones.
 const USAGE_BUDGET: usize = 320;
@@ -1097,18 +1103,27 @@ const USAGE_BUDGET: usize = 320;
 /// `iterations.0.tokens`). The rule is "no FIGURE vanishes": a zero number, a
 /// string that parses as zero, an empty string, a null, a `false` flag, and a
 /// composite whose leaves all carry no figure drop, so no raw JSON reaches the
-/// reply. A string that parses as a number IS the figure, because clauth
-/// fronts third-party proxies that stringify numerics. The dotted path
-/// locates a figure for reading, never for round-tripping: a dotted key and a
-/// nesting render the same (`{"a.b":1}` and `{"a":{"b":1}}`), and an array
-/// index joins the path the same way, so `{"a":[1]}` and `{"a":{"0":1}}`
-/// collide too. Survivor order is claude's wire order, which `serde_json`'s
-/// `preserve_order` feature keeps in the object map. The joined clause is
-/// then cut to `USAGE_BUDGET` characters, ending with `…` only on overflow.
+/// reply. The one deliberate omission is the cache total: Anthropic's
+/// `cache_creation_input_tokens` is the SUM of the `cache_creation.*`
+/// breakdown leaves, so when the total equals its breakdown the same figure
+/// would print twice, and the total drops, leaving the leaves; a total that
+/// disagrees with its breakdown renders alongside it, because dropping it
+/// would hide a figure. A string that parses as a number IS the figure,
+/// because clauth fronts third-party proxies that stringify numerics. The
+/// dotted path locates a figure for reading, never for round-tripping: a
+/// dotted key and a nesting render the same (`{"a.b":1}` and `{"a":{"b":1}}`),
+/// and an array index joins the path the same way, so `{"a":[1]}` and
+/// `{"a":{"0":1}}` collide too; an empty key segment reads `(unnamed)` rather
+/// than a blank span, so a figure whose key is blank still renders a name a
+/// reader can act on. Survivor order is claude's wire order, which
+/// `serde_json`'s `preserve_order` feature keeps in the object map. The joined
+/// clause is then cut to `USAGE_BUDGET` characters, ending with `…` only on
+/// overflow.
 fn usage_prose(u: &Value) -> String {
     let Some(obj) = u.as_object() else {
         return "unknown".to_string();
     };
+    let cache_total_is_sum = cache_total_equals_breakdown(obj);
     let mut clauses: Vec<String> = Vec::new();
     for (k, v) in obj {
         match k.as_str() {
@@ -1131,10 +1146,58 @@ fn usage_prose(u: &Value) -> String {
                     None => clauses.push(format!("{noun} unknown tokens")),
                 }
             }
-            _ => leaf_clauses(k, v, &mut clauses),
+            // The total equals its breakdown: the leaves carry the figure.
+            "cache_creation_input_tokens" if cache_total_is_sum => {}
+            _ => leaf_clauses(path_segment(k), v, &mut clauses),
         }
     }
-    truncate_clause(clauses.join(", "))
+    truncate_clause(clauses.join(", "), USAGE_BUDGET)
+}
+
+/// Whether the usage object's `cache_creation_input_tokens` total equals the
+/// sum of the numeric leaves of its `cache_creation` breakdown, so the same
+/// figure would print twice. A stringified figure counts as its numeric twin
+/// (proxies stringify numerics), and a breakdown with no parseable leaf is not
+/// a match, so a missing or partial breakdown never hides the total.
+fn cache_total_equals_breakdown(obj: &serde_json::Map<String, Value>) -> bool {
+    let Some(total) = obj
+        .get("cache_creation_input_tokens")
+        .and_then(value_as_number)
+    else {
+        return false;
+    };
+    let Some(breakdown) = obj.get("cache_creation").and_then(Value::as_object) else {
+        return false;
+    };
+    let mut sum = 0.0;
+    let mut any = false;
+    for v in breakdown.values() {
+        if let Some(n) = value_as_number(v) {
+            sum += n;
+            any = true;
+        }
+    }
+    any && sum == total
+}
+
+/// A JSON number or a string that parses as a finite one, as a figure. The
+/// string arm is [`string_figure`]'s own, so a `"26800"` reads as its numeric
+/// twin.
+fn value_as_number(v: &Value) -> Option<f64> {
+    match v {
+        Value::Number(n) => n.as_f64(),
+        Value::String(s) => string_figure(s).map(|(_, n)| n),
+        _ => None,
+    }
+}
+
+/// One dotted-path segment. An empty key names nothing, so the segment that
+/// would render as a blank span reads `(unnamed)` instead — the figure stays
+/// visible with a name a reader can act on. A literal key spelled `(unnamed)`
+/// collides with the sentinel, and any borrowed name collides with some
+/// spellable key, so no figure vanishes either way.
+fn path_segment(seg: &str) -> &str {
+    if seg.is_empty() { "(unnamed)" } else { seg }
 }
 
 /// A string that spells a finite number, or `None`. `"83930"`, `" 83930 "`
@@ -1155,7 +1218,8 @@ fn string_figure(s: &str) -> Option<(String, f64)> {
 
 /// Walk one usage value to its surviving figures, pushing one clause each. An
 /// object key or array index joins the path with a dot; arrays recurse, so a
-/// figure inside an array keeps its own path. A composite with no surviving
+/// figure inside an array keeps its own path. An empty key segment reads
+/// `(unnamed)` rather than a blank span. A composite with no surviving
 /// figure pushes nothing, and its top-level key drops.
 fn leaf_clauses(path: &str, v: &Value, out: &mut Vec<String>) {
     match v {
@@ -1166,7 +1230,7 @@ fn leaf_clauses(path: &str, v: &Value, out: &mut Vec<String>) {
         }
         Value::Object(o) => {
             for (k, child) in o {
-                leaf_clauses(&format!("{path}.{k}"), child, out);
+                leaf_clauses(&format!("{path}.{}", path_segment(k)), child, out);
             }
         }
         Value::Number(n) => {
@@ -1190,17 +1254,22 @@ fn leaf_clauses(path: &str, v: &Value, out: &mut Vec<String>) {
     }
 }
 
-/// Cut the clause to `USAGE_BUDGET` characters, ending a cut clause with a
-/// single `…`. No marker and no count: this is a one-line summary, so a
-/// pathological usage object is cut rather than allowed to dominate the
-/// reply. The JSON spelling is internal-only, so a cut figure is not
-/// recoverable by the caller. Characters are walked, so the cut never lands
-/// mid-UTF-8.
-fn truncate_clause(clause: String) -> String {
-    if clause.chars().count() <= USAGE_BUDGET {
+/// Cut the clause to `budget` characters, ending a cut clause with a single
+/// `…`. No marker and no count: this is a one-line summary, so a pathological
+/// usage object is cut rather than allowed to dominate the reply. The JSON
+/// spelling is internal-only, so a cut figure is not recoverable by the
+/// caller.
+///
+/// The cut walks Unicode SCALAR values, so it never lands mid-scalar and the
+/// output is always valid UTF-8; it can split a grapheme cluster (a combining
+/// sequence or a ZWJ emoji can be cut between its scalars), because the crate
+/// carries no grapheme segmentation. A budget of 0 cuts every non-empty
+/// clause to the marker alone.
+fn truncate_clause(clause: String, budget: usize) -> String {
+    if clause.chars().count() <= budget {
         clause
     } else {
-        let mut cut: String = clause.chars().take(USAGE_BUDGET - 1).collect();
+        let mut cut: String = clause.chars().take(budget.saturating_sub(1)).collect();
         cut.push('…');
         cut
     }
@@ -1227,11 +1296,12 @@ fn fmt_cost(cost: f64) -> String {
 /// The `permission_denials` field as a clause body, or `None` when the clause
 /// drops (absent, null, an empty list, or an empty string). A string renders
 /// as its own text. A list renders named tools once in first-seen order with
-/// a `N times` count when repeated, then any nameless entries as `N unnamed`
-/// after the named ones — `unnamed` is a spellable tool name, so the count
-/// keeps the synthetic group out of that namespace. A present value of any
-/// other shape reads `(unreadable)`, so a denial the envelope carried is
-/// never invisible.
+/// a `N times` count when repeated, then any nameless entries as `N unnamed
+/// entries` after the named ones — `unnamed` is a spellable tool name, so the
+/// count keeps the synthetic group out of that namespace, and `entry` /
+/// `entries` pluralizes the group's own count. A present value of any other
+/// shape reads `(unreadable)`, so a denial the envelope carried is never
+/// invisible.
 fn denial_names(denials: Option<&Value>) -> Option<String> {
     let value = denials?;
     if value.is_null() {
@@ -1267,7 +1337,11 @@ fn denial_names(denials: Option<&Value>) -> Option<String> {
         .map(|(n, c)| if c > 1 { format!("{n} {c} times") } else { n })
         .collect();
     if unnamed > 0 {
-        parts.push(format!("{unnamed} unnamed"));
+        parts.push(if unnamed == 1 {
+            "1 unnamed entry".to_string()
+        } else {
+            format!("{unnamed} unnamed entries")
+        });
     }
     Some(parts.join(", "))
 }

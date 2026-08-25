@@ -4661,9 +4661,27 @@ fn the_profiles_entry_names_both_scopes_and_the_reply_shape() {
         // word standing. The three are pinned individually because each one
         // separately means `delegate` refuses that account, and `mcp_run.rs`
         // reds a refusal test per state.
+        //
+        // The refusal correspondence the description used to assert in prose
+        // ("`delegate` refuses X accounts") left on 2026-08-26 (R18, the R13
+        // de-dup): the refusal itself owns that mapping — it names the state
+        // and the fix at call time — so the description now carries the flags
+        // as reply spellings and cites the refusal instead of restating its
+        // set. The three needles stay, pinning the renderer agreement; what
+        // moved is the prose around them.
         "`disabled`",
         "`login expired`",
         "`no api key`",
+        // R7 shipped the canceled clause in the description but nothing pinned
+        // it (convention-held until now), so a prose edit could drop it or
+        // flip its direction silently. Two needles: presence, and the
+        // non-refusal direction — dropping the clause reds the second, and
+        // flipping it to "means a refusal" reds the second without touching
+        // the first. `subscription canceled` is the one flag no refusal ever
+        // names (a canceled account still delegates), so the description is
+        // the only surface that can carry the fact.
+        "`subscription canceled`",
+        "does not mean a refusal",
         // The direction of the percentage. A caller reading it backwards picks
         // the most-spent account. Relaxed 2026-08-20 from `less headroom` to the
         // clause the owner's copy states it with: the direction is what matters,

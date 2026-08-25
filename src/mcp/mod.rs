@@ -578,7 +578,7 @@ pub(crate) struct DelegateArgs {
     /// Spell the type exactly as the `Agent` tool lists it. An unknown type is
     /// dropped with no error.
     prompt: Option<String>,
-    /// Passes a txt/md file as the prompt (path relative to `cwd`). Best for a
+    /// Passes a txt/md file as the prompt (path relative to `cwd`). Use it for a
     /// prompt you reuse across turns, or one that changes only slightly between
     /// delegates.
     prompt_file: Option<String>,
@@ -597,11 +597,14 @@ pub(crate) struct DelegateArgs {
     /// running. Its result is delivered to you automatically when it finishes.
     /// You can check, collect or stop it with `monitor`.
     background: Option<bool>,
-    /// Model for the delegated session. Unset = default model for that profile.
+    /// Model for the delegated session.
+    ///
+    /// Unset (default): the profile's own default model.
     model: Option<String>,
-    /// Directory the delegate runs in (must exist). Defaults to where this
-    /// session started. The delegate reads `CLAUDE.md` from its cwd
-    /// unconditionally.
+    /// Directory the delegate runs in (must exist). The delegate reads
+    /// `CLAUDE.md` from this directory unconditionally.
+    ///
+    /// Unset (default): where this session started.
     cwd: Option<String>,
     /// Continue a session by `session_id`, with `prompt` as the next message,
     /// in the session's original working directory. `cwd` is optional.
@@ -619,24 +622,23 @@ pub(crate) struct DelegateArgs {
     /// long it takes. Raise it only when the task is expected to make a slow
     /// tool call (e.g. a long build).
     ///
-    /// If `args` pins its own `--output-format`, this stops killing on silence
-    /// and works the same as `timeout_secs`.
+    /// If `args` pins its own `--output-format`, this limit is off;
+    /// `timeout_secs` is the deadline that applies instead.
     idle_secs: Option<u64>,
     /// Wall-clock limit in seconds (max: 3600). Applies only when `args` pins
     /// its own `--output-format`; leave it unset there for `idle_secs` to
     /// supply the limit instead. Ignored on any other run (a delegate that is
     /// still producing output keeps running).
     timeout_secs: Option<u64>,
-    /// Additional environment variables passed to the delegate session. clauth
-    /// sets `CLAUDE_CONFIG_DIR` and its own depth guard after your values. Read
-    /// `code.claude.com/docs/en/env-vars.md` to see what Claude Code supports.
+    /// Additional environment variables passed to the delegate session. Values
+    /// you set for `CLAUDE_CONFIG_DIR` and `CLAUTH_MCP_DEPTH` are replaced by
+    /// clauth's own. Read `code.claude.com/docs/en/env-vars.md` to see what
+    /// Claude Code supports.
     env: Option<HashMap<String, String>>,
-    /// Extra CLI arguments that go after the `claude -p` clauth invokes. They
-    /// go after streaming flags clauth adds, `--strict-mcp-config` on an
-    /// isolated run, and after `--model` when `model` is set.
-    ///
-    /// Pinning `--output-format` here replaces clauth's own, which turns off
-    /// the idle limit and leaves `timeout_secs` as the only guard.
+    /// Extra CLI arguments that go after the `claude -p` clauth invokes. Your
+    /// arguments come last, so they win where a flag repeats (including
+    /// `--model` when `model` is set). Pinning `--output-format` here replaces
+    /// clauth's own output shape, which switches the deadline to `timeout_secs`.
     ///
     /// A delegate that must write files needs
     /// `args: ["--dangerously-skip-permissions"]`; without it the session
@@ -708,9 +710,10 @@ impl ClauthServer {
 
     #[tool(
         description = "List of clauth accounts with their cached usage headrooms. A window's \
-percentage is how much of it is already used. Call it before picking a `delegate` target. \
-`delegate` refuses `disabled`, `login expired` or `no api key` accounts. `subscription \
-canceled` does not mean a refusal."
+percentage is how much of it is already used. Call it before picking a `delegate` target. A row \
+can carry `disabled`, `login expired`, `no api key` or `subscription canceled`; when `delegate` \
+refuses an account, its refusal names the state and the fix. `subscription canceled` does not \
+mean a refusal."
     )]
     async fn profiles(
         &self,
@@ -925,9 +928,9 @@ disturbing this session, use `delegate`."
     }
 
     #[tool(
-        description = "Run a task on another clauth account. `delegate` starts a fresh headless `claude` session on \
-that account and returns its final response. This is like the Agent tool, but the agent runs on \
-a different account's login.\n\n\
+        description = "Run a task on another clauth account. `delegate` starts a fresh `claude` \
+session on that account and returns its final response. This is like the Agent tool, but the \
+agent runs on a different account's login.\n\n\
 The delegate knows nothing about this conversation. Put everything it needs into `prompt`.\n\n\
 Delegating spends the target account, so pick the account with `profiles` first."
     )]

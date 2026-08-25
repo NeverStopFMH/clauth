@@ -7,10 +7,10 @@ use std::net::{IpAddr, Ipv6Addr};
 
 use serde_json::Value;
 
-use crate::format::{format_pct, humanize_span};
+use crate::format::{format_pct, humanize_span, local_stamp};
 use crate::providers::ThirdPartyStats;
 use crate::runtime::LinkMode;
-use crate::usage::humanize_duration;
+use crate::usage::{humanize_duration, iso_to_epoch_secs, now_epoch_secs};
 use crate::which::SessionAuth;
 
 /// Per-profile snapshot fed to [`instructions_block`]: stable identity only (name,
@@ -840,8 +840,21 @@ fn windows_prose(windows: &Value) -> String {
                     let label = w.get("label").and_then(Value::as_str).unwrap_or("unknown");
                     let pct = w.get("utilization_pct").and_then(Value::as_f64);
                     let mut s = format!("{label} {}", pct_clause(pct));
-                    if let Some(r) = w.get("resets_at").and_then(Value::as_str) {
-                        s.push_str(&format!(" (resets at {r})"));
+                    if let Some(epoch) = w
+                        .get("resets_at")
+                        .and_then(Value::as_str)
+                        .and_then(iso_to_epoch_secs)
+                    {
+                        let remaining = epoch - now_epoch_secs();
+                        // A reset already past is a stale reading `freshness_clause`
+                        // marks; `resets at <past> · now` would claim a reset that
+                        // already happened and a false countdown, so drop it.
+                        if remaining > 0
+                            && let Some(stamp) = local_stamp(epoch)
+                        {
+                            let countdown = humanize_duration(remaining);
+                            s.push_str(&format!(" (resets at {stamp} · {countdown})"));
+                        }
                     }
                     s
                 })

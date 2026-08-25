@@ -1089,6 +1089,96 @@ fn windows_prose_dates_its_figures_and_marks_a_stale_one() {
     );
 }
 
+/// The roster's reset stamp is a LOCAL prose stamp paired with its countdown,
+/// never the raw ISO `resets_at` the payload carries: no `T`, no `Z`, no `+`
+/// offset and no fractional seconds. Both windows take the same treatment
+/// because they share the arm.
+#[test]
+fn windows_prose_renders_a_local_reset_stamp_with_a_countdown_not_the_raw_iso() {
+    let now = crate::usage::now_epoch_secs();
+    let five_h = crate::usage::epoch_secs_to_iso(now + 3_600 + 30);
+    let seven_d = crate::usage::epoch_secs_to_iso(now + 7 * 86_400 + 30);
+    let out = windows_prose(&serde_json::json!({
+        "kind": "oauth",
+        "windows": [
+            {"label": "5h", "utilization_pct": 74.0, "resets_at": five_h},
+            {"label": "7d", "utilization_pct": 12.0, "resets_at": seven_d},
+        ],
+    }));
+    assert!(out.contains("resets at "), "{out}");
+    assert!(out.contains(" · "), "countdown missing: {out}");
+    // Negate on the STAMP alone: `T`/`Z`/`+`/`.` have no legitimate producer in
+    // a stamp, while a fractional `utilization_pct` would put `.` in the figure
+    // and a whole-string negation would then false-positive.
+    let stamps: Vec<&str> = out
+        .split("resets at ")
+        .skip(1)
+        .map(|clause| clause.split(" · ").next().unwrap())
+        .collect();
+    assert_eq!(stamps.len(), 2, "both windows carry a stamp: {out}");
+    for stamp in stamps {
+        assert!(!stamp.contains('T'), "raw ISO `T` leaked: {stamp}");
+        assert!(!stamp.contains('Z'), "raw ISO `Z` leaked: {stamp}");
+        assert!(!stamp.contains('+'), "raw ISO offset leaked: {stamp}");
+        assert!(!stamp.contains('.'), "fractional seconds leaked: {stamp}");
+    }
+}
+
+/// The countdown is pinned to the stored delta: the rendered figure equals
+/// `humanize_duration` of the same seconds-until-reset the test wrote into
+/// `resets_at`. A mid-minute delta keeps a ±1 s clock straddle from flipping the
+/// unit, so the pin is exact without a clock seam.
+#[test]
+fn windows_prose_pins_the_reset_countdown_to_the_stored_delta() {
+    let delta = 23 * 3600 + 4 * 60 + 30;
+    let now = crate::usage::now_epoch_secs();
+    let resets_at = crate::usage::epoch_secs_to_iso(now + delta);
+    let out = windows_prose(&serde_json::json!({
+        "kind": "oauth",
+        "windows": [{"label": "5h", "utilization_pct": 74.0, "resets_at": resets_at}],
+    }));
+    let expected = crate::usage::humanize_duration(delta);
+    assert!(
+        out.contains(&format!(" · {expected})")),
+        "countdown {expected} not found in {out}"
+    );
+}
+
+/// A missing or unparseable `resets_at` drops the parenthetical entirely — the
+/// figure stands alone, and the raw ISO never surfaces.
+#[test]
+fn windows_prose_drops_a_missing_or_unparseable_resets_at() {
+    assert_eq!(
+        windows_prose(&serde_json::json!({
+            "kind": "oauth",
+            "windows": [{"label": "5h", "utilization_pct": 12.0, "resets_at": null}],
+        })),
+        "5h 12% used",
+    );
+    assert_eq!(
+        windows_prose(&serde_json::json!({
+            "kind": "oauth",
+            "windows": [{"label": "5h", "utilization_pct": 12.0, "resets_at": "not-a-time"}],
+        })),
+        "5h 12% used",
+    );
+}
+
+/// A reset already in the past is a stale reading, not a countdown: `resets at
+/// <past> · now` would claim a reset that already happened and a false `now`.
+/// The figure stands alone; `freshness_clause` is what marks it stale.
+#[test]
+fn windows_prose_drops_a_past_resets_at() {
+    let past = crate::usage::epoch_secs_to_iso(crate::usage::now_epoch_secs() - 3_600);
+    assert_eq!(
+        windows_prose(&serde_json::json!({
+            "kind": "oauth",
+            "windows": [{"label": "5h", "utilization_pct": 74.0, "resets_at": past}],
+        })),
+        "5h 74% used",
+    );
+}
+
 /// The session arm renders its row through `profile_line` (so it inherits the
 /// roster's own guards), names how it resolved, then folds live usage and the
 /// digest. The live-usage clause is dropped when it would restate the row's

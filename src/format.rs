@@ -8,6 +8,8 @@
 //! module or mint one-caller abstractions, so the split stands over a single
 //! grab-bag `format.rs` (surveyed 2026-07-16).
 
+use chrono::{DateTime, Datelike, Local, Timelike};
+
 use crate::profile::Profile;
 use crate::usage::{PlanTier, humanize_duration};
 
@@ -400,6 +402,27 @@ pub(crate) fn format_pct(pct: f64) -> String {
     } else {
         format!("{pct}%")
     }
+}
+
+/// The one LOCAL prose-stamp formatter: an epoch-seconds instant as
+/// `YYYY-MM-DD HH:MM:SS` in the operator's local wall clock. A second spelling
+/// of a LOCAL stamp is a bug in its caller, not a new helper. Machine timestamps
+/// that stay UTC by design — the daemon `logline!` prefix and `clauth sessions`
+/// (its JSON `updated` and table column) — do not route through here.
+/// Returns `None` when the instant falls outside chrono's representable range.
+pub(crate) fn local_stamp(epoch: i64) -> Option<String> {
+    let naive = DateTime::from_timestamp(epoch, 0)?
+        .with_timezone(&Local)
+        .naive_local();
+    Some(format!(
+        "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
+        naive.year(),
+        naive.month(),
+        naive.day(),
+        naive.hour(),
+        naive.minute(),
+        naive.second(),
+    ))
 }
 
 #[cfg(test)]

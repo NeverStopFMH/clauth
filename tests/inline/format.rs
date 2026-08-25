@@ -258,6 +258,24 @@ fn format_pct_shows_fractional_percent() {
     assert_eq!(format_pct(42.3), "42.3%");
 }
 
+/// `local_stamp` is the one prose-stamp formatter: epoch seconds → `YYYY-MM-DD
+/// HH:MM:SS` in local wall clock. Pinned on a fixed epoch so the SHAPE asserts
+/// independently of the operator's zone — the wall-clock digits shift with the
+/// zone, the separators do not.
+#[test]
+fn local_stamp_renders_the_local_wall_clock_shape() {
+    let stamp = local_stamp(0).unwrap();
+    assert_eq!(stamp.len(), 19, "{stamp}");
+    for (i, c) in stamp.chars().enumerate() {
+        match i {
+            4 | 7 => assert_eq!(c, '-', "{stamp}"),
+            10 => assert_eq!(c, ' ', "{stamp}"),
+            13 | 16 => assert_eq!(c, ':', "{stamp}"),
+            _ => assert!(c.is_ascii_digit(), "non-digit at {i} in {stamp}"),
+        }
+    }
+}
+
 #[test]
 fn account_tier_reads_the_fetched_tier_only_the_canceled_marker_is_on_the_status_line() {
     let mut canceled = crate::testutil::blank_profile("a");

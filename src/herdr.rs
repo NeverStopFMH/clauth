@@ -12,9 +12,10 @@
 //! otherwise disable on load. The real write lands in place rather than through
 //! a rename, so the file keeps the mode and inode herdr's config already has.
 
-use std::io::IsTerminal as _;
+use std::io::{IsTerminal as _, Read as _};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Output, Stdio};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use serde_json::Value;
@@ -94,13 +95,13 @@ pub(crate) fn install(
 
     let path = config_path(&bin)?;
     let existing = read_config(&path)?;
-    let (text, plan, removed) = resync_text(&existing, &key, delegate_row_text)?;
+    let (text, plan, removed, noop) = install_resync(&existing, &key, delegate_row_text)?;
 
     for note in &plan.notes {
         outln!("clauth: {note}");
     }
 
-    if text == existing {
+    if noop {
         outln!("clauth: herdr's config already carries everything clauth would add");
         return Ok(());
     }
@@ -110,17 +111,16 @@ pub(crate) fn install(
     for line in plan.append.trim_start_matches('\n').lines() {
         outln!("+ {line}");
     }
-    if plan.append.is_empty() {
-        // A resync whose plan re-adds nothing still drops the blocks it
-        // stripped (the user hand-owns the binding); show that half the way
-        // `uninstall` does.
-        let mut diff = removed.clone();
-        if diff.first().is_some_and(String::is_empty) {
-            diff.remove(0);
-        }
-        for line in &diff {
-            outln!("- {line}");
-        }
+    // A resync also DROPS the blocks it stripped — a knob toggle replaces the
+    // old row, and a hand-owned binding re-adds nothing. Show the removal
+    // half whenever something was stripped, the way `uninstall` does, so the
+    // diff the user confirms shows both sides.
+    let mut diff = removed.clone();
+    if diff.first().is_some_and(String::is_empty) {
+        diff.remove(0);
+    }
+    for line in &diff {
+        outln!("- {line}");
     }
     outln!("");
 
@@ -201,10 +201,8 @@ pub(crate) fn config_path(bin: &str) -> Result<PathBuf> {
         return Ok(PathBuf::from(explicit));
     }
 
-    let out = Command::new(bin)
-        .args(["plugin", "config-dir", PLUGIN_ID])
-        .output()
-        .with_context(|| format!("could not run `{bin} plugin config-dir`"))?;
+    let out = bounded_output(bin, &["plugin", "config-dir", PLUGIN_ID], &[])
+        .with_context(|| format!("`{bin} plugin config-dir` timed out or could not run"))?;
     let printed = String::from_utf8_lossy(&out.stdout);
     // Guessing a second location is worse than failing here: a guess that
     // misses writes a config file herdr never reads, and the user is told they
@@ -294,8 +292,64 @@ pub(crate) fn probe() -> Option<HerdrProbe> {
     })
 }
 
+/// Bounds one herdr subprocess on the probe path (construction in herdr mode,
+/// `r` refreshes) and on the validated-write path (`check_config`): a hung
+/// herdr must delay the caller, never hang the first paint or a heal behind
+/// an open modal. Same kill-on-deadline shape as the pane reporter's `report`
+/// (`herdr_report.rs`); `probe()` runs its three calls sequentially, so the
+/// worst case is three times this bound. A child that floods its own pipe
+/// before the deadline is killed with it, same as one that never exits.
+/// `run_quiet` deliberately stays unbounded: it drives `plugin install` and
+/// friends, which can fetch over the network, and it only ever runs on the
+/// interactive CLI path where the user watches the stall.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+
+fn bounded_output(bin: &str, args: &[&str], envs: &[(&str, String)]) -> Option<Output> {
+    let mut cmd = Command::new(bin);
+    cmd.args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    for (k, v) in envs {
+        cmd.env(k, v);
+    }
+    let mut child = cmd.spawn().ok()?;
+    let deadline = Instant::now() + PROBE_TIMEOUT;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(10)),
+            // A failed waitpid leaves a zombie otherwise; reap like the
+            // reporter does.
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+    };
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    if let Some(mut pipe) = child.stdout.take() {
+        let _ = pipe.read_to_end(&mut stdout);
+    }
+    if let Some(mut pipe) = child.stderr.take() {
+        let _ = pipe.read_to_end(&mut stderr);
+    }
+    Some(Output {
+        status,
+        stdout,
+        stderr,
+    })
+}
+
 fn version_command(bin: &str) -> Option<String> {
-    let out = Command::new(bin).arg("--version").output().ok()?;
+    let out = bounded_output(bin, &["--version"], &[])?;
     if !out.status.success() {
         return None;
     }
@@ -313,15 +367,14 @@ fn version_from(line: &str) -> Option<String> {
 }
 
 fn registry_probe(bin: &str) -> (Option<RegistryEntry>, Option<String>) {
-    let out = match Command::new(bin)
-        .args(["plugin", "list", "--json"])
-        .output()
-    {
-        Ok(out) => out,
-        Err(e) => {
+    let out = match bounded_output(bin, &["plugin", "list", "--json"], &[]) {
+        Some(out) => out,
+        None => {
             return (
                 None,
-                Some(format!("could not run `{bin} plugin list --json`: {e}")),
+                Some(format!(
+                    "`{bin} plugin list --json` timed out or could not run"
+                )),
             );
         }
     };
@@ -697,6 +750,21 @@ fn resync_text(
     Ok((text, plan, removed))
 }
 
+/// `resync_text` plus the no-op verdict `install` branches on: an unchanged
+/// knob reconstructs the file byte for byte (the round-trip pins hold that
+/// half), so `text == existing` is the skip. Split out so a test pins the
+/// verdict both ways instead of the branch living unbacked in `install`,
+/// where a TTY and herdr's installer keep tests out.
+fn install_resync(
+    existing: &str,
+    key: &str,
+    delegate_row_text: bool,
+) -> Result<(String, ConfigPlan, Vec<String>, bool)> {
+    let (text, plan, removed) = resync_text(existing, key, delegate_row_text)?;
+    let noop = text == existing;
+    Ok((text, plan, removed, noop))
+}
+
 /// Test seam over [`strip_marked_blocks`], so the round-trip tests name the rule they pin.
 #[cfg(test)]
 fn without_marked_blocks(existing: &str) -> String {
@@ -706,6 +774,22 @@ fn without_marked_blocks(existing: &str) -> String {
 /// Drops every block this crate marked with `MARKER`, nothing else, plus the lines it removed in order so `uninstall` can print a `- ` diff that mirrors the `+ ` one `install` prints.
 ///
 /// A block is real only when a `[`-leading line follows the marker, since that header is what `install` always writes; the blank `install` prepends before it is dropped too. A marker standing alone drops itself and leaves the next line on the normal path. The residue is a marker inside a multi-line string whose next line happens to begin with `[`; telling that apart needs a TOML parser, and this strip only runs over lines `install` wrote, where the header always follows.
+/// The line prefixes a marked block's own tables use. The strip ends a block
+/// at the first line outside this vocab, so a user key glued directly to the
+/// block's last line (no blank separator, still valid TOML in the same table)
+/// survives the resync instead of being eaten with the block.
+fn is_block_line(lead: &str) -> bool {
+    [
+        "key = ",
+        "type = ",
+        "command = ",
+        "description = ",
+        "claude = ",
+    ]
+    .iter()
+    .any(|p| lead.starts_with(p))
+}
+
 fn strip_marked_blocks(existing: &str) -> (String, Vec<String>) {
     let mut out: Vec<String> = Vec::new();
     let mut removed: Vec<String> = Vec::new();
@@ -720,8 +804,15 @@ fn strip_marked_blocks(existing: &str) -> (String, Vec<String>) {
             if lead.is_empty() || lead.starts_with('[') {
                 skipping = false;
                 out.push(raw.to_string());
-            } else {
+            } else if is_block_line(lead) {
                 removed.push(content.to_string());
+            } else {
+                // A line clauth did not write, glued to the block's end: end
+                // the block here and keep the line. `text != existing` then
+                // still fires (the block was stripped), and the write removes
+                // clauth's blocks without touching the user's line.
+                skipping = false;
+                out.push(raw.to_string());
             }
             continue;
         }
@@ -907,11 +998,12 @@ fn added_diagnostics<'a>(before: &[String], after: &'a [String]) -> Vec<&'a str>
 /// codes.
 fn check_config(bin: &str, probe: &Path, text: &str) -> Result<Vec<String>> {
     std::fs::write(probe, text)?;
-    let out = Command::new(bin)
-        .args(["config", "check"])
-        .env("HERDR_CONFIG_PATH", probe)
-        .output()
-        .with_context(|| format!("could not run `{bin} config check`"))?;
+    let out = bounded_output(
+        bin,
+        &["config", "check"],
+        &[("HERDR_CONFIG_PATH", probe.to_string_lossy().into_owned())],
+    )
+    .with_context(|| format!("`{bin} config check` timed out or could not run"))?;
     if out.status.success() {
         return Ok(Vec::new());
     }

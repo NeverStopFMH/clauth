@@ -35,11 +35,12 @@
 //! pane, and a dead server (the TTL clears the stale `working`). herdr renders
 //! a token only where a sidebar row template names it — the same rule the
 //! profile tag lives under — and the row `clauth herdr install` writes
-//! (`herdr.rs`) names `$clauth` alone, the profile tag. So the state reads on
-//! the pane JSON (`pane get` / `pane list`), not on the pane row. Measured
-//! 2026-08-25 on 0.8.2: an applied token rendered nowhere on the agent row,
-//! and rendered `working` beside the account tag when a test template named
-//! the token.
+//! (`herdr.rs`) names `$clauth` alone, the profile tag, unless the
+//! `delegate_row_text` knob is on, which appends `$clauth_delegate` to it.
+//! With the knob off the state reads on the pane JSON (`pane get` / `pane
+//! list`), not on the pane row. Measured 2026-08-25 on 0.8.2: an applied
+//! token rendered nowhere on the agent row, and rendered `working` beside the
+//! account tag when a test template named the token.
 //!
 //! Every report is best-effort: a failed or hanging herdr spawn never fails a
 //! delegate. It does cost time, and the serve runtime is

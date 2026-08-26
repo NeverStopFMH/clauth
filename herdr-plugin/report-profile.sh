@@ -10,7 +10,11 @@
 set -u
 
 herdr_bin="${HERDR_BIN_PATH:-herdr}"
-sessions_dir="${CLAUTH_HOME:-$HOME/.clauth}/live_sessions"
+# clauth resolves its home off $HOME alone (no CLAUTH_HOME override exists in
+# the binary), so the registry the walk reads is the tree clauth actually
+# writes. An unset HOME trips `set -u` by design: nothing the walk needs can
+# resolve without it.
+sessions_dir="$HOME/.clauth/live_sessions"
 pane="${HERDR_PANE_ID:-}"
 
 # Prints the registry row owning $1 or one of its ancestors, empty if none.
@@ -34,10 +38,16 @@ session_row() {
 
 # The agent hooks fire for every agent herdr detects, codex and cursor
 # included, and those panes spend no clauth account. Both hooked events carry
-# `agent`, and an action carries `focused_pane_agent` instead. Neither is set
-# for a plain shell pane, which is the one case that still gets an answer.
+# `agent`; the `clauth.which` action carries `focused_pane_agent` in its
+# context instead, and that fallback is consulted ONLY when no pane id is set
+# (actions have none) — an event hook reading the context's focused pane would
+# answer for whichever pane holds focus, not the pane the event fired for.
+# Neither is set for a plain shell pane, which is the one case that still gets
+# an answer.
 agent=$(printf '%s' "${HERDR_PLUGIN_EVENT_JSON:-}" | sed -n 's/.*"agent":"\([^"]*\)".*/\1/p')
-[ -n "$agent" ] || agent=$(printf '%s' "${HERDR_PLUGIN_CONTEXT_JSON:-}" | sed -n 's/.*"focused_pane_agent":"\([^"]*\)".*/\1/p')
+if [ -z "$agent" ] && [ -z "$pane" ]; then
+    agent=$(printf '%s' "${HERDR_PLUGIN_CONTEXT_JSON:-}" | sed -n 's/.*"focused_pane_agent":"\([^"]*\)".*/\1/p')
+fi
 case "$agent" in
     "" | claude) ;;
     *) exit 0 ;;
@@ -89,8 +99,12 @@ border_label=$(clauth herdr config get border_label 2>/dev/null || printf 'off')
 state_dir="${HERDR_PLUGIN_STATE_DIR:-${TMPDIR:-/tmp}/clauth}"
 mkdir -p "$state_dir" 2>/dev/null || exit 0
 pidfile="$state_dir/watch-$pane.pid"
-if [ -f "$pidfile" ] && kill -0 "$(cat "$pidfile" 2>/dev/null)" 2>/dev/null; then
-    exit 0
+# Claim the pidfile atomically (noclobber): two hook runs firing together both
+# reach the check-empty pidfile, so the create itself is the gate — the loser
+# falls through to the liveness check and skips the spawn. A plain existence
+# check + kill -0 races, and both runs would spawn a watcher.
+if ! ( umask 077; set -C; echo "$$" > "$pidfile" ) 2>/dev/null; then
+    [ -f "$pidfile" ] && kill -0 "$(cat "$pidfile" 2>/dev/null)" 2>/dev/null && exit 0
 fi
 dir=$(dirname "$0")
 "$dir/watch-profile.sh" "$pane" "$pidfile" </dev/null >/dev/null 2>&1 &

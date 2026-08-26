@@ -13,12 +13,14 @@ herdr_bin="${HERDR_BIN_PATH:-herdr}"
 # The tag_watch_secs knob wins over the env, which wins over the 5s default;
 # a predating clauth answers nothing, so the env/default chain still holds.
 interval=$(clauth herdr config get tag_watch_secs 2>/dev/null || printf '%s' "${CLAUTH_PROFILE_WATCH_INTERVAL:-5}")
-# A non-numeric interval would make `sleep` fail instantly, and zero would hot-
-# spin the loop; clamp both to the default or a floor of one second.
+# A non-numeric interval would make `sleep` fail instantly, zero would hot-spin
+# the loop, and a hand-edited knob of absurd magnitude overflows `sleep`'s
+# parser; clamp non-numeric to the default, and the range to [1 s, 1 h].
 case "$interval" in
     *[!0-9]* | '') interval=5 ;;
 esac
 [ "$interval" -lt 1 ] && interval=1
+[ "$interval" -gt 3600 ] && interval=3600
 dir=$(dirname "$0")
 
 # Own the pidfile so `report-profile.sh` sees a live watch and does not spawn a

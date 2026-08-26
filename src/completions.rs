@@ -36,13 +36,15 @@ const BASH: &str = r#"_clauth() {
     elif [ "$COMP_CWORD" -eq 2 ] && [ "$prev" = "jobs" ]; then
         COMPREPLY=( $(compgen -W "--json" -- "${cur}") )
     elif [ "$COMP_CWORD" -eq 2 ] && [ "$prev" = "herdr" ]; then
-        COMPREPLY=( $(compgen -W "install config" -- "${cur}") )
+        COMPREPLY=( $(compgen -W "install uninstall config" -- "${cur}") )
     elif [ "$COMP_CWORD" -eq 3 ] && [ "${COMP_WORDS[1]}" = "herdr" ] && [ "${COMP_WORDS[2]}" = "config" ]; then
         COMPREPLY=( $(compgen -W "get" -- "${cur}") )
     elif [ "$COMP_CWORD" -eq 4 ] && [ "${COMP_WORDS[1]}" = "herdr" ] && [ "${COMP_WORDS[2]}" = "config" ] && [ "${COMP_WORDS[3]}" = "get" ]; then
         COMPREPLY=( $(compgen -W "popup_width pane_tag tag_watch_secs border_label delegate_dot delegate_row_text" -- "${cur}") )
     elif [ "${COMP_WORDS[1]}" = "herdr" ] && [ "${COMP_WORDS[2]}" = "install" ] && [ "${cur:0:2}" = "--" ]; then
         COMPREPLY=( $(compgen -W "--key --no-config --yes -y" -- "${cur}") )
+    elif [ "${COMP_WORDS[1]}" = "herdr" ] && [ "${COMP_WORDS[2]}" = "uninstall" ] && [ "${cur:0:2}" = "--" ]; then
+        COMPREPLY=( $(compgen -W "--no-config --yes -y" -- "${cur}") )
     elif [ "${COMP_WORDS[1]}" = "resume" ] && [ "${cur:0:2}" = "--" ]; then
         COMPREPLY=( $(compgen -W "--profile" -- "${cur}") )
     elif [ "${COMP_WORDS[1]}" = "delete" ] && [ "${cur:0:2}" = "--" ]; then
@@ -105,6 +107,7 @@ _clauth() {
         _describe 'profile' profiles
     elif (( CURRENT == 3 )) && [[ "${words[2]}" == herdr ]]; then
         _values 'subcommand' 'install[install the plugin and wire it into herdr'"'"'s config]' \
+            'uninstall[remove the plugin and the config lines it added]' \
             'config[print one herdr knob]'
     elif (( CURRENT == 4 )) && [[ "${words[2]}" == herdr && "${words[3]}" == config ]]; then
         _values 'subcommand' 'get[print the knob value on one line]'
@@ -112,6 +115,8 @@ _clauth() {
         _values 'key' 'popup_width[how wide the popup opens]' 'pane_tag[publish the profile tag token]' 'tag_watch_secs[per-pane tag watcher interval]' 'border_label[split-pane border account label]' 'delegate_dot[delegate pane metadata]' 'delegate_row_text[delegate text beside the sidebar row]'
     elif (( CURRENT >= 4 )) && [[ "${words[2]}" == herdr && "${words[3]}" == install ]]; then
         _values 'flag' '--key[key that opens the dashboard]' '--no-config[leave herdr'"'"'s config.toml alone]' '--yes[skip both confirm prompts]' '-y[skip both confirm prompts]'
+    elif (( CURRENT >= 4 )) && [[ "${words[2]}" == herdr && "${words[3]}" == uninstall ]]; then
+        _values 'flag' '--no-config[leave herdr'"'"'s config.toml alone]' '--yes[skip both confirm prompts]' '-y[skip both confirm prompts]'
     elif (( CURRENT == 3 )) && [[ "${words[2]}" == which ]]; then
         _values 'flag' '--json[emit JSON instead of plain name]'
     elif (( CURRENT == 3 )) && [[ "${words[2]}" == sessions ]]; then
@@ -168,12 +173,15 @@ complete -c clauth -f -n __fish_is_first_token -a status -d "Print the usage / a
 complete -c clauth -f -n __fish_is_first_token -a mcp -d "Run the stdio MCP server"
 complete -c clauth -f -n __fish_is_first_token -a herdr -d "Install the herdr plugin, read its knobs, or uninstall it"
 complete -c clauth -f -n "__fish_seen_subcommand_from herdr" -a install -d "Install the plugin and wire it into herdr's config"
+complete -c clauth -f -n "__fish_seen_subcommand_from herdr" -a uninstall -d "Remove the plugin and the config lines it added"
 complete -c clauth -f -n "__fish_seen_subcommand_from herdr" -a config -d "Print one herdr knob"
 complete -c clauth -f -n "__fish_seen_subcommand_from config" -a get -d "Print the knob value on one line"
 complete -c clauth -f -n "__fish_seen_subcommand_from get" -a "popup_width pane_tag tag_watch_secs border_label delegate_dot delegate_row_text" -d "Knob name"
 complete -c clauth -f -n "__fish_seen_subcommand_from herdr; and __fish_seen_subcommand_from install" -a --key -d "Key that opens the dashboard"
 complete -c clauth -f -n "__fish_seen_subcommand_from herdr; and __fish_seen_subcommand_from install" -a --no-config -d "Leave herdr's config.toml alone"
 complete -c clauth -f -n "__fish_seen_subcommand_from herdr; and __fish_seen_subcommand_from install" -a --yes -d "Skip both confirm prompts"
+complete -c clauth -f -n "__fish_seen_subcommand_from herdr; and __fish_seen_subcommand_from uninstall" -a --no-config -d "Leave herdr's config.toml alone"
+complete -c clauth -f -n "__fish_seen_subcommand_from herdr; and __fish_seen_subcommand_from uninstall" -a --yes -d "Skip both confirm prompts"
 complete -c clauth -f -n __fish_is_first_token -a --theme -d "Force a color depth instead of auto-detecting"
 complete -c clauth -f -n 'set -l t (commandline -opc); and test "$t[-1]" = "--theme"' -a "full compatible"
 complete -c clauth -f -n "__fish_seen_subcommand_from start login delete disable enable rolling-token static-token" -a "(__clauth_profiles)" -d Profile

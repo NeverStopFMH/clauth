@@ -134,12 +134,12 @@ fn every_shell_completes_login_setup_token_flag() {
     }
 }
 
-/// `clauth herdr install` is the only herdr subcommand whose flags the
-/// scripts offer, so the flag branch must track it: after `clauth herdr
-/// config get <key>` clap refuses `--key --no-config --yes`, and the scripts
-/// must not complete what clap rejects.
+/// `clauth herdr install` and `clauth herdr uninstall` are the only herdr
+/// subcommands whose flags the scripts offer, so the flag branches must track
+/// them: after `clauth herdr config get <key>` clap refuses `--key
+/// --no-config --yes`, and the scripts must not complete what clap rejects.
 #[test]
-fn herdr_flags_are_offered_only_under_install() {
+fn herdr_flags_are_offered_only_under_install_and_uninstall() {
     let cases = [
         (
             BASH,
@@ -157,7 +157,28 @@ fn herdr_flags_are_offered_only_under_install() {
         }
         assert!(
             script.contains(branch),
-            "the herdr flag offer must be gated to `install`, missing {branch:?}",
+            "the install flag offer must be gated to `install`, missing {branch:?}",
+        );
+    }
+    // `uninstall` offers the same flags minus `--key`, and each shell gates
+    // that arm on the subcommand too.
+    for (script, branch) in [
+        (
+            BASH,
+            r#""${COMP_WORDS[1]}" = "herdr" ] && [ "${COMP_WORDS[2]}" = "uninstall" ]"#,
+        ),
+        (
+            ZSH,
+            r#""${words[2]}" == herdr && "${words[3]}" == uninstall"#,
+        ),
+        (
+            FISH,
+            "__fish_seen_subcommand_from herdr; and __fish_seen_subcommand_from uninstall\" -a --no-config",
+        ),
+    ] {
+        assert!(
+            script.contains(branch),
+            "the uninstall flag offer must be gated to `uninstall`, missing {branch:?}",
         );
     }
     // The arm that follows `config get` completes knob names, never the
@@ -173,6 +194,10 @@ fn herdr_flags_are_offered_only_under_install() {
     assert!(
         FISH.contains(r#"-n "__fish_seen_subcommand_from herdr" -a install"#),
         "fish must still offer `install` right after `clauth herdr`"
+    );
+    assert!(
+        FISH.contains(r#"-n "__fish_seen_subcommand_from herdr" -a uninstall"#),
+        "fish must still offer `uninstall` right after `clauth herdr`"
     );
     assert!(
         FISH.contains(r#"-n "__fish_seen_subcommand_from herdr" -a config"#),

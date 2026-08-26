@@ -615,6 +615,161 @@ fn a_knob_toggle_rewrites_exactly_the_marked_blocks() {
     assert_eq!(back, wired, "off -> on -> off round-trips byte for byte");
 }
 
+/// A user key glued directly onto the last line install wrote (no blank
+/// separator, valid TOML in the same table) is not part of any block clauth
+/// wrote: the strip must end the block before it, so the resync write cannot
+/// eat the line.
+#[test]
+fn a_user_key_glued_to_a_marked_block_survives_the_resync() {
+    let orig = "# my config\n[ui]\naccent = \"cyan\"\n";
+    let plan = plan_config(orig, "prefix+a", false).expect("plan");
+    let wired = with_append(orig, &plan.append);
+    let glued = format!("{wired}row_gap = 1\n");
+    toml::from_str::<toml::Value>(&glued).expect("the glued line is valid TOML");
+    let (text, _, _) = resync_text(&glued, "prefix+a", false).expect("resync");
+    toml::from_str::<toml::Value>(&text).expect("the rewritten config parses");
+    assert!(
+        text.contains("row_gap = 1"),
+        "the user's glued line survives the resync write: {text}"
+    );
+    assert_eq!(
+        text.matches("[[keys.command]]").count(),
+        1,
+        "the binding block still reappears exactly once: {text}"
+    );
+}
+
+/// `install`'s no-op branch: the verdict skips the write only when the resync
+/// reconstructs the file byte for byte. Pinned both ways, since the branch
+/// lives where a TTY and herdr's installer keep tests out.
+#[test]
+fn the_noop_verdict_holds_both_ways() {
+    let orig = "# my config\n[ui]\naccent = \"cyan\"\n";
+    let plan = plan_config(orig, "prefix+a", false).expect("plan");
+    let wired = with_append(orig, &plan.append);
+    let (_, _, _, noop) = install_resync(&wired, "prefix+a", false).expect("resync");
+    assert!(noop, "an unchanged knob is a no-op");
+
+    // The toggle direction: the write must fire, or the old row survives.
+    let (_, _, _, noop) = install_resync(&wired, "prefix+a", true).expect("resync");
+    assert!(!noop, "a knob toggle is never a no-op");
+}
+
+/// Runs `sed -n <program>` over `input` and returns its stdout. The fit
+/// branch's parse runs through the installed sed, so the fixture pins the
+/// pattern against real sed semantics rather than a rust re-implementation.
+fn sed_pipe(input: &str, program: &str) -> String {
+    use std::io::Write as _;
+    let mut child = std::process::Command::new("sed")
+        .args(["-n", program])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .expect("sed spawns");
+    child
+        .stdin
+        .take()
+        .expect("stdin piped")
+        .write_all(input.as_bytes())
+        .expect("snapshot written");
+    let out = child.wait_with_output().expect("sed runs");
+    assert!(out.status.success(), "sed exited non-zero");
+    String::from_utf8(out.stdout).expect("utf8")
+}
+
+/// Writes an executable shim named `name` under `dir`, the same shape the
+/// report tests use: a probe against a slow herdr must hit the timeout arm.
+fn write_shim(dir: &Path, name: &str, body: &str) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt as _;
+    let path = dir.join(name);
+    std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).expect("shim written");
+    let mut perms = std::fs::metadata(&path)
+        .expect("shim metadata")
+        .permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&path, perms).expect("shim chmod");
+    path
+}
+
+/// The probe bound: a herdr that never answers costs the caller the timeout,
+/// never a hang. A 10 s sleep shim must resolve as no version inside roughly
+/// the 2 s bound.
+#[test]
+fn a_hung_herdr_bounds_the_probe_at_the_timeout() {
+    let home = crate::testutil::HomeSandbox::new();
+    let shim = write_shim(home.home(), "slow-herdr", "exec sleep 10");
+    let start = std::time::Instant::now();
+    let version = version_command(shim.to_str().expect("utf8 path"));
+    assert!(version.is_none(), "a hung herdr resolves as no version");
+    assert!(
+        start.elapsed() < std::time::Duration::from_secs(5),
+        "the probe is bounded, not the shim's full sleep"
+    );
+}
+
+/// The fit branch's snapshot parse, pinned against the REAL 0.8.2 shape
+/// (captured 2026-08-26): layout rows put `pane_id` right before `rect` and
+/// spell the rect `{"height":H,"width":W,...}`; pane records carry no rect at
+/// all, and they serialize AFTER the layouts, so the width pattern has to
+/// backtrack past the pane record to the layout row. The two sed programs are
+/// extracted from `open-pane.sh`'s source, so the pin reds when the script's
+/// pattern drifts from the shape instead of leaving a second spelling that
+/// can disagree with the script.
+#[test]
+fn the_fit_sed_reads_the_real_snapshot_shape() {
+    let script = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/herdr-plugin/open-pane.sh"
+    ))
+    .expect("open-pane.sh reads");
+
+    // The focused-id line: a single-quoted program, verbatim between the
+    // quotes.
+    let focused_line = script
+        .lines()
+        .find(|l| l.contains("focused_pane_id") && l.contains("sed -n"))
+        .expect("the focused-id sed line exists");
+    let focused_prog = focused_line
+        .split_once("sed -n '")
+        .expect("single-quoted program")
+        .1
+        .split('\'')
+        .next()
+        .expect("closing quote");
+    // The width line: a double-quoted program interpolating $focused, so the
+    // extracted span gets the shell's double-quote processing (`\"` -> `"`)
+    // and the id substituted, exactly as the script would run it.
+    let width_line = script
+        .lines()
+        .find(|l| l.contains(r#"pane_id\":\"$focused"#))
+        .expect("the width sed line exists");
+    let width_span = width_line
+        .split_once("sed -n \"")
+        .expect("double-quoted program")
+        .1
+        .rsplit_once('"')
+        .expect("closing quote")
+        .0;
+
+    let snap = concat!(
+        r#"{"focused_pane_id":"wP:p68","layouts":[{"focused":true,"pane_id":"wP:p68","#,
+        r#""rect":{"height":57,"width":206,"x":31,"y":1}}],"panes":[{"focused":true,"#,
+        r#""foreground_cwd":"/x","pane_id":"wP:p68","revision":8}]}"#,
+    );
+    let focused = sed_pipe(snap, focused_prog);
+    assert_eq!(focused.trim(), "wP:p68", "the focused id resolves");
+
+    let width_prog = width_span
+        .replace("\\\"", "\"")
+        .replace("$focused", focused.trim());
+    let width = sed_pipe(snap, &width_prog);
+    assert_eq!(
+        width.trim(),
+        "206",
+        "the width comes from the focused pane's layout row, not the pane record"
+    );
+}
+
 /// A hand-owned claude row is never rewritten: the strip removes only marked
 /// blocks, so the hand-written row survives the resync and the plan hands the
 /// knob-aware line over in a note.

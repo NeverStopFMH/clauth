@@ -2046,8 +2046,9 @@ impl App {
 
     /// herdr-mode landing, applied at construction (before the first paint):
     /// the Plugin tab with the herdr selector row under the cursor. The herdr
-    /// probe runs here too — `HERDR_ENV=1` proves herdr is present, and it is
-    /// three fast subprocesses — so the landing row is real at first paint
+    /// probe runs here too — `HERDR_ENV=1` proves herdr is present, and each
+    /// of its three subprocesses is bounded at `herdr::PROBE_TIMEOUT` (2 s,
+    /// worst case 6 s total) — so the landing row is real at first paint
     /// instead of waiting for `r`; the cursor clamp inside the recompute
     /// below keeps the landing row valid when herdr does not resolve. The
     /// `claude --version` probe stays `r`-gated: construction must not block

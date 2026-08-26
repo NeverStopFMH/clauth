@@ -5,8 +5,15 @@
 # and every other failure still reaches the plugin log.
 #
 # The popup_width knob picks the sizing flags, failing safe to the shipped
-# default (fit) when the clauth binary predates the subcommand. An older
-# herdr that refuses the flags gets the plain call as a retry.
+# default (fit) when the clauth binary predates the subcommand. A herdr that
+# refuses the sizing flags (measured 2026-08-26: 0.8.2 accepts them, hidden
+# from --help) gets the plain call as a retry.
+#
+# `set -e` is load-bearing here: every risky command sits in a condition or a
+# `&&`/`||` chain, so a snapshot or open failure falls through to the fallback
+# arms rather than aborting the open. report-profile.sh and watch-profile.sh
+# deliberately use `set -u` only, because a failed publish must never kill a
+# hook.
 set -eu
 
 entrypoint="${1:?usage: open-pane.sh <entrypoint-id>}"
@@ -27,15 +34,18 @@ case "$width_mode" in
         set -- "$@" --height 50%
         ;;
     *)
-        # fit: size against the focused pane's width. The snapshot is one
-        # compact JSON line, and only its layout panes put `focused` right
-        # ahead of `rect`, so the greedy prefix lands on the focused pane's
-        # own width and the whole-line match leaves just the capture. The
-        # workspace/tab/pane rows carry `focused` too, but never in front of
-        # a `rect`. A failed read leaves the flags off entirely, the pre-knob
-        # call shape.
-        width=$("$herdr_bin" api snapshot 2>/dev/null |
-            sed -n 's/.*"focused":true,"rect":{"x":[0-9]*,"y":[0-9]*,"width":\([0-9]*\).*/\1/p')
+        # fit: size against the focused pane's width. The snapshot names the
+        # focused pane in `focused_pane_id`, and its layout row spells the
+        # rect `{"height":H,"width":W,...}` on 0.8.2 (measured against the
+        # real snapshot 2026-08-26; the pane records carry no rect, and the
+        # layout rows put `pane_id` right before `rect`). Matching the pane
+        # by id keeps the greedy prefix from landing on another tab's focused
+        # row. A failed read leaves the flags off entirely, the pre-knob call
+        # shape.
+        snap=$("$herdr_bin" api snapshot 2>/dev/null)
+        focused=$(printf '%s' "$snap" | sed -n 's/.*"focused_pane_id":"\([^"]*\)".*/\1/p')
+        width=$(printf '%s' "$snap" |
+            sed -n "s/.*\"pane_id\":\"$focused\",\"rect\":{\"height\":[0-9]*,\"width\":\([0-9]*\).*/\1/p")
         if [ -n "$width" ]; then
             if [ "$width" -ge 540 ]; then
                 set -- "$@" --width 540 --height 50%

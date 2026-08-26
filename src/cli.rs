@@ -447,7 +447,8 @@ pub(crate) enum HerdrCommand {
     /// Print one herdr knob for the plugin scripts
     ///
     /// `clauth herdr config get <key>` prints the knob's value on its own
-    /// line, shell-shaped (`fit|full|half`, `on|off`, or the bare number).
+    /// line, shell-shaped (`fit|half|split-right|split-top`, `on|off`, or the
+    /// bare number).
     /// Hidden from help: this is the scripts' read path, not a human surface.
     #[command(hide = true)]
     Config {

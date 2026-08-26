@@ -3411,15 +3411,16 @@ fn rerun_pane_report(script: &str, pane: &str) {
     );
 }
 
-/// Advance the popup-width knob to the next mode, wrapping past `half` back to
-/// `fit` — space always cycles forward, never clamps.
+/// Advance the popup-width knob to the next shape, wrapping past `split-top`
+/// back to `fit` — space always cycles forward, never clamps.
 fn cycle_herdr_popup_width(app: &mut App) {
     {
         let mut cfg = app.config();
         cfg.state.herdr.popup_width = match cfg.state.herdr.popup_width {
-            PopupWidth::Fit => PopupWidth::Full,
-            PopupWidth::Full => PopupWidth::Half,
-            PopupWidth::Half => PopupWidth::Fit,
+            PopupWidth::Fit => PopupWidth::Half,
+            PopupWidth::Half => PopupWidth::SplitRight,
+            PopupWidth::SplitRight => PopupWidth::SplitTop,
+            PopupWidth::SplitTop => PopupWidth::Fit,
         };
         let _ = save_app_state(&cfg.state);
     }

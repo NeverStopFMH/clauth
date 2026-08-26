@@ -831,7 +831,7 @@ fn herdr_options_render_all_six_rows_on_both_tiers() {
     let screen = rows.join("\n");
     assert!(screen.contains("OPTIONS"), "the eyebrow renders:\n{screen}");
     assert!(
-        row_with(&rows, "popup width").contains("popup width  [fit]  full  half"),
+        row_with(&rows, "popup width").contains("popup width  [fit]  half  split-right  split-top"),
         "the focused cycle row brackets its selection:\n{screen}"
     );
     assert!(
@@ -892,7 +892,7 @@ fn herdr_options_render_blurred_when_focus_sits_on_the_selector() {
         .find(|r| r.contains("popup width"))
         .unwrap_or_else(|| panic!("no popup width row:\n{screen}"));
     assert!(
-        width_row.contains("popup width  fit  full  half"),
+        width_row.contains("popup width  fit  half  split-right  split-top"),
         "a blurred cycle row drops its brackets:\n{screen}"
     );
     assert!(

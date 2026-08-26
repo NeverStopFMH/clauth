@@ -463,19 +463,29 @@ pub(crate) enum ClockFormat {
     H12,
 }
 
-/// How wide the herdr popup `open-pane.sh` opens, one of the `[herdr]` knobs
-/// in profiles.toml. Serialized as a lowercase string so the file stays
-/// human-readable: `popup_width = "fit"`.
+/// What shape `open-pane.sh` opens the herdr entrypoint in, one of the
+/// `[herdr]` knobs in profiles.toml. Serialized as a lowercase string so the
+/// file stays human-readable: `popup_width = "fit"`.
+///
+/// The four-value set is fit, half, split-right, split-top. The retired
+/// `full` deserializes as [`PopupWidth::Fit`] — the owner's ruling, since
+/// fit and full resolved identically below the 540-col cap — so a
+/// profiles.toml written before the merge still loads.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub(crate) enum PopupWidth {
     /// Full width on terminals ≤ 540 cols, else a 540-col centered popup.
     #[default]
+    #[serde(alias = "full")]
     Fit,
-    /// The whole pane area.
-    Full,
     /// herdr's own default half-size.
     Half,
+    /// A real split pane right of the focused pane.
+    #[serde(rename = "split-right")]
+    SplitRight,
+    /// A real split pane directly above the focused pane.
+    #[serde(rename = "split-top")]
+    SplitTop,
 }
 
 impl PopupWidth {
@@ -483,8 +493,9 @@ impl PopupWidth {
     pub(crate) fn as_str(self) -> &'static str {
         match self {
             PopupWidth::Fit => "fit",
-            PopupWidth::Full => "full",
             PopupWidth::Half => "half",
+            PopupWidth::SplitRight => "split-right",
+            PopupWidth::SplitTop => "split-top",
         }
     }
 }
@@ -497,7 +508,8 @@ impl PopupWidth {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub(crate) struct HerdrSettings {
-    /// Which popup width mode `open-pane.sh` resolves per open.
+    /// Which open shape `open-pane.sh` resolves per open: popup sizing for
+    /// `fit`/`half`, a real split pane for `split-right`/`split-top`.
     pub(crate) popup_width: PopupWidth,
     /// Publish the `clauth=$profile` pane-metadata token (the sidebar tag).
     pub(crate) pane_tag: bool,

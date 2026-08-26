@@ -1076,6 +1076,267 @@ fn the_fit_sed_reads_the_real_snapshot_shape() {
     );
 }
 
+/// Runs the real `herdr-plugin/open-pane.sh` with `herdr_body` as the herdr
+/// shim (every call logs its argv as one line of `open.log`), the `clauth`
+/// shim answering `knob` for `herdr config get popup_width`, and returns
+/// (exit code, log).
+fn run_open_pane(home: &Path, herdr_body: &str, knob: &str) -> (Option<i32>, String) {
+    let herdr_shim = write_shim(home, "herdr", herdr_body);
+    write_shim(home, "clauth", &format!("echo {knob}"));
+    let out = std::process::Command::new("sh")
+        .arg(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/herdr-plugin/open-pane.sh"
+        ))
+        .arg("tui")
+        .env("HERDR_BIN_PATH", &herdr_shim)
+        .env("HERDR_PLUGIN_ID", "clauth")
+        .env(
+            "PATH",
+            format!(
+                "{}:{}",
+                home.display(),
+                std::env::var("PATH").unwrap_or_default()
+            ),
+        )
+        .output()
+        .expect("script runs");
+    let log = std::fs::read_to_string(home.join("open.log")).unwrap_or_default();
+    (out.status.code(), log)
+}
+
+/// The `split-right` knob opens a real pane right of the focused one: the
+/// open argv carries the placement/direction pair and no sizing flags, a
+/// failed open is a failure (no plain-pair retry — that would open the
+/// entrypoint's manifest placement, a popup, silently degrading the
+/// requested split), and the split arm never reads the snapshot.
+#[test]
+fn the_split_right_knob_opens_a_split_without_sizing_flags_or_a_plain_retry() {
+    let home = crate::testutil::HomeSandbox::new();
+    let (code, log) = run_open_pane(
+        home.home(),
+        "echo \"$@\" >> \"$(dirname \"$0\")/open.log\"; exit 1",
+        "split-right",
+    );
+    assert_eq!(
+        code,
+        Some(1),
+        "the shim's failure reaches the script's exit"
+    );
+    assert_eq!(
+        log.matches("plugin pane open").count(),
+        1,
+        "a split arm never retries the plain pair: {log}"
+    );
+    assert!(
+        !log.contains("api snapshot"),
+        "a split arm skips the snapshot read: {log}"
+    );
+    let open_line = log
+        .lines()
+        .find(|l| l.contains("plugin pane open"))
+        .expect("the open attempt ran: {log}");
+    assert!(
+        open_line.contains("--placement split --direction right"),
+        "the split-right argv: {open_line}"
+    );
+    for sizing in ["--width", "--height", "--target-pane"] {
+        assert!(
+            !open_line.contains(sizing),
+            "splits size by the pane grid, no {sizing}: {open_line}"
+        );
+    }
+}
+
+/// A split open has no singleton: "popup already open" is a popup-only
+/// answer, so a split arm must not take it as success (the popup arms do —
+/// the sibling test pins that half).
+#[test]
+fn a_split_open_does_not_take_popup_already_open_as_success() {
+    let home = crate::testutil::HomeSandbox::new();
+    let (code, log) = run_open_pane(
+        home.home(),
+        "echo \"$@\" >> \"$(dirname \"$0\")/open.log\"; echo 'popup already open' >&2; exit 1",
+        "split-right",
+    );
+    assert_eq!(
+        code,
+        Some(1),
+        "the split arm does not swallow the popup answer"
+    );
+    assert_eq!(
+        log.matches("plugin pane open").count(),
+        1,
+        "and it still never retries the plain pair: {log}"
+    );
+}
+
+/// The popup arms keep the singleton dance: "popup already open" is the same
+/// key pressed twice, exit 0.
+#[test]
+fn a_popup_arm_takes_popup_already_open_as_success() {
+    let home = crate::testutil::HomeSandbox::new();
+    let (code, log) = run_open_pane(
+        home.home(),
+        "echo \"$@\" >> \"$(dirname \"$0\")/open.log\"; echo 'popup already open' >&2; exit 1",
+        "half",
+    );
+    assert_eq!(
+        code,
+        Some(0),
+        "the singleton answer is success for a popup arm"
+    );
+    assert!(
+        log.contains("--entrypoint tui"),
+        "the open attempt ran: {log}"
+    );
+}
+
+/// The popup arms keep the old-herdr retry: a herdr refusing the sizing
+/// flags gets the plain pair as a second attempt — still a popup, the
+/// entrypoint's manifest placement — and its success decides the exit.
+#[test]
+fn a_popup_arm_retries_the_plain_pair_when_the_sizing_flags_are_refused() {
+    let home = crate::testutil::HomeSandbox::new();
+    let (code, log) = run_open_pane(
+        home.home(),
+        concat!(
+            "echo \"$@\" >> \"$(dirname \"$0\")/open.log\"\n",
+            // The shim's argv includes the `plugin pane open` prefix, so the
+            // sized call is 9 words and the plain pair is 7.
+            "case \"$#\" in\n",
+            "  9) echo 'unknown option: --height' >&2; exit 1 ;;\n",
+            "  7) ;;\n",
+            "esac\n",
+        ),
+        "half",
+    );
+    assert_eq!(code, Some(0), "the plain-pair retry succeeds");
+    assert_eq!(
+        log.matches("plugin pane open").count(),
+        2,
+        "one flagged attempt, one plain retry: {log}"
+    );
+    assert!(
+        log.lines()
+            .next()
+            .is_some_and(|l| l.contains("--height 50%")),
+        "the first attempt carries the sizing flag: {log}"
+    );
+    assert_eq!(
+        log.lines().last(),
+        Some("plugin pane open --plugin clauth --entrypoint tui"),
+        "the retry is the plain pair alone: {log}"
+    );
+}
+
+/// The `split-top` knob splits the pane ABOVE the focused one: the shim log
+/// shows the neighbor lookup (`pane neighbor --direction up --pane
+/// <focused>`) and the open argv targets the neighbor with a downward split,
+/// so the new pane lands directly above the focused pane.
+#[test]
+fn the_split_top_knob_splits_the_pane_above_the_focused_one() {
+    let home = crate::testutil::HomeSandbox::new();
+    let (code, log) = run_open_pane(
+        home.home(),
+        concat!(
+            "case \"$1\" in\n",
+            "  api) echo '{\"focused_pane_id\":\"wP:p68\"}'\n",
+            "       echo \"$@\" >> \"$(dirname \"$0\")/open.log\"\n",
+            "       ;;\n",
+            "  pane) echo '{\"result\":{\"neighbor\":{\"pane_id\":\"wP:p68\",\"direction\":\"up\",\"neighbor_pane_id\":\"wP:p70\"}}}'\n",
+            "        echo \"$@\" >> \"$(dirname \"$0\")/open.log\"\n",
+            "        ;;\n",
+            "  *)   echo \"$@\" >> \"$(dirname \"$0\")/open.log\"\n",
+            "       ;;\n",
+            "esac\n",
+        ),
+        "split-top",
+    );
+    assert_eq!(code, Some(0), "the split-top open succeeds");
+    assert!(log.contains("api snapshot"), "the snapshot read ran: {log}");
+    assert!(
+        log.contains("pane neighbor --direction up --pane wP:p68"),
+        "the neighbor lookup names the focused pane and the up direction: {log}"
+    );
+    let open_line = log
+        .lines()
+        .find(|l| l.contains("plugin pane open"))
+        .expect("the open attempt ran: {log}");
+    assert!(
+        open_line.contains("--target-pane wP:p70 --placement split --direction down"),
+        "the open splits the pane above downward: {open_line}"
+    );
+}
+
+/// No pane above the focused one (`neighbor_pane_id` absent from the
+/// answer): split-top splits the focused pane downward instead — the new
+/// pane lands below the focused pane, but the knob keeps its split (a popup
+/// fallback would abandon the knob).
+#[test]
+fn the_split_top_knob_without_a_neighbor_splits_the_focused_pane_down() {
+    let home = crate::testutil::HomeSandbox::new();
+    let (code, log) = run_open_pane(
+        home.home(),
+        concat!(
+            "case \"$1\" in\n",
+            "  api) echo '{\"focused_pane_id\":\"wP:p68\"}'\n",
+            "       echo \"$@\" >> \"$(dirname \"$0\")/open.log\"\n",
+            "       ;;\n",
+            "  pane) echo '{\"result\":{\"neighbor\":{\"pane_id\":\"wP:p68\",\"direction\":\"up\"}}}'\n",
+            "        echo \"$@\" >> \"$(dirname \"$0\")/open.log\"\n",
+            "        ;;\n",
+            "  *)   echo \"$@\" >> \"$(dirname \"$0\")/open.log\"\n",
+            "       ;;\n",
+            "esac\n",
+        ),
+        "split-top",
+    );
+    assert_eq!(code, Some(0), "the fallback still opens a split");
+    let open_line = log
+        .lines()
+        .find(|l| l.contains("plugin pane open"))
+        .expect("the open attempt ran: {log}");
+    assert!(
+        open_line.contains("--target-pane wP:p68 --placement split --direction down"),
+        "no neighbor splits the focused pane downward: {open_line}"
+    );
+}
+
+/// A failed snapshot on split-top skips the neighbor lookup and the target
+/// flag: herdr then splits the active pane downward, the same
+/// below-the-focused shape, so the knob keeps its split.
+#[test]
+fn the_split_top_knob_without_a_snapshot_splits_down_without_a_target() {
+    let home = crate::testutil::HomeSandbox::new();
+    let (code, log) = run_open_pane(
+        home.home(),
+        "echo \"$@\" >> \"$(dirname \"$0\")/open.log\"; exit 1",
+        "split-top",
+    );
+    assert_eq!(
+        code,
+        Some(1),
+        "the shim's failure reaches the script's exit"
+    );
+    assert!(
+        !log.contains("pane neighbor"),
+        "no neighbor lookup without a focused pane id: {log}"
+    );
+    let open_line = log
+        .lines()
+        .find(|l| l.contains("plugin pane open"))
+        .expect("the open attempt ran: {log}");
+    assert!(
+        open_line.contains("--placement split --direction down"),
+        "the fallback open keeps the downward split: {open_line}"
+    );
+    assert!(
+        !open_line.contains("--target-pane"),
+        "no target flag without a focused pane id: {open_line}"
+    );
+}
+
 /// A hand-owned claude row is never rewritten: the strip removes only marked
 /// blocks, so the hand-written row survives the resync and the plan hands the
 /// knob-aware line over in a note.
@@ -1135,7 +1396,10 @@ fn herdr_settings_round_trip_through_the_app_load_path() {
     let config = crate::profile::load_config().expect("load");
     assert_eq!(config.state.herdr, HerdrSettings::default());
 
-    // A partial table fills the missing knobs from the documented defaults.
+    // A partial table fills the missing knobs from the documented defaults,
+    // and the retired `full` popup width loads as Fit — the owner's merge
+    // (full and fit resolved identically below the 540-col cap) — so a
+    // profiles.toml written before the merge still loads.
     write_profiles_toml(concat!(
         "active_profile = \"acct\"\n",
         "profiles = [\"acct\"]\n",
@@ -1146,7 +1410,7 @@ fn herdr_settings_round_trip_through_the_app_load_path() {
     assert_eq!(
         config.state.herdr,
         HerdrSettings {
-            popup_width: PopupWidth::Full,
+            popup_width: PopupWidth::Fit,
             ..HerdrSettings::default()
         }
     );
@@ -1264,6 +1528,34 @@ fn herdr_config_get_honors_written_knobs_through_the_real_load_path() {
             herdr_value(&config.state.herdr, key).expect("value"),
             want,
             "written value for {key}"
+        );
+    }
+}
+
+#[test]
+fn popup_width_round_trips_all_four_spellings_through_the_real_load_path() {
+    let _home = crate::testutil::HomeSandbox::new();
+    for spelling in ["fit", "half", "split-right", "split-top"] {
+        write_profiles_toml(&format!(
+            "active_profile = \"acct\"\nprofiles = [\"acct\"]\n\
+             [herdr]\npopup_width = \"{spelling}\"\n"
+        ));
+        let config = crate::profile::load_config().expect("load");
+        assert_eq!(
+            herdr_value(&config.state.herdr, "popup_width").expect("value"),
+            spelling,
+            "the get path answers the written spelling"
+        );
+        crate::profile::save_app_state(&config.state).expect("save");
+        let again = crate::profile::load_config().expect("reload");
+        assert_eq!(
+            again.state.herdr.popup_width, config.state.herdr.popup_width,
+            "the {spelling} value survives a save + reload"
+        );
+        assert_eq!(
+            herdr_value(&again.state.herdr, "popup_width").expect("value"),
+            spelling,
+            "the reloaded get path still answers {spelling}"
         );
     }
 }

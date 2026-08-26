@@ -8250,8 +8250,8 @@ fn herdr_knobs() -> crate::profile::HerdrSettings {
         .herdr
 }
 
-/// `popup width`: space cycles fit → full → half → fit and ⏎ mirrors it (no
-/// separate edit step), persisting each step.
+/// `popup width`: space cycles fit → half → split-right → split-top → fit
+/// and ⏎ mirrors it (no separate edit step), persisting each step.
 #[test]
 fn herdr_popup_width_cycles_and_persists() {
     use super::{KeyCode, handle_key};
@@ -8262,14 +8262,20 @@ fn herdr_popup_width_cycles_and_persists() {
     handle_key(&mut app, space);
     assert_eq!(
         herdr_knobs().popup_width,
-        crate::profile::PopupWidth::Full,
+        crate::profile::PopupWidth::Half,
         "space cycles to the next option"
     );
     handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
     assert_eq!(
         herdr_knobs().popup_width,
-        crate::profile::PopupWidth::Half,
+        crate::profile::PopupWidth::SplitRight,
         "⏎ mirrors space on a cycle row"
+    );
+    handle_key(&mut app, space);
+    assert_eq!(
+        herdr_knobs().popup_width,
+        crate::profile::PopupWidth::SplitTop,
+        "space keeps cycling forward"
     );
     handle_key(&mut app, space);
     assert_eq!(

@@ -1125,7 +1125,8 @@ fn check_config(bin: &str, probe: &Path, text: &str) -> Result<Vec<String>> {
 
 /// `clauth herdr config get <key>` — the plugin scripts' read path for the
 /// knobs persisted under `[herdr]` in profiles.toml. One value per line in a
-/// shell shape: `fit|full|half` for `popup_width`, `on|off` for the bools, the
+/// shell shape: `fit|half|split-right|split-top` for `popup_width`, `on|off`
+/// for the bools, the
 /// bare number for `tag_watch_secs`, so a caller never parses help prose. A
 /// missing profiles.toml answers the defaults; an unknown key is a usage error
 /// (exit 2) naming the valid keys.

@@ -421,8 +421,9 @@ fn option_row(
             let width = settings.popup_width;
             for (i, (label, active)) in [
                 ("fit", width == PopupWidth::Fit),
-                ("full", width == PopupWidth::Full),
                 ("half", width == PopupWidth::Half),
+                ("split-right", width == PopupWidth::SplitRight),
+                ("split-top", width == PopupWidth::SplitTop),
             ]
             .iter()
             .enumerate()

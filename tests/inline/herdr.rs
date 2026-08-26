@@ -812,6 +812,7 @@ fn an_edited_block_is_absent_from_uninstalls_removal_diff() {
 /// the default key, and it must still land a knob toggle while keeping the
 /// key the user installed under. Drives the real `heal` (a shim herdr
 /// accepts the validated write), since the key re-use lives in `heal` itself.
+#[cfg(unix)]
 #[test]
 fn a_heal_keeps_a_custom_key_binding_and_still_toggles_the_row() {
     let home = crate::testutil::HomeSandbox::new();
@@ -924,6 +925,7 @@ fn the_noop_verdict_holds_both_ways() {
 /// Runs `sed -n <program>` over `input` and returns its stdout. The fit
 /// branch's parse runs through the installed sed, so the fixture pins the
 /// pattern against real sed semantics rather than a rust re-implementation.
+#[cfg(unix)]
 fn sed_pipe(input: &str, program: &str) -> String {
     use std::io::Write as _;
     let mut child = std::process::Command::new("sed")
@@ -945,6 +947,7 @@ fn sed_pipe(input: &str, program: &str) -> String {
 
 /// Writes an executable shim named `name` under `dir`, the same shape the
 /// report tests use: a probe against a slow herdr must hit the timeout arm.
+#[cfg(unix)]
 fn write_shim(dir: &Path, name: &str, body: &str) -> PathBuf {
     use std::os::unix::fs::PermissionsExt as _;
     let path = dir.join(name);
@@ -960,6 +963,7 @@ fn write_shim(dir: &Path, name: &str, body: &str) -> PathBuf {
 /// The probe bound: a herdr that never answers costs the caller the timeout,
 /// never a hang. A 10 s sleep shim must resolve as no version inside roughly
 /// the 2 s bound.
+#[cfg(unix)]
 #[test]
 fn a_hung_herdr_bounds_the_probe_at_the_timeout() {
     let home = crate::testutil::HomeSandbox::new();
@@ -976,6 +980,7 @@ fn a_hung_herdr_bounds_the_probe_at_the_timeout() {
 /// A failing `api snapshot` must not abort the open under `set -e`: the
 /// snapshot's failure falls through to the plain call, and the shim's log
 /// proves the open attempt ran (the abort path exits before any attempt).
+#[cfg(unix)]
 #[test]
 fn a_failing_snapshot_still_attempts_the_open() {
     let home = crate::testutil::HomeSandbox::new();
@@ -1021,6 +1026,7 @@ fn a_failing_snapshot_still_attempts_the_open() {
 /// extracted from `open-pane.sh`'s source, so the pin reds when the script's
 /// pattern drifts from the shape instead of leaving a second spelling that
 /// can disagree with the script.
+#[cfg(unix)]
 #[test]
 fn the_fit_sed_reads_the_real_snapshot_shape() {
     let script = std::fs::read_to_string(concat!(
@@ -1080,6 +1086,7 @@ fn the_fit_sed_reads_the_real_snapshot_shape() {
 /// shim (every call logs its argv as one line of `open.log`), the `clauth`
 /// shim answering `knob` for `herdr config get popup_width`, and returns
 /// (exit code, log).
+#[cfg(unix)]
 fn run_open_pane(home: &Path, herdr_body: &str, knob: &str) -> (Option<i32>, String) {
     let herdr_shim = write_shim(home, "herdr", herdr_body);
     write_shim(home, "clauth", &format!("echo {knob}"));
@@ -1110,6 +1117,7 @@ fn run_open_pane(home: &Path, herdr_body: &str, knob: &str) -> (Option<i32>, Str
 /// failed open is a failure (no plain-pair retry — that would open the
 /// entrypoint's manifest placement, a popup, silently degrading the
 /// requested split), and the split arm never reads the snapshot.
+#[cfg(unix)]
 #[test]
 fn the_split_right_knob_opens_a_split_without_sizing_flags_or_a_plain_retry() {
     let home = crate::testutil::HomeSandbox::new();
@@ -1151,6 +1159,7 @@ fn the_split_right_knob_opens_a_split_without_sizing_flags_or_a_plain_retry() {
 /// A split open has no singleton: "popup already open" is a popup-only
 /// answer, so a split arm must not take it as success (the popup arms do —
 /// the sibling test pins that half).
+#[cfg(unix)]
 #[test]
 fn a_split_open_does_not_take_popup_already_open_as_success() {
     let home = crate::testutil::HomeSandbox::new();
@@ -1173,6 +1182,7 @@ fn a_split_open_does_not_take_popup_already_open_as_success() {
 
 /// The popup arms keep the singleton dance: "popup already open" is the same
 /// key pressed twice, exit 0.
+#[cfg(unix)]
 #[test]
 fn a_popup_arm_takes_popup_already_open_as_success() {
     let home = crate::testutil::HomeSandbox::new();
@@ -1195,6 +1205,7 @@ fn a_popup_arm_takes_popup_already_open_as_success() {
 /// The popup arms keep the old-herdr retry: a herdr refusing the sizing
 /// flags gets the plain pair as a second attempt — still a popup, the
 /// entrypoint's manifest placement — and its success decides the exit.
+#[cfg(unix)]
 #[test]
 fn a_popup_arm_retries_the_plain_pair_when_the_sizing_flags_are_refused() {
     let home = crate::testutil::HomeSandbox::new();
@@ -1234,6 +1245,7 @@ fn a_popup_arm_retries_the_plain_pair_when_the_sizing_flags_are_refused() {
 /// shows the neighbor lookup (`pane neighbor --direction up --pane
 /// <focused>`) and the open argv targets the neighbor with a downward split,
 /// so the new pane lands directly above the focused pane.
+#[cfg(unix)]
 #[test]
 fn the_split_top_knob_splits_the_pane_above_the_focused_one() {
     let home = crate::testutil::HomeSandbox::new();
@@ -1273,6 +1285,7 @@ fn the_split_top_knob_splits_the_pane_above_the_focused_one() {
 /// answer): split-top splits the focused pane downward instead — the new
 /// pane lands below the focused pane, but the knob keeps its split (a popup
 /// fallback would abandon the knob).
+#[cfg(unix)]
 #[test]
 fn the_split_top_knob_without_a_neighbor_splits_the_focused_pane_down() {
     let home = crate::testutil::HomeSandbox::new();
@@ -1306,6 +1319,7 @@ fn the_split_top_knob_without_a_neighbor_splits_the_focused_pane_down() {
 /// A failed snapshot on split-top skips the neighbor lookup and the target
 /// flag: herdr then splits the active pane downward, the same
 /// below-the-focused shape, so the knob keeps its split.
+#[cfg(unix)]
 #[test]
 fn the_split_top_knob_without_a_snapshot_splits_down_without_a_target() {
     let home = crate::testutil::HomeSandbox::new();
@@ -1629,6 +1643,7 @@ fn herdr_config_get_parses_and_stays_out_of_herdrs_help() {
 /// dropped when this returns, so a path-based check outside would always
 /// read absent. The pidfile is created synchronously before the detached
 /// spawn, so it exists here exactly when the script's watcher path ran.
+#[cfg(unix)]
 fn report_profile_run(
     pane_tag: &str,
     border_label: &str,
@@ -1699,6 +1714,7 @@ fn report_profile_run(
 /// `--clear-token clauth` and no `--token`, and no pidfile under the state
 /// dir. The agent reads as claude, so a watcher WOULD spawn if the off path
 /// leaked past the gate.
+#[cfg(unix)]
 #[test]
 fn pane_tag_off_publishes_the_token_clear_and_spawns_no_watcher() {
     let (lines, watcher_spawned) = report_profile_run("off", "on", Some(r#"{"agent":"claude"}"#));
@@ -1725,6 +1741,7 @@ fn pane_tag_off_publishes_the_token_clear_and_spawns_no_watcher() {
 /// `border_label` off publishes the display-agent clear instead of omitting
 /// the artifact: the one-shot argv carries `--clear-display-agent` and no
 /// `--display-agent`, while the on pane_tag still publishes the token.
+#[cfg(unix)]
 #[test]
 fn border_label_off_publishes_the_display_agent_clear() {
     let (lines, _watcher_spawned) = report_profile_run("on", "off", None);
@@ -1750,6 +1767,7 @@ fn border_label_off_publishes_the_display_agent_clear() {
 
 /// Regression control: both knobs on publishes today's artifacts unchanged —
 /// `--token clauth=<profile>` and `--display-agent <profile>`, no clear flags.
+#[cfg(unix)]
 #[test]
 fn both_knobs_on_publish_the_token_and_display_agent_unchanged() {
     let (lines, _watcher_spawned) = report_profile_run("on", "on", None);
@@ -1781,6 +1799,7 @@ fn both_knobs_on_publish_the_token_and_display_agent_unchanged() {
 /// (0.8.2 pane.rs refuses only set+clear of the SAME field), so the script
 /// makes exactly one call and it publishes `--clear-token clauth` AND
 /// `--clear-display-agent`.
+#[cfg(unix)]
 #[test]
 fn both_knobs_off_publish_both_clears_in_one_call() {
     let (lines, _watcher_spawned) = report_profile_run("off", "off", None);

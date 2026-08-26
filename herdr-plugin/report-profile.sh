@@ -74,19 +74,32 @@ fi
 printf '%s\n' "$profile"
 
 [ -n "$pane" ] || exit 0
-# The pane_tag knob gates the whole publishing path: off skips the one-shot
-# report below AND the watcher spawn, while the resolve above still prints.
+# Each knob owns one artifact, and its off side publishes the matching clear
+# instead of nothing: a knob toggled off must not leave its stale artifact
+# standing on the pane. pane_tag still gates the watcher spawn below, while
+# the resolve above prints either way.
 pane_tag=$(clauth herdr config get pane_tag 2>/dev/null || printf 'on')
-[ "$pane_tag" = off ] && exit 0
-
-# The pane id goes BEFORE the flags. `report-metadata --help` prints it last,
-# and that order answers `unknown option: <value>` at exit 2 on 0.8.0.
-set -- "$pane" --source "${HERDR_PLUGIN_ID:-clauth}" --token "clauth=$profile"
-# border_label on also names the account on the pane's border. Named flags
-# may sit in any order; only the positional-first order above is load-bearing.
+if [ "$pane_tag" = on ]; then
+    token_flag="--token"
+    token_value="clauth=$profile"
+else
+    token_flag="--clear-token"
+    token_value="clauth"
+fi
+# border_label on also names the account on the pane's border; off publishes
+# the display-agent clear instead of leaving the stale label standing.
 border_label=$(clauth herdr config get border_label 2>/dev/null || printf 'off')
-[ "$border_label" = on ] && set -- "$@" --display-agent "$profile"
+# The pane id goes BEFORE the flags. `report-metadata --help` prints it last,
+# and that order answers `unknown option: <value>` at exit 2 on 0.8.0. Named
+# flags may sit in any order; only the positional-first order is load-bearing.
+set -- "$pane" --source "${HERDR_PLUGIN_ID:-clauth}" "$token_flag" "$token_value"
+if [ "$border_label" = on ]; then
+    set -- "$@" --display-agent "$profile"
+else
+    set -- "$@" --clear-display-agent
+fi
 "$herdr_bin" pane report-metadata "$@"
+[ "$pane_tag" = on ] || exit 0
 
 # A --with-fallback session moves onto another account mid-run with no herdr
 # event, so the one-shot report above goes stale until the next status change.

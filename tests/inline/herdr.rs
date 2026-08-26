@@ -1086,3 +1086,195 @@ fn herdr_config_get_parses_and_stays_out_of_herdrs_help() {
         "the scripts' read path must stay out of the help surface"
     );
 }
+
+// ── report-profile.sh knob-off overrides, driven through the real script ────
+
+/// Runs the real `herdr-plugin/report-profile.sh` against a shimmed `herdr`
+/// and `clauth`: the herdr shim logs every `pane report-metadata` argv as one
+/// line (and fails `process-info`, so a leaked watcher ends itself after its
+/// retry budget instead of looping), the clauth shim answers `which` with
+/// `fit` and dispatches `herdr config get <key>` to the knob values baked in
+/// at write time. HOME, the state dir and the pane id all point into the
+/// sandbox, so no live pane or real tree is touched. Returns the logged
+/// report lines and whether the watcher pidfile appeared under the state
+/// dir. `agent_json` is the event hook's `agent` field; `None` reads as no
+/// claude agent, which the script leaves watcher-less.
+///
+/// The watcher verdict is captured HERE, not by the caller: the sandbox is
+/// dropped when this returns, so a path-based check outside would always
+/// read absent. The pidfile is created synchronously before the detached
+/// spawn, so it exists here exactly when the script's watcher path ran.
+fn report_profile_run(
+    pane_tag: &str,
+    border_label: &str,
+    agent_json: Option<&str>,
+) -> (Vec<String>, bool) {
+    let home = crate::testutil::HomeSandbox::new();
+    write_shim(
+        home.home(),
+        "herdr",
+        "if [ \"$1\" = pane ] && [ \"$2\" = report-metadata ]; then echo \"$*\" >> \"$(dirname \"$0\")/report.log\"; exit 0; fi\nif [ \"$1\" = pane ] && [ \"$2\" = process-info ]; then exit 1; fi\nexit 0\n",
+    );
+    write_shim(
+        home.home(),
+        "clauth",
+        &format!(
+            "case \"$1:$4\" in\n  which:) echo fit ;;\n  herdr:pane_tag) echo {pane_tag} ;;\n  herdr:border_label) echo {border_label} ;;\n  herdr:tag_watch_secs) echo 1 ;;\nesac\nexit 0\n"
+        ),
+    );
+    let mut cmd = std::process::Command::new("sh");
+    cmd.arg(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/herdr-plugin/report-profile.sh"
+    ))
+    .env("HERDR_BIN_PATH", home.home().join("herdr"))
+    .env("HERDR_PLUGIN_ID", "clauth")
+    .env("HERDR_PANE_ID", "p1")
+    .env("HERDR_PLUGIN_STATE_DIR", home.home().join("state"))
+    .env("HOME", home.home())
+    .env(
+        "PATH",
+        format!(
+            "{}:{}",
+            home.home().display(),
+            std::env::var("PATH").unwrap_or_default()
+        ),
+    );
+    if let Some(agent) = agent_json {
+        cmd.env("HERDR_PLUGIN_EVENT_JSON", agent);
+    }
+    let out = cmd.output().expect("report-profile.sh runs");
+    assert!(
+        out.status.success(),
+        "the script exits 0: stderr {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "fit\n",
+        "the resolve prints the profile and nothing else"
+    );
+    let lines: Vec<String> = std::fs::read_to_string(home.home().join("report.log"))
+        .unwrap_or_default()
+        .lines()
+        .map(str::to_string)
+        .collect();
+    for line in &lines {
+        assert!(
+            line.starts_with("pane report-metadata p1 --source "),
+            "the pane id stays the first positional: {line}"
+        );
+    }
+    let pidfile = home.home().join("state/watch-p1.pid");
+    (lines, pidfile.exists())
+}
+
+/// `pane_tag` off publishes the token clear instead of silently skipping the
+/// report, and still skips the watcher: one report-metadata call carrying
+/// `--clear-token clauth` and no `--token`, and no pidfile under the state
+/// dir. The agent reads as claude, so a watcher WOULD spawn if the off path
+/// leaked past the gate.
+#[test]
+fn pane_tag_off_publishes_the_token_clear_and_spawns_no_watcher() {
+    let (lines, watcher_spawned) = report_profile_run("off", "on", Some(r#"{"agent":"claude"}"#));
+    assert_eq!(
+        lines.len(),
+        1,
+        "exactly one report-metadata call: {lines:?}"
+    );
+    let line = &lines[0];
+    assert!(
+        line.contains("--clear-token clauth"),
+        "the token clear is published: {line}"
+    );
+    assert!(
+        !line.contains("--token"),
+        "no token publish beside the clear: {line}"
+    );
+    assert!(
+        !watcher_spawned,
+        "pane_tag off still skips the watcher spawn (no pidfile under the state dir)"
+    );
+}
+
+/// `border_label` off publishes the display-agent clear instead of omitting
+/// the artifact: the one-shot argv carries `--clear-display-agent` and no
+/// `--display-agent`, while the on pane_tag still publishes the token.
+#[test]
+fn border_label_off_publishes_the_display_agent_clear() {
+    let (lines, _watcher_spawned) = report_profile_run("on", "off", None);
+    assert_eq!(
+        lines.len(),
+        1,
+        "exactly one report-metadata call: {lines:?}"
+    );
+    let line = &lines[0];
+    assert!(
+        line.contains("--clear-display-agent"),
+        "the display-agent clear is published: {line}"
+    );
+    assert!(
+        !line.contains("--display-agent"),
+        "no display-agent publish beside the clear: {line}"
+    );
+    assert!(
+        line.contains("--token clauth=fit"),
+        "the on pane_tag still publishes the token: {line}"
+    );
+}
+
+/// Regression control: both knobs on publishes today's artifacts unchanged —
+/// `--token clauth=<profile>` and `--display-agent <profile>`, no clear flags.
+#[test]
+fn both_knobs_on_publish_the_token_and_display_agent_unchanged() {
+    let (lines, _watcher_spawned) = report_profile_run("on", "on", None);
+    assert_eq!(
+        lines.len(),
+        1,
+        "exactly one report-metadata call: {lines:?}"
+    );
+    let line = &lines[0];
+    assert!(
+        line.contains("--token clauth=fit"),
+        "the token publish stays: {line}"
+    );
+    assert!(
+        line.contains("--display-agent fit"),
+        "the display-agent publish stays: {line}"
+    );
+    assert!(
+        !line.contains("--clear-token"),
+        "no clears on the on path: {line}"
+    );
+    assert!(
+        !line.contains("--clear-display-agent"),
+        "no clears on the on path: {line}"
+    );
+}
+
+/// Both knobs off: herdr's one report-metadata call can carry both clears
+/// (0.8.2 pane.rs refuses only set+clear of the SAME field), so the script
+/// makes exactly one call and it publishes `--clear-token clauth` AND
+/// `--clear-display-agent`.
+#[test]
+fn both_knobs_off_publish_both_clears_in_one_call() {
+    let (lines, _watcher_spawned) = report_profile_run("off", "off", None);
+    assert_eq!(lines.len(), 1, "both clears ride the one call: {lines:?}");
+    let line = &lines[0];
+    assert!(
+        line.contains("--clear-token clauth"),
+        "the token clear is published: {line}"
+    );
+    assert!(
+        line.contains("--clear-display-agent"),
+        "the display-agent clear is published: {line}"
+    );
+    assert!(
+        !line.contains("--token"),
+        "no publishes on the off path: {line}"
+    );
+    assert!(
+        !line.contains("--display-agent"),
+        "no publishes on the off path: {line}"
+    );
+}

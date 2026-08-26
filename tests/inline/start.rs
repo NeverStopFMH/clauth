@@ -635,3 +635,79 @@ fn run_applies_the_chain_gate_only_to_an_opted_in_start() {
         "a bare start must skip the gate entirely"
     );
 }
+
+// ── the plugin pre-flight ─────────────────────────────────────────────────
+
+/// The migration trigger's own pin: a `clauth start` heals a broken plugin
+/// registration before `claude` launches, and a healthy one costs no `claude
+/// plugin` spawn at all. Both halves drive the real `run` chokepoint against
+/// the fake-`claude` harness, so the shim's call log is the evidence.
+#[cfg(unix)]
+#[test]
+fn start_heals_the_plugin_registry_only_when_it_is_broken() {
+    use crate::testutil::{ConfigDirSandbox, FakeClaude, HomeSandbox};
+
+    let sb = HomeSandbox::new();
+    let claude = sb.home().join(".claude");
+    std::fs::create_dir_all(&claude).expect("~/.claude");
+    let _config = ConfigDirSandbox::new(&sb, &claude);
+    let fake = FakeClaude::new(&sb);
+    // `acquire` re-reads the account record from disk under the state flock, so
+    // the sandbox needs the profile the run starts under persisted the way
+    // `load_config` walks it.
+    let clauth_dir = crate::profile::clauth_dir().expect("clauth dir");
+    std::fs::create_dir_all(&clauth_dir).expect("clauth dir");
+    std::fs::write(
+        clauth_dir.join("profiles.toml"),
+        "profiles = [\"wired\", \"spare\"]\n",
+    )
+    .expect("profiles.toml");
+    let config = chain_ready_config("wired");
+
+    // Healthy: the gate reads the seeded registry, sees the materialized
+    // pointer with its manifest, and the heal stays out of the launch.
+    let expected = crate::plugin_host::expected_pointer().expect("pointer");
+    std::fs::create_dir_all(expected.join(".claude-plugin")).expect("pointer tree");
+    std::fs::write(
+        expected.join(".claude-plugin").join("marketplace.json"),
+        "{}",
+    )
+    .expect("manifest");
+    let path = expected.to_string_lossy().into_owned();
+    let marketplaces = serde_json::json!({
+        "clauth": {"source": {"source": "directory", "path": path}, "installLocation": path, "lastUpdated": "2026-08-26T00:00:00.000Z"}
+    });
+    let plugins = serde_json::json!({
+        "version": 2,
+        "plugins": {"clauth@clauth": [{"scope": "user", "installPath": path, "version": "0.14.1"}]}
+    });
+    let plugins_dir = claude.join("plugins");
+    std::fs::create_dir_all(&plugins_dir).expect("plugins dir");
+    for (name, value) in [
+        ("known_marketplaces.json", &marketplaces),
+        ("installed_plugins.json", &plugins),
+    ] {
+        std::fs::write(
+            plugins_dir.join(name),
+            serde_json::to_vec_pretty(value).expect("seed json"),
+        )
+        .expect("seed registry");
+    }
+
+    run(&config, "wired", &[], Isolation::Shared, None, false).expect("healthy start");
+    assert!(
+        !fake.log().contains("plugin"),
+        "a healthy start must spawn no claude plugin calls, got:\n{}",
+        fake.log()
+    );
+
+    // Broken: the marketplace registration vanishes, and the next start heals
+    // it through the lifecycle before claude launches.
+    std::fs::remove_file(plugins_dir.join("known_marketplaces.json")).expect("remove registry");
+    run(&config, "wired", &[], Isolation::Shared, None, false).expect("broken start");
+    assert!(
+        fake.log().contains("plugin list --json"),
+        "a broken registration must heal at start, got:\n{}",
+        fake.log()
+    );
+}

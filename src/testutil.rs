@@ -573,7 +573,21 @@ case "$1" in
         fi
         ;;
       marketplace)
-        if [ "$3" = "list" ]; then echo '[]'; fi
+        case "$3" in
+          list)
+            # The registered marketplace as `marketplace list --json` reads it:
+            # recorded at add time, so agentgear's probe can compare the path.
+            if [ -f "$CLAUDE_SHIM_MKT_STATE" ]; then
+              printf '[{"name":"clauth","path":"%s"}]\n' "$(cat "$CLAUDE_SHIM_MKT_STATE")"
+            else
+              echo '[]'
+            fi
+            ;;
+          add)
+            # Re-add over the same name re-points, like the real CLI.
+            printf '%s\n' "$4" > "$CLAUDE_SHIM_MKT_STATE"
+            ;;
+        esac
         ;;
       install)
         : > "$CLAUDE_SHIM_STATE"
@@ -608,6 +622,7 @@ pub(crate) struct FakeClaude<'a> {
     prev_runtime: Option<std::ffi::OsString>,
     prev_tree: Option<std::ffi::OsString>,
     prev_state: Option<std::ffi::OsString>,
+    prev_mkt_state: Option<std::ffi::OsString>,
     prev_log: Option<std::ffi::OsString>,
 }
 
@@ -673,6 +688,7 @@ impl<'a> FakeClaude<'a> {
         let prev_runtime = pin("XDG_RUNTIME_DIR", &run);
         let prev_tree = pin("CLAUDE_SHIM_TREE", &tree);
         let prev_state = pin("CLAUDE_SHIM_STATE", &tmp.path().join("state"));
+        let prev_mkt_state = pin("CLAUDE_SHIM_MKT_STATE", &tmp.path().join("mkt-state"));
         let log = tmp.path().join("log");
         let prev_log = pin("CLAUDE_SHIM_LOG", &log);
         Self {
@@ -685,6 +701,7 @@ impl<'a> FakeClaude<'a> {
             prev_runtime,
             prev_tree,
             prev_state,
+            prev_mkt_state,
             prev_log,
         }
     }
@@ -710,6 +727,7 @@ impl Drop for FakeClaude<'_> {
                 ("XDG_RUNTIME_DIR", &self.prev_runtime),
                 ("CLAUDE_SHIM_TREE", &self.prev_tree),
                 ("CLAUDE_SHIM_STATE", &self.prev_state),
+                ("CLAUDE_SHIM_MKT_STATE", &self.prev_mkt_state),
                 ("CLAUDE_SHIM_LOG", &self.prev_log),
             ] {
                 match value {

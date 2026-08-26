@@ -1,9 +1,10 @@
 //! Inline tests for `plugin_host`. No environment needed: these pin the
-//! compile-time wiring (derive metadata, the embedded tree) and the committed
-//! SessionStart hook that points at `clauth self-heal`. The lifecycle itself
-//! (the real `claude` CLI as transaction boundary) is pinned hermetically by
-//! the fake-claude install test in `tui_app.rs` and exercised for real in the
-//! scratch-profile verifies.
+//! compile-time wiring (derive metadata, the embedded tree), the committed
+//! SessionStart hook that points at `clauth self-heal`, and the `clauth start`
+//! pre-flight gate's registry shapes. The lifecycle itself (the real `claude`
+//! CLI as transaction boundary) is pinned hermetically by the fake-claude
+//! install test in `tui_app.rs` and exercised for real in the scratch-profile
+//! verifies.
 
 use super::ClauthPlugin;
 use agentgear::PluginHost;
@@ -122,4 +123,212 @@ fn self_heal_says_nothing_when_healthy_and_reports_changes() {
         "after the clear there is nothing left to say"
     );
     let _ = &fake;
+}
+
+// ── the start pre-flight gate ─────────────────────────────────────────────
+
+/// One gate fixture: the env harness comes up FIRST (so `expected_pointer`
+/// resolves inside the sandbox), the seed closure builds the registry pair
+/// against the sandbox's config dir and pointer, then the verdict runs. The
+/// gate itself never spawns; the shim is never called.
+#[cfg(unix)]
+fn gate_verdict(
+    seed: impl FnOnce(&std::path::Path, &std::path::Path) -> (serde_json::Value, serde_json::Value),
+) -> bool {
+    use crate::testutil::{ConfigDirSandbox, FakeClaude, HomeSandbox};
+
+    let home = HomeSandbox::new();
+    let claude = home.home().join(".claude-config");
+    std::fs::create_dir_all(&claude).expect("config dir");
+    let _config = ConfigDirSandbox::new(&home, &claude);
+    let _fake = FakeClaude::new(&home);
+    let expected = super::expected_pointer().expect("pointer");
+    let (marketplaces, plugins) = seed(&claude, &expected);
+    let dir = claude.join("plugins");
+    std::fs::create_dir_all(&dir).expect("plugins dir");
+    for (name, value) in [
+        ("known_marketplaces.json", &marketplaces),
+        ("installed_plugins.json", &plugins),
+    ] {
+        std::fs::write(
+            dir.join(name),
+            serde_json::to_vec_pretty(value).expect("seed json"),
+        )
+        .expect("seed registry");
+    }
+    super::preflight_gate()
+}
+
+/// The healthy pair: a directory-source `clauth` entry registered exactly at
+/// the materialized pointer (created on disk, manifest included) plus a
+/// user-scope plugin entry whose files resolve. Every shape test below breaks
+/// exactly one half of this and keeps the other.
+#[cfg(unix)]
+fn healthy_registry(
+    _claude: &std::path::Path,
+    expected: &std::path::Path,
+) -> (serde_json::Value, serde_json::Value) {
+    std::fs::create_dir_all(expected.join(".claude-plugin")).expect("pointer tree");
+    std::fs::write(
+        expected.join(".claude-plugin").join("marketplace.json"),
+        "{}",
+    )
+    .expect("manifest");
+    let path = expected.to_string_lossy().into_owned();
+    (
+        serde_json::json!({
+            "clauth": {
+                "source": {"source": "directory", "path": path},
+                "installLocation": path,
+                "lastUpdated": "2026-08-26T00:00:00.000Z"
+            }
+        }),
+        serde_json::json!({
+            "version": 2,
+            "plugins": {"clauth@clauth": [{"scope": "user", "installPath": path, "version": "0.14.1"}]}
+        }),
+    )
+}
+
+/// The decision's own pin: a healthy registration costs a start no heal, which
+/// is what keeps the pre-flight spawn-free on the common path.
+#[cfg(unix)]
+#[test]
+fn preflight_gate_stays_shut_on_a_healthy_registration() {
+    let verdict = gate_verdict(healthy_registry);
+    assert!(
+        !verdict,
+        "a registration at the materialized pointer with its manifest present must not heal"
+    );
+}
+
+/// Every shape the gate exists to catch, one break at a time from the healthy
+/// twin: marketplace absent, github-sourced, path diverged, path missing,
+/// manifest deleted, plugin installPath dead, plugin entry carrying load errors.
+/// Each is the deadlock half of the migration — the plugin then loads 0 hooks
+/// and the hook-side heal never fires.
+#[cfg(unix)]
+#[test]
+fn preflight_gate_fires_on_every_broken_or_divergent_shape() {
+    let broken = tempfile::tempdir().expect("tempdir");
+    let broken_path = broken.path().join("registered");
+    std::fs::create_dir_all(broken_path.join(".claude-plugin")).expect("broken dir");
+    let broken_path = broken_path.to_string_lossy().into_owned();
+    let healthy_plugins =
+        |claude: &std::path::Path, expected: &std::path::Path| healthy_registry(claude, expected).1;
+    let healthy_mkt =
+        |claude: &std::path::Path, expected: &std::path::Path| healthy_registry(claude, expected).0;
+    type Seed =
+        Box<dyn Fn(&std::path::Path, &std::path::Path) -> (serde_json::Value, serde_json::Value)>;
+    let cases: Vec<(&str, Seed)> = vec![
+        (
+            "marketplace entry absent",
+            Box::new(move |claude, expected| {
+                (serde_json::json!({}), healthy_plugins(claude, expected))
+            }),
+        ),
+        (
+            "marketplace entry github-sourced",
+            Box::new(move |claude, expected| {
+                (
+                    serde_json::json!({"clauth": {"source": {"source": "github", "repo": "uwuclxdy/clauth"}}}),
+                    healthy_plugins(claude, expected),
+                )
+            }),
+        ),
+        (
+            "marketplace path diverged from the pointer",
+            Box::new(move |claude, expected| {
+                (
+                    serde_json::json!({"clauth": {"source": {"source": "directory", "path": "/old/checkout/plugins"}}}),
+                    healthy_plugins(claude, expected),
+                )
+            }),
+        ),
+        (
+            "marketplace path missing",
+            Box::new(move |claude, expected| {
+                (
+                    serde_json::json!({"clauth": {"source": {"source": "directory"}}}),
+                    healthy_plugins(claude, expected),
+                )
+            }),
+        ),
+        (
+            "marketplace manifest deleted",
+            Box::new(move |claude, expected| {
+                (
+                    serde_json::json!({"clauth": {"source": {"source": "directory", "path": broken_path.clone()}}}),
+                    healthy_plugins(claude, expected),
+                )
+            }),
+        ),
+        (
+            "plugin entry installPath dead",
+            Box::new(move |claude, expected| {
+                (
+                    healthy_mkt(claude, expected),
+                    serde_json::json!({"version": 2, "plugins": {"clauth@clauth": [{"scope": "user", "installPath": "/gone/runtime/plugins/cache"}]}}),
+                )
+            }),
+        ),
+        (
+            "plugin entry carries load errors",
+            Box::new(move |claude, expected| {
+                let healthy_mkt = healthy_mkt(claude, expected);
+                let healthy_path = healthy_mkt["clauth"]["source"]["path"]
+                    .as_str()
+                    .expect("path")
+                    .to_string();
+                (
+                    healthy_mkt,
+                    serde_json::json!({
+                        "version": 2,
+                        "plugins": {"clauth@clauth": [{"scope": "user", "installPath": healthy_path, "errors": ["Marketplace clauth failed to load: cache-miss"]}]}
+                    }),
+                )
+            }),
+        ),
+    ];
+    for (name, seed) in cases {
+        assert!(gate_verdict(seed), "{name} must trip the gate");
+    }
+}
+
+/// A project-scope entry never trips the gate: the heal is user-scope and
+/// cannot fix it, so counting it would churn one heal per start for nothing.
+#[cfg(unix)]
+#[test]
+fn preflight_gate_ignores_project_scope_entries() {
+    let verdict = gate_verdict(|claude, expected| {
+        let (marketplaces, _) = healthy_registry(claude, expected);
+        let plugins = serde_json::json!({
+            "version": 2,
+            "plugins": {"clauth@clauth": [{"scope": "project", "installPath": "/gone/runtime/plugins/cache"}]}
+        });
+        (marketplaces, plugins)
+    });
+    assert!(
+        !verdict,
+        "a dead project entry is not the user-scope heal's job"
+    );
+}
+
+/// An unreadable or absent registry is "cannot tell", which heals: the heal is
+/// idempotent, and a first-run machine (no registry files yet) is exactly the
+/// migration case the gate exists to catch.
+#[cfg(unix)]
+#[test]
+fn preflight_gate_heals_when_the_registry_files_are_missing() {
+    use crate::testutil::{ConfigDirSandbox, FakeClaude, HomeSandbox};
+
+    let home = HomeSandbox::new();
+    let claude = home.home().join(".claude-config");
+    std::fs::create_dir_all(&claude).expect("config dir");
+    let _config = ConfigDirSandbox::new(&home, &claude);
+    let _fake = FakeClaude::new(&home);
+    assert!(
+        super::preflight_gate(),
+        "an unreadable registry must heal, conservatively"
+    );
 }

@@ -131,3 +131,5 @@ Each row is a check on your Claude Code wiring: `clauth` on `PATH`, the `mcpServ
 | `relink credentials` | the active profile's credential link is missing while its stored credentials are intact |
 | `add the keybinding and sidebar row to herdr's config` | the herdr plugin is installed but its key is unbound or its sidebar row is untemplated |
 | `install the clauth plugin` | the plugin row reads not installed, or installed project-local only; confirming runs the real `claude plugin` installer at user scope |
+
+The `herdr` row's detail takes focus: <kbd>⏎</kbd> on the row descends, <kbd>↑</kbd>/<kbd>↓</kbd> walk the options rows, <kbd>space</kbd> or <kbd>⏎</kbd> activates one (toggle, cycle, or open the tag-refresh editor), <kbd>+</kbd>/<kbd>-</kbd> step the refresh, <kbd>esc</kbd> closes the editor and then ascends. `delegate row text` opens a confirm that defaults to cancel.

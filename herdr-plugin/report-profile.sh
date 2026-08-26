@@ -64,9 +64,19 @@ fi
 printf '%s\n' "$profile"
 
 [ -n "$pane" ] || exit 0
+# The pane_tag knob gates the whole publishing path: off skips the one-shot
+# report below AND the watcher spawn, while the resolve above still prints.
+pane_tag=$(clauth herdr config get pane_tag 2>/dev/null || printf 'on')
+[ "$pane_tag" = off ] && exit 0
+
 # The pane id goes BEFORE the flags. `report-metadata --help` prints it last,
 # and that order answers `unknown option: <value>` at exit 2 on 0.8.0.
-"$herdr_bin" pane report-metadata "$pane" --source "${HERDR_PLUGIN_ID:-clauth}" --token "clauth=$profile"
+set -- "$pane" --source "${HERDR_PLUGIN_ID:-clauth}" --token "clauth=$profile"
+# border_label on also names the account on the pane's border. Named flags
+# may sit in any order; only the positional-first order above is load-bearing.
+border_label=$(clauth herdr config get border_label 2>/dev/null || printf 'off')
+[ "$border_label" = on ] && set -- "$@" --display-agent "$profile"
+"$herdr_bin" pane report-metadata "$@"
 
 # A --with-fallback session moves onto another account mid-run with no herdr
 # event, so the one-shot report above goes stale until the next status change.

@@ -10,7 +10,9 @@ set -u
 pane="${1:?usage: watch-profile.sh <pane-id> <pidfile>}"
 pidfile="${2:?usage: watch-profile.sh <pane-id> <pidfile>}"
 herdr_bin="${HERDR_BIN_PATH:-herdr}"
-interval="${CLAUTH_PROFILE_WATCH_INTERVAL:-5}"
+# The tag_watch_secs knob wins over the env, which wins over the 5s default;
+# a predating clauth answers nothing, so the env/default chain still holds.
+interval=$(clauth herdr config get tag_watch_secs 2>/dev/null || printf '%s' "${CLAUTH_PROFILE_WATCH_INTERVAL:-5}")
 # A non-numeric interval would make `sleep` fail instantly, and zero would hot-
 # spin the loop; clamp both to the default or a floor of one second.
 case "$interval" in

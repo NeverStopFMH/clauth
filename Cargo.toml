@@ -81,10 +81,6 @@ agentgear = "0.1"
 # exact and instant. No new crate — tokio is already a dependency above — and
 # resolver 3 keeps a dev-dependency's features out of the normal build.
 tokio = { version = "1.52.3", features = ["test-util"] }
-# The install test derives its hermetic tree-root expectation from the same
-# resolution agentgear uses (`dirs::data_dir()`); already in the tree as a
-# transitive dep, so this adds no new crate.
-dirs = "6"
 
 # npm installs `claude` as a `.cmd` shim that Rust's bare `Command::new` can't
 # resolve (no PATHEXT search); `which` finds it. Unix uses a bare lookup.

@@ -80,6 +80,7 @@ clauth list           # account table with cached usage, no network
 | `clauth completions <bash\|zsh\|fish\|install> [shell]` | | print or install a completion script |
 | `clauth herdr install` | `--key <spec>`, `--no-config`, `--yes` | install the [herdr](https://herdr.dev) plugin and bind a key to it |
 | `clauth herdr uninstall` | `--no-config`, `--yes` | remove that plugin and the config lines it added |
+| `clauth herdr config get <key>` | | print one herdr knob: `popup_width`, `pane_tag`, `tag_watch_secs`, `border_label`, `delegate_dot`, `delegate_row_text` |
 
 `--theme <full\|compatible>` is global and forces a color depth for the TUI.
 

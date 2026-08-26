@@ -137,6 +137,13 @@ If the messages limiter is blocking Claude Code, a live 5h window will not clear
 | `show_pace` | bool | `false` | ideal-pace marker on usage bars |
 | `count_cache` | bool | `false` | count cache tokens in the Tokens totals |
 | `auth_broken` | list | `[]` | accounts quarantined after a permanent OAuth rejection; clauth writes this |
+| `[herdr]` | table | `{}` | the herdr-plugin knobs the Plugin tab edits ([herdr plugin](Herdr-Plugin)) |
+| `[herdr] popup_width` | string | `fit` | `fit` (focused-pane width, 540-column cap), `full` (whole pane area), or `half` (herdr's default) |
+| `[herdr] pane_tag` | bool | `true` | publish the `clauth=$profile` pane-metadata tag |
+| `[herdr] tag_watch_secs` | int | `5` | seconds between the per-pane tag watcher's re-publishes |
+| `[herdr] border_label` | bool | `false` | publish `--display-agent "$profile"` so split-pane borders name the account |
+| `[herdr] delegate_dot` | bool | `true` | report `clauth_delegate=working\|idle` pane metadata during delegate runs |
+| `[herdr] delegate_row_text` | bool | `false` | append `$clauth_delegate` to the sidebar row `install` writes |
 
 ## `config.toml`
 

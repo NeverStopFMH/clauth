@@ -1,6 +1,6 @@
 # clauth herdr plugin
 
-Opens [clauth](https://github.com/uwuclxdy/clauth) in a [herdr](https://herdr.dev) popup: the account table, the usage windows, and the auto-switch chain, over whatever you were doing, without a pane of its own. It labels every herdr pane with the account that pane is spending, too.
+Opens [clauth](https://github.com/uwuclxdy/clauth) in a [herdr](https://herdr.dev) popup: the account table, the usage windows, and the auto-switch chain, over whatever you were doing, without a pane of its own. It labels every herdr pane with the account that pane is spending, and it shows when a delegate runs inside a pane. The popup width, the pane tag, and the delegate state all tune from the dashboard's Plugin tab.
 
 **The manual for all of it lives in the wiki: [herdr plugin](https://github.com/uwuclxdy/clauth/wiki/Herdr-Plugin).** This file covers what the plugin itself is, for anyone reading it before letting herdr run it.
 
@@ -27,6 +27,8 @@ Two actions and two event hooks, all of them one of the two shell scripts below,
 
 The watcher re-publishes the account every few seconds until the pane closes. An account swap fires no herdr event, so the timer is what keeps the tag from going stale. The scripts write only herdr's own pane metadata plus one pidfile per watched pane in the plugin state directory.
 
+The six knobs live in `~/.clauth/profiles.toml` under `[herdr]` and edit from the dashboard's Plugin tab (herdr row, options). The scripts read them through `clauth herdr config get <key>` and fall back to the shipped defaults when the binary predates the subcommand. The delegate state token (`clauth_delegate`) reports on the pane JSON and, with the `delegate_row_text` knob on, beside the row.
+
 ## Paste these if you installed by hand
 
 `clauth herdr install` writes both. herdr does not let a plugin declare either one, so without them the key does nothing and the tag stays invisible.
@@ -49,6 +51,6 @@ claude = [["state_icon", "workspace", "tab"], ["terminal_title_stripped"], ["age
 | File | Role |
 |------|------|
 | `herdr-plugin.toml` | Manifest: one popup entrypoint, two actions, two event hooks |
-| `open-pane.sh` | Opens an entrypoint, treating "popup already open" as a no-op |
+| `open-pane.sh` | Opens an entrypoint at the width the `popup_width` knob picks, treating "popup already open" as a no-op |
 | `report-profile.sh` | Resolves the account a pane burns and publishes it as pane metadata |
 | `watch-profile.sh` | Per-pane watcher re-publishing the account on a timer |

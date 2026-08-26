@@ -79,8 +79,8 @@ pub(crate) fn preflight() {
 /// user-scope heal converges, `false` only for a registration already sitting at
 /// agentgear's materialized `current@claude` pointer with its generated manifest
 /// present and every user-scope plugin entry's files resolvable. Read-only; a
-/// file this cannot read counts as "heal" (conservative — the heal is idempotent
-/// and a healthy install makes it a one-read no-op).
+/// file this cannot read counts as "heal" (conservative — the heal is idempotent,
+/// so a needless run costs nothing but its own reads).
 pub(crate) fn preflight_gate() -> bool {
     let Some(dir) = registry_dir() else {
         return true;

@@ -3048,8 +3048,9 @@ fn switch_tab(app: &mut App, tab: Tab) {
             app.plugin.focus = PluginFocus::List;
             app.plugin.cursor = 0;
             app.plugin.detail_scroll = 0;
-            // Leaving the tab abandons an open tag editor the same way the
-            // Config tab abandons its drafts.
+            // Entering the tab clears an open tag editor the same way the
+            // Config tab clears its drafts; `switch_tab` matches the
+            // destination, so the clear runs on entry, not on exit.
             app.plugin.herdr_tag_draft = None;
             // Recompute on focus; the cached `claude --version` is not re-probed.
             recompute_plugin_checks(app, false);
@@ -8052,9 +8053,16 @@ fn run_herdr_heal(app: &mut App, path: &std::path::Path) {
         delegate_row_text,
     ) {
         Ok(notes) if notes.is_empty() => {
+            // Name the knob state the write landed: the confirm copy for the
+            // off direction says "drop the delegate token", so a success toast
+            // reading "added the keybinding and sidebar row" would claim the
+            // opposite of what the user confirmed.
             app.toast(
                 ToastKind::Success,
-                "added the keybinding and sidebar row to herdr's config",
+                format!(
+                    "wrote herdr's config: keybinding + sidebar row (delegate token {})",
+                    if delegate_row_text { "on" } else { "off" }
+                ),
             );
             recompute_plugin_checks(app, false);
         }

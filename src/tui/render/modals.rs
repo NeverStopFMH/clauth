@@ -641,11 +641,16 @@ fn tab_specific_rows(tab: Tab) -> Vec<(&'static str, &'static [(&'static str, &'
         Tab::Plugin => vec![(
             "plugin",
             &[
-                ("\u{2191}\u{2193}", "pick check · scroll detail"),
-                ("\u{21b5}", "open the selected row's detail"),
+                (
+                    "\u{2191}\u{2193}",
+                    "pick check · scroll detail · walk herdr options",
+                ),
+                ("\u{21b5}", "open detail · activate an option"),
+                ("space", "activate the focused herdr option"),
+                ("+ / -", "step the tag refresh"),
                 ("f", "apply the selected row's fix"),
                 ("r", "re-run all checks"),
-                ("esc", "back to the list"),
+                ("esc", "back to the list · close the editor"),
             ][..],
         )],
         Tab::Fallback => vec![(

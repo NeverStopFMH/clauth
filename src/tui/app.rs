@@ -1320,6 +1320,13 @@ pub(crate) struct PluginState {
     pub(crate) delegates: Vec<crate::mcp::jobs::StoredJob>,
 }
 
+/// Selector index the `herdr` check occupies once it renders: `about`,
+/// `mcp servers`, `plugin`, `herdr`, `runtime`. The landing row in herdr mode;
+/// until the `r`-gated probe has resolved (or when herdr does not), the same
+/// index rests on `runtime`, the last row — the cursor clamp in
+/// `recompute_plugin_checks` keeps it valid either way.
+const HERDR_SELECTOR_ROW: usize = 3;
+
 impl Default for PluginState {
     fn default() -> Self {
         Self {
@@ -1488,6 +1495,10 @@ pub(crate) struct App {
     pub(crate) third_party_usage_store: ThirdPartyUsageStore,
     pub(crate) third_party_status: ThirdPartyStatusStore,
     pub(crate) tab: Tab,
+    /// Running inside a herdr pane (`HERDR_ENV=1` at `cmd_tui`): the header
+    /// carries a `[ herdr ]` tag and the TUI lands on the Plugin tab's herdr
+    /// row. Read-only after construction — the mode is decided once at launch.
+    pub(crate) herdr_mode: bool,
     pub(crate) modals: Vec<Modal>,
     /// First help-modal row on screen (↑↓ scrolls). Reset when the modal opens.
     pub(crate) help_scroll: u16,
@@ -1898,6 +1909,7 @@ impl App {
             third_party_usage_store,
             third_party_status,
             tab: Tab::Overview,
+            herdr_mode: false,
             modals: Vec::new(),
             help_scroll: 0,
             help_max_scroll: std::cell::Cell::new(0),
@@ -1971,6 +1983,23 @@ impl App {
             live_sessions,
             last_live_sessions_refresh: Some(Instant::now()),
         }
+    }
+
+    /// herdr-mode landing, applied at construction (before the first paint):
+    /// the Plugin tab with the herdr selector row under the cursor. Runs the
+    /// same recompute a manual tab switch runs, so the first paint shows the
+    /// checks instead of an empty selector; the cursor clamp inside it keeps
+    /// the landing row valid whether or not the `r`-gated herdr probe has
+    /// resolved yet. Nothing else changes — no key handling, no focus
+    /// stealing after construction.
+    pub(crate) fn with_herdr_mode(mut self, herdr_mode: bool) -> Self {
+        self.herdr_mode = herdr_mode;
+        if herdr_mode {
+            self.tab = Tab::Plugin;
+            self.plugin.cursor = HERDR_SELECTOR_ROW;
+            recompute_plugin_checks(&mut self, false);
+        }
+        self
     }
 
     /// Phase clock every ambient animation keys off: milliseconds since the TUI

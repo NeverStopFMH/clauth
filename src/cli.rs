@@ -443,4 +443,27 @@ pub(crate) enum HerdrCommand {
         #[arg(long, short = 'y')]
         yes: bool,
     },
+
+    /// Print one herdr knob for the plugin scripts
+    ///
+    /// `clauth herdr config get <key>` prints the knob's value on its own
+    /// line, shell-shaped (`fit|full|half`, `on|off`, or the bare number).
+    /// Hidden from help: this is the scripts' read path, not a human surface.
+    #[command(hide = true)]
+    Config {
+        #[command(subcommand)]
+        cmd: HerdrConfigCommand,
+    },
+}
+
+/// `clauth herdr config <cmd>`: the plugin scripts' read path for the knobs
+/// persisted under `[herdr]` in profiles.toml.
+#[derive(Subcommand, Debug)]
+pub(crate) enum HerdrConfigCommand {
+    /// Print one knob's value on its own line
+    Get {
+        /// Knob name: popup_width, pane_tag, tag_watch_secs, border_label,
+        /// delegate_dot, delegate_row_text.
+        key: String,
+    },
 }

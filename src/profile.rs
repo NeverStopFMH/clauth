@@ -463,6 +463,70 @@ pub(crate) enum ClockFormat {
     H12,
 }
 
+/// How wide the herdr popup `open-pane.sh` opens, one of the `[herdr]` knobs
+/// in profiles.toml. Serialized as a lowercase string so the file stays
+/// human-readable: `popup_width = "fit"`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum PopupWidth {
+    /// Full width on terminals ≤ 540 cols, else a 540-col centered popup.
+    #[default]
+    Fit,
+    /// The whole pane area.
+    Full,
+    /// herdr's own default half-size.
+    Half,
+}
+
+impl PopupWidth {
+    /// The `clauth herdr config get popup_width` spelling.
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            PopupWidth::Fit => "fit",
+            PopupWidth::Full => "full",
+            PopupWidth::Half => "half",
+        }
+    }
+}
+
+/// The herdr knobs, persisted under `[herdr]` in profiles.toml. Written by the
+/// Plugin tab's herdr-options form rows, read by the plugin scripts through
+/// `clauth herdr config get <key>` — so the on-disk shape is also a published
+/// read contract. The `[herdr]` table itself may be absent (defaults) or
+/// partial: a missing field fills from [`Default`] rather than erroring.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub(crate) struct HerdrSettings {
+    /// Which popup width mode `open-pane.sh` resolves per open.
+    pub(crate) popup_width: PopupWidth,
+    /// Publish the `clauth=$profile` pane-metadata token (the sidebar tag).
+    pub(crate) pane_tag: bool,
+    /// The per-pane tag watcher interval, seconds.
+    pub(crate) tag_watch_secs: u64,
+    /// Also publish `--display-agent "$profile"` so split-pane borders name
+    /// the account.
+    pub(crate) border_label: bool,
+    /// The `clauth mcp` server reports `clauth_delegate=working|idle` pane
+    /// metadata while delegates run.
+    pub(crate) delegate_dot: bool,
+    /// The sidebar row `clauth herdr install` appends gains the
+    /// `$clauth_delegate` token, so a running delegate reads as text.
+    pub(crate) delegate_row_text: bool,
+}
+
+impl Default for HerdrSettings {
+    fn default() -> Self {
+        Self {
+            popup_width: PopupWidth::Fit,
+            pane_tag: true,
+            tag_watch_secs: 5,
+            border_label: false,
+            delegate_dot: true,
+            delegate_row_text: false,
+        }
+    }
+}
+
 /// Stored at ~/.clauth/profiles.toml — ordering and active marker only.
 /// Credentials and endpoint config live in per-profile subdirectories.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -608,6 +672,15 @@ pub(crate) struct AppState {
     /// through [`AppState::burn_horizon_cap_ms`]. Inert unless burn-aware is on.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) burn_horizon_cap_ms: Option<u64>,
+    /// herdr-mode knobs (popup width, pane tag, the delegate dot). Omitted from
+    /// the file while every knob is at its default, so an untouched
+    /// profiles.toml gains no `[herdr]` block on the next save.
+    #[serde(default, skip_serializing_if = "herdr_is_default")]
+    pub(crate) herdr: HerdrSettings,
+}
+
+fn herdr_is_default(herdr: &HerdrSettings) -> bool {
+    *herdr == HerdrSettings::default()
 }
 
 impl AppState {
@@ -776,6 +849,7 @@ impl Default for AppState {
             weekly_switch_threshold: None,
             burn_switch_floor_pct: None,
             burn_horizon_cap_ms: None,
+            herdr: HerdrSettings::default(),
         }
     }
 }

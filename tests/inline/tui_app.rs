@@ -8219,3 +8219,60 @@ fn herdr_prose_lines_are_indented_so_they_do_not_read_as_fields() {
         check.detail
     );
 }
+
+// ── herdr mode landing ───────────────────────────────────────────────────────
+
+/// `with_herdr_mode(true)` lands on the Plugin tab with the herdr selector
+/// row under the cursor, checks already recomputed so the first paint is not
+/// empty. Until the `r`-gated probe resolves, the same cursor index rests on
+/// `runtime` (the last row); once the probe is injected, the cursor is on
+/// `herdr` itself — the clamp, not a magic index, keeps both valid.
+#[test]
+fn herdr_mode_lands_on_the_plugin_tab_with_the_herdr_row_selected() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = bare_app().with_herdr_mode(true);
+
+    assert_eq!(app.tab, super::Tab::Plugin, "herdr mode opens on Plugin");
+    assert!(app.herdr_mode);
+    assert!(
+        matches!(app.plugin.focus, super::PluginFocus::List),
+        "the landing must not steal focus into the detail pane"
+    );
+    let labels: Vec<&str> = app.plugin.checks.iter().map(|c| c.label).collect();
+    assert_eq!(
+        labels,
+        vec!["about", "mcp servers", "plugin", "runtime"],
+        "construction recomputes the checks, so the first paint is not empty"
+    );
+    assert_eq!(app.plugin.cursor, 3, "the landing cursor is the herdr slot");
+    assert_eq!(
+        app.plugin.selected_check().map(|c| c.label),
+        Some("runtime"),
+        "with the probe unresolved the same index rests on the last row"
+    );
+
+    // The probe resolves (a real run answers it on `r`): the herdr row inserts
+    // at the landing index and the cursor is on it without any key handling.
+    app.plugin.herdr = Some(Some(healthy_herdr_probe()));
+    super::recompute_plugin_checks(&mut app, false);
+    assert_eq!(app.plugin.cursor, 3);
+    assert_eq!(
+        app.plugin.selected_check().map(|c| c.label),
+        Some("herdr"),
+        "the landing row is the herdr check once it renders"
+    );
+}
+
+/// The mode-less constructor is untouched: Overview, first row, no flag.
+#[test]
+fn a_plain_app_lands_on_overview_with_the_first_row_selected() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let app = bare_app();
+    assert_eq!(app.tab, super::Tab::Overview);
+    assert!(!app.herdr_mode);
+    assert_eq!(app.plugin.cursor, 0);
+    assert!(
+        app.plugin.checks.is_empty(),
+        "no construction recompute outside herdr mode"
+    );
+}

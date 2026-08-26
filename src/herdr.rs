@@ -855,6 +855,39 @@ fn check_config(bin: &str, probe: &Path, text: &str) -> Result<Vec<String>> {
         .collect())
 }
 
+// ── Knob read path (`clauth herdr config get`) ─────────────────────────────
+
+/// `clauth herdr config get <key>` — the plugin scripts' read path for the
+/// knobs persisted under `[herdr]` in profiles.toml. One value per line in a
+/// shell shape: `fit|full|half` for `popup_width`, `on|off` for the bools, the
+/// bare number for `tag_watch_secs`, so a caller never parses help prose. A
+/// missing profiles.toml answers the defaults; an unknown key is a usage error
+/// (exit 2) naming the valid keys.
+pub(crate) fn config_get(key: &str) -> Result<()> {
+    let config = crate::profile::load_config()?;
+    outln!("{}", herdr_value(&config.state.herdr, key)?);
+    Ok(())
+}
+
+/// The pure half of [`config_get`]: the one-line value for `key`. Split out so
+/// the knob table and the error surface are pinned without capturing stdout.
+fn herdr_value(herdr: &crate::profile::HerdrSettings, key: &str) -> Result<String> {
+    let on_off = |b: bool| if b { "on" } else { "off" };
+    match key {
+        "popup_width" => Ok(herdr.popup_width.as_str().to_string()),
+        "pane_tag" => Ok(on_off(herdr.pane_tag).to_string()),
+        "tag_watch_secs" => Ok(herdr.tag_watch_secs.to_string()),
+        "border_label" => Ok(on_off(herdr.border_label).to_string()),
+        "delegate_dot" => Ok(on_off(herdr.delegate_dot).to_string()),
+        "delegate_row_text" => Ok(on_off(herdr.delegate_row_text).to_string()),
+        _ => Err(crate::UsageError(format!(
+            "unknown herdr config key '{key}'; valid keys: popup_width, pane_tag, \
+             tag_watch_secs, border_label, delegate_dot, delegate_row_text"
+        ))
+        .into()),
+    }
+}
+
 #[cfg(test)]
 #[path = "../tests/inline/herdr.rs"]
 mod tests;

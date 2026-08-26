@@ -209,6 +209,9 @@ fn dispatch(cli: Cli) -> Result<()> {
                 yes,
             } => herdr::install(key.as_deref(), no_config, yes),
             cli::HerdrCommand::Uninstall { no_config, yes } => herdr::uninstall(no_config, yes),
+            cli::HerdrCommand::Config { cmd } => match cmd {
+                cli::HerdrConfigCommand::Get { key } => herdr::config_get(&key),
+            },
         },
         Command::Run { .. } => anyhow::bail!(
             "`clauth run` isn't a command; for a headless delegate use \
@@ -1517,7 +1520,12 @@ fn cmd_tui(theme_override: Option<tui::theme::Tier>) -> Result<()> {
         ThemeName::Compatible => tui::theme::Tier::Compatible,
     });
     tui::theme::init(theme_override.or(config_tier));
-    tui::run(config)
+    // herdr injects `HERDR_ENV=1` into every pane it manages, and only the
+    // exact `"1"` counts (the same shape CLAUTH_NO_UPDATE reads). The settled
+    // detection channel: no flag, no config key, so a normal terminal can
+    // never trip it by accident.
+    let herdr_mode = std::env::var("HERDR_ENV").as_deref() == Ok("1");
+    tui::run(config, herdr_mode)
 }
 
 /// Feature→test traceability map.

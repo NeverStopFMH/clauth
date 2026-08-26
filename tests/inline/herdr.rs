@@ -1,9 +1,15 @@
 //! `clauth herdr install`'s decision half. `plan_config` is pure text in, text
 //! out, which is where the append-only rule either holds or corrupts a config
 //! clauth does not own; the subprocess half (herdr's installer, `config check`)
-//! is covered by running the command against a real herdr.
+//! is covered by running the command against a real herdr. The `[herdr]` knob
+//! table in profiles.toml and its `clauth herdr config get` read path are
+//! pinned here too, through the same load the TUI uses.
 
 use super::*;
+use clap::{CommandFactory, Parser as _};
+
+use crate::cli::{Cli, Command, HerdrCommand, HerdrConfigCommand};
+use crate::profile::{HerdrSettings, PopupWidth};
 
 /// Every plan this produces has to append onto the file it was planned against
 /// and still parse, or the write turns a working herdr config into a broken one.
@@ -521,5 +527,210 @@ fn read_config_treats_absent_as_empty_and_fails_on_non_utf8() {
     assert!(
         format!("{err:#}").contains("garbage.toml"),
         "names the path: {err:#}"
+    );
+}
+
+// ── `[herdr]` knob store + `clauth herdr config get` read path ─────────────
+
+/// Seed a real-shaped profiles.toml through the resolver the app reads
+/// (`clauth_dir()`), never a hand-built path, so the fixture pins the parse
+/// path `load_config` walks.
+fn write_profiles_toml(body: &str) {
+    let dir = crate::profile::clauth_dir().expect("clauth dir");
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    std::fs::write(dir.join("profiles.toml"), body).expect("write profiles.toml");
+}
+
+#[test]
+fn herdr_settings_round_trip_through_the_app_load_path() {
+    let _home = crate::testutil::HomeSandbox::new();
+
+    // No `[herdr]` table at all: the existing-file shape loads as defaults.
+    write_profiles_toml("active_profile = \"acct\"\nprofiles = [\"acct\"]\n");
+    let config = crate::profile::load_config().expect("load");
+    assert_eq!(config.state.herdr, HerdrSettings::default());
+
+    // A partial table fills the missing knobs from the documented defaults.
+    write_profiles_toml(concat!(
+        "active_profile = \"acct\"\n",
+        "profiles = [\"acct\"]\n",
+        "[herdr]\n",
+        "popup_width = \"full\"\n",
+    ));
+    let config = crate::profile::load_config().expect("load");
+    assert_eq!(
+        config.state.herdr,
+        HerdrSettings {
+            popup_width: PopupWidth::Full,
+            ..HerdrSettings::default()
+        }
+    );
+
+    // A full table loads every knob, and a save + reload is a true round trip.
+    write_profiles_toml(concat!(
+        "active_profile = \"acct\"\n",
+        "profiles = [\"acct\"]\n",
+        "[herdr]\n",
+        "popup_width = \"half\"\n",
+        "pane_tag = false\n",
+        "tag_watch_secs = 30\n",
+        "border_label = true\n",
+        "delegate_dot = false\n",
+        "delegate_row_text = true\n",
+    ));
+    let config = crate::profile::load_config().expect("load");
+    let want = HerdrSettings {
+        popup_width: PopupWidth::Half,
+        pane_tag: false,
+        tag_watch_secs: 30,
+        border_label: true,
+        delegate_dot: false,
+        delegate_row_text: true,
+    };
+    assert_eq!(config.state.herdr, want);
+    crate::profile::save_app_state(&config.state).expect("save");
+    let again = crate::profile::load_config().expect("reload");
+    assert_eq!(again.state.herdr, want);
+}
+
+#[test]
+fn saving_default_knobs_omits_the_herdr_block_until_one_moves() {
+    let _home = crate::testutil::HomeSandbox::new();
+    write_profiles_toml("active_profile = \"acct\"\nprofiles = [\"acct\"]\n");
+    let config = crate::profile::load_config().expect("load");
+
+    crate::profile::save_app_state(&config.state).expect("save");
+    let text = std::fs::read_to_string(
+        crate::profile::clauth_dir()
+            .expect("clauth dir")
+            .join("profiles.toml"),
+    )
+    .expect("read");
+    assert!(
+        !text.contains("[herdr]"),
+        "an untouched knob set must not grow a [herdr] block on save: {text}"
+    );
+
+    // One knob off its default is enough to persist the whole table.
+    let mut moved = config.state.clone();
+    moved.herdr.pane_tag = false;
+    crate::profile::save_app_state(&moved).expect("save");
+    let text = std::fs::read_to_string(
+        crate::profile::clauth_dir()
+            .expect("clauth dir")
+            .join("profiles.toml"),
+    )
+    .expect("read");
+    assert!(
+        text.contains("[herdr]"),
+        "a moved knob must persist: {text}"
+    );
+    assert!(
+        text.contains("pane_tag = false"),
+        "knob value persists: {text}"
+    );
+}
+
+#[test]
+fn herdr_config_get_answers_every_default_with_no_profiles_toml() {
+    let _home = crate::testutil::HomeSandbox::new();
+    // Nothing written: the get path must answer the defaults, not an error.
+    let config = crate::profile::load_config().expect("load");
+    for (key, want) in [
+        ("popup_width", "fit"),
+        ("pane_tag", "on"),
+        ("tag_watch_secs", "5"),
+        ("border_label", "off"),
+        ("delegate_dot", "on"),
+        ("delegate_row_text", "off"),
+    ] {
+        assert_eq!(
+            herdr_value(&config.state.herdr, key).expect("value"),
+            want,
+            "default for {key}"
+        );
+    }
+}
+
+#[test]
+fn herdr_config_get_honors_written_knobs_through_the_real_load_path() {
+    let _home = crate::testutil::HomeSandbox::new();
+    write_profiles_toml(concat!(
+        "active_profile = \"acct\"\n",
+        "profiles = [\"acct\"]\n",
+        "[herdr]\n",
+        "popup_width = \"half\"\n",
+        "pane_tag = false\n",
+        "tag_watch_secs = 30\n",
+        "border_label = true\n",
+        "delegate_dot = false\n",
+        "delegate_row_text = true\n",
+    ));
+    let config = crate::profile::load_config().expect("load");
+    for (key, want) in [
+        ("popup_width", "half"),
+        ("pane_tag", "off"),
+        ("tag_watch_secs", "30"),
+        ("border_label", "on"),
+        ("delegate_dot", "off"),
+        ("delegate_row_text", "on"),
+    ] {
+        assert_eq!(
+            herdr_value(&config.state.herdr, key).expect("value"),
+            want,
+            "written value for {key}"
+        );
+    }
+}
+
+#[test]
+fn herdr_config_get_unknown_key_is_a_usage_error_naming_the_valid_keys() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let err = config_get("popup-width").expect_err("an unknown key must fail");
+    let msg = err.to_string();
+    for key in [
+        "popup_width",
+        "pane_tag",
+        "tag_watch_secs",
+        "border_label",
+        "delegate_dot",
+        "delegate_row_text",
+    ] {
+        assert!(msg.contains(key), "the error must name {key}: {msg}");
+    }
+    assert_eq!(crate::exit_code(Err(err)), 2, "a bad key is a usage error");
+}
+
+#[test]
+fn herdr_config_get_parses_and_stays_out_of_herdrs_help() {
+    let Cli {
+        command:
+            Some(Command::Herdr {
+                cmd:
+                    HerdrCommand::Config {
+                        cmd: HerdrConfigCommand::Get { key },
+                    },
+            }),
+        ..
+    } = Cli::try_parse_from(["clauth", "herdr", "config", "get", "popup_width"])
+        .expect("`herdr config get` must parse")
+    else {
+        panic!("`herdr config get` must select the get arm");
+    };
+    assert_eq!(key, "popup_width");
+
+    // A bare `config` names no operation, and `get` takes exactly one key.
+    assert!(Cli::try_parse_from(["clauth", "herdr", "config"]).is_err());
+    assert!(Cli::try_parse_from(["clauth", "herdr", "config", "get"]).is_err());
+
+    // Hidden-ish: parseable, completable, but absent from herdr's help.
+    let help = Cli::command()
+        .find_subcommand_mut("herdr")
+        .expect("herdr subcommand")
+        .render_long_help()
+        .to_string();
+    assert!(
+        !help.contains("Print one herdr knob"),
+        "the scripts' read path must stay out of the help surface"
     );
 }

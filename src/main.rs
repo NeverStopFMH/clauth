@@ -207,7 +207,15 @@ fn dispatch(cli: Cli) -> Result<()> {
                 key,
                 no_config,
                 yes,
-            } => herdr::install(key.as_deref(), no_config, yes),
+            } => {
+                // The knob lives in profiles.toml (`AppState.herdr`), so the
+                // row the plugin writes matches the TUI's setting. A missing
+                // or unreadable file answers the default, never an error.
+                let delegate_row_text = crate::profile::load_config()
+                    .map(|config| config.state.herdr.delegate_row_text)
+                    .unwrap_or_else(|_| crate::profile::HerdrSettings::default().delegate_row_text);
+                herdr::install(key.as_deref(), no_config, yes, delegate_row_text)
+            }
             cli::HerdrCommand::Uninstall { no_config, yes } => herdr::uninstall(no_config, yes),
             cli::HerdrCommand::Config { cmd } => match cmd {
                 cli::HerdrConfigCommand::Get { key } => herdr::config_get(&key),

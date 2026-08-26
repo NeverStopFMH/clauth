@@ -15,8 +15,8 @@ use crate::profile::{HerdrSettings, PopupWidth};
 /// and still parse, or the write turns a working herdr config into a broken one.
 /// Goes through `with_append`, the same glue `install` uses, so the seam is
 /// pinned here rather than reimplemented.
-fn appended(existing: &str, key: &str) -> String {
-    let plan = plan_config(existing, key).expect("plan");
+fn appended(existing: &str, key: &str, delegate_row_text: bool) -> String {
+    let plan = plan_config(existing, key, delegate_row_text).expect("plan");
     let text = with_append(existing, &plan.append);
     toml::from_str::<toml::Value>(&text).expect("appended config parses");
     text
@@ -24,7 +24,7 @@ fn appended(existing: &str, key: &str) -> String {
 
 #[test]
 fn empty_config_gets_both_blocks() {
-    let text = appended("", "prefix+a");
+    let text = appended("", "prefix+a", false);
     assert!(text.contains(r#"command = "clauth.open""#));
     assert!(text.contains(r#"key = "prefix+a""#));
     assert!(text.contains("[ui.sidebar.agents.rows_by_agent]"));
@@ -39,7 +39,7 @@ fn an_existing_binding_is_left_alone() {
         "type = \"plugin_action\"\n",
         "command = \"clauth.open\"\n"
     );
-    let plan = plan_config(existing, "prefix+a").expect("plan");
+    let plan = plan_config(existing, "prefix+a", false).expect("plan");
     assert!(
         !plan.append.contains("[[keys.command]]"),
         "would double-bind the action"
@@ -57,7 +57,7 @@ fn another_plugins_binding_does_not_count_as_ours() {
         "type = \"plugin_action\"\n",
         "command = \"someone.else\"\n"
     );
-    let text = appended(existing, "prefix+a");
+    let text = appended(existing, "prefix+a", false);
     assert!(text.contains(r#"command = "clauth.open""#));
     // Arrays of tables append cleanly, so both bindings survive.
     let doc: toml::Value = toml::from_str(&text).expect("parses");
@@ -72,7 +72,7 @@ fn a_claude_row_already_rendering_the_token_is_left_alone() {
         r#"claude = [["state_icon"], ["agent", "$clauth"]]"#,
         "\n"
     );
-    let plan = plan_config(existing, "prefix+a").expect("plan");
+    let plan = plan_config(existing, "prefix+a", false).expect("plan");
     assert!(!plan.append.contains("rows_by_agent"));
     assert!(plan.notes.iter().any(|n| n.contains("already renders")));
 }
@@ -86,7 +86,7 @@ fn a_claude_row_without_the_token_is_reported_never_duplicated() {
         r#"claude = [["state_icon"], ["agent"]]"#,
         "\n"
     );
-    let plan = plan_config(existing, "prefix+a").expect("plan");
+    let plan = plan_config(existing, "prefix+a", false).expect("plan");
     assert!(
         !plan.append.contains("rows_by_agent"),
         "would duplicate the table"
@@ -96,7 +96,7 @@ fn a_claude_row_without_the_token_is_reported_never_duplicated() {
             .iter()
             .any(|n| n.contains("already sets a claude row"))
     );
-    appended(existing, "prefix+a");
+    appended(existing, "prefix+a", false);
 }
 
 #[test]
@@ -106,13 +106,13 @@ fn a_rows_by_agent_table_for_other_agents_is_reported_never_duplicated() {
         r#"codex = [["state_icon"], ["agent"]]"#,
         "\n"
     );
-    let plan = plan_config(existing, "prefix+a").expect("plan");
+    let plan = plan_config(existing, "prefix+a", false).expect("plan");
     assert!(
         !plan.append.contains("rows_by_agent"),
         "would duplicate the table"
     );
     assert!(plan.notes.iter().any(|n| n.contains("covers other agents")));
-    appended(existing, "prefix+a");
+    appended(existing, "prefix+a", false);
 }
 
 /// `[ui.sidebar.agents]` existing without `rows_by_agent` is the common shape
@@ -120,7 +120,7 @@ fn a_rows_by_agent_table_for_other_agents_is_reported_never_duplicated() {
 #[test]
 fn a_sidebar_agents_table_without_rows_by_agent_still_gets_the_block() {
     let existing = "[ui.sidebar.agents]\nrow_gap = 1\n";
-    let text = appended(existing, "prefix+a");
+    let text = appended(existing, "prefix+a", false);
     assert!(text.contains("[ui.sidebar.agents.rows_by_agent]"));
     let doc: toml::Value = toml::from_str(&text).expect("parses");
     assert_eq!(
@@ -136,15 +136,15 @@ fn a_sidebar_agents_table_without_rows_by_agent_still_gets_the_block() {
 
 #[test]
 fn a_fully_wired_config_plans_nothing() {
-    let existing = appended("", "prefix+a");
-    let plan = plan_config(&existing, "prefix+a").expect("plan");
+    let existing = appended("", "prefix+a", false);
+    let plan = plan_config(&existing, "prefix+a", false).expect("plan");
     assert!(plan.append.is_empty(), "second run would append again");
     assert_eq!(plan.notes.len(), 2);
 }
 
 #[test]
 fn a_config_that_does_not_parse_fails_before_anything_is_written() {
-    assert!(plan_config("this is not toml", "prefix+a").is_err());
+    assert!(plan_config("this is not toml", "prefix+a", false).is_err());
 }
 
 /// Comments and unrelated keys survive, because the write appends text rather
@@ -152,7 +152,7 @@ fn a_config_that_does_not_parse_fails_before_anything_is_written() {
 #[test]
 fn unrelated_config_survives_verbatim() {
     let existing = "# my herdr config\n[ui]\naccent = \"cyan\"\n";
-    let text = appended(existing, "prefix+a");
+    let text = appended(existing, "prefix+a", false);
     assert!(text.starts_with(existing));
     assert!(text.contains("# my herdr config"));
 }
@@ -194,7 +194,7 @@ fn the_append_seam_never_joins_two_lines() {
     assert_eq!(with_append("", "\n[b]\n"), "\n[b]\n");
     let joined = with_append(
         "accent = \"cyan\"",
-        &plan_config("accent = \"cyan\"", "prefix+a")
+        &plan_config("accent = \"cyan\"", "prefix+a", false)
             .expect("plan")
             .append,
     );
@@ -213,7 +213,7 @@ fn a_table_spelled_inline_is_handed_over_never_appended_onto() {
         r#"keys.command = [{ key = "prefix+z", type = "shell", command = "ls" }]"#,
         "[ui.sidebar.agents]\nrows_by_agent = { codex = [[\"agent\"]] }\n",
     ] {
-        let plan = plan_config(existing, "prefix+a").expect("plan");
+        let plan = plan_config(existing, "prefix+a", false).expect("plan");
         let text = with_append(existing, &plan.append);
         toml::from_str::<toml::Value>(&text)
             .unwrap_or_else(|e| panic!("appending onto {existing:?} broke the config: {e}"));
@@ -277,24 +277,31 @@ fn the_config_root_is_derived_from_herdrs_own_path_or_refused() {
     assert_eq!(config_path_from_plugin_dir("clauth"), None);
 }
 
-/// The seam `install` writes through: a plan appended onto its file must strip back to that file, byte for byte.
-fn round_trips(orig: &str) {
-    let plan = plan_config(orig, "prefix+a").expect("plan");
+/// The seam `install` writes through: a plan appended onto its file must strip back to that file, byte for byte. `uninstall`'s strip is knob-agnostic, so the delegate row (knob on) has to round-trip the same as today's.
+fn round_trips(orig: &str, delegate_row_text: bool) {
+    let plan = plan_config(orig, "prefix+a", delegate_row_text).expect("plan");
     let text = with_append(orig, &plan.append);
     assert_eq!(without_marked_blocks(&text), orig, "round trip lost bytes");
 }
 
 #[test]
 fn removing_marked_blocks_round_trips() {
-    round_trips("");
-    round_trips("# my config\n[ui]\naccent = \"cyan\"\n[keys]\nleader = \"ctrl+a\"\n");
-    round_trips("[[keys.command]]\nkey = \"prefix+z\"\ntype = \"shell\"\ncommand = \"ls\"\n");
+    round_trips("", false);
+    round_trips(
+        "# my config\n[ui]\naccent = \"cyan\"\n[keys]\nleader = \"ctrl+a\"\n",
+        false,
+    );
+    round_trips(
+        "[[keys.command]]\nkey = \"prefix+z\"\ntype = \"shell\"\ncommand = \"ls\"\n",
+        false,
+    );
+    round_trips("# my config\n[ui]\naccent = \"cyan\"\n", true);
 }
 
 #[test]
 fn hand_edited_marked_blocks_are_still_removed() {
     let orig = "# my config\n[ui]\naccent = \"cyan\"\n";
-    let plan = plan_config(orig, "prefix+a").expect("plan");
+    let plan = plan_config(orig, "prefix+a", false).expect("plan");
     let wired = with_append(orig, &plan.append);
     let edited = wired
         .replace(r#"key = "prefix+a""#, r#"key = "prefix+z""#)
@@ -305,7 +312,7 @@ fn hand_edited_marked_blocks_are_still_removed() {
 #[test]
 fn marked_blocks_mid_file_leave_trailing_content() {
     let orig = "# my config\n[ui]\naccent = \"cyan\"\n";
-    let plan = plan_config(orig, "prefix+a").expect("plan");
+    let plan = plan_config(orig, "prefix+a", false).expect("plan");
     let wired = with_append(orig, &plan.append);
     let trailing = format!("{wired}\n[extra]\nx = 1\n");
     assert_eq!(
@@ -427,7 +434,7 @@ fn plan_config_and_config_status_agree() {
     ];
     for existing in configs {
         let status = config_status(existing);
-        let plan = plan_config(existing, "prefix+a").expect("plan");
+        let plan = plan_config(existing, "prefix+a", false).expect("plan");
         assert_eq!(
             status.bound_key.is_some(),
             plan.notes.iter().any(|n| n.contains("already bound")),
@@ -527,6 +534,123 @@ fn read_config_treats_absent_as_empty_and_fails_on_non_utf8() {
     assert!(
         format!("{err:#}").contains("garbage.toml"),
         "names the path: {err:#}"
+    );
+}
+
+// ── delegate_row_text knob: the row content + the install/heal resync ─────
+
+/// The knob's only effect on the plan: off writes today's row byte for byte,
+/// on appends the delegate token to the agent group and nothing else.
+#[test]
+fn the_delegate_token_rides_the_row_only_when_the_knob_is_on() {
+    let off = appended("", "prefix+a", false);
+    assert!(
+        off.contains(r#"["agent", "$clauth"]"#),
+        "the knob off writes today's row exactly: {off}"
+    );
+    assert!(
+        !off.contains("$clauth_delegate"),
+        "the delegate token must stay out of the off row: {off}"
+    );
+
+    let on = appended("", "prefix+a", true);
+    assert!(
+        on.contains(r#"["agent", "$clauth", "$clauth_delegate"]"#),
+        "the knob on appends the delegate token to the agent group: {on}"
+    );
+    // The row is otherwise identical.
+    let off_row = off.split("rows_by_agent]\n").nth(1).expect("row");
+    let on_row = on.split("rows_by_agent]\n").nth(1).expect("row");
+    assert_eq!(
+        on_row.replace(
+            r#"["agent", "$clauth", "$clauth_delegate"]"#,
+            r#"["agent", "$clauth"]"#
+        ),
+        off_row,
+        "the on row differs only in the agent group"
+    );
+}
+
+/// The resync `install`/`heal` run, through the seam they both write through:
+/// strip clauth's blocks, plan on the base, append. A knob toggle must
+/// rewrite exactly the blocks clauth wrote — the old row goes, the new one
+/// lands, nothing user-owned moves — and the toggle back restores the
+/// original byte for byte.
+#[test]
+fn a_knob_toggle_rewrites_exactly_the_marked_blocks() {
+    let orig = "# my config\n[ui]\naccent = \"cyan\"\n";
+    // First run, knob off — today's row.
+    let plan = plan_config(orig, "prefix+a", false).expect("plan");
+    let wired = with_append(orig, &plan.append);
+
+    // The resync a toggle run makes, with the knob on.
+    let (text, plan, _) = resync_text(&wired, "prefix+a", true).expect("resync");
+    assert!(
+        plan.notes.is_empty(),
+        "the base the strip left carries nothing hand-owned to report on"
+    );
+    toml::from_str::<toml::Value>(&text).expect("the rewritten config parses");
+    assert!(
+        text.starts_with(orig),
+        "the user's own content is untouched"
+    );
+    assert_eq!(
+        text.matches("$clauth_delegate").count(),
+        1,
+        "exactly one delegate token, the new row's: {text}"
+    );
+    assert_eq!(
+        text.matches("rows_by_agent").count(),
+        1,
+        "the old row was stripped, not duplicated: {text}"
+    );
+    assert_eq!(
+        text.matches("[[keys.command]]").count(),
+        1,
+        "one binding block survives the strip-and-replan"
+    );
+
+    // And the toggle back restores today's row byte for byte.
+    let (back, _, _) = resync_text(&text, "prefix+a", false).expect("resync back");
+    assert_eq!(back, wired, "off -> on -> off round-trips byte for byte");
+}
+
+/// A hand-owned claude row is never rewritten: the strip removes only marked
+/// blocks, so the hand-written row survives the resync and the plan hands the
+/// knob-aware line over in a note.
+#[test]
+fn a_hand_owned_claude_row_survives_the_resync() {
+    let existing = concat!(
+        "# my config\n",
+        "[ui.sidebar.agents.rows_by_agent]\n",
+        r#"claude = [["state_icon"], ["agent"]]"#,
+        "\n"
+    );
+    let (text, plan, _) = resync_text(existing, "prefix+a", true).expect("resync");
+    assert!(
+        !plan.append.contains("rows_by_agent"),
+        "never appended beside a hand-owned table"
+    );
+    assert!(
+        plan.notes
+            .iter()
+            .any(|n| n.contains("already sets a claude row")),
+        "the hand-owned row keeps its verdict"
+    );
+    assert!(
+        plan.notes
+            .iter()
+            .any(|n| n.contains(r#"["agent", "$clauth", "$clauth_delegate"]"#)),
+        "the hand-merge line the note suggests carries the knob's token"
+    );
+    assert_eq!(
+        text.matches("rows_by_agent").count(),
+        1,
+        "the user's own row is the only one: {text}"
+    );
+    assert!(
+        text.contains(r#"claude = [["state_icon"], ["agent"]]"#),
+        "the user's row content survives byte for byte: {text}"
     );
 }
 

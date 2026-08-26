@@ -7907,7 +7907,15 @@ fn run_confirm_action(app: &mut App, action: ConfirmAction) {
             Err(e) => app.toast(ToastKind::Danger, format!("relink failed\n{e}")),
         },
         ConfirmAction::HealHerdrConfig(path) => {
-            match crate::herdr::heal(&path, crate::herdr::DEFAULT_KEY, &crate::herdr::herdr_bin()) {
+            // The knob rides the heal the way `install` reads it, so the row
+            // this fix writes matches the `delegate_row_text` set in the TUI.
+            let delegate_row_text = app.config().state.herdr.delegate_row_text;
+            match crate::herdr::heal(
+                &path,
+                crate::herdr::DEFAULT_KEY,
+                &crate::herdr::herdr_bin(),
+                delegate_row_text,
+            ) {
                 Ok(notes) if notes.is_empty() => {
                     app.toast(
                         ToastKind::Success,

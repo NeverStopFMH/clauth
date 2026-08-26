@@ -53,12 +53,14 @@
 //! `logline` routes off it — to the log file on an interactive pane, stderr
 //! otherwise).
 //!
-//! Gating: [`PaneReporter::resolve`] returns `None` unless BOTH `HERDR_PANE_ID`
-//! is present AND the herdr binary resolves — `HERDR_BIN_PATH` when set (a
-//! path must exist), else `herdr` found on `PATH` (the same resolution
-//! `crate::herdr::herdr_bin` names). Resolution happens once, in the serve
-//! path (`ClauthServer::with_herdr_pane`); a server built without it is a
-//! silent no-op.
+//! Gating: [`PaneReporter::resolve`] returns `None` unless the `delegate_dot`
+//! knob is on AND BOTH `HERDR_PANE_ID` is present AND the herdr binary
+//! resolves — `HERDR_BIN_PATH` when set (a path must exist), else `herdr`
+//! found on `PATH` (the same resolution `crate::herdr::herdr_bin` names). The
+//! knob reads once at server start off the on-demand config, defaulting on
+//! when profiles.toml is missing or unreadable. Resolution happens once, in
+//! the serve path (`ClauthServer::with_herdr_pane`); a server built without
+//! it is a silent no-op.
 //!
 //! TTL and refresh: every report carries `--ttl-ms` [`STATE_TTL_MS`], so the
 //! token self-clears with no exit path running — a server that dies
@@ -152,8 +154,13 @@ impl Gate {
 }
 
 impl PaneReporter {
-    /// `Some` only when the pane env is present and the herdr binary resolves.
-    pub(crate) fn resolve() -> Option<Self> {
+    /// `Some` only when the `delegate_dot` knob is on, the pane env is
+    /// present, and the herdr binary resolves. A knob-off server is the same
+    /// silent no-op as a missing pane id.
+    pub(crate) fn resolve(delegate_dot: bool) -> Option<Self> {
+        if !delegate_dot {
+            return None;
+        }
         let pane_id = std::env::var("HERDR_PANE_ID").ok()?;
         if pane_id.trim().is_empty() {
             return None;

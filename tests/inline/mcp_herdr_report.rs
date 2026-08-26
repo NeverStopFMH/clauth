@@ -264,7 +264,7 @@ fn drive(server: &ClauthServer, args: DelegateArgs) -> CallToolResult {
 /// shim lines are the construction-time pin.
 fn pinned_server(home: &HomeSandbox, pane: &str, shim: &Path) -> ClauthServer {
     let _pin = EnvPin::new(home, Some(pane), Some(shim));
-    ClauthServer::new().with_herdr_pane(PaneReporter::resolve())
+    ClauthServer::new().with_herdr_pane(PaneReporter::resolve(true))
 }
 
 // ── gating: what `PaneReporter::resolve` accepts ─────────────────────────────
@@ -274,7 +274,10 @@ fn resolve_requires_pane_id() {
     let home = HomeSandbox::new();
     let shim = echo_shim(home.home(), "herdr");
     let _pin = EnvPin::new(&home, None, Some(&shim));
-    assert!(PaneReporter::resolve().is_none(), "no pane id, no reporter");
+    assert!(
+        PaneReporter::resolve(true).is_none(),
+        "no pane id, no reporter"
+    );
 }
 
 #[test]
@@ -283,7 +286,7 @@ fn resolve_requires_resolvable_binary() {
     let missing = home.home().join("absent-herdr");
     let _pin = EnvPin::new(&home, Some("pane-7"), Some(&missing));
     assert!(
-        PaneReporter::resolve().is_none(),
+        PaneReporter::resolve(true).is_none(),
         "a pane id without a resolvable herdr binary is a no-op"
     );
 }
@@ -294,7 +297,7 @@ fn resolve_accepts_path_binary() {
     let shim = echo_shim(home.home(), "herdr");
     let _pin = EnvPin::new(&home, Some("pane-7"), Some(&shim));
     assert!(
-        PaneReporter::resolve().is_some(),
+        PaneReporter::resolve(true).is_some(),
         "pane id + HERDR_BIN_PATH resolves"
     );
 }
@@ -318,7 +321,7 @@ fn resolve_finds_bare_name_on_path() {
         }
         std::env::set_var("PATH", joined);
     }
-    let resolved = PaneReporter::resolve();
+    let resolved = PaneReporter::resolve(true);
     // SAFETY: same as above — restore.
     unsafe {
         match &saved {
@@ -329,6 +332,21 @@ fn resolve_finds_bare_name_on_path() {
     assert!(
         resolved.is_some(),
         "a bare `herdr` on PATH resolves (HERDR_BIN_PATH unset)"
+    );
+}
+
+#[test]
+fn resolve_requires_the_delegate_dot_knob() {
+    let home = HomeSandbox::new();
+    let shim = echo_shim(home.home(), "herdr");
+    let _pin = EnvPin::new(&home, Some("pane-7"), Some(&shim));
+    assert!(
+        PaneReporter::resolve(false).is_none(),
+        "delegate_dot off is the same silent no-op as a missing pane id"
+    );
+    assert!(
+        PaneReporter::resolve(true).is_some(),
+        "knob on + pane env + shim resolves"
     );
 }
 
@@ -554,7 +572,7 @@ fn overlap_reports_idle_once_after_last_end() {
     let shim = echo_shim(home.home(), "herdr");
     let reporter = {
         let _pin = EnvPin::new(&home, Some("pane-9"), Some(&shim));
-        PaneReporter::resolve().expect("pane env resolves a reporter")
+        PaneReporter::resolve(true).expect("pane env resolves a reporter")
     };
     // Two overlapping delegates, each entered the way a delegate enters: the
     // handler's `begin` at commit-to-launch, the run's own end-guard in its
@@ -586,7 +604,7 @@ fn overlap_reports_idle_once_after_last_end() {
 /// A reporter over a shim, resolved under a pin the caller does not keep.
 fn pinned_reporter(home: &HomeSandbox, pane: &str, shim: &Path) -> PaneReporter {
     let _pin = EnvPin::new(home, Some(pane), Some(shim));
-    PaneReporter::resolve().expect("pane env + shim resolves a reporter")
+    PaneReporter::resolve(true).expect("pane env + shim resolves a reporter")
 }
 
 // ── seq clock ────────────────────────────────────────────────────────────────
@@ -845,5 +863,30 @@ fn server_without_reporter_spawns_nothing_even_with_pane_env() {
     assert!(
         report_lines(home.home()).is_empty(),
         "a plain ClauthServer::new() carries no reporter"
+    );
+}
+
+#[test]
+fn server_with_knob_off_spawns_nothing_even_with_pane_env() {
+    let home = HomeSandbox::new();
+    let shim = echo_shim(home.home(), "herdr");
+    seed(&["sad"], true);
+    // The serve path resolves the reporter only while `delegate_dot` is on,
+    // so a knob-off resolution must be the same silent no-op as the missing
+    // pane env: the delegate runs, nothing spawns.
+    let _pin = EnvPin::new(&home, Some("pane-7"), Some(&shim));
+    let server = ClauthServer::new().with_herdr_pane(PaneReporter::resolve(false));
+    let result = drive(
+        &server,
+        DelegateArgs {
+            profiles: Some(vec!["sad".to_string()]),
+            prompt: Some("hi".into()),
+            ..base()
+        },
+    );
+    assert_eq!(result.is_error, Some(true), "the delegate still runs");
+    assert!(
+        report_lines(home.home()).is_empty(),
+        "the knob off resolves no reporter, so nothing spawns"
     );
 }

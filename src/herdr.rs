@@ -31,11 +31,12 @@ const GITHUB_SOURCE: &str = "uwuclxdy/clauth/herdr-plugin";
 pub(crate) const DEFAULT_KEY: &str = "prefix+a";
 /// The pane-metadata name `report-profile.sh` publishes the account under.
 const TOKEN: &str = "$clauth";
+/// The pane-metadata name the MCP server publishes delegate state under. The
+/// sidebar row `install` writes is the only template that renders it, so the
+/// row names it only while the `delegate_row_text` knob is on.
+const DELEGATE_TOKEN: &str = "$clauth_delegate";
 /// Marks this crate's additions inside a file clauth does not own.
 const MARKER: &str = "# clauth herdr plugin";
-/// The agent row that renders the token. Claude Code panes take the
-/// `rows_by_agent` template rather than the generic `rows`.
-const SIDEBAR_ROW: &str = r#"claude = [["state_icon", "workspace", "tab"], ["terminal_title_stripped"], ["agent", "$clauth"]]"#;
 
 /// Where the plugin comes from. A checkout gets linked in place so an edit is
 /// live on the next open; anyone else fetches the published subdir.
@@ -44,7 +45,12 @@ enum Source {
     Github,
 }
 
-pub(crate) fn install(key: Option<&str>, no_config: bool, yes: bool) -> Result<()> {
+pub(crate) fn install(
+    key: Option<&str>,
+    no_config: bool,
+    yes: bool,
+    delegate_row_text: bool,
+) -> Result<()> {
     // `herdr-plugin/herdr-plugin.toml` declares linux and macos, because its
     // entrypoints are POSIX shell. herdr links a plugin whose platforms exclude
     // the host and refuses each entrypoint at invocation instead, so without
@@ -82,19 +88,19 @@ pub(crate) fn install(key: Option<&str>, no_config: bool, yes: bool) -> Result<(
 
     if no_config {
         outln!("clauth: herdr's config left alone (--no-config)");
-        print_manual(&key);
+        print_manual(&key, delegate_row_text);
         return Ok(());
     }
 
     let path = config_path(&bin)?;
     let existing = read_config(&path)?;
-    let plan = plan_config(&existing, &key)?;
+    let (text, plan, removed) = resync_text(&existing, &key, delegate_row_text)?;
 
     for note in &plan.notes {
         outln!("clauth: {note}");
     }
 
-    if plan.append.is_empty() {
+    if text == existing {
         outln!("clauth: herdr's config already carries everything clauth would add");
         return Ok(());
     }
@@ -104,15 +110,26 @@ pub(crate) fn install(key: Option<&str>, no_config: bool, yes: bool) -> Result<(
     for line in plan.append.trim_start_matches('\n').lines() {
         outln!("+ {line}");
     }
+    if plan.append.is_empty() {
+        // A resync whose plan re-adds nothing still drops the blocks it
+        // stripped (the user hand-owns the binding); show that half the way
+        // `uninstall` does.
+        let mut diff = removed.clone();
+        if diff.first().is_some_and(String::is_empty) {
+            diff.remove(0);
+        }
+        for line in &diff {
+            outln!("- {line}");
+        }
+    }
     outln!("");
 
     if !confirm("write these to herdr's config?", yes)? {
         outln!("clauth: nothing written");
-        print_manual(&key);
+        print_manual(&key, delegate_row_text);
         return Ok(());
     }
 
-    let text = with_append(&existing, &plan.append);
     write_validated(&path, &existing, &text, &bin)?;
 
     outln!("clauth: wrote {}", path.display());
@@ -444,11 +461,11 @@ fn confirm(question: &str, yes: bool) -> Result<bool> {
     Ok(answer.eq_ignore_ascii_case("y") || answer.eq_ignore_ascii_case("yes"))
 }
 
-fn print_manual(key: &str) {
+fn print_manual(key: &str, delegate_row_text: bool) {
     outln!("clauth: add these to herdr's config.toml yourself:");
     outln!("");
     outln!("{}", binding_block(key));
-    outln!("{}", sidebar_block());
+    outln!("{}", sidebar_block(delegate_row_text));
 }
 
 fn binding_block(key: &str) -> String {
@@ -457,9 +474,24 @@ fn binding_block(key: &str) -> String {
     )
 }
 
-fn sidebar_block() -> String {
+fn sidebar_block(delegate_row_text: bool) -> String {
     format!(
-        "{MARKER}: `{TOKEN}` renders the account each Claude Code pane burns\n[ui.sidebar.agents.rows_by_agent]\n{SIDEBAR_ROW}\n"
+        "{MARKER}: `{TOKEN}` renders the account each Claude Code pane burns\n[ui.sidebar.agents.rows_by_agent]\n{}\n",
+        sidebar_row(delegate_row_text)
+    )
+}
+
+/// The claude row template, the knob's only effect: with `delegate_row_text`
+/// on, the agent group also names `$clauth_delegate`, so a running delegate
+/// reads as text beside the row. Off is today's row, byte for byte.
+fn sidebar_row(delegate_row_text: bool) -> String {
+    let agent = if delegate_row_text {
+        format!(r#"["agent", "{TOKEN}", "{DELEGATE_TOKEN}"]"#)
+    } else {
+        format!(r#"["agent", "{TOKEN}"]"#)
+    };
+    format!(
+        r#"claude = [["state_icon", "workspace", "tab"], ["terminal_title_stripped"], {agent}]"#
     )
 }
 
@@ -576,7 +608,12 @@ fn sidebar_state(doc: &toml::Value) -> SidebarState {
 /// the file structurally would drop their comments and ordering.
 ///
 /// Both verdicts route through the same helpers `config_status` uses, so the row and the install plan cannot drift.
-fn plan_config(existing: &str, key: &str) -> Result<ConfigPlan> {
+///
+/// The resync callers (`install`, `heal`) strip clauth's marked blocks before
+/// planning, so this never sees its own old blocks: a knob toggle plans
+/// against the base the strip left and re-appends the row the knob now asks
+/// for.
+fn plan_config(existing: &str, key: &str, delegate_row_text: bool) -> Result<ConfigPlan> {
     let doc: toml::Value = toml::from_str(existing)
         .context("herdr's config.toml does not parse; fix it before wiring clauth into it")?;
 
@@ -602,28 +639,62 @@ fn plan_config(existing: &str, key: &str) -> Result<ConfigPlan> {
             "the sidebar already renders the account, so the rows are left alone".to_string(),
         ),
         SidebarState::OtherClaudeRow => plan.notes.push(format!(
-            "your `[ui.sidebar.agents.rows_by_agent]` already sets a claude row, so add `\"{TOKEN}\"` to one of its groups yourself: {SIDEBAR_ROW}"
+            "your `[ui.sidebar.agents.rows_by_agent]` already sets a claude row, so add `\"{TOKEN}\"` to one of its groups yourself: {}",
+            sidebar_row(delegate_row_text)
         )),
         SidebarState::OtherAgentsOnly => plan.notes.push(format!(
-            "your `[ui.sidebar.agents.rows_by_agent]` covers other agents, so add this line under it yourself: {SIDEBAR_ROW}"
+            "your `[ui.sidebar.agents.rows_by_agent]` covers other agents, so add this line under it yourself: {}",
+            sidebar_row(delegate_row_text)
         )),
         SidebarState::Absent => {
-            plan.try_append(existing, &format!("\n{}", sidebar_block()), "the sidebar row");
+            plan.try_append(
+                existing,
+                &format!("\n{}", sidebar_block(delegate_row_text)),
+                "the sidebar row",
+            );
         }
     }
 
     Ok(plan)
 }
 
-/// Appends whatever `plan_config` says is missing. Returns the plan's notes (the pieces it refused to touch), empty when it wrote everything.
-pub(crate) fn heal(config_path: &Path, key: &str, bin: &str) -> Result<Vec<String>> {
+/// Appends whatever `plan_config` says is missing, after stripping the blocks
+/// a previous run wrote: the strip is what makes a knob toggle rewrite
+/// exactly clauth's own blocks, and an unchanged knob reconstructs the same
+/// text, so the write (and the `herdr config check` behind it) is skipped.
+/// Returns the plan's notes (the pieces it refused to touch), empty when it
+/// wrote everything.
+pub(crate) fn heal(
+    config_path: &Path,
+    key: &str,
+    bin: &str,
+    delegate_row_text: bool,
+) -> Result<Vec<String>> {
     let existing = read_config(config_path)?;
-    let plan = plan_config(&existing, key)?;
-    if !plan.append.is_empty() {
-        let text = with_append(&existing, &plan.append);
+    let (text, plan, _) = resync_text(&existing, key, delegate_row_text)?;
+    if text != existing {
         write_validated(config_path, &existing, &text, bin)?;
     }
     Ok(plan.notes)
+}
+
+/// The resync seam `install` and `heal` write through: strip this crate's
+/// marked blocks, plan on what is left, append the plan. A knob toggle then
+/// rewrites exactly the blocks clauth wrote — the strip takes the old blocks
+/// off, the plan re-adds the row the knob now asks for, nothing user-owned
+/// moves — while an unchanged knob reconstructs the text byte for byte, which
+/// is what keeps the callers' writes a no-op. Split out so a test that pins
+/// the seam is pinning what the two callers run rather than a second copy of
+/// it, the same reason `with_append` is one function.
+fn resync_text(
+    existing: &str,
+    key: &str,
+    delegate_row_text: bool,
+) -> Result<(String, ConfigPlan, Vec<String>)> {
+    let (base, removed) = strip_marked_blocks(existing);
+    let plan = plan_config(&base, key, delegate_row_text)?;
+    let text = with_append(&base, &plan.append);
+    Ok((text, plan, removed))
 }
 
 /// Test seam over [`strip_marked_blocks`], so the round-trip tests name the rule they pin.

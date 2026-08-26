@@ -4966,6 +4966,12 @@ pub(crate) fn serve() -> Result<()> {
     // Held across `block_on`, so the flock drops with the process however it dies
     // — a bare `claude` runs no clauth teardown, SIGKILL least of all.
     let _bare_marker = hold_bare_session_marker();
+    // The delegate-dot knob, read once at startup from the on-demand config.
+    // A missing or unreadable profiles.toml answers the default (dot on), so
+    // the knob can never fail the server.
+    let delegate_dot = load_config()
+        .map(|config| config.state.herdr.delegate_dot)
+        .unwrap_or_else(|_| crate::profile::HerdrSettings::default().delegate_dot);
     // rmcp's service loop arms a Tokio timer (needs `enable_time`), so a bare
     // current-thread runtime panics right after the first reply. `enable_all`
     // also turns on the I/O driver, covering a future transport that polls a real
@@ -4973,15 +4979,16 @@ pub(crate) fn serve() -> Result<()> {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
-    rt.block_on(run_server())
+    rt.block_on(run_server(delegate_dot))
 }
 
-async fn run_server() -> Result<()> {
+async fn run_server(delegate_dot: bool) -> Result<()> {
     use rmcp::{ServiceExt, transport::stdio};
     // Resolve the pane reporter once, at startup: the pane env is what this
     // process inherited from herdr, and a per-call re-read would race a
     // delegate with a changed environment.
-    let server = ClauthServer::new().with_herdr_pane(herdr_report::PaneReporter::resolve());
+    let server =
+        ClauthServer::new().with_herdr_pane(herdr_report::PaneReporter::resolve(delegate_dot));
     let service = server.serve(stdio()).await?;
     service.waiting().await?;
     Ok(())

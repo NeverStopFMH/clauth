@@ -8220,6 +8220,422 @@ fn herdr_prose_lines_are_indented_so_they_do_not_read_as_fields() {
     );
 }
 
+// ── herdr options (Plugin detail) ────────────────────────────────────────────
+
+/// The herdr detail with its options section: a resolved probe + parsed config
+/// verdict cached, the check built from them, focus descended. The knobs start
+/// at their shipped defaults.
+fn herdr_options_app() -> App {
+    let mut app = bare_app();
+    app.tab = super::Tab::Plugin;
+    app.plugin.herdr = Some(Some(healthy_herdr_probe()));
+    app.plugin.herdr_config = Some(healthy_herdr_config());
+    app.plugin.checks = vec![super::herdr_check(
+        &healthy_herdr_probe(),
+        Some(&healthy_herdr_config()),
+    )];
+    app.plugin.cursor = 0;
+    app.plugin.focus = super::PluginFocus::Detail;
+    app
+}
+
+/// The persisted knobs, through the real load path (`load_config` re-reads
+/// profiles.toml) — a key handler that mutates memory without saving reds
+/// this, and so does a save that writes a different shape than the loader
+/// reads.
+fn herdr_knobs() -> crate::profile::HerdrSettings {
+    crate::profile::load_config()
+        .expect("load persisted knobs")
+        .state
+        .herdr
+}
+
+/// `popup width`: space cycles fit → full → half → fit and ⏎ mirrors it (no
+/// separate edit step), persisting each step.
+#[test]
+fn herdr_popup_width_cycles_and_persists() {
+    use super::{KeyCode, handle_key};
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = herdr_options_app();
+    let space = crate::testutil::key(KeyCode::Char(' '));
+
+    handle_key(&mut app, space);
+    assert_eq!(
+        herdr_knobs().popup_width,
+        crate::profile::PopupWidth::Full,
+        "space cycles to the next option"
+    );
+    handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    assert_eq!(
+        herdr_knobs().popup_width,
+        crate::profile::PopupWidth::Half,
+        "⏎ mirrors space on a cycle row"
+    );
+    handle_key(&mut app, space);
+    assert_eq!(
+        herdr_knobs().popup_width,
+        crate::profile::PopupWidth::Fit,
+        "the cycle wraps"
+    );
+}
+
+/// `pane tag`: space toggles the knob and persists through the real save/load
+/// path.
+#[test]
+fn herdr_pane_tag_toggles_and_persists() {
+    use super::{KeyCode, handle_key};
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = herdr_options_app();
+    app.plugin.herdr_options_cursor = 1;
+    let space = crate::testutil::key(KeyCode::Char(' '));
+
+    handle_key(&mut app, space);
+    assert!(!herdr_knobs().pane_tag, "space flips the default on → off");
+    handle_key(&mut app, space);
+    assert!(herdr_knobs().pane_tag, "and back");
+}
+
+/// `tag refresh`: `+`/`-` step live with a floor of 1, ⏎ opens the typed editor
+/// (commits on ⏎, discards on ⎋, invalid input stays in the editor) — the
+/// Config-tab refresh-interval mechanism.
+#[test]
+fn herdr_tag_refresh_steps_types_and_persists() {
+    use super::{KeyCode, handle_key};
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = herdr_options_app();
+    app.plugin.herdr_options_cursor = 2;
+
+    for _ in 0..4 {
+        handle_key(&mut app, crate::testutil::key(KeyCode::Char('-')));
+    }
+    assert_eq!(herdr_knobs().tag_watch_secs, 1, "four steps down from 5");
+    handle_key(&mut app, crate::testutil::key(KeyCode::Char('-')));
+    assert_eq!(herdr_knobs().tag_watch_secs, 1, "the floor is 1, never 0");
+    handle_key(&mut app, crate::testutil::key(KeyCode::Char('+')));
+    assert_eq!(herdr_knobs().tag_watch_secs, 2);
+
+    // ⏎ opens the typed editor, seeded with the current value.
+    handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    assert!(
+        app.plugin.herdr_tag_draft.is_some(),
+        "⏎ opens the typed editor"
+    );
+    handle_key(&mut app, crate::testutil::key(KeyCode::Backspace));
+    handle_key(&mut app, crate::testutil::key(KeyCode::Char('3')));
+    handle_key(&mut app, crate::testutil::key(KeyCode::Char('0')));
+    handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    assert_eq!(herdr_knobs().tag_watch_secs, 30, "the typed value commits");
+    assert!(app.plugin.herdr_tag_draft.is_none());
+
+    // An under-floor value keeps the editor open and persists nothing.
+    handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    handle_key(&mut app, crate::testutil::key(KeyCode::Backspace));
+    handle_key(&mut app, crate::testutil::key(KeyCode::Backspace));
+    handle_key(&mut app, crate::testutil::key(KeyCode::Backspace));
+    handle_key(&mut app, crate::testutil::key(KeyCode::Char('0')));
+    handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    assert!(
+        app.plugin.herdr_tag_draft.is_some(),
+        "an invalid value stays in the editor"
+    );
+    assert_eq!(herdr_knobs().tag_watch_secs, 30, "and persists nothing");
+    handle_key(&mut app, crate::testutil::key(KeyCode::Esc));
+    assert!(app.plugin.herdr_tag_draft.is_none(), "⎋ discards the draft");
+    assert_eq!(herdr_knobs().tag_watch_secs, 30);
+}
+
+/// `border label`: space toggles the default-off knob and persists.
+#[test]
+fn herdr_border_label_toggles_and_persists() {
+    use super::{KeyCode, handle_key};
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = herdr_options_app();
+    app.plugin.herdr_options_cursor = 3;
+
+    handle_key(&mut app, crate::testutil::key(KeyCode::Char(' ')));
+    assert!(
+        herdr_knobs().border_label,
+        "space flips the default off → on"
+    );
+    handle_key(&mut app, crate::testutil::key(KeyCode::Char(' ')));
+    assert!(!herdr_knobs().border_label, "and back");
+}
+
+/// `delegate dot`: space toggles the default-on knob and persists.
+#[test]
+fn herdr_delegate_dot_toggles_and_persists() {
+    use super::{KeyCode, handle_key};
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = herdr_options_app();
+    app.plugin.herdr_options_cursor = 4;
+
+    handle_key(&mut app, crate::testutil::key(KeyCode::Char(' ')));
+    assert!(
+        !herdr_knobs().delegate_dot,
+        "space flips the default on → off"
+    );
+    handle_key(&mut app, crate::testutil::key(KeyCode::Char(' ')));
+    assert!(herdr_knobs().delegate_dot, "and back");
+}
+
+/// `delegate row text` is inert while herdr's config does not parse: space
+/// opens no modal, nothing persists, and ↑↓ still walks past the row. The
+/// other rows stay live in the same state.
+#[test]
+fn delegate_row_text_is_inert_when_herdr_config_does_not_parse() {
+    use super::{KeyCode, handle_key};
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = herdr_options_app();
+    app.plugin.herdr_config = Some(herdr_config(false, None, SidebarState::Absent));
+    app.plugin.herdr_options_cursor = 5;
+
+    handle_key(&mut app, crate::testutil::key(KeyCode::Char(' ')));
+    assert!(
+        app.modals.is_empty(),
+        "no confirm while the config does not parse"
+    );
+    assert!(!herdr_knobs().delegate_row_text);
+    handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+    assert_eq!(
+        app.plugin.herdr_options_cursor, 0,
+        "selection wraps past the inert row"
+    );
+
+    app.plugin.herdr_options_cursor = 4;
+    handle_key(&mut app, crate::testutil::key(KeyCode::Char(' ')));
+    assert!(!herdr_knobs().delegate_dot, "the other rows stay live");
+}
+
+/// A fixture whose herdr probe points at a temp config file, so the confirm
+/// flow runs heal against a path the test owns. The base config must already
+/// be written: the recompute inside reads it for the cached verdict. Checks
+/// come from the real recompute — the herdr check sits at its production
+/// index, so the post-confirm recompute inside `run_herdr_heal` leaves the
+/// cursor where it was (the real app's shape, not a one-element hand-built
+/// list that a recompute would strand on `about`).
+fn herdr_options_app_with_config(path: &std::path::Path) -> App {
+    let mut app = bare_app();
+    app.tab = super::Tab::Plugin;
+    let probe = crate::herdr::HerdrProbe {
+        version: Some("0.8.0".to_string()),
+        entry: Some(herdr_entry(true, Some("0.8.0"), vec![])),
+        config_path: Some(path.to_path_buf()),
+        error: None,
+    };
+    app.plugin.herdr = Some(Some(probe));
+    app.plugin.focus = super::PluginFocus::Detail;
+    super::recompute_plugin_checks(&mut app, false);
+    app.plugin.cursor = super::HERDR_SELECTOR_ROW;
+    app.plugin.herdr_options_cursor = 5;
+    app
+}
+
+/// Opening the confirm and canceling it: the reworded copy names the delegate
+/// token, cancel is the default selection, and esc leaves the knob unchanged
+/// and heal unrun — the config file stays byte-identical.
+#[test]
+fn delegate_row_text_confirm_copy_and_cancel_leave_everything_alone() {
+    use super::{KeyCode, Modal, handle_key};
+    let _home = crate::testutil::HomeSandbox::new();
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let config_path = tmp.path().join("herdr").join("config.toml");
+    std::fs::create_dir_all(config_path.parent().expect("parent")).expect("mkdir");
+    std::fs::write(&config_path, "# my config\n").expect("write base config");
+    let mut app = herdr_options_app_with_config(&config_path);
+
+    handle_key(&mut app, crate::testutil::key(KeyCode::Char(' ')));
+    match app.modals.last() {
+        Some(Modal::Confirm(state)) => {
+            assert_eq!(
+                state.message, "add the delegate token to herdr's sidebar row?",
+                "the copy says what the confirm will write"
+            );
+            assert!(
+                state
+                    .detail
+                    .as_deref()
+                    .unwrap_or("")
+                    .contains("$clauth_delegate"),
+                "the detail names the delegate token: {:?}",
+                state.detail
+            );
+            assert!(!state.choice, "cancel is the default selection");
+        }
+        other => panic!("expected the confirm modal, got {other:?}"),
+    }
+
+    handle_key(&mut app, crate::testutil::key(KeyCode::Esc));
+    assert!(app.modals.is_empty(), "esc cancels the confirm");
+    assert!(!herdr_knobs().delegate_row_text, "the knob stays off");
+    assert_eq!(
+        std::fs::read_to_string(&config_path).expect("read config"),
+        "# my config\n",
+        "cancel runs no heal — the config is byte-identical"
+    );
+}
+
+/// Write a POSIX shim named `name` whose body runs after the shebang, chmod
+/// +x, and return its path — the shape the mcp herdr-report pins use, because
+/// `herdr_bin()` resolves HERDR_BIN_PATH at call time.
+#[cfg(unix)]
+fn write_shim(dir: &std::path::Path, name: &str, body: &str) -> std::path::PathBuf {
+    use std::os::unix::fs::PermissionsExt as _;
+    let path = dir.join(name);
+    std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).expect("write shim");
+    let mut perms = std::fs::metadata(&path).expect("stat shim").permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&path, perms).expect("chmod shim");
+    path
+}
+
+/// RAII pin for `HERDR_BIN_PATH`, restored on drop (even on panic). Borrows
+/// the [`crate::testutil::HomeSandbox`]: the env is a process-global
+/// serialized by `HOME_TEST_LOCK`, which the sandbox holds.
+#[cfg(unix)]
+struct HerdrBinPin<'a> {
+    prev: Option<std::ffi::OsString>,
+    _home: std::marker::PhantomData<&'a crate::testutil::HomeSandbox>,
+}
+
+#[cfg(unix)]
+impl<'a> HerdrBinPin<'a> {
+    #[expect(
+        unsafe_code,
+        reason = "env mutation is unsafe in Rust 2024; serialized by HOME_TEST_LOCK, held by the borrowed sandbox"
+    )]
+    fn new(_home: &'a crate::testutil::HomeSandbox, bin: &std::path::Path) -> Self {
+        let prev = std::env::var_os("HERDR_BIN_PATH");
+        unsafe { std::env::set_var("HERDR_BIN_PATH", bin) };
+        Self {
+            prev,
+            _home: std::marker::PhantomData,
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for HerdrBinPin<'_> {
+    #[expect(
+        unsafe_code,
+        reason = "env mutation is unsafe in Rust 2024; serialized by HOME_TEST_LOCK, restored on drop"
+    )]
+    fn drop(&mut self) {
+        unsafe {
+            match &self.prev {
+                Some(v) => std::env::set_var("HERDR_BIN_PATH", v),
+                None => std::env::remove_var("HERDR_BIN_PATH"),
+            }
+        }
+    }
+}
+
+/// Confirming flips the knob on, persists it FIRST, then runs heal with the
+/// new value: herdr's config gains the delegate-token row and the user's own
+/// content survives. The heal invocation is pinned through a shim standing in
+/// as HERDR_BIN_PATH — `herdr config check` runs twice (before + after the
+/// write), and the write only lands once both accept.
+#[cfg(unix)]
+#[test]
+fn delegate_row_text_confirm_persists_the_knob_then_heals() {
+    use super::{KeyCode, Modal, handle_key};
+    let home = crate::testutil::HomeSandbox::new();
+    let tmp = tempfile::tempdir_in(home.home()).expect("tempdir");
+    let config_path = tmp.path().join("herdr").join("config.toml");
+    std::fs::create_dir_all(config_path.parent().expect("parent")).expect("mkdir");
+    std::fs::write(&config_path, "# my config\n").expect("write base config");
+    let mut app = herdr_options_app_with_config(&config_path);
+    let shim = write_shim(
+        tmp.path(),
+        "herdr-shim",
+        "echo \"$@\" >> \"$(dirname \"$0\")/heal.log\"",
+    );
+    let _bin = HerdrBinPin::new(&home, &shim);
+
+    handle_key(&mut app, crate::testutil::key(KeyCode::Char(' ')));
+    assert!(
+        matches!(app.modals.last(), Some(Modal::Confirm(_))),
+        "space opens the confirm"
+    );
+    handle_key(&mut app, crate::testutil::key(KeyCode::Right));
+    handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+
+    assert!(
+        herdr_knobs().delegate_row_text,
+        "confirm persists the knob through the real save path"
+    );
+    let text = std::fs::read_to_string(&config_path).expect("read config");
+    assert!(
+        text.starts_with("# my config\n"),
+        "the user's own content survives the heal: {text}"
+    );
+    assert!(
+        text.contains("$clauth_delegate"),
+        "heal wrote the row the new knob asks for: {text}"
+    );
+    assert_eq!(
+        text.matches("rows_by_agent").count(),
+        1,
+        "exactly one sidebar row: {text}"
+    );
+    let log = std::fs::read_to_string(tmp.path().join("heal.log")).expect("shim log");
+    assert_eq!(
+        log.lines().filter(|l| *l == "config check").count(),
+        2,
+        "heal validates before and after the write: {log}"
+    );
+}
+
+/// The same flow back: with the knob on, confirming drops the delegate token
+/// from the row clauth wrote — the direction-aware copy names the write.
+#[cfg(unix)]
+#[test]
+fn delegate_row_text_confirm_turns_the_knob_back_off() {
+    use super::{KeyCode, Modal, handle_key};
+    let home = crate::testutil::HomeSandbox::new();
+    let tmp = tempfile::tempdir_in(home.home()).expect("tempdir");
+    let config_path = tmp.path().join("herdr").join("config.toml");
+    std::fs::create_dir_all(config_path.parent().expect("parent")).expect("mkdir");
+    std::fs::write(&config_path, "# my config\n").expect("write base config");
+    let mut app = herdr_options_app_with_config(&config_path);
+    let shim = write_shim(
+        tmp.path(),
+        "herdr-shim",
+        "echo \"$@\" >> \"$(dirname \"$0\")/heal.log\"",
+    );
+    let _bin = HerdrBinPin::new(&home, &shim);
+
+    // First turn it on, the way the test above pins it.
+    handle_key(&mut app, crate::testutil::key(KeyCode::Char(' ')));
+    handle_key(&mut app, crate::testutil::key(KeyCode::Right));
+    handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    assert!(herdr_knobs().delegate_row_text);
+
+    // Now the off direction: the copy names what it will write out.
+    handle_key(&mut app, crate::testutil::key(KeyCode::Char(' ')));
+    match app.modals.last() {
+        Some(Modal::Confirm(state)) => {
+            assert_eq!(
+                state.message, "drop the delegate token from herdr's sidebar row?",
+                "the off-direction copy says what it writes"
+            );
+        }
+        other => panic!("expected the confirm modal, got {other:?}"),
+    }
+    handle_key(&mut app, crate::testutil::key(KeyCode::Right));
+    handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+
+    assert!(!herdr_knobs().delegate_row_text, "the knob turns back off");
+    let text = std::fs::read_to_string(&config_path).expect("read config");
+    assert!(
+        !text.contains("$clauth_delegate"),
+        "heal rewrote the row without the token: {text}"
+    );
+    assert!(
+        text.contains("$clauth"),
+        "the row itself stays, minus the delegate token: {text}"
+    );
+}
+
 // ── herdr mode landing ───────────────────────────────────────────────────────
 
 /// `with_herdr_mode(true)` lands on the Plugin tab with the herdr selector

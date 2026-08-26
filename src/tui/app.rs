@@ -40,10 +40,10 @@ use crate::lock::with_state_lock;
 use crate::lockorder::{RankedGuard, RankedMutex};
 use crate::oauth;
 use crate::profile::{
-    AppConfig, ClockFormat, ConfigHandle, ConsoleSite, DivergenceChoice, MAX_REFRESH_INTERVAL_MS,
-    MAX_WEEKLY_SWITCH_PCT, MIN_REFRESH_INTERVAL_MS, MIN_WEEKLY_SWITCH_PCT, ModelSettings, Profile,
-    ReloadFingerprint, ResetDisplay, ThemeName, load_config, reload_fingerprint, save_app_state,
-    save_profile,
+    AppConfig, ClockFormat, ConfigHandle, ConsoleSite, DivergenceChoice, HerdrSettings,
+    MAX_REFRESH_INTERVAL_MS, MAX_WEEKLY_SWITCH_PCT, MIN_REFRESH_INTERVAL_MS, MIN_WEEKLY_SWITCH_PCT,
+    ModelSettings, PopupWidth, Profile, ReloadFingerprint, ResetDisplay, ThemeName, load_config,
+    reload_fingerprint, save_app_state, save_profile,
 };
 use crate::status::{self, Incident, StatusEvent};
 use crate::tui::theme;
@@ -532,6 +532,10 @@ pub(crate) enum ConfirmAction {
     Acknowledge,
     /// Plugin tab: run `crate::herdr::heal` on the named config file.
     HealHerdrConfig(std::path::PathBuf),
+    /// Plugin tab herdr options: flip the `delegate row text` knob, persist it,
+    /// then heal herdr's config so the sidebar row matches the new knob. The
+    /// heal is what the confirm gates — it rewrites herdr's own file.
+    HerdrDelegateRowText(std::path::PathBuf),
     /// Plugin tab: install the clauth plugin through agentgear at user scope.
     /// A write into CC's plugin registry (driven via the `claude` CLI), so it
     /// keeps the confirm modal like every other mutating fix.
@@ -1320,6 +1324,19 @@ pub(crate) struct PluginState {
     /// who re-derives it and misses by half. What binds is the order: single-
     /// digit ms in release, roughly ten times that in debug.
     pub(crate) delegates: Vec<crate::mcp::jobs::StoredJob>,
+    /// Cursor over the herdr detail's options rows ([`HERDR_OPTIONS`]). The
+    /// herdr detail is the one detail pane that takes per-row focus: while it
+    /// is descended, ↑↓ walks these rows instead of scrolling the prose.
+    pub(crate) herdr_options_cursor: usize,
+    /// Typed editor for the `tag refresh` stepper — the Config-tab
+    /// refresh-interval editor's shape. `None` = not editing.
+    pub(crate) herdr_tag_draft: Option<InputState>,
+    /// The herdr config verdict from the last recompute (a cheap file re-read
+    /// that rides the per-tick refresh), cached so the render and the key
+    /// handler never re-read the file per frame. `None` = unreadable or no
+    /// config path. The options section reads it to decide whether the
+    /// `delegate row text` row can write.
+    pub(crate) herdr_config: Option<crate::herdr::ConfigStatus>,
 }
 
 /// Selector index the `herdr` check occupies once it renders: `about`,
@@ -1343,6 +1360,9 @@ impl Default for PluginState {
             mcp_boot: None,
             herdr: None,
             delegates: Vec::new(),
+            herdr_options_cursor: 0,
+            herdr_tag_draft: None,
+            herdr_config: None,
         }
     }
 }
@@ -1361,6 +1381,43 @@ impl PluginState {
     /// The fix offered by the row under the cursor, if any.
     pub(crate) fn selected_fix(&self) -> Option<&PluginFix> {
         self.selected_check().and_then(|check| check.fix.as_ref())
+    }
+}
+
+/// One editable row in the herdr detail's options section, in tab order. The
+/// values live in `AppState.herdr` (profiles.toml) and persist immediately on
+/// every change — there is no separate save step.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HerdrOption {
+    PopupWidth,
+    PaneTag,
+    TagRefresh,
+    BorderLabel,
+    DelegateDot,
+    DelegateRowText,
+}
+
+/// The options section's row order — also the ↑↓ walk order.
+pub(crate) const HERDR_OPTIONS: [HerdrOption; 6] = [
+    HerdrOption::PopupWidth,
+    HerdrOption::PaneTag,
+    HerdrOption::TagRefresh,
+    HerdrOption::BorderLabel,
+    HerdrOption::DelegateDot,
+    HerdrOption::DelegateRowText,
+];
+
+impl HerdrOption {
+    /// The form-row label, lowercase per the contract.
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::PopupWidth => "popup width",
+            Self::PaneTag => "pane tag",
+            Self::TagRefresh => "tag refresh",
+            Self::BorderLabel => "border label",
+            Self::DelegateDot => "delegate dot",
+            Self::DelegateRowText => "delegate row text",
+        }
     }
 }
 
@@ -2660,6 +2717,13 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) {
         return;
     }
 
+    // And the Plugin-tab herdr tag-refresh editor (same capture shape: typing
+    // owns the keyboard so digits can't trip global shortcuts).
+    if app.tab == Tab::Plugin && app.plugin.herdr_tag_draft.is_some() {
+        handle_herdr_tag_edit_key(app, key);
+        return;
+    }
+
     // Esc/q abandon an in-flight login (the detached worker's result is
     // discarded by the generation guard). Catching q here keeps it symmetric
     // with esc — otherwise q would ascend out of the Setup form (orphaning the
@@ -2983,6 +3047,9 @@ fn switch_tab(app: &mut App, tab: Tab) {
             app.plugin.focus = PluginFocus::List;
             app.plugin.cursor = 0;
             app.plugin.detail_scroll = 0;
+            // Leaving the tab abandons an open tag editor the same way the
+            // Config tab abandons its drafts.
+            app.plugin.herdr_tag_draft = None;
             // Recompute on focus; the cached `claude --version` is not re-probed.
             recompute_plugin_checks(app, false);
         }
@@ -3074,7 +3141,8 @@ fn trigger_status_refresh(app: &mut App) {
 
 /// Plugin tab keymap. List focus: ↑↓ moves the cursor (wrapping over both
 /// groups), ⏎ descends to the detail pane, `f` applies the selected row's fix.
-/// Detail focus: ↑↓ scrolls (clamped by the render pass); `f` still fixes.
+/// Detail focus: the herdr detail walks its focusable options rows, every
+/// other detail scrolls (clamped by the render pass); `f` still fixes.
 fn handle_plugin_key(app: &mut App, key: KeyEvent) {
     match app.plugin.focus {
         PluginFocus::List => {
@@ -3096,19 +3164,31 @@ fn handle_plugin_key(app: &mut App, key: KeyEvent) {
                 _ => {}
             }
         }
-        PluginFocus::Detail => match key.code {
-            KeyCode::Up => {
-                // Clamp before stepping — see the Status detail pane's ↑ arm.
-                let max = app.plugin.detail_max_scroll.get();
-                app.plugin.detail_scroll = app.plugin.detail_scroll.min(max).saturating_sub(1);
+        PluginFocus::Detail => {
+            if app
+                .plugin
+                .selected_check()
+                .is_some_and(|c| c.label == "herdr")
+            {
+                handle_herdr_options_key(app, key);
+            } else {
+                match key.code {
+                    KeyCode::Up => {
+                        // Clamp before stepping — see the Status detail pane's ↑ arm.
+                        let max = app.plugin.detail_max_scroll.get();
+                        app.plugin.detail_scroll =
+                            app.plugin.detail_scroll.min(max).saturating_sub(1);
+                    }
+                    KeyCode::Down => {
+                        let max = app.plugin.detail_max_scroll.get();
+                        app.plugin.detail_scroll =
+                            app.plugin.detail_scroll.saturating_add(1).min(max);
+                    }
+                    KeyCode::Char('f') => apply_plugin_fix(app),
+                    _ => {}
+                }
             }
-            KeyCode::Down => {
-                let max = app.plugin.detail_max_scroll.get();
-                app.plugin.detail_scroll = app.plugin.detail_scroll.saturating_add(1).min(max);
-            }
-            KeyCode::Char('f') => apply_plugin_fix(app),
-            _ => {}
-        },
+        }
     }
 }
 
@@ -3170,6 +3250,178 @@ fn apply_plugin_fix(app: &mut App) {
             }));
         }
     }
+}
+
+/// The herdr detail's options keymap: ↑↓ walks the six rows (wrapping), space
+/// and ⏎ activate the focused row, `+`/`-` step the tag-refresh stepper, `f`
+/// still applies the check's fix. Only the herdr detail routes here — every
+/// other detail keeps the scroll-only keymap.
+fn handle_herdr_options_key(app: &mut App, key: KeyEvent) {
+    let cursor = app.plugin.herdr_options_cursor;
+    let rows = HERDR_OPTIONS.len();
+    match key.code {
+        KeyCode::Up => app.plugin.herdr_options_cursor = (cursor + rows - 1) % rows,
+        KeyCode::Down => app.plugin.herdr_options_cursor = (cursor + 1) % rows,
+        KeyCode::Char('f') => apply_plugin_fix(app),
+        KeyCode::Enter | KeyCode::Char(' ') => activate_herdr_option(app, HERDR_OPTIONS[cursor]),
+        KeyCode::Char('+') => step_herdr_tag_refresh(app, 1),
+        KeyCode::Char('-') => step_herdr_tag_refresh(app, -1),
+        _ => {}
+    }
+}
+
+/// Apply space/⏎ to the focused options row: cycle, toggle, open the tag
+/// editor, or confirm the delegate-row rewrite. Every change persists
+/// immediately through `save_app_state` (the `cycle_theme` shape).
+fn activate_herdr_option(app: &mut App, row: HerdrOption) {
+    match row {
+        HerdrOption::PopupWidth => cycle_herdr_popup_width(app),
+        HerdrOption::PaneTag => toggle_herdr_bool(app, |h| h.pane_tag = !h.pane_tag),
+        HerdrOption::TagRefresh => begin_herdr_tag_edit(app),
+        HerdrOption::BorderLabel => toggle_herdr_bool(app, |h| h.border_label = !h.border_label),
+        HerdrOption::DelegateDot => toggle_herdr_bool(app, |h| h.delegate_dot = !h.delegate_dot),
+        // Inert while herdr's config does not read+parse: the write this row
+        // triggers goes through the parse, so offering it there is a promise
+        // the heal cannot keep. The render draws the row faint with the reason.
+        HerdrOption::DelegateRowText => {
+            if herdr_config_writable(app) {
+                open_herdr_row_text_confirm(app);
+            }
+        }
+    }
+}
+
+/// True while the herdr config behind the options section reads AND parses —
+/// the states where `heal` can actually rewrite the file. `None` (unreadable /
+/// no config path) and `parsed == false` both read as not writable. Shared by
+/// the key handler and the render so the inert row and the no-op key agree.
+pub(crate) fn herdr_config_writable(app: &App) -> bool {
+    app.plugin.herdr_config.as_ref().is_some_and(|c| c.parsed)
+}
+
+/// `+`/`-` on the tag-refresh stepper: ±1 second, floored at 1. A no-op on
+/// every other row.
+fn step_herdr_tag_refresh(app: &mut App, delta: i64) {
+    if HERDR_OPTIONS[app.plugin.herdr_options_cursor] != HerdrOption::TagRefresh {
+        return;
+    }
+    {
+        let mut cfg = app.config();
+        let cur = cfg.state.herdr.tag_watch_secs;
+        cfg.state.herdr.tag_watch_secs = if delta > 0 {
+            cur.saturating_add(1)
+        } else {
+            cur.saturating_sub(1).max(1)
+        };
+        let _ = save_app_state(&cfg.state);
+    }
+    app.last_reload_fp = reload_fingerprint();
+}
+
+/// Flip one herdr bool knob and persist immediately (the `cycle_theme` save
+/// shape — no separate save step).
+fn toggle_herdr_bool(app: &mut App, flip: impl FnOnce(&mut HerdrSettings)) {
+    {
+        let mut cfg = app.config();
+        flip(&mut cfg.state.herdr);
+        let _ = save_app_state(&cfg.state);
+    }
+    app.last_reload_fp = reload_fingerprint();
+}
+
+/// Advance the popup-width knob to the next mode, wrapping past `half` back to
+/// `fit` — space always cycles forward, never clamps.
+fn cycle_herdr_popup_width(app: &mut App) {
+    {
+        let mut cfg = app.config();
+        cfg.state.herdr.popup_width = match cfg.state.herdr.popup_width {
+            PopupWidth::Fit => PopupWidth::Full,
+            PopupWidth::Full => PopupWidth::Half,
+            PopupWidth::Half => PopupWidth::Fit,
+        };
+        let _ = save_app_state(&cfg.state);
+    }
+    app.last_reload_fp = reload_fingerprint();
+}
+
+/// Open the inline typed editor for the tag-refresh stepper, seeded with the
+/// current value in whole seconds. ⏎ commits, ⎋ discards — the Config-tab
+/// refresh-interval editor's mechanism.
+fn begin_herdr_tag_edit(app: &mut App) {
+    let secs = app.config().state.herdr.tag_watch_secs;
+    app.plugin.herdr_tag_draft = Some(InputState::new(&secs.to_string()));
+}
+
+/// Keystrokes while the herdr tag-refresh editor is open: ⏎ saves, ⎋ discards.
+fn handle_herdr_tag_edit_key(app: &mut App, key: KeyEvent) {
+    match key.code {
+        KeyCode::Esc => app.plugin.herdr_tag_draft = None,
+        KeyCode::Enter => commit_herdr_tag_edit(app),
+        _ => {
+            if let Some(input) = app.plugin.herdr_tag_draft.as_mut() {
+                apply_input_edit(input, key);
+            }
+        }
+    }
+}
+
+/// Parse and persist the typed tag-refresh seconds. A value under 1s keeps the
+/// draft open so the inline Invalid-input treatment stays on screen — no toast.
+fn commit_herdr_tag_edit(app: &mut App) {
+    let Some(raw) = app.plugin.herdr_tag_draft.as_ref().map(|i| i.trimmed()) else {
+        return;
+    };
+    let Some(secs) = parse_herdr_tag_secs(raw) else {
+        return;
+    };
+    {
+        let mut cfg = app.config();
+        cfg.state.herdr.tag_watch_secs = secs;
+        let _ = save_app_state(&cfg.state);
+    }
+    app.last_reload_fp = reload_fingerprint();
+    app.plugin.herdr_tag_draft = None;
+}
+
+/// A typed tag-refresh value is valid only as a whole number of seconds, at
+/// least 1 — shared by the commit path and the render's inline check.
+pub(crate) fn parse_herdr_tag_secs(raw: &str) -> Option<u64> {
+    let secs = raw.parse::<u64>().ok()?;
+    (secs >= 1).then_some(secs)
+}
+
+/// Open the confirm before flipping `delegate row text`: the flip rewrites
+/// herdr's own config (the row `clauth herdr install` appended), so it carries
+/// the same confirm gate as the `[f]` heal. The copy names the delegate token
+/// so the confirm says what it will write; cancel is the default choice.
+fn open_herdr_row_text_confirm(app: &mut App) {
+    let Some(path) = app
+        .plugin
+        .herdr
+        .as_ref()
+        .and_then(|probe| probe.as_ref())
+        .and_then(|probe| probe.config_path.clone())
+    else {
+        return;
+    };
+    let turning_on = !app.config().state.herdr.delegate_row_text;
+    app.disarm_quit();
+    app.modals.push(Modal::Confirm(ConfirmState {
+        message: if turning_on {
+            "add the delegate token to herdr's sidebar row?".to_string()
+        } else {
+            "drop the delegate token from herdr's sidebar row?".to_string()
+        },
+        detail: Some(if turning_on {
+            "writes $clauth_delegate into the row clauth added in herdr's config.toml, validated by `herdr config check`; a hand-owned row is left alone with a note."
+                .to_string()
+        } else {
+            "rewrites the row clauth added in herdr's config.toml without $clauth_delegate, validated by `herdr config check`; a hand-owned row is left alone with a note."
+                .to_string()
+        }),
+        choice: false,
+        on_confirm: ConfirmAction::HerdrDelegateRowText(path),
+    }));
 }
 
 /// Componentwise numeric comparison of two dotted version strings. `None` when
@@ -3549,6 +3801,15 @@ fn recompute_plugin_checks(app: &mut App, refresh_version: bool) {
             .and_then(Result::ok)
             .map(|text| crate::herdr::config_status(&text));
         checks.push(herdr_check(probe, config.as_ref()));
+        // The options section reads this verdict (writable vs inert) off the
+        // cache — recompute already paid for the file read, so neither the
+        // render nor the key handler re-reads per frame.
+        app.plugin.herdr_config = config;
+    } else {
+        // No herdr row renders without a probe, so its verdict must not
+        // outlive the probe (a stale writable verdict would arm the
+        // delegate-row confirm against a file that no longer resolves).
+        app.plugin.herdr_config = None;
     }
 
     // runtime — fold every profile's live sessions / credential link / token
@@ -7776,6 +8037,40 @@ fn handle_confirm_key(app: &mut App, key: KeyEvent) {
     }
 }
 
+/// Run `crate::herdr::heal` with the knob the state now holds and surface the
+/// outcome: success, non-empty refusal notes (warning), or failure (danger).
+/// Shared by the `[f]` fix and the `delegate row text` options row — the knob
+/// rides the heal the way `install` reads it, so the row written matches the
+/// `delegate_row_text` set in the TUI.
+fn run_herdr_heal(app: &mut App, path: &std::path::Path) {
+    let delegate_row_text = app.config().state.herdr.delegate_row_text;
+    match crate::herdr::heal(
+        path,
+        crate::herdr::DEFAULT_KEY,
+        &crate::herdr::herdr_bin(),
+        delegate_row_text,
+    ) {
+        Ok(notes) if notes.is_empty() => {
+            app.toast(
+                ToastKind::Success,
+                "added the keybinding and sidebar row to herdr's config",
+            );
+            recompute_plugin_checks(app, false);
+        }
+        Ok(notes) => {
+            // Non-empty notes = pieces clauth refused to touch (a table it
+            // cannot extend by appending). Reporting success over those is a
+            // lie, so the notes surface verbatim.
+            app.toast(
+                ToastKind::Warning,
+                format!("herdr's config needs attention\n{}", notes.join("\n")),
+            );
+            recompute_plugin_checks(app, false);
+        }
+        Err(e) => app.toast(ToastKind::Danger, format!("herdr config fix failed\n{e}")),
+    }
+}
+
 fn run_confirm_action(app: &mut App, action: ConfirmAction) {
     match action {
         ConfirmAction::CaptureConflict(snapshot, from_divergence) => {
@@ -7924,35 +8219,19 @@ fn run_confirm_action(app: &mut App, action: ConfirmAction) {
             }
             Err(e) => app.toast(ToastKind::Danger, format!("relink failed\n{e}")),
         },
-        ConfirmAction::HealHerdrConfig(path) => {
-            // The knob rides the heal the way `install` reads it, so the row
-            // this fix writes matches the `delegate_row_text` set in the TUI.
-            let delegate_row_text = app.config().state.herdr.delegate_row_text;
-            match crate::herdr::heal(
-                &path,
-                crate::herdr::DEFAULT_KEY,
-                &crate::herdr::herdr_bin(),
-                delegate_row_text,
-            ) {
-                Ok(notes) if notes.is_empty() => {
-                    app.toast(
-                        ToastKind::Success,
-                        "added the keybinding and sidebar row to herdr's config",
-                    );
-                    recompute_plugin_checks(app, false);
-                }
-                Ok(notes) => {
-                    // Non-empty notes = pieces clauth refused to touch (a table it
-                    // cannot extend by appending). Reporting success over those is a
-                    // lie, so the notes surface verbatim.
-                    app.toast(
-                        ToastKind::Warning,
-                        format!("herdr's config needs attention\n{}", notes.join("\n")),
-                    );
-                    recompute_plugin_checks(app, false);
-                }
-                Err(e) => app.toast(ToastKind::Danger, format!("herdr config fix failed\n{e}")),
+        ConfirmAction::HealHerdrConfig(path) => run_herdr_heal(app, &path),
+        ConfirmAction::HerdrDelegateRowText(path) => {
+            // Persist the flipped knob FIRST: `run_herdr_heal` reads it back off
+            // the state (the way `install` reads it), so heal writes the row the
+            // user just asked for. Cancel never reaches here — the modal pops
+            // without running the action.
+            {
+                let mut cfg = app.config();
+                cfg.state.herdr.delegate_row_text = !cfg.state.herdr.delegate_row_text;
+                let _ = save_app_state(&cfg.state);
             }
+            app.last_reload_fp = reload_fingerprint();
+            run_herdr_heal(app, &path);
         }
         ConfirmAction::InstallPlugin => match crate::plugin_host::install() {
             // A no-op from a row that read "not installed" means the backend

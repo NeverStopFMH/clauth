@@ -458,6 +458,21 @@ pub(super) fn label_style(focused: bool) -> Style {
     }
 }
 
+/// Render a typed editor's buffer with uniform `BG_SUNKEN` styling (DANGER fg
+/// when invalid). The native terminal cursor — set via
+/// `frame.set_cursor_position` — owns the caret glyph, so no simulated block
+/// cursor. Shared by the chain threshold/max-spend editors, the Config-tab
+/// refresh/weekly editors, and the Plugin-tab herdr tag-refresh editor.
+pub(super) fn value_caret(input: &InputState, invalid: bool) -> Vec<Span<'static>> {
+    let body = if invalid {
+        theme::danger()
+    } else {
+        theme::body()
+    }
+    .bg(theme::bg_sunken());
+    vec![Span::styled(input.value.clone(), body)]
+}
+
 /// Rounded box with contract-compliant chrome.
 ///
 /// Border: `LINE_STRONG` when focused, `LINE` when blurred.

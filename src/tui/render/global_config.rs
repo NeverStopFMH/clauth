@@ -29,7 +29,7 @@ use super::super::app::{
 use super::super::theme::{self, Tier};
 use super::panes::{
     cycle_option, draw_scrolled_lines, head_cols, help_tooltip_lines, highlight_row,
-    invalid_tooltip_lines, key_cell, label_style, section_box,
+    invalid_tooltip_lines, key_cell, label_style, section_box, value_caret,
 };
 
 /// Width of the key column: the longest keys (`allow extra usage` /
@@ -489,19 +489,6 @@ fn refresh_edit_line(arrow: Span<'static>, input: &InputState) -> Line<'static> 
     };
     spans.push(Span::styled(" s", unit_style));
     Line::from(spans)
-}
-
-/// Render the typed buffer with uniform `BG_SUNKEN` styling (DANGER fg when
-/// invalid). The terminal cursor — set via `frame.set_cursor_position` — owns
-/// the caret glyph, matching the chain threshold editor.
-fn value_caret(input: &InputState, invalid: bool) -> Vec<Span<'static>> {
-    let body = if invalid {
-        theme::danger()
-    } else {
-        theme::body()
-    }
-    .bg(theme::bg_sunken());
-    vec![Span::styled(input.value.clone(), body)]
 }
 
 /// Sub-line under the refresh field while typing: the valid range, in DANGER

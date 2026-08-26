@@ -28,7 +28,8 @@ use super::panes::{
     DIAG_AUTH_BROKEN, DIAG_BUDGET_SPENT, DIAG_CANCELED, DIAG_DISABLED, DIAG_KICK, DIAG_STALE,
     DIAG_WEEKLY_SOFT, DIAG_WEEKLY_SPENT, bold_when, draw_selector_list, head_cols,
     help_tooltip_lines, highlight_row, invalid_tooltip_lines, key_cell, label_style, master_detail,
-    name_color, pill, rail_hint_lines, section_box, section_box_verbatim, select_line, wrap_words,
+    name_color, pill, rail_hint_lines, section_box, section_box_verbatim, select_line, value_caret,
+    wrap_words,
 };
 use crate::fallback::{
     BlockedReason, DEFAULT_THRESHOLD, blocked_reason, health_blocked_reason, soonest_resume,
@@ -1022,18 +1023,6 @@ fn detail_row(
             ])
         }
     }
-}
-
-fn value_caret(input: &InputState, invalid: bool) -> Vec<Span<'static>> {
-    // The terminal cursor (set via frame.set_cursor_position) owns the caret
-    // glyph — render the whole buffer with uniform styling.
-    let body = if invalid {
-        theme::danger()
-    } else {
-        theme::body()
-    }
-    .bg(theme::bg_sunken());
-    vec![Span::styled(input.value.clone(), body)]
 }
 
 fn add_detail(app: &App, focused: bool, width: usize) -> Vec<Line<'static>> {

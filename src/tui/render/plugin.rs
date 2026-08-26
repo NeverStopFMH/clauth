@@ -25,12 +25,20 @@ use ratatui::symbols::border;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Paragraph};
 
-use super::super::app::{App, Health, PluginFocus};
+use super::super::app::{
+    App, HERDR_OPTIONS, Health, HerdrOption, InputState, PluginFocus, herdr_config_writable,
+    parse_herdr_tag_secs,
+};
 use super::super::theme;
 use super::format::spinner_frame;
-use super::panes::{draw_scrollbar, empty_state, key_cell, master_detail, section_box};
+use super::panes::{
+    cycle_option, draw_scrollbar, draw_scrolled_lines, empty_state, head_cols, help_tooltip_lines,
+    highlight_row, invalid_tooltip_lines, key_cell, label_style, master_detail, section_box,
+    value_caret,
+};
 use crate::format::truncate;
 use crate::mcp::jobs::{self, JobPhase, RunningLiveness, StoredJob};
+use crate::profile::{HerdrSettings, PopupWidth};
 use crate::usage::humanize_duration;
 
 pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
@@ -271,6 +279,18 @@ fn draw_detail(frame: &mut Frame<'_>, area: Rect, app: &App) {
         .unwrap_or(0)
         .min(18);
     let lines: Vec<Line<'static>> = detail.iter().map(|line| detail_line(line, key_w)).collect();
+
+    // The herdr detail appends its options section and takes per-row focus;
+    // every other detail keeps the scroll-only path below.
+    if app
+        .plugin
+        .selected_check()
+        .is_some_and(|c| c.label == "herdr")
+    {
+        draw_herdr_detail(frame, inner, app, lines);
+        return;
+    }
+
     let total = lines.len();
     let viewport = inner.height as usize;
 
@@ -285,6 +305,197 @@ fn draw_detail(frame: &mut Frame<'_>, area: Rect, app: &App) {
         inner,
     );
     draw_scrollbar(frame, inner, total, scroll as usize, viewport);
+}
+
+/// The herdr detail: the read-only prose above, then an `options` section of
+/// six focusable form rows editing the `AppState.herdr` knobs. While the
+/// detail pane is descended, ↑↓ walks the rows and the whole form scrolls so
+/// the focused row (plus its tooltip) stays on screen — the form-pane
+/// `draw_scrolled_lines` shape, so the prose scrolls to follow the cursor
+/// rather than holding a manual offset. The section header underlines while
+/// focus rests on one of its rows.
+fn draw_herdr_detail(frame: &mut Frame<'_>, inner: Rect, app: &App, mut lines: Vec<Line<'static>>) {
+    let focused = app.plugin.focus == PluginFocus::Detail;
+
+    lines.push(Line::from(""));
+    let mut section_style = theme::label();
+    if focused {
+        section_style = section_style.underlined();
+    }
+    lines.push(Line::from(Span::styled("OPTIONS", section_style)));
+
+    let settings = app.config().state.herdr.clone();
+    let editing = app.plugin.herdr_tag_draft.as_ref();
+    let writable = herdr_config_writable(app);
+    // The focused row's block (row + its tooltip lines) for the scroll focus,
+    // and the native-cursor slot for the tag editor.
+    let mut focus = (0usize, 1usize);
+    let mut caret: Option<(u16, usize)> = None;
+
+    for (i, row) in HERDR_OPTIONS.iter().enumerate() {
+        let selected = focused && i == app.plugin.herdr_options_cursor;
+        let row_editing = if *row == HerdrOption::TagRefresh {
+            editing
+        } else {
+            None
+        };
+        let inert = *row == HerdrOption::DelegateRowText && !writable;
+        if selected {
+            focus.0 = lines.len();
+        }
+        let line = option_row(*row, &settings, selected, row_editing, inert);
+        match row_editing {
+            Some(input) => {
+                // The edit row renders plain (no highlight) with the edit
+                // gutter; the native terminal cursor owns the caret. x = "✎ "
+                // (2) + label + the 2-space value gap + pre-caret cols.
+                let cx = inner.x.saturating_add(
+                    (2 + row.label().chars().count() + 2 + head_cols(input)) as u16,
+                );
+                caret = Some((cx, lines.len()));
+                lines.push(line);
+                lines.extend(tag_refresh_range_tooltip(input, inner.width as usize));
+            }
+            None => {
+                lines.push(if selected {
+                    highlight_row(line, inner.width as usize)
+                } else {
+                    line
+                });
+                if selected && inert {
+                    lines.extend(help_tooltip_lines(
+                        herdr_row_text_tooltip(app),
+                        inner.width as usize,
+                    ));
+                }
+            }
+        }
+        if selected {
+            focus.1 = lines.len();
+        }
+    }
+
+    let offset = draw_scrolled_lines(frame, inner, lines, focus);
+    // A caret scrolled off the top has no cell to sit in; leaving the cursor
+    // unset is better than parking it on an unrelated row.
+    if let Some((cx, row)) = caret
+        && let Some(visible) = row
+            .checked_sub(offset)
+            .filter(|v| *v < inner.height as usize)
+    {
+        frame.set_cursor_position((cx, inner.y.saturating_add(visible as u16)));
+    }
+}
+
+/// One herdr-options form row: caret gutter + lowercase label + the row's
+/// control, the value trailing the label by a 2-space gap. Ragged rows by
+/// design — the caret and tint carry alignment, so no key column. `selected`
+/// promotes the label and brackets the cycle row's option; the caller adds
+/// the tint via `highlight_row`. `inert` (delegate row text while herdr's
+/// config cannot be rewritten) renders the whole row faint — a true disabled
+/// row.
+fn option_row(
+    row: HerdrOption,
+    settings: &HerdrSettings,
+    selected: bool,
+    editing: Option<&InputState>,
+    inert: bool,
+) -> Line<'static> {
+    let arrow = if editing.is_some() {
+        Span::styled(format!("{} ", theme::edit_glyph()), theme::accent().bold())
+    } else if selected && inert {
+        Span::styled("❯ ", theme::faint())
+    } else if selected {
+        Span::styled("❯ ", theme::accent().bold())
+    } else {
+        Span::raw("  ")
+    };
+    let key_style = if inert {
+        theme::faint()
+    } else {
+        label_style(selected)
+    };
+    let mut spans = vec![arrow, Span::styled(format!("{}  ", row.label()), key_style)];
+    match row {
+        HerdrOption::PopupWidth => {
+            let width = settings.popup_width;
+            for (i, (label, active)) in [
+                ("fit", width == PopupWidth::Fit),
+                ("full", width == PopupWidth::Full),
+                ("half", width == PopupWidth::Half),
+            ]
+            .iter()
+            .enumerate()
+            {
+                if i > 0 {
+                    spans.push(Span::raw("  "));
+                }
+                spans.push(cycle_option(label, *active, selected));
+            }
+        }
+        HerdrOption::PaneTag => spans.push(toggle_value(settings.pane_tag, inert)),
+        HerdrOption::TagRefresh => match editing {
+            Some(input) => {
+                let invalid = parse_herdr_tag_secs(input.trimmed()).is_none();
+                spans.extend(value_caret(input, invalid));
+                let unit_style = if invalid {
+                    theme::danger()
+                } else {
+                    theme::faint()
+                };
+                spans.push(Span::styled(" s", unit_style));
+            }
+            None => spans.push(Span::styled(
+                format!("{}s", settings.tag_watch_secs),
+                theme::accent(),
+            )),
+        },
+        HerdrOption::BorderLabel => spans.push(toggle_value(settings.border_label, inert)),
+        HerdrOption::DelegateDot => spans.push(toggle_value(settings.delegate_dot, inert)),
+        HerdrOption::DelegateRowText => spans.push(toggle_value(settings.delegate_row_text, inert)),
+    }
+    Line::from(spans)
+}
+
+/// A toggle row's value: the tier-dependent glyph, ACCENT when on, faint when
+/// off — and whole-faint on an inert row whatever its state.
+fn toggle_value(on: bool, inert: bool) -> Span<'static> {
+    let style = if inert || !on {
+        theme::faint()
+    } else {
+        theme::accent()
+    };
+    Span::styled(
+        if on {
+            theme::toggle_on()
+        } else {
+            theme::toggle_off()
+        },
+        style,
+    )
+}
+
+/// Sub-line under the tag-refresh field while typing: the floor, DANGER when
+/// the buffer parses under it, else faint — the Config-tab refresh editor's
+/// shape.
+fn tag_refresh_range_tooltip(input: &InputState, width: usize) -> Vec<Line<'static>> {
+    const RANGE: &str = "min is 1 s";
+    if parse_herdr_tag_secs(input.trimmed()).is_none() {
+        invalid_tooltip_lines(RANGE, width)
+    } else {
+        help_tooltip_lines(RANGE, width)
+    }
+}
+
+/// The disabled-row reason for `delegate row text`: the heal behind it writes
+/// through herdr's parse, so a config that cannot be read or parsed leaves the
+/// row nothing it can do.
+fn herdr_row_text_tooltip(app: &App) -> &'static str {
+    if app.plugin.herdr_config.as_ref().is_some_and(|c| !c.parsed) {
+        "herdr's config doesn't parse, so clauth can't rewrite the row"
+    } else {
+        "herdr's config can't be read, so clauth can't rewrite the row"
+    }
 }
 
 /// Style one detail line: the `[f] …` fix row as a hint (ACCENT-bold `[f]` key +

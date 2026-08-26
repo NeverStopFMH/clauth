@@ -793,3 +793,168 @@ fn herdr_row_renders_warn_dot_without_fix_when_config_unreadable() {
     let check = herdr_check(&healthy_probe(), None);
     assert_row(check, Health::Warn, false);
 }
+
+// ── herdr options ─────────────────────────────────────────────────────────────
+
+/// The herdr detail with its options section: the probe + config verdict the
+/// recompute caches, the check built from them, focus descended into the
+/// detail so the rows render focusable.
+fn herdr_options_app(config: ConfigStatus) -> App {
+    let mut app = App::new(AppConfig {
+        state: AppState::default(),
+        profiles: Vec::new(),
+    });
+    let probe = healthy_probe();
+    app.plugin.herdr = Some(Some(probe.clone()));
+    app.plugin.herdr_config = Some(config.clone());
+    app.plugin.checks = vec![herdr_check(&probe, Some(&config))];
+    app.plugin.cursor = 0;
+    app.plugin.focus = crate::tui::app::PluginFocus::Detail;
+    app
+}
+
+/// The six rows render their real values and glyphs on BOTH tiers — the toggle
+/// glyph is the one control the tier changes, so each tier pins its own.
+#[test]
+fn herdr_options_render_all_six_rows_on_both_tiers() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let app = herdr_options_app(healthy_config());
+    let row_with = |rows: &[String], label: &str| -> String {
+        rows.iter()
+            .find(|r| r.contains(label))
+            .unwrap_or_else(|| panic!("no `{label}` row"))
+            .clone()
+    };
+
+    let full = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let (rows, _) = render(&app);
+    let screen = rows.join("\n");
+    assert!(screen.contains("OPTIONS"), "the eyebrow renders:\n{screen}");
+    assert!(
+        row_with(&rows, "popup width").contains("popup width  [fit]  full  half"),
+        "the focused cycle row brackets its selection:\n{screen}"
+    );
+    assert!(
+        row_with(&rows, "pane tag").contains("─●"),
+        "pane tag on:\n{screen}"
+    );
+    assert!(
+        row_with(&rows, "tag refresh").contains("5s"),
+        "tag refresh default 5s:\n{screen}"
+    );
+    assert!(
+        row_with(&rows, "border label").contains("○─"),
+        "border label off:\n{screen}"
+    );
+    assert!(
+        row_with(&rows, "delegate dot").contains("─●"),
+        "delegate dot on:\n{screen}"
+    );
+    assert!(
+        row_with(&rows, "delegate row text").contains("○─"),
+        "delegate row text off:\n{screen}"
+    );
+    drop(full);
+
+    let compatible = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Compatible);
+    let (rows, _) = render(&app);
+    let screen = rows.join("\n");
+    assert!(
+        row_with(&rows, "pane tag").contains("[on]"),
+        "pane tag [on]:\n{screen}"
+    );
+    assert!(
+        row_with(&rows, "border label").contains("[off]"),
+        "border label [off]:\n{screen}"
+    );
+    assert!(
+        row_with(&rows, "delegate dot").contains("[on]"),
+        "delegate dot [on]:\n{screen}"
+    );
+    assert!(
+        row_with(&rows, "delegate row text").contains("[off]"),
+        "delegate row text [off]:\n{screen}"
+    );
+    drop(compatible);
+}
+
+/// While focus sits on the selector, the option rows render blurred: no caret,
+/// and the cycle row carries its selection by color alone (no brackets).
+#[test]
+fn herdr_options_render_blurred_when_focus_sits_on_the_selector() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = herdr_options_app(healthy_config());
+    app.plugin.focus = crate::tui::app::PluginFocus::List;
+    let (rows, _) = render(&app);
+    let screen = rows.join("\n");
+    let width_row = rows
+        .iter()
+        .find(|r| r.contains("popup width"))
+        .unwrap_or_else(|| panic!("no popup width row:\n{screen}"));
+    assert!(
+        width_row.contains("popup width  fit  full  half"),
+        "a blurred cycle row drops its brackets:\n{screen}"
+    );
+    assert!(
+        !width_row.contains('❯'),
+        "the caret renders only inside the focused pane:\n{screen}"
+    );
+}
+
+/// The `delegate row text` row renders whole-faint with a tooltip while focused
+/// when herdr's config does not parse — the one state where the write it would
+/// trigger cannot happen. The hue is pinned off the styled buffer, not the
+/// glyph text.
+#[test]
+fn delegate_row_text_renders_inert_with_tooltip_when_herdr_config_does_not_parse() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = herdr_options_app(config(false, None, SidebarState::Absent));
+    app.plugin.herdr_options_cursor = 5;
+    let (rows, buf) = render(&app);
+    let screen = rows.join("\n");
+
+    let row_idx = rows
+        .iter()
+        .position(|r| r.contains("delegate row text"))
+        .unwrap_or_else(|| panic!("no delegate row text row:\n{screen}"));
+    let row = &rows[row_idx];
+    assert!(
+        screen.contains("herdr's config doesn't parse, so clauth can't rewrite the row"),
+        "the tooltip renders under the focused inert row:\n{screen}"
+    );
+    for needle in ["❯", "delegate row text"] {
+        let byte = row
+            .find(needle)
+            .unwrap_or_else(|| panic!("no `{needle}`:\n{row}"));
+        let col = row[..byte].chars().count();
+        assert_eq!(
+            buf.content[row_idx * W as usize + col].fg,
+            super::theme::text_faint_color(),
+            "`{needle}` renders faint on the inert row:\n{screen}"
+        );
+    }
+}
+
+/// The tag-refresh editor renders the edit gutter, the sunken buffer with its
+/// unit, and the range sub-line — the Config-tab refresh editor's shape.
+#[test]
+fn herdr_tag_refresh_editor_renders_the_edit_state() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = herdr_options_app(healthy_config());
+    app.plugin.herdr_options_cursor = 2;
+    app.plugin.herdr_tag_draft = Some(crate::tui::app::InputState::new("5"));
+    let (rows, _) = render(&app);
+    let screen = rows.join("\n");
+    let tag_row = rows
+        .iter()
+        .find(|r| r.contains("tag refresh"))
+        .unwrap_or_else(|| panic!("no tag refresh row:\n{screen}"));
+    assert!(
+        tag_row.contains("✎ tag refresh  5 s"),
+        "the edit gutter + buffer + unit render:\n{screen}"
+    );
+    assert!(
+        screen.contains("min is 1 s"),
+        "the range sub-line renders while typing:\n{screen}"
+    );
+}

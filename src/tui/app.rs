@@ -3347,10 +3347,12 @@ fn toggle_herdr_bool(app: &mut App, flip: impl FnOnce(&mut HerdrSettings)) {
 /// TUI cannot hot-patch), and `tag_refresh` belongs to watchers that already
 /// hold their own interval, so both keep their current behavior.
 ///
-/// Gated on the TUI really running inside herdr (`HERDR_ENV=1` plus the
-/// injected binary and plugin-root paths): a standalone TUI has no panes to
-/// reach and behaves exactly as before. Best-effort — a failure anywhere is
-/// silent, and the next tick still lands the change.
+/// Gated on the plugin-pane environment (`HERDR_ENV=1` plus the injected
+/// binary and plugin-root paths): no herdr command exposes the plugin root,
+/// so this gate is the only channel, and a bare `clauth` TUI inside a herdr
+/// pane silently skips the push too. Best-effort — a failure anywhere is
+/// silent, and the change still lands with the next report (a watcher tick,
+/// or the next agent-event hook for panes without one).
 fn push_herdr_knob_change() {
     if std::env::var("HERDR_ENV").as_deref() != Ok("1") {
         return;
@@ -3397,8 +3399,8 @@ fn herdr_pane_ids(bin: &str) -> Option<Vec<String>> {
 
 /// Re-run `report-profile.sh` for one pane with the pane id set and the
 /// event/context JSON cleared — the exact `watch-profile.sh` invocation. The
-/// script's pidfile gate makes a duplicate watcher spawn impossible, so
-/// re-running it alongside the live watchers is safe.
+/// script's pidfile gate skips the watcher spawn while a live watch exists,
+/// so re-running it alongside the live watchers is safe.
 fn rerun_pane_report(script: &str, pane: &str) {
     let _ = crate::herdr::bounded_output(
         script,

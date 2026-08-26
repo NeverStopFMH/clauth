@@ -12,7 +12,7 @@ clauth herdr install
 
 One command for the whole setup. It runs herdr's own installer, passing herdr's preview of every command the plugin would run as you straight through, then adds the two things a herdr plugin cannot declare for itself: the key that opens the dashboard, and the sidebar row that renders the pane tag. Both land in your herdr `config.toml`, appended after a diff and a `[y/N]`, and herdr validates the result before anything is written.
 
-Run it a second time and it adds nothing. Run it from a clauth checkout and it links the local `herdr-plugin/` directory instead of fetching the published one, so an edit is live on the next open.
+Run it a second time and it adds nothing. `--key` picks the keybinding, and a re-run with a new key re-binds an existing clauth binding to it; the Plugin tab's heal keeps the installed key instead. Run it from a clauth checkout and it links the local `herdr-plugin/` directory instead of fetching the published one, so an edit is live on the next open.
 
 | Flag | Effect |
 |------|--------|
@@ -86,16 +86,16 @@ A clauth TUI opened inside a herdr pane (`HERDR_ENV=1`) adds one thing: the head
 
 ## Herdr options
 
-Six knobs tune the plugin. They live in the dashboard's Plugin tab: select `herdr`, press <kbd>⏎</kbd>, and an `options` section at the bottom of the detail lists them as form rows. They persist in `~/.clauth/profiles.toml` under `[herdr]`, never in herdr's own `config.toml`. The plugin scripts read them through `clauth herdr config get <key>`, which prints one line (`fit`, `on`, `off`, or a count).
+Six knobs tune the plugin. They live in the dashboard's Plugin tab: select `herdr`, press <kbd>⏎</kbd>, and an `options` section at the bottom of the detail lists them as form rows. They persist in `~/.clauth/profiles.toml` under `[herdr]`, never in herdr's own `config.toml`. The plugin scripts read them through `clauth herdr config get <key>`, which prints one line (`fit`, `on`, `off`, or a count). Knob changes apply immediately: moving `pane tag` or `border label` re-reports every pane at once (from the plugin-pane launch only; a standalone TUI has no panes to reach, and a bare pane lacks the plugin root).
 
 | Knob | Default | What it does |
 |------|---------|--------------|
-| `popup width` | `fit` | how wide `clauth.open` makes the popup: `fit` sizes it against the focused pane (full width up to 540 columns, then a centered 540), `full` takes the whole pane area, `half` is herdr's default half-size. If the snapshot herdr serves cannot be read, the popup opens without sizing flags, which is herdr's default |
-| `pane tag` | on | publish the `clauth=$profile` token |
+| `popup width` | `fit` | the placement `clauth.open` uses: `fit` opens a popup sized against the focused pane (full width up to 540 columns, then a centered 540), `half` is herdr's default half-size popup, `split-right` opens a real pane right of the focused one, `split-top` opens a real pane directly above it (a downward split of the pane above; no pane above splits the focused pane instead). `full` folded into `fit`, so a saved `full` loads as `fit`. If the snapshot herdr serves cannot be read, the popup opens without sizing flags |
+| `pane tag` | on | publish the `clauth=$profile` token; off clears the token on every pane |
 | `tag refresh` | 5 | seconds between the per-pane watcher's re-publishes |
-| `border label` | off | publish `--display-agent "$profile"` so split-pane borders name the account |
+| `border label` | off | publish `--display-agent "$profile"` so split-pane borders name the account; off clears the stale label |
 | `delegate dot` | on | the `clauth mcp` server reports `clauth_delegate=working\|idle` during delegate runs; off disables the reporting entirely |
-| `delegate row text` | off | the sidebar row `install` writes gains the `$clauth_delegate` token, so a running delegate reads as text beside the row; toggling it in the TUI rewrites only the blocks clauth itself wrote, behind a confirm that defaults to cancel |
+| `delegate row text` | off | the sidebar row `install` writes gains the `$clauth_delegate` token, so a running delegate reads as text beside the row; toggling it in the TUI rewrites only the blocks clauth itself wrote (a block you edited by hand is kept whole), behind a confirm that defaults to cancel |
 
 The options render whether the TUI runs inside herdr or standalone. herdr mode differs only in the header tag and the landing tab.
 

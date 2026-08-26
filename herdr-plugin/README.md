@@ -51,6 +51,6 @@ claude = [["state_icon", "workspace", "tab"], ["terminal_title_stripped"], ["age
 | File | Role |
 |------|------|
 | `herdr-plugin.toml` | Manifest: one popup entrypoint, two actions, two event hooks |
-| `open-pane.sh` | Opens an entrypoint at the width the `popup_width` knob picks, treating "popup already open" as a no-op |
+| `open-pane.sh` | Opens an entrypoint in the placement the `popup_width` knob picks; "popup already open" is a no-op for the popup placements only |
 | `report-profile.sh` | Resolves the account a pane burns and publishes it as pane metadata |
 | `watch-profile.sh` | Per-pane watcher re-publishing the account on a timer |

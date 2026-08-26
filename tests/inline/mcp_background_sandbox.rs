@@ -24,6 +24,12 @@ fn detached_task_still_running_at_teardown_never_touches_the_real_home() {
     let profile = format!("clauth-f1-leak-probe-{}", std::process::id());
     let home = HomeSandbox::new();
 
+    // Resolved while `HOME_TEST_LOCK` is still held, when no other test's env
+    // pin can be live. `FakeClaude` pins `$HOME`, which `dirs::home_dir()`
+    // reads first: resolving after `drop(home)` could read a concurrent
+    // test's sandbox home and false-green the probe.
+    let real_home = dirs::home_dir().expect("resolve real home for the probe");
+
     // Arm the gate only after `home` holds `HOME_TEST_LOCK`: a single global
     // slot shared by every test, so arming it earlier could gate some other
     // test's unrelated background task instead of this one.
@@ -74,9 +80,8 @@ fn detached_task_still_running_at_teardown_never_touches_the_real_home() {
     drop(home);
     releaser.join().expect("releaser thread joins");
 
-    // The real, OS-resolved home — bypassing any test override, which may
-    // legitimately belong to a different, unrelated concurrent test by now.
-    let real_home = dirs::home_dir().expect("resolve real home for the probe");
+    // `real_home` was captured at the top while the lock was held, so it is
+    // the OS-resolved home by construction.
     let real_job_path = real_home
         .join(".clauth")
         .join("jobs")

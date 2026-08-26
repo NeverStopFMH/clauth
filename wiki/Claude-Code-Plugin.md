@@ -6,7 +6,7 @@ clauth ships an MCP server that hands your profiles to a live Claude Code sessio
 
 Open the TUI's Plugin tab, move to the `plugin` row, and press <kbd>f</kbd>. Confirming the prompt installs the plugin at user scope through Claude Code's own installer. If a broken registration ever trips it, the plugin repairs itself: its `SessionStart` hook runs `clauth self-heal`, which reinstalls a registered-but-broken install and leaves a deliberate uninstall alone.
 
-Installed through the old `/plugin marketplace add uwuclxdy/clauth` flow? That marketplace fetched a manifest file the repo no longer ships, so after the next clauth update the self-heal update call fails against it. Move to the one-key install once: run `claude plugin marketplace remove clauth`, then <kbd>f</kbd> on the Plugin tab's `plugin` row.
+Installed through the old `/plugin marketplace add uwuclxdy/clauth` flow? That registration migrates itself: the marketplace it fetched points at a manifest file the repo no longer ships, so `clauth start` (or the plugin's `SessionStart` hook on a bare `claude` session) re-points it at the locally materialized plugin tree on the next launch. Nothing to do by hand.
 
 Claude Code launches `clauth mcp` in the background for the session's lifetime. `clauth` has to be on `PATH`, which it is after any standard install.
 

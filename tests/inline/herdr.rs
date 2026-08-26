@@ -639,6 +639,39 @@ fn a_user_key_glued_to_a_marked_block_survives_the_resync() {
     );
 }
 
+/// A user line INTERRUPTING clauth's block (a comment or key between the
+/// block's own lines) makes the whole block user-owned: the strip must keep
+/// the header and every line, or the resync write strands the tail lines
+/// under a table whose header was consumed.
+#[test]
+fn a_user_line_inside_a_marked_block_keeps_the_whole_block() {
+    let orig = "# my config\n[ui]\naccent = \"cyan\"\n";
+    let plan = plan_config(orig, "prefix+a", false).expect("plan");
+    let wired = with_append(orig, &plan.append);
+    // Interrupt the keys block: a comment between key and type.
+    let interrupted = wired.replace(
+        "key = \"prefix+a\"\ntype = \"plugin_action\"",
+        "key = \"prefix+a\"\n# pinned by hand\ntype = \"plugin_action\"",
+    );
+    let (text, _, _) = resync_text(&interrupted, "prefix+a", false).expect("resync");
+    toml::from_str::<toml::Value>(&text).expect("the rewritten config parses");
+    // The discriminator that matters: the whole interrupted block survives
+    // under its own header. A strip that removes the header while keeping the
+    // tail strands `type`/`command`/`description` under `[ui]` — this
+    // sequence check catches that, a parse check alone does not.
+    assert!(
+        text.contains(
+            "[[keys.command]]\nkey = \"prefix+a\"\n# pinned by hand\ntype = \"plugin_action\""
+        ),
+        "the interrupted block stays intact under its header: {text}"
+    );
+    assert_eq!(
+        text.matches("[[keys.command]]").count(),
+        1,
+        "the interrupted block is not duplicated: {text}"
+    );
+}
+
 /// `install`'s no-op branch: the verdict skips the write only when the resync
 /// reconstructs the file byte for byte. Pinned both ways, since the branch
 /// lives where a TTY and herdr's installer keep tests out.
@@ -704,6 +737,46 @@ fn a_hung_herdr_bounds_the_probe_at_the_timeout() {
     assert!(
         start.elapsed() < std::time::Duration::from_secs(5),
         "the probe is bounded, not the shim's full sleep"
+    );
+}
+
+/// A failing `api snapshot` must not abort the open under `set -e`: the
+/// snapshot's failure falls through to the plain call, and the shim's log
+/// proves the open attempt ran (the abort path exits before any attempt).
+#[test]
+fn a_failing_snapshot_still_attempts_the_open() {
+    let home = crate::testutil::HomeSandbox::new();
+    let herdr_shim = write_shim(
+        home.home(),
+        "herdr",
+        "echo \"$@\" >> \"$(dirname \"$0\")/open.log\"; exit 1",
+    );
+    write_shim(home.home(), "clauth", "echo fit");
+    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/herdr-plugin/open-pane.sh");
+    let out = std::process::Command::new("sh")
+        .arg(path)
+        .arg("tui")
+        .env("HERDR_BIN_PATH", &herdr_shim)
+        .env("HERDR_PLUGIN_ID", "clauth")
+        .env(
+            "PATH",
+            format!(
+                "{}:{}",
+                home.home().display(),
+                std::env::var("PATH").unwrap_or_default()
+            ),
+        )
+        .output()
+        .expect("script runs");
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "the open fails with the shim's exit, not the snapshot's abort"
+    );
+    let log = std::fs::read_to_string(home.home().join("open.log")).unwrap_or_default();
+    assert!(
+        log.contains("--entrypoint tui"),
+        "the open attempt ran after the failed snapshot: {log}"
     );
 }
 

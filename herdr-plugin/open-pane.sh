@@ -41,8 +41,9 @@ case "$width_mode" in
         # layout rows put `pane_id` right before `rect`). Matching the pane
         # by id keeps the greedy prefix from landing on another tab's focused
         # row. A failed read leaves the flags off entirely, the pre-knob call
-        # shape.
-        snap=$("$herdr_bin" api snapshot 2>/dev/null)
+        # shape: the `|| snap=''` keeps a failing snapshot from aborting the
+        # whole open under `set -e`.
+        snap=$("$herdr_bin" api snapshot 2>/dev/null) || snap=''
         focused=$(printf '%s' "$snap" | sed -n 's/.*"focused_pane_id":"\([^"]*\)".*/\1/p')
         width=$(printf '%s' "$snap" |
             sed -n "s/.*\"pane_id\":\"$focused\",\"rect\":{\"height\":[0-9]*,\"width\":\([0-9]*\).*/\1/p")

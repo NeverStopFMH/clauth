@@ -12,6 +12,7 @@
 //! otherwise disable on load. The real write lands in place rather than through
 //! a rename, so the file keeps the mode and inode herdr's config already has.
 
+use std::ffi::OsStr;
 use std::io::{IsTerminal as _, Read as _};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
@@ -299,12 +300,12 @@ pub(crate) fn probe() -> Option<HerdrProbe> {
 /// (`herdr_report.rs`); `probe()` runs its three calls sequentially, so the
 /// worst case is three times this bound. A child that floods its own pipe
 /// before the deadline is killed with it, same as one that never exits.
-/// `run_quiet` deliberately stays unbounded: it drives `plugin install` and
-/// friends, which can fetch over the network, and it only ever runs on the
-/// interactive CLI path where the user watches the stall.
+/// `run_quiet` deliberately stays unbounded: its caller is `plugin link`, a
+/// local registry write; the network-fetching `plugin install` runs through
+/// `run` with inherited stdio, where the user watches any stall.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 
-fn bounded_output(bin: &str, args: &[&str], envs: &[(&str, String)]) -> Option<Output> {
+fn bounded_output(bin: &str, args: &[&str], envs: &[(&str, &OsStr)]) -> Option<Output> {
     let mut cmd = Command::new(bin);
     cmd.args(args)
         .stdin(Stdio::null())
@@ -778,21 +779,30 @@ fn without_marked_blocks(existing: &str) -> String {
 /// at the first line outside this vocab, so a user key glued directly to the
 /// block's last line (no blank separator, still valid TOML in the same table)
 /// survives the resync instead of being eaten with the block.
-fn is_block_line(lead: &str) -> bool {
-    [
-        "key = ",
-        "type = ",
-        "command = ",
-        "description = ",
-        "claude = ",
-    ]
-    .iter()
-    .any(|p| lead.starts_with(p))
+/// A marked block's own table lines, keyed on which table the header names.
+/// The split matters: a `claude = ` glued to the keys block's end is a user
+/// key in `[[keys.command]]`, not the sidebar row, and the union vocab would
+/// eat it.
+fn is_block_line(header: &str, lead: &str) -> bool {
+    if header.contains("rows_by_agent") {
+        lead.starts_with("claude = ")
+    } else {
+        ["key = ", "type = ", "command = ", "description = "]
+            .iter()
+            .any(|p| lead.starts_with(p))
+    }
 }
 
 fn strip_marked_blocks(existing: &str) -> (String, Vec<String>) {
     let mut out: Vec<String> = Vec::new();
     let mut removed: Vec<String> = Vec::new();
+    // The block being skipped: marker + header + table lines, buffered rather
+    // than committed line by line, because a line clauth did not write turns
+    // the whole block user-owned and it must be restored, header included.
+    // Committing early strands the tail lines under a table whose header was
+    // already removed.
+    let mut block: Vec<String> = Vec::new();
+    let mut header: Option<String> = None;
     let mut skipping = false;
     let mut lines = existing.split_inclusive('\n').peekable();
 
@@ -803,15 +813,16 @@ fn strip_marked_blocks(existing: &str) -> (String, Vec<String>) {
         if skipping {
             if lead.is_empty() || lead.starts_with('[') {
                 skipping = false;
+                removed.extend(stripped(&mut block));
                 out.push(raw.to_string());
-            } else if is_block_line(lead) {
-                removed.push(content.to_string());
+            } else if is_block_line(header.as_deref().unwrap_or(""), lead) {
+                block.push(raw.to_string());
             } else {
-                // A line clauth did not write, glued to the block's end: end
-                // the block here and keep the line. `text != existing` then
-                // still fires (the block was stripped), and the write removes
-                // clauth's blocks without touching the user's line.
+                // A line clauth did not write: the block is user-owned, so
+                // the strip keeps everything it would have removed. The plan
+                // then sees the binding as hand-owned and re-adds nothing.
                 skipping = false;
+                out.append(&mut block);
                 out.push(raw.to_string());
             }
             continue;
@@ -819,29 +830,47 @@ fn strip_marked_blocks(existing: &str) -> (String, Vec<String>) {
 
         if lead.starts_with(MARKER) {
             // Pop the blank install prepends only when a real block follows, so
-            // a standalone marker keeps the line above it too.
+            // a standalone marker keeps the line above it too. The popped blank
+            // joins the buffer: an interrupted block restores it with the rest.
             if lines
                 .peek()
                 .is_some_and(|next| next.trim_start().starts_with('['))
                 && out.last().is_some_and(|last| last.trim().is_empty())
                 && let Some(blank) = out.pop()
             {
-                removed.push(blank.strip_suffix('\n').unwrap_or(&blank).to_string());
+                block.push(blank);
             }
-            removed.push(content.to_string());
+            block.push(raw.to_string());
             // `next_if` leaves a non-`[` line for the normal path rather than
             // consuming it as a header.
-            if let Some(header) = lines.next_if(|next| next.trim_start().starts_with('[')) {
-                removed.push(header.strip_suffix('\n').unwrap_or(header).to_string());
+            if let Some(h) = lines.next_if(|next| next.trim_start().starts_with('[')) {
+                header = Some(h.strip_suffix('\n').unwrap_or(h).to_string());
+                block.push(h.to_string());
                 skipping = true;
+            } else {
+                // A standalone marker: clauth's marker, nothing below it.
+                removed.extend(stripped(&mut block));
             }
             continue;
         }
 
         out.push(raw.to_string());
     }
+    // A block running to the file's end is clauth's: no interruption.
+    if skipping {
+        removed.extend(stripped(&mut block));
+    }
 
     (out.concat(), removed)
+}
+
+/// The display list's shape: one entry per line, newlines stripped. `out`
+/// keeps raw lines (the newlines are the file), `removed` is what the diffs
+/// print.
+fn stripped(block: &mut Vec<String>) -> impl Iterator<Item = String> + '_ {
+    block
+        .drain(..)
+        .map(|l| l.strip_suffix('\n').unwrap_or(&l).to_string())
 }
 
 pub(crate) fn uninstall(no_config: bool, yes: bool) -> Result<()> {
@@ -1001,7 +1030,7 @@ fn check_config(bin: &str, probe: &Path, text: &str) -> Result<Vec<String>> {
     let out = bounded_output(
         bin,
         &["config", "check"],
-        &[("HERDR_CONFIG_PATH", probe.to_string_lossy().into_owned())],
+        &[("HERDR_CONFIG_PATH", probe.as_os_str())],
     )
     .with_context(|| format!("`{bin} config check` timed out or could not run"))?;
     if out.status.success() {

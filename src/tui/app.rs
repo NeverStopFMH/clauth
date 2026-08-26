@@ -3278,9 +3278,15 @@ fn handle_herdr_options_key(app: &mut App, key: KeyEvent) {
 fn activate_herdr_option(app: &mut App, row: HerdrOption) {
     match row {
         HerdrOption::PopupWidth => cycle_herdr_popup_width(app),
-        HerdrOption::PaneTag => toggle_herdr_bool(app, |h| h.pane_tag = !h.pane_tag),
+        HerdrOption::PaneTag => {
+            toggle_herdr_bool(app, |h| h.pane_tag = !h.pane_tag);
+            push_herdr_knob_change();
+        }
         HerdrOption::TagRefresh => begin_herdr_tag_edit(app),
-        HerdrOption::BorderLabel => toggle_herdr_bool(app, |h| h.border_label = !h.border_label),
+        HerdrOption::BorderLabel => {
+            toggle_herdr_bool(app, |h| h.border_label = !h.border_label);
+            push_herdr_knob_change();
+        }
         HerdrOption::DelegateDot => toggle_herdr_bool(app, |h| h.delegate_dot = !h.delegate_dot),
         // Inert while herdr's config does not read+parse: the write this row
         // triggers goes through the parse, so offering it there is a promise
@@ -3329,6 +3335,80 @@ fn toggle_herdr_bool(app: &mut App, flip: impl FnOnce(&mut HerdrSettings)) {
         let _ = save_app_state(&cfg.state);
     }
     app.last_reload_fp = reload_fingerprint();
+}
+
+/// Push a `pane_tag`/`border_label` change onto the live herdr panes right
+/// now, instead of letting it sit until the next watcher tick
+/// (`tag_watch_secs` away, 5 s by default): re-run `report-profile.sh` once
+/// per pane, the way `watch-profile.sh` re-runs it. The off direction clears
+/// its artifact through the same re-run, so it no longer waits for the tick
+/// either. Only the two knobs that script reads trigger this —
+/// `delegate_dot`'s gate lives in the MCP server process (a separate binary a
+/// TUI cannot hot-patch), and `tag_refresh` belongs to watchers that already
+/// hold their own interval, so both keep their current behavior.
+///
+/// Gated on the TUI really running inside herdr (`HERDR_ENV=1` plus the
+/// injected binary and plugin-root paths): a standalone TUI has no panes to
+/// reach and behaves exactly as before. Best-effort — a failure anywhere is
+/// silent, and the next tick still lands the change.
+fn push_herdr_knob_change() {
+    if std::env::var("HERDR_ENV").as_deref() != Ok("1") {
+        return;
+    }
+    let Ok(bin) = std::env::var("HERDR_BIN_PATH") else {
+        return;
+    };
+    let Ok(root) = std::env::var("HERDR_PLUGIN_ROOT") else {
+        return;
+    };
+    let script = std::path::PathBuf::from(&root)
+        .join("report-profile.sh")
+        .to_string_lossy()
+        .into_owned();
+    spawn_worker(move || {
+        let Some(panes) = herdr_pane_ids(&bin) else {
+            return;
+        };
+        for pane in panes {
+            rerun_pane_report(&script, &pane);
+        }
+    });
+}
+
+/// `bin pane list` → pane ids, parsed leniently: an unknown payload shape (a
+/// herdr release moving a field) reads as no panes rather than a wrong one.
+/// Bounded at `crate::herdr::PROBE_TIMEOUT` — a hung herdr delays the push
+/// worker, never the key handling.
+fn herdr_pane_ids(bin: &str) -> Option<Vec<String>> {
+    let out = crate::herdr::bounded_output(bin, &["pane", "list"], &[])?;
+    if !out.status.success() {
+        return None;
+    }
+    let root: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&out.stdout)).ok()?;
+    let panes = root.get("result")?.get("panes")?.as_array()?;
+    Some(
+        panes
+            .iter()
+            .filter_map(|pane| pane.get("pane_id")?.as_str().map(str::to_string))
+            .collect(),
+    )
+}
+
+/// Re-run `report-profile.sh` for one pane with the pane id set and the
+/// event/context JSON cleared — the exact `watch-profile.sh` invocation. The
+/// script's pidfile gate makes a duplicate watcher spawn impossible, so
+/// re-running it alongside the live watchers is safe.
+fn rerun_pane_report(script: &str, pane: &str) {
+    let _ = crate::herdr::bounded_output(
+        script,
+        &[],
+        &[
+            ("HERDR_PANE_ID", std::ffi::OsStr::new(pane)),
+            ("HERDR_PLUGIN_EVENT_JSON", std::ffi::OsStr::new("")),
+            ("HERDR_PLUGIN_CONTEXT_JSON", std::ffi::OsStr::new("")),
+        ],
+    );
 }
 
 /// Advance the popup-width knob to the next mode, wrapping past `half` back to

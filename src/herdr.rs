@@ -294,18 +294,19 @@ pub(crate) fn probe() -> Option<HerdrProbe> {
 }
 
 /// Bounds one herdr subprocess on the probe path (construction in herdr mode,
-/// `r` refreshes) and on the validated-write path (`check_config`): a hung
-/// herdr must delay the caller, never hang the first paint or a heal behind
-/// an open modal. Same kill-on-deadline shape as the pane reporter's `report`
+/// `r` refreshes), on the validated-write path (`check_config`), and on the
+/// TUI's knob push (`crate::tui::app::push_herdr_knob_change`): a hung herdr must
+/// delay the caller, never hang the first paint or a heal behind an open
+/// modal. Same kill-on-deadline shape as the pane reporter's `report`
 /// (`herdr_report.rs`); `probe()` runs its three calls sequentially, so the
 /// worst case is three times this bound. A child that floods its own pipe
 /// before the deadline is killed with it, same as one that never exits.
 /// `run_quiet` deliberately stays unbounded: its caller is `plugin link`, a
 /// local registry write; the network-fetching `plugin install` runs through
 /// `run` with inherited stdio, where the user watches any stall.
-const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+pub(crate) const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 
-fn bounded_output(bin: &str, args: &[&str], envs: &[(&str, &OsStr)]) -> Option<Output> {
+pub(crate) fn bounded_output(bin: &str, args: &[&str], envs: &[(&str, &OsStr)]) -> Option<Output> {
     let mut cmd = Command::new(bin);
     cmd.args(args)
         .stdin(Stdio::null())

@@ -8280,11 +8280,15 @@ fn herdr_popup_width_cycles_and_persists() {
 }
 
 /// `pane tag`: space toggles the knob and persists through the real save/load
-/// path.
+/// path. The toggle fires the knob push, so the herdr runtime env is pinned
+/// (HERDR_ENV dropped, the paths pointed into the sandbox): an ambient herdr
+/// environment must never make this test re-report the live panes.
 #[test]
 fn herdr_pane_tag_toggles_and_persists() {
     use super::{KeyCode, handle_key};
-    let _home = crate::testutil::HomeSandbox::new();
+    let home = crate::testutil::HomeSandbox::new();
+    let tmp = tempfile::tempdir_in(home.home()).expect("tempdir");
+    let _env = HerdrRuntimePin::new(&home, &tmp.path().join("herdr"), tmp.path(), false);
     let mut app = herdr_options_app();
     app.plugin.herdr_options_cursor = 1;
     let space = crate::testutil::key(KeyCode::Char(' '));
@@ -8344,11 +8348,16 @@ fn herdr_tag_refresh_steps_types_and_persists() {
     assert_eq!(herdr_knobs().tag_watch_secs, 30);
 }
 
-/// `border label`: space toggles the default-off knob and persists.
+/// `border label`: space toggles the default-off knob and persists. The
+/// toggle fires the knob push, so the herdr runtime env is pinned (HERDR_ENV
+/// dropped, the paths pointed into the sandbox): an ambient herdr environment
+/// must never make this test re-report the live panes.
 #[test]
 fn herdr_border_label_toggles_and_persists() {
     use super::{KeyCode, handle_key};
-    let _home = crate::testutil::HomeSandbox::new();
+    let home = crate::testutil::HomeSandbox::new();
+    let tmp = tempfile::tempdir_in(home.home()).expect("tempdir");
+    let _env = HerdrRuntimePin::new(&home, &tmp.path().join("herdr"), tmp.path(), false);
     let mut app = herdr_options_app();
     app.plugin.herdr_options_cursor = 3;
 
@@ -8359,6 +8368,92 @@ fn herdr_border_label_toggles_and_persists() {
     );
     handle_key(&mut app, crate::testutil::key(KeyCode::Char(' ')));
     assert!(!herdr_knobs().border_label, "and back");
+}
+
+/// Toggling a knob `report-profile.sh` reads pushes the change onto every
+/// live pane in the same key press: `herdr pane list` enumerates the panes
+/// once, then each pane gets one re-run of the reporter with its pane id set
+/// and the event/context JSON cleared — the `watch-profile.sh` invocation.
+/// The stale event/context values the pin plants in the process env prove the
+/// clearing is explicit, not inherited luck.
+#[cfg(unix)]
+#[test]
+fn herdr_border_label_toggle_reruns_the_pane_report_per_pane() {
+    use super::{KeyCode, handle_key};
+    let home = crate::testutil::HomeSandbox::new();
+    let tmp = tempfile::tempdir_in(home.home()).expect("tempdir");
+    let herdr_shim = write_shim(
+        tmp.path(),
+        "herdr",
+        "printf '%s\\n' \"$*\" >> \"$(dirname \"$0\")/herdr.log\"\nprintf '%s\\n' '{\"id\":\"cli:pane:list\",\"result\":{\"panes\":[{\"pane_id\":\"pane-a\"},{\"pane_id\":\"pane-b\"}]}}'",
+    );
+    let _report_shim = write_shim(
+        tmp.path(),
+        "report-profile.sh",
+        "set -u\nprintf 'pane=%s event=%s context=%s\\n' \"$HERDR_PANE_ID\" \"$HERDR_PLUGIN_EVENT_JSON\" \"$HERDR_PLUGIN_CONTEXT_JSON\" >> \"$(dirname \"$0\")/report.log\"",
+    );
+    let _env = HerdrRuntimePin::new(&home, &herdr_shim, tmp.path(), true);
+    let mut app = herdr_options_app();
+    app.plugin.herdr_options_cursor = 3;
+
+    handle_key(&mut app, crate::testutil::key(KeyCode::Char(' ')));
+    assert!(
+        herdr_knobs().border_label,
+        "space flips the default off → on"
+    );
+    super::join_test_workers();
+
+    let herdr_log = std::fs::read_to_string(tmp.path().join("herdr.log")).expect("herdr log");
+    assert_eq!(
+        herdr_log, "pane list\n",
+        "the only herdr call is the pane enumeration"
+    );
+    let report_log = std::fs::read_to_string(tmp.path().join("report.log")).expect("report log");
+    assert_eq!(
+        report_log, "pane=pane-a event= context=\npane=pane-b event= context=\n",
+        "one re-report per listed pane, its pane id set and the event/context JSON cleared"
+    );
+}
+
+/// The same toggle with no `HERDR_ENV` — a standalone TUI has no panes to
+/// reach — spawns nothing at all: the shims' logs never appear even though
+/// the binary and plugin-root paths are pinned. The knob itself still
+/// toggles and persists.
+#[cfg(unix)]
+#[test]
+fn herdr_border_label_toggle_spawns_nothing_outside_herdr() {
+    use super::{KeyCode, handle_key};
+    let home = crate::testutil::HomeSandbox::new();
+    let tmp = tempfile::tempdir_in(home.home()).expect("tempdir");
+    let herdr_shim = write_shim(
+        tmp.path(),
+        "herdr",
+        "printf '%s\\n' \"$*\" >> \"$(dirname \"$0\")/herdr.log\"\nprintf '%s\\n' '{\"id\":\"cli:pane:list\",\"result\":{\"panes\":[{\"pane_id\":\"pane-a\"},{\"pane_id\":\"pane-b\"}]}}'",
+    );
+    let _report_shim = write_shim(
+        tmp.path(),
+        "report-profile.sh",
+        "set -u\nprintf 'pane=%s event=%s context=%s\\n' \"$HERDR_PANE_ID\" \"$HERDR_PLUGIN_EVENT_JSON\" \"$HERDR_PLUGIN_CONTEXT_JSON\" >> \"$(dirname \"$0\")/report.log\"",
+    );
+    let _env = HerdrRuntimePin::new(&home, &herdr_shim, tmp.path(), false);
+    let mut app = herdr_options_app();
+    app.plugin.herdr_options_cursor = 3;
+
+    handle_key(&mut app, crate::testutil::key(KeyCode::Char(' ')));
+    assert!(
+        herdr_knobs().border_label,
+        "the knob still flips and persists standalone"
+    );
+    super::join_test_workers();
+
+    assert!(
+        !tmp.path().join("herdr.log").exists(),
+        "no pane enumeration ran"
+    );
+    assert!(
+        !tmp.path().join("report.log").exists(),
+        "no pane re-report ran"
+    );
 }
 
 /// `delegate dot`: space toggles the default-on knob and persists.
@@ -8524,6 +8619,80 @@ impl Drop for HerdrBinPin<'_> {
             match &self.prev {
                 Some(v) => std::env::set_var("HERDR_BIN_PATH", v),
                 None => std::env::remove_var("HERDR_BIN_PATH"),
+            }
+        }
+    }
+}
+
+/// RAII pin for the vars the knob push reads (`HERDR_ENV`, `HERDR_BIN_PATH`,
+/// `HERDR_PLUGIN_ROOT`) plus stale event/context values the per-pane re-run
+/// must NOT inherit — the push clears them, so a child carrying "stale-event"
+/// reds the pin. With `herdr_env: false` only `HERDR_ENV` is removed: the
+/// other vars stay pinned to prove the gate, not a missing path, is what
+/// suppresses the spawn. Restored on drop (even on panic). Same contract as
+/// [`HerdrBinPin`]: process-global env, serialized by `HOME_TEST_LOCK`, which
+/// the borrowed sandbox holds.
+struct HerdrRuntimePin<'a> {
+    prevs: Vec<(&'static str, Option<std::ffi::OsString>)>,
+    _home: std::marker::PhantomData<&'a crate::testutil::HomeSandbox>,
+}
+
+impl<'a> HerdrRuntimePin<'a> {
+    #[expect(
+        unsafe_code,
+        reason = "env mutation is unsafe in Rust 2024; serialized by HOME_TEST_LOCK, held by the borrowed sandbox"
+    )]
+    fn new(
+        _home: &'a crate::testutil::HomeSandbox,
+        bin: &std::path::Path,
+        plugin_root: &std::path::Path,
+        herdr_env: bool,
+    ) -> Self {
+        let mut prevs = Vec::new();
+        for (key, value) in [
+            ("HERDR_ENV", herdr_env.then_some("1".to_string())),
+            (
+                "HERDR_BIN_PATH",
+                Some(bin.as_os_str().to_string_lossy().into_owned()),
+            ),
+            (
+                "HERDR_PLUGIN_ROOT",
+                Some(plugin_root.as_os_str().to_string_lossy().into_owned()),
+            ),
+            ("HERDR_PLUGIN_EVENT_JSON", Some("stale-event".to_string())),
+            (
+                "HERDR_PLUGIN_CONTEXT_JSON",
+                Some("stale-context".to_string()),
+            ),
+        ] {
+            let prev = std::env::var_os(key);
+            unsafe {
+                match &value {
+                    Some(v) => std::env::set_var(key, v),
+                    None => std::env::remove_var(key),
+                }
+            }
+            prevs.push((key, prev));
+        }
+        Self {
+            prevs,
+            _home: std::marker::PhantomData,
+        }
+    }
+}
+
+impl Drop for HerdrRuntimePin<'_> {
+    #[expect(
+        unsafe_code,
+        reason = "env mutation is unsafe in Rust 2024; serialized by HOME_TEST_LOCK, restored on drop"
+    )]
+    fn drop(&mut self) {
+        for (key, prev) in self.prevs.iter().rev() {
+            unsafe {
+                match prev {
+                    Some(v) => std::env::set_var(key, v),
+                    None => std::env::remove_var(key),
+                }
             }
         }
     }

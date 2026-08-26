@@ -1287,17 +1287,19 @@ pub(crate) struct PluginState {
     pub(crate) error: Option<String>,
     pub(crate) checks: Vec<Check>,
     /// Cached `claude --version`: `None` = unprobed, `Some(None)` = probed and
-    /// missing/unparseable, `Some(Some(v))` = the version string. Re-probed only
-    /// on an explicit `r` so a tab switch never re-spawns the subprocess.
+    /// missing/unparseable, `Some(Some(v))` = the version string. Probed only
+    /// on an explicit `r` — construction and a tab switch never spawn the
+    /// subprocess, so the first paint never blocks on it.
     pub(crate) cc_version: Option<Option<String>>,
     /// Cached `clauth mcp` discovery handshake: `None` = unprobed. Re-probed only
     /// on `r` (heavier than the others — it boots the real server), never on a tab
     /// switch or the per-tick refresh.
     pub(crate) mcp_boot: Option<crate::plugin_probe::McpProbe>,
     /// Cached herdr probe: `None` = unprobed, `Some(None)` = herdr does not
-    /// resolve (no row), `Some(Some(p))` = the probe. Re-probed only on `r`; it
-    /// spawns three subprocesses, so a tab switch and the per-tick refresh reuse
-    /// the cached value.
+    /// resolve (no row), `Some(Some(p))` = the probe. Probed at construction in
+    /// herdr mode (`HERDR_ENV=1` proves herdr is present) and re-probed on `r`;
+    /// it spawns three subprocesses, so a tab switch and the per-tick refresh
+    /// reuse the cached value.
     pub(crate) herdr: Option<Option<crate::herdr::HerdrProbe>>,
     /// The `clauth mcp` job store as of the last refresh, newest first: what the
     /// delegates pane draws. Re-read on the same cadence as the checks, because
@@ -1322,8 +1324,8 @@ pub(crate) struct PluginState {
 
 /// Selector index the `herdr` check occupies once it renders: `about`,
 /// `mcp servers`, `plugin`, `herdr`, `runtime`. The landing row in herdr mode;
-/// until the `r`-gated probe has resolved (or when herdr does not), the same
-/// index rests on `runtime`, the last row — the cursor clamp in
+/// when the construction probe does not resolve herdr, the same index rests
+/// on `runtime`, the last row — the cursor clamp in
 /// `recompute_plugin_checks` keeps it valid either way.
 const HERDR_SELECTOR_ROW: usize = 3;
 
@@ -1986,17 +1988,26 @@ impl App {
     }
 
     /// herdr-mode landing, applied at construction (before the first paint):
-    /// the Plugin tab with the herdr selector row under the cursor. Runs the
-    /// same recompute a manual tab switch runs, so the first paint shows the
-    /// checks instead of an empty selector; the cursor clamp inside it keeps
-    /// the landing row valid whether or not the `r`-gated herdr probe has
-    /// resolved yet. Nothing else changes — no key handling, no focus
-    /// stealing after construction.
+    /// the Plugin tab with the herdr selector row under the cursor. The herdr
+    /// probe runs here too — `HERDR_ENV=1` proves herdr is present, and it is
+    /// three fast subprocesses — so the landing row is real at first paint
+    /// instead of waiting for `r`; the cursor clamp inside the recompute
+    /// below keeps the landing row valid when herdr does not resolve. The
+    /// `claude --version` probe stays `r`-gated: construction must not block
+    /// the first paint on a spawn. Nothing else changes — no key handling, no
+    /// focus stealing after construction.
     pub(crate) fn with_herdr_mode(mut self, herdr_mode: bool) -> Self {
         self.herdr_mode = herdr_mode;
         if herdr_mode {
             self.tab = Tab::Plugin;
             self.plugin.cursor = HERDR_SELECTOR_ROW;
+            // Skipped under test (a spawned probe would read the real
+            // registry); the landing test injects the probe instead.
+            self.plugin.herdr = Some(if cfg!(test) {
+                None
+            } else {
+                crate::herdr::probe()
+            });
             recompute_plugin_checks(&mut self, false);
         }
         self
@@ -3303,9 +3314,11 @@ fn recompute_plugin_checks(app: &mut App, refresh_version: bool) {
 
     app.plugin.error = None;
 
-    // CC version is cached; a tab switch reuses it, only `r` re-probes. Skipped
-    // under test so the suite never spawns the real `claude` binary.
-    if refresh_version || app.plugin.cc_version.is_none() {
+    // CC version is cached; only `r` probes. Construction and a tab switch
+    // leave it unprobed rather than spawning `claude --version` synchronously
+    // — construction must not block the first paint. Skipped under test so
+    // the suite never spawns the real `claude` binary.
+    if refresh_version {
         app.plugin.fetching = true;
         app.plugin.cc_version = Some(if cfg!(test) {
             None
@@ -3314,7 +3327,6 @@ fn recompute_plugin_checks(app: &mut App, refresh_version: bool) {
         });
         app.plugin.fetching = false;
     }
-    let cc_version = app.plugin.cc_version.clone().flatten();
 
     let mut checks: Vec<Check> = Vec::with_capacity(4);
 
@@ -3338,19 +3350,25 @@ fn recompute_plugin_checks(app: &mut App, refresh_version: bool) {
             about_detail.push("install clauth so its bin directory is on PATH".to_string());
         }
     }
-    match &cc_version {
-        Some(version) => about_detail.push(format!("claude: {version}")),
-        None => {
+    match &app.plugin.cc_version {
+        Some(Some(version)) => about_detail.push(format!("claude: {version}")),
+        Some(None) => {
             about_detail.push("claude: not found".to_string());
             about_detail.push("claude --version failed or claude is not on PATH".to_string());
             about_detail.push("install claude code so the claude binary resolves".to_string());
         }
+        // Unprobed is not missing: the probe is `r`-gated, so before the first
+        // `r` the row names the key that fills the line in instead of claiming
+        // a binary is absent.
+        None => about_detail.push("claude: press r to probe".to_string()),
     }
     checks.push(Check {
         label: "about",
         health: if clauth_path.is_none() {
             Health::Danger
-        } else if cc_version.is_none() {
+        } else if matches!(app.plugin.cc_version, Some(None)) {
+            // Probed and missing is the only version verdict that warns; an
+            // unprobed version is not evidence of anything.
             Health::Warn
         } else {
             Health::Ok

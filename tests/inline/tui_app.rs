@@ -8224,9 +8224,12 @@ fn herdr_prose_lines_are_indented_so_they_do_not_read_as_fields() {
 
 /// `with_herdr_mode(true)` lands on the Plugin tab with the herdr selector
 /// row under the cursor, checks already recomputed so the first paint is not
-/// empty. Until the `r`-gated probe resolves, the same cursor index rests on
-/// `runtime` (the last row); once the probe is injected, the cursor is on
-/// `herdr` itself — the clamp, not a magic index, keeps both valid.
+/// empty. Construction probes herdr right away — `HERDR_ENV=1` proves herdr
+/// is present — so on a real run the row is there at first paint; the probe
+/// is skipped under test (it would read the real registry), and the
+/// injected-probe half below pins the landed cursor. The `claude --version`
+/// probe stays `r`-gated: construction must not block the first paint on a
+/// spawn.
 #[test]
 fn herdr_mode_lands_on_the_plugin_tab_with_the_herdr_row_selected() {
     let _home = crate::testutil::HomeSandbox::new();
@@ -8238,6 +8241,14 @@ fn herdr_mode_lands_on_the_plugin_tab_with_the_herdr_row_selected() {
         matches!(app.plugin.focus, super::PluginFocus::List),
         "the landing must not steal focus into the detail pane"
     );
+    assert!(
+        matches!(app.plugin.herdr, Some(None)),
+        "construction ran the probe (skipped under test, standing in as no herdr)"
+    );
+    assert!(
+        app.plugin.cc_version.is_none(),
+        "construction must not spawn `claude --version`; the probe stays `r`-gated"
+    );
     let labels: Vec<&str> = app.plugin.checks.iter().map(|c| c.label).collect();
     assert_eq!(
         labels,
@@ -8248,11 +8259,25 @@ fn herdr_mode_lands_on_the_plugin_tab_with_the_herdr_row_selected() {
     assert_eq!(
         app.plugin.selected_check().map(|c| c.label),
         Some("runtime"),
-        "with the probe unresolved the same index rests on the last row"
+        "with no herdr resolved the same index rests on the last row"
+    );
+    // Unprobed must read as unprobed, never as a missing binary.
+    let about = &app.plugin.checks[0];
+    assert_eq!(about.label, "about");
+    assert!(
+        about.detail.iter().any(|l| l == "claude: press r to probe"),
+        "the about row invites the `r` probe: {:?}",
+        about.detail
+    );
+    assert!(
+        !about.detail.iter().any(|l| l == "claude: not found"),
+        "an unprobed version must not claim claude is missing: {:?}",
+        about.detail
     );
 
-    // The probe resolves (a real run answers it on `r`): the herdr row inserts
-    // at the landing index and the cursor is on it without any key handling.
+    // The probe resolves (a real construction runs it, `r` re-runs it): the
+    // herdr row inserts at the landing index and the cursor is on it without
+    // any key handling.
     app.plugin.herdr = Some(Some(healthy_herdr_probe()));
     super::recompute_plugin_checks(&mut app, false);
     assert_eq!(app.plugin.cursor, 3);
@@ -8260,6 +8285,13 @@ fn herdr_mode_lands_on_the_plugin_tab_with_the_herdr_row_selected() {
         app.plugin.selected_check().map(|c| c.label),
         Some("herdr"),
         "the landing row is the herdr check once it renders"
+    );
+
+    // `r` is still the only thing that probes the version.
+    super::recompute_plugin_checks(&mut app, true);
+    assert!(
+        app.plugin.cc_version.is_some(),
+        "`r` runs the version probe"
     );
 }
 

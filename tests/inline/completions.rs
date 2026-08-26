@@ -134,6 +134,52 @@ fn every_shell_completes_login_setup_token_flag() {
     }
 }
 
+/// `clauth herdr install` is the only herdr subcommand whose flags the
+/// scripts offer, so the flag branch must track it: after `clauth herdr
+/// config get <key>` clap refuses `--key --no-config --yes`, and the scripts
+/// must not complete what clap rejects.
+#[test]
+fn herdr_flags_are_offered_only_under_install() {
+    let cases = [
+        (
+            BASH,
+            r#""${COMP_WORDS[1]}" = "herdr" ] && [ "${COMP_WORDS[2]}" = "install" ]"#,
+        ),
+        (ZSH, r#""${words[2]}" == herdr && "${words[3]}" == install"#),
+        (
+            FISH,
+            "__fish_seen_subcommand_from herdr; and __fish_seen_subcommand_from install\" -a --key",
+        ),
+    ];
+    for (script, branch) in cases {
+        for flag in ["--key", "--no-config", "--yes"] {
+            assert!(script.contains(flag), "script must offer {flag}");
+        }
+        assert!(
+            script.contains(branch),
+            "the herdr flag offer must be gated to `install`, missing {branch:?}",
+        );
+    }
+    // The arm that follows `config get` completes knob names, never the
+    // install flags above.
+    assert!(
+        BASH.contains(
+            r#"compgen -W "popup_width pane_tag tag_watch_secs border_label delegate_dot delegate_row_text""#
+        ),
+        "bash's `config get` arm offers the knobs and nothing else"
+    );
+    // The subcommand offer itself stays gated on `herdr` alone: the flag
+    // offer below it is the only one the `install` clause may gate.
+    assert!(
+        FISH.contains(r#"-n "__fish_seen_subcommand_from herdr" -a install"#),
+        "fish must still offer `install` right after `clauth herdr`"
+    );
+    assert!(
+        FISH.contains(r#"-n "__fish_seen_subcommand_from herdr" -a config"#),
+        "fish must still offer `config` right after `clauth herdr`"
+    );
+}
+
 /// The scripts are hand-written (clap_complete's stable generator can't
 /// reproduce the live `clauth __complete` profile-name shellout), so nothing
 /// structural keeps them level with the grammar — they had already drifted three

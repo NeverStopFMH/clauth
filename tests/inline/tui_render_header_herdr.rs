@@ -109,6 +109,48 @@ fn herdr_mode_sheds_the_tag_instead_of_clipping_the_version_at_narrow_width() {
     );
 }
 
+/// The shed boundary itself, derived the way the renderer derives it — off
+/// the version string width, never a hardcoded column — so a version bump
+/// moves the pin with it. Pinned on both sides of the seam, so a `<`/`<=`
+/// inversion in the fit rule reds whichever way it leans.
+#[test]
+fn the_tag_fits_exactly_at_the_boundary_and_sheds_one_column_narrower() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = app_with_mode(true);
+    app.daemon_health = crate::daemon::DaemonHealth::Fresh;
+    let ver = format!("v{VERSION}");
+    // The renderer's fit rule: brand + daemon dot + tag + version against the
+    // row width, where the row starts after the 10-column logo.
+    let used = "clauth".chars().count() + "  ● daemon".chars().count();
+    let tag_w = "  [ herdr ]".chars().count();
+    let boundary = 10 + used + tag_w + ver.chars().count();
+
+    let (at, _buf) = row0_render(&app, boundary as u16);
+    assert!(
+        at.contains("[ herdr ]"),
+        "at the exact fit width the tag must render: {at:?}"
+    );
+    assert!(
+        at.ends_with(&ver),
+        "the version keeps its right edge at the boundary"
+    );
+
+    let (shed, _buf) = row0_render(&app, (boundary - 1) as u16);
+    assert!(
+        !shed.contains("[ herdr ]"),
+        "one column narrower the tag must shed: {shed:?}"
+    );
+    assert!(
+        shed.ends_with(&ver),
+        "the version keeps its right edge one column past the boundary"
+    );
+
+    // Both sides against the independently derived expectation, so the pin
+    // cannot drift from the renderer's own fit rule.
+    assert_eq!(at, expected_row0(true, true, boundary - 10));
+    assert_eq!(shed, expected_row0(true, true, boundary - 11));
+}
+
 /// The "byte-identical to today" half: a non-herdr launch renders the exact
 /// pre-tag row 0 at both widths, daemon dot or not.
 #[test]

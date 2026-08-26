@@ -664,9 +664,10 @@ fn sidebar_state(doc: &toml::Value) -> SidebarState {
 /// Both verdicts route through the same helpers `config_status` uses, so the row and the install plan cannot drift.
 ///
 /// The resync callers (`install`, `heal`) strip clauth's marked blocks before
-/// planning, so this never sees its own old blocks: a knob toggle plans
-/// against the base the strip left and re-appends the row the knob now asks
-/// for.
+/// planning, so a knob toggle plans against the base the strip left and
+/// re-appends the row the knob now asks for. A block the strip kept as
+/// user-owned comes through here intact, and the verdicts below report it
+/// as hand-owned instead of re-adding it.
 fn plan_config(existing: &str, key: &str, delegate_row_text: bool) -> Result<ConfigPlan> {
     let doc: toml::Value = toml::from_str(existing)
         .context("herdr's config.toml does not parse; fix it before wiring clauth into it")?;
@@ -725,27 +726,42 @@ pub(crate) fn heal(
     delegate_row_text: bool,
 ) -> Result<Vec<String>> {
     let existing = read_config(config_path)?;
-    let (text, plan, _) = resync_text(&existing, key, delegate_row_text)?;
+    // An existing `clauth.open` binding is the user's key choice: heal
+    // refreshes what clauth wrote, it must not re-key the binding. The
+    // caller's key applies only when nothing binds the action yet.
+    let plan_key = config_status(&existing)
+        .bound_key
+        .unwrap_or_else(|| key.to_string());
+    let (text, plan, _) = resync_text(&existing, &plan_key, delegate_row_text)?;
     if text != existing {
         write_validated(config_path, &existing, &text, bin)?;
     }
     Ok(plan.notes)
 }
 
-/// The resync seam `install` and `heal` write through: strip this crate's
-/// marked blocks, plan on what is left, append the plan. A knob toggle then
+/// The resync seam `install` and `heal` write through: strip the blocks
+/// clauth wrote, plan on what is left, append the plan. A knob toggle then
 /// rewrites exactly the blocks clauth wrote — the strip takes the old blocks
 /// off, the plan re-adds the row the knob now asks for, nothing user-owned
-/// moves — while an unchanged knob reconstructs the text byte for byte, which
-/// is what keeps the callers' writes a no-op. Split out so a test that pins
-/// the seam is pinning what the two callers run rather than a second copy of
-/// it, the same reason `with_append` is one function.
+/// moves — while an unchanged knob reconstructs the text byte for byte,
+/// which is what keeps the callers' writes a no-op. A block the user edited
+/// is kept; when a kept block follows a stripped one, re-appending the
+/// stripped block would move it past the kept one, so the resync then plans
+/// against the file as it is and reports what it sees through the
+/// hand-owned notes. Split out so a test that pins the seam is pinning what
+/// the two callers run rather than a second copy of it, the same reason
+/// `with_append` is one function.
 fn resync_text(
     existing: &str,
     key: &str,
     delegate_row_text: bool,
 ) -> Result<(String, ConfigPlan, Vec<String>)> {
-    let (base, removed) = strip_marked_blocks(existing);
+    let (base, removed, kept_after_stripped) = strip_marked_blocks(existing);
+    let (base, removed) = if kept_after_stripped {
+        (existing.to_string(), Vec::new())
+    } else {
+        (base, removed)
+    };
     let plan = plan_config(&base, key, delegate_row_text)?;
     let text = with_append(&base, &plan.append);
     Ok((text, plan, removed))
@@ -772,7 +788,7 @@ fn without_marked_blocks(existing: &str) -> String {
     strip_marked_blocks(existing).0
 }
 
-/// Drops every block this crate marked with `MARKER`, nothing else, plus the lines it removed in order so `uninstall` can print a `- ` diff that mirrors the `+ ` one `install` prints.
+/// Drops every block this crate wrote, nothing else, and returns the removed lines in order so `uninstall` can print a `- ` diff that mirrors the `+ ` one `install` prints. "Wrote" is judged by content: a buffered block is stripped only when it equals a block the generators emit — both knob variants of the sidebar block, or the binding block modulo its `key =` line, so the key `install` was run under does not make the binding read as an edit. An edited or interrupted block is kept whole, and the third return is `true` when a kept block follows an already-stripped one — the one arrangement in which re-appending the stripped block would move the kept block out of place; `resync_text` keeps the whole file in that case.
 ///
 /// A block is real only when a `[`-leading line follows the marker, since that header is what `install` always writes; the blank `install` prepends before it is dropped too. A marker standing alone drops itself and leaves the next line on the normal path. The residue is a marker inside a multi-line string whose next line happens to begin with `[`; telling that apart needs a TOML parser, and this strip only runs over lines `install` wrote, where the header always follows.
 /// The line prefixes a marked block's own tables use. The strip ends a block
@@ -793,9 +809,15 @@ fn is_block_line(header: &str, lead: &str) -> bool {
     }
 }
 
-fn strip_marked_blocks(existing: &str) -> (String, Vec<String>) {
+fn strip_marked_blocks(existing: &str) -> (String, Vec<String>, bool) {
     let mut out: Vec<String> = Vec::new();
     let mut removed: Vec<String> = Vec::new();
+    // The third return: a kept block follows an already-stripped one, the
+    // one arrangement in which re-appending the stripped block would move
+    // the kept block out of place. `resync_text` keys its keep-everything
+    // rule on this.
+    let mut stripped_block = false;
+    let mut kept_after_stripped = false;
     // The block being skipped: marker + header + table lines, buffered rather
     // than committed line by line, because a line clauth did not write turns
     // the whole block user-owned and it must be restored, header included.
@@ -813,7 +835,15 @@ fn strip_marked_blocks(existing: &str) -> (String, Vec<String>) {
         if skipping {
             if lead.is_empty() || lead.starts_with('[') {
                 skipping = false;
-                removed.extend(stripped(&mut block));
+                // A block one of the generators would write is stripped; an
+                // edited block is the user's now and is restored whole.
+                if is_clauth_block(&block) {
+                    removed.extend(stripped(&mut block));
+                    stripped_block = true;
+                } else {
+                    kept_after_stripped |= stripped_block;
+                    out.append(&mut block);
+                }
                 out.push(raw.to_string());
             } else if is_block_line(header.as_deref().unwrap_or(""), lead) {
                 block.push(raw.to_string());
@@ -822,6 +852,7 @@ fn strip_marked_blocks(existing: &str) -> (String, Vec<String>) {
                 // the strip keeps everything it would have removed. The plan
                 // then sees the binding as hand-owned and re-adds nothing.
                 skipping = false;
+                kept_after_stripped |= stripped_block;
                 out.append(&mut block);
                 out.push(raw.to_string());
             }
@@ -856,12 +887,17 @@ fn strip_marked_blocks(existing: &str) -> (String, Vec<String>) {
 
         out.push(raw.to_string());
     }
-    // A block running to the file's end is clauth's: no interruption.
+    // A block running to the file's end is clauth's unless a user edited it.
     if skipping {
-        removed.extend(stripped(&mut block));
+        if is_clauth_block(&block) {
+            removed.extend(stripped(&mut block));
+        } else {
+            kept_after_stripped |= stripped_block;
+            out.append(&mut block);
+        }
     }
 
-    (out.concat(), removed)
+    (out.concat(), removed, kept_after_stripped)
 }
 
 /// The display list's shape: one entry per line, newlines stripped. `out`
@@ -871,6 +907,43 @@ fn stripped(block: &mut Vec<String>) -> impl Iterator<Item = String> + '_ {
     block
         .drain(..)
         .map(|l| l.strip_suffix('\n').unwrap_or(&l).to_string())
+}
+
+/// Whether a buffered block is one clauth itself would write: the sidebar
+/// block under either knob variant (a toggle still strips the old row), or
+/// the binding block with the key read back off its own `key =` line, so a
+/// binding is clauth's whatever key `install` was run under. The block may
+/// open with the blank the marker branch pops into the buffer (`install`
+/// prepends it before its blocks), and a block ending the file may carry no
+/// trailing newline; the candidates carry neither.
+fn is_clauth_block(block: &[String]) -> bool {
+    let text = block.concat();
+    let text = text.strip_prefix('\n').unwrap_or(&text);
+    let text = text.strip_suffix('\n').unwrap_or(text);
+
+    let on = sidebar_block(true);
+    let off = sidebar_block(false);
+    if text == on.strip_suffix('\n').unwrap_or(&on)
+        || text == off.strip_suffix('\n').unwrap_or(&off)
+    {
+        return true;
+    }
+    let Some(binding_key) = key_from_block(block) else {
+        return false;
+    };
+    let candidate = binding_block(&binding_key);
+    text == candidate.strip_suffix('\n').unwrap_or(&candidate)
+}
+
+/// The key a binding block binds, read back off its own `key = "..."` line.
+/// The binding comparison runs modulo this key, so a block is clauth's
+/// whatever key `install` was run under, while any other edit keeps it.
+fn key_from_block(block: &[String]) -> Option<String> {
+    block.iter().find_map(|raw| {
+        let line = raw.strip_suffix('\n').unwrap_or(raw).trim_start();
+        let inner = line.strip_prefix("key = \"")?;
+        inner.strip_suffix('"').map(str::to_string)
+    })
 }
 
 pub(crate) fn uninstall(no_config: bool, yes: bool) -> Result<()> {
@@ -883,7 +956,7 @@ pub(crate) fn uninstall(no_config: bool, yes: bool) -> Result<()> {
     } else {
         let path = config_path(&bin)?;
         let previous = read_config(&path)?;
-        let (text, removed) = strip_marked_blocks(&previous);
+        let (text, removed, _) = strip_marked_blocks(&previous);
         (text != previous).then_some((path, previous, text, removed))
     };
 

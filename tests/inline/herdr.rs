@@ -299,17 +299,6 @@ fn removing_marked_blocks_round_trips() {
 }
 
 #[test]
-fn hand_edited_marked_blocks_are_still_removed() {
-    let orig = "# my config\n[ui]\naccent = \"cyan\"\n";
-    let plan = plan_config(orig, "prefix+a", false).expect("plan");
-    let wired = with_append(orig, &plan.append);
-    let edited = wired
-        .replace(r#"key = "prefix+a""#, r#"key = "prefix+z""#)
-        .replace(r#"["agent", "$clauth"]"#, r#"["agent", "custom"]"#);
-    assert_eq!(without_marked_blocks(&edited), orig);
-}
-
-#[test]
 fn marked_blocks_mid_file_leave_trailing_content() {
     let orig = "# my config\n[ui]\naccent = \"cyan\"\n";
     let plan = plan_config(orig, "prefix+a", false).expect("plan");
@@ -635,7 +624,7 @@ fn a_user_key_glued_to_a_marked_block_survives_the_resync() {
     assert_eq!(
         text.matches("[[keys.command]]").count(),
         1,
-        "the binding block still reappears exactly once: {text}"
+        "the binding block stays in place exactly once: {text}"
     );
 }
 
@@ -669,6 +658,250 @@ fn a_user_line_inside_a_marked_block_keeps_the_whole_block() {
         text.matches("[[keys.command]]").count(),
         1,
         "the interrupted block is not duplicated: {text}"
+    );
+}
+
+// ── edited marked blocks: the strip keeps what clauth did not write ────────
+
+/// The todo's repro: a user who trims the claude row (drops the `tab` group)
+/// owns that row now. The strip must compare the block against every block
+/// clauth writes — both knob variants — and keep a mismatch whole, so the
+/// resync reconstructs the file byte for byte and the plan reports the row
+/// through the hand-owned note instead of silently rewriting it. The toggle
+/// direction holds too: an edited row matches neither variant, so a knob
+/// change leaves it alone just the same.
+#[test]
+fn an_edited_sidebar_row_survives_the_resync_byte_for_byte() {
+    let orig = "# my config\n[ui]\naccent = \"cyan\"\n";
+    let plan = plan_config(orig, "prefix+a", false).expect("plan");
+    let wired = with_append(orig, &plan.append);
+    let edited = wired.replace(
+        r#"claude = [["state_icon", "workspace", "tab"], ["terminal_title_stripped"], ["agent", "$clauth"]]"#,
+        r#"claude = [["state_icon", "workspace"], ["agent", "$clauth"]]"#,
+    );
+    assert_ne!(edited, wired, "the fixture edit landed");
+    for delegate_row_text in [false, true] {
+        let (text, plan, removed, noop) =
+            install_resync(&edited, "prefix+a", delegate_row_text).expect("resync");
+        assert!(
+            !removed.iter().any(|line| line.starts_with("claude = ")),
+            "the edited row is not in the removal diff: {removed:?}"
+        );
+        assert_eq!(
+            text, edited,
+            "the edited row survives a resync byte for byte (knob {delegate_row_text})"
+        );
+        assert!(
+            noop,
+            "an edited row is left alone, so the heal write is skipped (knob {delegate_row_text})"
+        );
+        assert!(
+            plan.notes.iter().any(|n| n.contains("already renders")),
+            "the row still renders the token, so the hand-owned note fires (knob {delegate_row_text}): {:?}",
+            plan.notes
+        );
+    }
+}
+
+/// A binding block edited without touching the command it binds (a
+/// description, say) is the user's now: the strip keeps the block, the plan
+/// sees `clauth.open` still bound and reports it, and the resync
+/// reconstructs the file byte for byte.
+#[test]
+fn an_edited_binding_block_survives_the_resync_byte_for_byte() {
+    let orig = "# my config\n[ui]\naccent = \"cyan\"\n";
+    let plan = plan_config(orig, "prefix+a", false).expect("plan");
+    let wired = with_append(orig, &plan.append);
+    let edited = wired.replace(
+        r#"description = "clauth accounts""#,
+        r#"description = "opener""#,
+    );
+    assert_ne!(edited, wired, "the fixture edit landed");
+    let (text, plan, removed, noop) = install_resync(&edited, "prefix+a", false).expect("resync");
+    assert!(
+        !removed.iter().any(|line| line.starts_with("command = ")),
+        "the edited binding is not in the removal diff: {removed:?}"
+    );
+    assert_eq!(text, edited, "the edited binding survives byte for byte");
+    assert!(
+        noop,
+        "an edited binding is left alone, so the heal write is skipped"
+    );
+    assert!(
+        plan.notes.iter().any(|n| n.contains("already bound")),
+        "`clauth.open` is still bound, so the hand-owned note fires: {:?}",
+        plan.notes
+    );
+}
+
+/// An edit that moves the command off `clauth.open` (say `clauth.open
+/// --now`) keeps the whole block too, and `bound_key` matches the exact
+/// command, so `clauth.open` now reads as unbound: no already-bound note
+/// fires, and clauth appends its own binding beside the user's.
+#[test]
+fn a_binding_edited_off_clauth_open_keeps_the_edit_and_rewires_clauths_own() {
+    let orig = "# my config\n[ui]\naccent = \"cyan\"\n";
+    let plan = plan_config(orig, "prefix+a", false).expect("plan");
+    let wired = with_append(orig, &plan.append);
+    let edited = wired.replace(
+        r#"command = "clauth.open""#,
+        r#"command = "clauth.open --now""#,
+    );
+    assert_ne!(edited, wired, "the fixture edit landed");
+    let (text, plan, removed, noop) = install_resync(&edited, "prefix+a", false).expect("resync");
+    assert!(
+        !removed.iter().any(|line| line.starts_with("command = ")),
+        "the edited binding is not in the removal diff: {removed:?}"
+    );
+    assert!(
+        text.contains(r#"command = "clauth.open --now""#),
+        "the user's command edit survives: {text}"
+    );
+    assert!(
+        text.contains(r#"command = "clauth.open""#),
+        "`clauth.open` reads as unbound, so clauth wires its own binding"
+    );
+    assert_eq!(
+        text.matches("[[keys.command]]").count(),
+        2,
+        "the edited binding and clauth's own both stand: {text}"
+    );
+    assert!(
+        plan.notes.iter().all(|n| !n.contains("already bound")),
+        "no already-bound note: the edited command no longer binds `clauth.open`: {:?}",
+        plan.notes
+    );
+    assert!(!noop, "clauth's own binding is added, so the write fires");
+}
+
+/// `uninstall` strips with no key in hand, and it must keep the user's edits
+/// just the same: an edited sidebar block is absent from the removal diff,
+/// while an untouched binding block still comes out.
+#[test]
+fn an_edited_block_is_absent_from_uninstalls_removal_diff() {
+    let orig = "# my config\n[ui]\naccent = \"cyan\"\n";
+    let plan = plan_config(orig, "prefix+a", false).expect("plan");
+    let wired = with_append(orig, &plan.append);
+    let edited = wired.replace(
+        r#"claude = [["state_icon", "workspace", "tab"], ["terminal_title_stripped"], ["agent", "$clauth"]]"#,
+        r#"claude = [["state_icon", "workspace"], ["agent", "$clauth"]]"#,
+    );
+    assert_ne!(edited, wired, "the fixture edit landed");
+    let (text, removed, kept_after_stripped) = strip_marked_blocks(&edited);
+    assert!(
+        kept_after_stripped,
+        "the strip reports a kept block following a stripped one"
+    );
+    assert!(
+        removed
+            .iter()
+            .any(|line| line.starts_with("[[keys.command]]")),
+        "the untouched binding block still comes out: {removed:?}"
+    );
+    assert!(
+        !removed.iter().any(|line| line.starts_with("claude = ")),
+        "the edited sidebar block is not in the removal diff: {removed:?}"
+    );
+    assert!(
+        text.contains(r#"claude = [["state_icon", "workspace"], ["agent", "$clauth"]]"#),
+        "the edited row survives the uninstall strip: {text}"
+    );
+}
+
+/// A config installed under a custom key: the TUI heal always plans with
+/// the default key, and it must still land a knob toggle while keeping the
+/// key the user installed under. Drives the real `heal` (a shim herdr
+/// accepts the validated write), since the key re-use lives in `heal` itself.
+#[test]
+fn a_heal_keeps_a_custom_key_binding_and_still_toggles_the_row() {
+    let home = crate::testutil::HomeSandbox::new();
+    let herdr = write_shim(home.home(), "herdr", "exit 0");
+    let path = home.home().join("config.toml");
+    let orig = "# my config\n[ui]\naccent = \"cyan\"\n";
+    let plan = plan_config(orig, "ctrl+alt+x", false).expect("plan");
+    let wired = with_append(orig, &plan.append);
+    std::fs::write(&path, &wired).expect("fixture written");
+    let notes = heal(&path, DEFAULT_KEY, herdr.to_str().expect("path"), true).expect("heal");
+    assert!(
+        notes.is_empty(),
+        "nothing hand-owned in the fixture: {notes:?}"
+    );
+    let text = std::fs::read_to_string(&path).expect("read back");
+    assert!(
+        text.contains(r#"key = "ctrl+alt+x""#),
+        "the heal keeps the installed key: {text}"
+    );
+    assert!(
+        !text.contains(r#"key = "prefix+a""#),
+        "the heal does not re-key the binding: {text}"
+    );
+    assert!(
+        text.contains("$clauth_delegate"),
+        "the knob toggle still lands: {text}"
+    );
+}
+
+/// `install --key <new>` over a config wired under another key re-binds:
+/// the binding comparison runs modulo the key, so the strip takes the old
+/// block and the plan re-adds it under the key just passed.
+#[test]
+fn an_install_with_a_new_key_rebinds_a_wired_config() {
+    let orig = "# my config\n[ui]\naccent = \"cyan\"\n";
+    let plan = plan_config(orig, "ctrl+alt+x", false).expect("plan");
+    let wired = with_append(orig, &plan.append);
+    let (text, plan, _, _) = install_resync(&wired, "prefix+z", false).expect("resync");
+    assert!(
+        plan.notes.is_empty(),
+        "no hand-owned pieces: {:?}",
+        plan.notes
+    );
+    assert!(
+        text.contains(r#"key = "prefix+z""#),
+        "the new key lands: {text}"
+    );
+    assert!(
+        !text.contains(r#"key = "ctrl+alt+x""#),
+        "the old key goes: {text}"
+    );
+    assert_eq!(
+        text.matches("[[keys.command]]").count(),
+        1,
+        "one binding, rebound: {text}"
+    );
+}
+
+/// An edited binding is kept but does not freeze the untouched blocks after
+/// it: the plan appends at the end, and re-appending the stripped sidebar
+/// block lands it in its original slot (binding first, sidebar last). The
+/// knob toggle must still rewrite the sidebar row.
+#[test]
+fn an_edited_binding_does_not_freeze_the_sidebar_toggle() {
+    let orig = "# my config\n[ui]\naccent = \"cyan\"\n";
+    let plan = plan_config(orig, "prefix+a", false).expect("plan");
+    let wired = with_append(orig, &plan.append);
+    let edited = wired.replace(
+        r#"description = "clauth accounts""#,
+        r#"description = "opener""#,
+    );
+    assert_ne!(edited, wired, "the fixture edit landed");
+    let (text, plan, _, _) = install_resync(&edited, "prefix+a", true).expect("resync");
+    assert!(
+        text.contains(r#"description = "opener""#),
+        "the edited binding survives: {text}"
+    );
+    assert!(
+        text.contains("$clauth_delegate"),
+        "the sidebar toggle still lands beside the kept binding: {text}"
+    );
+    assert_eq!(
+        text.matches("[[keys.command]]").count(),
+        1,
+        "the kept binding is not duplicated: {text}"
+    );
+    assert!(
+        plan.notes.iter().any(|n| n.contains("already bound")),
+        "the kept binding keeps its already-bound note: {:?}",
+        plan.notes
     );
 }
 

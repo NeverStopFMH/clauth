@@ -2083,8 +2083,14 @@ impl App {
 
     /// Lock the shared AppConfig. Order: AppConfig outer, `with_state_lock` inner.
     pub(crate) fn config(&self) -> RankedGuard<'_, AppConfig> {
+        Self::lock_config(&self.config)
+    }
+
+    /// The `config` lock for a worker holding only the cloned [`ConfigHandle`]
+    /// — same lock and poison policy, without an `&App`.
+    pub(crate) fn lock_config(config: &ConfigHandle) -> RankedGuard<'_, AppConfig> {
         #[allow(clippy::expect_used, reason = "mutex poisoning is unrecoverable")]
-        self.config.lock().expect("config mutex poisoned")
+        config.lock().expect("config mutex poisoned")
     }
 
     /// Spawn the bootstrap on a background thread (never blocks first paint).
@@ -2117,13 +2123,7 @@ impl App {
 
             // Re-establish the credentials symlink (shutdown replaced it with
             // a plain file); without this, CC refreshes bypass the profile.
-            #[allow(clippy::expect_used, reason = "mutex poisoning is unrecoverable")]
-            let active = config
-                .lock()
-                .expect("config mutex poisoned")
-                .state
-                .active_profile
-                .clone();
+            let active = Self::lock_config(&config).state.active_profile.clone();
             if let Some(active) = active {
                 let _ = link_profile_credentials(&active);
             }
@@ -2133,8 +2133,7 @@ impl App {
             // the `Queued` marking below — a disabled profile is seeded but never
             // queued for a fetch it will never get.
             let (seed_names, snapshot, third_party) = {
-                #[allow(clippy::expect_used, reason = "mutex poisoning is unrecoverable")]
-                let cfg = config.lock().expect("config mutex poisoned");
+                let cfg = Self::lock_config(&config);
                 (
                     collect_oauth_seed_names(&cfg),
                     collect_tokens(&cfg),

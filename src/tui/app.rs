@@ -2095,7 +2095,7 @@ impl App {
     /// The `config` lock for a worker holding only the cloned [`ConfigHandle`]
     /// — same lock and poison policy, without an `&App`.
     pub(crate) fn lock_config(config: &ConfigHandle) -> RankedGuard<'_, AppConfig> {
-        #[allow(clippy::expect_used, reason = "mutex poisoning is unrecoverable")]
+        #[expect(clippy::expect_used, reason = "mutex poisoning is unrecoverable")]
         config.lock().expect("config mutex poisoned")
     }
 
@@ -2433,7 +2433,7 @@ impl App {
                 let names: Vec<String> = cfg.profiles.iter().map(|p| p.name.to_string()).collect();
                 (tokens, third_party, names)
             };
-            #[allow(clippy::expect_used, reason = "mutex poisoning is unrecoverable")]
+            #[expect(clippy::expect_used, reason = "mutex poisoning is unrecoverable")]
             {
                 *self
                     .usage_tokens
@@ -2456,7 +2456,7 @@ impl App {
         // invert lock order (TOKENS is outer of CONFIG).
         let tokens = collect_tokens(&self.config());
         let third_party = collect_third_party_entries(&self.config().profiles);
-        #[allow(clippy::expect_used, reason = "mutex poisoning is unrecoverable")]
+        #[expect(clippy::expect_used, reason = "mutex poisoning is unrecoverable")]
         {
             *self
                 .usage_tokens
@@ -2473,7 +2473,7 @@ impl App {
     /// profile's cached plan/tier — only the single-profile refresh re-pulls
     /// `/profile`, keeping the global refresh light on the rate-limited host.
     pub(crate) fn manual_refresh(&self) {
-        #[allow(clippy::expect_used, reason = "mutex poisoning is unrecoverable")]
+        #[expect(clippy::expect_used, reason = "mutex poisoning is unrecoverable")]
         let names: Vec<ProfileName> = self
             .usage_tokens
             .lock()

@@ -1669,10 +1669,10 @@ impl SessionSwap {
         }
     }
 
-    /// Step 0. Every arm refuses distinctly, so the log names the cause. The
-    /// [`SwapPlan`] it returns is the touch step's only key: `load_profile` below
-    /// is what clears a crash-staged credential sidecar, and moving the store's
-    /// mtime before that clearing would discard the sidecar for good.
+    /// Every arm refuses distinctly, so the log names the cause. The [`SwapPlan`]
+    /// it returns is the touch step's only key: `load_profile` below is what
+    /// clears a crash-staged credential sidecar, and moving the store's mtime
+    /// before that clearing would discard the sidecar for good.
     fn precondition(&self, intended: &str) -> Result<SwapPlan, SwapRefused> {
         let intended = ProfileName::from(intended);
         if self.shutdown.load(std::sync::atomic::Ordering::Acquire) {
@@ -1703,6 +1703,46 @@ impl SessionSwap {
         })
     }
 
+    /// Publish the swap into the cell: the member and canonical store the cell
+    /// names become what the credential leg and teardown read, a freshly stamped
+    /// marker joins `held`, and the refusal memo clears.
+    ///
+    /// Called only after the link has moved, inside the same `with_state_lock`
+    /// hold that spans the drain, the stamp and the repoint — the rank assert at
+    /// the entry is that contract executable. A cell naming a member the link
+    /// never reached would be permanent: `poll` filters on `member()` equality,
+    /// so nothing retries, and the next tick would treat an interactive `/login`
+    /// belonging to one member as the other's, writing it over a chain the
+    /// session never authenticated as.
+    ///
+    /// Every member the session has run on keeps its markers for the session's
+    /// life, so a claim never replaces one; the whole `held` vec is released by
+    /// [`release_swapped_markers`](Self::release_swapped_markers) at teardown.
+    fn publish_swap(&self, plan: &SwapPlan, claim: MarkerClaim) {
+        debug_assert!(
+            crate::lockorder::holds::<crate::lockorder::rank::State>(),
+            "the swap cell is published only inside the state-flock hold, or a \
+             marker saying the new member while the link still resolves to the \
+             old one lets a rotation burn the old member's chain under the live \
+             session"
+        );
+        {
+            let mut cell = self.cell();
+            cell.member = plan.member.to_string();
+            cell.canonical = plan.store.clone();
+            if let MarkerClaim::Stamped(markers) = claim {
+                cell.held.push(markers);
+            }
+            cell.last_refusal = None;
+        }
+        debug_assert!(
+            is_session_alive(&self.launch_marker),
+            "the launch member's marker must still be held after publishing a swap — \
+             marker lifetime must not be shortened, or collect() probing current_member \
+             would read an alive session as dead"
+        );
+    }
+
     /// Move this session onto `intended`.
     ///
     /// ONE rotation guard: `RankGuard::enter` asserts a strictly greater rank and
@@ -1715,11 +1755,7 @@ impl SessionSwap {
     ///
     /// Inside that hold the order is chosen so every failure lands on one side or
     /// the other and never between them. Everything that can fail runs BEFORE the
-    /// link moves; the cell is published only once it has. A cell naming a member
-    /// the link never reached would be permanent — `poll` filters on
-    /// `member()` equality, so nothing retries — and it would have the next tick
-    /// treat an interactive `/login` belonging to one member as the other's,
-    /// writing it over a chain the session never authenticated as.
+    /// link moves; [`publish_swap`](Self::publish_swap) runs only once it has.
     fn swap_to(&self, intended: &str) -> Result<SwapOutcome> {
         let plan = match self.precondition(intended) {
             Ok(plan) => plan,
@@ -1757,23 +1793,7 @@ impl SessionSwap {
             // otherwise. Publish, then let a registry failure be logged rather
             // than propagated as a swap that did not happen — the same line
             // `acquire` takes for `register`, and for the same reason.
-            {
-                let mut cell = self.cell();
-                cell.member = plan.member.to_string();
-                cell.canonical = plan.store.clone();
-                // Step 8: every member the session has run on keeps its markers
-                // for the session's life, so a claim never replaces one.
-                if let MarkerClaim::Stamped(markers) = claim {
-                    cell.held.push(markers);
-                }
-                cell.last_refusal = None;
-            }
-            debug_assert!(
-                is_session_alive(&self.launch_marker),
-                "the launch member's marker must still be held after publishing a swap — \
-                 marker lifetime must not be shortened, or collect() probing current_member \
-                 would read an alive session as dead"
-            );
+            self.publish_swap(&plan, claim);
             // A freshly loaded row, edited through the session's own field view:
             // a row read before the swap and stored after would revert an
             // `intended_member` the daemon wrote in between.

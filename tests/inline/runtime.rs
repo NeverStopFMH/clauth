@@ -6272,7 +6272,7 @@ fn a_swap_does_not_start_once_teardown_has_begun() {
 
         let before = SystemTime::now() - Duration::from_secs(60);
         set_mtime(&intended_store, before);
-        swap.begin_shutdown();
+        swap.shutdown.begin();
 
         assert_eq!(
             swap.precondition("bye-b").map(|plan| plan.member),

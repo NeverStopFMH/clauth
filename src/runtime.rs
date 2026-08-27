@@ -1515,6 +1515,30 @@ struct SwapCell {
     last_refusal: Option<(String, SwapRefused)>,
 }
 
+/// One-shot shutdown gate for a session's swap executor: `begin` is a Release
+/// store and `is_begun` an Acquire load, so once teardown begins no later
+/// precondition can pass — a swap is never STARTED mid-teardown, whichever of
+/// the watchdog thread and `Drop` gets there first.
+struct ShutdownFlag {
+    inner: std::sync::atomic::AtomicBool,
+}
+
+impl ShutdownFlag {
+    fn new() -> Self {
+        Self {
+            inner: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    fn begin(&self) {
+        self.inner.store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    fn is_begun(&self) -> bool {
+        self.inner.load(std::sync::atomic::Ordering::Acquire)
+    }
+}
+
 /// The per-session credential swap executor: a live `clauth start` session moving
 /// from the account it launched on to another chain member, without a restart and
 /// without letting a rotation spend a single-use refresh token the live Claude
@@ -1541,9 +1565,7 @@ pub(crate) struct SessionSwap {
     /// holder — see [`MarkerClaim::AlreadyOurs`].
     launch_marker: PathBuf,
     cell: crate::lockorder::RankedMutex<SwapCell, crate::lockorder::rank::SwapCell>,
-    /// Set before `Drop` signals the watchdog, so a swap is never STARTED once
-    /// teardown has begun.
-    shutdown: std::sync::atomic::AtomicBool,
+    shutdown: ShutdownFlag,
 }
 
 impl SessionSwap {
@@ -1570,7 +1592,7 @@ impl SessionSwap {
                 held: Vec::new(),
                 last_refusal: None,
             }),
-            shutdown: std::sync::atomic::AtomicBool::new(false),
+            shutdown: ShutdownFlag::new(),
         }
     }
 
@@ -1627,12 +1649,6 @@ impl SessionSwap {
         true
     }
 
-    /// Stop starting swaps. Called before `Drop` signals the watchdog.
-    fn begin_shutdown(&self) {
-        self.shutdown
-            .store(true, std::sync::atomic::Ordering::Release);
-    }
-
     /// The swap leg of this session's own watchdog tick: execute a move when the
     /// daemon has named a member that differs from the one the link resolves to.
     /// The daemon writes `intended_member` only for a row whose `follows_chain` is
@@ -1675,7 +1691,7 @@ impl SessionSwap {
     /// before that clearing would discard the sidecar for good.
     fn precondition(&self, intended: &str) -> Result<SwapPlan, SwapRefused> {
         let intended = ProfileName::from(intended);
-        if self.shutdown.load(std::sync::atomic::Ordering::Acquire) {
+        if self.shutdown.is_begun() {
             return Err(SwapRefused::ShuttingDown);
         }
         swap_support(self.mode, cfg!(target_os = "macos")).map_err(SwapRefused::Unsupported)?;
@@ -2321,7 +2337,7 @@ impl Drop for ProfileRuntime {
         // Before the signal, not after: the watchdog may be mid-tick, and a swap
         // STARTED from here would hold this join for the state-lock timeout plus
         // an unbounded rotation-flock wait.
-        self.swap.begin_shutdown();
+        self.swap.shutdown.begin();
         // Drop the sender to signal the watchdog, then join.
         drop(self.watchdog_signal.take());
         if let Some(h) = self.watchdog_handle.take() {

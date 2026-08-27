@@ -242,8 +242,11 @@ impl RankGuard {
 
 /// Whether the current thread holds rank `R`. Lets a function whose correctness
 /// depends on a lock its own signature cannot express assert that rather than say
-/// it in a comment — the state flock's holders are the case that needs it, since
-/// `with_state_lock` takes a bare closure and so has no witness to hand out.
+/// it in a comment — the state flock's holders are the case that needs it.
+/// Writers of shared state prefer the [`crate::lock::StateLockHeld`] witness
+/// `with_state_lock` hands its closure; this is the fallback for sites that only
+/// assert (e.g. a cache-consistency check), which have nothing to hand a witness
+/// to.
 ///
 /// Always `true` in release: the rank stack is `cfg(debug_assertions)`-only, so a
 /// caller must use this inside a `debug_assert!` and never as real control flow.

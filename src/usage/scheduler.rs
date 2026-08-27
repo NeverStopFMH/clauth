@@ -3194,7 +3194,7 @@ fn scan_session_switches(
         return;
     }
 
-    let batch = crate::lock::with_state_lock(|| {
+    let batch = crate::lock::with_state_lock(|_held| {
         for (session_id, target, cursor) in &writes {
             // A session that died between `list()` and this hold is skipped
             // silently — that is what keeps "no row for this id" from being this

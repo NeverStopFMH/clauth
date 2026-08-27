@@ -838,7 +838,7 @@ pub(crate) fn stamp_run_sessions(
     if ids.is_empty() {
         return;
     }
-    let result = crate::lock::with_state_lock(|| {
+    let result = crate::lock::with_state_lock(|_held| {
         let Some(path) = store_path() else {
             return Ok(());
         };

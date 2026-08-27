@@ -14,7 +14,7 @@ use crate::claude::{
     live_diverged_and_unsaved, managed_env_key_label, read_claude_credentials,
     read_claude_endpoint_config, snapshot_active_credentials,
 };
-use crate::lock::with_state_lock;
+use crate::lock::{StateLockHeld, with_state_lock};
 use crate::lockorder::RankedMutex;
 use crate::oauth;
 use crate::out::{out, outln};
@@ -94,7 +94,7 @@ fn ensure_switch_target_ok(config: &AppConfig, name: &ProfileName) -> Result<()>
 }
 
 pub(crate) fn switch_profile(config: &mut AppConfig, name: &ProfileName) -> Result<()> {
-    with_state_lock(|| {
+    with_state_lock(|held| {
         ensure_switch_target_ok(config, name)?;
         if config.is_active(name) {
             return Ok(());
@@ -127,7 +127,7 @@ pub(crate) fn switch_profile(config: &mut AppConfig, name: &ProfileName) -> Resu
         } else {
             force_link_profile_credentials(name)?;
         }
-        finish_switch(config, name)
+        finish_switch(config, name, held)
     })
 }
 
@@ -136,26 +136,26 @@ pub(crate) fn switch_profile(config: &mut AppConfig, name: &ProfileName) -> Resu
 /// `link_profile_credentials` refuse-guard (which exists to protect an
 /// un-captured re-login) precisely because the caller chose to drop it.
 pub(crate) fn switch_profile_discard(config: &mut AppConfig, target: &ProfileName) -> Result<()> {
-    with_state_lock(|| {
+    with_state_lock(|held| {
         ensure_switch_target_ok(config, target)?;
         if config.is_active(target) {
             return Ok(());
         }
         force_link_profile_credentials(target)?;
-        finish_switch(config, target)
+        finish_switch(config, target, held)
     })
 }
 
 /// Force-snapshot the outgoing creds then force the symlink. CLI prompt path only.
 pub(crate) fn switch_profile_reconciled(config: &mut AppConfig, name: &ProfileName) -> Result<()> {
-    with_state_lock(|| {
+    with_state_lock(|held| {
         ensure_switch_target_ok(config, name)?;
         if config.is_active(name) {
             return Ok(());
         }
         force_snapshot_active_credentials(config)?;
         force_link_profile_credentials(name)?;
-        finish_switch(config, name)
+        finish_switch(config, name, held)
     })
 }
 
@@ -346,7 +346,7 @@ pub(crate) fn switch_profile_noninteractive(
 /// fresh `/login` is dropped: the TUI gates that on the divergence prompt, while
 /// the automatic wrap-off leg accepts the drop, unattended by design.
 pub(crate) fn switch_off(config: &mut AppConfig) -> Result<()> {
-    with_state_lock(|| {
+    with_state_lock(|held| {
         if config.state.active_profile.is_none() {
             return Ok(());
         }
@@ -355,17 +355,17 @@ pub(crate) fn switch_off(config: &mut AppConfig) -> Result<()> {
         // No active account left to show; issue #17 applies here too — a
         // stale identity block is just as wrong once creds are cleared.
         crate::claude_json::strip_home_oauth_account()?;
-        config.state.active_profile = None;
+        config.state.set_active(None, held);
         // Same fresh-state rule as `finish_switch`: only the active marker is
         // this leg's change, so write it onto the current on-disk state rather
         // than a possibly-stale in-memory list.
         let mut state = load_app_state()?;
-        state.active_profile = None;
+        state.set_active(None, held);
         save_app_state(&state)
     })
 }
 
-fn finish_switch(config: &mut AppConfig, name: &ProfileName) -> Result<()> {
+fn finish_switch(config: &mut AppConfig, name: &ProfileName, held: &StateLockHeld) -> Result<()> {
     // Capture outgoing env keys before active_profile is reassigned.
     let prev_env_keys: Vec<String> = config
         .state
@@ -380,14 +380,14 @@ fn finish_switch(config: &mut AppConfig, name: &ProfileName) -> Result<()> {
     // re-derives it from the just-relinked credentials instead of showing
     // the wrong account until its next `/login`.
     crate::claude_json::strip_home_oauth_account()?;
-    config.state.active_profile = Some(name.clone());
+    config.state.set_active(Some(name.clone()), held);
     // Fresh state, not the whole in-memory list: a daemon drain may hold a
     // config older than a concurrent CLI delete/rename/login, and re-serializing
     // it would resurrect a deleted row or rewind an edit. Only the active marker
     // is this leg's own change, so read the current profiles.toml and change
     // that one field.
     let mut state = load_app_state()?;
-    state.active_profile = Some(name.clone());
+    state.set_active(Some(name.clone()), held);
     save_app_state(&state)
 }
 
@@ -397,7 +397,7 @@ pub(crate) fn edit_profile_endpoint(
     base_url: Option<String>,
     api_key: Option<String>,
 ) -> Result<()> {
-    with_state_lock(|| {
+    with_state_lock(|_held| {
         let profile = config.find_mut(name).context("profile not found")?;
         let old_api_key = profile.api_key.clone();
         profile.base_url = base_url;
@@ -454,7 +454,7 @@ pub(crate) fn store_console_login(
     name: &ProfileName,
     console: ConsoleCredential,
 ) -> Result<()> {
-    with_state_lock(|| {
+    with_state_lock(|_held| {
         let profile = config.find_mut(name).context("profile not found")?;
         profile.console = Some(console);
         profile.third_party_usage = None;
@@ -475,7 +475,7 @@ pub(crate) fn edit_profile_model(
     name: &ProfileName,
     models: ModelSettings,
 ) -> Result<()> {
-    with_state_lock(|| {
+    with_state_lock(|_held| {
         let profile = config.find_mut(name).context("profile not found")?;
         profile.models = models;
         save_profile(profile)?;
@@ -507,7 +507,7 @@ pub(crate) fn edit_profile_preset(
     base_url: Option<String>,
     models: ModelSettings,
 ) -> Result<()> {
-    with_state_lock(|| {
+    with_state_lock(|_held| {
         let profile = config.find_mut(name).context("profile not found")?;
         profile.base_url = base_url;
         profile.models = models;
@@ -543,7 +543,7 @@ pub(crate) fn edit_profile_env(
     name: &ProfileName,
     env: BTreeMap<String, String>,
 ) -> Result<()> {
-    with_state_lock(|| {
+    with_state_lock(|_held| {
         let profile = config.find_mut(name).context("profile not found")?;
         // Snapshot before overwrite — a removed key is only stripped from live
         // settings when it appears in `prev` but not in the new `profile.env`.
@@ -652,7 +652,7 @@ pub(crate) fn rename_profile(
         config.canonical_name(new).is_none_or(|n| n == old.as_str()),
         "rename target '{new}' already names an account"
     );
-    with_state_lock(|| {
+    with_state_lock(|held| {
         // Same gate delete and disable carry, same predicate and copy: a live
         // session's runtime tree, markers and env paths all live under this
         // directory, so moving it out from under the child breaks the session
@@ -697,7 +697,7 @@ pub(crate) fn rename_profile(
         }
 
         let was_active = config.is_active(old);
-        config.rename_all_occurrences(old, new);
+        config.rename_all_occurrences(old, new, held);
 
         save_app_state(&config.state)?;
 
@@ -724,7 +724,7 @@ pub(crate) fn delete_profile(
     force: bool,
     _rotation: &RotationGuard,
 ) -> Result<()> {
-    with_state_lock(|| {
+    with_state_lock(|held| {
         // Refuse to pull an account out from under a running `clauth start`
         // session (either flavor), checked before any removal so a refused
         // delete is a clean no-op. `--yes` skips the confirm prompt but does NOT
@@ -766,7 +766,7 @@ pub(crate) fn delete_profile(
             std::fs::remove_dir_all(&dir)
                 .with_context(|| format!("failed to delete profile directory for '{name}'"))?;
         }
-        config.remove(name);
+        config.remove(name, held);
         save_app_state(&config.state)?;
         Ok(())
     })?;
@@ -791,7 +791,7 @@ pub(crate) fn delete_profile(
 /// currently active from before this feature). Returns `Ok(true)` when it
 /// flips the flag and persists.
 pub(crate) fn disable_profile(config: &mut AppConfig, name: &ProfileName) -> Result<bool> {
-    with_state_lock(|| {
+    with_state_lock(|_held| {
         let profile = config
             .find(name)
             .with_context(|| format!("profile '{name}' not found"))?;
@@ -818,7 +818,7 @@ pub(crate) fn disable_profile(config: &mut AppConfig, name: &ProfileName) -> Res
 /// Idempotent: an already-enabled account returns `Ok(false)` with no write
 /// and no error. Returns `Ok(true)` when it clears the flag and persists.
 pub(crate) fn enable_profile(config: &mut AppConfig, name: &ProfileName) -> Result<bool> {
-    with_state_lock(|| {
+    with_state_lock(|_held| {
         let profile = config
             .find_mut(name)
             .with_context(|| format!("profile '{name}' not found"))?;
@@ -838,7 +838,7 @@ pub(crate) fn create_blank_profile(
     api_key: Option<String>,
     model: Option<String>,
 ) -> Result<()> {
-    with_state_lock(|| {
+    with_state_lock(|_held| {
         let mut profile = Profile::new(name, base_url, api_key);
         // Part of the same single save as the profile itself — a chained
         // edit-after-create would leave a saved-but-model-less profile behind
@@ -872,7 +872,7 @@ pub(crate) fn duplicate_profile(
     source: &ProfileName,
     name: String,
 ) -> Result<()> {
-    with_state_lock(|| {
+    with_state_lock(|_held| {
         let src = config.find(source).context("profile not found")?;
         let mut profile = Profile::new(name, src.base_url.clone(), src.api_key.clone());
         profile.auto_start = src.auto_start;
@@ -1023,9 +1023,9 @@ pub(crate) fn capture_into_profile(
     } = snapshot;
     let name = ProfileName::from(name);
     let seed_name = name.clone();
-    with_state_lock(|| {
+    with_state_lock(|held| {
         let mut profile = Profile::new(name.to_string(), base_url, api_key);
-        profile.credentials = credentials;
+        profile.set_credentials(credentials, held);
         save_profile(&profile)?;
         config.add(profile);
         // AUTH-1: a fresh login/capture clears any stale auth-broken quarantine
@@ -1034,7 +1034,7 @@ pub(crate) fn capture_into_profile(
 
         if config.state.active_profile.is_none() {
             link_profile_credentials(&name)?;
-            config.state.active_profile = Some(name.clone());
+            config.state.set_active(Some(name.clone()), held);
         }
         save_app_state(&config.state)
     })?;
@@ -1058,20 +1058,20 @@ pub(crate) fn create_profile_from_login(
 ) -> Result<()> {
     let name = ProfileName::from(name);
     let seed_name = name.clone();
-    with_state_lock(|| {
+    with_state_lock(|held| {
         let mut profile = Profile::new(name.to_string(), None, None);
         profile.models.default = model
             .as_deref()
             .map(str::trim)
             .filter(|m| !m.is_empty())
             .map(str::to_string);
-        profile.credentials = Some(credentials);
+        profile.set_credentials(Some(credentials), held);
         save_profile(&profile)?;
         config.add(profile);
 
         if config.state.active_profile.is_none() {
             link_profile_credentials(&name)?;
-            config.state.active_profile = Some(name.clone());
+            config.state.set_active(Some(name.clone()), held);
         }
         save_app_state(&config.state)
     })?;
@@ -1108,7 +1108,7 @@ pub(crate) fn overwrite_captured_profile(
         api_key,
         account_uuid,
     } = snapshot;
-    with_state_lock(|| {
+    with_state_lock(|held| {
         let provider = base_url.as_deref().and_then(Provider::from_base_url);
         let was_active = config.is_active(name);
         let profile = config
@@ -1116,7 +1116,7 @@ pub(crate) fn overwrite_captured_profile(
             .with_context(|| format!("profile '{name}' vanished before overwrite"))?;
         profile.base_url = base_url;
         profile.api_key = api_key;
-        profile.credentials = credentials;
+        profile.set_credentials(credentials, held);
         profile.provider = provider;
         // Same rule as `edit_profile_endpoint`: a reauth replaces the credential
         // set, and the console session is one of them.
@@ -1150,7 +1150,7 @@ pub(crate) fn overwrite_captured_profile(
         let disabled = config.find(name).is_some_and(Profile::is_disabled);
         if config.state.active_profile.is_none() && !disabled {
             link_profile_credentials(name)?;
-            config.state.active_profile = Some(name.clone());
+            config.state.set_active(Some(name.clone()), held);
         } else if was_active {
             // The overwritten profile is (and stays) the active one: unlike a
             // brand-new capture, `save_profile` just rewrote credentials.json
@@ -1214,12 +1214,12 @@ pub(crate) fn overwrite_captured_profile(
 /// profile, clear the live `~/.claude` link and deactivate — a credential-less
 /// profile can't be meaningfully active, and the honest state is "no active".
 pub(crate) fn clear_profile_credentials(config: &mut AppConfig, name: &ProfileName) -> Result<()> {
-    with_state_lock(|| {
+    with_state_lock(|held| {
         let was_active = config.is_active(name);
         let profile = config
             .find_mut(name)
             .with_context(|| format!("profile '{name}' not found"))?;
-        profile.credentials = None;
+        profile.set_credentials(None, held);
         profile.usage = None;
         profile.fetch_status = None;
         profile.third_party_usage = None;
@@ -1242,7 +1242,7 @@ pub(crate) fn clear_profile_credentials(config: &mut AppConfig, name: &ProfileNa
 
         if was_active {
             clear_claude_credentials()?;
-            config.state.active_profile = None;
+            config.state.set_active(None, held);
             save_app_state(&config.state)?;
         }
         Ok(())
@@ -1264,7 +1264,7 @@ pub(crate) fn clear_profile_credentials(config: &mut AppConfig, name: &ProfileNa
 /// active — so a running `claude` loses the token too. The account stays active:
 /// its base url is still wired, only the key is gone.
 pub(crate) fn clear_profile_api_key(config: &mut AppConfig, name: &ProfileName) -> Result<()> {
-    with_state_lock(|| {
+    with_state_lock(|_held| {
         let base_url = config.find(name).and_then(|p| p.base_url.clone());
         edit_profile_endpoint(config, name, base_url, None)?;
         // The endpoint editor clears the in-memory stats; also drop the on-disk
@@ -1284,7 +1284,7 @@ pub(crate) fn reorder_profile(config: &mut AppConfig, from: usize, to: usize) ->
     if from == to || from >= config.profiles.len() || to >= config.profiles.len() {
         return Ok(());
     }
-    with_state_lock(|| {
+    with_state_lock(|_held| {
         // Resync to fix length drift from a partial save in a prior session.
         config.sync_state_profiles();
         let profile = config.profiles.remove(from);

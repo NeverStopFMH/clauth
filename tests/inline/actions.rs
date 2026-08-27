@@ -2812,7 +2812,14 @@ fn finish_switch_deletes_stale_oauth_account_block() {
     write_home_claude_json_with_identity();
 
     let mut config = acct_config();
-    finish_switch(&mut config, &crate::profile::ProfileName::from("acct")).expect("finish_switch");
+    crate::lock::with_state_lock(|held| {
+        finish_switch(
+            &mut config,
+            &crate::profile::ProfileName::from("acct"),
+            held,
+        )
+    })
+    .expect("finish_switch");
 
     let after: serde_json::Value =
         serde_json::from_slice(&std::fs::read(home_claude_json_path()).unwrap()).unwrap();

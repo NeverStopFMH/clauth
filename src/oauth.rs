@@ -10,7 +10,7 @@ use crate::lock::with_state_lock;
 use crate::lockorder::{RankedMutex, rank};
 use crate::logline::logline;
 use crate::profile::{
-    AccountId, AppConfig, OAuthToken, ProfileName, clear_staged_credentials, save_profile,
+    AccountId, AppConfig, OAuthToken, ProfileName, SlotOps, clear_staged_credentials, save_profile,
     stage_rotated_credentials,
 };
 use crate::runtime::RotationGuard;
@@ -890,7 +890,7 @@ fn rotate_one_inner(
     let token = {
         #[allow(clippy::expect_used, reason = "mutex poisoning is unrecoverable")]
         let cfg = config.lock().expect("config mutex poisoned");
-        with_state_lock(|| {
+        with_state_lock(|_held| {
             // macOS only: clauth can't write the Keychain item this session's CC
             // reads, so rotating would sign it out. Skipping returns
             // Persisted(false) (`runtime::rotation_blocked_by_live_session`).
@@ -1127,7 +1127,7 @@ pub(crate) fn prime_window(config: &crate::profile::ConfigHandle, name: &Profile
     let (access_token, refresh_token, expires_at) = {
         #[allow(clippy::expect_used, reason = "mutex poisoning is unrecoverable")]
         let cfg = config.lock().expect("config mutex poisoned");
-        match with_state_lock(|| {
+        match with_state_lock(|_held| {
             let Some(profile) = cfg.find(name) else {
                 return Ok::<_, anyhow::Error>(None);
             };
@@ -1209,7 +1209,7 @@ pub(crate) fn apply_rotated_tokens_locked(
     // across this function.
     #[cfg(target_os = "macos")]
     let mut mirror: Option<crate::profile::ClaudeCredentials> = None;
-    with_state_lock(|| {
+    with_state_lock(|held| {
         // The profile may have been deleted or renamed out-of-process since this
         // caller's config was loaded (the single-fetcher holds a stale config
         // between reloads). `save_profile` and the stage below would recreate its
@@ -1221,7 +1221,7 @@ pub(crate) fn apply_rotated_tokens_locked(
         let Some(profile) = cfg.find_mut(name) else {
             return Err(anyhow::anyhow!("failed to persist rotated tokens"));
         };
-        let Some(creds) = profile.credentials.as_mut() else {
+        let Some(creds) = profile.credentials_mut(held) else {
             return Err(anyhow::anyhow!("failed to persist rotated tokens"));
         };
         let Some(oauth) = creds.claude_ai_oauth.as_mut() else {
@@ -1535,7 +1535,7 @@ pub(crate) fn try_adopt_live_rotation(
     // rotation that already advanced the store past the mirror).
     #[allow(clippy::expect_used, reason = "mutex poisoning is unrecoverable")]
     let mut cfg = config.lock().expect("config mutex poisoned");
-    let adopted = with_state_lock(|| {
+    let adopted = with_state_lock(|held| {
         if !cfg.is_active(name) {
             return Ok(false);
         }
@@ -1556,7 +1556,7 @@ pub(crate) fn try_adopt_live_rotation(
         {
             return Ok(false);
         }
-        profile.credentials = Some(live.clone());
+        profile.set_credentials(Some(live.clone()), held);
         save_profile(profile)?;
         Ok::<bool, anyhow::Error>(true)
     })
@@ -2334,41 +2334,77 @@ fn horizon_expiring(expires_at: Option<i64>, flagged: bool, horizon_ms: i64) -> 
 /// stale quarantine — the chain is alive under someone else's advance
 /// (mirrors `carry_external_rotation`; a wrong lift self-corrects when the
 /// carried pair's own refresh 400s). Unreadable or tokenless disk state is a
-/// no-op: the in-memory shape stays the best available truth.
+/// no-op: the in-memory shape stays the best available truth. Only the
+/// state-flock failure is an error — proceeding past it would refresh from
+/// the stale in-memory pair: a double-spend of the single-use token a
+/// sibling just advanced, and a re-quarantine of a login the disk pair
+/// proves alive.
 fn adopt_disk_rotation(
     config: &crate::profile::ConfigHandle,
     name: &ProfileName,
     _guard: &RotationGuard,
-) {
+) -> Result<()> {
     let Ok(disk) = crate::profile::load_profile(name) else {
-        return;
+        return Ok(());
     };
     if disk.refresh_token().is_none() {
-        return;
+        return Ok(());
     }
     {
         let Ok(mut cfg) = config.lock() else {
-            return;
+            return Ok(());
         };
         let Some(profile) = cfg.find_mut(name) else {
-            return;
+            return Ok(());
         };
         if profile.refresh_token() == disk.refresh_token() {
-            return;
+            return Ok(());
         }
-        profile.credentials = disk.credentials;
+        let creds = disk.credentials.into_inner();
+        // The slot write goes through the witness, so take the flock for the
+        // in-memory adoption itself — the established `config` → state order.
+        with_state_lock(|held| {
+            profile.set_credentials(creds, held);
+            Ok(())
+        })?;
     }
     mark_auth_broken(config, name, false);
+    Ok(())
+}
+
+/// Map a failed adoption flock to its Transient — contention and fault are
+/// different verdicts, the same split `sidecar_repair_transient` makes for
+/// the repair leg. `with_state_lock` fails on a bounded cross-process flock
+/// timeout ([`crate::lock::StateLockTimeout`]) or an IO fault, and on macOS
+/// a sibling process can hold that flock across the `/usr/bin/security`
+/// shell-out for up to 20 seconds — a slow Keychain in ANOTHER process
+/// surfaces here as a timeout.
+fn adopt_lock_transient(name: &ProfileName, e: &anyhow::Error) -> crate::format::Transient {
+    if e.chain()
+        .any(|c| c.downcast_ref::<crate::lock::StateLockTimeout>().is_some())
+    {
+        return crate::format::Transient::new(
+            crate::format::Cause::StateLockBusy(name.to_string()),
+            crate::format::Retry::Wait,
+        );
+    }
+    crate::format::Transient::new(
+        crate::format::Cause::StateLockUnavailable(name.to_string()),
+        // The cause names its own next step; a second one contradicts it.
+        crate::format::Retry::Stated,
+    )
 }
 
 /// The refresh leg; the `guard` witness proves the [`RotationGuard`] is held.
-/// First adopts a cross-process rotation from disk ([`adopt_disk_rotation`]),
-/// then re-reads the auth shape UNDER the guard — between the pre-check and
-/// guard acquisition a sibling rotation (in-process or peer) may have spent
-/// the single-use refresh token and persisted a new pair, and refreshing from
-/// that stale snapshot would 400 and wrongly quarantine a healthy login. This
-/// function takes no token arguments, so post-guard decisions structurally
-/// cannot reuse pre-guard data.
+/// First adopts a cross-process rotation from disk ([`adopt_disk_rotation`];
+/// an adoption that could not take the state flock refuses the gate as
+/// Transient — never a proceed), then re-reads the auth shape UNDER the guard
+/// — between the pre-check and guard acquisition a sibling rotation
+/// (in-process or peer) may have spent the single-use refresh token and
+/// persisted a new pair, and refreshing from that stale snapshot would 400
+/// and wrongly quarantine a healthy login. This function takes no token
+/// arguments, so post-guard decisions structurally cannot reuse pre-guard
+/// data.
 fn gate_under_guard(
     config: &crate::profile::ConfigHandle,
     name: &ProfileName,
@@ -2376,7 +2412,11 @@ fn gate_under_guard(
     guard: &RotationGuard,
     fresh_horizon_ms: i64,
 ) -> AuthGate {
-    adopt_disk_rotation(config, name, guard);
+    // A failed adoption flock is a refusal, never a no-op: proceeding would
+    // spend the already-spent single-use token from the stale in-memory pair.
+    if let Err(e) = adopt_disk_rotation(config, name, guard) {
+        return AuthGate::Transient(adopt_lock_transient(name, &e));
+    }
     let (expires_at, refresh_token, scopes, flagged) = match oauth_shape(config, name) {
         Err(gate) => return gate,
         Ok(shape) => shape,

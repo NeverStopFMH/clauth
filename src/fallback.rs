@@ -824,7 +824,7 @@ pub(crate) struct ChainSnapshot {
 /// member, or the chain is empty — every case where `next_auto_switch_target`
 /// short-circuits anyway, so callers can skip evaluation on `None`.
 pub(crate) fn snapshot_chain(config: &AppConfig) -> Option<ChainSnapshot> {
-    let active = config.state.active_profile.clone()?;
+    let active = config.state.active_profile.as_ref().cloned()?;
     if !config.state.fallback_chain.iter().any(|n| n == &active) {
         return None;
     }
@@ -1596,7 +1596,7 @@ pub(crate) fn auto_switch_if_needed(
     config: &mut AppConfig,
     active_burn_pct_per_hour: Option<f64>,
 ) -> Result<Option<SwitchAction>> {
-    with_state_lock(|| {
+    with_state_lock(|_held| {
         let Some(active_name) = config.state.active_profile.as_ref() else {
             return Ok(None);
         };

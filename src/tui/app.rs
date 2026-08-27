@@ -2122,7 +2122,11 @@ impl App {
 
             // Re-establish the credentials symlink (shutdown replaced it with
             // a plain file); without this, CC refreshes bypass the profile.
-            let active = Self::lock_config(&h.config).state.active_profile.clone();
+            let active = Self::lock_config(&h.config)
+                .state
+                .active_profile
+                .as_ref()
+                .cloned();
             if let Some(active) = active {
                 let _ = link_profile_credentials(&active);
             }
@@ -2611,13 +2615,13 @@ impl App {
 /// takes live creds, NewProfile captures them, Discard relinks as-is); a stale
 /// access token is refreshed lazily on the next fetch.
 pub(super) fn reconcile_startup(app: &mut App) {
-    let Some(active) = app.config().state.active_profile.clone() else {
+    let Some(active) = app.config().state.active_profile.as_ref().cloned() else {
         let _ = app.startup_sender.send(StartupSignal::ReconcileDone);
         return;
     };
 
     // Read live credentials under the state lock to avoid torn snapshots.
-    let live = with_state_lock(|| Ok(read_claude_credentials().ok().flatten()))
+    let live = with_state_lock(|_held| Ok(read_claude_credentials().ok().flatten()))
         .ok()
         .flatten();
     let diverged = {
@@ -4269,7 +4273,7 @@ fn finalize_switch(app: &mut App, name: &ProfileName) {
     // snapshot and then `link_profile_credentials` would bail on the regular
     // file, stranding the fresh `/login` chain. Raise the Divergence modal so
     // the user cleans up first; first-login adoption stays a clean switch.
-    let outgoing = app.config().state.active_profile.clone();
+    let outgoing = app.config().state.active_profile.as_ref().cloned();
     if let Some(active) = outgoing
         && active != *name
         && active_diverged_unsaved(&active)
@@ -4297,7 +4301,7 @@ fn finalize_switch(app: &mut App, name: &ProfileName) {
 /// divergence guard: an unsaved `/login` must be resolved before clearing live
 /// credentials. No HTTP.
 fn perform_switch_off(app: &mut App) {
-    let Some(active) = app.config().state.active_profile.clone() else {
+    let Some(active) = app.config().state.active_profile.as_ref().cloned() else {
         return;
     };
     if active_diverged_unsaved(&active) {
@@ -8207,8 +8211,10 @@ fn run_confirm_action(app: &mut App, action: ConfirmAction) {
             if from_divergence {
                 let _ = detach_credentials_link();
                 let mut cfg = app.config();
-                cfg.state.active_profile = None;
-                let _ = save_app_state(&cfg.state);
+                let _ = with_state_lock(|held| {
+                    cfg.state.set_active(None, held);
+                    save_app_state(&cfg.state)
+                });
             }
             let name = ProfileName::from(name);
             let result = {
@@ -8236,8 +8242,10 @@ fn run_confirm_action(app: &mut App, action: ConfirmAction) {
             let result = {
                 let mut cfg = app.config();
                 overwrite_captured_profile(&mut cfg, &name, *snapshot).and_then(|()| {
-                    cfg.state.active_profile = Some(name.clone());
-                    save_app_state(&cfg.state)
+                    with_state_lock(|held| {
+                        cfg.state.set_active(Some(name.clone()), held);
+                        save_app_state(&cfg.state)
+                    })
                 })
             };
             let result = result.and_then(|()| force_link_profile_credentials(&name));
@@ -8660,8 +8668,10 @@ fn handle_capture_name_key(app: &mut App, key: KeyEvent) {
             if from_divergence {
                 let _ = detach_credentials_link();
                 let mut cfg = app.config();
-                cfg.state.active_profile = None;
-                let _ = save_app_state(&cfg.state);
+                let _ = with_state_lock(|held| {
+                    cfg.state.set_active(None, held);
+                    save_app_state(&cfg.state)
+                });
             }
             let result = {
                 let mut cfg = app.config();
@@ -9362,7 +9372,7 @@ fn poll_credentials_divergence(app: &mut App) {
     if !app.modals.is_empty() {
         return;
     }
-    let Some(active) = app.config().state.active_profile.clone() else {
+    let Some(active) = app.config().state.active_profile.as_ref().cloned() else {
         app.divergence_pending = None;
         return;
     };

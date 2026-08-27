@@ -15,10 +15,97 @@ pub(crate) enum DivergenceChoice {
     Discard,
 }
 
-use crate::lock::with_state_lock;
+use crate::lock::{StateLockHeld, with_state_lock};
 use crate::logline::logline;
 use crate::providers::{Provider, ThirdPartyStats};
 use crate::usage::{FetchStatus, UsageInfo};
+
+/// A slot that reads like its inner value but writes only through the
+/// witness-gated [`SlotOps::set`]. `active_profile` and `credentials` are
+/// read-modify-written cross-process, so every write must run under the state
+/// flock — [`AppState::set_active`] and [`Profile::set_credentials`] take the
+/// [`StateLockHeld`] witness `with_state_lock` hands out, and a plain
+/// `slot = value` assignment no longer compiles: the inner value is private to
+/// this module.
+///
+/// Under `cfg(test)` the type is an alias for `T`, so fixtures build in-memory
+/// states without staging a flock hold and existing test literals compile
+/// unchanged. The witness signatures survive both builds; the gate's non-test
+/// clippy leg is what enforces the write contract.
+///
+/// `DerefMut` is deliberately absent: it would let `*slot = value` assign the
+/// inner without a witness. The `Debug` impl delegates so a derived log of
+/// `AppState`/`Profile` renders exactly as it did before the wrapper.
+#[cfg(not(test))]
+#[derive(Clone, Default, Serialize, Deserialize)]
+#[serde(transparent)]
+pub(crate) struct LockedSlot<T>(T);
+
+#[cfg(test)]
+pub(crate) type LockedSlot<T> = T;
+
+/// The write path and the move-out read, implemented for both shapes of
+/// [`LockedSlot`] so the writers' bodies need no `cfg` splits.
+pub(crate) trait SlotOps<T> {
+    /// The one sanctioned write path: requires the state-flock witness, which
+    /// is only handed out inside `with_state_lock`.
+    fn set(&mut self, value: T, held: &StateLockHeld);
+
+    /// Move the inner value out. Reads are not gated — the witness governs
+    /// writes, and every reader of a cached credential already serializes its
+    /// own snapshot under the config mutex.
+    fn into_inner(self) -> T;
+}
+
+#[cfg(not(test))]
+impl<T> SlotOps<T> for LockedSlot<T> {
+    fn set(&mut self, value: T, _held: &StateLockHeld) {
+        self.0 = value;
+    }
+
+    fn into_inner(self) -> T {
+        self.0
+    }
+}
+
+#[cfg(test)]
+impl<T> SlotOps<Option<T>> for Option<T> {
+    fn set(&mut self, value: Option<T>, _held: &StateLockHeld) {
+        *self = value;
+    }
+
+    fn into_inner(self) -> Option<T> {
+        self
+    }
+}
+
+/// Build a slot value inside this module — the only construction path outside
+/// serde, [`Default`], and [`Clone`]. Private so production code cannot mint a
+/// slot to assign.
+#[cfg(not(test))]
+fn slot<T>(value: T) -> LockedSlot<T> {
+    LockedSlot(value)
+}
+
+#[cfg(test)]
+fn slot<T>(value: T) -> T {
+    value
+}
+
+#[cfg(not(test))]
+impl<T: std::fmt::Debug> std::fmt::Debug for LockedSlot<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+#[cfg(not(test))]
+impl<T> std::ops::Deref for LockedSlot<T> {
+    type Target = T;
+    fn deref(&self) -> &T {
+        &self.0
+    }
+}
 
 /// Newtype over `String` (transparent on disk). Makes every name-list mutation
 /// compiler-checked — a rename that misses a `Vec` or the active marker is a
@@ -267,7 +354,7 @@ pub(crate) struct Profile {
     /// api key can't read quota, so this is what the Alibaba usage fetch runs
     /// on; `None` means the account renders no usage until a console login.
     pub(crate) console: Option<ConsoleCredential>,
-    pub(crate) credentials: Option<ClaudeCredentials>,
+    pub(crate) credentials: LockedSlot<Option<ClaudeCredentials>>,
     pub(crate) usage: Option<UsageInfo>,
     pub(crate) fetch_status: Option<FetchStatus>,
     /// Recognised third-party provider (derived from base_url).
@@ -297,7 +384,7 @@ impl Profile {
             bell_threshold: None,
             disabled: false,
             console: None,
-            credentials: None,
+            credentials: slot(None),
             usage: None,
             fetch_status: None,
             provider,
@@ -414,6 +501,33 @@ impl Profile {
     /// Granted OAuth scopes space-joined (see [`ClaudeCredentials::scopes_joined`]).
     pub(crate) fn scopes_joined(&self) -> Option<String> {
         self.credentials.as_ref()?.scopes_joined()
+    }
+
+    /// Replace the stored credential set. Requires the state-flock witness:
+    /// the slot is read-modify-written cross-process, so an unlocked write can
+    /// clobber a concurrent rotation.
+    pub(crate) fn set_credentials(
+        &mut self,
+        credentials: Option<ClaudeCredentials>,
+        _held: &StateLockHeld,
+    ) {
+        self.credentials.set(credentials, _held);
+    }
+
+    /// In-place access to the stored pair for the rotation persist leg, which
+    /// rewrites token fields under the same hold the witness proves.
+    pub(crate) fn credentials_mut(
+        &mut self,
+        _held: &StateLockHeld,
+    ) -> Option<&mut ClaudeCredentials> {
+        #[cfg(not(test))]
+        {
+            self.credentials.0.as_mut()
+        }
+        #[cfg(test)]
+        {
+            self.credentials.as_mut()
+        }
     }
 }
 
@@ -543,7 +657,8 @@ impl Default for HerdrSettings {
 /// Credentials and endpoint config live in per-profile subdirectories.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct AppState {
-    pub(crate) active_profile: Option<ProfileName>,
+    #[serde(default)]
+    pub(crate) active_profile: LockedSlot<Option<ProfileName>>,
     pub(crate) profiles: Vec<ProfileName>,
     #[serde(default)]
     pub(crate) fallback_chain: Vec<ProfileName>,
@@ -701,6 +816,13 @@ impl AppState {
         self.auth_broken.iter().any(|n| n == name)
     }
 
+    /// Set the active-profile marker. Requires the state-flock witness: the
+    /// marker is read-modify-written cross-process, so an unlocked write can
+    /// lose a concurrent switch.
+    pub(crate) fn set_active(&mut self, active: Option<ProfileName>, _held: &StateLockHeld) {
+        self.active_profile.set(active, _held);
+    }
+
     /// Mark or clear `name`'s auth-broken flag in this state. Returns `true`
     /// when the list actually changed. Pure in-memory mutation — the caller
     /// decides what to persist.
@@ -840,7 +962,7 @@ pub(crate) const DEFAULT_BURN_HORIZON_MS: u64 = 60_000;
 impl Default for AppState {
     fn default() -> Self {
         Self {
-            active_profile: None,
+            active_profile: slot(None),
             profiles: Vec::new(),
             fallback_chain: Vec::new(),
             switch_off_when_spent: false,
@@ -930,13 +1052,13 @@ impl AppConfig {
         self.profiles.push(profile);
     }
 
-    pub(crate) fn remove(&mut self, name: &ProfileName) {
+    pub(crate) fn remove(&mut self, name: &ProfileName, held: &StateLockHeld) {
         self.profiles.retain(|p| p.name != *name);
         self.state.profiles.retain(|n| n != name);
         self.state.fallback_chain.retain(|n| n != name);
         self.state.auth_broken.retain(|n| n != name);
         if self.is_active(name) {
-            self.state.active_profile = None;
+            self.state.set_active(None, held);
         }
     }
 
@@ -946,7 +1068,12 @@ impl AppConfig {
     }
 
     /// Replace `old` with `new` in every name list and the active marker.
-    pub(crate) fn rename_all_occurrences(&mut self, old: &ProfileName, new: &ProfileName) {
+    pub(crate) fn rename_all_occurrences(
+        &mut self,
+        old: &ProfileName,
+        new: &ProfileName,
+        held: &StateLockHeld,
+    ) {
         if let Some(profile) = self.find_mut(old) {
             profile.name = new.clone();
         }
@@ -960,7 +1087,7 @@ impl AppConfig {
             *slot = new.clone();
         }
         if self.is_active(old) {
-            self.state.active_profile = Some(new.clone());
+            self.state.set_active(Some(new.clone()), held);
         }
     }
 }
@@ -1614,7 +1741,9 @@ pub(crate) fn read_toml_file<T: DeserializeOwned>(path: &Path) -> Result<T> {
 /// 200ms while waiting): a full `load_config` there reads every profile's
 /// config and credentials for one string.
 pub(crate) fn active_profile_name() -> Option<ProfileName> {
-    load_app_state().ok().and_then(|s| s.active_profile)
+    load_app_state()
+        .ok()
+        .and_then(|s| s.active_profile.into_inner())
 }
 
 /// Whether the on-disk profile list still carries `name`, read from
@@ -1677,7 +1806,7 @@ pub(crate) fn load_app_state() -> Result<AppState> {
 }
 
 pub(crate) fn save_app_state(state: &AppState) -> Result<()> {
-    with_state_lock(|| {
+    with_state_lock(|_held| {
         mkdir_700(&clauth_dir()?)?;
         atomic_write_600(&app_state_path()?, toml::to_string_pretty(state)?)
             .context("failed to write profiles.toml")
@@ -1699,7 +1828,7 @@ pub(crate) fn save_app_state(state: &AppState) -> Result<()> {
 /// profile that is still present from one deleted and re-logged-in under the
 /// same name.
 pub(crate) fn set_auth_broken_persisted(name: &ProfileName, broken: bool) -> Result<bool> {
-    with_state_lock(|| {
+    with_state_lock(|_held| {
         let mut state = load_app_state()?;
         if broken && !state.profiles.iter().any(|n| n == name) {
             return Ok(false);
@@ -2035,7 +2164,7 @@ pub(crate) fn load_profile(name: &ProfileName) -> Result<Profile> {
         bell_threshold: finite_pct(config.bell_threshold),
         disabled: config.disabled,
         console: console_credential(&config.console),
-        credentials,
+        credentials: slot(credentials),
         usage: None,
         fetch_status: None,
         provider,
@@ -2081,7 +2210,7 @@ fn maybe_rewrite_config_toml(config_path: &Path, raw_config: &str, profile: &Pro
         Err(_) => raw_config != rendered,
     };
     if needs_rewrite {
-        let _ = with_state_lock(|| {
+        let _ = with_state_lock(|_held| {
             // config.toml can carry `api_key` — same 0600 rule as save_profile.
             let _ = atomic_write_600(config_path, &rendered);
             Ok(())
@@ -2134,13 +2263,13 @@ pub(crate) fn preserve_extra_blocks(
 }
 
 pub(crate) fn save_profile(profile: &Profile) -> Result<()> {
-    with_state_lock(|| {
+    with_state_lock(|_held| {
         mkdir_700(&profile_dir(&profile.name)?)?;
 
         // credentials.json BEFORE config.toml: single-use refresh token must
         // not be lost to a config.toml write failure.
         let cred_path = profile_credentials_path(&profile.name)?;
-        match &profile.credentials {
+        match profile.credentials.as_ref() {
             Some(creds) => {
                 let bytes = serialize_credentials_preserving_extra(creds, &cred_path)?;
                 atomic_write_600(&cred_path, bytes).context("failed to write credentials.json")?;
@@ -2177,7 +2306,7 @@ pub(crate) fn stage_rotated_credentials(
     name: &ProfileName,
     creds: &ClaudeCredentials,
 ) -> Result<()> {
-    with_state_lock(|| {
+    with_state_lock(|_held| {
         mkdir_700(&profile_dir(name)?)?;
         atomic_write_600(
             &profile_credentials_pending_path(name)?,
@@ -2233,7 +2362,7 @@ fn recover_pending_credentials(
         // the rotated login alone, so writing it raw would drop every non-login
         // block the store carries. The recovery leg is the one write that reaches
         // the store without going through `save_profile`.
-        let _ = with_state_lock(|| {
+        let _ = with_state_lock(|_held| {
             let body = serialize_credentials_preserving_extra(&pending, &cred_path)?;
             atomic_write_600(&cred_path, body).map_err(Into::into)
         });

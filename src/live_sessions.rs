@@ -273,7 +273,7 @@ fn write_row(row: &LiveSession) -> Result<()> {
 /// File a starting session's row. Called once the session's liveness marker is
 /// flock-held, so a row never exists without something for GC to test it by.
 pub(crate) fn register(row: &LiveSession) -> Result<()> {
-    with_state_lock(|| write_row(row))
+    with_state_lock(|_held| write_row(row))
 }
 
 /// Drop a session's row. Idempotent — a row already reaped by GC is not an
@@ -281,7 +281,7 @@ pub(crate) fn register(row: &LiveSession) -> Result<()> {
 /// its store and leave the row resurrected.
 pub(crate) fn unregister(session_id: &str) -> Result<()> {
     let path = row_path(session_id)?;
-    with_state_lock(|| match std::fs::remove_file(&path) {
+    with_state_lock(|_held| match std::fs::remove_file(&path) {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(e) => Err(e).with_context(|| format!("failed to remove {}", path.display())),
@@ -323,7 +323,7 @@ pub(crate) fn get(session_id: &str) -> Option<LiveSession> {
 /// missing row is an error naming the id, never a silent no-op.
 fn update(session_id: &str, edit: impl FnOnce(&mut LiveSession)) -> Result<()> {
     let path = row_path(session_id)?;
-    with_state_lock(|| {
+    with_state_lock(|_held| {
         let bytes = std::fs::read(&path)
             .with_context(|| format!("no live-session row for {session_id}"))?;
         let mut row: LiveSession = serde_json::from_slice(&bytes)

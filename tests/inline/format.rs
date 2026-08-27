@@ -186,8 +186,11 @@ fn every_transient_cause_renders_its_own_copy() {
         ),
         (
             Cause::StateLockBusy("work".to_string()),
-            "another clauth process holds ~/.clauth's state lock · 'work' session token left \
-             untouched",
+            "another clauth process holds ~/.clauth's state lock · 'work' left unchanged",
+        ),
+        (
+            Cause::StateLockUnavailable("work".to_string()),
+            "could not lock 'work' for a token refresh; check permissions on ~/.clauth",
         ),
     ] {
         assert_eq!(Transient::new(cause, Retry::Stated).text(), want);
@@ -211,6 +214,7 @@ fn only_the_relogin_causes_read_as_permanent() {
         (Cause::InternalLock, false),
         (Cause::PersistFailed("work".to_string()), false),
         (Cause::StateLockBusy("work".to_string()), false),
+        (Cause::StateLockUnavailable("work".to_string()), false),
     ] {
         let t = Transient::new(cause, Retry::Stated);
         assert_eq!(t.permanent_until_relogin(), want, "{}", t.text());

@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 
-use crate::lock::with_state_lock;
+use crate::lock::{StateLockHeld, with_state_lock};
 use crate::logline::logline;
 use crate::profile::{
     AppConfig, ClaudeCredentials, Profile, ProfileName, atomic_write, atomic_write_600, claude_dir,
@@ -106,7 +106,7 @@ pub(crate) fn installed_session_token(name: &ProfileName) -> Option<String> {
 /// success, not an error: the requested end state already holds.
 pub(crate) fn clear_session_token(name: &ProfileName) -> Result<bool> {
     let path = profile_dir(name)?.join("session-token.json");
-    with_state_lock(|| match std::fs::remove_file(&path) {
+    with_state_lock(|_held| match std::fs::remove_file(&path) {
         Ok(()) => Ok(true),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
         Err(e) => Err(anyhow::Error::new(e).context("remove session-token.json")),
@@ -124,7 +124,7 @@ pub(crate) fn clear_session_token(name: &ProfileName) -> Result<bool> {
 /// one path where keeping the bytes on disk would defeat the command.
 pub(crate) fn clear_static_backup(name: &ProfileName) -> Result<bool> {
     let path = profile_dir(name)?.join("session-token.static.json");
-    with_state_lock(|| match std::fs::remove_file(&path) {
+    with_state_lock(|_held| match std::fs::remove_file(&path) {
         Ok(()) => Ok(true),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
         Err(e) => Err(anyhow::Error::new(e).context("remove session-token.static.json")),
@@ -297,7 +297,7 @@ pub(crate) fn write_session_token(name: &ProfileName, token: &str, now_ms: i64) 
     };
     let bytes = serde_json::to_vec_pretty(&sidecar).context("serialize session token")?;
     let path = profile_dir(name)?.join("session-token.json");
-    with_state_lock(|| atomic_write_600(&path, &bytes).context("write session-token.json"))?;
+    with_state_lock(|_held| atomic_write_600(&path, &bytes).context("write session-token.json"))?;
     Ok(expires_at)
 }
 
@@ -339,7 +339,7 @@ pub(crate) fn stamp_rolling_token(
     };
     let bytes = serde_json::to_vec_pretty(&sidecar).context("serialize rolling session token")?;
     let path = profile_dir(name)?.join("session-token.json");
-    with_state_lock(|| {
+    with_state_lock(|_held| {
         preserve_static_mint(name)?;
         atomic_write_600(&path, &bytes).context("write rolling session-token.json")
     })
@@ -475,7 +475,7 @@ pub(crate) fn write_session_token_with_backup(
     };
     let bytes = serde_json::to_vec_pretty(&sidecar).context("serialize session token")?;
     let dir = profile_dir(name)?;
-    with_state_lock(|| {
+    with_state_lock(|_held| {
         atomic_write_600(&dir.join("session-token.json"), &bytes)
             .context("write session-token.json")?;
         atomic_write_600(&dir.join("session-token.static.json"), &bytes)
@@ -510,7 +510,7 @@ pub(crate) fn heal_misfilled_sidecar(name: &ProfileName) -> Result<HealOutcome> 
     let dir = profile_dir(name)?;
     let sidecar = dir.join("session-token.json");
     let backup = dir.join("session-token.static.json");
-    with_state_lock(|| {
+    with_state_lock(|_held| {
         if !matches!(
             session_token_status(name),
             Some(SessionTokenStatus::NotLongLived)
@@ -538,7 +538,7 @@ pub(crate) fn heal_misfilled_sidecar(name: &ProfileName) -> Result<HealOutcome> 
 pub(crate) fn quarantine_misfilled_sidecar(name: &ProfileName) -> Result<bool> {
     let dir = profile_dir(name)?;
     let sidecar = dir.join("session-token.json");
-    with_state_lock(|| {
+    with_state_lock(|_held| {
         if !matches!(
             session_token_status(name),
             Some(SessionTokenStatus::NotLongLived)
@@ -820,7 +820,7 @@ pub(crate) fn restore_static_mint(name: &ProfileName) -> Result<bool> {
     let dir = profile_dir(name)?;
     let backup = dir.join("session-token.static.json");
     let sidecar = dir.join("session-token.json");
-    with_state_lock(|| {
+    with_state_lock(|_held| {
         let Some(bytes) = live_backup_bytes(name, &backup)? else {
             return Ok(false);
         };
@@ -1437,7 +1437,7 @@ fn carry_live_extra_best_effort(link: &Path, target: &Path, name: &ProfileName) 
 /// Windows). Refuses to overwrite a non-matching regular file — that would silently
 /// drop a CC re-login the user hasn't resolved yet.
 pub(crate) fn link_profile_credentials(name: &ProfileName) -> Result<()> {
-    with_state_lock(|| {
+    with_state_lock(|_held| {
         let link = claude_credentials_path()?;
         let target = install_source_path(name)?;
 
@@ -1497,7 +1497,7 @@ pub(crate) fn link_profile_credentials(name: &ProfileName) -> Result<()> {
 }
 
 pub(crate) fn clear_claude_credentials() -> Result<()> {
-    with_state_lock(|| {
+    with_state_lock(|_held| {
         let link = claude_credentials_path()?;
         if link.symlink_metadata().is_ok() {
             std::fs::remove_file(&link).context("failed to remove .credentials.json")?;
@@ -1630,7 +1630,7 @@ pub(crate) fn apply_profile_to_claude_settings(
     profile: &Profile,
     prev_env_keys: &[String],
 ) -> Result<()> {
-    with_state_lock(|| apply_profile_to_claude_settings_inner(profile, prev_env_keys))
+    with_state_lock(|_held| apply_profile_to_claude_settings_inner(profile, prev_env_keys))
 }
 
 fn apply_profile_to_claude_settings_inner(
@@ -1899,8 +1899,8 @@ pub(crate) fn build_claude_settings_json(
 /// `force_snapshot_active_credentials` after user confirmation. First-login
 /// on a credential-less profile is adopted instead.
 pub(crate) fn snapshot_active_credentials(config: &mut AppConfig) -> Result<()> {
-    with_state_lock(|| {
-        let Some(active) = config.state.active_profile.clone() else {
+    with_state_lock(|held| {
+        let Some(active) = config.state.active_profile.as_ref().cloned() else {
             return Ok(());
         };
         if matches!(classify_credentials_link(&active)?, LinkState::Diverged) {
@@ -1909,7 +1909,7 @@ pub(crate) fn snapshot_active_credentials(config: &mut AppConfig) -> Result<()> 
             }
             return Ok(());
         }
-        snapshot_active_credentials_unchecked(config, &active)
+        snapshot_active_credentials_unchecked(config, &active, held)
     })
 }
 
@@ -1924,8 +1924,8 @@ pub(crate) fn snapshot_active_credentials(config: &mut AppConfig) -> Result<()> 
 /// captured it into neither. Refusing costs an adopt; the alternative costs the
 /// login.
 pub(crate) fn adopt_first_login(config: &mut AppConfig, active: &ProfileName) -> Result<()> {
-    with_state_lock(|| {
-        snapshot_active_credentials_unchecked(config, active)?;
+    with_state_lock(|held| {
+        snapshot_active_credentials_unchecked(config, active, held)?;
         anyhow::ensure!(
             install_source_path(active)?.exists(),
             "refusing to relink '{active}': the live login was not captured into it"
@@ -1937,6 +1937,7 @@ pub(crate) fn adopt_first_login(config: &mut AppConfig, active: &ProfileName) ->
 fn snapshot_active_credentials_unchecked(
     config: &mut AppConfig,
     active: &ProfileName,
+    held: &StateLockHeld,
 ) -> Result<()> {
     // CLA-SPLIT: a profile whose live slot holds its static session token carries
     // nothing to snapshot, and capturing the live file into `profile.credentials`
@@ -1973,7 +1974,7 @@ fn snapshot_active_credentials_unchecked(
         return Ok(());
     }
     if let Some(profile) = config.find_mut(active) {
-        profile.credentials = Some(credentials);
+        profile.set_credentials(Some(credentials), held);
         save_profile(profile)?;
     }
     Ok(())
@@ -1981,17 +1982,17 @@ fn snapshot_active_credentials_unchecked(
 
 /// Snapshot the live `.credentials.json` into the active profile unconditionally.
 pub(crate) fn force_snapshot_active_credentials(config: &mut AppConfig) -> Result<()> {
-    with_state_lock(|| {
-        let Some(active) = config.state.active_profile.clone() else {
+    with_state_lock(|held| {
+        let Some(active) = config.state.active_profile.as_ref().cloned() else {
             return Ok(());
         };
-        snapshot_active_credentials_unchecked(config, &active)
+        snapshot_active_credentials_unchecked(config, &active, held)
     })
 }
 
 /// Re-link `.credentials.json` to `name`'s stored credentials, overwriting the live path.
 pub(crate) fn force_link_profile_credentials(name: &ProfileName) -> Result<()> {
-    with_state_lock(|| {
+    with_state_lock(|_held| {
         let link = claude_credentials_path()?;
         let target = install_source_path(name)?;
         if link.symlink_metadata().is_ok() {
@@ -2038,7 +2039,7 @@ pub(crate) fn credentials_diverged(
 /// No-op if already a regular file or absent. Prevents CC writes from bleeding
 /// into the profile's storage after the user disowns the active profile.
 pub(crate) fn detach_credentials_link() -> Result<()> {
-    with_state_lock(|| {
+    with_state_lock(|_held| {
         let path = claude_credentials_path()?;
         let Ok(meta) = path.symlink_metadata() else {
             return Ok(());

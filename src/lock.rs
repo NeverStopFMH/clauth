@@ -194,6 +194,17 @@ pub(crate) fn set_state_lock_timeout_override(timeout: Option<Duration>) {
     STATE_LOCK_TIMEOUT_OVERRIDE.with(|c| c.set(timeout));
 }
 
+/// Zero-sized proof that the current thread holds the cross-process state
+/// flock. Only [`with_state_lock`] mints it, handing one to its closure, so a
+/// writer of shared state ([`crate::profile::AppState::set_active`],
+/// [`crate::profile::Profile::set_credentials`]) can require it in its
+/// signature instead of leaving the hold to a comment.
+///
+/// Deliberately not `Copy` or `Clone`: a copied witness would outlive the
+/// hold it proves, keeping the compile-time contract bypassable.
+#[derive(Debug)]
+pub(crate) struct StateLockHeld(());
+
 #[must_use]
 pub(crate) struct StateLock {
     // Non-None only for the outermost acquisition on this thread.
@@ -325,11 +336,12 @@ impl Drop for StateLock {
     }
 }
 
-/// Run `f` while holding the cross-process state lock. Re-entrant within the
-/// same thread; serializes concurrent calls from different threads.
-pub(crate) fn with_state_lock<T>(f: impl FnOnce() -> Result<T>) -> Result<T> {
+/// Run `f` while holding the cross-process state lock, handing it the
+/// [`StateLockHeld`] witness. Re-entrant within the same thread; serializes
+/// concurrent calls from different threads.
+pub(crate) fn with_state_lock<T>(f: impl FnOnce(&StateLockHeld) -> Result<T>) -> Result<T> {
     let _guard = StateLock::acquire()?;
-    f()
+    f(&StateLockHeld(()))
 }
 
 #[cfg(test)]

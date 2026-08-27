@@ -2951,7 +2951,11 @@ fn acquire_refuses_a_record_removed_without_a_rotation_lock() {
                 "the seam must fire while the account is still configured, \
                      or it poses nothing"
             );
-            config.remove(&crate::profile::ProfileName::from("mixedver"));
+            crate::lock::with_state_lock(|held| {
+                config.remove(&crate::profile::ProfileName::from("mixedver"), held);
+                Ok(())
+            })
+            .expect("remove record");
             crate::profile::save_app_state(&config.state).expect("save app state");
             std::fs::remove_dir_all(
                 crate::profile::profile_dir(&crate::profile::ProfileName::from("mixedver"))

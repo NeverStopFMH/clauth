@@ -717,7 +717,7 @@ fn live_bare_dir() -> Result<PathBuf> {
 pub(crate) fn register_bare_session() -> Result<File> {
     let dir = live_bare_dir()?;
     let path = dir.join(std::process::id().to_string());
-    with_state_lock(|| {
+    with_state_lock(|_held| {
         crate::profile::mkdir_700(&dir)
             .with_context(|| format!("failed to create {}", dir.display()))?;
         let file =
@@ -835,7 +835,7 @@ fn gc_bare_markers() {
     if entries.next().is_none() {
         return;
     }
-    let _ = with_state_lock(|| {
+    let _ = with_state_lock(|_held| {
         let _ = prune_stale_sessions(&dir);
         Ok::<_, anyhow::Error>(())
     });
@@ -863,7 +863,7 @@ fn gc_live_session_rows() {
 /// a marker in it. The two go together; a `runtime` path that does not exist
 /// collects the orphaned marker dir alone.
 fn gc_one_pair(runtime: &Path, sessions: &Path) -> Result<()> {
-    with_state_lock(|| {
+    with_state_lock(|_held| {
         // An unknown reads as live: this leg runs from the daemon's timer, in a
         // different process, against every profile, and under `LinkMode::Fake`
         // the tree it would remove is the one a live sibling is running out of.
@@ -1189,7 +1189,7 @@ pub(crate) fn unsupported_swap_platform(is_macos: bool) -> Option<SwapUnsupporte
 /// as either answer — a probe that could not run says nothing about the host.
 pub(crate) fn unsupported_swap_transport(name: &ProfileName) -> Result<Option<SwapUnsupported>> {
     let profile_root = profile_dir(name)?;
-    let mode = with_state_lock(|| {
+    let mode = with_state_lock(|_held| {
         crate::profile::mkdir_700(&profile_root)
             .with_context(|| format!("failed to create {}", profile_root.display()))?;
         detect_link_mode(&profile_root)
@@ -1727,7 +1727,7 @@ impl SessionSwap {
         };
         let _rotation = RotationGuard::acquire(&plan.member)?;
         let link = self.runtime.join(".credentials.json");
-        with_state_lock(|| {
+        with_state_lock(|_held| {
             let current = self.canonical();
             // DRAIN. A Claude Code re-login sitting in the runtime file belongs to
             // the member the link STILL resolves to; once canonical moves, the
@@ -1988,7 +1988,7 @@ impl ProfileRuntime {
         let _rotation_guard = RotationGuard::acquire(name)?;
         pre_lock_done();
 
-        let (session, paths, pid_lock, legacy_lock, mode) = with_state_lock(|| {
+        let (session, paths, pid_lock, legacy_lock, mode) = with_state_lock(|_held| {
             // Inside the hold, and ahead of every write this closure does — see
             // `refuse_if_unconfigured` for which mechanism each half buys.
             refuse_if_unconfigured(name)?;
@@ -3018,12 +3018,12 @@ fn tick(claude_home: &Path, swap: &SessionSwap) -> Result<()> {
     let runtime = swap.runtime.as_path();
     let link = runtime.join(".credentials.json");
     match swap.mode {
-        LinkMode::Real => with_state_lock(|| {
+        LinkMode::Real => with_state_lock(|_held| {
             sync_credentials_unlocked(&link, &swap.canonical())?;
             Ok::<_, anyhow::Error>(())
         }),
         LinkMode::Fake if swap.isolation == Isolation::Isolated => {
-            with_state_lock(|| mirror_credentials(&link, &swap.canonical()))
+            with_state_lock(|_held| mirror_credentials(&link, &swap.canonical()))
         }
         LinkMode::Fake => {
             // Bulk tree walk + copies run WITHOUT the state lock: on a large
@@ -3043,7 +3043,7 @@ fn tick(claude_home: &Path, swap: &SessionSwap) -> Result<()> {
             // interleave with acquire/switch credential writes) stays under the
             // lock.
             mirror_tree(claude_home, runtime)?;
-            with_state_lock(|| mirror_credentials(&link, &swap.canonical()))
+            with_state_lock(|_held| mirror_credentials(&link, &swap.canonical()))
         }
     }
 }
@@ -3056,8 +3056,9 @@ fn tick(claude_home: &Path, swap: &SessionSwap) -> Result<()> {
 ///
 /// Running this outside the state flock races the credential writes of a
 /// concurrent `acquire` or switch, which is what that flock exists to serialize.
-/// `with_state_lock` takes a bare closure, so there is no witness type to demand
-/// in the signature; the rank stack is the next best check.
+/// A [`crate::lock::StateLockHeld`] witness could be threaded here, but the unit
+/// tests below drive it with no hold at all — the rank stack is the next best
+/// check until those grow a `HomeSandbox`.
 ///
 /// Ceiling: the assert is off under `cfg(test)`, because 20 inline tests drive
 /// this and `mirror_credentials` as units with no home sandbox, so taking the

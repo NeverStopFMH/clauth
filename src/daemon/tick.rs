@@ -158,7 +158,7 @@ impl super::Daemon {
             .config
             .lock()
             .ok()
-            .and_then(|c| c.state.active_profile.clone());
+            .and_then(|c| c.state.active_profile.as_ref().cloned());
         if let Some(active) = outgoing
             && active != target
             && active_diverged_unsaved(&active)
@@ -225,7 +225,7 @@ impl super::Daemon {
             // A delete landing between the early drop above and this hold is
             // caught by `switch_profile`'s own fresh membership gate
             // (`ensure_switch_target_ok`), which runs inside this same flock.
-            crate::lock::with_state_lock(|| {
+            crate::lock::with_state_lock(|_held| {
                 switch_profile(&mut cfg, &target)?;
                 Ok((reload_fingerprint(), returning))
             })
@@ -307,7 +307,7 @@ impl super::Daemon {
             .config
             .lock()
             .ok()
-            .and_then(|c| c.state.active_profile.clone());
+            .and_then(|c| c.state.active_profile.as_ref().cloned());
         let Some(active) = active else {
             return; // already off
         };
@@ -324,7 +324,7 @@ impl super::Daemon {
                 reason = "config mutex poisoning is unrecoverable"
             )]
             let mut cfg = self.config.lock().expect("config poisoned");
-            crate::lock::with_state_lock(|| {
+            crate::lock::with_state_lock(|_held| {
                 switch_off(&mut cfg)?;
                 Ok(reload_fingerprint())
             })

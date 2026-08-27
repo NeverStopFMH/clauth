@@ -1668,6 +1668,90 @@ fn gate_under_guard_spends_the_disk_pair_after_an_external_rotation() {
     ));
 }
 
+/// A wedged state flock during the adoption leg must not send the stale
+/// in-memory pair into the refresh: the gate yields Transient with the
+/// contention copy, the refresher never runs (the already-spent single-use
+/// token stays unspent), and the disk pair is not half-adopted. The wedge is
+/// a second open file description holding the flock — which conflicts exactly
+/// as a second process would (same pose as the teardown wedge in
+/// `runtime.rs`) — and the deadline override keeps the wait off the real 25 s.
+#[test]
+fn gate_under_guard_refuses_when_the_adoption_flock_is_wedged() {
+    let _home = HomeSandbox::new();
+    let name = "test-gate-flock-wedge";
+    let handle = Arc::new(RankedMutex::new(oauth_config(
+        name,
+        Some("rt-stale"),
+        Some(past_expiry()),
+    )));
+    save_disk_profile(name, "rt-peer", Some(future_expiry()));
+
+    let lock_path = crate::profile::clauth_dir()
+        .expect("clauth dir")
+        .join(crate::lock::LOCK_FILENAME);
+    let holder = crate::profile::open_state_file(&lock_path).expect("open holder");
+    holder.lock().expect("hold the flock");
+
+    crate::lock::set_state_lock_timeout_override(Some(std::time::Duration::from_millis(50)));
+    let gate = gate_under_guard(
+        &handle,
+        &crate::profile::ProfileName::from(name),
+        never_refresh,
+        &gate_guard(name),
+        AUTH_GATE_GRACE_MS,
+    );
+    crate::lock::set_state_lock_timeout_override(None);
+    drop(holder);
+
+    let AuthGate::Transient(t) = gate else {
+        panic!("a wedged adoption flock must refuse the gate");
+    };
+    assert!(
+        t.text().contains("another clauth process holds"),
+        "the timeout reads as contention, got: {}",
+        t.text()
+    );
+    assert_eq!(
+        handle
+            .lock()
+            .unwrap()
+            .find(&crate::profile::ProfileName::from(name))
+            .unwrap()
+            .refresh_token(),
+        Some("rt-stale"),
+        "a failed adoption must not half-land the disk pair"
+    );
+}
+
+/// The adoption flock's failure maps contention and fault to different
+/// verdicts — the same split as the sidecar repair leg. A timeout is a busy
+/// sibling (retry), never a "check permissions" hunt; a genuine IO fault
+/// keeps the fault copy.
+#[test]
+fn an_adoption_flock_failure_splits_contention_from_fault() {
+    let busy =
+        anyhow::Error::new(crate::lock::StateLockTimeout::stub()).context("adopt disk rotation");
+    let t = adopt_lock_transient(&crate::profile::ProfileName::from("busy"), &busy);
+    assert!(
+        t.text().contains("another clauth process holds"),
+        "contention names the holder, got: {}",
+        t.text()
+    );
+    assert!(
+        !t.text().contains("check permissions"),
+        "contention must not prescribe a permissions hunt, got: {}",
+        t.text()
+    );
+
+    let fault = anyhow::anyhow!("read-only file system").context("open state lock");
+    let t = adopt_lock_transient(&crate::profile::ProfileName::from("busy"), &fault);
+    assert!(
+        t.text().contains("check permissions on ~/.clauth"),
+        "a genuine filesystem fault keeps the fault copy, got: {}",
+        t.text()
+    );
+}
+
 /// A differing disk pair proves the chain is alive, so a standing in-memory
 /// quarantine is stale and lifts (same rationale as the scheduler's
 /// `carry_external_rotation`): the gate proceeds from the adopted pair

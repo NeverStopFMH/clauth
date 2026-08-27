@@ -264,7 +264,7 @@ pub(crate) fn sync_once() -> Result<()> {
 /// `settings.json` reads, parses, and writes.
 fn sync_members(paths: &[PathBuf]) -> Result<bool> {
     let operator_file = claude_dir()?.join("settings.json");
-    with_state_lock(|| {
+    with_state_lock(|_held| {
         let Some(custom_env) = per_profile_env_keys() else {
             return Ok(false);
         };

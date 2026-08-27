@@ -429,6 +429,7 @@ fn auth_broken_round_trips_and_is_omitted_when_empty() {
 // profile.
 #[test]
 fn remove_drops_auth_broken_entry() {
+    let _home = crate::testutil::HomeSandbox::new();
     let mut config = AppConfig {
         state: AppState {
             profiles: vec!["a".into(), "b".into()],
@@ -441,7 +442,11 @@ fn remove_drops_auth_broken_entry() {
     };
     config.set_auth_broken(&crate::profile::ProfileName::from("a"), true);
     config.set_auth_broken(&crate::profile::ProfileName::from("b"), true);
-    config.remove(&crate::profile::ProfileName::from("a"));
+    crate::lock::with_state_lock(|held| {
+        config.remove(&crate::profile::ProfileName::from("a"), held);
+        Ok(())
+    })
+    .expect("remove");
     assert!(
         !config.is_auth_broken(&crate::profile::ProfileName::from("a")),
         "removed name leaves the quarantine"
@@ -456,6 +461,7 @@ fn remove_drops_auth_broken_entry() {
 // that dropped it would silently un-quarantine a dead login.
 #[test]
 fn rename_carries_auth_broken_entry() {
+    let _home = crate::testutil::HomeSandbox::new();
     let mut config = AppConfig {
         state: AppState {
             profiles: vec!["old".into()],
@@ -464,10 +470,15 @@ fn rename_carries_auth_broken_entry() {
         profiles: vec![Profile::new("old".to_string(), None, None)],
     };
     config.set_auth_broken(&crate::profile::ProfileName::from("old"), true);
-    config.rename_all_occurrences(
-        &crate::profile::ProfileName::from("old"),
-        &crate::profile::ProfileName::from("new"),
-    );
+    crate::lock::with_state_lock(|held| {
+        config.rename_all_occurrences(
+            &crate::profile::ProfileName::from("old"),
+            &crate::profile::ProfileName::from("new"),
+            held,
+        );
+        Ok(())
+    })
+    .expect("rename");
     assert!(
         !config.is_auth_broken(&crate::profile::ProfileName::from("old")),
         "old name no longer quarantined"

@@ -158,17 +158,27 @@ pub(crate) enum Cause {
     /// retryable in-process: only a fresh `clauth login <p> --setup-token`
     /// re-captures the mint.
     SidecarMisfilled(String),
-    /// CLA-ROLL: a sidecar repair could not take the cross-process state flock
-    /// inside its bounded wait — another clauth process is busy under
-    /// `~/.clauth` (on macOS that flock is even held across a
-    /// `/usr/bin/security` shell-out for up to 20 seconds). Genuine
-    /// contention, not a fault: the holder finishes and a retry goes through.
-    /// Distinct from [`Self::SidecarWriteFailed`] on purpose — that copy
-    /// prescribes a permissions check, which a busy sibling would send the
-    /// operator on for nothing. Same contention-vs-fault split as
-    /// [`Self::RotationLockUnavailable`] (fault) vs
-    /// [`Self::RotationLockHeld`] (contention).
+    /// The cross-process state flock could not be taken inside its bounded
+    /// wait — another clauth process is busy under `~/.clauth` (on macOS that
+    /// flock is even held across a `/usr/bin/security` shell-out for up to 20
+    /// seconds). Surfaced by the CLA-ROLL sidecar repair and the gate's
+    /// rotation-adoption leg alike. Genuine contention, not a fault: the
+    /// holder finishes and a retry goes through. Distinct from
+    /// [`Self::SidecarWriteFailed`] and [`Self::StateLockUnavailable`] on
+    /// purpose — that copy prescribes a permissions check, which a busy
+    /// sibling would send the operator on for nothing. Same
+    /// contention-vs-fault split as [`Self::RotationLockUnavailable`] (fault)
+    /// vs [`Self::RotationLockHeld`] (contention).
     StateLockBusy(String),
+    /// The cross-process state flock could not be CREATED or OPENED during
+    /// the gate's rotation-adoption leg — a filesystem or permissions problem
+    /// under `~/.clauth`, not contention. The gate aborted rather than
+    /// refresh from a pair a sibling may already have advanced. Distinct from
+    /// [`Self::StateLockBusy`] on purpose — that copy says a busy sibling
+    /// will finish, which a fault never does. Same contention-vs-fault split
+    /// as [`Self::RotationLockUnavailable`] (fault) vs
+    /// [`Self::RotationLockHeld`] (contention), one lock further down.
+    StateLockUnavailable(String),
 }
 
 impl Cause {
@@ -211,8 +221,13 @@ impl Cause {
             }
             Self::StateLockBusy(profile) => {
                 format!(
-                    "another clauth process holds ~/.clauth's state lock · '{profile}' session \
-                     token left untouched"
+                    "another clauth process holds ~/.clauth's state lock · '{profile}' left \
+                     unchanged"
+                )
+            }
+            Self::StateLockUnavailable(profile) => {
+                format!(
+                    "could not lock '{profile}' for a token refresh; check permissions on ~/.clauth"
                 )
             }
             Self::PersistFailed(profile) => {

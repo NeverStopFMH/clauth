@@ -429,7 +429,8 @@ impl Daemon {
             .expect("config mutex poisoned")
             .state
             .active_profile
-            .clone();
+            .as_ref()
+            .cloned();
         if let Some(active) = active {
             let _ = link_profile_credentials(&active);
         }

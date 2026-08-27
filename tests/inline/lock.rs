@@ -25,7 +25,7 @@ fn cross_thread_with_state_lock_serializes() {
             std::thread::spawn(move || {
                 // All threads rendezvous here to maximize concurrent entry.
                 barrier.wait();
-                with_state_lock(|| {
+                with_state_lock(|_held| {
                     let start = epoch.elapsed().as_nanos() as u64;
                     // Sleep widens the interval so overlaps are detectable.
                     std::thread::sleep(std::time::Duration::from_millis(5));
@@ -66,7 +66,8 @@ fn cross_thread_with_state_lock_serializes() {
 #[test]
 fn same_thread_reentrancy_does_not_deadlock() {
     let _home = crate::testutil::HomeSandbox::new();
-    let result = with_state_lock(|| with_state_lock(|| with_state_lock(|| Ok(42u32))));
+    let result =
+        with_state_lock(|_held| with_state_lock(|_held| with_state_lock(|_held| Ok(42u32))));
     assert_eq!(result.unwrap(), 42);
 }
 
@@ -99,11 +100,11 @@ fn poison_recovery_after_panicking_closure() {
     );
 
     // THREAD_LOCK poisoned + slot None; fresh acquire must recover and re-flock.
-    let result = with_state_lock(|| Ok(7u32));
+    let result = with_state_lock(|_held| Ok(7u32));
     assert_eq!(result.unwrap(), 7, "lock must be reusable after a panic");
 
     // Reentrancy must still work post-recovery.
-    let again = with_state_lock(|| with_state_lock(|| Ok(8u32)));
+    let again = with_state_lock(|_held| with_state_lock(|_held| Ok(8u32)));
     assert_eq!(again.unwrap(), 8, "reentrancy still works post-recovery");
 }
 
@@ -124,7 +125,7 @@ fn the_subprocess_budget_binds_only_inside_a_hold() {
         "outside a hold there is nothing to bound"
     );
 
-    with_state_lock(|| {
+    with_state_lock(|_held| {
         let inside = clamp_to_hold_budget(huge);
         assert!(
             inside <= SUBPROCESS_BUDGET,
@@ -162,10 +163,10 @@ fn a_reentrant_hold_keeps_spending_the_outer_budget() {
     // sleep is what the correct code must visibly spend and the mutant cannot.
     const SPENT: Duration = Duration::from_millis(50);
 
-    with_state_lock(|| {
+    with_state_lock(|_held| {
         let outer = clamp_to_hold_budget(huge);
         std::thread::sleep(SPENT);
-        with_state_lock(|| {
+        with_state_lock(|_held| {
             let inner = clamp_to_hold_budget(huge);
             let spent = outer.saturating_sub(inner);
             assert!(
@@ -220,6 +221,6 @@ fn held_flock_times_out_then_recovers_on_release() {
 
     // Direction 2: once the holder releases, the next acquisition succeeds.
     drop(holder);
-    let ran = with_state_lock(|| Ok(1234u32)).expect("acquire after the holder releases");
+    let ran = with_state_lock(|_held| Ok(1234u32)).expect("acquire after the holder releases");
     assert_eq!(ran, 1234, "closure runs once the flock is free");
 }

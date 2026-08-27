@@ -1,49 +1,52 @@
 //! `clauth list` — a human-readable account table.
 //!
-//! Renders over the exact `serde_json::Value` body `daemon::build_status`
-//! produces, the same one `clauth status --json` serializes, so every column
-//! sourced from that body cannot drift from `status`. Presentation only: it
-//! reads the on-disk usage caches `build_status` reads and never fetches.
+//! Renders over the typed entries `daemon::build_profile_entries` produces —
+//! the same entries `build_status` serializes into the body `clauth status
+//! --json` prints — so every column sourced from those entries cannot drift
+//! from `status`. Presentation only: it reads the on-disk usage caches
+//! `build_status` reads and never fetches.
 //!
-//! Two facts do NOT come from the body, because it carries neither: the
+//! Two facts do NOT come from the entries, because they carry neither: the
 //! `disabled` flag (read off `config`) and the `canceled` flag (read off the
 //! per-profile usage cache). Both surface in the trailing state marker, so this
 //! table shows two states `status --json` does not expose.
 
 use anyhow::Result;
 
-use crate::daemon::build_status;
+use crate::daemon::{ProfileEntry, build_profile_entries};
 use crate::format::format_pct;
 use crate::out::out;
 use crate::profile::{AppConfig, load_config};
+use crate::profile_json::Window;
 
 /// `clauth list [--all|--disabled]` — print the account table. `include_disabled`
-/// mirrors `build_status`'s flag: disabled profiles are hidden by default (the
-/// active profile is always kept, disabled or not).
+/// mirrors `build_profile_entries`'s flag: disabled profiles are hidden by
+/// default (the active profile is always kept, disabled or not).
 pub(crate) fn run(include_disabled: bool) -> Result<()> {
     let config = load_config()?;
-    let body = build_status(
+    let entries = build_profile_entries(
         &config,
         config.state.refresh_interval_ms,
         None,
         include_disabled,
     );
-    out!("{}", render_table(&config, &body));
+    out!("{}", render_table(&config, &entries));
     Ok(())
 }
 
-/// One rendered table row. Three sources, because the JSON body carries only
-/// the first: a single `build_status` profile entry, `config` for the disabled
-/// flag, and the profile's own `usage_cache.json` for the canceled one (via
-/// `profile_json::is_canceled_cached`).
+/// One rendered table row. Three sources, because the status entry carries only
+/// the first: a single `build_profile_entries` profile entry, `config` for the
+/// disabled flag, and the profile's own `usage_cache.json` for the canceled one
+/// (via `profile_json::is_canceled_cached`).
 struct Row {
     /// `*` for the active profile, a space otherwise.
     marker: char,
     name: String,
     /// Tier for an anthropic account (`Max 5x`), else the provider name for a
-    /// third-party one. Reading `entry["tier"]` keeps this in lockstep with
-    /// `status`. A canceled subscription reads as its post-cancellation tier
-    /// (`Free`) here; [`Row::state_suffix`] is what names the cancellation.
+    /// third-party one. Typed off the entry's `tier` field, keeping this in
+    /// lockstep with `status`. A canceled subscription reads as its
+    /// post-cancellation tier (`Free`) here; [`Row::state_suffix`] is what names
+    /// the cancellation.
     plan: String,
     /// 5h / 7d window utilization as `NN%` (share consumed), `-` when no cache.
     five_h: String,
@@ -69,26 +72,23 @@ struct Row {
 }
 
 impl Row {
-    fn from_entry(config: &AppConfig, entry: &serde_json::Value) -> Row {
-        let name = entry["name"].as_str().unwrap_or("?");
-        let typed_name = crate::profile::ProfileName::from(name);
-        let provider = entry["provider"].as_str().unwrap_or("");
-        let windows = entry["windows"].as_array();
+    fn from_entry(config: &AppConfig, entry: &ProfileEntry) -> Row {
+        let typed_name = &entry.name;
         Row {
-            marker: if entry["active"].as_bool() == Some(true) {
-                '*'
-            } else {
-                ' '
-            },
-            name: name.to_string(),
-            plan: entry["tier"].as_str().unwrap_or(provider).to_string(),
-            five_h: window_pct(windows, crate::usage::LABEL_5H),
-            seven_d: window_pct(windows, crate::usage::LABEL_7D),
-            endpoint: entry["base_url"].as_str().unwrap_or("-").to_string(),
-            disabled: config.find(&typed_name).is_some_and(|p| p.is_disabled()),
-            canceled: crate::profile_json::is_canceled_cached(&typed_name),
-            usage_login: (entry["fetch_status"].as_str() == Some("AuthExpired")).then(|| {
-                let p = config.find(&typed_name);
+            marker: if entry.active { '*' } else { ' ' },
+            name: entry.name.as_str().to_string(),
+            plan: entry
+                .tier
+                .as_deref()
+                .unwrap_or(entry.provider.as_str())
+                .to_string(),
+            five_h: window_pct(&entry.windows, crate::usage::LABEL_5H),
+            seven_d: window_pct(&entry.windows, crate::usage::LABEL_7D),
+            endpoint: entry.base_url.as_deref().unwrap_or("-").to_string(),
+            disabled: config.find(typed_name).is_some_and(|p| p.is_disabled()),
+            canceled: crate::profile_json::is_canceled_cached(typed_name),
+            usage_login: (entry.fetch_status.as_deref() == Some("AuthExpired")).then(|| {
+                let p = config.find(typed_name);
                 if p.is_some_and(|p| p.console.is_some()) {
                     "login expired"
                 } else if p.is_some_and(|p| p.provider != Some(crate::providers::Provider::Alibaba))
@@ -126,11 +126,12 @@ impl Row {
 /// The `utilization_pct` of the window labeled `label`, formatted via
 /// [`format_pct`] (drops trailing `.0`); `-` when the profile has no cache
 /// or no such window.
-fn window_pct(windows: Option<&Vec<serde_json::Value>>, label: &str) -> String {
+fn window_pct(windows: &[Window], label: &str) -> String {
     windows
-        .and_then(|ws| ws.iter().find(|w| w["label"].as_str() == Some(label)))
-        .and_then(|w| w["utilization_pct"].as_f64())
-        .map_or_else(|| "-".to_string(), format_pct)
+        .iter()
+        .find(|w| w.label == label)
+        .map(|w| format_pct(w.utilization_pct))
+        .unwrap_or_else(|| "-".to_string())
 }
 
 /// Minimum column width: the header vs every cell, counted in `char`s so a
@@ -143,9 +144,7 @@ fn col_width<'a>(header: &str, cells: impl Iterator<Item = &'a str>) -> usize {
         .unwrap_or(0)
 }
 
-fn render_table(config: &AppConfig, body: &serde_json::Value) -> String {
-    let empty = Vec::new();
-    let entries = body["profiles"].as_array().unwrap_or(&empty);
+fn render_table(config: &AppConfig, entries: &[ProfileEntry]) -> String {
     if entries.is_empty() {
         return "no accounts yet. add one with `clauth login <name>`.\n".to_string();
     }

@@ -12,11 +12,15 @@
 
 use std::collections::HashMap;
 
-use crate::profile::{AppConfig, Profile};
+use serde::{Deserialize, Serialize};
+
+use crate::profile::{AppConfig, Profile, ProfileName};
 use crate::profile_cache::{
     THIRD_PARTY_CACHE_FILE, USAGE_CACHE_FILE, load_profile_cache, profile_cache_mtime_ms,
 };
-use crate::profile_json::{provider_label, tier_label, usage_cache_file, windows_json};
+use crate::profile_json::{
+    Window, provider_label, published_windows, tier_label, usage_cache_file,
+};
 use crate::providers::ThirdPartyStats;
 use crate::usage::{
     FetchStatus, UsageInfo, epoch_secs_to_iso, is_stuck_rate_limited, now_ms, windows_maxed,
@@ -103,24 +107,80 @@ fn auth_status_str(config: &AppConfig, p: &Profile, now_ms: i64) -> &'static str
     "ok"
 }
 
-/// Build the full `status.json` body. `interval_ms` is the live refresh interval
-/// (daemon) or `config.state.refresh_interval_ms` (single-shot). `live` carries
-/// the scheduler's in-memory freshness/countdown stores when a daemon is running.
+/// One `profiles[]` entry of the published `status.json` body — the shape both
+/// the writer ([`build_profile_entries`], serialized by [`build_status`]) and
+/// the reader (`clauth list`'s table rows) derive from, so a reader's field
+/// access cannot drift from what the writer emits. Contract: wiki/Daemon.md.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct ProfileEntry {
+    pub(crate) name: ProfileName,
+    /// Active-profile marker source. The active profile is always kept, disabled
+    /// or not: the top-level `active_profile` field names it unconditionally,
+    /// and a reader resolves that name against `profiles[]`.
+    pub(crate) active: bool,
+    /// Additive (CLA-ROLL): what the sidecar actually HOLDS — the same content
+    /// classification the TUI renders, not the config flag. The two part ways
+    /// exactly when honesty matters: a dead chain degrades the sidecar onto its
+    /// static mint while the flag stays on, and the flag would promise readers
+    /// a re-stamp for a mint nobody is going to re-stamp. While true, the
+    /// sidecar's hours-scale countdown is routine maintenance (daemon re-stamps
+    /// on rotation and on the freshness timer); while false it is a real
+    /// credential clock. Readers key their token-row rendering off this so a
+    /// rolling token never displays as an expiring mint — nor the reverse.
+    pub(crate) rolling_token: bool,
+    /// Display provider label: a recognised third-party name, else `anthropic`.
+    pub(crate) provider: String,
+    /// The third-party endpoint, `None` for the default Anthropic one.
+    pub(crate) base_url: Option<String>,
+    /// Human tier label for an anthropic account (`Max 5x`); `None` for
+    /// third-party/api-key profiles.
+    pub(crate) tier: Option<String>,
+    /// A live `clauth start` session runs for this profile.
+    pub(crate) has_live_session: bool,
+    /// `ok` / `expiring` / `broken` (see [`auth_status_str`]).
+    pub(crate) auth_status: String,
+    /// Freshness: a live daemon's verdict or the cache-mtime derivation; `None`
+    /// when there is no cache at all.
+    pub(crate) fetch_status: Option<String>,
+    /// Additive (schema stays 1): true when the daemon distrusts this reading
+    /// as a deep-slot stuck RateLimited — readers dim it / show a "stuck" cue
+    /// instead of treating it as current truth. Always false for the single-shot
+    /// `status --json`.
+    pub(crate) stale: bool,
+    /// ISO-8601 UTC stamp of the cache behind the published figures; `None`
+    /// when there is no cache.
+    pub(crate) fetched_at: Option<String>,
+    /// ISO-8601 UTC stamp of the next scheduled refresh; `None` when none is
+    /// pending (a spent skipped account, or no cache).
+    pub(crate) next_refresh_at: Option<String>,
+    pub(crate) auto_start: bool,
+    pub(crate) bell_threshold: Option<f64>,
+    /// The chain-membership object (`position` / `threshold` / `armed`), `None`
+    /// when not a chain member.
+    pub(crate) fallback: Option<serde_json::Value>,
+    /// The OAuth 5h/7d usage rows; empty when the profile has no OAuth cache.
+    pub(crate) windows: Vec<Window>,
+    /// The third-party availability object (`available`), `None` for OAuth
+    /// accounts.
+    pub(crate) third_party: Option<serde_json::Value>,
+}
+
+/// The per-profile entries [`build_status`] publishes — typed, so a reader
+/// (`clauth list`) derives its fields instead of re-spelling string keys. One
+/// builder for both surfaces, so they cannot drift.
+///
 /// `include_disabled` gates whether a user-disabled account appears in the
 /// `profiles` array at all — the daemon's own `status.json` feed always passes
 /// `false` (hidden by default); the single-shot `clauth status --json --all`/
-/// `--disabled` flag flips it to `true`. The active profile is ALWAYS kept, disabled or not: the
-/// top-level `active_profile` field names it unconditionally, and a reader
-/// following this contract resolves that name against `profiles[]` — hiding it
-/// there would leave `active_profile` dangling.
-pub(crate) fn build_status(
+/// `--disabled` flag flips it to `true`.
+pub(crate) fn build_profile_entries(
     config: &AppConfig,
     interval_ms: u64,
     live: Option<&LiveSignals>,
     include_disabled: bool,
-) -> serde_json::Value {
+) -> Vec<ProfileEntry> {
     let now = now_ms();
-    let profiles: Vec<serde_json::Value> = config
+    config
         .profiles
         .iter()
         .filter(|p| include_disabled || !p.is_disabled() || config.is_active(&p.name))
@@ -234,45 +294,43 @@ pub(crate) fn build_status(
                 None
             };
 
-            serde_json::json!({
-                "name": name,
-                "active": config.is_active(name),
-                // Additive (CLA-ROLL): what the sidecar actually HOLDS — the
-                // same content classification the TUI renders, not the config
-                // flag. The two part ways exactly when honesty matters: a dead
-                // chain degrades the sidecar onto its static mint while the
-                // flag stays on, and the flag would promise readers a re-stamp
-                // for a mint nobody is going to re-stamp. While true, the
-                // sidecar's hours-scale countdown is routine maintenance
-                // (daemon re-stamps on rotation and on the freshness timer);
-                // while false it is a real credential clock. Readers key their
-                // token-row rendering off this so a rolling token never
-                // displays as an expiring mint — nor the reverse.
-                "rolling_token": matches!(
+            ProfileEntry {
+                name: name.clone(),
+                active: config.is_active(name),
+                rolling_token: matches!(
                     crate::claude::sidecar_summary(name),
                     Some((crate::claude::SidecarKind::Rolling, _))
                 ),
-                "provider": provider_label(p),
-                "base_url": p.base_url,
-                "tier": tier_label(p),
-                "has_live_session": crate::runtime::has_live_session(name),
-                "auth_status": auth_status_str(config, p, now as i64),
-                "fetch_status": fetch_status,
-                // Additive (schema stays 1): true when the daemon distrusts this
-                // reading as a deep-slot stuck RateLimited — readers dim it / show
-                // a "stuck" cue instead of treating it as current truth. Always
-                // false for the single-shot `status --json`.
-                "stale": stale,
-                "fetched_at": mtime_ms.map(iso_from_ms),
-                "next_refresh_at": next_refresh_ms.map(iso_from_ms),
-                "auto_start": p.auto_start,
-                "bell_threshold": p.bell_threshold,
-                "fallback": fallback_json(config, p),
-                "windows": windows_json(name),
-                "third_party": third_party,
-            })
+                provider: provider_label(p),
+                base_url: p.base_url.clone(),
+                tier: tier_label(p),
+                has_live_session: crate::runtime::has_live_session(name),
+                auth_status: auth_status_str(config, p, now as i64).to_string(),
+                fetch_status: fetch_status.map(str::to_string),
+                stale,
+                fetched_at: mtime_ms.map(iso_from_ms),
+                next_refresh_at: next_refresh_ms.map(iso_from_ms),
+                auto_start: p.auto_start,
+                bell_threshold: p.bell_threshold,
+                fallback: fallback_json(config, p),
+                windows: published_windows(name),
+                third_party,
+            }
         })
-        .collect();
+        .collect()
+}
+
+/// Build the full `status.json` body. `interval_ms` is the live refresh interval
+/// (daemon) or `config.state.refresh_interval_ms` (single-shot). `live` carries
+/// the scheduler's in-memory freshness/countdown stores when a daemon is running.
+pub(crate) fn build_status(
+    config: &AppConfig,
+    interval_ms: u64,
+    live: Option<&LiveSignals>,
+    include_disabled: bool,
+) -> serde_json::Value {
+    let now = now_ms();
+    let profiles = build_profile_entries(config, interval_ms, live, include_disabled);
 
     serde_json::json!({
         "schema": SCHEMA_VERSION,

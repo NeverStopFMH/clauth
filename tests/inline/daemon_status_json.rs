@@ -798,3 +798,50 @@ fn build_status_rolling_token_is_false_for_a_misfill() {
         "a mis-fill is the state the split exists to detect, not a rolling token"
     );
 }
+
+/// The published `profiles[]` entries deserialize into [`ProfileEntry`] — the
+/// typed spelling the reader (`clauth list`) derives its fields from. A field
+/// the writer drops or renames reds here instead of in a reader's typed access.
+#[test]
+fn published_entries_deserialize_into_the_typed_contract() {
+    let _home = HomeSandbox::new();
+    let mut config = AppConfig {
+        state: AppState::default(),
+        profiles: vec![oauth_profile("work")],
+    };
+    config.state.active_profile = Some("work".into());
+    // Warm the cache so the entry carries real window rows.
+    crate::testutil::register_names(&["work"]);
+    crate::profile_cache::write_profile_cache(
+        &crate::profile::ProfileName::from("work"),
+        crate::profile_cache::USAGE_CACHE_FILE,
+        &crate::usage::UsageInfo {
+            five_hour: Some(crate::usage::UsageWindow {
+                utilization: 42.4,
+                resets_at: None,
+            }),
+            ..Default::default()
+        },
+    );
+
+    let v = build_status(&config, 300_000, None, false);
+    let entries: Vec<ProfileEntry> = serde_json::from_value(v["profiles"].clone()).unwrap();
+    assert_eq!(entries.len(), 1);
+    let entry = &entries[0];
+    assert_eq!(entry.name.as_str(), "work");
+    assert!(entry.active);
+    assert_eq!(entry.windows.len(), 1);
+    assert_eq!(entry.windows[0].label, "5h");
+    assert_eq!(entry.windows[0].utilization_pct, 42.4);
+    // The window row's published key set, pinned like the entry's above: both
+    // sides derive from one struct, so a rename compiles clean and would
+    // silently change the wire shape for every external reader.
+    let mut win_keys: Vec<&str> = v["profiles"][0]["windows"][0]
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(|k| k.as_str())
+        .collect();
+    win_keys.sort_unstable();
+    assert_eq!(win_keys, ["label", "resets_at", "utilization_pct"]);
+}

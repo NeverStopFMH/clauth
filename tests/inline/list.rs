@@ -68,8 +68,8 @@ fn list_table_hides_disabled_by_default_and_marks_the_active_profile() {
     config.state.active_profile = Some("work".into());
     warm_usage("work", 42.4, 17.6);
 
-    let body = build_status(&config, config.state.refresh_interval_ms, None, false);
-    let table = render_table(&config, &body);
+    let entries = build_profile_entries(&config, config.state.refresh_interval_ms, None, false);
+    let table = render_table(&config, &entries);
 
     let lines: Vec<&str> = table.lines().collect();
     assert_eq!(
@@ -95,8 +95,8 @@ fn list_table_reveals_disabled_with_a_trailing_marker_when_included() {
     config.state.active_profile = Some("work".into());
     warm_usage("work", 42.4, 17.6);
 
-    let body = build_status(&config, config.state.refresh_interval_ms, None, true);
-    let table = render_table(&config, &body);
+    let entries = build_profile_entries(&config, config.state.refresh_interval_ms, None, true);
+    let table = render_table(&config, &entries);
 
     let lines: Vec<&str> = table.lines().collect();
     assert_eq!(
@@ -144,7 +144,7 @@ fn list_table_marks_a_canceled_account_and_keeps_its_real_tier() {
 
     let table = render_table(
         &config,
-        &build_status(&config, config.state.refresh_interval_ms, None, true),
+        &build_profile_entries(&config, config.state.refresh_interval_ms, None, true),
     );
     let lines: Vec<&str> = table.lines().collect();
     assert_eq!(
@@ -172,7 +172,7 @@ fn list_table_leaves_a_live_account_unmarked() {
 
     let table = render_table(
         &config,
-        &build_status(&config, config.state.refresh_interval_ms, None, true),
+        &build_profile_entries(&config, config.state.refresh_interval_ms, None, true),
     );
     assert_eq!(table.lines().collect::<Vec<_>>(), [HEADER, WORK_ROW]);
     assert!(
@@ -199,7 +199,7 @@ fn list_table_stacks_disabled_and_canceled_rather_than_letting_one_win() {
 
     let table = render_table(
         &config,
-        &build_status(&config, config.state.refresh_interval_ms, None, true),
+        &build_profile_entries(&config, config.state.refresh_interval_ms, None, true),
     );
     let lines: Vec<&str> = table.lines().collect();
     assert_eq!(
@@ -231,8 +231,8 @@ fn list_table_shows_provider_as_plan_and_the_base_url_endpoint_for_a_third_party
         profiles: vec![zai],
     };
 
-    let body = build_status(&config, config.state.refresh_interval_ms, None, false);
-    let table = render_table(&config, &body);
+    let entries = build_profile_entries(&config, config.state.refresh_interval_ms, None, false);
+    let table = render_table(&config, &entries);
 
     let lines: Vec<&str> = table.lines().collect();
     assert_eq!(
@@ -252,9 +252,9 @@ fn list_table_reports_no_accounts_when_empty() {
         state: AppState::default(),
         profiles: vec![],
     };
-    let body = build_status(&config, config.state.refresh_interval_ms, None, true);
+    let entries = build_profile_entries(&config, config.state.refresh_interval_ms, None, true);
     assert_eq!(
-        render_table(&config, &body),
+        render_table(&config, &entries),
         "no accounts yet. add one with `clauth login <name>`.\n"
     );
 }
@@ -285,8 +285,8 @@ fn a_dead_credential_is_named_in_the_state_suffix() {
     crate::testutil::register_names(&["qwen"]);
     crate::profile_cache::write_auth_expired(&crate::profile::ProfileName::from("qwen"), fp);
 
-    let body = crate::daemon::build_status(&config, 300_000, None, false);
-    let table = render_table(&config, &body);
+    let entries = crate::daemon::build_profile_entries(&config, 300_000, None, false);
+    let table = render_table(&config, &entries);
     assert!(
         table.contains("login expired"),
         "the table must name a credential that will never self-heal, got:\n{table}"
@@ -320,8 +320,8 @@ fn a_profile_that_never_stored_a_session_is_told_it_needs_one() {
     crate::testutil::register_names(&["qwen"]);
     crate::profile_cache::write_auth_expired(&crate::profile::ProfileName::from("qwen"), fp);
 
-    let body = crate::daemon::build_status(&config, 300_000, None, false);
-    let table = render_table(&config, &body);
+    let entries = crate::daemon::build_profile_entries(&config, 300_000, None, false);
+    let table = render_table(&config, &entries);
     assert!(
         table.contains("login needed"),
         "an account that never had a session is not expired, got:\n{table}"
@@ -353,8 +353,8 @@ fn a_dead_api_key_is_told_the_key_was_rejected() {
     crate::testutil::register_names(&["deepseek"]);
     crate::profile_cache::write_auth_expired(&crate::profile::ProfileName::from("deepseek"), fp);
 
-    let body = crate::daemon::build_status(&config, 300_000, None, false);
-    let table = render_table(&config, &body);
+    let entries = crate::daemon::build_profile_entries(&config, 300_000, None, false);
+    let table = render_table(&config, &entries);
     assert!(
         table.contains("key rejected"),
         "a dead api key is not a login problem, got:\n{table}"

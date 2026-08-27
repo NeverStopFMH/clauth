@@ -114,7 +114,7 @@ Rows are registered, with a harness tag on the row. They count in the live tally
 | profile CRUD | `save_profile` `profile.rs:1435` (no dir-exists check), `rename_profile` `actions.rs:492-496` (two-sided dir move), `delete_profile` `actions.rs:517` (live gate `:523`, dir removal `:555`, state `:560-561`) |
 | perms walk | `enforce_clauth_perms` `profile.rs:1218`, callers `profile.rs:1525` and `daemon/mod.rs:126` |
 | hot reload | `ReloadFingerprint` `profile.rs:865`, `reload_fingerprint` `:878`; `app_state_mtime` `:879` covers `profiles.toml` only; the dir walk `:881-901` already picks up any profile's `config.toml` |
-| published feed | `SCHEMA_VERSION` `daemon/status_json.rs:26`; body `:232-240`. Readers: `daemon/probe.rs:101` (untyped, `generated_at` only) and the whole of `list.rs` |
+| published feed | `SCHEMA_VERSION` `daemon/status_json.rs:26`; body `:232-240`. Readers: `daemon/probe.rs:101` (untyped, `generated_at` only); `list.rs` renders the typed `ProfileEntry` rows `build_profile_entries` builds |
 | shared JSON view | `profile_json.rs` feeds MCP, the daemon writer, and `status --json`. One additive change covers three surfaces |
 | which | `session_auth` `which.rs:111`, `session_profile_from_config_dir` `:133-146` (gated on `is_shared_runtime_dir_name`, returns the dir's `file_name()` verbatim) |
 | clean slate | zero `codex` tokens in `src/`. Three `harness` hits, all the test-harness sense (`testutil.rs:60,80`, `usage/fetch.rs:19`), so a bare `rg harness` sweep has noise |

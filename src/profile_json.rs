@@ -6,6 +6,8 @@
 //! return the last-persisted numbers whether or not a scheduler is live. One
 //! home for the shape keeps the three surfaces from drifting.
 
+use serde::{Deserialize, Serialize};
+
 use crate::profile::{Profile, ProfileName};
 use crate::profile_cache::{
     THIRD_PARTY_CACHE_FILE, USAGE_CACHE_FILE, load_profile_cache, profile_cache_mtime_ms,
@@ -204,33 +206,41 @@ fn cache_age_secs(name: &ProfileName, file: &str) -> Option<u64> {
     now_ms().checked_sub(mtime).map(|age| age / 1000)
 }
 
-/// The `{label, utilization_pct, resets_at}` rows of an OAuth usage read — 5h,
-/// 7d, then one entry per weekly model window (`7d <model>`).
-pub(crate) fn oauth_windows(usage: &UsageInfo) -> Vec<serde_json::Value> {
+/// One published OAuth window row — the `{label, utilization_pct, resets_at}`
+/// spelling of a 5h, 7d, or per-model weekly window. Both writers
+/// ([`oauth_windows`] → the daemon's `status.json` feed and the MCP payloads)
+/// and the reader (`clauth list`'s 5h/7d columns) derive from this one struct,
+/// so a reader's key spelling cannot drift from what a writer emits.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct Window {
+    pub(crate) label: String,
+    pub(crate) utilization_pct: f64,
+    pub(crate) resets_at: Option<String>,
+}
+
+/// The [`Window`] rows of an OAuth usage read — 5h, 7d, then one entry per
+/// weekly model window (`7d <model>`).
+pub(crate) fn oauth_windows(usage: &UsageInfo) -> Vec<Window> {
     usage
         .windows()
         .into_iter()
-        .map(|(label, w)| {
-            serde_json::json!({
-                "label": label,
-                "utilization_pct": w.utilization,
-                "resets_at": w.resets_at,
-            })
+        .map(|(label, w)| Window {
+            label: label.to_string(),
+            utilization_pct: w.utilization,
+            resets_at: w.resets_at.clone(),
         })
         .collect()
 }
 
-/// The profile's OAuth usage windows as a JSON array, read fresh from the disk
-/// cache; empty when there is no cache. The published `status.json` shape, whose
-/// readers branch on `schema` — hence an array here rather than
-/// [`ProfileWindows`]'s discriminated spelling, which the MCP surface renders.
-pub(crate) fn windows_json(name: &ProfileName) -> serde_json::Value {
-    serde_json::Value::Array(
-        load_profile_cache::<UsageInfo>(name, USAGE_CACHE_FILE)
-            .as_ref()
-            .map(oauth_windows)
-            .unwrap_or_default(),
-    )
+/// The profile's OAuth usage windows, read fresh from the disk cache; empty
+/// when there is no cache. The rows of the published `status.json` `windows`
+/// array — hence this flat spelling rather than [`ProfileWindows`]'s
+/// discriminated one, which the MCP surface renders.
+pub(crate) fn published_windows(name: &ProfileName) -> Vec<Window> {
+    load_profile_cache::<UsageInfo>(name, USAGE_CACHE_FILE)
+        .as_ref()
+        .map(oauth_windows)
+        .unwrap_or_default()
 }
 
 #[cfg(test)]

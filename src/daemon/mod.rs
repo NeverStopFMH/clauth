@@ -54,7 +54,7 @@ use crate::usage::{
 use status_json::LiveSignals;
 // `clauth list` (src/list.rs) renders a human table over the same body, so the
 // two surfaces read one code path and cannot drift.
-pub(crate) use status_json::build_status;
+pub(crate) use status_json::{ProfileEntry, build_profile_entries, build_status};
 
 /// Main-loop cadence. The scheduler ticks on its own 1s timer; this loop only
 /// executes queued switches/config edits and rewrites `status.json`, so 1s is plenty.

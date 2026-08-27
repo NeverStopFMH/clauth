@@ -1793,8 +1793,8 @@ fn collect_session_tokens(names: &[String]) -> HashMap<String, crate::claude::Se
         .collect()
 }
 
-/// Cloned `Arc`s bundled for [`spawn_refresher`]; carries no lock rank and is
-/// safe to construct while holding any lock.
+/// Cloned `Arc`s bundled for [`spawn_refresher`] and the bootstrap worker;
+/// carries no lock rank and is safe to construct while holding any lock.
 struct WorkerHandles {
     config: ConfigHandle,
     usage_tokens: TokenList,
@@ -1814,9 +1814,13 @@ struct WorkerHandles {
     third_party_status: ThirdPartyStatusStore,
     shutting_down: Arc<AtomicBool>,
     fetch_lease: Arc<crate::daemon::FetchLease>,
+    bootstrap_active: Arc<AtomicBool>,
+    startup_sender: StartupSender,
 }
 
 impl WorkerHandles {
+    /// Clone every `Arc` the background workers share with the UI thread out of
+    /// `app`.
     fn from_app(app: &App) -> Self {
         Self {
             config: Arc::clone(&app.config),
@@ -1837,6 +1841,8 @@ impl WorkerHandles {
             third_party_status: Arc::clone(&app.third_party_status),
             shutting_down: Arc::clone(&app.shutting_down),
             fetch_lease: Arc::clone(&app.fetch_lease),
+            bootstrap_active: Arc::clone(&app.bootstrap_active),
+            startup_sender: app.startup_sender.clone(),
         }
     }
 }
@@ -2105,17 +2111,10 @@ impl App {
     /// token snapshot, starts the scheduler, applies usage, and runs the startup
     /// auto-switch.
     pub(crate) fn spawn_bootstrap(&self) {
-        let config = Arc::clone(&self.config);
-        let usage_store = Arc::clone(&self.usage_store);
-        let usage_status = Arc::clone(&self.usage_status);
-        let third_party_usage_store = Arc::clone(&self.third_party_usage_store);
-        let third_party_status = Arc::clone(&self.third_party_status);
-        let last_fetched = Arc::clone(&self.last_fetched);
-        let refresh_interval = Arc::clone(&self.refresh_interval);
-        let activity = Arc::clone(&self.activity);
+        let h = WorkerHandles::from_app(self);
         let done = BootstrapDoneGuard {
-            bootstrap_active: Arc::clone(&self.bootstrap_active),
-            startup_sender: self.startup_sender.clone(),
+            bootstrap_active: h.bootstrap_active,
+            startup_sender: h.startup_sender,
         };
 
         spawn_worker(move || {
@@ -2123,7 +2122,7 @@ impl App {
 
             // Re-establish the credentials symlink (shutdown replaced it with
             // a plain file); without this, CC refreshes bypass the profile.
-            let active = Self::lock_config(&config).state.active_profile.clone();
+            let active = Self::lock_config(&h.config).state.active_profile.clone();
             if let Some(active) = active {
                 let _ = link_profile_credentials(&active);
             }
@@ -2133,25 +2132,25 @@ impl App {
             // the `Queued` marking below — a disabled profile is seeded but never
             // queued for a fetch it will never get.
             let (seed_names, snapshot, third_party) = {
-                let cfg = Self::lock_config(&config);
+                let cfg = Self::lock_config(&h.config);
                 (
                     collect_oauth_seed_names(&cfg),
                     collect_tokens(&cfg),
                     collect_third_party_entries(&cfg.profiles),
                 )
             };
-            let interval_ms = refresh_interval.load(Ordering::Relaxed);
+            let interval_ms = h.refresh_interval.load(Ordering::Relaxed);
             bootstrap_fetch(
-                &usage_store,
-                &usage_status,
-                &last_fetched,
+                &h.usage_store,
+                &h.usage_status,
+                &h.last_fetched,
                 &seed_names,
                 interval_ms,
             );
             bootstrap_third_party(
-                &third_party_usage_store,
-                &third_party_status,
-                &last_fetched,
+                &h.third_party_usage_store,
+                &h.third_party_status,
+                &h.last_fetched,
                 &third_party,
                 interval_ms,
             );
@@ -2169,7 +2168,7 @@ impl App {
             // past). The first tick re-marks (idempotent); each worker flips itself
             // to Fetching when its request fires and clears on landing.
             let now = now_ms();
-            let due_now: Vec<String> = match last_fetched.lock() {
+            let due_now: Vec<String> = match h.last_fetched.lock() {
                 Ok(lf) => snapshot
                     .iter()
                     .map(|e| e.name.clone())
@@ -2182,7 +2181,7 @@ impl App {
                 Err(_) => Vec::new(),
             };
             for name in &due_now {
-                mark_activity(&activity, name, ProfileActivity::Queued);
+                mark_activity(&h.activity, name, ProfileActivity::Queued);
             }
         });
     }

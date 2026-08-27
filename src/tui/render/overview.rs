@@ -322,7 +322,6 @@ fn render_overview_row(
 
     let active = cfg.is_active(&profile.name);
     let disabled = profile.is_disabled();
-    let name_str = profile.name.to_string();
     // Overview rows only: the refresh countdown carries the profile's
     // fetch-state cue (amber = last-known numbers, red = failed) so staleness
     // reads off the timer instead of the bar brackets.
@@ -346,7 +345,7 @@ fn render_overview_row(
             .activity
             .lock()
             .ok()
-            .and_then(|g| g.get(&name_str).copied())
+            .and_then(|g| g.get(profile.name.as_str()).copied())
             .unwrap_or(ProfileActivity::Idle);
         if !matches!(activity, ProfileActivity::Idle) {
             let frame = spinner_frame(app.tick_count);
@@ -357,7 +356,7 @@ fn render_overview_row(
                 .next_refresh_per_profile
                 .lock()
                 .ok()
-                .and_then(|m| m.get(&name_str).copied())
+                .and_then(|m| m.get(profile.name.as_str()).copied())
                 .map(|next_ms| {
                     let now = now_ms();
                     let secs = ((next_ms as i64 - now as i64) / 1000).max(0);
@@ -375,7 +374,7 @@ fn render_overview_row(
 
     // Long-lived-token state from the per-frame-free cache (App::session_tokens).
     // `token_danger` (expired or mis-filled) drives the `⊘` marker.
-    let token_status = app.session_tokens.get(&name_str);
+    let token_status = app.session_tokens.get(profile.name.as_str());
     let token_danger = token_status.is_some_and(|s| s.is_danger(now_ms() as i64));
 
     let mut spans = vec![cursor];
@@ -399,7 +398,7 @@ fn render_overview_row(
     } else if token_danger {
         spans.push(Span::styled("⊘", hue(theme::danger())));
         spans.push(Span::raw(" "));
-    } else if app.bell_fired.contains_key(&name_str) {
+    } else if app.bell_fired.contains_key(profile.name.as_str()) {
         spans.push(Span::styled("!", hue(theme::danger())));
         spans.push(Span::raw(" "));
     } else if active {
@@ -463,13 +462,7 @@ fn render_overview_row(
     let reset_style = |label, window: Option<&UsageWindow>| {
         let window = window?;
         drain_reset_style(
-            drain_rate(
-                app,
-                &crate::profile::ProfileName::from(name_str.clone()),
-                profile,
-                label,
-                window,
-            ),
+            drain_rate(app, &profile.name, profile, label, window),
             window_rate_unit(label),
             window,
         )
@@ -529,8 +522,7 @@ fn render_overview_row(
     if widths.live > 0 {
         spans.push(gap(widths));
         spans.push(live_cell(
-            app.live_sessions
-                .member(&crate::profile::ProfileName::from(name_str.clone())),
+            app.live_sessions.member(&profile.name),
             widths.live,
         ));
     }

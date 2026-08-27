@@ -1202,13 +1202,13 @@ pub(crate) fn kick_block_switch_grade(block: &KickBlock, now_secs: i64) -> bool 
 
 /// Names whose live kick block is switch-grade ([`kick_block_switch_grade`]),
 /// copied out under one short leaf lock for the auto-switch/recovery scans.
-fn kick_rejected_names(blocks: &KickBlocks, now_secs: i64) -> Vec<String> {
+fn kick_rejected_names(blocks: &KickBlocks, now_secs: i64) -> Vec<ProfileName> {
     blocks
         .lock()
         .map(|m| {
             m.iter()
                 .filter(|(_, b)| kick_block_switch_grade(b, now_secs))
-                .map(|(n, _)| n.clone())
+                .map(|(n, _)| ProfileName::from(n.clone()))
                 .collect()
         })
         .unwrap_or_default()
@@ -3009,16 +3009,13 @@ fn scan_auto_switch(
         .chain
         .iter()
         .filter(|m| decision_fresh_any(status, third_party_status, &m.name))
-        .map(|m| m.name.to_string())
+        .map(|m| m.name.clone())
         .collect();
 
     // Only act on a reading worth acting on. The rule, and the two bypasses that
     // keep it from wedging the scan, live in `reading_is_actionable` — shared with
     // the per-session leg, which applies it to each session's own member.
-    let active_broken = snapshot
-        .broken
-        .iter()
-        .any(|b| b == snapshot.active.as_str());
+    let active_broken = snapshot.broken.iter().any(|b| b == &snapshot.active);
     if !reading_is_actionable(active_broken, status, streaks, &snapshot.active.clone()) {
         return;
     }
@@ -3152,9 +3149,9 @@ fn scan_session_switches(
             .chain
             .iter()
             .filter(|m| decision_fresh_any(status, third_party_status, &m.name))
-            .map(|m| m.name.to_string())
+            .map(|m| m.name.clone())
             .collect();
-        let member_broken = snapshot.broken.iter().any(|b| b == member.as_str());
+        let member_broken = snapshot.broken.contains(&member);
         // The OAuth `StatusStore` alone, where the candidate fill above unions both
         // — and `decision_fresh_any` records why the twins must not disagree. Sound
         // here only because `swap_eligible`'s `is_oauth` arm leaves a

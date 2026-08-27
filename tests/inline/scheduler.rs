@@ -1494,7 +1494,10 @@ fn only_a_switch_grade_kick_block_rotates_the_chain() {
         ("dead".to_string(), grade),
         ("blip".to_string(), KickBlock { streak: 1, ..grade }),
     ])));
-    assert_eq!(kick_rejected_names(&blocks, now), vec!["dead".to_string()]);
+    assert_eq!(
+        kick_rejected_names(&blocks, now),
+        vec![crate::profile::ProfileName::from("dead")]
+    );
 }
 
 /// `note_kick_outcome` lifecycle: a 429 upserts the block and writes the

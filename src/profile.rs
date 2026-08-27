@@ -25,8 +25,11 @@ use crate::usage::{FetchStatus, UsageInfo};
 /// read-modify-written cross-process, so every write must run under the state
 /// flock — [`AppState::set_active`] and [`Profile::set_credentials`] take the
 /// [`StateLockHeld`] witness `with_state_lock` hands out, and a plain
-/// `slot = value` assignment no longer compiles: the inner value is private to
-/// this module.
+/// `slot = value` assignment of a real value no longer compiles: the inner is
+/// private to this module. `slot = Default::default()` still compiles — a
+/// witness-free clear to the default that `#[serde(default)]` on
+/// `active_profile` needs the derive for — and is the one write left outside
+/// the witness.
 ///
 /// Under `cfg(test)` the type is an alias for `T`, so fixtures build in-memory
 /// states without staging a flock hold and existing test literals compile

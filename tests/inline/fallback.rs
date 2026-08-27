@@ -944,7 +944,7 @@ fn find_recovered_returns_first_member_below_threshold() {
         Some("b".to_string()),
     );
     assert_eq!(
-        find_recovered_member(&members, &store, &["b".to_string()]),
+        find_recovered_member(&members, &store, &[ProfileName::from("b")]),
         None,
         "a kick-rejected member's idle usage is not recovery — its account \
          still refuses inference"
@@ -1508,7 +1508,7 @@ fn auto_switch_kick_rejected_active_walks_away_despite_idle_usage() {
         "a",
     );
     let mut snap = snapshot_chain(&config).expect("snapshot");
-    snap.kick_rejected = vec!["a".to_string()];
+    snap.kick_rejected = vec![ProfileName::from("a")];
     let store = store_with_infos(vec![
         // The rejected active's live read: an idle, lapsed window — exactly the
         // shape the 2026-07-15 outage froze uwuclxdy in while healthy siblings
@@ -1535,7 +1535,7 @@ fn auto_switch_never_targets_a_kick_rejected_member() {
     profiles[2].last_resort = true;
     let config = config_with_chain(profiles, "a");
     let mut snap = snapshot_chain(&config).expect("snapshot");
-    snap.kick_rejected = vec!["b".to_string()];
+    snap.kick_rejected = vec![ProfileName::from("b")];
     let store = store_with_infos(vec![
         // Exhausted active, idle-but-rejected b → the walk must land on c.
         ("a", usage_info(Some(window(100.0, Some(live_reset()))))),
@@ -1549,7 +1549,7 @@ fn auto_switch_never_targets_a_kick_rejected_member() {
 
     // Same chain with the rejection also covering the last resort: nothing
     // viable remains and the active stays put (no Off — switch_off_when_spent is unset).
-    snap.kick_rejected = vec!["b".to_string(), "c".to_string()];
+    snap.kick_rejected = vec![ProfileName::from("b"), ProfileName::from("c")];
     assert_eq!(next_auto_switch_target(&snap, &store), None);
 }
 
@@ -1588,7 +1588,7 @@ fn auto_switch_prefers_fresh_member_over_earlier_stale_one() {
         "a",
     );
     let mut snap = snapshot_chain(&config).expect("snapshot");
-    snap.fresh = vec!["c".to_string()];
+    snap.fresh = vec![ProfileName::from("c")];
     let store = store_with_utils(&[("a", 100.0), ("b", 10.0), ("c", 20.0)]);
     assert_eq!(
         next_auto_switch_target(&snap, &store),
@@ -1660,7 +1660,11 @@ fn return_to_preferred_walks_a_drifted_active_home() {
         "c",
     );
     let mut snap = snapshot_chain(&config).expect("snapshot");
-    snap.fresh = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+    snap.fresh = vec![
+        ProfileName::from("a"),
+        ProfileName::from("b"),
+        ProfileName::from("c"),
+    ];
     let store = store_with_utils(&[("a", 10.0), ("b", 10.0), ("c", 10.0)]);
     assert_eq!(
         next_auto_switch_target(&snap, &store),
@@ -1685,7 +1689,11 @@ fn return_to_preferred_is_a_no_op_once_already_home() {
         "a",
     );
     let mut snap = snapshot_chain(&config).expect("snapshot");
-    snap.fresh = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+    snap.fresh = vec![
+        ProfileName::from("a"),
+        ProfileName::from("b"),
+        ProfileName::from("c"),
+    ];
     let store = store_with_utils(&[("a", 10.0), ("b", 10.0), ("c", 10.0)]);
     assert_eq!(
         next_auto_switch_target(&snap, &store),
@@ -1711,7 +1719,11 @@ fn a_spent_preferred_active_is_left_not_kept() {
         "a",
     );
     let mut snap = snapshot_chain(&config).expect("snapshot");
-    snap.fresh = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+    snap.fresh = vec![
+        ProfileName::from("a"),
+        ProfileName::from("b"),
+        ProfileName::from("c"),
+    ];
     // Preferred active spent; b and c clear.
     let store = store_with_utils(&[("a", 100.0), ("b", 10.0), ("c", 10.0)]);
     assert_eq!(
@@ -1738,7 +1750,7 @@ fn return_to_preferred_gated_on_target_freshness() {
     );
     let mut snap = snapshot_chain(&config).expect("snapshot");
     // Active is fresh; preferred "a" is deliberately absent from `fresh`.
-    snap.fresh = vec!["b".to_string(), "c".to_string()];
+    snap.fresh = vec![ProfileName::from("b"), ProfileName::from("c")];
     let store = store_with_utils(&[("a", 10.0), ("b", 10.0), ("c", 10.0)]);
     assert_eq!(
         next_auto_switch_target(&snap, &store),
@@ -1763,7 +1775,11 @@ fn return_to_preferred_gated_on_target_clearance() {
         "c",
     );
     let mut snap = snapshot_chain(&config).expect("snapshot");
-    snap.fresh = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+    snap.fresh = vec![
+        ProfileName::from("a"),
+        ProfileName::from("b"),
+        ProfileName::from("c"),
+    ];
     let store = store_with_utils(&[("a", 100.0), ("b", 10.0), ("c", 10.0)]);
     assert_eq!(
         next_auto_switch_target(&snap, &store),
@@ -1790,7 +1806,7 @@ fn return_to_preferred_gated_on_active_freshness() {
     );
     let mut snap = snapshot_chain(&config).expect("snapshot");
     // Preferred "a" is fresh; the active "c" is deliberately NOT (stuck).
-    snap.fresh = vec!["a".to_string(), "b".to_string()];
+    snap.fresh = vec![ProfileName::from("a"), ProfileName::from("b")];
     let store = store_with_utils(&[("a", 10.0), ("b", 10.0), ("c", 10.0)]);
     assert_eq!(
         next_auto_switch_target(&snap, &store),
@@ -1815,12 +1831,18 @@ fn return_to_preferred_skips_a_broken_kick_rejected_or_canceled_preferred() {
             "c",
         )
     };
-    let fresh_all = || vec!["a".to_string(), "b".to_string(), "c".to_string()];
+    let fresh_all = || {
+        vec![
+            ProfileName::from("a"),
+            ProfileName::from("b"),
+            ProfileName::from("c"),
+        ]
+    };
 
     // Broken preferred.
     let config = base();
     let mut snap = snapshot_chain(&config).expect("snapshot");
-    snap.broken = vec!["a".to_string()];
+    snap.broken = vec![ProfileName::from("a")];
     snap.fresh = fresh_all();
     let store = store_with_utils(&[("a", 10.0), ("b", 10.0), ("c", 10.0)]);
     assert_eq!(
@@ -1832,7 +1854,7 @@ fn return_to_preferred_skips_a_broken_kick_rejected_or_canceled_preferred() {
     // Kick-rejected preferred.
     let config = base();
     let mut snap = snapshot_chain(&config).expect("snapshot");
-    snap.kick_rejected = vec!["a".to_string()];
+    snap.kick_rejected = vec![ProfileName::from("a")];
     snap.fresh = fresh_all();
     assert_eq!(
         next_auto_switch_target(&snap, &store),

@@ -776,7 +776,7 @@ pub(crate) struct ChainSnapshot {
     /// Snapshot of `AppState::auth_broken` — members whose OAuth refresh is
     /// revoked/invalid (AUTH-1). Excluded from every walk pass so a dead token
     /// is never installed unattended.
-    pub(crate) broken: Vec<String>,
+    pub(crate) broken: Vec<ProfileName>,
     /// Snapshot of `AppState::burn_aware_switching` (issue #8 follow-up b) —
     /// gates whether the ACTIVE-side check in `next_auto_switch_target`
     /// projects ahead of the next poll instead of using the static threshold.
@@ -807,7 +807,7 @@ pub(crate) struct ChainSnapshot {
     /// from the live kick-block map. A rejected member can't serve inference
     /// even with idle-looking usage, so it is walked around like `broken`, and
     /// a rejected ACTIVE bypasses the exhaustion gate the same way.
-    pub(crate) kick_rejected: Vec<String>,
+    pub(crate) kick_rejected: Vec<ProfileName>,
     /// Members whose last store read was live (`FetchStatus::Fresh`) — the same
     /// freshness `decision_fresh` gates the ACTIVE on. Not config state:
     /// [`snapshot_chain`] leaves it empty and the scheduler's scan fills it from
@@ -816,7 +816,7 @@ pub(crate) struct ChainSnapshot {
     /// member has headroom the walk still accepts a stale-but-unexhausted one,
     /// so an exhausted active never loses its escape (2026-06-28 target
     /// asymmetry: the walk gates only the ACTIVE, never the target).
-    pub(crate) fresh: Vec<String>,
+    pub(crate) fresh: Vec<ProfileName>,
 }
 
 /// Snapshot active profile + chain + per-member thresholds out of `AppConfig`.
@@ -924,12 +924,7 @@ fn build_chain_snapshot(
         active,
         chain,
         switch_off_when_spent: config.state.switch_off_when_spent,
-        broken: config
-            .state
-            .auth_broken
-            .iter()
-            .map(|n| n.as_str().to_string())
-            .collect(),
+        broken: config.state.auth_broken.clone(),
         burn_aware: config.state.burn_aware_switching,
         interval_ms: config.state.refresh_interval_ms,
         burn_floor_pct: config.state.burn_switch_floor_pct(),
@@ -1291,7 +1286,7 @@ fn next_auto_switch_target_with_usage(
     // sibling idled (observed 2026-07-09). The flag is terminal-confirmed (set
     // only after a rejected refresh AND a failed live-mirror adopt), and the
     // walk below never consults the broken active's own usage.
-    let active_broken = snapshot.broken.iter().any(|b| b == active.name.as_str());
+    let active_broken = snapshot.broken.iter().any(|b| b == &active.name);
     // A kick-rejected active is broken's messages-limiter analogue: its usage
     // can read as idle headroom (`/usage` stays 200 through the outage) while
     // every inference request is rejected, so exhaustion can't be a
@@ -1299,10 +1294,7 @@ fn next_auto_switch_target_with_usage(
     // the block clears itself once a kick lands — so only the switch-grade
     // form (limiter-confirmed `rejected`, ≥2 kicks, ceiling ahead) reaches
     // this snapshot at all.
-    let active_kick_rejected = snapshot
-        .kick_rejected
-        .iter()
-        .any(|k| k == active.name.as_str());
+    let active_kick_rejected = snapshot.kick_rejected.iter().any(|k| k == &active.name);
     // A canceled active is `broken`'s subscription analogue: its cached usage
     // reads as idle headroom while `/v1/messages` 403s, so exhaustion can't gate
     // leaving it. Sourced from the usage snapshot (the plan the scheduler holds),
@@ -1321,14 +1313,11 @@ fn next_auto_switch_target_with_usage(
 
     let skip = |i: usize| {
         snapshot.chain[i].name == active.name
-            || snapshot
-                .broken
-                .iter()
-                .any(|b| b == snapshot.chain[i].name.as_str())
+            || snapshot.broken.iter().any(|b| b == &snapshot.chain[i].name)
             || snapshot
                 .kick_rejected
                 .iter()
-                .any(|k| k == snapshot.chain[i].name.as_str())
+                .any(|k| k == &snapshot.chain[i].name)
             || is_canceled_from_usage(&snapshot.chain[i].name, usage)
     };
     let walk = |accept: &dyn Fn(&ChainMember) -> bool| -> Option<String> {
@@ -1384,11 +1373,11 @@ fn next_auto_switch_target_with_usage(
         // home is clear and fresh.
         if let Some(pref) = snapshot.chain.iter().find(|m| m.preferred)
             && pref.name != active.name
-            && snapshot.fresh.iter().any(|n| n == active.name.as_str())
+            && snapshot.fresh.iter().any(|n| n == &active.name)
             && let Some(pi) = snapshot.chain.iter().position(|m| m.name == pref.name)
             && !skip(pi)
             && clear(&snapshot.chain[pi])
-            && snapshot.fresh.iter().any(|n| n == pref.name.as_str())
+            && snapshot.fresh.iter().any(|n| n == &pref.name)
         {
             return Some(SwitchAction::To(pref.name.to_string()));
         }
@@ -1399,7 +1388,7 @@ fn next_auto_switch_target_with_usage(
     // (2026-06-28 target asymmetry): prefer a member whose usage read we
     // TRUST (`snapshot.fresh`, the same StatusStore liveness `decision_fresh`
     // gates the ACTIVE on), but the any-freshness pass always runs.
-    let is_fresh = |m: &ChainMember| snapshot.fresh.iter().any(|n| n == m.name.as_str());
+    let is_fresh = |m: &ChainMember| snapshot.fresh.iter().any(|n| n == &m.name);
     if let Some(name) = walk(&|m| clear(m) && is_fresh(m)) {
         return Some(SwitchAction::To(name));
     }
@@ -1526,11 +1515,11 @@ fn fully_clear_target(config: &AppConfig, weekly_pct: f64) -> Option<String> {
 pub(crate) fn find_recovered_member(
     chain: &[ChainMember],
     store: &UsageStore,
-    kick_rejected: &[String],
+    kick_rejected: &[ProfileName],
 ) -> Option<String> {
     let now = now_epoch_secs();
     let recovered = |member: &ChainMember, require_scoped_clear: bool| -> Option<bool> {
-        if kick_rejected.iter().any(|k| k == member.name.as_str()) {
+        if kick_rejected.iter().any(|k| k == &member.name) {
             return Some(false);
         }
         // A fetched entry whose 5h window is absent or past its reset is idle

@@ -4205,7 +4205,7 @@ pub(crate) struct SwitchGateResult {
 /// `claude` refreshing through the symlink — the same exemption as the
 /// CLI/MCP paths.
 fn perform_switch(app: &mut App, name: &ProfileName) {
-    let active = app.config().state.active_profile.clone();
+    let active = app.config().state.active_profile.as_ref().cloned();
     if active.as_deref() == Some(name) {
         finalize_switch(app, name);
         return;

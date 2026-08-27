@@ -162,7 +162,7 @@ pub(crate) fn switch_profile_reconciled(config: &mut AppConfig, name: &ProfileNa
 /// CLI switch: relink (reconciling diverged live file via `[Y/n]` prompt), then
 /// prime the 5h window. No token rotation — stale chains rotate lazily on first use.
 pub(crate) fn switch_profile_cli(config: AppConfig, canonical: &ProfileName) -> Result<()> {
-    let outgoing = config.state.active_profile.clone();
+    let outgoing = config.state.active_profile.as_ref().cloned();
 
     // Diverged link = CC re-logged and wrote a regular file; must reconcile
     // (capture into outgoing profile) rather than refuse. A logged-out shell is

@@ -63,8 +63,8 @@ use crate::claude::{build_claude_settings_json, create_symlink};
 use crate::lock::with_state_lock;
 use crate::logline::logline;
 use crate::profile::{
-    ClaudeCredentials, Profile, atomic_write_600, claude_dir, clauth_dir, home_dir, profile_dir,
-    profile_subpath,
+    ClaudeCredentials, Profile, ProfileName, atomic_write_600, claude_dir, clauth_dir, home_dir,
+    profile_dir, profile_subpath,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -297,7 +297,7 @@ struct SessionPaths {
 
 impl SessionPaths {
     fn resolve(
-        name: &str,
+        name: &ProfileName,
         isolation: Isolation,
         session: &SessionId,
         mode: LinkMode,
@@ -392,7 +392,11 @@ fn stamp_legacy_marker(path: &Path) -> Option<File> {
 /// deliberately loose filter: a row reaped under a live session is a live
 /// session nothing can be pointed at again, while probing an absent path costs
 /// one `open` that fails.
-fn session_marker_paths(profile: &str, isolated: bool, session_id: &str) -> Result<[PathBuf; 2]> {
+fn session_marker_paths(
+    profile: &ProfileName,
+    isolated: bool,
+    session_id: &str,
+) -> Result<[PathBuf; 2]> {
     let isolation = if isolated {
         Isolation::Isolated
     } else {
@@ -416,7 +420,11 @@ fn session_marker_paths(profile: &str, isolated: bool, session_id: &str) -> Resu
 /// fall back to `start_profile` (where a session that never moved lives), so a row
 /// can never be alive for one consumer and dead for another. A caller MUST use the
 /// same fallback the tally uses, or GC would reap what the tally counts.
-pub(crate) fn session_row_is_live(start_profile: &str, isolated: bool, session_id: &str) -> bool {
+pub(crate) fn session_row_is_live(
+    start_profile: &ProfileName,
+    isolated: bool,
+    session_id: &str,
+) -> bool {
     let Ok(markers) = session_marker_paths(start_profile, isolated, session_id) else {
         return true;
     };
@@ -429,7 +437,7 @@ pub(crate) fn session_row_is_live(start_profile: &str, isolated: bool, session_i
 /// rebuild it.
 #[cfg(test)]
 pub(crate) fn hold_session_row_marker(
-    start_profile: &str,
+    start_profile: &ProfileName,
     isolated: bool,
     session_id: &str,
 ) -> Result<File> {
@@ -465,7 +473,7 @@ fn profiles_root_dir() -> Result<PathBuf> {
 /// The filter stays the LOOSE prefix test on purpose, where GC's uses the strict
 /// [`is_sessions_dir_name`]: a name this misses is a live session the destructive
 /// guards cannot see, while a name GC's misses is only a dir left uncollected.
-fn session_marker_dirs(name: &str) -> Option<Vec<PathBuf>> {
+fn session_marker_dirs(name: &ProfileName) -> Option<Vec<PathBuf>> {
     let profile = profile_dir(name).ok()?;
     let entries = match std::fs::read_dir(&profile) {
         Ok(entries) => entries,
@@ -500,7 +508,7 @@ fn session_marker_dirs(name: &str) -> Option<Vec<PathBuf>> {
 /// deleted account is unrecoverable, an unrotated one is not), but the cost is
 /// a stalled profile, not an inconvenience. Only a dir that is genuinely absent
 /// counts as idle.
-pub(crate) fn has_live_session(name: &str) -> bool {
+pub(crate) fn has_live_session(name: &ProfileName) -> bool {
     match session_marker_dirs(name) {
         None => true,
         Some(dirs) => dirs
@@ -574,7 +582,7 @@ fn rotation_blocked_by_live_session(has_live_session: bool, is_macos: bool) -> b
 /// reach this predicate at all — their stand-in markers live under
 /// [`live_bare_dir`], not the profile — so the refusal is unchanged for them
 /// by construction rather than by this check.
-fn live_session_holds_rotatable(name: &str) -> bool {
+fn live_session_holds_rotatable(name: &ProfileName) -> bool {
     let Some(dirs) = session_marker_dirs(name) else {
         return true;
     };
@@ -614,7 +622,7 @@ fn live_session_holds_rotatable(name: &str) -> bool {
 /// strictly the more expensive probe (a registry read plus a credential parse
 /// per live session), and it only ever narrows an answer that is already
 /// `true`, so it is never paid by a profile that was not about to be refused.
-pub(crate) fn rotation_blocked_for(name: &str) -> bool {
+pub(crate) fn rotation_blocked_for(name: &ProfileName) -> bool {
     cfg!(target_os = "macos")
         && rotation_blocked_by_live_session(has_live_session(name), true)
         && live_session_holds_rotatable(name)
@@ -638,7 +646,7 @@ pub(crate) fn rotation_blocked_for(name: &str) -> bool {
 /// [`hold_session_row_marker`]: a test-only observation of a layout this module
 /// owns, so nothing outside it rebuilds the paths.
 #[cfg(test)]
-pub(crate) fn live_session_count(name: &str) -> usize {
+pub(crate) fn live_session_count(name: &ProfileName) -> usize {
     let Some(dirs) = session_marker_dirs(name) else {
         return 1;
     };
@@ -842,8 +850,8 @@ fn gc_bare_markers() {
 /// its own entry point so every existing `gc_stale_runtimes` caller gets it.
 fn gc_live_session_rows() {
     for row in crate::live_sessions::list() {
-        let probe = row.current_member.as_deref().unwrap_or(&row.start_profile);
-        if !session_row_is_live(probe, row.isolated, &row.session_id)
+        let probe = ProfileName::from(row.current_member.as_deref().unwrap_or(&row.start_profile));
+        if !session_row_is_live(&probe, row.isolated, &row.session_id)
             && let Err(e) = crate::live_sessions::unregister(&row.session_id)
         {
             logline!("clauth: dropping stale live-session row failed: {e}");
@@ -959,7 +967,7 @@ pub(crate) fn live_isolated_stores() -> Vec<(String, PathBuf)> {
     out
 }
 
-fn canonical_credentials(name: &str) -> Result<PathBuf> {
+fn canonical_credentials(name: &ProfileName) -> Result<PathBuf> {
     // CLA-ROLL: arm a rolling-token profile's sidecar BEFORE resolving the source —
     // a session launched inside an arming window (flag on, sidecar not yet
     // rolling) would otherwise copy the rotating pair, and the daemon's later
@@ -999,7 +1007,7 @@ fn canonical_credentials(name: &str) -> Result<PathBuf> {
 /// upgrade is a sweep over this directory keyed on names absent from state,
 /// taking each lock before unlinking it — never a reap inside the delete, which
 /// would unlink a lock its own caller is holding.
-pub(crate) fn rotation_lock_path(name: &str) -> Result<PathBuf> {
+pub(crate) fn rotation_lock_path(name: &ProfileName) -> Result<PathBuf> {
     Ok(clauth_dir()?
         .join("rotation-locks")
         .join(format!("{name}.lock")))
@@ -1042,7 +1050,7 @@ impl RotationGuard {
     /// rotation or acquire for this profile releases it. Creates the
     /// rotation-locks directory if missing; it creates no profile directory,
     /// so a caller that needs one makes it itself.
-    pub(crate) fn acquire(name: &str) -> Result<Self> {
+    pub(crate) fn acquire(name: &ProfileName) -> Result<Self> {
         let path = rotation_lock_path(name)?;
         if let Some(parent) = path.parent() {
             crate::profile::mkdir_700(parent)
@@ -1064,7 +1072,7 @@ impl RotationGuard {
     /// where a `clauth start` holding this lock across its recursive
     /// `~/.claude` copy would otherwise stall every account's poll while the
     /// heartbeat (stamped in the main loop, not here) stays fresh.
-    pub(crate) fn try_acquire(name: &str) -> Result<Option<Self>> {
+    pub(crate) fn try_acquire(name: &ProfileName) -> Result<Option<Self>> {
         let path = rotation_lock_path(name)?;
         if let Some(parent) = path.parent() {
             crate::profile::mkdir_700(parent)
@@ -1179,7 +1187,7 @@ pub(crate) fn unsupported_swap_platform(is_macos: bool) -> Option<SwapUnsupporte
 ///
 /// `Ok(None)` is the supported host. An IO failure propagates rather than reading
 /// as either answer — a probe that could not run says nothing about the host.
-pub(crate) fn unsupported_swap_transport(name: &str) -> Result<Option<SwapUnsupported>> {
+pub(crate) fn unsupported_swap_transport(name: &ProfileName) -> Result<Option<SwapUnsupported>> {
     let profile_root = profile_dir(name)?;
     let mode = with_state_lock(|| {
         crate::profile::mkdir_700(&profile_root)
@@ -1323,7 +1331,7 @@ pub(crate) fn swap_eligible(
 /// stands, so the sidecar is still resolved against real bytes first. There is no
 /// other constructor, so the touch cannot be reached without the load.
 struct SwapPlan {
-    member: String,
+    member: ProfileName,
     store: PathBuf,
 }
 
@@ -1666,6 +1674,7 @@ impl SessionSwap {
     /// is what clears a crash-staged credential sidecar, and moving the store's
     /// mtime before that clearing would discard the sidecar for good.
     fn precondition(&self, intended: &str) -> Result<SwapPlan, SwapRefused> {
+        let intended = ProfileName::from(intended);
         if self.shutdown.load(std::sync::atomic::Ordering::Acquire) {
             return Err(SwapRefused::ShuttingDown);
         }
@@ -1680,16 +1689,16 @@ impl SessionSwap {
         if intended == self.member() {
             return Err(SwapRefused::AlreadyCurrent);
         }
-        let profile = crate::profile::load_profile(intended)
+        let profile = crate::profile::load_profile(&intended)
             .map_err(|e| SwapRefused::ProfileUnreadable(format!("{e:#}")))?;
         swap_eligible(&profile, &self.launch)?;
-        let store = crate::claude::install_source_path(intended)
+        let store = crate::claude::install_source_path(&intended)
             .map_err(|e| SwapRefused::ProfileUnreadable(format!("{e:#}")))?;
         if !store.exists() {
             return Err(SwapRefused::NoCredentialStore);
         }
         Ok(SwapPlan {
-            member: intended.to_string(),
+            member: intended,
             store,
         })
     }
@@ -1750,7 +1759,7 @@ impl SessionSwap {
             // `acquire` takes for `register`, and for the same reason.
             {
                 let mut cell = self.cell();
-                cell.member = plan.member.clone();
+                cell.member = plan.member.to_string();
                 cell.canonical = plan.store.clone();
                 // Step 8: every member the session has run on keeps its markers
                 // for the session's life, so a claim never replaces one.
@@ -1906,7 +1915,7 @@ pub(crate) struct ProfileRuntime {
 /// already converged. That argument is refuted one paragraph up: the guard
 /// BLOCKS behind a rotation, and a rotation is precisely what stages a
 /// `credentials.json.pending` sidecar for the next load to adopt.
-fn refuse_if_unconfigured(name: &str) -> Result<()> {
+fn refuse_if_unconfigured(name: &ProfileName) -> Result<()> {
     // Deliberately NOT the `cfg!(test) ||` form its two neighbours in this file
     // carry. Their escape exists because their unit tests drive them with no home
     // sandbox, so demanding the flock would lock the operator's real `~/.clauth`.

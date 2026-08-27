@@ -407,7 +407,9 @@ pub(crate) fn serve_endpoints(
     (format!("http://127.0.0.1:{port}"), handle)
 }
 
-pub(crate) fn rotation_fixture_config(name: &str) -> crate::profile::ConfigHandle {
+pub(crate) fn rotation_fixture_config(
+    name: &crate::profile::ProfileName,
+) -> crate::profile::ConfigHandle {
     let mut profile = blank_profile(name);
     profile.credentials = Some(crate::profile::ClaudeCredentials {
         claude_ai_oauth: Some(crate::profile::OAuthToken {
@@ -425,8 +427,8 @@ pub(crate) fn rotation_fixture_config(name: &str) -> crate::profile::ConfigHandl
         state: crate::profile::AppState::default(),
         profiles: vec![profile],
     };
-    config.state.profiles.push(name.into());
-    config.state.active_profile = Some(name.into());
+    config.state.profiles.push(name.clone());
+    config.state.active_profile = Some(name.clone());
     crate::profile::save_app_state(&config.state).expect("save app state");
     std::sync::Arc::new(crate::lockorder::RankedMutex::new(config))
 }
@@ -447,7 +449,7 @@ pub(crate) fn rotation_fixture_config(name: &str) -> crate::profile::ConfigHandl
 /// no macOS caller is a dead-code error that reds that leg on clippy
 /// `-D warnings` before a test runs.
 #[cfg(not(target_os = "macos"))]
-pub(crate) fn block_credentials_write(name: &str) {
+pub(crate) fn block_credentials_write(name: &crate::profile::ProfileName) {
     let path = crate::profile::profile_subpath(name, "credentials.json").expect("credentials path");
     if path.is_file() {
         std::fs::remove_file(&path).expect("drop the fixture's credentials file");
@@ -772,9 +774,9 @@ impl Drop for TierSandbox {
 
 /// A minimal `Profile` with every optional field unset — tests fill in what
 /// they assert on.
-pub(crate) fn blank_profile(name: &str) -> crate::profile::Profile {
+pub(crate) fn blank_profile(name: &crate::profile::ProfileName) -> crate::profile::Profile {
     crate::profile::Profile {
-        name: name.into(),
+        name: name.clone(),
         base_url: None,
         api_key: None,
         auto_start: false,

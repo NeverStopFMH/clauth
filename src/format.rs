@@ -297,7 +297,7 @@ impl Transient {
 
 /// A login whose refresh token is dead: re-login is the only fix. Shared by the
 /// CLI/MCP switch bail, the daemon tick log, and the TUI switch toast.
-pub(crate) fn login_expired(name: &str) -> Message {
+pub(crate) fn login_expired(name: &crate::profile::ProfileName) -> Message {
     Message {
         head: format!("login for '{name}' has expired"),
         detail: Some(format!(
@@ -309,7 +309,7 @@ pub(crate) fn login_expired(name: &str) -> Message {
 /// A refresh that failed for a transient reason: this switch is refused but the
 /// login is not quarantined. The next step comes from `err`'s own [`Retry`], so
 /// a throttle is never told to check its connection.
-pub(crate) fn refresh_transient(name: &str, err: &Transient) -> Message {
+pub(crate) fn refresh_transient(name: &crate::profile::ProfileName, err: &Transient) -> Message {
     Message {
         head: format!("could not refresh '{name}' before switching"),
         detail: Some(err.text()),
@@ -320,7 +320,10 @@ pub(crate) fn refresh_transient(name: &str, err: &Transient) -> Message {
 /// status. Split as a second constructor rather than a flag, because `line()`
 /// serves BOTH the CLI bail and the MCP payload — the surface split cannot be
 /// made on the renderer.
-pub(crate) fn refresh_transient_cli(name: &str, err: &Transient) -> Message {
+pub(crate) fn refresh_transient_cli(
+    name: &crate::profile::ProfileName,
+    err: &Transient,
+) -> Message {
     Message {
         head: format!("could not refresh '{name}' before switching"),
         detail: Some(err.text_with_status()),

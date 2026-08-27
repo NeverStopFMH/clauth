@@ -264,7 +264,7 @@ fn seed_flag_states() {
     // The org drops to `claude_free` when a subscription is canceled, so the
     // cached `/profile` plan is where cancellation is readable at all.
     write_profile_cache(
-        "gone",
+        &crate::profile::ProfileName::from("gone"),
         USAGE_CACHE_FILE,
         &UsageInfo {
             plan: Some(PlanInfo {
@@ -355,7 +355,11 @@ fn seed_canceled_account() {
         }),
         ..Default::default()
     };
-    write_profile_cache("kerry", USAGE_CACHE_FILE, &usage);
+    write_profile_cache(
+        &crate::profile::ProfileName::from("kerry"),
+        USAGE_CACHE_FILE,
+        &usage,
+    );
 }
 
 /// The session row resolves through the same tiers `which` used and reports
@@ -423,8 +427,11 @@ fn a_generic_api_key_row_reports_its_own_figures_and_claims_no_anthropic_plan() 
         ..Default::default()
     })
     .expect("save state");
-    let cache =
-        crate::profile_cache::profile_cache_path("litellm", THIRD_PARTY_CACHE_FILE).unwrap();
+    let cache = crate::profile_cache::profile_cache_path(
+        &crate::profile::ProfileName::from("litellm"),
+        THIRD_PARTY_CACHE_FILE,
+    )
+    .unwrap();
     std::fs::write(&cache, crate::testutil::THIRD_PARTY_CACHE_BYTES).expect("provider cache");
 
     let row = lines(&call_profiles(None, None)).remove(0);
@@ -482,7 +489,7 @@ fn a_bars_carrying_z_ai_row_renders_the_headline_alone() {
     let parsed = serde_json::from_str::<crate::providers::ThirdPartyStats>(CAPTURED_GLM_CACHE)
         .expect("the captured z.ai cache parses");
     crate::profile_cache::write_profile_cache(
-        "glm",
+        &crate::profile::ProfileName::from("glm"),
         crate::profile_cache::THIRD_PARTY_CACHE_FILE,
         &parsed,
     );

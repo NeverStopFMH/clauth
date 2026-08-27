@@ -600,7 +600,8 @@ fn seed_profiles(enabled: &[&str], disabled: &[&str]) {
             .expect("create profile");
     }
     for name in disabled {
-        crate::actions::disable_profile(&mut config, name).expect("disable profile");
+        crate::actions::disable_profile(&mut config, &crate::profile::ProfileName::from(*name))
+            .expect("disable profile");
     }
 }
 

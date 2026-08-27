@@ -32,7 +32,7 @@ fn warm_usage(name: &str, five_h: f64, seven_d: f64) {
     // test's pin, so the name has to exist in the record for the write to land.
     crate::testutil::register_names(&[name]);
     write_profile_cache(
-        name,
+        &crate::profile::ProfileName::from(name),
         USAGE_CACHE_FILE,
         &UsageInfo {
             plan: Some(PlanInfo {
@@ -115,7 +115,7 @@ fn list_table_reveals_disabled_with_a_trailing_marker_when_included() {
 fn warm_canceled(name: &str) {
     crate::testutil::register_names(&[name]);
     write_profile_cache(
-        name,
+        &crate::profile::ProfileName::from(name),
         USAGE_CACHE_FILE,
         &UsageInfo {
             plan: Some(PlanInfo {
@@ -283,7 +283,7 @@ fn a_dead_credential_is_named_in_the_state_suffix() {
     };
     let fp = crate::usage::profile_credential_fingerprint(&config.profiles[0]).unwrap();
     crate::testutil::register_names(&["qwen"]);
-    crate::profile_cache::write_auth_expired("qwen", fp);
+    crate::profile_cache::write_auth_expired(&crate::profile::ProfileName::from("qwen"), fp);
 
     let body = crate::daemon::build_status(&config, 300_000, None, false);
     let table = render_table(&config, &body);
@@ -318,7 +318,7 @@ fn a_profile_that_never_stored_a_session_is_told_it_needs_one() {
     };
     let fp = crate::usage::profile_credential_fingerprint(&config.profiles[0]).unwrap();
     crate::testutil::register_names(&["qwen"]);
-    crate::profile_cache::write_auth_expired("qwen", fp);
+    crate::profile_cache::write_auth_expired(&crate::profile::ProfileName::from("qwen"), fp);
 
     let body = crate::daemon::build_status(&config, 300_000, None, false);
     let table = render_table(&config, &body);
@@ -351,7 +351,7 @@ fn a_dead_api_key_is_told_the_key_was_rejected() {
     };
     let fp = crate::usage::profile_credential_fingerprint(&config.profiles[0]).unwrap();
     crate::testutil::register_names(&["deepseek"]);
-    crate::profile_cache::write_auth_expired("deepseek", fp);
+    crate::profile_cache::write_auth_expired(&crate::profile::ProfileName::from("deepseek"), fp);
 
     let body = crate::daemon::build_status(&config, 300_000, None, false);
     let table = render_table(&config, &body);

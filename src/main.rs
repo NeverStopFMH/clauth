@@ -58,7 +58,7 @@ use clap::Parser as _;
 
 use crate::cli::{Cli, Command, LoginArgs, ThemeArg};
 use crate::out::{errln, out, outln};
-use crate::profile::{AppConfig, ThemeName, load_config};
+use crate::profile::{AppConfig, ProfileName, ThemeName, load_config};
 use crate::runtime::Isolation;
 
 /// Resolve `name` to its canonical spelling, or bail with a [`UsageError`].
@@ -68,13 +68,16 @@ use crate::runtime::Isolation;
 /// that isn't there: a usage error (exit 2), not a runtime failure (exit 1).
 /// Shared by every profile-naming command: `start`/`delete`/`disable`/
 /// `enable`/`switch`/`rolling-token`/`static-token`.
-fn resolve_or_bail(config: &AppConfig, name: &str) -> Result<String> {
-    config.canonical_name(name).ok_or_else(|| {
-        let available = config.names().join(", ");
-        usage_error(format!(
-            "profile '{name}' not found\navailable: {available}"
-        ))
-    })
+fn resolve_or_bail(config: &AppConfig, name: &str) -> Result<ProfileName> {
+    config
+        .canonical_name(name)
+        .map(ProfileName::from)
+        .ok_or_else(|| {
+            let available = config.names().join(", ");
+            usage_error(format!(
+                "profile '{name}' not found\navailable: {available}"
+            ))
+        })
 }
 
 fn main() {
@@ -463,13 +466,13 @@ fn cmd_login(args: LoginArgs) -> Result<()> {
     platform::init();
     let mut config = load_config()?;
     let route = login_route(&config, &args.profile);
-    let target = match &route {
+    let target = ProfileName::from(match &route {
         LoginRoute::Reauth(existing) => existing.clone(),
         LoginRoute::New(fresh) => {
             actions::validate_profile_name(fresh, &config.names(), None)?;
             fresh.clone()
         }
-    };
+    });
     let reauth = matches!(route, LoginRoute::Reauth(_));
     let is_api = args.is_api_mode();
 
@@ -546,7 +549,7 @@ fn cmd_login(args: LoginArgs) -> Result<()> {
             collect_api_endpoint(args.base_url.as_deref(), args.api_key.as_deref())?;
         actions::create_blank_profile(
             &mut config,
-            target.clone(),
+            target.to_string(),
             base_url,
             api_key,
             args.model.clone(),
@@ -554,7 +557,7 @@ fn cmd_login(args: LoginArgs) -> Result<()> {
         outln!("clauth: captured into profile '{target}'. Switch to it with:  clauth {target}");
     } else {
         let snapshot = run_oauth_browser(false, &target)?;
-        actions::capture_into_profile(&mut config, target.clone(), snapshot)?;
+        actions::capture_into_profile(&mut config, target.to_string(), snapshot)?;
         // Apply the requested default model so the captured profile's sessions
         // route there from the first launch.
         if let Some(model) = args.model.as_deref() {
@@ -583,8 +586,9 @@ fn cmd_login(args: LoginArgs) -> Result<()> {
 /// for. The profile's api key is left alone — the callback's is workspace-scoped
 /// and belongs to a different product (see `actions::store_console_login`).
 fn cmd_login_console(config: &mut AppConfig, target: &str, model: Option<&str>) -> Result<()> {
+    let target = ProfileName::from(target);
     let base_url = config
-        .find(target)
+        .find(&target)
         .and_then(|p| p.base_url.clone())
         .unwrap_or_default();
     let (site, region) = providers::alibaba::site_and_region(&base_url)
@@ -595,9 +599,9 @@ fn cmd_login_console(config: &mut AppConfig, target: &str, model: Option<&str>) 
     let outcome = alibaba_login::login_with(site, region, |url| {
         outln!("\nIf the browser didn't open, visit this URL to sign in:\n{url}\n");
     })?;
-    actions::store_console_login(config, target, outcome.console.clone())?;
+    actions::store_console_login(config, &target, outcome.console.clone())?;
     if let Some(model) = model {
-        actions::set_profile_default_model(config, target, model)?;
+        actions::set_profile_default_model(config, &target, model)?;
     }
     outln!(
         "clauth: console session captured for '{target}'.\n{}",
@@ -629,11 +633,12 @@ fn cmd_login_setup_token(
 ) -> Result<()> {
     use std::io::IsTerminal as _;
     let interactive = std::io::stdin().is_terminal();
+    let target = ProfileName::from(target);
 
     // Replacing an existing sidecar re-points every future switch at the new
     // token — confirm like the other in-place replacements. A fresh capture
     // (no sidecar yet) is additive and needs no ceremony.
-    if claude::session_token_status(target).is_some() && !yes {
+    if claude::session_token_status(&target).is_some() && !yes {
         if !interactive {
             anyhow::bail!(
                 "'{target}' already has a long-lived token; pass --yes to replace it non-interactively"
@@ -674,7 +679,7 @@ fn cmd_login_setup_token(
             model.map(str::to_string),
         )?;
     } else if let Some(model) = model {
-        actions::set_profile_default_model(config, target, model)?;
+        actions::set_profile_default_model(config, &target, model)?;
     }
 
     // CLA-ROLL: on a rolling-token profile the next rotation overwrites this
@@ -682,12 +687,12 @@ fn cmd_login_setup_token(
     // degrade backup atomically (one flock section, same bytes; a two-step
     // write-then-copy can snapshot a concurrent rotation's rolling token as "the
     // mint").
-    let rolling_on = config.find(target).is_some_and(|p| p.rolling_token);
+    let rolling_on = config.find(&target).is_some_and(|p| p.rolling_token);
     let now = crate::usage::now_ms() as i64;
     let expires_at = if rolling_on {
-        claude::write_session_token_with_backup(target, &token, now)?
+        claude::write_session_token_with_backup(&target, &token, now)?
     } else {
-        claude::write_session_token(target, &token, now)?
+        claude::write_session_token(&target, &token, now)?
     };
     let days = (expires_at - crate::usage::now_ms() as i64) / 86_400_000;
     outln!(
@@ -749,7 +754,7 @@ fn cmd_static_token_clear(name: &str, yes: bool) -> Result<()> {
 
     let config = load_config()?;
     let canonical = resolve_or_bail(&config, name)?;
-    let target = canonical.as_str();
+    let target = &canonical;
     let profile = config
         .find(target)
         .ok_or_else(|| anyhow::anyhow!("no profile named '{target}'"))?;
@@ -1016,7 +1021,7 @@ fn cmd_delete(name: &str, yes: bool, force: bool) -> Result<()> {
 /// and by `start::run` — the authoritative chokepoint every session-spawn path
 /// (`cmd_start`, `sessions_cli::run_resume`) funnels through — so all three
 /// callers share one message instead of drifting.
-fn refuse_if_disabled(config: &AppConfig, name: &str) -> Result<()> {
+fn refuse_if_disabled(config: &AppConfig, name: &ProfileName) -> Result<()> {
     if config.find(name).is_some_and(|p| p.is_disabled()) {
         anyhow::bail!("'{name}': account is disabled, run `clauth enable {name}`");
     }
@@ -1124,11 +1129,7 @@ fn cmd_rolling_token(name: &str) -> Result<()> {
     // mis-fill pre-clear would have removed the sidecar — leaving the profile
     // with nothing at all, which is worse than the disengaged mis-fill it
     // started in.
-    if config
-        .state
-        .auth_broken
-        .contains(&canonical.as_str().into())
-    {
+    if config.state.auth_broken.contains(&canonical) {
         anyhow::bail!(
             "'{canonical}' usage chain is dead · run `clauth login {canonical}` first, \
              then re-run"
@@ -1277,7 +1278,7 @@ fn scope_widening_disclosure(canonical: &str) -> String {
 /// No confirm prompt: a security prompt on a repeatable command gets clicked
 /// through. The printed scope list plus the SECURITY.md row is the honest
 /// middle, and it is printed AFTER the fact, when it describes something real.
-fn report_armed_sidecar(canonical: &str, chain_is_broken: bool) -> Result<()> {
+fn report_armed_sidecar(canonical: &ProfileName, chain_is_broken: bool) -> Result<()> {
     let Some((kind, token)) = claude::sidecar_summary(canonical) else {
         // The gate said Ready and `has_session_token` held, yet the read-back
         // finds nothing parseable — a race or a filesystem fault. Claiming
@@ -1510,15 +1511,16 @@ fn write_api_key<W: std::io::Write>(writer: &mut W, key: &str) -> Result<()> {
 /// unit-testable without capturing stdout. An empty key reads as `None`:
 /// a credential that is whitespace-only is not a credential.
 fn api_key_for_profile(name: &str) -> Result<Option<String>> {
+    let name = ProfileName::from(name);
     // `load_profile` is permissive — a missing `config.toml` reads as the
     // default profile, so a helper pointing at a typo'd or deleted name would
     // otherwise return `Ok(None)` indistinguishable from a real no-key
     // profile. The dir-existence check fails closed with a clearer message
     // instead; both cases still surface as exit 1 via `cmd_api_key`.
-    if !profile::profile_dir(name)?.exists() {
+    if !profile::profile_dir(&name)?.exists() {
         anyhow::bail!("profile '{name}' not found");
     }
-    let profile = profile::load_profile(name)?;
+    let profile = profile::load_profile(&name)?;
     let key = profile
         .api_key
         .as_deref()

@@ -438,7 +438,12 @@ fn the_action_menu_titles_its_scope_and_rules_off_the_global_group() {
     let _home = crate::testutil::HomeSandbox::new();
     let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
 
-    let app = app_on(Tab::Overview, vec![crate::testutil::blank_profile("acct")]);
+    let app = app_on(
+        Tab::Overview,
+        vec![crate::testutil::blank_profile(
+            &crate::profile::ProfileName::from("acct"),
+        )],
+    );
     let (rows, left, right) = render_action_menu(&app, 60, 20);
     let slice =
         |row: &String| -> String { row.chars().skip(left).take(right - left + 1).collect() };
@@ -502,7 +507,12 @@ fn an_all_scoped_action_menu_names_its_account_without_a_rule() {
     let _home = crate::testutil::HomeSandbox::new();
     let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
 
-    let mut app = app_on(Tab::Setup, vec![crate::testutil::blank_profile("acct")]);
+    let mut app = app_on(
+        Tab::Setup,
+        vec![crate::testutil::blank_profile(
+            &crate::profile::ProfileName::from("acct"),
+        )],
+    );
     app.profile_cursor = 0;
     // ⏎ on the account list is what seeds the draft the menu titles itself with.
     handle_key(&mut app, crate::testutil::key(KeyCode::Enter));

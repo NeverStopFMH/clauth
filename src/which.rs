@@ -197,8 +197,8 @@ fn resolve_profile<'a>(
     creds: Option<&ClaudeCredentials>,
     in_session: bool,
     session_profile: Option<&str>,
-    installed_session_token: &dyn Fn(&str) -> Option<String>,
-) -> Option<(&'a str, Source)> {
+    installed_session_token: &dyn Fn(&crate::profile::ProfileName) -> Option<String>,
+) -> Option<(&'a crate::profile::ProfileName, Source)> {
     let (name, source) = resolve_profile_candidate(
         config,
         creds,
@@ -227,8 +227,8 @@ fn resolve_profile_candidate<'a>(
     creds: Option<&ClaudeCredentials>,
     in_session: bool,
     session_profile: Option<&str>,
-    installed_session_token: &dyn Fn(&str) -> Option<String>,
-) -> Option<(&'a str, Source)> {
+    installed_session_token: &dyn Fn(&crate::profile::ProfileName) -> Option<String>,
+) -> Option<(&'a crate::profile::ProfileName, Source)> {
     if let Some(name) = creds
         .and_then(ClaudeCredentials::refresh_token)
         .and_then(|rt| match_by_refresh_token(config, rt))
@@ -248,8 +248,10 @@ fn resolve_profile_candidate<'a>(
     {
         return Some((name, Source::SessionTokenMatch));
     }
-    if let Some(profile) = session_profile.and_then(|n| config.find(n)) {
-        return Some((profile.name.as_str(), Source::SessionDir));
+    if let Some(profile) =
+        session_profile.and_then(|n| config.find(&crate::profile::ProfileName::from(n)))
+    {
+        return Some((&profile.name, Source::SessionDir));
     }
     if in_session {
         return None;
@@ -262,23 +264,26 @@ fn resolve_profile_candidate<'a>(
     config
         .state
         .active_profile
-        .as_deref()
+        .as_ref()
         .and_then(|n| config.find(n))
         .filter(|p| p.credentials.is_none())
-        .map(|p| (p.name.as_str(), Source::CredentialLessActive))
+        .map(|p| (&p.name, Source::CredentialLessActive))
 }
 
-fn match_by_refresh_token<'a>(config: &'a AppConfig, refresh_token: &str) -> Option<&'a str> {
-    let active = config.state.active_profile.as_deref();
+fn match_by_refresh_token<'a>(
+    config: &'a AppConfig,
+    refresh_token: &str,
+) -> Option<&'a crate::profile::ProfileName> {
+    let active = config.state.active_profile.as_ref();
     let mut fallback = None;
     for p in &config.profiles {
         if p.refresh_token() != Some(refresh_token) {
             continue;
         }
-        if Some(p.name.as_str()) == active {
-            return Some(p.name.as_str());
+        if Some(&p.name) == active {
+            return Some(&p.name);
         }
-        fallback.get_or_insert(p.name.as_str());
+        fallback.get_or_insert(&p.name);
     }
     fallback
 }
@@ -289,21 +294,21 @@ fn match_by_refresh_token<'a>(config: &'a AppConfig, refresh_token: &str) -> Opt
 fn match_by_session_token<'a>(
     config: &'a AppConfig,
     access_token: &str,
-    installed_session_token: &dyn Fn(&str) -> Option<String>,
-) -> Option<&'a str> {
+    installed_session_token: &dyn Fn(&crate::profile::ProfileName) -> Option<String>,
+) -> Option<&'a crate::profile::ProfileName> {
     if access_token.is_empty() {
         return None;
     }
-    let active = config.state.active_profile.as_deref();
+    let active = config.state.active_profile.as_ref();
     let mut fallback = None;
     for p in &config.profiles {
-        if installed_session_token(p.name.as_str()).as_deref() != Some(access_token) {
+        if installed_session_token(&p.name).as_deref() != Some(access_token) {
             continue;
         }
-        if Some(p.name.as_str()) == active {
-            return Some(p.name.as_str());
+        if Some(&p.name) == active {
+            return Some(&p.name);
         }
-        fallback.get_or_insert(p.name.as_str());
+        fallback.get_or_insert(&p.name);
     }
     fallback
 }
@@ -347,7 +352,8 @@ fn emit_json(config: &AppConfig, resolved: Option<(String, Source)>) {
 /// second call. It reads neither the profile's `[env]` block nor anything
 /// else; the routing answer is `crate::profile::stored_endpoint`.
 fn json_view(config: &AppConfig, resolved: Option<&(String, Source)>) -> serde_json::Value {
-    let profile = resolved.and_then(|(name, _)| config.find(name));
+    let profile = resolved
+        .and_then(|(name, _)| config.find(&crate::profile::ProfileName::from(name.clone())));
     serde_json::json!({
         "profile": profile.map(|p| &p.name),
         "source": resolved.map(|(_, s)| s.as_str()),

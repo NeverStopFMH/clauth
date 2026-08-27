@@ -75,7 +75,7 @@ fn draw_chain_selector(frame: &mut Frame<'_>, area: Rect, app: &App, focused: bo
                             .state
                             .fallback_chain
                             .get(*i)
-                            .map(|n| n.to_string())
+                            .cloned()
                             .unwrap_or_default();
                         // `#n` right-aligned in a fixed 3 cells, so `#1` and
                         // `#10` start their names on the same column. The
@@ -100,9 +100,9 @@ fn draw_chain_selector(frame: &mut Frame<'_>, area: Rect, app: &App, focused: bo
                         } else {
                             bold_when(name_color(cfg.is_active(&name)), selected && focused)
                         };
-                        let reason = cfg
-                            .find(&name)
-                            .and_then(|p| blocked_reason(&cfg, p, kick_lifts.get(&name).copied()));
+                        let reason = cfg.find(&name).and_then(|p| {
+                            blocked_reason(&cfg, p, kick_lifts.get(name.as_str()).copied())
+                        });
                         let rail_w = rail.width();
                         let mut spans = vec![rail];
                         match &reason {
@@ -122,7 +122,7 @@ fn draw_chain_selector(frame: &mut Frame<'_>, area: Rect, app: &App, focused: bo
                                 spans.push(Span::raw(format!("{pad} ")));
                                 spans.push(reason_marker(reason));
                             }
-                            None => spans.push(Span::styled(name.clone(), ns)),
+                            None => spans.push(Span::styled(name.to_string(), ns)),
                         }
                         Line::from(spans)
                     }
@@ -171,13 +171,8 @@ fn draw_chain_detail(frame: &mut Frame<'_>, area: Rect, app: &App) {
         match selected {
             Some(ChainItemKind::Member(i)) => {
                 let cfg = app.config();
-                let name = cfg
-                    .state
-                    .fallback_chain
-                    .get(i)
-                    .map(|n| n.to_string())
-                    .unwrap_or_default();
-                let kick_lift = kick_lifts.get(&name).copied();
+                let name = cfg.state.fallback_chain.get(i).cloned().unwrap_or_default();
+                let kick_lift = kick_lifts.get(name.as_str()).copied();
                 let (lines, rows_start) = member_detail(
                     &cfg,
                     &name,
@@ -191,7 +186,7 @@ fn draw_chain_detail(frame: &mut Frame<'_>, area: Rect, app: &App) {
                     kick_lift,
                     app.live_sessions.member(&name),
                 );
-                (name, true, lines, rows_start)
+                (name.to_string(), true, lines, rows_start)
             }
             Some(ChainItemKind::Add) => (
                 "add to chain".to_string(),
@@ -373,7 +368,7 @@ fn reason_pill_spans(reason: &BlockedReason, fmt: ResetFmt) -> Vec<Span<'static>
 /// ladder has no notion of), so bridging the two just to share strings would
 /// couple two ladders that are allowed to diverge. Same register: short,
 /// lowercase, names the concrete next action.
-fn reason_fix(reason: &BlockedReason, name: &str) -> String {
+fn reason_fix(reason: &BlockedReason, name: &crate::profile::ProfileName) -> String {
     match reason {
         BlockedReason::Disabled => "excluded from the walk, enable it on the setup tab".to_string(),
         BlockedReason::Canceled => "this subscription has been canceled".to_string(),
@@ -494,7 +489,7 @@ fn pill_block(pills: Vec<(Vec<Span<'static>>, String)>, width: usize) -> Vec<Lin
 #[allow(clippy::too_many_arguments)]
 fn member_detail(
     cfg: &AppConfig,
-    name: &str,
+    name: &crate::profile::ProfileName,
     focused: bool,
     row_cursor: usize,
     armed_remove: bool,
@@ -728,7 +723,7 @@ fn member_detail(
 /// Hint under the `last resort` toggle — phrased for the state flipping it
 /// would produce: on → describes the standing behavior; off → what turning it
 /// on does, naming the member the (exclusive) mark would move away from.
-fn last_resort_hint(cfg: &AppConfig, name: &str, on: bool) -> String {
+fn last_resort_hint(cfg: &AppConfig, name: &crate::profile::ProfileName, on: bool) -> String {
     if on {
         return "this account keeps working once every other one is spent".to_string();
     }
@@ -748,7 +743,7 @@ fn last_resort_hint(cfg: &AppConfig, name: &str, on: bool) -> String {
 /// Hint under the `preferred` toggle — twin of [`last_resort_hint`]: on →
 /// describes the standing return behavior; off → what turning it on does,
 /// naming the member the (exclusive) mark would move away from.
-fn preferred_hint(cfg: &AppConfig, name: &str, on: bool) -> String {
+fn preferred_hint(cfg: &AppConfig, name: &crate::profile::ProfileName, on: bool) -> String {
     if on {
         return "work returns to this account once it's free again".to_string();
     }
@@ -799,7 +794,7 @@ fn max_spend_range_tooltip(input: &InputState, width: usize) -> Vec<Line<'static
 /// nothing — that is the reading this line exists to stop. `spend_room` fails
 /// closed on money (unknown spend never reads as $0), so each of its refusals
 /// gets its own copy instead of one $0-implying fallback.
-fn max_spend_hint(cfg: &AppConfig, name: &str, ceiling: f64) -> String {
+fn max_spend_hint(cfg: &AppConfig, name: &crate::profile::ProfileName, ceiling: f64) -> String {
     if !cfg.state.spend_budget_switching {
         return "turn on allow extra usage in config before this does anything".to_string();
     }

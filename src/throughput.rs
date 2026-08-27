@@ -76,7 +76,7 @@ fn model_key(model: Option<&str>) -> String {
 /// Record one successful delegate run's observed pace. No-op on a zero/missing
 /// duration or token count — nothing meaningful to measure.
 pub(crate) fn record_success(
-    profile: &str,
+    profile: &crate::profile::ProfileName,
     model: Option<&str>,
     output_tokens: u64,
     duration_ms: u64,
@@ -102,7 +102,7 @@ pub(crate) fn record_success(
 
 /// Record a rate-limit / 429 hit for a model, with an optional Retry-After hint.
 pub(crate) fn record_rate_limit(
-    profile: &str,
+    profile: &crate::profile::ProfileName,
     model: Option<&str>,
     retry_after_s: Option<u64>,
     now: i64,
@@ -117,7 +117,7 @@ pub(crate) fn record_rate_limit(
 
 /// Display summary for a profile's models, most-recently-sampled first. Empty
 /// when the profile has no recorded runs.
-pub(crate) fn summary(profile: &str, now: i64) -> Vec<ModelSummary> {
+pub(crate) fn summary(profile: &crate::profile::ProfileName, now: i64) -> Vec<ModelSummary> {
     let Some(store) = load_profile_cache::<ThroughputStore>(profile, THROUGHPUT_CACHE_FILE) else {
         return Vec::new();
     };

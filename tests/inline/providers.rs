@@ -115,12 +115,12 @@ fn disk_cache_roundtrips_stats() {
     };
     crate::testutil::register_names(&["tp-cache-test"]);
     crate::profile_cache::write_profile_cache(
-        "tp-cache-test",
+        &crate::profile::ProfileName::from("tp-cache-test"),
         crate::profile_cache::THIRD_PARTY_CACHE_FILE,
         &stats,
     );
     let loaded = crate::profile_cache::load_profile_cache::<ThirdPartyStats>(
-        "tp-cache-test",
+        &crate::profile::ProfileName::from("tp-cache-test"),
         crate::profile_cache::THIRD_PARTY_CACHE_FILE,
     )
     .expect("cache present");
@@ -134,8 +134,8 @@ fn disk_cache_missing_reads_as_none() {
     let _home = HomeSandbox::new();
     assert!(
         crate::profile_cache::load_profile_cache::<ThirdPartyStats>(
-            "tp-cache-absent",
-            crate::profile_cache::THIRD_PARTY_CACHE_FILE,
+            &crate::profile::ProfileName::from("tp-cache-absent"),
+            crate::profile_cache::THIRD_PARTY_CACHE_FILE
         )
         .is_none()
     );

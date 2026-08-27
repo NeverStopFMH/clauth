@@ -162,7 +162,7 @@ fn sample_digest() -> DigestSample {
     // the state-wait loop pays 5x a second — the same order as the
     // `profiles.toml` read above it, and the price of naming the right file.
     let usage_cache_mtime = active
-        .as_deref()
+        .as_ref()
         .and_then(|name| {
             crate::profile_cache::profile_cache_path(
                 name,

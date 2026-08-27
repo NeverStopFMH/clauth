@@ -383,9 +383,9 @@ fn disabled_account_only_dims_its_name_in_the_setup_list() {
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
 
-    let mut disabled = crate::testutil::blank_profile("xqzoff");
+    let mut disabled = crate::testutil::blank_profile(&crate::profile::ProfileName::from("xqzoff"));
     disabled.disabled = true;
-    let enabled = crate::testutil::blank_profile("xqzon");
+    let enabled = crate::testutil::blank_profile(&crate::profile::ProfileName::from("xqzon"));
     let names: Vec<ProfileName> = vec!["xqzoff".into(), "xqzon".into()];
     let app = App::new(AppConfig {
         state: AppState {
@@ -847,7 +847,7 @@ fn snap_rolling_token_is_the_sidecar_content_not_the_config_flag() {
     use crate::profile::{AppConfig, AppState, ClaudeCredentials, OAuthToken};
     let _home = crate::testutil::HomeSandbox::new();
     let name = "cfg-snap-roll";
-    let dir = crate::profile::profile_dir(name).expect("dir");
+    let dir = crate::profile::profile_dir(&crate::profile::ProfileName::from(name)).expect("dir");
     std::fs::create_dir_all(&dir).expect("mkdir");
     let app_with_flag = |rolling_token: bool| {
         let mut p = crate::profile::Profile::new(name.to_string(), None, None);

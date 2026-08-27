@@ -4,7 +4,7 @@ use anyhow::Result;
 
 use crate::actions::{switch_off, switch_profile};
 use crate::lock::with_state_lock;
-use crate::profile::{AppConfig, Profile};
+use crate::profile::{AppConfig, Profile, ProfileName};
 use crate::usage::{
     FetchStatus, UsageInfo, UsageStore, UsageWindow, five_hour_live, iso_to_epoch_secs,
     now_epoch_secs, seven_day_live,
@@ -335,7 +335,7 @@ fn scoped_weekly_blocked(profile: &Profile, chain_soft: f64) -> bool {
 /// blocked" (the member is then judged by the aggregate gates alone).
 fn scoped_blocked_from_usage(member: &ChainMember, usage: &HashMap<String, UsageInfo>) -> bool {
     member.check_scoped
-        && usage.get(&member.name).is_some_and(|info| {
+        && usage.get(member.name.as_str()).is_some_and(|info| {
             scoped_weekly_blocked_info(info, now_epoch_secs(), member.scoped_line)
         })
 }
@@ -385,7 +385,7 @@ pub(crate) fn is_canceled(profile: &Profile) -> bool {
 /// Sole caller is the scheduler-side [`is_exhausted_active_from_usage`] — the
 /// UI-thread [`is_exhausted_active`] takes its rate as a parameter instead so
 /// the render pass never triggers this disk read under the config guard.
-fn burn_rate_for_profile(name: &str, window: &UsageWindow) -> Option<f64> {
+fn burn_rate_for_profile(name: &ProfileName, window: &UsageWindow) -> Option<f64> {
     let history = crate::profile::load_usage_history(name);
     let pair = ("5h", window);
     crate::usage::compute_burn_rates_from_history(
@@ -738,7 +738,7 @@ pub(crate) fn health_blocked_reason(
 /// (which holds `usage_store` then takes `config`).
 #[derive(Debug, Clone)]
 pub(crate) struct ChainMember {
-    pub(crate) name: String,
+    pub(crate) name: ProfileName,
     pub(crate) threshold: f64,
     /// Mirrors `Profile::last_resort` — a terminal stop for the chain walk,
     /// decoupled from `threshold` (issue #8 follow-up: a threshold no longer
@@ -769,7 +769,7 @@ pub(crate) struct ChainMember {
 /// under the `AppConfig` mutex by [`snapshot_chain`], then evaluated lock-free.
 #[derive(Debug, Clone)]
 pub(crate) struct ChainSnapshot {
-    pub(crate) active: String,
+    pub(crate) active: ProfileName,
     pub(crate) chain: Vec<ChainMember>,
     /// Snapshot of `AppState::switch_off_when_spent` — drives the switch-off-all decision.
     pub(crate) switch_off_when_spent: bool,
@@ -824,7 +824,7 @@ pub(crate) struct ChainSnapshot {
 /// member, or the chain is empty — every case where `next_auto_switch_target`
 /// short-circuits anyway, so callers can skip evaluation on `None`.
 pub(crate) fn snapshot_chain(config: &AppConfig) -> Option<ChainSnapshot> {
-    let active = config.state.active_profile.as_deref()?.to_string();
+    let active = config.state.active_profile.clone()?;
     if !config.state.fallback_chain.iter().any(|n| n == &active) {
         return None;
     }
@@ -854,17 +854,15 @@ pub(crate) fn snapshot_chain(config: &AppConfig) -> Option<ChainSnapshot> {
 /// burned chain.
 pub(crate) fn snapshot_session_chain(
     config: &AppConfig,
-    member: &str,
+    member: &ProfileName,
     launch: &crate::runtime::LaunchTransport,
 ) -> Option<ChainSnapshot> {
     if !config.state.fallback_chain.iter().any(|n| n == member) {
         return None;
     }
-    Some(build_chain_snapshot(
-        config,
-        member.to_string(),
-        &|profile| profile.is_none_or(|p| crate::runtime::swap_eligible(p, launch).is_err()),
-    ))
+    Some(build_chain_snapshot(config, member.clone(), &|profile| {
+        profile.is_none_or(|p| crate::runtime::swap_eligible(p, launch).is_err())
+    }))
 }
 
 /// The shared body of [`snapshot_chain`] and [`snapshot_session_chain`],
@@ -875,7 +873,7 @@ pub(crate) fn snapshot_session_chain(
 /// every tick and wedges the decision on the one member it must leave.
 fn build_chain_snapshot(
     config: &AppConfig,
-    active: String,
+    active: ProfileName,
     skip_candidate: &dyn Fn(Option<&Profile>) -> bool,
 ) -> ChainSnapshot {
     let weekly_pct = config.state.weekly_switch_threshold_pct();
@@ -899,7 +897,7 @@ fn build_chain_snapshot(
             // evaluated eagerly, so spelling it twice here charged the GLOBAL path a
             // third scan per member for a closure that is `|_| false` there.
             let profile = config.find(name);
-            name.as_str() == active.as_str()
+            *name == active.as_str()
                 || (profile.is_some()
                     && !profile.is_some_and(Profile::is_disabled)
                     && !skip_candidate(profile))
@@ -907,7 +905,7 @@ fn build_chain_snapshot(
         .map(|name| {
             let profile = config.find(name);
             ChainMember {
-                name: name.to_string(),
+                name: name.clone(),
                 threshold: profile.map(threshold_for).unwrap_or(DEFAULT_THRESHOLD),
                 last_resort: profile.is_some_and(|p| p.last_resort),
                 preferred: profile.is_some_and(|p| p.preferred),
@@ -956,7 +954,7 @@ fn is_exhausted_from_usage(
     line: f64,
 ) -> bool {
     let now = now_epoch_secs();
-    usage.get(&member.name).is_some_and(|info| {
+    usage.get(member.name.as_str()).is_some_and(|info| {
         weekly_blocked_info(info, now, line)
             || (five_hour_live(info, now)
                 && info
@@ -968,9 +966,9 @@ fn is_exhausted_from_usage(
 
 /// Scheduler-side [`is_canceled`] over a usage snapshot — reads the plan from the
 /// single-lock `UsageStore` clone, exactly like [`is_exhausted_from_usage`].
-fn is_canceled_from_usage(name: &str, usage: &HashMap<String, UsageInfo>) -> bool {
+fn is_canceled_from_usage(name: &ProfileName, usage: &HashMap<String, UsageInfo>) -> bool {
     usage
-        .get(name)
+        .get(name.as_str())
         .and_then(|i| i.plan.as_ref())
         .is_some_and(|p| p.is_canceled())
 }
@@ -992,7 +990,7 @@ fn is_exhausted_active_from_usage(
     horizon_cap_ms: u64,
 ) -> bool {
     let now = now_epoch_secs();
-    let Some(info) = usage.get(&member.name) else {
+    let Some(info) = usage.get(member.name.as_str()) else {
         return false;
     };
     // The weekly line trumps projection (mirrors `is_exhausted_active`).
@@ -1048,7 +1046,7 @@ fn walk_chain(
 /// `scan_recovery` so their skip lists can't drift apart. The `== active`
 /// guard is walk-structural and stays at the call site; canceled is
 /// usage-derived and split by data source (see `candidate_excluded`).
-pub(crate) fn walk_excluded(config: &AppConfig, name: &str) -> bool {
+pub(crate) fn walk_excluded(config: &AppConfig, name: &ProfileName) -> bool {
     let p = config.find(name);
     p.is_none() || config.is_auth_broken(name) || p.is_some_and(Profile::is_disabled)
 }
@@ -1059,7 +1057,7 @@ pub(crate) fn walk_excluded(config: &AppConfig, name: &str) -> bool {
 /// daemon recovery walk can't (its `Profile.usage` is never written headless),
 /// so it excludes canceled via the store-native `plan.is_canceled()` inside
 /// `find_recovered_member` instead and must NOT call this.
-fn candidate_excluded(config: &AppConfig, name: &str) -> bool {
+fn candidate_excluded(config: &AppConfig, name: &ProfileName) -> bool {
     walk_excluded(config, name) || config.find(name).is_some_and(is_canceled)
 }
 
@@ -1086,13 +1084,13 @@ pub(crate) fn next_target(
     config: &AppConfig,
     active_burn_pct_per_hour: Option<f64>,
 ) -> Option<SwitchAction> {
-    let active = config.state.active_profile.as_deref()?;
+    let active = config.state.active_profile.as_ref()?;
     let chain = &config.state.fallback_chain;
     let active_idx = chain.iter().position(|n| n == active)?;
     let len = chain.len();
     let weekly_pct = config.state.weekly_switch_threshold_pct();
 
-    let skip = |i: usize| chain[i] == active || candidate_excluded(config, &chain[i]);
+    let skip = |i: usize| chain[i] == *active || candidate_excluded(config, &chain[i]);
     let walk = |accept: &dyn Fn(&Profile) -> bool| -> Option<String> {
         let pick = walk_chain(active_idx, len, &skip, &|i| {
             config.find(&chain[i]).is_some_and(&accept)
@@ -1293,7 +1291,7 @@ fn next_auto_switch_target_with_usage(
     // sibling idled (observed 2026-07-09). The flag is terminal-confirmed (set
     // only after a rejected refresh AND a failed live-mirror adopt), and the
     // walk below never consults the broken active's own usage.
-    let active_broken = snapshot.broken.iter().any(|b| b == &active.name);
+    let active_broken = snapshot.broken.iter().any(|b| b == active.name.as_str());
     // A kick-rejected active is broken's messages-limiter analogue: its usage
     // can read as idle headroom (`/usage` stays 200 through the outage) while
     // every inference request is rejected, so exhaustion can't be a
@@ -1301,7 +1299,10 @@ fn next_auto_switch_target_with_usage(
     // the block clears itself once a kick lands — so only the switch-grade
     // form (limiter-confirmed `rejected`, ≥2 kicks, ceiling ahead) reaches
     // this snapshot at all.
-    let active_kick_rejected = snapshot.kick_rejected.iter().any(|k| k == &active.name);
+    let active_kick_rejected = snapshot
+        .kick_rejected
+        .iter()
+        .any(|k| k == active.name.as_str());
     // A canceled active is `broken`'s subscription analogue: its cached usage
     // reads as idle headroom while `/v1/messages` 403s, so exhaustion can't gate
     // leaving it. Sourced from the usage snapshot (the plan the scheduler holds),
@@ -1320,16 +1321,19 @@ fn next_auto_switch_target_with_usage(
 
     let skip = |i: usize| {
         snapshot.chain[i].name == active.name
-            || snapshot.broken.iter().any(|b| b == &snapshot.chain[i].name)
+            || snapshot
+                .broken
+                .iter()
+                .any(|b| b == snapshot.chain[i].name.as_str())
             || snapshot
                 .kick_rejected
                 .iter()
-                .any(|k| k == &snapshot.chain[i].name)
+                .any(|k| k == snapshot.chain[i].name.as_str())
             || is_canceled_from_usage(&snapshot.chain[i].name, usage)
     };
     let walk = |accept: &dyn Fn(&ChainMember) -> bool| -> Option<String> {
         let pick = walk_chain(active_idx, len, &skip, &|i| accept(&snapshot.chain[i]));
-        pick.map(|i| snapshot.chain[i].name.clone())
+        pick.map(|i| snapshot.chain[i].name.to_string())
     };
     // Headroom accept, lockstep with [`next_target`]: clear on the aggregate
     // gates AND — per the member's own `check_scoped` gate — every per-model
@@ -1380,13 +1384,13 @@ fn next_auto_switch_target_with_usage(
         // home is clear and fresh.
         if let Some(pref) = snapshot.chain.iter().find(|m| m.preferred)
             && pref.name != active.name
-            && snapshot.fresh.iter().any(|n| n == &active.name)
+            && snapshot.fresh.iter().any(|n| n == active.name.as_str())
             && let Some(pi) = snapshot.chain.iter().position(|m| m.name == pref.name)
             && !skip(pi)
             && clear(&snapshot.chain[pi])
-            && snapshot.fresh.iter().any(|n| n == &pref.name)
+            && snapshot.fresh.iter().any(|n| n == pref.name.as_str())
         {
-            return Some(SwitchAction::To(pref.name.clone()));
+            return Some(SwitchAction::To(pref.name.to_string()));
         }
         return None;
     }
@@ -1395,7 +1399,7 @@ fn next_auto_switch_target_with_usage(
     // (2026-06-28 target asymmetry): prefer a member whose usage read we
     // TRUST (`snapshot.fresh`, the same StatusStore liveness `decision_fresh`
     // gates the ACTIVE on), but the any-freshness pass always runs.
-    let is_fresh = |m: &ChainMember| snapshot.fresh.iter().any(|n| n == &m.name);
+    let is_fresh = |m: &ChainMember| snapshot.fresh.iter().any(|n| n == m.name.as_str());
     if let Some(name) = walk(&|m| clear(m) && is_fresh(m)) {
         return Some(SwitchAction::To(name));
     }
@@ -1427,16 +1431,20 @@ fn next_auto_switch_target_with_usage(
     // active still within budget stays put rather than ping-ponging between two
     // paying members.
     let active_is_spend_armed = spend_armed(
-        usage.get(&active.name),
+        usage.get(active.name.as_str()),
         snapshot.spend_budget,
         active.max_spend,
     );
     if active_is_spend_armed {
         return None;
     }
-    if let Some(name) =
-        walk(&|m| spend_armed(usage.get(&m.name), snapshot.spend_budget, m.max_spend))
-    {
+    if let Some(name) = walk(&|m| {
+        spend_armed(
+            usage.get(m.name.as_str()),
+            snapshot.spend_budget,
+            m.max_spend,
+        )
+    }) {
         return Some(SwitchAction::To(name));
     }
 
@@ -1462,7 +1470,7 @@ fn next_auto_switch_target_with_usage(
     // spent its pay-as-you-go budget reads `switch_off_when_budget_spent`, since staying on
     // it keeps costing money rather than merely erroring.
     let active_budget_spent = budget_spent(
-        usage.get(&active.name),
+        usage.get(active.name.as_str()),
         snapshot.spend_budget,
         active.max_spend,
     );
@@ -1522,7 +1530,7 @@ pub(crate) fn find_recovered_member(
 ) -> Option<String> {
     let now = now_epoch_secs();
     let recovered = |member: &ChainMember, require_scoped_clear: bool| -> Option<bool> {
-        if kick_rejected.iter().any(|k| k == &member.name) {
+        if kick_rejected.iter().any(|k| k == member.name.as_str()) {
             return Some(false);
         }
         // A fetched entry whose 5h window is absent or past its reset is idle
@@ -1533,7 +1541,7 @@ pub(crate) fn find_recovered_member(
         // Nor does a canceled one — its plan flips to `claude_free` while the
         // cached 5h window keeps reading idle.
         match store.lock() {
-            Ok(s) => s.get(&member.name).map(|info| {
+            Ok(s) => s.get(member.name.as_str()).map(|info| {
                 !info.plan.as_ref().is_some_and(|p| p.is_canceled())
                     && !weekly_blocked_info(info, now, member.weekly_line)
                     && (!require_scoped_clear
@@ -1558,7 +1566,7 @@ pub(crate) fn find_recovered_member(
     if let Some(pref) = chain.iter().find(|m| m.preferred)
         && recovered(pref, false) == Some(true)
     {
-        return Some(pref.name.clone());
+        return Some(pref.name.to_string());
     }
     // Prefer a member clear of every per-model weekly window it gates on,
     // then fall back to the aggregate-only recovery — the chain is OFF here,
@@ -1566,12 +1574,12 @@ pub(crate) fn find_recovered_member(
     // as a last pick.
     for member in chain {
         if recovered(member, true) == Some(true) {
-            return Some(member.name.clone());
+            return Some(member.name.to_string());
         }
     }
     for member in chain {
         if recovered(member, false) == Some(true) {
-            return Some(member.name.clone());
+            return Some(member.name.to_string());
         }
     }
     None
@@ -1589,7 +1597,7 @@ pub(crate) fn auto_switch_if_needed(
     active_burn_pct_per_hour: Option<f64>,
 ) -> Result<Option<SwitchAction>> {
     with_state_lock(|| {
-        let Some(active_name) = config.state.active_profile.as_deref() else {
+        let Some(active_name) = config.state.active_profile.as_ref() else {
             return Ok(None);
         };
         if !config.state.fallback_chain.iter().any(|n| n == active_name) {
@@ -1625,7 +1633,7 @@ pub(crate) fn auto_switch_if_needed(
                 && scoped_weekly_blocked(active, weekly_pct)
                 && let Some(target) = fully_clear_target(config, weekly_pct)
             {
-                switch_profile(config, &target)?;
+                switch_profile(config, &ProfileName::from(target.clone()))?;
                 return Ok(Some(SwitchAction::To(target)));
             }
             return Ok(None);
@@ -1636,7 +1644,7 @@ pub(crate) fn auto_switch_if_needed(
         };
 
         match &action {
-            SwitchAction::To(target) => switch_profile(config, target)?,
+            SwitchAction::To(target) => switch_profile(config, &ProfileName::from(target.clone()))?,
             SwitchAction::Off => switch_off(config)?,
         }
         Ok(Some(action))

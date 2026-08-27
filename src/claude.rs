@@ -6,8 +6,8 @@ use anyhow::{Context, Result};
 use crate::lock::with_state_lock;
 use crate::logline::logline;
 use crate::profile::{
-    AppConfig, ClaudeCredentials, Profile, atomic_write, atomic_write_600, claude_dir, profile_dir,
-    read_json_file, save_profile,
+    AppConfig, ClaudeCredentials, Profile, ProfileName, atomic_write, atomic_write_600, claude_dir,
+    profile_dir, read_json_file, save_profile,
 };
 
 pub(crate) fn claude_credentials_path() -> Result<PathBuf> {
@@ -27,7 +27,7 @@ fn claude_settings_path() -> Result<PathBuf> {
 /// on a single-use refresh chain (the root cause of the 2026-07-16..18
 /// serial `refresh token revoked` deaths: N live sessions + clauth all
 /// rotating the same chains through one live slot).
-pub(crate) fn has_session_token(name: &str) -> bool {
+pub(crate) fn has_session_token(name: &ProfileName) -> bool {
     matches!(
         session_token_status(name),
         Some(SessionTokenStatus::LongLived(_))
@@ -67,7 +67,7 @@ impl SessionTokenStatus {
 
 /// Content-aware read of a profile's sidecar: `None` = no sidecar (or one too
 /// corrupt to parse a login out of — same disengaged outcome either way).
-pub(crate) fn session_token_status(name: &str) -> Option<SessionTokenStatus> {
+pub(crate) fn session_token_status(name: &ProfileName) -> Option<SessionTokenStatus> {
     let path = profile_dir(name).ok()?.join("session-token.json");
     if !path.exists() {
         return None;
@@ -88,7 +88,7 @@ pub(crate) fn session_token_status(name: &str) -> Option<SessionTokenStatus> {
 /// content-classified, so a ROLLING stamp (refresh-less by construction, like
 /// the mint) attributes here too: `clauth which` names a session running on a
 /// rolling bearer the same way it names one on a static mint.
-pub(crate) fn installed_session_token(name: &str) -> Option<String> {
+pub(crate) fn installed_session_token(name: &ProfileName) -> Option<String> {
     if !has_session_token(name) {
         return None;
     }
@@ -104,7 +104,7 @@ pub(crate) fn installed_session_token(name: &str) -> Option<String> {
 /// `credentials.json`. Returns whether a file was actually removed, so a caller
 /// can tell "cleared" from "there was nothing to clear". An absent sidecar is
 /// success, not an error: the requested end state already holds.
-pub(crate) fn clear_session_token(name: &str) -> Result<bool> {
+pub(crate) fn clear_session_token(name: &ProfileName) -> Result<bool> {
     let path = profile_dir(name)?.join("session-token.json");
     with_state_lock(|| match std::fs::remove_file(&path) {
         Ok(()) => Ok(true),
@@ -122,7 +122,7 @@ pub(crate) fn clear_session_token(name: &str) -> Result<bool> {
 /// success. A plain delete, not a quarantine — quarantine preserves EVIDENCE of
 /// an anomaly, and an operator-confirmed removal of their own credential is the
 /// one path where keeping the bytes on disk would defeat the command.
-pub(crate) fn clear_static_backup(name: &str) -> Result<bool> {
+pub(crate) fn clear_static_backup(name: &ProfileName) -> Result<bool> {
     let path = profile_dir(name)?.join("session-token.static.json");
     with_state_lock(|| match std::fs::remove_file(&path) {
         Ok(()) => Ok(true),
@@ -135,7 +135,7 @@ pub(crate) fn clear_static_backup(name: &str) -> Result<bool> {
 /// A single stat: the Setup tab's clear row uses it to DISCLOSE that the
 /// backup goes with a clear, and to stay reachable while the backup is the
 /// only long-lived piece left.
-pub(crate) fn has_static_backup(name: &str) -> bool {
+pub(crate) fn has_static_backup(name: &ProfileName) -> bool {
     profile_dir(name).is_ok_and(|d| d.join("session-token.static.json").exists())
 }
 
@@ -148,7 +148,9 @@ pub(crate) fn has_static_backup(name: &str) -> bool {
 /// codebase goes through an atomic tempfile + rename, so a change is always a
 /// fresh mtime. Metadata only — no locks, no reads: a mid-write observation
 /// just changes again on the next look, which is the correct answer anyway.
-pub(crate) fn credential_fingerprint(name: &str) -> [Option<(std::time::SystemTime, u64)>; 3] {
+pub(crate) fn credential_fingerprint(
+    name: &ProfileName,
+) -> [Option<(std::time::SystemTime, u64)>; 3] {
     let Ok(dir) = profile_dir(name) else {
         return [None, None, None];
     };
@@ -282,7 +284,7 @@ pub(crate) fn validate_api_key(key: &str) -> Result<()> {
 /// Write `name`'s `session-token.json` from a validated mint, stamping the
 /// assumed one-year expiry. 0600 like every credential file. Returns the
 /// stamped epoch-ms expiry for the caller's summary line.
-pub(crate) fn write_session_token(name: &str, token: &str, now_ms: i64) -> Result<i64> {
+pub(crate) fn write_session_token(name: &ProfileName, token: &str, now_ms: i64) -> Result<i64> {
     let expires_at = now_ms + SETUP_TOKEN_ASSUMED_LIFETIME_MS;
     let sidecar = ClaudeCredentials {
         claude_ai_oauth: Some(crate::profile::OAuthToken {
@@ -313,7 +315,10 @@ pub(crate) fn write_session_token(name: &str, token: &str, now_ms: i64) -> Resul
 /// preserved at `session-token.static.json` ([`preserve_static_mint`]) so
 /// switching back to the static token — or a terminally dead chain — can restore Sonnet-cap
 /// service instead of signing sessions out.
-pub(crate) fn stamp_rolling_token(name: &str, chain: &crate::profile::OAuthToken) -> Result<()> {
+pub(crate) fn stamp_rolling_token(
+    name: &ProfileName,
+    chain: &crate::profile::OAuthToken,
+) -> Result<()> {
     let rolled = rolling_projection(chain);
     // [`sidecar_kind_of`]'s totality is enforced HERE, at the only writer of
     // rolling content: a chain whose recorded grant would classify as a mint
@@ -362,7 +367,7 @@ pub(crate) fn rolling_projection(chain: &crate::profile::OAuthToken) -> crate::p
 /// shape only an explicit re-mint produces), which replaces it; a sidecar
 /// that is absent or holds a rolling/mis-filled value has no mint to
 /// preserve. Callers hold the state flock.
-fn preserve_static_mint(name: &str) -> Result<()> {
+fn preserve_static_mint(name: &ProfileName) -> Result<()> {
     let dir = profile_dir(name)?;
     let sidecar = dir.join("session-token.json");
     let backup = dir.join("session-token.static.json");
@@ -453,7 +458,11 @@ fn preserve_static_mint(name: &str) -> Result<()> {
 /// roll replaces the mint with an hours-horizon token that then gets
 /// snapshotted as "the mint", which a later restore would then install as a
 /// dead credential. Returns the stamped expiry like [`write_session_token`].
-pub(crate) fn write_session_token_with_backup(name: &str, token: &str, now_ms: i64) -> Result<i64> {
+pub(crate) fn write_session_token_with_backup(
+    name: &ProfileName,
+    token: &str,
+    now_ms: i64,
+) -> Result<i64> {
     let expires_at = now_ms + SETUP_TOKEN_ASSUMED_LIFETIME_MS;
     let sidecar = ClaudeCredentials {
         claude_ai_oauth: Some(crate::profile::OAuthToken {
@@ -497,7 +506,7 @@ pub(crate) enum HealOutcome {
 /// CLA-ROLL: heal a mis-filled sidecar on a rolling-token profile — quarantine
 /// the evidence (the profile's own `quarantine/` dir), restore the preserved
 /// static mint over it.
-pub(crate) fn heal_misfilled_sidecar(name: &str) -> Result<HealOutcome> {
+pub(crate) fn heal_misfilled_sidecar(name: &ProfileName) -> Result<HealOutcome> {
     let dir = profile_dir(name)?;
     let sidecar = dir.join("session-token.json");
     let backup = dir.join("session-token.static.json");
@@ -526,7 +535,7 @@ pub(crate) fn heal_misfilled_sidecar(name: &str) -> Result<HealOutcome> {
 /// sidecar absent) — the CLI `clauth rolling-token <p>` pre-clear, where overwriting
 /// is explicit operator intent but the evidence still goes to quarantine
 /// first. `Ok(true)` when a mis-fill was cleared.
-pub(crate) fn quarantine_misfilled_sidecar(name: &str) -> Result<bool> {
+pub(crate) fn quarantine_misfilled_sidecar(name: &ProfileName) -> Result<bool> {
     let dir = profile_dir(name)?;
     let sidecar = dir.join("session-token.json");
     with_state_lock(|| {
@@ -546,7 +555,7 @@ pub(crate) fn quarantine_misfilled_sidecar(name: &str) -> Result<bool> {
 /// before the caller overwrites or removes it — timestamp + sequence, suffixed
 /// with the quarantined file's basename, so the evidence of whatever
 /// mis-filled it survives the repair. Callers hold the state flock.
-fn quarantine_file_locked(name: &str, path: &Path, suffix: &str) -> Result<()> {
+fn quarantine_file_locked(name: &ProfileName, path: &Path, suffix: &str) -> Result<()> {
     let bytes = std::fs::read(path).context("read credential file for quarantine")?;
     // UNDER THE PROFILE, not a global `~/.clauth/quarantine/`. What lands here
     // can be a rotating pair — that is what makes a sidecar a mis-fill — and
@@ -574,7 +583,7 @@ fn quarantine_file_locked(name: &str, path: &Path, suffix: &str) -> Result<()> {
 /// spends a refresh, and never fails the caller — a stamping hiccup must not
 /// block a session start (the vanilla fallback still works; the daemon heals
 /// the sidecar on its next rotation).
-pub(crate) fn arm_rolling_from_disk(name: &str) {
+pub(crate) fn arm_rolling_from_disk(name: &ProfileName) {
     arm_rolling_from_disk_synced(name, || {});
 }
 
@@ -583,7 +592,7 @@ pub(crate) fn arm_rolling_from_disk(name: &str) {
 /// holds the guard while this thread parks, so "the write uses the post-guard
 /// re-read" is pinned by construction rather than by a sleep long enough to
 /// probably lose a race. Production passes a no-op.
-fn arm_rolling_from_disk_synced(name: &str, pre_guard_done: impl FnOnce()) {
+fn arm_rolling_from_disk_synced(name: &ProfileName, pre_guard_done: impl FnOnce()) {
     const ROLLING_ARM_GRACE_MS: i64 = 30 * 60 * 1000;
     let profile = match crate::profile::load_profile(name) {
         Ok(profile) => profile,
@@ -775,7 +784,7 @@ fn classify_backup_bytes(bytes: &[u8], now: i64) -> BackupVerdict {
 /// Read failures are loud: this file is the mint's only other copy, and
 /// "could not read it" must never be reported as "it does not exist". Callers
 /// hold the state flock (the quarantine move needs it).
-fn live_backup_bytes(name: &str, backup: &Path) -> Result<Option<Vec<u8>>> {
+fn live_backup_bytes(name: &ProfileName, backup: &Path) -> Result<Option<Vec<u8>>> {
     let bytes = match std::fs::read(backup) {
         Ok(b) => b,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -807,7 +816,7 @@ fn live_backup_bytes(name: &str, backup: &Path) -> Result<Option<Vec<u8>>> {
 /// the usage chain died terminally). `Ok(true)` when a backup existed and was
 /// restored; `Ok(false)` when there was nothing to restore (the sidecar is
 /// left as-is — a last rolling token keeps serving until its real expiry).
-pub(crate) fn restore_static_mint(name: &str) -> Result<bool> {
+pub(crate) fn restore_static_mint(name: &ProfileName) -> Result<bool> {
     let dir = profile_dir(name)?;
     let backup = dir.join("session-token.static.json");
     let sidecar = dir.join("session-token.json");
@@ -842,7 +851,9 @@ pub(crate) fn restore_static_mint(name: &str) -> Result<bool> {
 /// mis-fill comes back as [`SidecarKind::Misfilled`], never laundered into
 /// `Rolling` by its chain-shaped scopes — the state agrees with
 /// [`session_token_status`]'s `NotLongLived` on the same bytes.
-pub(crate) fn sidecar_summary(name: &str) -> Option<(SidecarKind, crate::profile::OAuthToken)> {
+pub(crate) fn sidecar_summary(
+    name: &ProfileName,
+) -> Option<(SidecarKind, crate::profile::OAuthToken)> {
     let path = profile_dir(name).ok()?.join("session-token.json");
     let creds = read_json_file::<ClaudeCredentials>(&path).ok()?;
     let oauth = creds.claude_ai_oauth?;
@@ -853,7 +864,7 @@ pub(crate) fn sidecar_summary(name: &str) -> Option<(SidecarKind, crate::profile
 /// `session-token.json` when present ([`has_session_token`]), else its
 /// `credentials.json` — which is exactly the pre-split behavior, so profiles
 /// without the sidecar are byte-identical to before.
-pub(crate) fn install_source_path(name: &str) -> Result<PathBuf> {
+pub(crate) fn install_source_path(name: &ProfileName) -> Result<PathBuf> {
     let dir = profile_dir(name)?;
     // Content-aware, not a bare existence check (#53 review): a sidecar that
     // isn't genuinely long-lived must not become the install source — see
@@ -876,7 +887,7 @@ pub(crate) fn install_source_path(name: &str) -> Result<PathBuf> {
 /// out. Their copy claimed a relink onto a stored OAuth login regardless, which is
 /// why this exists rather than each surface guessing — a message derived from a
 /// different fact than the action drifts from it silently.
-pub(crate) fn has_stored_oauth_login(name: &str) -> bool {
+pub(crate) fn has_stored_oauth_login(name: &ProfileName) -> bool {
     profile_dir(name).is_ok_and(|dir| dir.join("credentials.json").exists())
 }
 
@@ -895,7 +906,7 @@ pub(crate) enum LinkState {
     Missing,
 }
 
-pub(crate) fn classify_credentials_link(active: &str) -> Result<LinkState> {
+pub(crate) fn classify_credentials_link(active: &ProfileName) -> Result<LinkState> {
     let link = claude_credentials_path()?;
     // CLA-SPLIT: the live slot is compared against what a switch INSTALLS —
     // for a session-token profile that's the static token, so a live slot
@@ -952,7 +963,7 @@ fn paths_equivalent(a: &Path, b: &Path) -> bool {
 /// True when the profile has no stored credentials but the live path is a regular
 /// file with a completed OAuth login — first login after blank profile creation.
 /// clauth adopts this rather than treating it as divergence.
-pub(crate) fn is_first_login(active: &str) -> Result<bool> {
+pub(crate) fn is_first_login(active: &ProfileName) -> Result<bool> {
     let link = claude_credentials_path()?;
     // CLA-SPLIT: a profile whose install source is its session token is never
     // "credential-less" — a live OAuth login must not be adopted over it.
@@ -1012,7 +1023,7 @@ fn is_first_login_at(link: &Path, expected: &Path) -> bool {
 /// resolve in the TUI" until its retry TTL, and the TUI prompts about
 /// credentials that are fully saved (observed live 2026-07-21 on the macOS
 /// fork as a symlink; recurs there as a regular file after any CC session).
-pub(crate) fn live_login_is_stored(active: &str) -> bool {
+pub(crate) fn live_login_is_stored(active: &ProfileName) -> bool {
     let Ok(link) = claude_credentials_path() else {
         return false;
     };
@@ -1084,7 +1095,7 @@ pub(crate) fn live_credentials_are_shell() -> bool {
 /// no login, see [`live_login_is_stored`]). Routing every gate through this one
 /// predicate keeps the exemptions from drifting apart. The underlying reads
 /// propagate their error; a boolean gate maps that to `false` with `.unwrap_or(false)`.
-pub(crate) fn live_diverged_and_unsaved(active: &str) -> Result<bool> {
+pub(crate) fn live_diverged_and_unsaved(active: &ProfileName) -> Result<bool> {
     Ok(
         matches!(classify_credentials_link(active)?, LinkState::Diverged)
             && !is_first_login(active)?
@@ -1303,7 +1314,7 @@ pub(crate) fn strip_account_credentials(blob: &mut serde_json::Value) -> SignOut
 /// sidecar: [`write_session_token`] rebuilds that file from the mint alone, so a
 /// block carried there is dropped at the next re-mint and sits on disk for
 /// nothing until then.
-fn carry_live_extra_into(link: &Path, target: &Path, name: &str) -> Result<()> {
+fn carry_live_extra_into(link: &Path, target: &Path, name: &ProfileName) -> Result<()> {
     if target
         .file_name()
         .is_some_and(|n| n == "session-token.json")
@@ -1343,7 +1354,7 @@ fn carry_live_extra_into(link: &Path, target: &Path, name: &str) -> Result<()> {
 /// login set. Best-effort like the carry itself: `write_profile_cache` swallows
 /// its own failures, and keeping MCP logins is a convenience where completing
 /// the capture or switch that triggered this is not.
-fn park_mcp_logins(name: &str, source: &serde_json::Value) {
+fn park_mcp_logins(name: &ProfileName, source: &serde_json::Value) {
     let Some(obj) = source.as_object() else {
         return;
     };
@@ -1368,7 +1379,7 @@ fn park_mcp_logins(name: &str, source: &serde_json::Value) {
 /// to — so the logins are already unreachable by the time any relink runs, and
 /// the carry above never sees them. Reading the STORE rather than the live slot
 /// is what makes this behave the same on a host that copies the slot instead.
-pub(crate) fn park_mcp_logins_from_store(name: &str, store: &Path) {
+pub(crate) fn park_mcp_logins_from_store(name: &ProfileName, store: &Path) {
     if let Ok(existing) = read_json_file::<serde_json::Value>(store) {
         park_mcp_logins(name, &existing);
     }
@@ -1384,7 +1395,7 @@ pub(crate) fn park_mcp_logins_from_store(name: &str, store: &Path) {
 /// Re-filtered through [`CARRIED_CREDENTIAL_KEYS`] on the way back in: the park
 /// already filtered, so this only bounds what a hand-edited parked file can put
 /// into a credential store.
-pub(crate) fn restore_parked_mcp_logins(name: &str, store: &Path) {
+pub(crate) fn restore_parked_mcp_logins(name: &ProfileName, store: &Path) {
     let Some(parked) = crate::profile_cache::load_profile_cache::<serde_json::Value>(
         name,
         crate::profile_cache::MCP_LOGINS_FILE,
@@ -1413,7 +1424,7 @@ pub(crate) fn restore_parked_mcp_logins(name: &str, store: &Path) {
     }
 }
 
-fn carry_live_extra_best_effort(link: &Path, target: &Path, name: &str) {
+fn carry_live_extra_best_effort(link: &Path, target: &Path, name: &ProfileName) {
     if let Err(e) = carry_live_extra_into(link, target, name) {
         logline!(
             "clauth: switched to '{name}' but could not carry its MCP server logins: {e:#}. \
@@ -1425,7 +1436,7 @@ fn carry_live_extra_best_effort(link: &Path, target: &Path, name: &str) {
 /// Symlink `~/.claude/.credentials.json` → profile's `credentials.json` (copy on
 /// Windows). Refuses to overwrite a non-matching regular file — that would silently
 /// drop a CC re-login the user hasn't resolved yet.
-pub(crate) fn link_profile_credentials(name: &str) -> Result<()> {
+pub(crate) fn link_profile_credentials(name: &ProfileName) -> Result<()> {
     with_state_lock(|| {
         let link = claude_credentials_path()?;
         let target = install_source_path(name)?;
@@ -1533,7 +1544,7 @@ pub(crate) fn read_claude_endpoint_config() -> Result<ClaudeEndpoint> {
                 .get("apiKeyHelper")
                 .and_then(|v| v.as_str())
                 .and_then(profile_name_from_helper)
-                .and_then(|name| crate::profile::load_profile(&name).ok())
+                .and_then(|name| crate::profile::load_profile(&ProfileName::from(name)).ok())
                 .and_then(|p| p.api_key)
         });
     Ok(ClaudeEndpoint {
@@ -1662,7 +1673,7 @@ const API_KEY_HELPER_SUBCMD: &str = "__api-key";
 /// dot — entirely within the safe-char set, so it round-trips unquoted; the
 /// helper-quoting exists for the exe path, which may contain spaces
 /// (`/Applications/...`, `C:\Program Files\...`).
-fn build_api_key_helper_command(exe: &Path, profile_name: &str) -> String {
+fn build_api_key_helper_command(exe: &Path, profile_name: &ProfileName) -> String {
     let exe_cow = exe.to_string_lossy();
     // A long-lived process (daemon/TUI) that rebuilds settings after the
     // in-place self-updater swapped the binary sees Linux `current_exe()`
@@ -1912,7 +1923,7 @@ pub(crate) fn snapshot_active_credentials(config: &mut AppConfig) -> Result<()> 
 /// genuine Claude Code login from BOTH the live file and the Keychain, having
 /// captured it into neither. Refusing costs an adopt; the alternative costs the
 /// login.
-pub(crate) fn adopt_first_login(config: &mut AppConfig, active: &str) -> Result<()> {
+pub(crate) fn adopt_first_login(config: &mut AppConfig, active: &ProfileName) -> Result<()> {
     with_state_lock(|| {
         snapshot_active_credentials_unchecked(config, active)?;
         anyhow::ensure!(
@@ -1923,7 +1934,10 @@ pub(crate) fn adopt_first_login(config: &mut AppConfig, active: &str) -> Result<
     })
 }
 
-fn snapshot_active_credentials_unchecked(config: &mut AppConfig, active: &str) -> Result<()> {
+fn snapshot_active_credentials_unchecked(
+    config: &mut AppConfig,
+    active: &ProfileName,
+) -> Result<()> {
     // CLA-SPLIT: a profile whose live slot holds its static session token carries
     // nothing to snapshot, and capturing the live file into `profile.credentials`
     // would clobber the clauth-private usage OAuth pair. The guard lives at this
@@ -1976,7 +1990,7 @@ pub(crate) fn force_snapshot_active_credentials(config: &mut AppConfig) -> Resul
 }
 
 /// Re-link `.credentials.json` to `name`'s stored credentials, overwriting the live path.
-pub(crate) fn force_link_profile_credentials(name: &str) -> Result<()> {
+pub(crate) fn force_link_profile_credentials(name: &ProfileName) -> Result<()> {
     with_state_lock(|| {
         let link = claude_credentials_path()?;
         let target = install_source_path(name)?;

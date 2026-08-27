@@ -295,7 +295,7 @@ fn chain_ready_config(name: &str) -> AppConfig {
 /// Nothing else in these tests creates it, so its absence is what proves the probe
 /// never ran.
 fn profile_dir_of(name: &str) -> std::path::PathBuf {
-    crate::profile::profile_dir(name).expect("profile dir")
+    crate::profile::profile_dir(&crate::profile::ProfileName::from(name)).expect("profile dir")
 }
 
 /// Assert the eligible twin cleared every gate under test — the twin each refusal
@@ -314,7 +314,9 @@ fn profile_dir_of(name: &str) -> std::path::PathBuf {
 /// probe, which materializes the profile dir.
 #[track_caller]
 fn the_eligible_twin_clears_every_gate(verdict: Result<()>, name: &str) {
-    match crate::runtime::unsupported_swap_transport(name).expect("probe the transport") {
+    match crate::runtime::unsupported_swap_transport(&crate::profile::ProfileName::from(name))
+        .expect("probe the transport")
+    {
         None => {
             verdict.expect("the eligible twin must clear every gate");
         }
@@ -322,7 +324,7 @@ fn the_eligible_twin_clears_every_gate(verdict: Result<()>, name: &str) {
             verdict
                 .expect_err("a shared-tree host refuses the twin at the transport probe")
                 .to_string(),
-            unsupported_host_refusal(name, why),
+            unsupported_host_refusal(&crate::profile::ProfileName::from(name), why),
             "the twin must reach the transport probe and be refused only there"
         ),
     }
@@ -334,12 +336,18 @@ fn the_eligible_twin_clears_every_gate(verdict: Result<()>, name: &str) {
 #[test]
 fn the_unsupported_host_refusal_names_each_cause() {
     assert_eq!(
-        unsupported_host_refusal("acme", SwapUnsupported::KeychainFirst),
+        unsupported_host_refusal(
+            &crate::profile::ProfileName::from("acme"),
+            SwapUnsupported::KeychainFirst
+        ),
         "'acme': --with-fallback needs a per-session credential swap, but this host \
          resolves credentials keychain-first; start without it"
     );
     assert_eq!(
-        unsupported_host_refusal("acme", SwapUnsupported::SharedRuntimeTree),
+        unsupported_host_refusal(
+            &crate::profile::ProfileName::from("acme"),
+            SwapUnsupported::SharedRuntimeTree
+        ),
         "'acme': --with-fallback needs a per-session credential swap, but this host \
          shares one runtime tree across the profile's sessions; start without it"
     );
@@ -354,7 +362,9 @@ fn with_fallback_refuses_a_keychain_first_host() {
     let _sb = HomeSandbox::new();
     let _daemon = crate::daemon::hold_daemon_lock();
     let config = chain_ready_config("macish");
-    let profile = config.find("macish").expect("fixture profile");
+    let profile = config
+        .find(&crate::profile::ProfileName::from("macish"))
+        .expect("fixture profile");
 
     let err = refuse_unless_chain_eligible(&config, profile, Isolation::Shared, true)
         .expect_err("a keychain-first host must refuse");
@@ -380,7 +390,9 @@ fn with_fallback_refuses_a_non_oauth_profile() {
     let _daemon = crate::daemon::hold_daemon_lock();
     let mut third_party = chain_ready_config("thirdparty");
     third_party.profiles[0].base_url = Some("https://api.example.com".to_string());
-    let profile = third_party.find("thirdparty").expect("fixture profile");
+    let profile = third_party
+        .find(&crate::profile::ProfileName::from("thirdparty"))
+        .expect("fixture profile");
 
     let err = refuse_unless_chain_eligible(&third_party, profile, Isolation::Shared, false)
         .expect_err("a custom endpoint must refuse");
@@ -391,7 +403,9 @@ fn with_fallback_refuses_a_non_oauth_profile() {
     );
 
     let oauth = chain_ready_config("thirdparty");
-    let profile = oauth.find("thirdparty").expect("fixture profile");
+    let profile = oauth
+        .find(&crate::profile::ProfileName::from("thirdparty"))
+        .expect("fixture profile");
     the_eligible_twin_clears_every_gate(
         refuse_unless_chain_eligible(&oauth, profile, Isolation::Shared, false),
         "thirdparty",
@@ -407,7 +421,9 @@ fn with_fallback_refuses_a_profile_outside_the_fallback_chain() {
     let _daemon = crate::daemon::hold_daemon_lock();
     let mut loner = chain_ready_config("loner");
     loner.state.fallback_chain.clear();
-    let profile = loner.find("loner").expect("fixture profile");
+    let profile = loner
+        .find(&crate::profile::ProfileName::from("loner"))
+        .expect("fixture profile");
 
     let err = refuse_unless_chain_eligible(&loner, profile, Isolation::Shared, false)
         .expect_err("a non-member must refuse");
@@ -418,7 +434,9 @@ fn with_fallback_refuses_a_profile_outside_the_fallback_chain() {
     );
 
     let member = chain_ready_config("loner");
-    let profile = member.find("loner").expect("fixture profile");
+    let profile = member
+        .find(&crate::profile::ProfileName::from("loner"))
+        .expect("fixture profile");
     the_eligible_twin_clears_every_gate(
         refuse_unless_chain_eligible(&member, profile, Isolation::Shared, false),
         "loner",
@@ -433,7 +451,9 @@ fn with_fallback_refuses_a_profile_outside_the_fallback_chain() {
 fn with_fallback_refuses_when_no_daemon_is_running() {
     let _sb = HomeSandbox::new();
     let config = chain_ready_config("undaemoned");
-    let profile = config.find("undaemoned").expect("fixture profile");
+    let profile = config
+        .find(&crate::profile::ProfileName::from("undaemoned"))
+        .expect("fixture profile");
 
     let err = refuse_unless_chain_eligible(&config, profile, Isolation::Shared, false)
         .expect_err("no daemon must refuse");
@@ -462,7 +482,9 @@ fn with_fallback_refuses_when_the_daemon_lock_cannot_be_read() {
     let lock_path = crate::daemon::daemon_lock_path();
     fs::create_dir_all(&lock_path).expect("mkdir over the lock path");
     let config = chain_ready_config("unreadable");
-    let profile = config.find("unreadable").expect("fixture profile");
+    let profile = config
+        .find(&crate::profile::ProfileName::from("unreadable"))
+        .expect("fixture profile");
 
     let err = refuse_unless_chain_eligible(&config, profile, Isolation::Shared, false)
         .expect_err("an unreadable daemon lock must refuse");
@@ -492,7 +514,9 @@ fn with_fallback_refuses_a_chain_with_nowhere_to_go() {
     lone.state
         .fallback_chain
         .retain(|n| n.as_str() == "onlyone");
-    let profile = lone.find("onlyone").expect("fixture profile");
+    let profile = lone
+        .find(&crate::profile::ProfileName::from("onlyone"))
+        .expect("fixture profile");
 
     let err = refuse_unless_chain_eligible(&lone, profile, Isolation::Shared, false)
         .expect_err("a chain of one must refuse");
@@ -503,7 +527,9 @@ fn with_fallback_refuses_a_chain_with_nowhere_to_go() {
     );
 
     let paired = chain_ready_config("onlyone");
-    let profile = paired.find("onlyone").expect("fixture profile");
+    let profile = paired
+        .find(&crate::profile::ProfileName::from("onlyone"))
+        .expect("fixture profile");
     the_eligible_twin_clears_every_gate(
         refuse_unless_chain_eligible(&paired, profile, Isolation::Shared, false),
         "onlyone",
@@ -519,7 +545,9 @@ fn with_fallback_refuses_an_isolated_session() {
     let _sb = HomeSandbox::new();
     let _daemon = crate::daemon::hold_daemon_lock();
     let config = chain_ready_config("throwaway");
-    let profile = config.find("throwaway").expect("fixture profile");
+    let profile = config
+        .find(&crate::profile::ProfileName::from("throwaway"))
+        .expect("fixture profile");
 
     let err = refuse_unless_chain_eligible(&config, profile, Isolation::Isolated, false)
         .expect_err("an isolated session must refuse");
@@ -545,7 +573,9 @@ fn a_refused_with_fallback_start_never_probes_the_disk() {
     let _sb = HomeSandbox::new();
     // No daemon held: the last pure gate refuses.
     let config = chain_ready_config("untouched");
-    let profile = config.find("untouched").expect("fixture profile");
+    let profile = config
+        .find(&crate::profile::ProfileName::from("untouched"))
+        .expect("fixture profile");
     let err = refuse_unless_chain_eligible(&config, profile, Isolation::Shared, false)
         .expect_err("no daemon must refuse");
     // WHICH gate refused is the whole subject here: a fixture that drifted into
@@ -586,7 +616,10 @@ fn a_refused_with_fallback_start_never_probes_the_disk() {
         Ok(()) => {}
         Err(e) => assert_eq!(
             e.to_string(),
-            unsupported_host_refusal("untouched", SwapUnsupported::SharedRuntimeTree),
+            unsupported_host_refusal(
+                &crate::profile::ProfileName::from("untouched"),
+                SwapUnsupported::SharedRuntimeTree
+            ),
             "a host that cleared every pure gate can only be refused by the probe"
         ),
     }
@@ -609,8 +642,15 @@ fn run_applies_the_chain_gate_only_to_an_opted_in_start() {
     let mut loner = chain_ready_config("wired");
     loner.state.fallback_chain.clear();
 
-    let err = run(&loner, "wired", &[], Isolation::Shared, None, true)
-        .expect_err("an opted-in start must be gated");
+    let err = run(
+        &loner,
+        &crate::profile::ProfileName::from("wired"),
+        &[],
+        Isolation::Shared,
+        None,
+        true,
+    )
+    .expect_err("an opted-in start must be gated");
     // WHICH gate answers is platform-decided, since `run` passes
     // `cfg!(target_os = "macos")` in and the unsupported-host arm precedes the
     // membership one. Each build sees one arm, so it is the ubuntu and macOS CI
@@ -627,8 +667,15 @@ fn run_applies_the_chain_gate_only_to_an_opted_in_start() {
         }
     );
 
-    let err = run(&loner, "wired", &[], Isolation::Shared, None, false)
-        .expect_err("the sandbox has no ~/.claude to launch against");
+    let err = run(
+        &loner,
+        &crate::profile::ProfileName::from("wired"),
+        &[],
+        Isolation::Shared,
+        None,
+        false,
+    )
+    .expect_err("the sandbox has no ~/.claude to launch against");
     assert_eq!(
         err.to_string(),
         "~/.claude not found; install Claude Code first",
@@ -694,7 +741,15 @@ fn start_heals_the_plugin_registry_only_when_it_is_broken() {
         .expect("seed registry");
     }
 
-    run(&config, "wired", &[], Isolation::Shared, None, false).expect("healthy start");
+    run(
+        &config,
+        &crate::profile::ProfileName::from("wired"),
+        &[],
+        Isolation::Shared,
+        None,
+        false,
+    )
+    .expect("healthy start");
     assert!(
         !fake.log().contains("plugin"),
         "a healthy start must spawn no claude plugin calls, got:\n{}",
@@ -704,7 +759,15 @@ fn start_heals_the_plugin_registry_only_when_it_is_broken() {
     // Broken: the marketplace registration vanishes, and the next start heals
     // it through the lifecycle before claude launches.
     std::fs::remove_file(plugins_dir.join("known_marketplaces.json")).expect("remove registry");
-    run(&config, "wired", &[], Isolation::Shared, None, false).expect("broken start");
+    run(
+        &config,
+        &crate::profile::ProfileName::from("wired"),
+        &[],
+        Isolation::Shared,
+        None,
+        false,
+    )
+    .expect("broken start");
     assert!(
         fake.log().contains("plugin list --json"),
         "a broken registration must heal at start, got:\n{}",

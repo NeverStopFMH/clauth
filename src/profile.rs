@@ -697,20 +697,20 @@ fn herdr_is_default(herdr: &HerdrSettings) -> bool {
 
 impl AppState {
     /// Whether `name` is on the persisted quarantine list.
-    pub(crate) fn is_auth_broken(&self, name: &str) -> bool {
-        self.auth_broken.iter().any(|n| n.as_str() == name)
+    pub(crate) fn is_auth_broken(&self, name: &ProfileName) -> bool {
+        self.auth_broken.iter().any(|n| n == name)
     }
 
     /// Mark or clear `name`'s auth-broken flag in this state. Returns `true`
     /// when the list actually changed. Pure in-memory mutation — the caller
     /// decides what to persist.
-    pub(crate) fn set_auth_broken(&mut self, name: &str, broken: bool) -> bool {
+    pub(crate) fn set_auth_broken(&mut self, name: &ProfileName, broken: bool) -> bool {
         let present = self.is_auth_broken(name);
         if broken && !present {
-            self.auth_broken.push(name.into());
+            self.auth_broken.push(name.clone());
             true
         } else if !broken && present {
-            self.auth_broken.retain(|n| n.as_str() != name);
+            self.auth_broken.retain(|n| n != name);
             true
         } else {
             false
@@ -880,29 +880,29 @@ pub(crate) type ConfigHandle =
     std::sync::Arc<crate::lockorder::RankedMutex<AppConfig, crate::lockorder::rank::Config>>;
 
 impl AppConfig {
-    pub(crate) fn is_active(&self, name: &str) -> bool {
-        self.state.active_profile.as_deref() == Some(name)
+    pub(crate) fn is_active(&self, name: &ProfileName) -> bool {
+        self.state.active_profile.as_ref() == Some(name)
     }
 
     /// True when `name`'s last OAuth refresh was rejected as revoked/invalid
     /// (AUTH-1). Such a profile is skipped by the fallback chain walk.
-    pub(crate) fn is_auth_broken(&self, name: &str) -> bool {
+    pub(crate) fn is_auth_broken(&self, name: &ProfileName) -> bool {
         self.state.is_auth_broken(name)
     }
 
     /// Mark or clear `name`'s auth-broken flag. Returns `true` when the set
     /// actually changed, so the caller can skip a redundant `save_app_state`.
     /// Pure in-memory mutation — the caller persists via `save_app_state`.
-    pub(crate) fn set_auth_broken(&mut self, name: &str, broken: bool) -> bool {
+    pub(crate) fn set_auth_broken(&mut self, name: &ProfileName, broken: bool) -> bool {
         self.state.set_auth_broken(name, broken)
     }
 
-    pub(crate) fn find(&self, name: &str) -> Option<&Profile> {
-        self.profiles.iter().find(|p| p.name == name)
+    pub(crate) fn find(&self, name: &ProfileName) -> Option<&Profile> {
+        self.profiles.iter().find(|p| p.name == *name)
     }
 
-    pub(crate) fn find_mut(&mut self, name: &str) -> Option<&mut Profile> {
-        self.profiles.iter_mut().find(|p| p.name == name)
+    pub(crate) fn find_mut(&mut self, name: &ProfileName) -> Option<&mut Profile> {
+        self.profiles.iter_mut().find(|p| p.name == *name)
     }
 
     pub(crate) fn names(&self) -> Vec<&str> {
@@ -930,11 +930,11 @@ impl AppConfig {
         self.profiles.push(profile);
     }
 
-    pub(crate) fn remove(&mut self, name: &str) {
-        self.profiles.retain(|p| p.name != name);
-        self.state.profiles.retain(|n| n.as_str() != name);
-        self.state.fallback_chain.retain(|n| n.as_str() != name);
-        self.state.auth_broken.retain(|n| n.as_str() != name);
+    pub(crate) fn remove(&mut self, name: &ProfileName) {
+        self.profiles.retain(|p| p.name != *name);
+        self.state.profiles.retain(|n| n != name);
+        self.state.fallback_chain.retain(|n| n != name);
+        self.state.auth_broken.retain(|n| n != name);
         if self.is_active(name) {
             self.state.active_profile = None;
         }
@@ -946,31 +946,21 @@ impl AppConfig {
     }
 
     /// Replace `old` with `new` in every name list and the active marker.
-    pub(crate) fn rename_all_occurrences(&mut self, old: &str, new: &str) {
+    pub(crate) fn rename_all_occurrences(&mut self, old: &ProfileName, new: &ProfileName) {
         if let Some(profile) = self.find_mut(old) {
-            profile.name = new.into();
+            profile.name = new.clone();
         }
-        if let Some(slot) = self.state.profiles.iter_mut().find(|n| n.as_str() == old) {
-            *slot = new.into();
+        if let Some(slot) = self.state.profiles.iter_mut().find(|n| **n == *old) {
+            *slot = new.clone();
         }
-        if let Some(slot) = self
-            .state
-            .fallback_chain
-            .iter_mut()
-            .find(|n| n.as_str() == old)
-        {
-            *slot = new.into();
+        if let Some(slot) = self.state.fallback_chain.iter_mut().find(|n| **n == *old) {
+            *slot = new.clone();
         }
-        if let Some(slot) = self
-            .state
-            .auth_broken
-            .iter_mut()
-            .find(|n| n.as_str() == old)
-        {
-            *slot = new.into();
+        if let Some(slot) = self.state.auth_broken.iter_mut().find(|n| **n == *old) {
+            *slot = new.clone();
         }
         if self.is_active(old) {
-            self.state.active_profile = Some(new.into());
+            self.state.active_profile = Some(new.clone());
         }
     }
 }
@@ -1281,23 +1271,23 @@ fn app_state_path() -> Result<PathBuf> {
     Ok(clauth_dir()?.join("profiles.toml"))
 }
 
-pub(crate) fn profile_dir(name: &str) -> Result<PathBuf> {
-    Ok(profiles_root()?.join(name))
+pub(crate) fn profile_dir(name: &ProfileName) -> Result<PathBuf> {
+    Ok(profiles_root()?.join(name.as_str()))
 }
 
-pub(crate) fn profile_subpath(name: &str, sub: &str) -> Result<PathBuf> {
+pub(crate) fn profile_subpath(name: &ProfileName, sub: &str) -> Result<PathBuf> {
     Ok(profile_dir(name)?.join(sub))
 }
 
-fn profile_config_path(name: &str) -> Result<PathBuf> {
+fn profile_config_path(name: &ProfileName) -> Result<PathBuf> {
     profile_subpath(name, "config.toml")
 }
 
-fn profile_credentials_path(name: &str) -> Result<PathBuf> {
+fn profile_credentials_path(name: &ProfileName) -> Result<PathBuf> {
     profile_subpath(name, "credentials.json")
 }
 
-pub(crate) fn profile_history_path(name: &str) -> Result<PathBuf> {
+pub(crate) fn profile_history_path(name: &ProfileName) -> Result<PathBuf> {
     Ok(profile_dir(name)?.join("usage_history.jsonl"))
 }
 
@@ -1317,7 +1307,7 @@ struct HistoryLine {
 /// Not a hot-path call: a full read + parse + rewrite per profile. The scheduler
 /// runs it at startup and then on a coarse cadence (`HISTORY_PRUNE_INTERVAL_MS`),
 /// under the fetch lease so the rewrite never races an append.
-pub(crate) fn prune_usage_history(name: &str) {
+pub(crate) fn prune_usage_history(name: &ProfileName) {
     let Ok(path) = profile_history_path(name) else {
         return;
     };
@@ -1392,7 +1382,7 @@ fn history_append_file(path: &Path) -> std::io::Result<std::fs::File> {
 /// lands mid-rewrite. One telemetry sample, bounded by the rewrite duration —
 /// a sidecar lock on both sides is the upgrade path if that ever stops being
 /// acceptable (flocking the log itself cannot work: the rename swaps the inode).
-pub(crate) fn append_usage_sample(name: &str, prev: Option<&UsageInfo>, next: &UsageInfo) {
+pub(crate) fn append_usage_sample(name: &ProfileName, prev: Option<&UsageInfo>, next: &UsageInfo) {
     let Ok(next_json) = serde_json::to_string(next) else {
         return;
     };
@@ -1440,7 +1430,7 @@ pub(crate) fn append_usage_sample(name: &str, prev: Option<&UsageInfo>, next: &U
 
 /// Load all parsed entries from a profile's usage_history.jsonl.
 /// Returns chronological (timestamp_ms, UsageInfo) pairs.
-pub(crate) fn load_usage_history(name: &str) -> Vec<(u64, UsageInfo)> {
+pub(crate) fn load_usage_history(name: &ProfileName) -> Vec<(u64, UsageInfo)> {
     let Ok(path) = profile_history_path(name) else {
         return vec![];
     };
@@ -1458,7 +1448,7 @@ pub(crate) fn load_usage_history(name: &str) -> Vec<(u64, UsageInfo)> {
     entries
 }
 
-fn profile_credentials_pending_path(name: &str) -> Result<PathBuf> {
+fn profile_credentials_pending_path(name: &ProfileName) -> Result<PathBuf> {
     profile_subpath(name, "credentials.json.pending")
 }
 
@@ -1656,11 +1646,8 @@ pub(crate) fn active_profile_name() -> Option<ProfileName> {
 /// from the old chain). Only a full [`reload_fingerprint`] drift check closes
 /// that, and no caller has needed the extra read; treat it as a documented
 /// boundary, not an oversight.
-pub(crate) fn is_configured(name: &str) -> Result<bool> {
-    Ok(load_app_state()?
-        .profiles
-        .iter()
-        .any(|n| n.as_str() == name))
+pub(crate) fn is_configured(name: &ProfileName) -> Result<bool> {
+    Ok(load_app_state()?.profiles.iter().any(|n| n == name))
 }
 
 pub(crate) fn load_app_state() -> Result<AppState> {
@@ -1711,10 +1698,10 @@ pub(crate) fn save_app_state(state: &AppState) -> Result<()> {
 /// Same name-keyed residual as [`is_configured`]: this cannot distinguish a
 /// profile that is still present from one deleted and re-logged-in under the
 /// same name.
-pub(crate) fn set_auth_broken_persisted(name: &str, broken: bool) -> Result<bool> {
+pub(crate) fn set_auth_broken_persisted(name: &ProfileName, broken: bool) -> Result<bool> {
     with_state_lock(|| {
         let mut state = load_app_state()?;
-        if broken && !state.profiles.iter().any(|n| n.as_str() == name) {
+        if broken && !state.profiles.iter().any(|n| n == name) {
             return Ok(false);
         }
         if !state.set_auth_broken(name, broken) {
@@ -1854,7 +1841,7 @@ fn usage_cache_is_third_party(
 /// `load_config` first, and `recover_pending_credentials` consumes the sidecar —
 /// and it costs at most one digest call reporting no refresh. Pinned, in that
 /// direction, by `the_lock_free_third_party_read_agrees_with_a_full_load`.
-pub(crate) fn stored_usage_cache_is_third_party(name: &str) -> bool {
+pub(crate) fn stored_usage_cache_is_third_party(name: &ProfileName) -> bool {
     let Ok(config_path) = profile_config_path(name) else {
         return false;
     };
@@ -1882,7 +1869,7 @@ pub(crate) fn stored_usage_cache_is_third_party(name: &str) -> bool {
 /// integration an account is scheduled under — an operator-authored
 /// `ANTHROPIC_BASE_URL` reroutes the request but does not change which provider
 /// clauth typed it as.
-pub(crate) fn stored_provider(name: &str) -> Option<Provider> {
+pub(crate) fn stored_provider(name: &ProfileName) -> Option<Provider> {
     let Ok(config_path) = profile_config_path(name) else {
         return None;
     };
@@ -1948,7 +1935,7 @@ pub(crate) enum StoredEndpoint {
 /// `credentials.pending` sidecar reads here as having none, so
 /// [`effective_base_url`] KEEPS a `base_url` a full load would drop and the
 /// caller qualifies a figure it need not have.
-pub(crate) fn stored_endpoint(name: &str) -> StoredEndpoint {
+pub(crate) fn stored_endpoint(name: &ProfileName) -> StoredEndpoint {
     let Ok(config_path) = profile_config_path(name) else {
         return StoredEndpoint::Unknown;
     };
@@ -1973,7 +1960,7 @@ pub(crate) fn stored_endpoint(name: &str) -> StoredEndpoint {
     }
 }
 
-pub(crate) fn load_profile(name: &str) -> Result<Profile> {
+pub(crate) fn load_profile(name: &ProfileName) -> Result<Profile> {
     let config_path = profile_config_path(name)?;
     let raw_config = match std::fs::read_to_string(&config_path) {
         Ok(s) => s,
@@ -2016,7 +2003,7 @@ pub(crate) fn load_profile(name: &str) -> Result<Profile> {
         };
 
     let profile = Profile {
-        name: name.into(),
+        name: name.clone(),
         base_url,
         api_key: config.api_key,
         auto_start: config.auto_start,
@@ -2186,7 +2173,10 @@ pub(crate) fn save_profile(profile: &Profile) -> Result<()> {
 /// Write rotated credentials to a sidecar BEFORE `save_profile`. Single-use
 /// refresh tokens can't be lost to a crash mid-save; `load_profile` adopts
 /// this sidecar on next start if the commit never landed.
-pub(crate) fn stage_rotated_credentials(name: &str, creds: &ClaudeCredentials) -> Result<()> {
+pub(crate) fn stage_rotated_credentials(
+    name: &ProfileName,
+    creds: &ClaudeCredentials,
+) -> Result<()> {
     with_state_lock(|| {
         mkdir_700(&profile_dir(name)?)?;
         atomic_write_600(
@@ -2197,7 +2187,7 @@ pub(crate) fn stage_rotated_credentials(name: &str, creds: &ClaudeCredentials) -
     })
 }
 
-pub(crate) fn clear_staged_credentials(name: &str) {
+pub(crate) fn clear_staged_credentials(name: &ProfileName) {
     if let Ok(path) = profile_credentials_pending_path(name) {
         let _ = std::fs::remove_file(path);
     }
@@ -2206,7 +2196,7 @@ pub(crate) fn clear_staged_credentials(name: &str) {
 /// Adopt the rotation sidecar when it's at least as new as `credentials.json`
 /// (commit failed or process died mid-save). A stale sidecar is discarded.
 fn recover_pending_credentials(
-    name: &str,
+    name: &ProfileName,
     loaded: Option<ClaudeCredentials>,
 ) -> Option<ClaudeCredentials> {
     let Ok(pending_path) = profile_credentials_pending_path(name) else {
@@ -2264,7 +2254,7 @@ pub(crate) fn load_config() -> Result<AppConfig> {
     let profiles = state
         .profiles
         .iter()
-        .map(|n| load_profile(n))
+        .map(load_profile)
         .collect::<Result<Vec<_>>>()?;
     Ok(AppConfig { state, profiles })
 }

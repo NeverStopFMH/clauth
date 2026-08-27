@@ -11,6 +11,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
+use crate::profile::ProfileName;
+
 /// Filename of the OAuth usage cache, relative to the per-profile dir.
 pub(crate) const USAGE_CACHE_FILE: &str = "usage_cache.json";
 /// Filename of the third-party provider cache, relative to the per-profile dir.
@@ -59,20 +61,20 @@ struct AuthVerdict {
 /// Record that `name`'s usage credential is dead. Best-effort like every other
 /// per-profile cache: a record that never lands leaves the reader on the
 /// mtime derivation, which is the pre-record answer rather than a worse one.
-pub(crate) fn write_auth_expired(name: &str, credential: u64) {
+pub(crate) fn write_auth_expired(name: &ProfileName, credential: u64) {
     write_profile_cache(name, THIRD_PARTY_AUTH_FILE, &AuthVerdict { credential });
 }
 
 /// Drop the record — any outcome other than `AuthExpired` proves the verdict no
 /// longer holds. Cheap and unconditional: the file is usually absent.
-pub(crate) fn clear_auth_expired(name: &str) {
+pub(crate) fn clear_auth_expired(name: &ProfileName) {
     remove_profile_cache(name, THIRD_PARTY_AUTH_FILE);
 }
 
 /// Whether `name` carries a dead-credential verdict for the credential it holds
 /// RIGHT NOW. A record for any other fingerprint is inert — that is what makes
 /// this safe to persist.
-pub(crate) fn auth_expired_matches(name: &str, credential: u64) -> bool {
+pub(crate) fn auth_expired_matches(name: &ProfileName, credential: u64) -> bool {
     load_profile_cache::<AuthVerdict>(name, THIRD_PARTY_AUTH_FILE)
         .is_some_and(|v| v.credential == credential)
 }
@@ -115,7 +117,7 @@ pub(crate) struct TouchReceipt {
 /// other per-profile cache — a receipt that never lands leaves the readers on the
 /// raw mtime, which is the pre-receipt answer rather than a worse one.
 pub(crate) fn write_touch_receipt(
-    name: &str,
+    name: &ProfileName,
     store: &Path,
     stamped: SystemTime,
     prev: Option<SystemTime>,
@@ -165,7 +167,7 @@ pub(crate) fn effective_write_time(store: &Path) -> Option<SystemTime> {
 
 /// Resolve `<profile_dir>/<file>` for `name`. `None` only when the per-profile
 /// dir itself can't be resolved (matches the prior per-layer `cache_path`).
-pub(crate) fn profile_cache_path(name: &str, file: &str) -> Option<PathBuf> {
+pub(crate) fn profile_cache_path(name: &ProfileName, file: &str) -> Option<PathBuf> {
     // `profile_dir` (override-aware) rather than raw `dirs::home_dir`, so tests
     // never touch the real `~/.clauth`.
     crate::profile::profile_dir(name).ok().map(|p| p.join(file))
@@ -174,7 +176,7 @@ pub(crate) fn profile_cache_path(name: &str, file: &str) -> Option<PathBuf> {
 /// Read + deserialize `<profile_dir>/<file>`. `None` on missing file or any
 /// read/parse error — the caller treats both as "no cache" (matches the prior
 /// per-layer loaders exactly).
-pub(crate) fn load_profile_cache<T: DeserializeOwned>(name: &str, file: &str) -> Option<T> {
+pub(crate) fn load_profile_cache<T: DeserializeOwned>(name: &ProfileName, file: &str) -> Option<T> {
     profile_cache_path(name, file).and_then(|p| {
         let text = std::fs::read_to_string(p).ok()?;
         serde_json::from_str::<T>(&text).ok()
@@ -196,7 +198,7 @@ pub(crate) fn load_profile_cache<T: DeserializeOwned>(name: &str, file: &str) ->
 /// parse of `profiles.toml` per write — the record is small, and the same
 /// read already backs the oauth adopt gate and the daemon's switch-target
 /// existence check.
-pub(crate) fn write_profile_cache<T: Serialize>(name: &str, file: &str, value: &T) {
+pub(crate) fn write_profile_cache<T: Serialize>(name: &ProfileName, file: &str, value: &T) {
     if !crate::profile::is_configured(name).unwrap_or(false) {
         return;
     }
@@ -212,14 +214,14 @@ pub(crate) fn write_profile_cache<T: Serialize>(name: &str, file: &str, value: &
 /// Delete `<profile_dir>/<file>`. Best-effort, same contract as the writer: an
 /// already-absent file and any removal error alike leave the caller with "no
 /// cache", which is the intended post-state either way.
-pub(crate) fn remove_profile_cache(name: &str, file: &str) {
+pub(crate) fn remove_profile_cache(name: &ProfileName, file: &str) {
     if let Some(path) = profile_cache_path(name, file) {
         let _ = std::fs::remove_file(path);
     }
 }
 
 /// Epoch-ms of `<profile_dir>/<file>`'s last write, or `None` when it's absent.
-pub(crate) fn profile_cache_mtime_ms(name: &str, file: &str) -> Option<u64> {
+pub(crate) fn profile_cache_mtime_ms(name: &ProfileName, file: &str) -> Option<u64> {
     let modified = std::fs::metadata(profile_cache_path(name, file)?)
         .ok()?
         .modified()

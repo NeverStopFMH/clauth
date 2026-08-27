@@ -42,8 +42,8 @@ use crate::oauth;
 use crate::profile::{
     AppConfig, ClockFormat, ConfigHandle, ConsoleSite, DivergenceChoice, HerdrSettings,
     MAX_REFRESH_INTERVAL_MS, MAX_WEEKLY_SWITCH_PCT, MIN_REFRESH_INTERVAL_MS, MIN_WEEKLY_SWITCH_PCT,
-    ModelSettings, PopupWidth, Profile, ReloadFingerprint, ResetDisplay, ThemeName, load_config,
-    reload_fingerprint, save_app_state, save_profile,
+    ModelSettings, PopupWidth, Profile, ProfileName, ReloadFingerprint, ResetDisplay, ThemeName,
+    load_config, reload_fingerprint, save_app_state, save_profile,
 };
 use crate::status::{self, Incident, StatusEvent};
 use crate::tui::theme;
@@ -1781,7 +1781,7 @@ fn collect_session_tokens(names: &[String]) -> HashMap<String, crate::claude::Se
             // LongLived. (The cache held the `SidecarKind` too while the
             // Overview wore a type tag; upstream 5dde024 removed the tag, and
             // the kind went with it.)
-            let (kind, oauth) = crate::claude::sidecar_summary(n)?;
+            let (kind, oauth) = crate::claude::sidecar_summary(&ProfileName::from(n.clone()))?;
             let status = match kind {
                 crate::claude::SidecarKind::Misfilled => {
                     crate::claude::SessionTokenStatus::NotLongLived
@@ -1875,7 +1875,7 @@ impl App {
         let mut history_cache: HashMap<String, Vec<(u64, UsageInfo)>> = HashMap::new();
         let mut history_mtimes: HashMap<String, std::time::SystemTime> = HashMap::new();
         for profile in &config.profiles {
-            let name = profile.name.as_str();
+            let name = &profile.name;
             let data = crate::profile::load_usage_history(name);
             if !data.is_empty() {
                 if let Ok(path) = crate::profile::profile_history_path(name)
@@ -2171,8 +2171,8 @@ impl App {
             let due_now: Vec<String> = match h.last_fetched.lock() {
                 Ok(lf) => snapshot
                     .iter()
-                    .map(|e| e.name.clone())
-                    .chain(third_party.iter().map(|e| e.name.clone()))
+                    .map(|e| e.name.to_string())
+                    .chain(third_party.iter().map(|e| e.name.to_string()))
                     .filter(|n| {
                         lf.get(n)
                             .is_none_or(|t| t.as_millis().saturating_add(interval_ms) <= now)
@@ -2181,7 +2181,11 @@ impl App {
                 Err(_) => Vec::new(),
             };
             for name in &due_now {
-                mark_activity(&h.activity, name, ProfileActivity::Queued);
+                mark_activity(
+                    &h.activity,
+                    &ProfileName::from(name.clone()),
+                    ProfileActivity::Queued,
+                );
             }
         });
     }
@@ -2193,11 +2197,15 @@ impl App {
     /// reads `usage_history.jsonl` while holding the config guard;
     /// `fallback::burn_rate_for_profile` is the disk-reading twin used off the
     /// render/UI thread (the scheduler tick, after locks are dropped).
-    pub(crate) fn active_burn_rate(&self, name: &str, usage_info: &UsageInfo) -> Option<f64> {
+    pub(crate) fn active_burn_rate(
+        &self,
+        name: &ProfileName,
+        usage_info: &UsageInfo,
+    ) -> Option<f64> {
         let five_h = usage_info.five_hour.as_ref().map(|w| ("5h", w))?;
         crate::usage::compute_burn_rates_from_history(
             self.history_cache
-                .get(name)
+                .get(name.as_str())
                 .map(|v| v.as_slice())
                 .unwrap_or(&[]),
             std::slice::from_ref(&five_h),
@@ -2231,11 +2239,7 @@ impl App {
             // risks acting on a window the account no longer has. Stale profiles
             // are due on the scheduler's first tick, which fetches then
             // auto-switches off the corrected numbers.
-            let active_profile = cfg
-                .state
-                .active_profile
-                .as_deref()
-                .and_then(|n| cfg.find(n));
+            let active_profile = cfg.state.active_profile.as_ref().and_then(|n| cfg.find(n));
             let active_fresh =
                 active_profile.is_some_and(|p| p.fetch_status == Some(FetchStatus::Fresh));
             if active_fresh {
@@ -2243,7 +2247,7 @@ impl App {
                 // while the config guard is held; see `active_burn_rate`.
                 let rate = active_profile.and_then(|p| {
                     let usage = p.usage.as_ref()?;
-                    self.active_burn_rate(p.name.as_str(), usage)
+                    self.active_burn_rate(&p.name, usage)
                 });
                 auto_switch_if_needed(&mut cfg, rate).ok().flatten()
             } else {
@@ -2255,7 +2259,10 @@ impl App {
                 // Destination-based, as in the pending-switch drain: landing on
                 // the home account reads as a return whether the return pass or
                 // an exhaustion walk onto a clear preferred put us there.
-                let returned = self.config().find(&target).is_some_and(|p| p.preferred);
+                let returned = self
+                    .config()
+                    .find(&ProfileName::from(target.clone()))
+                    .is_some_and(|p| p.preferred);
                 let msg = if returned {
                     format!("returned to preferred account '{target}'")
                 } else {
@@ -2389,12 +2396,14 @@ impl App {
         // whichever process holds the fetch lease — this one or a headless
         // daemon — so an mtime bump is the only signal that new samples landed.
         for name in &history_names {
-            if let Ok(path) = crate::profile::profile_history_path(name)
+            if let Ok(path) = crate::profile::profile_history_path(&ProfileName::from(name.clone()))
                 && let Ok(mtime) = path.metadata().and_then(|m| m.modified())
                 && self.history_mtimes.get(name) != Some(&mtime)
             {
-                self.history_cache
-                    .insert(name.clone(), crate::profile::load_usage_history(name));
+                self.history_cache.insert(
+                    name.clone(),
+                    crate::profile::load_usage_history(&ProfileName::from(name.clone())),
+                );
                 self.history_mtimes.insert(name.clone(), mtime);
             }
         }
@@ -2461,7 +2470,7 @@ impl App {
     /// `/profile`, keeping the global refresh light on the rate-limited host.
     pub(crate) fn manual_refresh(&self) {
         #[allow(clippy::expect_used, reason = "mutex poisoning is unrecoverable")]
-        let names: Vec<String> = self
+        let names: Vec<ProfileName> = self
             .usage_tokens
             .lock()
             .expect("usage_tokens mutex poisoned")
@@ -2475,14 +2484,14 @@ impl App {
 
     /// Queue a single profile for an immediate re-fetch (Usage `r` / action
     /// menu), also re-pulling its `/profile` (plan / tier).
-    pub(crate) fn manual_refresh_one(&self, name: &str) {
+    pub(crate) fn manual_refresh_one(&self, name: &ProfileName) {
         self.enqueue_refetch(name, true);
     }
 
     /// Mark a profile for an immediate re-fetch. `refresh_plan` expires the
     /// `/profile` TTL so the next fetch re-pulls plan/tier — set for an explicit
     /// single-profile refresh, cleared for the bulk refresh-all.
-    fn enqueue_refetch(&self, name: &str, refresh_plan: bool) {
+    fn enqueue_refetch(&self, name: &ProfileName, refresh_plan: bool) {
         // Light a pending spinner immediately so the UI reflects the keypress.
         // Only when idle — don't clobber an in-flight switch/refresh marker. The
         // next tick's worker flips Queued→Fetching when its request fires; a name
@@ -2572,8 +2581,8 @@ impl App {
         self.config().profiles.len()
     }
 
-    pub(crate) fn profile_name_at(&self, idx: usize) -> Option<String> {
-        self.config().profiles.get(idx).map(|p| p.name.to_string())
+    pub(crate) fn profile_name_at(&self, idx: usize) -> Option<ProfileName> {
+        self.config().profiles.get(idx).map(|p| p.name.clone())
     }
 
     /// Clamp `profile_cursor` to `0..profile_count`.
@@ -3900,7 +3909,7 @@ fn recompute_plugin_checks(app: &mut App, refresh_version: bool) {
     // then drop it before the FS reads (`classify_credentials_link`) so no lock
     // is held across I/O.
     struct Snap {
-        name: String,
+        name: ProfileName,
         active: bool,
         expires_at: Option<i64>,
     }
@@ -3909,8 +3918,8 @@ fn recompute_plugin_checks(app: &mut App, refresh_version: bool) {
         cfg.profiles
             .iter()
             .map(|p| Snap {
-                name: p.name.as_str().to_string(),
-                active: cfg.is_active(p.name.as_str()),
+                name: p.name.clone(),
+                active: cfg.is_active(&p.name),
                 expires_at: p.access_token_expires_at(),
             })
             .collect()
@@ -3953,20 +3962,20 @@ fn recompute_plugin_checks(app: &mut App, refresh_version: bool) {
             live_names.push(if instances > 1 {
                 format!("{} · {instances}", snap.name)
             } else {
-                snap.name.clone()
+                snap.name.to_string()
             });
         }
         // Observed delegate throughput (MCP `delegate`); a recent rate-limit on any
         // exercised model warns even when the credential link is healthy.
         let throughput = crate::throughput::summary(&snap.name, now_secs);
         if throughput.iter().any(|t| t.rate_limited_recent) {
-            rate_limited_names.push(snap.name.clone());
+            rate_limited_names.push(snap.name.to_string());
         }
 
         if !snap.active {
             continue;
         }
-        active_name = Some(snap.name.clone());
+        active_name = Some(snap.name.to_string());
 
         // A classify error (broken symlink mid-read, perms) must not read as
         // healthy: surface it as a warn with an `unknown` link label rather than
@@ -3994,9 +4003,9 @@ fn recompute_plugin_checks(app: &mut App, refresh_version: bool) {
         };
         active_bad = link_err || diverged || missing;
         active_fix = if diverged {
-            Some(PluginFix::RepairDivergence(snap.name.clone()))
+            Some(PluginFix::RepairDivergence(snap.name.to_string()))
         } else if missing && stored_creds {
-            Some(PluginFix::RelinkCredentials(snap.name.clone()))
+            Some(PluginFix::RelinkCredentials(snap.name.to_string()))
         } else {
             None
         };
@@ -4121,7 +4130,7 @@ fn request_switch_to(app: &mut App, idx: usize) {
     let Some(profile) = cfg.profiles.get(idx) else {
         return;
     };
-    let name = profile.name.to_string();
+    let name = profile.name.clone();
     // `switch_profile` already refuses a disabled target (shared guard), but a
     // disabled row must never even offer the confirm — never selectable, not
     // just never landed.
@@ -4133,7 +4142,7 @@ fn request_switch_to(app: &mut App, idx: usize) {
         message: format!("switch to '{name}'?"),
         detail: None,
         choice: true,
-        on_confirm: ConfirmAction::Switch(name),
+        on_confirm: ConfirmAction::Switch(name.to_string()),
     }));
 }
 
@@ -4173,7 +4182,7 @@ fn reorder_main_cursor(app: &mut App, delta: i32) {
 /// One off-thread AUTH-1 switch-gate answer, posted by `spawn_switch_gate`'s
 /// worker and drained by `drain_switch_gates`.
 pub(crate) struct SwitchGateResult {
-    name: String,
+    name: ProfileName,
     gate: oauth::AuthGate,
 }
 
@@ -4184,13 +4193,13 @@ pub(crate) struct SwitchGateResult {
 /// (`switch_profile` no-ops on `is_active`), and gating it races a live
 /// `claude` refreshing through the symlink — the same exemption as the
 /// CLI/MCP paths.
-fn perform_switch(app: &mut App, name: &str) {
+fn perform_switch(app: &mut App, name: &ProfileName) {
     let active = app.config().state.active_profile.clone();
     if active.as_deref() == Some(name) {
         finalize_switch(app, name);
         return;
     }
-    spawn_switch_gate(app, name.to_string(), oauth::refresh_result);
+    spawn_switch_gate(app, name.clone(), oauth::refresh_result);
 }
 
 /// Run `ensure_installable` for `name` off the UI thread and post the answer
@@ -4199,7 +4208,7 @@ fn perform_switch(app: &mut App, name: &str) {
 /// clears it. `refresher` is injected so tests gate offline; under `cfg(test)`
 /// the gate runs synchronously — a detached worker would race the test's
 /// `HomeSandbox` (the gate persists `auth_broken` transitions to home paths).
-fn spawn_switch_gate<F>(app: &mut App, name: String, refresher: F)
+fn spawn_switch_gate<F>(app: &mut App, name: ProfileName, refresher: F)
 where
     F: Fn(&str, Option<&str>) -> std::result::Result<oauth::TokenResponse, oauth::RefreshError>
         + Send
@@ -4222,7 +4231,7 @@ where
 /// True when the live credentials diverge from the stored chain and it's not a
 /// first-login adoption (must be reconciled before clearing/relinking). A
 /// logged-out shell is exempt — an empty login needs no reconciling.
-fn active_diverged_unsaved(active: &str) -> bool {
+fn active_diverged_unsaved(active: &ProfileName) -> bool {
     crate::claude::live_diverged_and_unsaved(active).unwrap_or(false)
 }
 
@@ -4255,14 +4264,14 @@ fn open_divergence_modal(app: &mut App, active: &str) {
 /// `switch_profile`, token-snapshot refresh. No HTTP — the AUTH-1 gate has
 /// already answered (or the target is the already-active exemption) by the
 /// time this runs.
-fn finalize_switch(app: &mut App, name: &str) {
+fn finalize_switch(app: &mut App, name: &ProfileName) {
     // Guard a diverged outgoing active: `switch_profile` would no-op the
     // snapshot and then `link_profile_credentials` would bail on the regular
     // file, stranding the fresh `/login` chain. Raise the Divergence modal so
     // the user cleans up first; first-login adoption stays a clean switch.
     let outgoing = app.config().state.active_profile.clone();
     if let Some(active) = outgoing
-        && active != name
+        && active != *name
         && active_diverged_unsaved(&active)
     {
         clear_activity(&app.activity, name);
@@ -5095,7 +5104,7 @@ fn handle_fallback_add_key(app: &mut App, key: KeyEvent) {
             };
         }
         KeyCode::Enter | KeyCode::Char(' ') => {
-            let name = candidates[app.fallback_detail_cursor].clone();
+            let name = ProfileName::from(candidates[app.fallback_detail_cursor].clone());
             let would_mix = {
                 let cfg = app.config();
                 chain_would_mix(&cfg, &name)
@@ -5107,7 +5116,7 @@ fn handle_fallback_add_key(app: &mut App, key: KeyEvent) {
                         .into(),
                     detail: Some("api → oauth switches may not work until cc restarts.".into()),
                     choice: false,
-                    on_confirm: ConfirmAction::AddChainCandidate(name),
+                    on_confirm: ConfirmAction::AddChainCandidate(name.to_string()),
                 }));
             } else {
                 commit_chain_add(app, &name);
@@ -5119,7 +5128,7 @@ fn handle_fallback_add_key(app: &mut App, key: KeyEvent) {
 
 /// Add `name` to the chain, toast, and re-home focus. Shared by the direct
 /// add path and the `AddChainCandidate` confirm callback.
-fn commit_chain_add(app: &mut App, name: &str) {
+fn commit_chain_add(app: &mut App, name: &ProfileName) {
     add_chain_candidate(app, name);
     app.toast(ToastKind::Success, format!("added '{name}' to chain"));
     // When the picker empties, `+ add` disappears — land on the new member.
@@ -5159,7 +5168,7 @@ pub(crate) fn chain_candidates(app: &App) -> Vec<String> {
 /// `claude` session stuck on the api-key account until restart. Fires only
 /// when a homogeneous chain would gain its other kind — silent on empty,
 /// already-mixed, and same-kind adds.
-pub(crate) fn chain_would_mix(cfg: &AppConfig, name: &str) -> bool {
+pub(crate) fn chain_would_mix(cfg: &AppConfig, name: &ProfileName) -> bool {
     let Some(candidate) = cfg.find(name) else {
         return false;
     };
@@ -5689,7 +5698,7 @@ fn toggle_preferred(app: &mut App) {
 }
 
 /// Add a profile to the chain (seeding default threshold if unset) and persist.
-fn add_chain_candidate(app: &mut App, name: &str) {
+fn add_chain_candidate(app: &mut App, name: &ProfileName) {
     let mut cfg = app.config();
     if let Some(profile) = cfg.find_mut(name)
         && profile.fallback_threshold.is_none()
@@ -5697,7 +5706,7 @@ fn add_chain_candidate(app: &mut App, name: &str) {
         profile.fallback_threshold = Some(DEFAULT_THRESHOLD);
         let _ = save_profile(profile);
     }
-    cfg.state.fallback_chain.push(name.into());
+    cfg.state.fallback_chain.push(name.clone());
     let _ = save_app_state(&cfg.state);
 }
 
@@ -5836,7 +5845,7 @@ pub(crate) fn build_action_menu(app: &App) -> ActionMenuState {
         // still stamp the draft's endpoint + model fields.
         Tab::Setup => {
             if let Some((name, _, _)) = focused_account(app) {
-                context = Some(name);
+                context = Some(name.to_string());
                 scoped.push(Duplicate);
                 scoped.push(SaveAsPreset);
                 scoped.push(ApplyPreset);
@@ -5881,7 +5890,7 @@ fn push_account_scope(app: &App, scoped: &mut Vec<ActionMenuAction>) -> Option<S
     if focused_provider_console(app).is_some() {
         scoped.push(ActionMenuAction::OpenProviderConsole);
     }
-    Some(name)
+    Some(name.to_string())
 }
 
 /// The console page the focused account's endpoint mints its api key on.
@@ -5986,11 +5995,11 @@ fn handle_action_menu_key(app: &mut App, key: KeyEvent) {
 /// routing: the actions it gates (rotate, refresh) act on the stored token chain,
 /// so a hybrid holding a real pair behind a `base_url` can rotate it, and an
 /// endpoint-only profile cannot.
-fn focused_account(app: &App) -> Option<(String, bool, bool)> {
+fn focused_account(app: &App) -> Option<(ProfileName, bool, bool)> {
     let cfg = app.config();
     cfg.profiles
         .get(app.profile_cursor)
-        .map(|p| (p.name.to_string(), p.login_is_oauth(), p.is_third_party()))
+        .map(|p| (p.name.clone(), p.login_is_oauth(), p.is_third_party()))
 }
 
 /// Dispatch a selected action menu item to its handler.
@@ -6023,7 +6032,7 @@ fn dispatch_action_menu_action(app: &mut App, action: ActionMenuAction) {
                     message: format!("rotate access token for '{name}'?"),
                     detail: None,
                     choice: false,
-                    on_confirm: ConfirmAction::RotateOne(name),
+                    on_confirm: ConfirmAction::RotateOne(name.to_string()),
                 }));
             }
             Some((name, _, _)) => {
@@ -6240,9 +6249,9 @@ pub(crate) fn config_rows(app: &App) -> Vec<ConfigRow> {
     // rendered). The no-other-login refusal is a dim, not a hide — see
     // `run_config_row`.
     if profile.is_some_and(|p| {
-        crate::claude::session_token_status(p.name.as_str()).is_some()
+        crate::claude::session_token_status(&p.name).is_some()
             || p.rolling_token
-            || crate::claude::has_static_backup(p.name.as_str())
+            || crate::claude::has_static_backup(&p.name)
     }) {
         rows.push(ConfigRow::ClearSessionToken);
     }
@@ -6297,7 +6306,7 @@ fn build_draft_new() -> ConfigDraft {
     }
 }
 
-fn build_draft_existing(app: &App, name: &str) -> ConfigDraft {
+fn build_draft_existing(app: &App, name: &ProfileName) -> ConfigDraft {
     let cfg = app.config();
     let profile = cfg.find(name);
     let m = profile.map(|p| p.models.clone()).unwrap_or_default();
@@ -6381,7 +6390,8 @@ fn run_config_row(app: &mut App, row: ConfigRow) {
     let name = app
         .config_draft
         .as_ref()
-        .and_then(|d| d.editing_name.clone());
+        .and_then(|d| d.editing_name.clone())
+        .map(ProfileName::from);
     match row {
         ConfigRow::Disabled => {
             if let Some(name) = name {
@@ -6503,7 +6513,7 @@ fn run_config_row(app: &mut App, row: ConfigRow) {
                     message: format!("log out of '{name}'?"),
                     detail: Some(detail.to_string()),
                     choice: false,
-                    on_confirm: ConfirmAction::BlankCredentials(name),
+                    on_confirm: ConfirmAction::BlankCredentials(name.to_string()),
                 }));
             }
         }
@@ -6582,7 +6592,7 @@ fn run_config_row(app: &mut App, row: ConfigRow) {
 /// sidecar's write time in, so leaving it stale is what makes the next tick
 /// reload and rebuild `session_tokens` (the Overview `⊘` marker's cache). The
 /// local `remove` below only spares that marker one tick of staleness.
-fn perform_clear_session_token(app: &mut App, name: &str) {
+fn perform_clear_session_token(app: &mut App, name: &ProfileName) {
     let _guard = match crate::runtime::RotationGuard::try_acquire(name) {
         Ok(Some(guard)) => guard,
         Ok(None) => {
@@ -6653,7 +6663,7 @@ fn perform_clear_session_token(app: &mut App, name: &str) {
         app.toast(ToastKind::Danger, format!("clear failed\n{e}"));
         return;
     }
-    app.session_tokens.remove(name);
+    app.session_tokens.remove(name.as_str());
     // Read AFTER the clear, so it names the store the relink actually finds:
     // `install_source_path` falls back to `credentials.json` only once the
     // sidecar is gone. An api-key account has none, so it is signed out rather
@@ -6744,10 +6754,11 @@ fn start_api_relogin(app: &mut App) {
     let name = app
         .config_draft
         .as_ref()
-        .and_then(|d| d.editing_name.clone());
+        .and_then(|d| d.editing_name.clone())
+        .map(ProfileName::from);
     let (base, key) = {
         let cfg = app.config();
-        let p = name.as_deref().and_then(|n| cfg.find(n));
+        let p = name.as_ref().and_then(|n| cfg.find(n));
         (
             p.and_then(|p| p.base_url.clone()).unwrap_or_default(),
             p.and_then(|p| p.api_key.clone()).unwrap_or_default(),
@@ -6838,11 +6849,12 @@ fn login_row_flow(app: &App, editing: Option<&str>) -> LoginRowFlow {
     let Some(name) = editing else {
         return LoginRowFlow::OauthMint;
     };
-    if let Some((site, region)) = console_login_target(app, name) {
+    let name = ProfileName::from(name);
+    if let Some((site, region)) = console_login_target(app, &name) {
         return LoginRowFlow::Console { site, region };
     }
     let cfg = app.config();
-    match cfg.find(name) {
+    match cfg.find(&name) {
         Some(p) if !p.login_is_oauth() => LoginRowFlow::ApiKey,
         _ => LoginRowFlow::OauthMint,
     }
@@ -6859,7 +6871,7 @@ fn login_row_flow(app: &App, editing: Option<&str>) -> LoginRowFlow {
 /// The verdict itself is [`Profile::console_login_target`], shared with the row's
 /// hint and label so the copy cannot describe a different flow than the one ⏎
 /// runs.
-fn console_login_target(app: &App, name: &str) -> Option<(ConsoleSite, &'static str)> {
+fn console_login_target(app: &App, name: &ProfileName) -> Option<(ConsoleSite, &'static str)> {
     let cfg = app.config();
     cfg.find(name)?.console_login_target()
 }
@@ -6959,7 +6971,8 @@ fn cancel_config_edit(app: &mut App, field: ConfigRow) {
     let editing_name = app
         .config_draft
         .as_ref()
-        .and_then(|d| d.editing_name.clone());
+        .and_then(|d| d.editing_name.clone())
+        .map(ProfileName::from);
     if let Some(name) = editing_name {
         let value = {
             let cfg = app.config();
@@ -6981,7 +6994,7 @@ fn cancel_config_edit(app: &mut App, field: ConfigRow) {
 
 /// The persisted value behind a buffered row, used to revert on ⎋ and to reseed
 /// the buffer after a commit. Toggle/action rows have no buffer → empty string.
-fn row_committed_value(profile: Option<&Profile>, name: &str, row: ConfigRow) -> String {
+fn row_committed_value(profile: Option<&Profile>, name: &ProfileName, row: ConfigRow) -> String {
     match row {
         ConfigRow::Name => name.to_string(),
         ConfigRow::BaseUrl => profile.and_then(|p| p.base_url.clone()).unwrap_or_default(),
@@ -7059,6 +7072,7 @@ fn commit_model_field(app: &mut App, field: ConfigRow) {
         .config_draft
         .as_ref()
         .and_then(|d| d.editing_name.clone())
+        .map(ProfileName::from)
     else {
         return;
     };
@@ -7120,7 +7134,8 @@ fn cycle_model(app: &mut App) {
     let editing_name = app
         .config_draft
         .as_ref()
-        .and_then(|d| d.editing_name.clone());
+        .and_then(|d| d.editing_name.clone())
+        .map(ProfileName::from);
     let Some(name) = editing_name else {
         if let Some(d) = app.config_draft.as_mut() {
             let next = next_model_preset(d.model.trimmed_some().as_deref()).unwrap_or_default();
@@ -7174,6 +7189,7 @@ fn enter_env_value_edit(app: &mut App, i: usize) {
         .config_draft
         .as_ref()
         .and_then(|d| d.editing_name.clone())
+        .map(ProfileName::from)
     else {
         return;
     };
@@ -7204,6 +7220,7 @@ fn commit_env_value(app: &mut App, i: usize) {
         .config_draft
         .as_ref()
         .and_then(|d| d.editing_name.clone())
+        .map(ProfileName::from)
     else {
         return;
     };
@@ -7256,6 +7273,7 @@ fn commit_env_new_key(app: &mut App) {
         .config_draft
         .as_ref()
         .and_then(|d| d.editing_name.clone())
+        .map(ProfileName::from)
     else {
         return;
     };
@@ -7288,9 +7306,11 @@ fn commit_env_new_key(app: &mut App) {
         d.active = None;
     }
     match collision {
-        Some(c) => app
-            .modals
-            .push(Modal::EnvCollision(env_collision_form(name, key, c))),
+        Some(c) => app.modals.push(Modal::EnvCollision(env_collision_form(
+            name.to_string(),
+            key,
+            c,
+        ))),
         None => env_add_commit(app, &name, &key),
     }
 }
@@ -7298,7 +7318,7 @@ fn commit_env_new_key(app: &mut App) {
 /// Add (when new) the custom key with an empty value, then focus its row and open
 /// the value editor. An existing key (overwrite chosen on the prompt) is edited in
 /// place — never re-blanked.
-fn env_add_commit(app: &mut App, name: &str, key: &str) {
+fn env_add_commit(app: &mut App, name: &ProfileName, key: &str) {
     let exists = {
         let cfg = app.config();
         cfg.find(name)
@@ -7397,7 +7417,7 @@ fn handle_env_collision_key(app: &mut App, key: KeyEvent) {
         }
         KeyCode::Enter | KeyCode::Char(' ') => {
             let choice = EnvCollisionForm::options()[state.cursor.min(last)];
-            let name = state.profile.clone();
+            let name = ProfileName::from(state.profile.clone());
             let pending = state.key.clone();
             let existing_idx = state.existing_idx;
             app.modals.pop();
@@ -7409,7 +7429,7 @@ fn handle_env_collision_key(app: &mut App, key: KeyEvent) {
 
 fn run_env_collision_choice(
     app: &mut App,
-    name: &str,
+    name: &ProfileName,
     key: &str,
     existing_idx: Option<usize>,
     choice: EnvCollisionChoice,
@@ -7453,9 +7473,11 @@ fn commit_rename(app: &mut App) {
     // The rotation guard is taken BEFORE `app.config()`: ROTATION ranks outside
     // `Config`, so acquiring it under the config guard is the inversion
     // `lockorder` asserts on.
-    let result = rotation_guard_for_mutation(&old).and_then(|rotation| {
+    let old_pn = ProfileName::from(old.clone());
+    let new_pn = ProfileName::from(new.clone());
+    let result = rotation_guard_for_mutation(&old_pn).and_then(|rotation| {
         let mut cfg = app.config();
-        rename_profile(&mut cfg, &old, &new, &rotation)
+        rename_profile(&mut cfg, &old_pn, &new_pn, &rotation)
     });
     match result {
         Ok(()) => {
@@ -7476,7 +7498,7 @@ fn commit_endpoint(app: &mut App) {
     let Some(d) = app.config_draft.as_ref() else {
         return;
     };
-    let Some(name) = d.editing_name.clone() else {
+    let Some(name) = d.editing_name.clone().map(ProfileName::from) else {
         return;
     };
     let active_field = d.active;
@@ -7586,7 +7608,7 @@ fn commit_new_account(app: &mut App) {
     }
 }
 
-fn perform_delete(app: &mut App, name: &str) {
+fn perform_delete(app: &mut App, name: &ProfileName) {
     // The unforced guard in `delete_profile` refuses a live-session profile,
     // which would otherwise dead-end the TUI on a danger toast with no way
     // forward. Confirm the deauth risk instead of attempting (and failing)
@@ -7607,7 +7629,7 @@ fn perform_delete(app: &mut App, name: &str) {
     finish_delete(app, name, false);
 }
 
-fn finish_delete(app: &mut App, name: &str, force: bool) {
+fn finish_delete(app: &mut App, name: &ProfileName, force: bool) {
     // Before `app.config()`, for the reason the rename path states.
     let result = rotation_guard_for_mutation(name).and_then(|rotation| {
         let mut cfg = app.config();
@@ -7659,7 +7681,7 @@ fn toggle_focused_account_disabled(app: &mut App) {
         message: format!("disable '{name}'?"),
         detail: Some(DISABLE_DETAIL.to_string()),
         choice: false,
-        on_confirm: ConfirmAction::DisableOne(name),
+        on_confirm: ConfirmAction::DisableOne(name.to_string()),
     }));
 }
 
@@ -7673,7 +7695,7 @@ fn prompt_duplicate_profile(app: &mut App) {
     };
     app.modals.push(Modal::NamePrompt(NamePromptForm {
         input: InputState::new(""),
-        action: NamePromptAction::DuplicateProfile(name),
+        action: NamePromptAction::DuplicateProfile(name.to_string()),
     }));
 }
 
@@ -7684,7 +7706,7 @@ fn prompt_save_preset(app: &mut App) {
     };
     app.modals.push(Modal::NamePrompt(NamePromptForm {
         input: InputState::new(""),
-        action: NamePromptAction::SavePreset(name),
+        action: NamePromptAction::SavePreset(name.to_string()),
     }));
 }
 
@@ -7694,7 +7716,7 @@ fn prompt_save_preset(app: &mut App) {
 /// are stamped into the draft, not a saved profile.
 fn open_preset_picker(app: &mut App) {
     let target = if let Some((name, _, _)) = focused_account(app) {
-        name
+        name.to_string()
     } else if app.profile_cursor >= app.profile_count() {
         if app.config_draft.is_none() {
             app.config_draft = Some(build_draft_new());
@@ -7741,7 +7763,11 @@ fn handle_name_prompt_key(app: &mut App, key: KeyEvent) {
                         return;
                     }
                     app.modals.pop();
-                    duplicate_profile_into(app, &source, &name);
+                    duplicate_profile_into(
+                        app,
+                        &ProfileName::from(source),
+                        &ProfileName::from(name),
+                    );
                 }
                 NamePromptAction::SavePreset(source) => {
                     // The preset store is its own namespace, so the roster is
@@ -7834,7 +7860,9 @@ fn handle_preset_picker_key(app: &mut App, key: KeyEvent) {
             // warning: "this overwrites settings" says nothing a user can act on.
             let clobbered = {
                 let cfg = app.config();
-                cfg.find(&target).map(preset_clobbers).unwrap_or_default()
+                cfg.find(&ProfileName::from(target.clone()))
+                    .map(preset_clobbers)
+                    .unwrap_or_default()
             };
             if clobbered.is_empty() {
                 apply_preset_to(app, &target, &preset.name);
@@ -7900,11 +7928,12 @@ fn apply_preset_to(app: &mut App, target: &str, preset: &str) {
         stamp_draft_from_preset(app, &preset);
         return;
     }
+    let target = ProfileName::from(target);
     let result = {
         let mut cfg = app.config();
         edit_profile_preset(
             &mut cfg,
-            target,
+            &target,
             preset.base_url.clone(),
             preset.models.clone(),
         )
@@ -7914,7 +7943,7 @@ fn apply_preset_to(app: &mut App, target: &str, preset: &str) {
             app.refresh_tokens();
             app.last_reload_fp = reload_fingerprint();
             if app.config_draft.is_some() {
-                app.config_draft = Some(build_draft_existing(app, target));
+                app.config_draft = Some(build_draft_existing(app, &target));
             }
             app.toast(
                 ToastKind::Success,
@@ -7962,7 +7991,7 @@ fn stamp_draft_from_preset(app: &mut App, preset: &crate::presets::Preset) {
 fn save_preset_from(app: &mut App, source: &str, preset: &str) {
     let fields = {
         let cfg = app.config();
-        cfg.find(source)
+        cfg.find(&ProfileName::from(source))
             .map(|p| (p.base_url.clone(), p.models.clone()))
     };
     let Some((base_url, models)) = fields else {
@@ -7976,7 +8005,7 @@ fn save_preset_from(app: &mut App, source: &str, preset: &str) {
 }
 
 /// Copy `source` onto a new account named `new_name` and select it.
-fn duplicate_profile_into(app: &mut App, source: &str, new_name: &str) {
+fn duplicate_profile_into(app: &mut App, source: &ProfileName, new_name: &ProfileName) {
     let result = {
         let mut cfg = app.config();
         duplicate_profile(&mut cfg, source, new_name.to_string())
@@ -7989,7 +8018,7 @@ fn duplicate_profile_into(app: &mut App, source: &str, new_name: &str) {
                 .config()
                 .profiles
                 .iter()
-                .position(|p| p.name == new_name)
+                .position(|p| p.name == *new_name)
                 .unwrap_or(0);
             app.profile_cursor = idx;
             app.config_action_cursor = 0;
@@ -8018,7 +8047,7 @@ fn duplicate_profile_into(app: &mut App, source: &str, new_name: &str) {
 /// work lists (`collect_tokens`/`collect_third_party_entries` both filter on
 /// `is_disabled`) the same way `toggle_auto_start` does, since a per-profile
 /// `config.toml` write doesn't bump the mtime the periodic reload watches.
-fn toggle_profile_disabled(app: &mut App, name: &str) {
+fn toggle_profile_disabled(app: &mut App, name: &ProfileName) {
     let currently_disabled = app.config().find(name).is_some_and(Profile::is_disabled);
     let gated = app.config().is_active(name) || crate::runtime::has_live_session(name);
     if gated {
@@ -8047,7 +8076,7 @@ fn toggle_profile_disabled(app: &mut App, name: &str) {
     }
 }
 
-fn toggle_auto_start(app: &mut App, name: &str) {
+fn toggle_auto_start(app: &mut App, name: &ProfileName) {
     enum Outcome {
         NotOAuth,
         Saved(bool),
@@ -8181,6 +8210,7 @@ fn run_confirm_action(app: &mut App, action: ConfirmAction) {
                 cfg.state.active_profile = None;
                 let _ = save_app_state(&cfg.state);
             }
+            let name = ProfileName::from(name);
             let result = {
                 let mut cfg = app.config();
                 overwrite_captured_profile(&mut cfg, &name, *snapshot)
@@ -8202,10 +8232,11 @@ fn run_confirm_action(app: &mut App, action: ConfirmAction) {
             // so `overwrite_captured_profile` just rewrites its stored creds and
             // skips its own guarded relink. Then force the live link onto it and
             // make it active — the divergence is resolved onto the target.
+            let name = ProfileName::from(name);
             let result = {
                 let mut cfg = app.config();
                 overwrite_captured_profile(&mut cfg, &name, *snapshot).and_then(|()| {
-                    cfg.state.active_profile = Some(name.as_str().into());
+                    cfg.state.active_profile = Some(name.clone());
                     save_app_state(&cfg.state)
                 })
             };
@@ -8223,6 +8254,7 @@ fn run_confirm_action(app: &mut App, action: ConfirmAction) {
             }
         }
         ConfirmAction::Switch(name) => {
+            let name = ProfileName::from(name);
             if switch_gate_in_flight(&app.activity) {
                 app.toast(
                     ToastKind::Warning,
@@ -8264,6 +8296,7 @@ fn run_confirm_action(app: &mut App, action: ConfirmAction) {
             // Backstop for a session that started between arming the confirm and
             // running it: on macOS `rotate_one_inner` refuses, and an unguarded
             // "rotating 'X'" toast would be a success-shaped message for a no-op.
+            let name = ProfileName::from(name);
             if crate::runtime::rotation_blocked_for(&name) {
                 app.toast(
                     ToastKind::Warning,
@@ -8287,7 +8320,7 @@ fn run_confirm_action(app: &mut App, action: ConfirmAction) {
         }
         // Re-checked inside `toggle_profile_disabled`: an account can go active
         // or open a session between arming this confirm and running it.
-        ConfirmAction::DisableOne(name) => toggle_profile_disabled(app, &name),
+        ConfirmAction::DisableOne(name) => toggle_profile_disabled(app, &ProfileName::from(name)),
         ConfirmAction::WireMcpServers => {
             match crate::plugin_probe::wire_mcp_server() {
                 Ok(()) => {
@@ -8298,17 +8331,20 @@ fn run_confirm_action(app: &mut App, action: ConfirmAction) {
                 Err(e) => app.toast(ToastKind::Danger, format!("wire failed\n{e}")),
             }
         }
-        ConfirmAction::RelinkCredentials(name) => match force_link_profile_credentials(&name) {
-            Ok(()) => {
-                app.refresh_tokens();
-                app.toast(
-                    ToastKind::Success,
-                    format!("relinked credentials to '{name}'"),
-                );
-                recompute_plugin_checks(app, false);
+        ConfirmAction::RelinkCredentials(name) => {
+            let name = ProfileName::from(name);
+            match force_link_profile_credentials(&name) {
+                Ok(()) => {
+                    app.refresh_tokens();
+                    app.toast(
+                        ToastKind::Success,
+                        format!("relinked credentials to '{name}'"),
+                    );
+                    recompute_plugin_checks(app, false);
+                }
+                Err(e) => app.toast(ToastKind::Danger, format!("relink failed\n{e}")),
             }
-            Err(e) => app.toast(ToastKind::Danger, format!("relink failed\n{e}")),
-        },
+        }
         ConfirmAction::HealHerdrConfig(path) => run_herdr_heal(app, &path),
         ConfirmAction::HerdrDelegateRowText(path) => {
             // Persist the flipped knob FIRST: `run_herdr_heal` reads it back off
@@ -8347,6 +8383,7 @@ fn run_confirm_action(app: &mut App, action: ConfirmAction) {
             Err(e) => app.toast(ToastKind::Danger, format!("install failed\n{e}")),
         },
         ConfirmAction::BlankCredentials(name) => {
+            let name = ProfileName::from(name);
             let result = {
                 let mut cfg = app.config();
                 // OAuth accounts drop the token via the shared clearer; API
@@ -8368,8 +8405,10 @@ fn run_confirm_action(app: &mut App, action: ConfirmAction) {
             }
         }
         ConfirmAction::RestartLogin(name, is_new) => start_login(app, name, is_new),
-        ConfirmAction::DeleteLiveSession(name) => finish_delete(app, &name, true),
-        ConfirmAction::AddChainCandidate(name) => commit_chain_add(app, &name),
+        ConfirmAction::DeleteLiveSession(name) => {
+            finish_delete(app, &ProfileName::from(name), true)
+        }
+        ConfirmAction::AddChainCandidate(name) => commit_chain_add(app, &ProfileName::from(name)),
         ConfirmAction::OverwritePreset(preset, source) => save_preset_from(app, &source, &preset),
         ConfirmAction::ApplyPresetOver(target, preset) => apply_preset_to(app, &target, &preset),
         ConfirmAction::DeletePreset(preset) => match crate::presets::delete_preset(&preset) {
@@ -8446,7 +8485,7 @@ fn run_divergence_choice(app: &mut App, active: &str, choice: DivergenceChoice) 
                 app.toast(ToastKind::Danger, format!("overwrite failed\n{e}"));
                 return;
             }
-            if let Err(e) = force_link_profile_credentials(active) {
+            if let Err(e) = force_link_profile_credentials(&ProfileName::from(active)) {
                 app.toast(ToastKind::Danger, format!("relink failed\n{e}"));
                 return;
             }
@@ -8471,7 +8510,7 @@ fn run_divergence_choice(app: &mut App, active: &str, choice: DivergenceChoice) 
 }
 
 fn run_discard_divergence(app: &mut App, active: &str) {
-    if let Err(e) = force_link_profile_credentials(active) {
+    if let Err(e) = force_link_profile_credentials(&ProfileName::from(active)) {
         app.toast(ToastKind::Danger, format!("discard failed\n{e}"));
         return;
     }
@@ -8895,7 +8934,7 @@ fn apply_login(app: &mut App, session: LoginSession, outcome: crate::oauth_login
 
     let (exists, has_creds) = {
         let cfg = app.config();
-        let profile = cfg.find(&session.name);
+        let profile = cfg.find(&ProfileName::from(session.name.clone()));
         (
             profile.is_some(),
             profile.and_then(|p| p.credentials.as_ref()).is_some(),
@@ -8937,7 +8976,7 @@ fn apply_login(app: &mut App, session: LoginSession, outcome: crate::oauth_login
     }
     let result = {
         let mut cfg = app.config();
-        overwrite_captured_profile(&mut cfg, &session.name, snapshot)
+        overwrite_captured_profile(&mut cfg, &ProfileName::from(session.name.clone()), snapshot)
     };
     match result {
         Ok(()) => {
@@ -8965,7 +9004,7 @@ fn apply_console_login(
     session: LoginSession,
     outcome: crate::alibaba_login::ConsoleLoginOutcome,
 ) {
-    let name = session.name;
+    let name = ProfileName::from(session.name);
     let (exists, target) = {
         let cfg = app.config();
         let profile = cfg.find(&name);
@@ -9059,6 +9098,7 @@ pub(crate) fn on_tick(app: &mut App) {
         .map(|mut g| g.drain().collect())
         .unwrap_or_default();
     for name in auto_switch_targets {
+        let name = ProfileName::from(name);
         if switch_gate_in_flight(&app.activity) || !is_idle(&app.activity, &name) {
             continue;
         }
@@ -9322,13 +9362,7 @@ fn poll_credentials_divergence(app: &mut App) {
     if !app.modals.is_empty() {
         return;
     }
-    let Some(active) = app
-        .config()
-        .state
-        .active_profile
-        .as_deref()
-        .map(str::to_string)
-    else {
+    let Some(active) = app.config().state.active_profile.clone() else {
         app.divergence_pending = None;
         return;
     };
@@ -9371,7 +9405,7 @@ fn poll_credentials_divergence(app: &mut App) {
         app.divergence_pending = None;
         return;
     }
-    resolve_or_note_divergence(app, &active);
+    resolve_or_note_divergence(app, active.as_ref());
 }
 
 /// Apply the configured `default_divergence`, or flag the non-blocking banner

@@ -355,12 +355,12 @@ fn relogin_is_diverged_and_not_first_login() {
     );
 
     assert_eq!(
-        classify_credentials_link("active").expect("classify"),
+        classify_credentials_link(&crate::profile::ProfileName::from("active")).expect("classify"),
         LinkState::Diverged,
         "a CC re-login leaves a plain file diverging from the stored chain",
     );
     assert!(
-        !is_first_login("active").expect("first login"),
+        !is_first_login(&crate::profile::ProfileName::from("active")).expect("first login"),
         "stored creds exist, so this is a re-login overwrite, not a first login",
     );
 }
@@ -380,11 +380,11 @@ fn overwrite_confirm_captures_relogin_into_profile() {
 
     // `y` answer = force-snapshot the live creds into the active profile, relink.
     force_snapshot_active_credentials(&mut config).expect("snapshot");
-    force_link_profile_credentials("active").expect("relink");
+    force_link_profile_credentials(&crate::profile::ProfileName::from("active")).expect("relink");
 
     // The profile's stored chain now holds the re-logged tokens.
     let stored = config
-        .find("active")
+        .find(&crate::profile::ProfileName::from("active"))
         .and_then(|p| p.credentials.as_ref())
         .and_then(|c| c.refresh_token());
     assert_eq!(
@@ -395,14 +395,14 @@ fn overwrite_confirm_captures_relogin_into_profile() {
 
     // The live path is reconciled back to a symlink into the profile.
     assert_eq!(
-        classify_credentials_link("active").expect("classify"),
+        classify_credentials_link(&crate::profile::ProfileName::from("active")).expect("classify"),
         LinkState::LinkedTo,
         "after capture+relink the live path links to the profile's creds",
     );
 
     // The on-disk profile credentials file carries the re-logged chain too.
     let on_disk: ClaudeCredentials = crate::profile::read_json_file(
-        &crate::profile::profile_dir("active")
+        &crate::profile::profile_dir(&crate::profile::ProfileName::from("active"))
             .expect("profile dir")
             .join("credentials.json"),
     )
@@ -429,7 +429,7 @@ fn overwrite_cancel_leaves_stored_and_live_untouched() {
     // `n` answer = abort. We perform no snapshot and no relink; assert the
     // pre-prompt state is preserved.
     let stored = config
-        .find("active")
+        .find(&crate::profile::ProfileName::from("active"))
         .and_then(|p| p.credentials.as_ref())
         .and_then(|c| c.refresh_token());
     assert_eq!(
@@ -440,7 +440,7 @@ fn overwrite_cancel_leaves_stored_and_live_untouched() {
 
     // The live file CC wrote is still a plain diverged file with its own chain.
     assert_eq!(
-        classify_credentials_link("active").expect("classify"),
+        classify_credentials_link(&crate::profile::ProfileName::from("active")).expect("classify"),
         LinkState::Diverged,
         "cancel leaves the live re-login in place (still diverged)",
     );
@@ -688,7 +688,8 @@ fn build_settings_api_key_helper_shell_quotes_exe_path() {
 #[test]
 fn build_settings_api_key_helper_leaves_profile_name_unquoted() {
     let exe = std::path::Path::new("/usr/local/bin/clauth");
-    let cmd = build_api_key_helper_command(exe, "acme_corp-1.0+@");
+    let cmd =
+        build_api_key_helper_command(exe, &crate::profile::ProfileName::from("acme_corp-1.0+@"));
     assert_eq!(
         cmd, "/usr/local/bin/clauth __api-key acme_corp-1.0+@",
         "validated profile names must not be over-quoted"
@@ -702,7 +703,7 @@ fn build_settings_api_key_helper_leaves_profile_name_unquoted() {
 #[test]
 fn build_settings_api_key_helper_strips_deleted_exe_marker() {
     let exe = std::path::Path::new("/home/uwuclxdy/.cargo/bin/clauth (deleted)");
-    let cmd = build_api_key_helper_command(exe, "acme");
+    let cmd = build_api_key_helper_command(exe, &crate::profile::ProfileName::from("acme"));
     assert_eq!(cmd, "/home/uwuclxdy/.cargo/bin/clauth __api-key acme");
 }
 
@@ -895,7 +896,7 @@ fn force_snapshot_skips_shell_but_still_captures_real_divergence() {
     );
     force_snapshot_active_credentials(&mut shell_config).expect("force snapshot shell");
     let stored: ClaudeCredentials = crate::profile::read_json_file(
-        &crate::profile::profile_dir("shell-active")
+        &crate::profile::profile_dir(&crate::profile::ProfileName::from("shell-active"))
             .expect("dir")
             .join("credentials.json"),
     )
@@ -918,7 +919,7 @@ fn force_snapshot_skips_shell_but_still_captures_real_divergence() {
     );
     force_snapshot_active_credentials(&mut real_config).expect("force snapshot real");
     let stored: ClaudeCredentials = crate::profile::read_json_file(
-        &crate::profile::profile_dir("real-active")
+        &crate::profile::profile_dir(&crate::profile::ProfileName::from("real-active"))
             .expect("dir")
             .join("credentials.json"),
     )
@@ -984,7 +985,7 @@ fn snapshot_skips_shell_on_blank_profile_and_preserves_live_file() {
     );
     assert!(
         config
-            .find("blank-active")
+            .find(&crate::profile::ProfileName::from("blank-active"))
             .expect("profile")
             .credentials
             .is_none(),
@@ -1018,7 +1019,7 @@ fn force_snapshot_skips_an_absent_live_file() {
     force_snapshot_active_credentials(&mut config).expect("force snapshot absent");
 
     let stored: ClaudeCredentials = crate::profile::read_json_file(
-        &crate::profile::profile_dir("absent-active")
+        &crate::profile::profile_dir(&crate::profile::ProfileName::from("absent-active"))
             .expect("dir")
             .join("credentials.json"),
     )
@@ -1040,7 +1041,8 @@ fn force_snapshot_skips_an_absent_live_file() {
 /// Write a `session-token.json` (static long-lived login) into `name`'s
 /// profile dir, as the split-credential fill does.
 fn fill_session_token_by_hand(name: &str, access: &str) {
-    let dir = crate::profile::profile_dir(name).expect("profile dir");
+    let dir =
+        crate::profile::profile_dir(&crate::profile::ProfileName::from(name)).expect("profile dir");
     fs::create_dir_all(&dir).expect("mkdir profile");
     fs::write(
         dir.join("session-token.json"),
@@ -1058,17 +1060,21 @@ fn install_source_prefers_session_token() {
     profile.credentials = Some(creds("usage-access", Some("usage-refresh")));
     crate::profile::save_profile(&profile).expect("save profile");
 
-    assert!(!has_session_token("split"));
+    assert!(!has_session_token(&crate::profile::ProfileName::from(
+        "split"
+    )));
     assert!(
-        install_source_path("split")
+        install_source_path(&crate::profile::ProfileName::from("split"))
             .expect("source")
             .ends_with("credentials.json")
     );
 
     fill_session_token_by_hand("split", "oat-access");
-    assert!(has_session_token("split"));
+    assert!(has_session_token(&crate::profile::ProfileName::from(
+        "split"
+    )));
     assert!(
-        install_source_path("split")
+        install_source_path(&crate::profile::ProfileName::from("split"))
             .expect("source")
             .ends_with("session-token.json")
     );
@@ -1086,11 +1092,15 @@ fn installed_session_token_tracks_what_a_switch_installs() {
     profile.credentials = Some(creds("usage-access", Some("usage-refresh")));
     crate::profile::save_profile(&profile).expect("save profile");
 
-    assert_eq!(installed_session_token("split"), None, "no sidecar yet");
+    assert_eq!(
+        installed_session_token(&crate::profile::ProfileName::from("split")),
+        None,
+        "no sidecar yet"
+    );
 
     fill_session_token_by_hand("split", "oat-access");
     assert_eq!(
-        installed_session_token("split").as_deref(),
+        installed_session_token(&crate::profile::ProfileName::from("split")).as_deref(),
         Some("oat-access")
     );
 
@@ -1100,7 +1110,7 @@ fn installed_session_token_tracks_what_a_switch_installs() {
     // Re-gating this on a mint-only predicate is what would silently turn
     // every rolling session's statusline to `unknown`.
     stamp_rolling_token(
-        "split",
+        &crate::profile::ProfileName::from("split"),
         &OAuthToken {
             access_token: "at-rolling".to_string(),
             refresh_token: Some("rt-chain".to_string()),
@@ -1111,25 +1121,26 @@ fn installed_session_token_tracks_what_a_switch_installs() {
     )
     .expect("stamp rolling");
     assert_eq!(
-        installed_session_token("split").as_deref(),
+        installed_session_token(&crate::profile::ProfileName::from("split")).as_deref(),
         Some("at-rolling"),
         "a rolling stamp attributes like the mint"
     );
 
     // Mis-fill: a rotating pair in the sidecar leaves the split disengaged, so
     // the install source is the OAuth pair and there is nothing to attribute by.
-    let dir = crate::profile::profile_dir("split").expect("profile dir");
+    let dir = crate::profile::profile_dir(&crate::profile::ProfileName::from("split"))
+        .expect("profile dir");
     fs::write(
         dir.join("session-token.json"),
         serde_json::to_vec(&creds("oat-access", Some("rt-misfill"))).expect("ser sidecar"),
     )
     .expect("write sidecar");
     assert_eq!(
-        session_token_status("split"),
+        session_token_status(&crate::profile::ProfileName::from("split")),
         Some(SessionTokenStatus::NotLongLived)
     );
     assert_eq!(
-        installed_session_token("split"),
+        installed_session_token(&crate::profile::ProfileName::from("split")),
         None,
         "mis-fill installs nothing"
     );
@@ -1139,11 +1150,11 @@ fn installed_session_token_tracks_what_a_switch_installs() {
     // sidecar would answer to the same empty string.
     fill_session_token_by_hand("split", "");
     assert!(
-        has_session_token("split"),
+        has_session_token(&crate::profile::ProfileName::from("split")),
         "a blank mint is still long-lived"
     );
     assert_eq!(
-        installed_session_token("split"),
+        installed_session_token(&crate::profile::ProfileName::from("split")),
         None,
         "blank is not a token"
     );
@@ -1157,9 +1168,9 @@ fn installed_session_token_tracks_what_a_switch_installs() {
 #[test]
 fn the_credential_fingerprint_tracks_each_of_the_three_files() {
     let _home = HomeSandbox::new();
-    let dir = crate::profile::profile_dir("fp").expect("dir");
+    let dir = crate::profile::profile_dir(&crate::profile::ProfileName::from("fp")).expect("dir");
     fs::create_dir_all(&dir).expect("mkdir");
-    let f0 = credential_fingerprint("fp");
+    let f0 = credential_fingerprint(&crate::profile::ProfileName::from("fp"));
     assert_eq!(
         f0,
         [None, None, None],
@@ -1167,21 +1178,21 @@ fn the_credential_fingerprint_tracks_each_of_the_three_files() {
     );
 
     fs::write(dir.join("credentials.json"), b"{\"a\":1}").expect("write");
-    let f1 = credential_fingerprint("fp");
+    let f1 = credential_fingerprint(&crate::profile::ProfileName::from("fp"));
     assert_ne!(
         f1, f0,
         "a re-login (credentials.json) moves the fingerprint"
     );
 
     fs::write(dir.join("session-token.json"), b"{\"b\":22}").expect("write");
-    let f2 = credential_fingerprint("fp");
+    let f2 = credential_fingerprint(&crate::profile::ProfileName::from("fp"));
     assert_ne!(
         f2, f1,
         "a re-mint (session-token.json) moves the fingerprint"
     );
 
     fs::write(dir.join("session-token.static.json"), b"{\"c\":333}").expect("write");
-    let f3 = credential_fingerprint("fp");
+    let f3 = credential_fingerprint(&crate::profile::ProfileName::from("fp"));
     assert_ne!(
         f3, f2,
         "a hand-restored backup (session-token.static.json) moves the fingerprint"
@@ -1199,23 +1210,31 @@ fn clear_session_token_flips_the_install_source_back() {
     crate::profile::save_profile(&profile).expect("save profile");
     fill_session_token_by_hand("split", "oat-access");
     assert!(
-        install_source_path("split")
+        install_source_path(&crate::profile::ProfileName::from("split"))
             .expect("source")
             .ends_with("session-token.json")
     );
 
-    assert!(clear_session_token("split").expect("clear"), "removed one");
-    assert!(!has_session_token("split"));
-    assert_eq!(session_token_status("split"), None);
     assert!(
-        install_source_path("split")
+        clear_session_token(&crate::profile::ProfileName::from("split")).expect("clear"),
+        "removed one"
+    );
+    assert!(!has_session_token(&crate::profile::ProfileName::from(
+        "split"
+    )));
+    assert_eq!(
+        session_token_status(&crate::profile::ProfileName::from("split")),
+        None
+    );
+    assert!(
+        install_source_path(&crate::profile::ProfileName::from("split"))
             .expect("source")
             .ends_with("credentials.json"),
         "install source flips back to the usage pair"
     );
     // The usage OAuth pair is untouched — clearing drops the sidecar only.
     assert_eq!(
-        crate::profile::load_profile("split")
+        crate::profile::load_profile(&crate::profile::ProfileName::from("split"))
             .expect("reload")
             .credentials
             .and_then(|c| c.access_token().map(str::to_string))
@@ -1224,7 +1243,7 @@ fn clear_session_token_flips_the_install_source_back() {
     );
 
     assert!(
-        !clear_session_token("split").expect("second clear"),
+        !clear_session_token(&crate::profile::ProfileName::from("split")).expect("second clear"),
         "idempotent: nothing left to remove"
     );
 }
@@ -1250,7 +1269,7 @@ fn has_stored_oauth_login_tracks_the_store_the_relink_would_find() {
     crate::profile::save_profile(&api).expect("save api profile");
     fill_session_token_by_hand("apionly", "oat-access");
     assert!(
-        !has_stored_oauth_login("apionly"),
+        !has_stored_oauth_login(&crate::profile::ProfileName::from("apionly")),
         "an api-key profile has no OAuth login for the clear to fall back to"
     );
 
@@ -1259,9 +1278,11 @@ fn has_stored_oauth_login_tracks_the_store_the_relink_would_find() {
     oauth.credentials = Some(creds("usage-access", Some("usage-refresh")));
     crate::profile::save_profile(&oauth).expect("save oauth profile");
     fill_session_token_by_hand("split", "oat-access");
-    assert!(has_stored_oauth_login("split"));
+    assert!(has_stored_oauth_login(&crate::profile::ProfileName::from(
+        "split"
+    )));
     assert!(
-        install_source_path("split")
+        install_source_path(&crate::profile::ProfileName::from("split"))
             .expect("source")
             .ends_with("session-token.json"),
         "the sidecar still outranks it until the clear runs"
@@ -1270,18 +1291,20 @@ fn has_stored_oauth_login_tracks_the_store_the_relink_would_find() {
     // The file is the authority: dropping the store flips the answer even though
     // the loaded config still carries the credentials.
     std::fs::remove_file(
-        crate::profile::profile_dir("split")
+        crate::profile::profile_dir(&crate::profile::ProfileName::from("split"))
             .expect("dir")
             .join("credentials.json"),
     )
     .expect("remove the store");
     assert!(
-        !has_stored_oauth_login("split"),
+        !has_stored_oauth_login(&crate::profile::ProfileName::from("split")),
         "reads the store on disk, which is what the relink resolves"
     );
 
     // An unknown profile has no directory at all, so it can fall back to nothing.
-    assert!(!has_stored_oauth_login("nosuchprofile"));
+    assert!(!has_stored_oauth_login(&crate::profile::ProfileName::from(
+        "nosuchprofile"
+    )));
 }
 
 /// A live slot holding the profile's static session token is the designed
@@ -1299,14 +1322,14 @@ fn session_token_live_is_linked_and_snapshot_keeps_usage_oauth() {
     fill_session_token_by_hand("split", "oat-access");
 
     assert_eq!(
-        classify_credentials_link("split").expect("classify"),
+        classify_credentials_link(&crate::profile::ProfileName::from("split")).expect("classify"),
         LinkState::LinkedTo,
         "live slot holding the session token is the steady state, not divergence",
     );
 
     snapshot_active_credentials(&mut config).expect("snapshot");
     let stored: ClaudeCredentials = crate::profile::read_json_file(
-        &crate::profile::profile_dir("split")
+        &crate::profile::profile_dir(&crate::profile::ProfileName::from("split"))
             .expect("dir")
             .join("credentials.json"),
     )
@@ -1341,9 +1364,10 @@ fn switch_installs_session_token_not_usage_oauth() {
     config.state.profiles = vec!["a".into(), "b".into()];
     config.state.active_profile = Some("a".into());
     crate::profile::save_app_state(&config.state).expect("persist state");
-    force_link_profile_credentials("a").expect("link a");
+    force_link_profile_credentials(&crate::profile::ProfileName::from("a")).expect("link a");
 
-    crate::actions::switch_profile(&mut config, "b").expect("switch to b");
+    crate::actions::switch_profile(&mut config, &crate::profile::ProfileName::from("b"))
+        .expect("switch to b");
 
     let live_target =
         std::fs::read_link(claude_credentials_path().expect("path")).expect("live is a symlink");
@@ -1352,7 +1376,7 @@ fn switch_installs_session_token_not_usage_oauth() {
         "the live slot must point at b's session token, got {live_target:?}",
     );
     let stored: ClaudeCredentials = crate::profile::read_json_file(
-        &crate::profile::profile_dir("b")
+        &crate::profile::profile_dir(&crate::profile::ProfileName::from("b"))
             .expect("dir")
             .join("credentials.json"),
     )
@@ -1433,7 +1457,7 @@ fn force_snapshot_never_clobbers_the_session_token_usage_pair() {
     force_snapshot_active_credentials(&mut config).expect("force snapshot");
 
     let stored: ClaudeCredentials = crate::profile::read_json_file(
-        &crate::profile::profile_dir("split")
+        &crate::profile::profile_dir(&crate::profile::ProfileName::from("split"))
             .expect("dir")
             .join("credentials.json"),
     )
@@ -1454,21 +1478,26 @@ fn write_session_token_produces_a_recognised_sidecar() {
     let _home = HomeSandbox::new();
     let profile = crate::profile::Profile::new("cap".to_string(), None, None);
     crate::profile::save_profile(&profile).expect("save profile");
-    assert_eq!(session_token_status("cap"), None, "no sidecar yet");
+    assert_eq!(
+        session_token_status(&crate::profile::ProfileName::from("cap")),
+        None,
+        "no sidecar yet"
+    );
 
     let now = 1_700_000_000_000_i64;
     let token = format!("sk-ant-oat01-{}", "y".repeat(48));
-    let stamped = write_session_token("cap", &token, now).expect("write sidecar");
+    let stamped = write_session_token(&crate::profile::ProfileName::from("cap"), &token, now)
+        .expect("write sidecar");
     assert_eq!(stamped, now + SETUP_TOKEN_ASSUMED_LIFETIME_MS);
 
-    assert!(has_session_token("cap"));
+    assert!(has_session_token(&crate::profile::ProfileName::from("cap")));
     assert!(
-        install_source_path("cap")
+        install_source_path(&crate::profile::ProfileName::from("cap"))
             .expect("source")
             .ends_with("session-token.json")
     );
     assert_eq!(
-        session_token_status("cap"),
+        session_token_status(&crate::profile::ProfileName::from("cap")),
         Some(SessionTokenStatus::LongLived(Some(stamped)))
     );
 
@@ -1476,7 +1505,7 @@ fn write_session_token_produces_a_recognised_sidecar() {
     {
         use std::os::unix::fs::PermissionsExt as _;
         let mode = std::fs::metadata(
-            crate::profile::profile_dir("cap")
+            crate::profile::profile_dir(&crate::profile::ProfileName::from("cap"))
                 .expect("dir")
                 .join("session-token.json"),
         )
@@ -1496,7 +1525,7 @@ fn session_token_status_distinguishes_missing_from_unstamped() {
     crate::profile::save_profile(&profile).expect("save profile");
     fill_session_token_by_hand("hand", "oat-access");
     assert_eq!(
-        session_token_status("hand"),
+        session_token_status(&crate::profile::ProfileName::from("hand")),
         Some(SessionTokenStatus::LongLived(None))
     );
 }
@@ -1515,7 +1544,8 @@ fn a_rotating_pair_in_the_sidecar_never_engages_the_split() {
     profile.credentials = Some(creds("usage-access", Some("usage-refresh")));
     crate::profile::save_profile(&profile).expect("save profile");
 
-    let dir = crate::profile::profile_dir("mis").expect("profile dir");
+    let dir = crate::profile::profile_dir(&crate::profile::ProfileName::from("mis"))
+        .expect("profile dir");
     fs::write(
         dir.join("session-token.json"),
         serde_json::to_vec(&creds("rotating-access", Some("rotating-refresh")))
@@ -1524,12 +1554,15 @@ fn a_rotating_pair_in_the_sidecar_never_engages_the_split() {
     .expect("write sidecar");
 
     assert_eq!(
-        session_token_status("mis"),
+        session_token_status(&crate::profile::ProfileName::from("mis")),
         Some(SessionTokenStatus::NotLongLived)
     );
-    assert!(!has_session_token("mis"), "the split stays disengaged");
     assert!(
-        install_source_path("mis")
+        !has_session_token(&crate::profile::ProfileName::from("mis")),
+        "the split stays disengaged"
+    );
+    assert!(
+        install_source_path(&crate::profile::ProfileName::from("mis"))
             .expect("source")
             .ends_with("credentials.json"),
         "switches keep installing the rotating pair from credentials.json"
@@ -1569,13 +1602,14 @@ fn a_regular_file_mirror_of_a_stored_login_is_not_unsaved() {
     fill_session_token_by_hand("split", "oat-access");
     assert!(
         matches!(
-            classify_credentials_link("split").expect("classify"),
+            classify_credentials_link(&crate::profile::ProfileName::from("split"))
+                .expect("classify"),
             LinkState::Diverged
         ),
         "the mirror no longer matches the flipped install source"
     );
     assert!(
-        live_login_is_stored("split"),
+        live_login_is_stored(&crate::profile::ProfileName::from("split")),
         "…but the mirror's login is saved in credentials.json — not unsaved \
          (a symlink-identity check would read this regular file as unsaved)"
     );
@@ -1588,13 +1622,15 @@ fn a_regular_file_mirror_of_a_stored_login_is_not_unsaved() {
     )
     .expect("write regular re-login");
     assert!(
-        !live_login_is_stored("split"),
+        !live_login_is_stored(&crate::profile::ProfileName::from("split")),
         "a re-login whose token matches no store must stay protected"
     );
 
     // Absent live slot: nothing to match, nothing saved.
     fs::remove_file(&live).expect("drop file");
-    assert!(!live_login_is_stored("split"));
+    assert!(!live_login_is_stored(&crate::profile::ProfileName::from(
+        "split"
+    )));
 }
 
 /// The symlink half of the same exemption, and the original 2026-07-21 repro:
@@ -1614,13 +1650,14 @@ fn a_clauth_symlink_under_a_flipped_install_source_is_not_unsaved() {
 
     let live = claude_credentials_path().expect("creds path");
     fs::create_dir_all(live.parent().expect("parent")).expect("mkdir .claude");
-    let store = crate::profile::profile_dir("split")
+    let store = crate::profile::profile_dir(&crate::profile::ProfileName::from("split"))
         .expect("dir")
         .join("credentials.json");
     std::os::unix::fs::symlink(&store, &live).expect("symlink live");
     assert!(
         matches!(
-            classify_credentials_link("split").expect("classify"),
+            classify_credentials_link(&crate::profile::ProfileName::from("split"))
+                .expect("classify"),
             LinkState::LinkedTo
         ),
         "before the capture the link points at the install source"
@@ -1629,13 +1666,14 @@ fn a_clauth_symlink_under_a_flipped_install_source_is_not_unsaved() {
     fill_session_token_by_hand("split", "oat-access");
     assert!(
         matches!(
-            classify_credentials_link("split").expect("classify"),
+            classify_credentials_link(&crate::profile::ProfileName::from("split"))
+                .expect("classify"),
             LinkState::Diverged
         ),
         "the stale link no longer points at what a switch installs"
     );
     assert!(
-        live_login_is_stored("split"),
+        live_login_is_stored(&crate::profile::ProfileName::from("split")),
         "…but a clauth-owned symlink holds nothing unsaved"
     );
 
@@ -1644,7 +1682,7 @@ fn a_clauth_symlink_under_a_flipped_install_source_is_not_unsaved() {
     // deferred over an empty slot.
     fs::remove_file(&store).expect("drop store file");
     assert!(
-        live_login_is_stored("split"),
+        live_login_is_stored(&crate::profile::ProfileName::from("split")),
         "a dangling clauth symlink is a store slot, not an unsaved login"
     );
 }
@@ -1683,7 +1721,12 @@ fn carry_copies_mcp_oauth_and_leaves_the_target_login_untouched() {
     )
     .expect("write target");
 
-    carry_live_extra_into(&live, &target, "carrytest").expect("carry");
+    carry_live_extra_into(
+        &live,
+        &target,
+        &crate::profile::ProfileName::from("carrytest"),
+    )
+    .expect("carry");
 
     let got: serde_json::Value =
         serde_json::from_slice(&fs::read(&target).expect("read target")).expect("parse");
@@ -1715,16 +1758,16 @@ fn a_block_the_live_file_lacks_survives_onto_the_live_slot() {
 
     // B's store already holds an MCP login from an earlier era; the live file
     // (A, freshly logged in through the browser) carries none.
-    let b_store = crate::profile::profile_dir("b")
+    let b_store = crate::profile::profile_dir(&crate::profile::ProfileName::from("b"))
         .expect("dir")
         .join("credentials.json");
     let mut stored: serde_json::Value =
         serde_json::from_slice(&fs::read(&b_store).expect("read b")).expect("parse");
     stored["mcpOAuth"] = serde_json::json!({ "sentry": { "accessToken": "mock-sentry" } });
     fs::write(&b_store, serde_json::to_vec(&stored).unwrap()).expect("seed b");
-    force_link_profile_credentials("a").expect("link a");
+    force_link_profile_credentials(&crate::profile::ProfileName::from("a")).expect("link a");
 
-    force_link_profile_credentials("b").expect("link b");
+    force_link_profile_credentials(&crate::profile::ProfileName::from("b")).expect("link b");
 
     let live_path = claude_credentials_path().expect("creds path");
     let after: serde_json::Value =
@@ -1746,14 +1789,18 @@ fn carry_skips_the_static_token_sidecar() {
     let mut split = crate::profile::Profile::new("split".to_string(), None, None);
     split.credentials = Some(creds("usage-access", Some("usage-refresh")));
     crate::profile::save_profile(&split).expect("save split");
-    let target = crate::profile::profile_dir("split")
+    let target = crate::profile::profile_dir(&crate::profile::ProfileName::from("split"))
         .expect("dir")
         .join("session-token.json");
-    crate::claude::write_session_token("split", &format!("sk-ant-{}", "m".repeat(40)), 0)
-        .expect("mint");
+    crate::claude::write_session_token(
+        &crate::profile::ProfileName::from("split"),
+        &format!("sk-ant-{}", "m".repeat(40)),
+        0,
+    )
+    .expect("mint");
     let before = fs::read(&target).expect("read sidecar");
 
-    let live = crate::profile::profile_dir("split")
+    let live = crate::profile::profile_dir(&crate::profile::ProfileName::from("split"))
         .expect("dir")
         .join("live.json");
     fs::write(
@@ -1762,7 +1809,12 @@ fn carry_skips_the_static_token_sidecar() {
     )
     .expect("write live");
 
-    carry_live_extra_into(&live, &target, "carrytest").expect("carry");
+    carry_live_extra_into(
+        &live,
+        &target,
+        &crate::profile::ProfileName::from("carrytest"),
+    )
+    .expect("carry");
 
     assert_eq!(
         fs::read(&target).expect("read sidecar"),
@@ -1797,7 +1849,12 @@ fn carry_moves_only_the_allowlisted_key() {
     )
     .expect("write target");
 
-    carry_live_extra_into(&live, &target, "carrytest").expect("carry");
+    carry_live_extra_into(
+        &live,
+        &target,
+        &crate::profile::ProfileName::from("carrytest"),
+    )
+    .expect("carry");
 
     let got: serde_json::Value =
         serde_json::from_slice(&fs::read(&target).expect("read target")).expect("parse");
@@ -1915,11 +1972,11 @@ fn carry_keeps_the_store_at_0600() {
     let mut a = crate::profile::Profile::new("a".to_string(), None, None);
     a.credentials = Some(creds("login-a", Some("refresh-a")));
     crate::profile::save_profile(&a).expect("save a");
-    let target = crate::profile::profile_dir("a")
+    let target = crate::profile::profile_dir(&crate::profile::ProfileName::from("a"))
         .expect("dir")
         .join("credentials.json");
 
-    let live = crate::profile::profile_dir("a")
+    let live = crate::profile::profile_dir(&crate::profile::ProfileName::from("a"))
         .expect("dir")
         .join("live.json");
     fs::write(
@@ -1928,7 +1985,12 @@ fn carry_keeps_the_store_at_0600() {
     )
     .expect("write live");
 
-    carry_live_extra_into(&live, &target, "carrytest").expect("carry");
+    carry_live_extra_into(
+        &live,
+        &target,
+        &crate::profile::ProfileName::from("carrytest"),
+    )
+    .expect("carry");
 
     // Assert the write HAPPENED before asserting its mode: a carry that never
     // runs leaves the mode `save_profile` set, so a mode check alone passes
@@ -1954,7 +2016,7 @@ fn seed_store_with_mcp_logins(name: &str) -> std::path::PathBuf {
     let mut profile = crate::profile::Profile::new(name.to_string(), None, None);
     profile.credentials = Some(creds("stored-access", Some("stored-refresh")));
     crate::profile::save_profile(&profile).expect("save profile");
-    let store = crate::profile::profile_dir(name)
+    let store = crate::profile::profile_dir(&crate::profile::ProfileName::from(name))
         .expect("profile dir")
         .join("credentials.json");
     let mut value: serde_json::Value =
@@ -1980,9 +2042,11 @@ fn a_store_removal_parks_the_mcp_logins_it_was_holding() {
     crate::profile::save_profile(&profile).expect("save without a login");
 
     assert!(!store.exists(), "the store is still removed");
-    let parked: serde_json::Value =
-        crate::profile_cache::load_profile_cache("crossed", crate::profile_cache::MCP_LOGINS_FILE)
-            .expect("the MCP logins must be parked, not dropped with the store");
+    let parked: serde_json::Value = crate::profile_cache::load_profile_cache(
+        &crate::profile::ProfileName::from("crossed"),
+        crate::profile_cache::MCP_LOGINS_FILE,
+    )
+    .expect("the MCP logins must be parked, not dropped with the store");
     assert_eq!(parked["mcpOAuth"]["linear"]["accessToken"], "mock-linear");
     assert!(
         parked.get("claudeAiOauth").is_none(),
@@ -2017,8 +2081,8 @@ fn a_regained_store_takes_its_parked_mcp_logins_back() {
     );
     assert!(
         crate::profile_cache::load_profile_cache::<serde_json::Value>(
-            "crossed",
-            crate::profile_cache::MCP_LOGINS_FILE,
+            &crate::profile::ProfileName::from("crossed"),
+            crate::profile_cache::MCP_LOGINS_FILE
         )
         .is_none(),
         "the parked copy goes once the store holds them again"
@@ -2048,11 +2112,14 @@ fn a_carry_with_no_store_to_land_in_parks_instead() {
 
     // The park the carry falls back to is a cache write, gated on the record.
     crate::testutil::register_names(&["apikey"]);
-    carry_live_extra_into(&live, &absent, "apikey").expect("carry");
+    carry_live_extra_into(&live, &absent, &crate::profile::ProfileName::from("apikey"))
+        .expect("carry");
 
-    let parked: serde_json::Value =
-        crate::profile_cache::load_profile_cache("apikey", crate::profile_cache::MCP_LOGINS_FILE)
-            .expect("a carry with nowhere to land must park rather than drop");
+    let parked: serde_json::Value = crate::profile_cache::load_profile_cache(
+        &crate::profile::ProfileName::from("apikey"),
+        crate::profile_cache::MCP_LOGINS_FILE,
+    )
+    .expect("a carry with nowhere to land must park rather than drop");
     assert_eq!(parked["mcpOAuth"]["linear"]["accessToken"], "mock-linear");
     assert!(
         parked.get("trustedDeviceToken").is_none(),
@@ -2075,8 +2142,11 @@ fn a_store_with_no_mcp_logins_parks_nothing() {
     crate::profile::save_profile(&profile).expect("save without a login");
 
     assert!(
-        crate::profile_cache::profile_cache_path("plain", crate::profile_cache::MCP_LOGINS_FILE)
-            .is_some_and(|p| !p.exists()),
+        crate::profile_cache::profile_cache_path(
+            &crate::profile::ProfileName::from("plain"),
+            crate::profile_cache::MCP_LOGINS_FILE
+        )
+        .is_some_and(|p| !p.exists()),
         "a store carrying no MCP logins parks no file at all"
     );
 }
@@ -2096,9 +2166,11 @@ fn the_parked_mcp_logins_file_is_owner_only() {
     profile.credentials = None;
     crate::profile::save_profile(&profile).expect("save without a login");
 
-    let parked =
-        crate::profile_cache::profile_cache_path("crossed", crate::profile_cache::MCP_LOGINS_FILE)
-            .expect("parked path");
+    let parked = crate::profile_cache::profile_cache_path(
+        &crate::profile::ProfileName::from("crossed"),
+        crate::profile_cache::MCP_LOGINS_FILE,
+    )
+    .expect("parked path");
     assert!(
         parked.exists(),
         "the park must have written for its mode to mean anything"
@@ -2125,7 +2197,7 @@ fn switching_accounts_preserves_mcp_oauth_end_to_end() {
 
     // Make A live, then simulate Claude Code authenticating an MCP server: it
     // writes an mcpOAuth block through clauth's symlink into A's store.
-    force_link_profile_credentials("a").expect("link a");
+    force_link_profile_credentials(&crate::profile::ProfileName::from("a")).expect("link a");
     let live_path = claude_credentials_path().expect("creds path");
     let mut live: serde_json::Value =
         serde_json::from_slice(&fs::read(&live_path).expect("read live")).expect("parse live");
@@ -2133,7 +2205,7 @@ fn switching_accounts_preserves_mcp_oauth_end_to_end() {
     fs::write(&live_path, serde_json::to_vec(&live).unwrap()).expect("write live mcp");
 
     // Switch to B.
-    force_link_profile_credentials("b").expect("link b");
+    force_link_profile_credentials(&crate::profile::ProfileName::from("b")).expect("link b");
 
     // The live credential now resolves to B's login AND still carries mcpOAuth.
     let after: serde_json::Value =
@@ -2172,7 +2244,8 @@ fn link_adopts_a_matching_login_and_preserves_mcp_oauth() {
     .expect("write live");
 
     // Must NOT refuse (same login), and must carry mcpOAuth onto the store.
-    link_profile_credentials("main").expect("link adopts a matching login");
+    link_profile_credentials(&crate::profile::ProfileName::from("main"))
+        .expect("link adopts a matching login");
 
     let after: serde_json::Value =
         serde_json::from_slice(&std::fs::read(&live_path).expect("read after")).expect("parse");
@@ -2202,7 +2275,8 @@ fn link_still_refuses_a_different_live_login() {
     )
     .expect("write live");
 
-    let err = link_profile_credentials("other").expect_err("must refuse a different login");
+    let err = link_profile_credentials(&crate::profile::ProfileName::from("other"))
+        .expect_err("must refuse a different login");
     assert!(
         err.to_string().contains("refusing to replace"),
         "the guard still protects an unresolved different login: {err}"
@@ -2232,7 +2306,8 @@ fn link_refuses_a_torn_live_file_over_a_profile_storing_no_login() {
     // Caught mid-write by CC: valid prefix, no closing brace.
     std::fs::write(&live_path, br#"{"claudeAiOauth":{"accessToken":"live"#).expect("write torn");
 
-    let err = link_profile_credentials("endpoint").expect_err("must refuse a torn live file");
+    let err = link_profile_credentials(&crate::profile::ProfileName::from("endpoint"))
+        .expect_err("must refuse a torn live file");
     assert!(
         err.to_string().contains("refusing to replace"),
         "a file too torn to parse is a possible mid-write login, not a match: {err}"
@@ -2267,7 +2342,8 @@ fn link_refuses_a_login_less_live_file_over_a_profile_storing_no_login() {
     )
     .expect("write login-less live");
 
-    let err = link_profile_credentials("endpoint").expect_err("must refuse a login-less live file");
+    let err = link_profile_credentials(&crate::profile::ProfileName::from("endpoint"))
+        .expect_err("must refuse a login-less live file");
     assert!(
         err.to_string().contains("refusing to replace"),
         "no login on either side is not a matching login: {err}"
@@ -2300,7 +2376,8 @@ fn link_refuses_two_differing_logged_out_shells() {
     )
     .expect("write shell");
 
-    let err = link_profile_credentials("acct").expect_err("must refuse two blank logins");
+    let err = link_profile_credentials(&crate::profile::ProfileName::from("acct"))
+        .expect_err("must refuse two blank logins");
     assert!(
         err.to_string().contains("refusing to replace"),
         "a blank token must never match another blank token: {err}"
@@ -2323,7 +2400,7 @@ fn a_failed_carry_still_completes_the_switch() {
     b.credentials = Some(creds("login-b", Some("refresh-b")));
     crate::profile::save_profile(&b).expect("save b");
 
-    force_link_profile_credentials("a").expect("link a");
+    force_link_profile_credentials(&crate::profile::ProfileName::from("a")).expect("link a");
     let live_path = claude_credentials_path().expect("creds path");
     let mut live: serde_json::Value =
         serde_json::from_slice(&fs::read(&live_path).expect("read live")).expect("parse live");
@@ -2331,7 +2408,7 @@ fn a_failed_carry_still_completes_the_switch() {
     fs::write(&live_path, serde_json::to_vec(&live).unwrap()).expect("write live mcp");
 
     // Lock B's directory so the carry's atomic write cannot land its temp file.
-    let b_dir = crate::profile::profile_dir("b").expect("dir");
+    let b_dir = crate::profile::profile_dir(&crate::profile::ProfileName::from("b")).expect("dir");
     fs::set_permissions(&b_dir, fs::Permissions::from_mode(0o500)).expect("lock b");
     if fs::write(b_dir.join(".probe"), b"x").is_ok() {
         // Running as root: mode bits do not deny, so there is no failure to drive.
@@ -2339,7 +2416,7 @@ fn a_failed_carry_still_completes_the_switch() {
         return;
     }
 
-    let result = force_link_profile_credentials("b");
+    let result = force_link_profile_credentials(&crate::profile::ProfileName::from("b"));
     fs::set_permissions(&b_dir, fs::Permissions::from_mode(0o700)).expect("unlock b");
     result.expect("an unwritable store must not fail the switch");
 
@@ -2358,10 +2435,13 @@ fn a_failed_carry_still_completes_the_switch() {
 fn stamp_rolling_token_writes_a_refreshless_long_lived_shape() {
     let _home = HomeSandbox::new();
     let name = "feed-shape";
-    std::fs::create_dir_all(crate::profile::profile_dir(name).expect("dir")).expect("mkdir");
+    std::fs::create_dir_all(
+        crate::profile::profile_dir(&crate::profile::ProfileName::from(name)).expect("dir"),
+    )
+    .expect("mkdir");
     let exp = crate::usage::now_ms() as i64 + 8 * 3_600_000;
     stamp_rolling_token(
-        name,
+        &crate::profile::ProfileName::from(name),
         &OAuthToken {
             access_token: "at-chain".to_string(),
             refresh_token: Some("rt-chain".to_string()),
@@ -2371,9 +2451,9 @@ fn stamp_rolling_token_writes_a_refreshless_long_lived_shape() {
         },
     )
     .expect("feed");
-    let status = session_token_status(name).expect("sidecar");
+    let status = session_token_status(&crate::profile::ProfileName::from(name)).expect("sidecar");
     assert_eq!(status, SessionTokenStatus::LongLived(Some(exp)));
-    let dir = crate::profile::profile_dir(name).expect("dir");
+    let dir = crate::profile::profile_dir(&crate::profile::ProfileName::from(name)).expect("dir");
     let creds: ClaudeCredentials =
         serde_json::from_slice(&std::fs::read(dir.join("session-token.json")).expect("read"))
             .expect("parse");
@@ -2396,9 +2476,17 @@ fn stamp_rolling_token_writes_a_refreshless_long_lived_shape() {
 fn first_stamp_preserves_the_mint_once_and_only_the_mint() {
     let _home = HomeSandbox::new();
     let name = "feed-preserve";
-    std::fs::create_dir_all(crate::profile::profile_dir(name).expect("dir")).expect("mkdir");
+    std::fs::create_dir_all(
+        crate::profile::profile_dir(&crate::profile::ProfileName::from(name)).expect("dir"),
+    )
+    .expect("mkdir");
     let now = crate::usage::now_ms() as i64;
-    write_session_token(name, "sk-ant-oat01-genuine-mint-value-1234567890", now).expect("mint");
+    write_session_token(
+        &crate::profile::ProfileName::from(name),
+        "sk-ant-oat01-genuine-mint-value-1234567890",
+        now,
+    )
+    .expect("mint");
     let fed = |token: &str| OAuthToken {
         access_token: token.to_string(),
         refresh_token: None,
@@ -2406,9 +2494,9 @@ fn first_stamp_preserves_the_mint_once_and_only_the_mint() {
         scopes: None,
         subscription_type: Some("max".into()),
     };
-    stamp_rolling_token(name, &fed("at-1")).expect("feed 1");
-    stamp_rolling_token(name, &fed("at-2")).expect("feed 2");
-    let dir = crate::profile::profile_dir(name).expect("dir");
+    stamp_rolling_token(&crate::profile::ProfileName::from(name), &fed("at-1")).expect("feed 1");
+    stamp_rolling_token(&crate::profile::ProfileName::from(name), &fed("at-2")).expect("feed 2");
+    let dir = crate::profile::profile_dir(&crate::profile::ProfileName::from(name)).expect("dir");
     let backup: ClaudeCredentials = serde_json::from_slice(
         &std::fs::read(dir.join("session-token.static.json")).expect("backup exists"),
     )
@@ -2422,7 +2510,7 @@ fn first_stamp_preserves_the_mint_once_and_only_the_mint() {
     // A fed sidecar with the backup consumed is never re-preserved as a mint
     // (subscriptionType + hours horizon both disqualify it).
     std::fs::remove_file(dir.join("session-token.static.json")).expect("consume");
-    stamp_rolling_token(name, &fed("at-3")).expect("feed 3");
+    stamp_rolling_token(&crate::profile::ProfileName::from(name), &fed("at-3")).expect("feed 3");
     assert!(
         !dir.join("session-token.static.json").exists(),
         "a fed value must never become the degrade fallback"
@@ -2435,13 +2523,21 @@ fn first_stamp_preserves_the_mint_once_and_only_the_mint() {
 fn restore_static_mint_round_trip() {
     let _home = HomeSandbox::new();
     let name = "feed-restore";
-    std::fs::create_dir_all(crate::profile::profile_dir(name).expect("dir")).expect("mkdir");
+    std::fs::create_dir_all(
+        crate::profile::profile_dir(&crate::profile::ProfileName::from(name)).expect("dir"),
+    )
+    .expect("mkdir");
     let now = crate::usage::now_ms() as i64;
-    write_session_token(name, "sk-ant-oat01-genuine-mint-value-1234567890", now).expect("mint");
-    let dir = crate::profile::profile_dir(name).expect("dir");
+    write_session_token(
+        &crate::profile::ProfileName::from(name),
+        "sk-ant-oat01-genuine-mint-value-1234567890",
+        now,
+    )
+    .expect("mint");
+    let dir = crate::profile::profile_dir(&crate::profile::ProfileName::from(name)).expect("dir");
     let mint_bytes = std::fs::read(dir.join("session-token.json")).expect("mint bytes");
     stamp_rolling_token(
-        name,
+        &crate::profile::ProfileName::from(name),
         &OAuthToken {
             access_token: "at-fed".to_string(),
             refresh_token: None,
@@ -2451,14 +2547,14 @@ fn restore_static_mint_round_trip() {
         },
     )
     .expect("feed");
-    assert!(restore_static_mint(name).expect("restore"));
+    assert!(restore_static_mint(&crate::profile::ProfileName::from(name)).expect("restore"));
     assert_eq!(
         std::fs::read(dir.join("session-token.json")).expect("sidecar"),
         mint_bytes,
         "mint restored byte-identical"
     );
     assert!(
-        !restore_static_mint(name).expect("second restore"),
+        !restore_static_mint(&crate::profile::ProfileName::from(name)).expect("second restore"),
         "backup consumed"
     );
 }
@@ -2471,11 +2567,19 @@ fn restore_static_mint_round_trip() {
 fn write_session_token_with_backup_stamps_both_from_the_same_mint() {
     let _home = HomeSandbox::new();
     let name = "feed-remint";
-    std::fs::create_dir_all(crate::profile::profile_dir(name).expect("dir")).expect("mkdir");
+    std::fs::create_dir_all(
+        crate::profile::profile_dir(&crate::profile::ProfileName::from(name)).expect("dir"),
+    )
+    .expect("mkdir");
     let now = crate::usage::now_ms() as i64;
-    write_session_token(name, "sk-ant-oat01-genuine-mint-value-1234567890", now).expect("mint 1");
+    write_session_token(
+        &crate::profile::ProfileName::from(name),
+        "sk-ant-oat01-genuine-mint-value-1234567890",
+        now,
+    )
+    .expect("mint 1");
     stamp_rolling_token(
-        name,
+        &crate::profile::ProfileName::from(name),
         &OAuthToken {
             access_token: "at-fed".to_string(),
             refresh_token: None,
@@ -2485,9 +2589,13 @@ fn write_session_token_with_backup_stamps_both_from_the_same_mint() {
         },
     )
     .expect("feed preserves mint 1");
-    write_session_token_with_backup(name, "sk-ant-oat01-fresher-mint-value-0987654321", now)
-        .expect("re-mint");
-    let dir = crate::profile::profile_dir(name).expect("dir");
+    write_session_token_with_backup(
+        &crate::profile::ProfileName::from(name),
+        "sk-ant-oat01-fresher-mint-value-0987654321",
+        now,
+    )
+    .expect("re-mint");
+    let dir = crate::profile::profile_dir(&crate::profile::ProfileName::from(name)).expect("dir");
     let sidecar = std::fs::read(dir.join("session-token.json")).expect("sidecar");
     let backup = std::fs::read(dir.join("session-token.static.json")).expect("backup");
     assert_eq!(sidecar, backup, "one mint, two byte-identical copies");
@@ -2506,13 +2614,21 @@ fn write_session_token_with_backup_stamps_both_from_the_same_mint() {
 fn heal_misfilled_sidecar_quarantines_and_restores_the_mint() {
     let _home = HomeSandbox::new();
     let name = "feed-heal";
-    std::fs::create_dir_all(crate::profile::profile_dir(name).expect("dir")).expect("mkdir");
+    std::fs::create_dir_all(
+        crate::profile::profile_dir(&crate::profile::ProfileName::from(name)).expect("dir"),
+    )
+    .expect("mkdir");
     let now = crate::usage::now_ms() as i64;
-    write_session_token(name, "sk-ant-oat01-genuine-mint-value-1234567890", now).expect("mint");
-    let dir = crate::profile::profile_dir(name).expect("dir");
+    write_session_token(
+        &crate::profile::ProfileName::from(name),
+        "sk-ant-oat01-genuine-mint-value-1234567890",
+        now,
+    )
+    .expect("mint");
+    let dir = crate::profile::profile_dir(&crate::profile::ProfileName::from(name)).expect("dir");
     let mint_bytes = std::fs::read(dir.join("session-token.json")).expect("mint bytes");
     stamp_rolling_token(
-        name,
+        &crate::profile::ProfileName::from(name),
         &OAuthToken {
             access_token: "at-fed".to_string(),
             refresh_token: None,
@@ -2529,7 +2645,7 @@ fn heal_misfilled_sidecar_quarantines_and_restores_the_mint() {
     )
     .expect("misfill");
     assert_eq!(
-        heal_misfilled_sidecar(name).expect("heal"),
+        heal_misfilled_sidecar(&crate::profile::ProfileName::from(name)).expect("heal"),
         HealOutcome::Healed
     );
     assert_eq!(
@@ -2561,12 +2677,12 @@ fn heal_misfilled_sidecar_quarantines_and_restores_the_mint() {
     )
     .expect("misfill 2");
     assert_eq!(
-        heal_misfilled_sidecar(name).expect("no-backup heal"),
+        heal_misfilled_sidecar(&crate::profile::ProfileName::from(name)).expect("no-backup heal"),
         HealOutcome::NoLiveBackup
     );
     assert!(
         matches!(
-            session_token_status(name),
+            session_token_status(&crate::profile::ProfileName::from(name)),
             Some(SessionTokenStatus::NotLongLived)
         ),
         "mis-fill left in place without a backup"
@@ -2574,9 +2690,14 @@ fn heal_misfilled_sidecar_quarantines_and_restores_the_mint() {
     // And a sidecar that is not mis-filled at all reports itself as exactly
     // that — the state the install gate lets fall through to the normal
     // rolling table, never the vanilla path.
-    write_session_token(name, "sk-ant-oat01-genuine-mint-value-1234567890", now).expect("re-mint");
+    write_session_token(
+        &crate::profile::ProfileName::from(name),
+        "sk-ant-oat01-genuine-mint-value-1234567890",
+        now,
+    )
+    .expect("re-mint");
     assert_eq!(
-        heal_misfilled_sidecar(name).expect("healthy heal"),
+        heal_misfilled_sidecar(&crate::profile::ProfileName::from(name)).expect("healthy heal"),
         HealOutcome::NotMisfilled
     );
 }
@@ -2664,10 +2785,10 @@ fn classification_is_the_scope_set_never_the_clock() {
 fn stamp_rolling_token_refuses_a_mint_shaped_chain_grant() {
     let _home = HomeSandbox::new();
     let name = "stamp-refuse";
-    let dir = crate::profile::profile_dir(name).expect("dir");
+    let dir = crate::profile::profile_dir(&crate::profile::ProfileName::from(name)).expect("dir");
     std::fs::create_dir_all(&dir).expect("mkdir");
     let err = stamp_rolling_token(
-        name,
+        &crate::profile::ProfileName::from(name),
         &refreshless(
             Some(vec!["user:inference", "user:sessions:claude_code"]),
             None,
@@ -2694,7 +2815,7 @@ fn stamp_rolling_token_refuses_a_mint_shaped_chain_grant() {
 fn a_mint_in_its_final_month_is_still_preserved() {
     let _home = HomeSandbox::new();
     let name = "kind-late-mint";
-    let dir = crate::profile::profile_dir(name).expect("dir");
+    let dir = crate::profile::profile_dir(&crate::profile::ProfileName::from(name)).expect("dir");
     std::fs::create_dir_all(&dir).expect("mkdir");
     let now = crate::usage::now_ms() as i64;
 
@@ -2719,7 +2840,7 @@ fn a_mint_in_its_final_month_is_still_preserved() {
     .expect("write mint");
 
     stamp_rolling_token(
-        name,
+        &crate::profile::ProfileName::from(name),
         &OAuthToken {
             access_token: "at-rolling".to_string(),
             refresh_token: None,
@@ -2744,7 +2865,10 @@ fn a_mint_in_its_final_month_is_still_preserved() {
         "a mint's remaining life must not decide whether it is worth keeping"
     );
     assert!(
-        matches!(sidecar_summary(name), Some((SidecarKind::Rolling, _))),
+        matches!(
+            sidecar_summary(&crate::profile::ProfileName::from(name)),
+            Some((SidecarKind::Rolling, _))
+        ),
         "and the sidecar now classifies as the rolling bearer it holds"
     );
 }
@@ -2759,7 +2883,7 @@ fn a_mint_in_its_final_month_is_still_preserved() {
 fn a_rolling_bearer_is_never_preserved_as_the_mint() {
     let _home = HomeSandbox::new();
     let name = "kind-roll-shape";
-    let dir = crate::profile::profile_dir(name).expect("dir");
+    let dir = crate::profile::profile_dir(&crate::profile::ProfileName::from(name)).expect("dir");
     std::fs::create_dir_all(&dir).expect("mkdir");
     let now = crate::usage::now_ms() as i64;
 
@@ -2788,7 +2912,7 @@ fn a_rolling_bearer_is_never_preserved_as_the_mint() {
     )
     .expect("write");
     stamp_rolling_token(
-        name,
+        &crate::profile::ProfileName::from(name),
         &OAuthToken {
             access_token: "at-next".to_string(),
             refresh_token: None,
@@ -2820,7 +2944,7 @@ fn a_rolling_bearer_is_never_preserved_as_the_mint() {
     )
     .expect("write");
     stamp_rolling_token(
-        name,
+        &crate::profile::ProfileName::from(name),
         &OAuthToken {
             access_token: "at-next-2".to_string(),
             refresh_token: None,
@@ -2845,7 +2969,7 @@ fn a_rolling_bearer_is_never_preserved_as_the_mint() {
 fn quarantining_a_misfill_removes_the_sidecar() {
     let _home = HomeSandbox::new();
     let name = "kind-quarantine";
-    let dir = crate::profile::profile_dir(name).expect("dir");
+    let dir = crate::profile::profile_dir(&crate::profile::ProfileName::from(name)).expect("dir");
     std::fs::create_dir_all(&dir).expect("mkdir");
     let misfill = ClaudeCredentials {
         claude_ai_oauth: Some(OAuthToken {
@@ -2861,7 +2985,9 @@ fn quarantining_a_misfill_removes_the_sidecar() {
         serde_json::to_vec_pretty(&misfill).expect("ser"),
     )
     .expect("write");
-    assert!(quarantine_misfilled_sidecar(name).expect("quarantine"));
+    assert!(
+        quarantine_misfilled_sidecar(&crate::profile::ProfileName::from(name)).expect("quarantine")
+    );
     assert!(!dir.join("session-token.json").exists(), "sidecar removed");
     assert!(
         dir.join("quarantine").exists(),
@@ -2891,7 +3017,7 @@ fn quarantining_a_misfill_removes_the_sidecar() {
 fn arming_from_disk_stamps_the_post_guard_chain_not_a_stale_snapshot() {
     let _home = HomeSandbox::new();
     let name = "arm-postguard";
-    let dir = crate::profile::profile_dir(name).expect("dir");
+    let dir = crate::profile::profile_dir(&crate::profile::ProfileName::from(name)).expect("dir");
     std::fs::create_dir_all(&dir).expect("mkdir");
     let now = crate::usage::now_ms() as i64;
 
@@ -2929,11 +3055,12 @@ fn arming_from_disk_stamps_the_post_guard_chain_not_a_stale_snapshot() {
     // Stand in for the daemon's in-flight rotation: hold the guard, let the
     // arming leg finish its pre-guard read and park on the flock, move the
     // chain, then release.
-    let guard = crate::runtime::RotationGuard::acquire(name).expect("hold the guard");
+    let guard = crate::runtime::RotationGuard::acquire(&crate::profile::ProfileName::from(name))
+        .expect("hold the guard");
     let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
     let armer_barrier = std::sync::Arc::clone(&barrier);
     let armer = std::thread::spawn(move || {
-        arm_rolling_from_disk_synced("arm-postguard", || {
+        arm_rolling_from_disk_synced(&crate::profile::ProfileName::from("arm-postguard"), || {
             armer_barrier.wait();
         })
     });
@@ -2971,7 +3098,7 @@ fn arming_from_disk_stamps_the_post_guard_chain_not_a_stale_snapshot() {
 fn arming_from_disk_skips_a_profile_cleared_while_it_waited() {
     let _home = HomeSandbox::new();
     let name = "arm-cleared";
-    let dir = crate::profile::profile_dir(name).expect("dir");
+    let dir = crate::profile::profile_dir(&crate::profile::ProfileName::from(name)).expect("dir");
     std::fs::create_dir_all(&dir).expect("mkdir");
     let now = crate::usage::now_ms() as i64;
 
@@ -3007,11 +3134,12 @@ fn arming_from_disk_skips_a_profile_cleared_while_it_waited() {
     // Stand in for the clear: hold the guard, let the arming leg pass its
     // pre-filter and park, then disarm the flag and take the sidecar — the
     // clear's own writes — and release.
-    let guard = crate::runtime::RotationGuard::acquire(name).expect("hold the guard");
+    let guard = crate::runtime::RotationGuard::acquire(&crate::profile::ProfileName::from(name))
+        .expect("hold the guard");
     let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
     let armer_barrier = std::sync::Arc::clone(&barrier);
     let armer = std::thread::spawn(move || {
-        arm_rolling_from_disk_synced("arm-cleared", || {
+        arm_rolling_from_disk_synced(&crate::profile::ProfileName::from("arm-cleared"), || {
             armer_barrier.wait();
         })
     });
@@ -3038,7 +3166,7 @@ fn arming_from_disk_skips_a_profile_cleared_while_it_waited() {
 fn a_restored_mint_is_preserved_again_on_the_next_roll() {
     let _home = HomeSandbox::new();
     let name = "kind-restore-reroll";
-    let dir = crate::profile::profile_dir(name).expect("dir");
+    let dir = crate::profile::profile_dir(&crate::profile::ProfileName::from(name)).expect("dir");
     std::fs::create_dir_all(&dir).expect("mkdir");
     let now = crate::usage::now_ms() as i64;
 
@@ -3061,9 +3189,12 @@ fn a_restored_mint_is_preserved_again_on_the_next_roll() {
     .expect("write backup");
     std::fs::write(dir.join("session-token.json"), b"{}").expect("write sidecar");
 
-    assert!(restore_static_mint(name).expect("restore"));
+    assert!(restore_static_mint(&crate::profile::ProfileName::from(name)).expect("restore"));
     assert!(
-        matches!(sidecar_summary(name), Some((SidecarKind::Mint, _))),
+        matches!(
+            sidecar_summary(&crate::profile::ProfileName::from(name)),
+            Some((SidecarKind::Mint, _))
+        ),
         "a restored mint classifies as the mint it is"
     );
     assert!(
@@ -3074,7 +3205,7 @@ fn a_restored_mint_is_preserved_again_on_the_next_roll() {
     // The next roll must put it straight back — the degrade ladder's rung is
     // rebuilt, not spent.
     stamp_rolling_token(
-        name,
+        &crate::profile::ProfileName::from(name),
         &OAuthToken {
             access_token: "at-rolling".to_string(),
             refresh_token: None,
@@ -3108,7 +3239,7 @@ fn a_restored_mint_is_preserved_again_on_the_next_roll() {
 fn arming_from_disk_rechecks_chain_staleness_after_the_guard_wait() {
     let _home = HomeSandbox::new();
     let name = "arm-restale";
-    let dir = crate::profile::profile_dir(name).expect("dir");
+    let dir = crate::profile::profile_dir(&crate::profile::ProfileName::from(name)).expect("dir");
     std::fs::create_dir_all(&dir).expect("mkdir");
     let now = crate::usage::now_ms() as i64;
 
@@ -3152,11 +3283,12 @@ fn arming_from_disk_rechecks_chain_staleness_after_the_guard_wait() {
 
     // While the armer is parked on the guard, the chain goes stale: the value
     // it will re-read post-guard has only 10 minutes left — inside the grace.
-    let guard = crate::runtime::RotationGuard::acquire(name).expect("hold the guard");
+    let guard = crate::runtime::RotationGuard::acquire(&crate::profile::ProfileName::from(name))
+        .expect("hold the guard");
     let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
     let armer_barrier = std::sync::Arc::clone(&barrier);
     let armer = std::thread::spawn(move || {
-        arm_rolling_from_disk_synced("arm-restale", || {
+        arm_rolling_from_disk_synced(&crate::profile::ProfileName::from("arm-restale"), || {
             armer_barrier.wait();
         })
     });
@@ -3198,7 +3330,7 @@ fn a_rotating_pair_classifies_misfilled_never_rolling() {
     // rather than a sibling check.
     let _home = HomeSandbox::new();
     let name = "misfill-preserve";
-    let dir = crate::profile::profile_dir(name).expect("dir");
+    let dir = crate::profile::profile_dir(&crate::profile::ProfileName::from(name)).expect("dir");
     std::fs::create_dir_all(&dir).expect("mkdir");
     std::fs::write(
         dir.join("session-token.json"),
@@ -3209,7 +3341,7 @@ fn a_rotating_pair_classifies_misfilled_never_rolling() {
     )
     .expect("write");
     stamp_rolling_token(
-        name,
+        &crate::profile::ProfileName::from(name),
         &OAuthToken {
             access_token: "at-next".to_string(),
             refresh_token: None,
@@ -3238,12 +3370,12 @@ fn a_rotating_pair_classifies_misfilled_never_rolling() {
 fn a_backup_that_is_not_a_mint_is_quarantined_never_restored() {
     let _home = HomeSandbox::new();
     let name = "nonmint-backup";
-    let dir = crate::profile::profile_dir(name).expect("dir");
+    let dir = crate::profile::profile_dir(&crate::profile::ProfileName::from(name)).expect("dir");
     std::fs::create_dir_all(&dir).expect("mkdir");
     let now = crate::usage::now_ms() as i64;
     // A live rolling bearer in the sidecar — what a bad restore would destroy.
     stamp_rolling_token(
-        name,
+        &crate::profile::ProfileName::from(name),
         &OAuthToken {
             access_token: "at-alive".to_string(),
             refresh_token: None,
@@ -3268,7 +3400,8 @@ fn a_backup_that_is_not_a_mint_is_quarantined_never_restored() {
     ] {
         std::fs::write(dir.join("session-token.static.json"), &bytes).expect("write backup");
         assert!(
-            !restore_static_mint(name).expect("restore verdict"),
+            !restore_static_mint(&crate::profile::ProfileName::from(name))
+                .expect("restore verdict"),
             "a {label} backup restores nothing"
         );
         assert!(
@@ -3307,7 +3440,7 @@ fn a_backup_that_is_not_a_mint_is_quarantined_never_restored() {
 fn an_expired_backup_is_never_restored() {
     let _home = HomeSandbox::new();
     let name = "expired-backup";
-    let dir = crate::profile::profile_dir(name).expect("dir");
+    let dir = crate::profile::profile_dir(&crate::profile::ProfileName::from(name)).expect("dir");
     std::fs::create_dir_all(&dir).expect("mkdir");
     let now = crate::usage::now_ms() as i64;
     let expired = ClaudeCredentials {
@@ -3346,7 +3479,7 @@ fn an_expired_backup_is_never_restored() {
     .expect("write sidecar");
 
     assert!(
-        !restore_static_mint(name).expect("restore"),
+        !restore_static_mint(&crate::profile::ProfileName::from(name)).expect("restore"),
         "an expired backup reads as nothing-to-restore"
     );
     assert!(
@@ -3371,12 +3504,12 @@ fn an_expired_backup_is_never_restored() {
     )
     .expect("misfill");
     assert_eq!(
-        heal_misfilled_sidecar(name).expect("heal"),
+        heal_misfilled_sidecar(&crate::profile::ProfileName::from(name)).expect("heal"),
         HealOutcome::NoLiveBackup
     );
     assert!(
         matches!(
-            session_token_status(name),
+            session_token_status(&crate::profile::ProfileName::from(name)),
             Some(SessionTokenStatus::NotLongLived)
         ),
         "the mis-fill stays in place rather than trading working-vanilla for a dead mint"
@@ -3392,13 +3525,13 @@ fn an_expired_backup_is_never_restored() {
 fn an_unreadable_sidecar_aborts_the_roll_instead_of_forfeiting_the_mint() {
     let _home = HomeSandbox::new();
     let name = "unreadable-sidecar";
-    let dir = crate::profile::profile_dir(name).expect("dir");
+    let dir = crate::profile::profile_dir(&crate::profile::ProfileName::from(name)).expect("dir");
     std::fs::create_dir_all(&dir).expect("mkdir");
     // A directory where the sidecar goes: reads fail with a non-NotFound
     // error on every platform, which is the shape of a transient fault.
     std::fs::create_dir(dir.join("session-token.json")).expect("block the sidecar path");
     let err = stamp_rolling_token(
-        name,
+        &crate::profile::ProfileName::from(name),
         &OAuthToken {
             access_token: "at-next".to_string(),
             refresh_token: None,
@@ -3431,7 +3564,7 @@ fn an_unreadable_sidecar_aborts_the_roll_instead_of_forfeiting_the_mint() {
 fn a_fresh_mint_replaces_an_expired_backup_on_the_next_roll() {
     let _home = HomeSandbox::new();
     let name = "expired-backup-replaced";
-    let dir = crate::profile::profile_dir(name).expect("dir");
+    let dir = crate::profile::profile_dir(&crate::profile::ProfileName::from(name)).expect("dir");
     std::fs::create_dir_all(&dir).expect("mkdir");
     let now = crate::usage::now_ms() as i64;
     let expired = ClaudeCredentials {
@@ -3453,10 +3586,15 @@ fn a_fresh_mint_replaces_an_expired_backup_on_the_next_roll() {
     .expect("write dead backup");
     // The fresh mint the operator just captured (flag was off, so no
     // with-backup write happened).
-    write_session_token(name, "sk-ant-oat01-fresh-m2", now).expect("mint");
+    write_session_token(
+        &crate::profile::ProfileName::from(name),
+        "sk-ant-oat01-fresh-m2",
+        now,
+    )
+    .expect("mint");
 
     stamp_rolling_token(
-        name,
+        &crate::profile::ProfileName::from(name),
         &OAuthToken {
             access_token: "at-rolled".to_string(),
             refresh_token: None,
@@ -3493,7 +3631,7 @@ fn a_fresh_mint_replaces_an_expired_backup_on_the_next_roll() {
 fn a_fresher_sidecar_mint_upgrades_a_live_but_older_backup() {
     let _home = HomeSandbox::new();
     let name = "older-backup-upgraded";
-    let dir = crate::profile::profile_dir(name).expect("dir");
+    let dir = crate::profile::profile_dir(&crate::profile::ProfileName::from(name)).expect("dir");
     std::fs::create_dir_all(&dir).expect("mkdir");
     let now = crate::usage::now_ms() as i64;
     let mint = |token: &str, exp: i64| ClaudeCredentials {
@@ -3510,7 +3648,7 @@ fn a_fresher_sidecar_mint_upgrades_a_live_but_older_backup() {
     };
     let roll = || {
         stamp_rolling_token(
-            name,
+            &crate::profile::ProfileName::from(name),
             &OAuthToken {
                 access_token: "at-rolled".to_string(),
                 refresh_token: None,
@@ -3532,7 +3670,12 @@ fn a_fresher_sidecar_mint_upgrades_a_live_but_older_backup() {
     )
     .expect("write stale backup");
     // The fresh re-mint sits only in the sidecar (flag was off).
-    write_session_token(name, "sk-ant-oat01-fresh-m2", now).expect("mint");
+    write_session_token(
+        &crate::profile::ProfileName::from(name),
+        "sk-ant-oat01-fresh-m2",
+        now,
+    )
+    .expect("mint");
     roll();
     let read_backup = || -> ClaudeCredentials {
         serde_json::from_slice(
@@ -3572,7 +3715,7 @@ fn a_fresher_sidecar_mint_upgrades_a_live_but_older_backup() {
 fn preserve_quarantines_a_displaced_slot_holder_that_was_never_a_mint() {
     let _home = HomeSandbox::new();
     let name = "nonmint-slot-displaced";
-    let dir = crate::profile::profile_dir(name).expect("dir");
+    let dir = crate::profile::profile_dir(&crate::profile::ProfileName::from(name)).expect("dir");
     std::fs::create_dir_all(&dir).expect("mkdir");
     let now = crate::usage::now_ms() as i64;
     std::fs::write(
@@ -3580,9 +3723,14 @@ fn preserve_quarantines_a_displaced_slot_holder_that_was_never_a_mint() {
         serde_json::to_vec(&creds("at-pair", Some("rt-pair"))).expect("ser"),
     )
     .expect("write pair into the slot");
-    write_session_token(name, "sk-ant-oat01-genuine", now).expect("mint");
+    write_session_token(
+        &crate::profile::ProfileName::from(name),
+        "sk-ant-oat01-genuine",
+        now,
+    )
+    .expect("mint");
     stamp_rolling_token(
-        name,
+        &crate::profile::ProfileName::from(name),
         &OAuthToken {
             access_token: "at-rolled".to_string(),
             refresh_token: None,
@@ -3625,7 +3773,7 @@ fn preserve_quarantines_a_displaced_slot_holder_that_was_never_a_mint() {
 fn a_backup_inside_ccs_refresh_window_reads_as_expired() {
     let _home = HomeSandbox::new();
     let name = "window-backup";
-    let dir = crate::profile::profile_dir(name).expect("dir");
+    let dir = crate::profile::profile_dir(&crate::profile::ProfileName::from(name)).expect("dir");
     std::fs::create_dir_all(&dir).expect("mkdir");
     let now = crate::usage::now_ms() as i64;
     let closing = ClaudeCredentials {
@@ -3646,7 +3794,7 @@ fn a_backup_inside_ccs_refresh_window_reads_as_expired() {
     )
     .expect("write closing backup");
     assert!(
-        !restore_static_mint(name).expect("restore verdict"),
+        !restore_static_mint(&crate::profile::ProfileName::from(name)).expect("restore verdict"),
         "two minutes of life is dead-on-arrival for a refresh-less mint"
     );
     assert!(
@@ -3663,7 +3811,7 @@ fn a_backup_inside_ccs_refresh_window_reads_as_expired() {
 fn restore_quarantines_a_misfilled_sidecar_before_overwriting_it() {
     let _home = HomeSandbox::new();
     let name = "restore-misfill-evidence";
-    let dir = crate::profile::profile_dir(name).expect("dir");
+    let dir = crate::profile::profile_dir(&crate::profile::ProfileName::from(name)).expect("dir");
     std::fs::create_dir_all(&dir).expect("mkdir");
     let now = crate::usage::now_ms() as i64;
     let live_mint = ClaudeCredentials {
@@ -3688,7 +3836,7 @@ fn restore_quarantines_a_misfilled_sidecar_before_overwriting_it() {
         serde_json::to_vec(&creds("at-misfill", Some("rt-misfill"))).expect("ser"),
     )
     .expect("misfill");
-    assert!(restore_static_mint(name).expect("restore"));
+    assert!(restore_static_mint(&crate::profile::ProfileName::from(name)).expect("restore"));
     let sidecar: ClaudeCredentials =
         serde_json::from_slice(&std::fs::read(dir.join("session-token.json")).expect("read"))
             .expect("parse");
@@ -3744,18 +3892,29 @@ fn force_snapshot_does_not_resurrect_a_deleted_profile() {
     // leaves the live file alone.
     let mut disk = crate::profile::load_config().expect("load disk config");
     disk.state.active_profile = None;
-    let guard = crate::runtime::RotationGuard::acquire("gone").expect("rotation guard");
-    crate::actions::delete_profile(&mut disk, "gone", false, &guard).expect("delete");
+    let guard = crate::runtime::RotationGuard::acquire(&crate::profile::ProfileName::from("gone"))
+        .expect("rotation guard");
+    crate::actions::delete_profile(
+        &mut disk,
+        &crate::profile::ProfileName::from("gone"),
+        false,
+        &guard,
+    )
+    .expect("delete");
     drop(guard);
     assert!(
-        !crate::profile::profile_dir("gone").expect("dir").exists(),
+        !crate::profile::profile_dir(&crate::profile::ProfileName::from("gone"))
+            .expect("dir")
+            .exists(),
         "fixture precondition: the delete removed the directory"
     );
 
     force_snapshot_active_credentials(&mut stale).expect("force snapshot");
 
     assert!(
-        !crate::profile::profile_dir("gone").expect("dir").exists(),
+        !crate::profile::profile_dir(&crate::profile::ProfileName::from("gone"))
+            .expect("dir")
+            .exists(),
         "a deleted profile's directory must not be resurrected by the capture sink"
     );
 }

@@ -131,13 +131,29 @@ fn drain_rate_covers_third_party_windows_from_avg_pace() {
     let seven = seven.expect("7d bar synthesizes a window");
 
     assert!(
-        app.active_burn_rate("tp", &UsageInfo::default()).is_none(),
+        app.active_burn_rate(
+            &crate::profile::ProfileName::from("tp"),
+            &UsageInfo::default()
+        )
+        .is_none(),
         "no burn history exists for an api-key profile — avg pace is the only source",
     );
-    let five_rate = drain_rate(&app, "tp", profile, LABEL_5H, &five)
-        .expect("a half-elapsed 5h window yields an avg pace");
-    let seven_rate = drain_rate(&app, "tp", profile, LABEL_7D, &seven)
-        .expect("a half-elapsed 7d window yields an avg pace");
+    let five_rate = drain_rate(
+        &app,
+        &crate::profile::ProfileName::from("tp"),
+        profile,
+        LABEL_5H,
+        &five,
+    )
+    .expect("a half-elapsed 5h window yields an avg pace");
+    let seven_rate = drain_rate(
+        &app,
+        &crate::profile::ProfileName::from("tp"),
+        profile,
+        LABEL_7D,
+        &seven,
+    )
+    .expect("a half-elapsed 7d window yields an avg pace");
     assert!(five_rate > 0.0 && seven_rate > 0.0);
 
     // 60% over the 2.5h elapsed half of a 5h window is past its 50% ideal line,
@@ -173,7 +189,14 @@ fn drain_rate_oauth_five_hour_uses_recent_burn() {
     let p = &app.config().profiles[0];
     let w = p.usage.as_ref().unwrap().five_hour.clone().unwrap();
     assert!(
-        drain_rate(&app, "a", p, LABEL_5H, &w).is_none(),
+        drain_rate(
+            &app,
+            &crate::profile::ProfileName::from("a"),
+            p,
+            LABEL_5H,
+            &w
+        )
+        .is_none(),
         "no recorded history → no rate, rather than an avg-pace fallback",
     );
 }
@@ -1289,7 +1312,17 @@ fn chain_row_switch_hint_rides_the_target_row() {
     let config = config_with(vec![a], Some("a"), vec!["a"]);
     let app = App::new(config);
     let cfg = app.config();
-    let row = chain_row(&cfg, "a", 0, 0, 8, GAUGE_W, 3, None, Some(7200));
+    let row = chain_row(
+        &cfg,
+        &crate::profile::ProfileName::from("a"),
+        0,
+        0,
+        8,
+        GAUGE_W,
+        3,
+        None,
+        Some(7200),
+    );
     let base = row.base_width();
     let line = row.into_line(base + TRAILER_GAP, 60);
     let text = line_text(&line);
@@ -1321,7 +1354,17 @@ fn chain_row_marks_a_homecoming_onto_preferred_with_the_house_glyph() {
     let cfg = app.config();
 
     let hint = |name: &str| {
-        let row = chain_row(&cfg, name, 0, 0, 8, GAUGE_W, 3, None, Some(7200));
+        let row = chain_row(
+            &cfg,
+            &crate::profile::ProfileName::from(name),
+            0,
+            0,
+            8,
+            GAUGE_W,
+            3,
+            None,
+            Some(7200),
+        );
         let base = row.base_width();
         line_text(&row.into_line(base + TRAILER_GAP, 60))
     };
@@ -1423,7 +1466,7 @@ fn chain_row_shows_both_switch_hint_and_reason_marker_when_they_fit() {
     let cfg = app.config();
     let row = chain_row(
         &cfg,
-        "a",
+        &crate::profile::ProfileName::from("a"),
         0,
         0,
         8,
@@ -1454,7 +1497,7 @@ fn chain_row_drops_switch_hint_before_reason_marker_when_narrow() {
     let build = || {
         chain_row(
             &cfg,
-            "a",
+            &crate::profile::ProfileName::from("a"),
             0,
             0,
             8,

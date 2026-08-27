@@ -2624,7 +2624,9 @@ fn seed_claude_json_leaves_existing_real_copy_untouched() {
 fn has_live_session_false_when_no_sessions_dir() {
     let tmp = tempfile::tempdir().expect("tempdir");
     with_fake_home(tmp.path(), || {
-        assert!(!has_live_session("ghost")); // no sessions dir → false, not error
+        assert!(!has_live_session(&crate::profile::ProfileName::from(
+            "ghost"
+        ))); // no sessions dir → false, not error
     });
 }
 
@@ -2639,7 +2641,9 @@ fn has_live_session_false_when_sessions_dir_empty() {
             .join("empty")
             .join("sessions");
         fs::create_dir_all(&sessions).expect("mkdir sessions");
-        assert!(!has_live_session("empty"));
+        assert!(!has_live_session(&crate::profile::ProfileName::from(
+            "empty"
+        )));
     });
 }
 
@@ -2655,7 +2659,9 @@ fn has_live_session_false_when_all_sessions_dead() {
             .join("sessions");
         fs::create_dir_all(&sessions).expect("mkdir sessions");
         fs::write(sessions.join("99999"), b"").expect("write dead pid"); // unlocked file = dead
-        assert!(!has_live_session("dead"));
+        assert!(!has_live_session(&crate::profile::ProfileName::from(
+            "dead"
+        )));
     });
 }
 
@@ -2673,7 +2679,9 @@ fn has_live_session_true_when_any_session_alive() {
         let pid_path = sessions.join("12345");
         let file = open_pid_file(&pid_path).expect("open pid");
         file.lock().expect("lock pid");
-        assert!(has_live_session("alive"));
+        assert!(has_live_session(&crate::profile::ProfileName::from(
+            "alive"
+        )));
         drop(file);
         // The probe is deliberately fail-alive (any try_lock I/O error reads
         // as "alive" — see `is_session_alive`), so one transient error under a
@@ -2682,7 +2690,7 @@ fn has_live_session_true_when_any_session_alive() {
         // `live_session_count_counts_only_alive`.
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         let settled_dead = loop {
-            let alive = has_live_session("alive");
+            let alive = has_live_session(&crate::profile::ProfileName::from("alive"));
             if !alive {
                 break true;
             }
@@ -2710,7 +2718,9 @@ fn has_live_session_true_with_mixed_alive_and_dead() {
         let live_path = sessions.join("22222"); // live
         let file = open_pid_file(&live_path).expect("open live pid");
         file.lock().expect("lock live pid");
-        assert!(has_live_session("mixed"));
+        assert!(has_live_session(&crate::profile::ProfileName::from(
+            "mixed"
+        )));
         drop(file);
     });
 }
@@ -2738,7 +2748,7 @@ fn live_session_count_counts_only_alive() {
         let settled = |expect: usize| {
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
             loop {
-                let n = live_session_count("counted");
+                let n = live_session_count(&crate::profile::ProfileName::from("counted"));
                 if n == expect || std::time::Instant::now() >= deadline {
                     return n;
                 }
@@ -2748,7 +2758,10 @@ fn live_session_count_counts_only_alive() {
         assert_eq!(settled(2), 2);
         drop(a);
         assert_eq!(settled(1), 1);
-        assert_eq!(live_session_count("ghost"), 0); // no sessions dir → zero
+        assert_eq!(
+            live_session_count(&crate::profile::ProfileName::from("ghost")),
+            0
+        ); // no sessions dir → zero
     });
 }
 
@@ -2819,7 +2832,7 @@ fn acquire_creates_runtime_and_pid_file() {
 ///
 /// Driven single-threaded and through the REAL `actions::delete_profile`,
 /// because the seam is between two statements of the CALLER rather than inside
-/// `acquire`: `start::run` reads `config.find(name)` and hands the borrow down,
+/// `acquire`: `start::run` reads `config.find(&crate::profile::ProfileName::from(name))` and hands the borrow down,
 /// so a test that deletes between those two statements occupies exactly the
 /// window. A second thread would add a scheduler to the fixture without moving
 /// the seam, and could not land the delete inside `acquire`'s own hold anyway —
@@ -2840,17 +2853,26 @@ fn acquire_refuses_a_profile_deleted_after_the_config_load() {
 
         let mut config = crate::profile::load_config().expect("load config");
         assert!(
-            config.find("vanishes").is_some(),
+            config
+                .find(&crate::profile::ProfileName::from("vanishes"))
+                .is_some(),
             "fixture must start from a configured account, or the gate below \
              proves nothing"
         );
-        let guard = RotationGuard::acquire("vanishes").expect("rotation guard");
-        crate::actions::delete_profile(&mut config, "vanishes", false, &guard).expect("delete");
+        let guard = RotationGuard::acquire(&crate::profile::ProfileName::from("vanishes"))
+            .expect("rotation guard");
+        crate::actions::delete_profile(
+            &mut config,
+            &crate::profile::ProfileName::from("vanishes"),
+            false,
+            &guard,
+        )
+        .expect("delete");
         drop(guard);
         assert!(
             crate::profile::load_config()
                 .expect("reload config")
-                .find("vanishes")
+                .find(&crate::profile::ProfileName::from("vanishes"))
                 .is_none(),
             "fixture must have removed the record it is about to start against"
         );
@@ -2876,7 +2898,7 @@ fn acquire_refuses_a_profile_deleted_after_the_config_load() {
         // a resurrector sitting ahead of the gate and this assertion is what
         // reds. Do not weaken it to match the narrower claim it reads as.
         assert!(
-            !crate::profile::profile_dir("vanishes")
+            !crate::profile::profile_dir(&crate::profile::ProfileName::from("vanishes"))
                 .expect("profile dir")
                 .exists(),
             "a refused start must not put the deleted profile directory back"
@@ -2923,14 +2945,19 @@ fn acquire_refuses_a_record_removed_without_a_rotation_lock() {
             // placement rests on.
             let mut config = crate::profile::load_config().expect("load config");
             assert!(
-                config.find("mixedver").is_some(),
+                config
+                    .find(&crate::profile::ProfileName::from("mixedver"))
+                    .is_some(),
                 "the seam must fire while the account is still configured, \
                      or it poses nothing"
             );
-            config.remove("mixedver");
+            config.remove(&crate::profile::ProfileName::from("mixedver"));
             crate::profile::save_app_state(&config.state).expect("save app state");
-            std::fs::remove_dir_all(crate::profile::profile_dir("mixedver").expect("profile dir"))
-                .expect("remove the profile dir");
+            std::fs::remove_dir_all(
+                crate::profile::profile_dir(&crate::profile::ProfileName::from("mixedver"))
+                    .expect("profile dir"),
+            )
+            .expect("remove the profile dir");
         })
         .map(|_| ())
         .expect_err("a record removed inside the window must still refuse");
@@ -2960,14 +2987,22 @@ fn acquire_refuses_a_deleted_account_whose_directory_came_back() {
         let profile = configured_profile("resurrected");
 
         let mut config = crate::profile::load_config().expect("load config");
-        let guard = RotationGuard::acquire("resurrected").expect("rotation guard");
-        crate::actions::delete_profile(&mut config, "resurrected", false, &guard).expect("delete");
+        let guard = RotationGuard::acquire(&crate::profile::ProfileName::from("resurrected"))
+            .expect("rotation guard");
+        crate::actions::delete_profile(
+            &mut config,
+            &crate::profile::ProfileName::from("resurrected"),
+            false,
+            &guard,
+        )
+        .expect("delete");
         drop(guard);
 
         // The transport probe every `--with-fallback` start runs, verbatim.
-        unsupported_swap_transport("resurrected").expect("probe the transport");
+        unsupported_swap_transport(&crate::profile::ProfileName::from("resurrected"))
+            .expect("probe the transport");
         assert!(
-            crate::profile::profile_dir("resurrected")
+            crate::profile::profile_dir(&crate::profile::ProfileName::from("resurrected"))
                 .expect("profile dir")
                 .exists(),
             "fixture must have put the directory back, or it poses nothing"
@@ -3183,7 +3218,7 @@ fn acquire_twice_same_process_counts_two_sessions() {
             .expect("second acquire");
 
         assert_eq!(
-            live_session_count("concurrent"),
+            live_session_count(&crate::profile::ProfileName::from("concurrent")),
             2,
             "two concurrent same-process sessions must both register live"
         );
@@ -3195,7 +3230,10 @@ fn acquire_twice_same_process_counts_two_sessions() {
             rt1_runtime.is_dir(),
             "the surviving session's runtime is untouched by a sibling's teardown"
         );
-        assert_eq!(live_session_count("concurrent"), 1);
+        assert_eq!(
+            live_session_count(&crate::profile::ProfileName::from("concurrent")),
+            1
+        );
 
         drop(rt1);
         assert!(
@@ -3252,7 +3290,10 @@ fn two_shared_sessions_get_independent_trees() {
                 "each tree is built independently, not shared"
             );
         }
-        assert_eq!(live_session_count("twin"), 2);
+        assert_eq!(
+            live_session_count(&crate::profile::ProfileName::from("twin")),
+            2
+        );
 
         drop(b);
         drop(a);
@@ -3305,7 +3346,7 @@ fn acquire_stamps_the_pre_upgrade_liveness_marker_for_both_flavors() {
                 "a pre-upgrade clauth probes exactly {legacy_dir} and must see this session"
             );
             assert_eq!(
-                live_session_count(name),
+                live_session_count(&crate::profile::ProfileName::from(name)),
                 1,
                 "the compat marker and the per-session marker are ONE session, not two"
             );
@@ -3320,7 +3361,10 @@ fn acquire_stamps_the_pre_upgrade_liveness_marker_for_both_flavors() {
                 !legacy.exists(),
                 "the last session out removes the shared compat dir"
             );
-            assert_eq!(live_session_count(name), 0);
+            assert_eq!(
+                live_session_count(&crate::profile::ProfileName::from(name)),
+                0
+            );
         }
     });
 }
@@ -3537,7 +3581,7 @@ fn teardown_racing_a_wedged_peer_removes_its_own_files_within_one_retry() {
             "teardown must remove its own marker dir within one retry"
         );
         assert_eq!(
-            live_session_count("wedged"),
+            live_session_count(&crate::profile::ProfileName::from("wedged")),
             0,
             "teardown must release every liveness marker within one retry"
         );
@@ -3632,7 +3676,7 @@ fn the_pre_upgrade_marker_dir_survives_until_the_last_session_leaves() {
             "both sessions must be visible to a pre-upgrade probe"
         );
         assert_eq!(
-            live_session_count("upgrade-twin"),
+            live_session_count(&crate::profile::ProfileName::from("upgrade-twin")),
             2,
             "two sessions, four markers, still two sessions"
         );
@@ -3643,7 +3687,10 @@ fn the_pre_upgrade_marker_dir_survives_until_the_last_session_leaves() {
             legacy.is_dir(),
             "the compat dir is shared — it must survive"
         );
-        assert_eq!(live_session_count("upgrade-twin"), 1);
+        assert_eq!(
+            live_session_count(&crate::profile::ProfileName::from("upgrade-twin")),
+            1
+        );
 
         drop(a);
         assert!(!legacy.exists());
@@ -3695,7 +3742,10 @@ fn dropping_one_shared_session_leaves_the_sibling_intact() {
             is_session_alive(&a_marker),
             "the sibling's marker must still be flock-held"
         );
-        assert_eq!(live_session_count("survivor"), 1);
+        assert_eq!(
+            live_session_count(&crate::profile::ProfileName::from("survivor")),
+            1
+        );
 
         drop(a);
         assert!(!a_runtime.exists());
@@ -3887,8 +3937,13 @@ fn fake_mode_liveness_counts_both_shared_sessions() {
             let tree = a.config_dir().to_path_buf();
             let markers = a.sessions_dir().to_path_buf();
 
-            assert!(has_live_session("fakegate"));
-            assert_eq!(live_session_count("fakegate"), 2);
+            assert!(has_live_session(&crate::profile::ProfileName::from(
+                "fakegate"
+            )));
+            assert_eq!(
+                live_session_count(&crate::profile::ProfileName::from("fakegate")),
+                2
+            );
             assert_eq!(
                 dir_entry_names(&markers).len(),
                 2,
@@ -3896,16 +3951,26 @@ fn fake_mode_liveness_counts_both_shared_sessions() {
             );
 
             drop(b);
-            assert!(has_live_session("fakegate"));
-            assert_eq!(live_session_count("fakegate"), 1);
+            assert!(has_live_session(&crate::profile::ProfileName::from(
+                "fakegate"
+            )));
+            assert_eq!(
+                live_session_count(&crate::profile::ProfileName::from("fakegate")),
+                1
+            );
             assert!(
                 tree.is_dir(),
                 "the shared tree must survive while a sibling still holds it"
             );
 
             drop(a);
-            assert!(!has_live_session("fakegate"));
-            assert_eq!(live_session_count("fakegate"), 0);
+            assert!(!has_live_session(&crate::profile::ProfileName::from(
+                "fakegate"
+            )));
+            assert_eq!(
+                live_session_count(&crate::profile::ProfileName::from("fakegate")),
+                0
+            );
             assert!(!tree.exists(), "the last session out discards the tree");
             assert!(!markers.exists());
         });
@@ -3994,7 +4059,7 @@ fn fake_mode_stamps_no_second_compat_marker() {
                     "{name}: a pre-upgrade clauth probes exactly {legacy_dir} and must see this session"
                 );
                 assert_eq!(
-                    live_session_count(name),
+                    live_session_count(&crate::profile::ProfileName::from(name)),
                     1,
                     "{name}: one marker, one session"
                 );
@@ -4002,7 +4067,10 @@ fn fake_mode_stamps_no_second_compat_marker() {
                 drop(rt);
 
                 assert!(!legacy.exists(), "{name}: the last session out removes it");
-                assert_eq!(live_session_count(name), 0);
+                assert_eq!(
+                    live_session_count(&crate::profile::ProfileName::from(name)),
+                    0
+                );
             }
         });
     });
@@ -4395,21 +4463,31 @@ fn has_live_session_sees_a_per_session_dir_of_either_flavor() {
             marker.lock().expect("lock marker");
 
             assert!(
-                has_live_session(profile),
+                has_live_session(&crate::profile::ProfileName::from(profile)),
                 "a live marker in {sessions_name} must gate rotation"
             );
-            assert_eq!(live_session_count(profile), 1);
+            assert_eq!(
+                live_session_count(&crate::profile::ProfileName::from(profile)),
+                1
+            );
 
             drop(marker);
             // The probe is deliberately fail-alive (any try_lock I/O error reads
             // as "alive" — see `is_session_alive`), so only a PERSISTENTLY-alive
             // reading after the holder dropped is a regression.
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-            while has_live_session(profile) && std::time::Instant::now() < deadline {
+            while has_live_session(&crate::profile::ProfileName::from(profile))
+                && std::time::Instant::now() < deadline
+            {
                 std::thread::sleep(std::time::Duration::from_millis(20));
             }
-            assert!(!has_live_session(profile));
-            assert_eq!(live_session_count(profile), 0);
+            assert!(!has_live_session(&crate::profile::ProfileName::from(
+                profile
+            )));
+            assert_eq!(
+                live_session_count(&crate::profile::ProfileName::from(profile)),
+                0
+            );
         }
     });
 }
@@ -4436,9 +4514,13 @@ fn an_unreadable_profile_dir_reads_as_live_not_idle() {
         fs::write(sessions.join("9001-0"), b"").expect("dead marker");
 
         // Control: readable and genuinely idle.
-        assert!(!has_live_session("unreadable"));
+        assert!(!has_live_session(&crate::profile::ProfileName::from(
+            "unreadable"
+        )));
         // Control: never configured at all is still idle, not unknown.
-        assert!(!has_live_session("never-started"));
+        assert!(!has_live_session(&crate::profile::ProfileName::from(
+            "never-started"
+        )));
 
         fs::set_permissions(&profile, fs::Permissions::from_mode(0o000)).expect("chmod");
         if fs::read_dir(&profile).is_ok() {
@@ -4449,11 +4531,11 @@ fn an_unreadable_profile_dir_reads_as_live_not_idle() {
         }
 
         assert!(
-            has_live_session("unreadable"),
+            has_live_session(&crate::profile::ProfileName::from("unreadable")),
             "an unreadable profile dir must read as live — a spurious false burns the chain"
         );
         assert_eq!(
-            live_session_count("unreadable"),
+            live_session_count(&crate::profile::ProfileName::from("unreadable")),
             1,
             "the count must not contradict the gate within a tick"
         );
@@ -4639,8 +4721,14 @@ fn has_live_session_sees_isolated_session() {
         let pid = sessions.join("4242");
         let file = open_pid_file(&pid).expect("open pid");
         file.lock().expect("lock pid");
-        assert!(has_live_session("iso"), "isolated live session counts");
-        assert_eq!(live_session_count("iso"), 1);
+        assert!(
+            has_live_session(&crate::profile::ProfileName::from("iso")),
+            "isolated live session counts"
+        );
+        assert_eq!(
+            live_session_count(&crate::profile::ProfileName::from("iso")),
+            1
+        );
         drop(file);
         // The probe is deliberately fail-alive (any try_lock I/O error reads
         // as "alive" — see `is_session_alive`), so transient errors under a
@@ -4648,10 +4736,12 @@ fn has_live_session_sees_isolated_session() {
         // generously; only a PERSISTENT "alive" after the lock holder dropped
         // is a regression (flaked once under the full suite, 2026-07-12).
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        while has_live_session("iso") && std::time::Instant::now() < deadline {
+        while has_live_session(&crate::profile::ProfileName::from("iso"))
+            && std::time::Instant::now() < deadline
+        {
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
-        assert!(!has_live_session("iso"));
+        assert!(!has_live_session(&crate::profile::ProfileName::from("iso")));
     });
 }
 
@@ -4899,7 +4989,7 @@ fn acquire_registers_a_row_and_teardown_removes_it() {
         assert_eq!(
             registered.launch_store.as_deref(),
             Some(
-                crate::profile::profile_dir("registered")
+                crate::profile::profile_dir(&crate::profile::ProfileName::from("registered"))
                     .expect("profile dir")
                     .join("credentials.json")
                     .as_path()
@@ -5029,7 +5119,8 @@ fn member(name: &str) -> Profile {
 /// be in the record that acquire re-reads.
 fn member_store(profile: &Profile) -> PathBuf {
     register_profile(profile);
-    crate::claude::install_source_path(profile.name.as_str()).expect("install source")
+    crate::claude::install_source_path(&crate::profile::ProfileName::from(profile.name.as_str()))
+        .expect("install source")
 }
 
 /// A live session with NO watchdog thread behind it, so every credential leg is
@@ -5047,9 +5138,15 @@ fn lone_session(
 ) -> (std::sync::Arc<SessionSwap>, SwappedMarkers) {
     let name = launch.name.as_str();
     let session = SessionId::mint();
-    let store = crate::claude::install_source_path(name).expect("install source");
-    let paths =
-        SessionPaths::resolve(name, isolation, &session, LinkMode::Real).expect("session paths");
+    let store = crate::claude::install_source_path(&crate::profile::ProfileName::from(name))
+        .expect("install source");
+    let paths = SessionPaths::resolve(
+        &crate::profile::ProfileName::from(name),
+        isolation,
+        &session,
+        LinkMode::Real,
+    )
+    .expect("session paths");
     crate::profile::mkdir_700(&paths.runtime).expect("mkdir runtime");
     create_symlink(&store, &paths.runtime.join(".credentials.json")).expect("link creds");
     let markers = stamp_swapped_markers(&paths)
@@ -5132,8 +5229,10 @@ fn the_with_fallback_flag_reaches_the_row_only_where_a_swap_can_land() {
         // broken predicate flip both sides together and the assertion hold on a
         // host that can no longer swap. `acquire` above already materialized the
         // profile dir, so this probes what the clamp probed.
-        let host_can_swap = detect_link_mode(&profile_dir("optin-flag").expect("profile dir"))
-            .expect("probe link mode")
+        let host_can_swap = detect_link_mode(
+            &profile_dir(&crate::profile::ProfileName::from("optin-flag")).expect("profile dir"),
+        )
+        .expect("probe link mode")
             == LinkMode::Real
             && !cfg!(target_os = "macos");
         assert_eq!(
@@ -5240,18 +5339,21 @@ fn the_swap_host_probe_names_each_unsupported_transport() {
         // root is about a directory the subject never looks at. Both spellings
         // sit in one tempdir tree, so no fixture the suite can build separates
         // them, which is exactly why the mismatch was invisible.
-        let probed = profile_dir("probe-host").expect("profile dir");
+        let probed =
+            profile_dir(&crate::profile::ProfileName::from("probe-host")).expect("profile dir");
         crate::profile::mkdir_700(&probed).expect("materialize the probed dir");
         let host_shares_one_tree =
             detect_link_mode(&probed).expect("probe link mode") == LinkMode::Fake;
         assert_eq!(
-            unsupported_swap_transport("probe-host").expect("probe"),
+            unsupported_swap_transport(&crate::profile::ProfileName::from("probe-host"))
+                .expect("probe"),
             host_shares_one_tree.then_some(SwapUnsupported::SharedRuntimeTree),
             "the unforced probe must name the transport this host actually has"
         );
         with_link_mode(LinkMode::Fake, || {
             assert_eq!(
-                unsupported_swap_transport("probe-host").expect("probe"),
+                unsupported_swap_transport(&crate::profile::ProfileName::from("probe-host"))
+                    .expect("probe"),
                 Some(SwapUnsupported::SharedRuntimeTree),
                 "a fake-symlink host shares one tree across the profile's sessions"
             );
@@ -5274,13 +5376,17 @@ fn session_row_is_live_finds_the_marker_a_real_session_stamped() {
         let sid = swap.session.as_str();
 
         assert!(
-            session_row_is_live("rowlive-a", false, sid),
+            session_row_is_live(&crate::profile::ProfileName::from("rowlive-a"), false, sid),
             "the probe must look where `stamp_swapped_markers` actually writes"
         );
         // The other direction, so the assert above cannot be won by a predicate that
         // reads everything as live: a session id nothing stamped is dead.
         assert!(
-            !session_row_is_live("rowlive-a", false, "9999-0"),
+            !session_row_is_live(
+                &crate::profile::ProfileName::from("rowlive-a"),
+                false,
+                "9999-0"
+            ),
             "an unstamped session id must read dead"
         );
     });
@@ -5381,8 +5487,12 @@ fn a_swap_adopts_a_crash_staged_sidecar_before_moving_the_store_mtime() {
                 subscription_type: None,
             }),
         };
-        crate::profile::stage_rotated_credentials("stage-b", &staged).expect("stage");
-        let sidecar = crate::profile::profile_dir("stage-b")
+        crate::profile::stage_rotated_credentials(
+            &crate::profile::ProfileName::from("stage-b"),
+            &staged,
+        )
+        .expect("stage");
+        let sidecar = crate::profile::profile_dir(&crate::profile::ProfileName::from("stage-b"))
             .expect("profile dir")
             .join("credentials.json.pending");
         assert!(
@@ -5565,7 +5675,10 @@ fn the_precondition_refuses_a_member_whose_transport_differs() {
         // The cleared case yields the plan the touch step needs, keyed to the
         // member it loaded.
         let cleared = |name: &str| swap.precondition(name).map(|plan| plan.member);
-        assert_eq!(cleared("pre-twin"), Ok("pre-twin".to_string()));
+        assert_eq!(
+            cleared("pre-twin"),
+            Ok(crate::profile::ProfileName::from("pre-twin"))
+        );
         assert_eq!(cleared("pre-env"), Err(SwapRefused::EnvDiffers));
         assert_eq!(cleared("pre-models"), Err(SwapRefused::ModelsDiffers));
         assert_eq!(cleared("pre-endpoint"), Err(SwapRefused::NotOauth));
@@ -5597,7 +5710,9 @@ fn a_swap_holds_both_of_the_intended_members_liveness_markers() {
             SwapOutcome::Swapped
         );
 
-        let profile_dir = crate::profile::profile_dir("marker-b").expect("profile dir");
+        let profile_dir =
+            crate::profile::profile_dir(&crate::profile::ProfileName::from("marker-b"))
+                .expect("profile dir");
         for marker in [
             profile_dir.join(format!("sessions-{sid}")).join(&sid),
             profile_dir.join("sessions").join(&sid),
@@ -5610,7 +5725,7 @@ fn a_swap_holds_both_of_the_intended_members_liveness_markers() {
             );
         }
         assert!(
-            has_live_session("marker-b"),
+            has_live_session(&crate::profile::ProfileName::from("marker-b")),
             "the rotation gate must see the swapped-onto member as live"
         );
     });
@@ -5635,7 +5750,7 @@ fn a_swap_refuses_a_member_whose_marker_another_process_holds() {
         let sid = swap.session.as_str().to_string();
 
         // A live foreign process already owns the per-session marker path.
-        let markers = crate::profile::profile_dir("held-b")
+        let markers = crate::profile::profile_dir(&crate::profile::ProfileName::from("held-b"))
             .expect("profile dir")
             .join(format!("sessions-{sid}"));
         fs::create_dir_all(&markers).expect("mkdir markers");
@@ -5683,7 +5798,8 @@ fn a_swap_keeps_both_members_marked_live_and_still_rotatable() {
             SwapOutcome::Swapped
         );
 
-        let launch_dir = crate::profile::profile_dir("rot-a").expect("profile dir");
+        let launch_dir = crate::profile::profile_dir(&crate::profile::ProfileName::from("rot-a"))
+            .expect("profile dir");
         for marker in [
             launch_dir.join(format!("sessions-{sid}")).join(&sid),
             launch_dir.join("sessions").join(&sid),
@@ -5697,8 +5813,14 @@ fn a_swap_keeps_both_members_marked_live_and_still_rotatable() {
 
         let config = config_of(&[&launch, &intended]);
         let want = vec![
-            ("rot-a".to_string(), "rt-rot-a".to_string()),
-            ("rot-b".to_string(), "rt-rot-b".to_string()),
+            (
+                crate::profile::ProfileName::from("rot-a"),
+                "rt-rot-a".to_string(),
+            ),
+            (
+                crate::profile::ProfileName::from("rot-b"),
+                "rt-rot-b".to_string(),
+            ),
         ];
         assert_eq!(
             crate::oauth::rotation_candidates(&config, false),
@@ -5841,7 +5963,8 @@ fn gc_spares_a_swapped_members_marker_dir_while_the_session_lives() {
 
         assert_eq!(swap.swap_to("gc-b").expect("swap"), SwapOutcome::Swapped);
 
-        let profile_dir = crate::profile::profile_dir("gc-b").expect("profile dir");
+        let profile_dir = crate::profile::profile_dir(&crate::profile::ProfileName::from("gc-b"))
+            .expect("profile dir");
         let own = profile_dir.join(format!("sessions-{sid}"));
         let compat = profile_dir.join("sessions");
 
@@ -5901,12 +6024,19 @@ fn gc_keeps_a_swapped_row_after_its_launch_profile_is_force_deleted() {
             },
             profiles: vec![launch, intended],
         };
-        let rotation = crate::actions::rotation_guard_for_mutation("rowgc-a")
-            .expect("uncontended rotation lock");
-        crate::actions::delete_profile(&mut config, "rowgc-a", true, &rotation)
-            .expect("force-delete");
+        let rotation = crate::actions::rotation_guard_for_mutation(
+            &crate::profile::ProfileName::from("rowgc-a"),
+        )
+        .expect("uncontended rotation lock");
+        crate::actions::delete_profile(
+            &mut config,
+            &crate::profile::ProfileName::from("rowgc-a"),
+            true,
+            &rotation,
+        )
+        .expect("force-delete");
         assert!(
-            !crate::profile::profile_dir("rowgc-a")
+            !crate::profile::profile_dir(&crate::profile::ProfileName::from("rowgc-a"))
                 .expect("profile dir")
                 .exists(),
             "fixture: the force-delete must take the launch marker dirs with it"
@@ -5963,7 +6093,8 @@ fn teardown_removes_every_marker_a_swap_stamped() {
 
         let mut markers = Vec::new();
         for name in ["down-a", "down-b"] {
-            let dir = crate::profile::profile_dir(name).expect("profile dir");
+            let dir = crate::profile::profile_dir(&crate::profile::ProfileName::from(name))
+                .expect("profile dir");
             markers.push(dir.join(format!("sessions-{sid}")).join(&sid));
             markers.push(dir.join("sessions").join(&sid));
         }
@@ -5981,7 +6112,7 @@ fn teardown_removes_every_marker_a_swap_stamped() {
             );
         }
         assert!(
-            !has_live_session("down-b"),
+            !has_live_session(&crate::profile::ProfileName::from("down-b")),
             "the swapped-onto member must be rotatable again once the session exits"
         );
     });
@@ -6013,7 +6144,7 @@ fn teardown_leaves_a_swapped_compat_marker_it_never_owned() {
 
         // A live foreign holder already owns the compat path on the member we are
         // about to swap onto.
-        let compat = crate::profile::profile_dir("foreign-b")
+        let compat = crate::profile::profile_dir(&crate::profile::ProfileName::from("foreign-b"))
             .expect("profile dir")
             .join("sessions");
         fs::create_dir_all(&compat).expect("mkdir compat");
@@ -6204,7 +6335,7 @@ fn a_swap_back_onto_a_member_the_session_already_ran_on_succeeds() {
         );
         for name in ["back-a", "back-b"] {
             assert!(
-                has_live_session(name),
+                has_live_session(&crate::profile::ProfileName::from(name)),
                 "{name} must stay rotation-blocked: the child still holds its chain"
             );
         }
@@ -6721,13 +6852,15 @@ fn a_bare_session_marker_is_invisible_to_has_live_session() {
         );
 
         assert!(
-            !has_live_session("work"),
+            !has_live_session(&crate::profile::ProfileName::from("work")),
             "a bare `claude` must not gate this profile's delete/disable/rotation"
         );
 
-        let _started = hold_session_row_marker("work", false, "4242-0").expect("hold a session");
+        let _started =
+            hold_session_row_marker(&crate::profile::ProfileName::from("work"), false, "4242-0")
+                .expect("hold a session");
         assert!(
-            has_live_session("work"),
+            has_live_session(&crate::profile::ProfileName::from("work")),
             "a real `clauth start` session still reads live with a bare marker present"
         );
     });
@@ -7187,7 +7320,7 @@ fn the_mirror_walks_past_a_publish_in_flight() {
 
 /// A live marker plus its registry row, launched on `store`.
 fn live_session_launched_on(profile: &str, sid: &str, store: &Path) -> std::fs::File {
-    let sessions = crate::profile::profile_dir(profile)
+    let sessions = crate::profile::profile_dir(&crate::profile::ProfileName::from(profile))
         .expect("profile_dir")
         .join("sessions");
     fs::create_dir_all(&sessions).expect("mkdir sessions");
@@ -7233,13 +7366,13 @@ fn write_creds(path: &Path, refresh: Option<&str>) {
 fn a_session_launched_on_a_rotating_pair_still_blocks_rotation() {
     let tmp = tempfile::tempdir().expect("tempdir");
     with_fake_home(tmp.path(), || {
-        let store = crate::profile::profile_dir("rot")
+        let store = crate::profile::profile_dir(&crate::profile::ProfileName::from("rot"))
             .expect("profile_dir")
             .join("credentials.json");
         write_creds(&store, Some("rt-live"));
         let _held = live_session_launched_on("rot", "11111-0", &store);
         assert!(
-            live_session_holds_rotatable("rot"),
+            live_session_holds_rotatable(&crate::profile::ProfileName::from("rot")),
             "a session holding a refresh token is exactly what the refusal protects"
         );
     });
@@ -7249,13 +7382,13 @@ fn a_session_launched_on_a_rotating_pair_still_blocks_rotation() {
 fn a_session_launched_on_a_refreshless_sidecar_does_not_block_rotation() {
     let tmp = tempfile::tempdir().expect("tempdir");
     with_fake_home(tmp.path(), || {
-        let store = crate::profile::profile_dir("roll")
+        let store = crate::profile::profile_dir(&crate::profile::ProfileName::from("roll"))
             .expect("profile_dir")
             .join("session-token.json");
         write_creds(&store, None);
         let _held = live_session_launched_on("roll", "22222-0", &store);
         assert!(
-            !live_session_holds_rotatable("roll"),
+            !live_session_holds_rotatable(&crate::profile::ProfileName::from("roll")),
             "no refresh token means no invalid_grant, so there is nothing to strand"
         );
     });
@@ -7268,12 +7401,15 @@ fn a_session_launched_on_a_refreshless_sidecar_does_not_block_rotation() {
 fn one_rotatable_session_refuses_for_the_whole_profile() {
     let tmp = tempfile::tempdir().expect("tempdir");
     with_fake_home(tmp.path(), || {
-        let dir = crate::profile::profile_dir("mixed").expect("profile_dir");
+        let dir = crate::profile::profile_dir(&crate::profile::ProfileName::from("mixed"))
+            .expect("profile_dir");
         write_creds(&dir.join("session-token.json"), None);
         write_creds(&dir.join("credentials.json"), Some("rt-live"));
         let _a = live_session_launched_on("mixed", "33333-0", &dir.join("session-token.json"));
         let _b = live_session_launched_on("mixed", "44444-0", &dir.join("credentials.json"));
-        assert!(live_session_holds_rotatable("mixed"));
+        assert!(live_session_holds_rotatable(
+            &crate::profile::ProfileName::from("mixed")
+        ));
     });
 }
 
@@ -7285,53 +7421,53 @@ fn every_unknown_launch_store_reads_as_rotatable() {
     let tmp = tempfile::tempdir().expect("tempdir");
     with_fake_home(tmp.path(), || {
         // (a) a live marker with no registry row at all.
-        let sessions = crate::profile::profile_dir("orphan")
+        let sessions = crate::profile::profile_dir(&crate::profile::ProfileName::from("orphan"))
             .expect("profile_dir")
             .join("sessions");
         fs::create_dir_all(&sessions).expect("mkdir");
         let held = open_pid_file(&sessions.join("55555-0")).expect("open pid");
         held.lock().expect("lock");
         assert!(
-            live_session_holds_rotatable("orphan"),
+            live_session_holds_rotatable(&crate::profile::ProfileName::from("orphan")),
             "a marker with no row is an unknown, and unknowns block"
         );
         drop(held);
 
         // (b) a row from a clauth that predates the field.
-        let store = crate::profile::profile_dir("legacy")
+        let store = crate::profile::profile_dir(&crate::profile::ProfileName::from("legacy"))
             .expect("profile_dir")
             .join("session-token.json");
         write_creds(&store, None);
         let _l = live_session_launched_on("legacy", "66666-0", &store);
         register_row("legacy", "66666-0", None); // overwrite with a pre-field row
         assert!(
-            live_session_holds_rotatable("legacy"),
+            live_session_holds_rotatable(&crate::profile::ProfileName::from("legacy")),
             "serde(default) must fail CLOSED, or an upgrade silently unblocks rotation"
         );
 
         // (c) a marker whose name is not a session id at all, so no row can
         // ever be found for it.
-        let odd = crate::profile::profile_dir("odd")
+        let odd = crate::profile::profile_dir(&crate::profile::ProfileName::from("odd"))
             .expect("profile_dir")
             .join("sessions");
         fs::create_dir_all(&odd).expect("mkdir");
         let stray = open_pid_file(&odd.join("not-a-sid")).expect("open pid");
         stray.lock().expect("lock");
         assert!(
-            live_session_holds_rotatable("odd"),
+            live_session_holds_rotatable(&crate::profile::ProfileName::from("odd")),
             "an unparseable marker name is an unknown, and unknowns block"
         );
         drop(stray);
 
         // (d) the store is unreadable / half-written.
-        let torn = crate::profile::profile_dir("torn")
+        let torn = crate::profile::profile_dir(&crate::profile::ProfileName::from("torn"))
             .expect("profile_dir")
             .join("session-token.json");
         fs::create_dir_all(torn.parent().expect("parent")).expect("mkdir");
         fs::write(&torn, b"{\"claudeAiOauth\":{\"acc").expect("write partial");
         let _t = live_session_launched_on("torn", "77777-0", &torn);
         assert!(
-            live_session_holds_rotatable("torn"),
+            live_session_holds_rotatable(&crate::profile::ProfileName::from("torn")),
             "a partial read is not proof of absence"
         );
     });
@@ -7342,7 +7478,7 @@ fn no_live_session_is_not_rotatable() {
     let tmp = tempfile::tempdir().expect("tempdir");
     with_fake_home(tmp.path(), || {
         assert!(
-            !live_session_holds_rotatable("idle"),
+            !live_session_holds_rotatable(&crate::profile::ProfileName::from("idle")),
             "with nothing live there is nothing to strand"
         );
     });
@@ -7357,23 +7493,24 @@ fn no_live_session_is_not_rotatable() {
 fn rotation_blocked_for_reads_what_the_live_session_holds() {
     let tmp = tempfile::tempdir().expect("tempdir");
     with_fake_home(tmp.path(), || {
-        let rotating = crate::profile::profile_dir("wired-rot")
+        let rotating = crate::profile::profile_dir(&crate::profile::ProfileName::from("wired-rot"))
             .expect("profile_dir")
             .join("credentials.json");
         write_creds(&rotating, Some("rt-live"));
         let _a = live_session_launched_on("wired-rot", "88888-0", &rotating);
         assert!(
-            rotation_blocked_for("wired-rot"),
+            rotation_blocked_for(&crate::profile::ProfileName::from("wired-rot")),
             "a live session on a rotating pair must still refuse"
         );
 
-        let refreshless = crate::profile::profile_dir("wired-roll")
-            .expect("profile_dir")
-            .join("session-token.json");
+        let refreshless =
+            crate::profile::profile_dir(&crate::profile::ProfileName::from("wired-roll"))
+                .expect("profile_dir")
+                .join("session-token.json");
         write_creds(&refreshless, None);
         let _b = live_session_launched_on("wired-roll", "99999-0", &refreshless);
         assert!(
-            !rotation_blocked_for("wired-roll"),
+            !rotation_blocked_for(&crate::profile::ProfileName::from("wired-roll")),
             "the narrowing is not wired into rotation_blocked_for"
         );
     });

@@ -71,6 +71,7 @@ struct Row {
 impl Row {
     fn from_entry(config: &AppConfig, entry: &serde_json::Value) -> Row {
         let name = entry["name"].as_str().unwrap_or("?");
+        let typed_name = crate::profile::ProfileName::from(name);
         let provider = entry["provider"].as_str().unwrap_or("");
         let windows = entry["windows"].as_array();
         Row {
@@ -84,10 +85,10 @@ impl Row {
             five_h: window_pct(windows, crate::usage::LABEL_5H),
             seven_d: window_pct(windows, crate::usage::LABEL_7D),
             endpoint: entry["base_url"].as_str().unwrap_or("-").to_string(),
-            disabled: config.find(name).is_some_and(|p| p.is_disabled()),
-            canceled: crate::profile_json::is_canceled_cached(name),
+            disabled: config.find(&typed_name).is_some_and(|p| p.is_disabled()),
+            canceled: crate::profile_json::is_canceled_cached(&typed_name),
             usage_login: (entry["fetch_status"].as_str() == Some("AuthExpired")).then(|| {
-                let p = config.find(name);
+                let p = config.find(&typed_name);
                 if p.is_some_and(|p| p.console.is_some()) {
                     "login expired"
                 } else if p.is_some_and(|p| p.provider != Some(crate::providers::Provider::Alibaba))

@@ -6,7 +6,7 @@
 //! return the last-persisted numbers whether or not a scheduler is live. One
 //! home for the shape keeps the three surfaces from drifting.
 
-use crate::profile::Profile;
+use crate::profile::{Profile, ProfileName};
 use crate::profile_cache::{
     THIRD_PARTY_CACHE_FILE, USAGE_CACHE_FILE, load_profile_cache, profile_cache_mtime_ms,
 };
@@ -15,7 +15,7 @@ use crate::usage::{PlanInfo, PlanTier, UsageInfo, now_ms};
 
 /// The last-persisted `/profile` plan for a name, off the same on-disk cache
 /// every reader here sources from.
-fn cached_plan(name: &str) -> Option<PlanInfo> {
+fn cached_plan(name: &ProfileName) -> Option<PlanInfo> {
     load_profile_cache::<UsageInfo>(name, USAGE_CACHE_FILE).and_then(|u| u.plan)
 }
 
@@ -24,7 +24,7 @@ fn cached_plan(name: &str) -> Option<PlanInfo> {
 /// that only the TUI ever fills — outside it that predicate answers `false` for
 /// every account, canceled or not. This reads the disk instead, so a CLI
 /// surface gets the same answer the TUI does.
-pub(crate) fn is_canceled_cached(name: &str) -> bool {
+pub(crate) fn is_canceled_cached(name: &ProfileName) -> bool {
     cached_plan(name).is_some_and(|p| p.is_canceled())
 }
 
@@ -51,7 +51,7 @@ pub(crate) fn tier_label(profile: &Profile) -> Option<String> {
     if profile.is_third_party() {
         return None;
     }
-    let fetched = cached_plan(profile.name.as_str()).filter(|p| p.tier != PlanTier::Unknown);
+    let fetched = cached_plan(&profile.name).filter(|p| p.tier != PlanTier::Unknown);
     match fetched {
         Some(plan) => plan.tier.short_label(),
         None => {
@@ -87,7 +87,7 @@ pub(crate) fn usage_cache_file(p: &Profile) -> &'static str {
 /// profile load: one caller samples this under a leaf lock at 5 Hz, where
 /// recovering a staged rotation would take the state flock and invert the lock
 /// order.
-pub(crate) fn usage_cache_file_for(name: &str) -> &'static str {
+pub(crate) fn usage_cache_file_for(name: &ProfileName) -> &'static str {
     cache_file_of(crate::profile::stored_usage_cache_is_third_party(name))
 }
 
@@ -165,12 +165,12 @@ impl ProfileWindows {
 /// Read one account's headroom out of whichever cache its own fetch leg writes,
 /// discriminated by [`ProfileWindows`].
 pub(crate) fn profile_windows(p: &Profile) -> ProfileWindows {
-    windows_of(p.name.as_str(), p.usage_cache_is_third_party(), p.provider)
+    windows_of(&p.name, p.usage_cache_is_third_party(), p.provider)
 }
 
 /// [`profile_windows`] for a caller holding only a name, classified the same
 /// side-effect-free way [`usage_cache_file_for`] classifies its own.
-pub(crate) fn profile_windows_for(name: &str) -> ProfileWindows {
+pub(crate) fn profile_windows_for(name: &ProfileName) -> ProfileWindows {
     windows_of(
         name,
         crate::profile::stored_usage_cache_is_third_party(name),
@@ -178,7 +178,7 @@ pub(crate) fn profile_windows_for(name: &str) -> ProfileWindows {
     )
 }
 
-fn windows_of(name: &str, third_party: bool, provider: Option<Provider>) -> ProfileWindows {
+fn windows_of(name: &ProfileName, third_party: bool, provider: Option<Provider>) -> ProfileWindows {
     let file = cache_file_of(third_party);
     let age_secs = cache_age_secs(name, file);
     if third_party {
@@ -199,7 +199,7 @@ fn windows_of(name: &str, third_party: bool, provider: Option<Provider>) -> Prof
 /// would render that as `cached just now` with `stale` false — maximum
 /// confidence for the one stamp that proves the clock is wrong — where an
 /// undated figure says exactly what clauth knows: it cannot date this one.
-fn cache_age_secs(name: &str, file: &str) -> Option<u64> {
+fn cache_age_secs(name: &ProfileName, file: &str) -> Option<u64> {
     let mtime = profile_cache_mtime_ms(name, file)?;
     now_ms().checked_sub(mtime).map(|age| age / 1000)
 }
@@ -224,7 +224,7 @@ pub(crate) fn oauth_windows(usage: &UsageInfo) -> Vec<serde_json::Value> {
 /// cache; empty when there is no cache. The published `status.json` shape, whose
 /// readers branch on `schema` — hence an array here rather than
 /// [`ProfileWindows`]'s discriminated spelling, which the MCP surface renders.
-pub(crate) fn windows_json(name: &str) -> serde_json::Value {
+pub(crate) fn windows_json(name: &ProfileName) -> serde_json::Value {
     serde_json::Value::Array(
         load_profile_cache::<UsageInfo>(name, USAGE_CACHE_FILE)
             .as_ref()

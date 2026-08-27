@@ -46,7 +46,8 @@ fn seed_profiles(names: &[&str], disabled: bool) {
     }
     if disabled {
         for name in names {
-            crate::actions::disable_profile(&mut config, name).expect("disable profile");
+            crate::actions::disable_profile(&mut config, &crate::profile::ProfileName::from(*name))
+                .expect("disable profile");
         }
     }
 }
@@ -882,7 +883,7 @@ fn background_single_auth_broken_target_refuses_before_reserving_a_job() {
     crate::actions::create_blank_profile(&mut config, "zzbg-dead".to_string(), None, None, None)
         .expect("create profile");
     assert!(
-        config.set_auth_broken("zzbg-dead", true),
+        config.set_auth_broken(&crate::profile::ProfileName::from("zzbg-dead"), true),
         "fixture control: the profile was not already quarantined",
     );
     crate::profile::save_app_state(&config.state).expect("persist the quarantine");
@@ -902,7 +903,7 @@ fn background_single_auth_broken_target_refuses_before_reserving_a_job() {
     });
     assert_refusal(
         &result,
-        &[&crate::format::login_expired("zzbg-dead").line()],
+        &[&crate::format::login_expired(&crate::profile::ProfileName::from("zzbg-dead")).line()],
     );
     assert_no_job_keys(&result);
     assert_no_job_files();
@@ -922,7 +923,8 @@ fn background_fanout_with_a_disabled_member_refuses_before_writing_jobs() {
     };
     crate::actions::create_blank_profile(&mut config, "zzbg-off".to_string(), None, None, None)
         .expect("create profile");
-    crate::actions::disable_profile(&mut config, "zzbg-off").expect("disable profile");
+    crate::actions::disable_profile(&mut config, &crate::profile::ProfileName::from("zzbg-off"))
+        .expect("disable profile");
     crate::actions::create_blank_profile(
         &mut config,
         "zzbg-ds".to_string(),
@@ -1384,7 +1386,12 @@ fn fold_fanout_rows_keeps_a_lost_member_in_its_own_slot() {
 fn fold_fanout_rows_ages_a_rate_limit_off_after_the_recent_window() {
     let _home = HomeSandbox::new();
     crate::testutil::register_names(&["solo"]);
-    crate::throughput::record_rate_limit("solo", Some("claude-opus"), Some(10), 1_000);
+    crate::throughput::record_rate_limit(
+        &crate::profile::ProfileName::from("solo"),
+        Some("claude-opus"),
+        Some(10),
+        1_000,
+    );
     let names = vec!["solo".to_string()];
     let envelope = || Ok(serde_json::json!({ "result": "boom" }));
     let fresh = fold_fanout_rows(

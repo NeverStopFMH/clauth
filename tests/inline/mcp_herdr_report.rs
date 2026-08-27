@@ -222,7 +222,8 @@ fn seed(names: &[&str], disabled: bool) {
     }
     if disabled {
         for name in names {
-            crate::actions::disable_profile(&mut config, name).expect("disable profile");
+            crate::actions::disable_profile(&mut config, &crate::profile::ProfileName::from(*name))
+                .expect("disable profile");
         }
     }
 }

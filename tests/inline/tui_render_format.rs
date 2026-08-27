@@ -168,10 +168,10 @@ fn no_data_dash_stays_faint() {
 fn account_type_label_dashes_an_unfetched_plan() {
     assert_eq!(NO_DATA, "—", "the house no-data glyph");
 
-    let unfetched = crate::testutil::blank_profile("a");
+    let unfetched = crate::testutil::blank_profile(&crate::profile::ProfileName::from("a"));
     assert_eq!(account_type_label(&unfetched), NO_DATA);
 
-    let mut unclassified = crate::testutil::blank_profile("b");
+    let mut unclassified = crate::testutil::blank_profile(&crate::profile::ProfileName::from("b"));
     unclassified.credentials = Some(crate::profile::ClaudeCredentials {
         claude_ai_oauth: Some(crate::profile::OAuthToken {
             access_token: "at".into(),
@@ -198,15 +198,15 @@ fn account_type_label_keeps_every_known_tier() {
         })
     };
 
-    let mut max = crate::testutil::blank_profile("a");
+    let mut max = crate::testutil::blank_profile(&crate::profile::ProfileName::from("a"));
     max.usage = plan(crate::usage::PlanTier::Max(Some(20)));
     assert_eq!(account_type_label(&max), "Max 20x");
 
-    let mut free = crate::testutil::blank_profile("b");
+    let mut free = crate::testutil::blank_profile(&crate::profile::ProfileName::from("b"));
     free.usage = plan(crate::usage::PlanTier::Free);
     assert_eq!(account_type_label(&free), "Free");
 
-    let mut api = crate::testutil::blank_profile("c");
+    let mut api = crate::testutil::blank_profile(&crate::profile::ProfileName::from("c"));
     api.base_url = Some("https://api.deepseek.com/anthropic".into());
     assert_eq!(account_type_label(&api), "API");
 }

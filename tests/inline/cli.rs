@@ -1018,7 +1018,8 @@ mod disabled_target_refusal {
         };
         crate::actions::create_blank_profile(&mut config, name.to_string(), None, None, None)
             .expect("create profile");
-        crate::actions::disable_profile(&mut config, name).expect("disable profile");
+        crate::actions::disable_profile(&mut config, &crate::profile::ProfileName::from(name))
+            .expect("disable profile");
     }
 
     #[test]
@@ -1224,7 +1225,7 @@ mod api_key_helper_tests {
     /// Write a profile to the sandboxed home with the given api_key (or none),
     /// then save it so `load_profile` can read it back the way the helper does.
     fn save_profile_with_key(name: &str, api_key: Option<&str>) {
-        let mut profile = crate::testutil::blank_profile(name);
+        let mut profile = crate::testutil::blank_profile(&crate::profile::ProfileName::from(name));
         profile.api_key = api_key.map(str::to_string);
         save_profile(&profile).expect("save_profile");
     }
@@ -1462,7 +1463,7 @@ mod static_token_verdicts {
 
     fn rolling_sidecar(name: &str, exp_in_ms: i64) {
         crate::claude::stamp_rolling_token(
-            name,
+            &crate::profile::ProfileName::from(name),
             &crate::profile::OAuthToken {
                 access_token: "at-rolled".to_string(),
                 refresh_token: None,
@@ -1482,7 +1483,7 @@ mod static_token_verdicts {
         let _home = HomeSandbox::new();
         seeded_profile("st-mint", false);
         crate::claude::write_session_token(
-            "st-mint",
+            &crate::profile::ProfileName::from("st-mint"),
             "sk-ant-oat01-static-verdicts-mint-000",
             crate::usage::now_ms() as i64,
         )
@@ -1507,7 +1508,8 @@ mod static_token_verdicts {
         );
         // The flag flip IS durable on this path — stopping the re-stamps is
         // what the operator asked for; the missing mint is the error.
-        let p = crate::profile::load_profile("st-roll").expect("reload");
+        let p = crate::profile::load_profile(&crate::profile::ProfileName::from("st-roll"))
+            .expect("reload");
         assert!(
             !p.rolling_token,
             "the rolling flag turns off even when the restore fails"
@@ -1519,7 +1521,8 @@ mod static_token_verdicts {
         let _home = HomeSandbox::new();
         seeded_profile("st-aged", true);
         rolling_sidecar("st-aged", 8 * 3_600_000);
-        let dir = crate::profile::profile_dir("st-aged").expect("dir");
+        let dir = crate::profile::profile_dir(&crate::profile::ProfileName::from("st-aged"))
+            .expect("dir");
         let expired = crate::profile::ClaudeCredentials {
             claude_ai_oauth: Some(crate::profile::OAuthToken {
                 access_token: "sk-ant-oat01-aged".to_string(),
@@ -1575,7 +1578,8 @@ mod static_token_verdicts {
         };
         crate::profile::save_app_state(&state).expect("save state");
         // A mis-filled sidecar that the pre-clear would have quarantined away.
-        let dir = crate::profile::profile_dir("rt-dead").expect("dir");
+        let dir = crate::profile::profile_dir(&crate::profile::ProfileName::from("rt-dead"))
+            .expect("dir");
         std::fs::write(
             dir.join("session-token.json"),
             serde_json::to_vec_pretty(&profile.credentials).expect("ser"),
@@ -1591,7 +1595,8 @@ mod static_token_verdicts {
             dir.join("session-token.json").exists(),
             "the mis-fill is NOT quarantined away by a command that then failed"
         );
-        let p = crate::profile::load_profile("rt-dead").expect("reload");
+        let p = crate::profile::load_profile(&crate::profile::ProfileName::from("rt-dead"))
+            .expect("reload");
         assert!(!p.rolling_token, "nothing durable from a failed arm");
     }
 
@@ -1633,7 +1638,8 @@ mod static_token_verdicts {
         unrecorded_chain_profile("rt-back", false);
         let err = cmd_rolling_token("rt-back").expect_err("an unrecorded grant refuses the arm");
         assert!(format!("{err:#}").contains("no recorded grant"), "{err:#}");
-        let p = crate::profile::load_profile("rt-back").expect("reload");
+        let p = crate::profile::load_profile(&crate::profile::ProfileName::from("rt-back"))
+            .expect("reload");
         assert!(
             !p.rolling_token,
             "the flag persisted for the arm is rolled back when the arm fails"
@@ -1641,7 +1647,8 @@ mod static_token_verdicts {
 
         unrecorded_chain_profile("rt-keep", true);
         cmd_rolling_token("rt-keep").expect_err("same refusal");
-        let p = crate::profile::load_profile("rt-keep").expect("reload");
+        let p = crate::profile::load_profile(&crate::profile::ProfileName::from("rt-keep"))
+            .expect("reload");
         assert!(
             p.rolling_token,
             "a flag that was already on is left on — rollback restores the PRIOR value, \
@@ -1656,14 +1663,15 @@ mod static_token_verdicts {
     fn the_arming_report_fails_on_what_it_cannot_verify() {
         let _home = HomeSandbox::new();
         seeded_profile("rt-report", true);
-        let err = report_armed_sidecar("rt-report", false)
+        let err = report_armed_sidecar(&crate::profile::ProfileName::from("rt-report"), false)
             .expect_err("no readable sidecar must not report armed");
         assert!(
             format!("{err:#}").contains("no readable sidecar"),
             "{err:#}"
         );
 
-        let dir = crate::profile::profile_dir("rt-report").expect("dir");
+        let dir = crate::profile::profile_dir(&crate::profile::ProfileName::from("rt-report"))
+            .expect("dir");
         let pair = crate::profile::ClaudeCredentials {
             claude_ai_oauth: Some(crate::profile::OAuthToken {
                 access_token: "at-raced".to_string(),
@@ -1678,7 +1686,7 @@ mod static_token_verdicts {
             serde_json::to_vec_pretty(&pair).expect("ser"),
         )
         .expect("write misfill");
-        let err = report_armed_sidecar("rt-report", false)
+        let err = report_armed_sidecar(&crate::profile::ProfileName::from("rt-report"), false)
             .expect_err("a raced-in rotating pair must not report armed");
         assert!(
             format!("{err:#}").contains("rotating pair while arming"),
@@ -1693,7 +1701,8 @@ mod static_token_verdicts {
     fn an_expired_mint_in_the_sidecar_is_a_failed_restore() {
         let _home = HomeSandbox::new();
         seeded_profile("st-deadmint", false);
-        let dir = crate::profile::profile_dir("st-deadmint").expect("dir");
+        let dir = crate::profile::profile_dir(&crate::profile::ProfileName::from("st-deadmint"))
+            .expect("dir");
         let dead = crate::profile::ClaudeCredentials {
             claude_ai_oauth: Some(crate::profile::OAuthToken {
                 access_token: "sk-ant-oat01-clock-dead".to_string(),
@@ -1719,7 +1728,8 @@ mod static_token_verdicts {
         // identical bytes must not read as dead in the backup slot but fine
         // in the live one.
         seeded_profile("st-window", false);
-        let dir = crate::profile::profile_dir("st-window").expect("dir");
+        let dir = crate::profile::profile_dir(&crate::profile::ProfileName::from("st-window"))
+            .expect("dir");
         let closing = crate::profile::ClaudeCredentials {
             claude_ai_oauth: Some(crate::profile::OAuthToken {
                 access_token: "sk-ant-oat01-two-minutes".to_string(),
@@ -1751,7 +1761,8 @@ mod static_token_verdicts {
         let _home = HomeSandbox::new();
         seeded_profile("st-eio", true);
         rolling_sidecar("st-eio", 8 * 3_600_000);
-        let dir = crate::profile::profile_dir("st-eio").expect("dir");
+        let dir =
+            crate::profile::profile_dir(&crate::profile::ProfileName::from("st-eio")).expect("dir");
         // A directory where the backup goes: reads fail with a non-NotFound
         // error on every platform.
         std::fs::create_dir(dir.join("session-token.static.json")).expect("block the backup path");
@@ -1760,7 +1771,8 @@ mod static_token_verdicts {
             format!("{err:#}").contains("is off the rolling token now"),
             "the error owns the flag state the command already changed: {err:#}"
         );
-        let p = crate::profile::load_profile("st-eio").expect("reload");
+        let p = crate::profile::load_profile(&crate::profile::ProfileName::from("st-eio"))
+            .expect("reload");
         assert!(!p.rolling_token, "the flip it owns is real");
     }
 
@@ -1776,7 +1788,8 @@ mod static_token_verdicts {
         let _home = HomeSandbox::new();
         seeded_profile("st-corrupt", true);
         rolling_sidecar("st-corrupt", 8 * 3_600_000);
-        let dir = crate::profile::profile_dir("st-corrupt").expect("dir");
+        let dir = crate::profile::profile_dir(&crate::profile::ProfileName::from("st-corrupt"))
+            .expect("dir");
         std::fs::write(dir.join("session-token.static.json"), b"not json at all")
             .expect("corrupt backup");
 
@@ -1803,7 +1816,7 @@ mod static_token_verdicts {
         // plain no-backup write — exactly what `clauth login --setup-token`
         // runs), then the command reports the mint as already in front.
         crate::claude::write_session_token(
-            "st-corrupt",
+            &crate::profile::ProfileName::from("st-corrupt"),
             "sk-ant-oat01-fresh-recovery-mint",
             crate::usage::now_ms() as i64,
         )
@@ -1978,13 +1991,13 @@ mod static_token_clear {
         // mint into `session-token.static.json`, which is exactly the two-file
         // state a rolling profile carries in production.
         crate::claude::write_session_token(
-            "cl-roll",
+            &crate::profile::ProfileName::from("cl-roll"),
             "sk-ant-oat01-clear-full-exit-mint",
             crate::usage::now_ms() as i64,
         )
         .expect("mint");
         crate::claude::stamp_rolling_token(
-            "cl-roll",
+            &crate::profile::ProfileName::from("cl-roll"),
             &crate::profile::OAuthToken {
                 access_token: "at-rolled".to_string(),
                 refresh_token: None,
@@ -1997,7 +2010,8 @@ mod static_token_clear {
             },
         )
         .expect("stamp");
-        let dir = crate::profile::profile_dir("cl-roll").expect("dir");
+        let dir = crate::profile::profile_dir(&crate::profile::ProfileName::from("cl-roll"))
+            .expect("dir");
         assert!(dir.join("session-token.static.json").exists(), "fixture");
 
         cmd_static_token_clear("cl-roll", true).expect("the clear succeeds");
@@ -2010,7 +2024,8 @@ mod static_token_clear {
             !dir.join("session-token.static.json").exists(),
             "the preserved mint is a long-lived credential and goes with the clear"
         );
-        let p = crate::profile::load_profile("cl-roll").expect("reload");
+        let p = crate::profile::load_profile(&crate::profile::ProfileName::from("cl-roll"))
+            .expect("reload");
         assert!(
             !p.rolling_token,
             "the flag goes too, or the daemon re-stamps a sidecar over the clear"
@@ -2032,7 +2047,8 @@ mod static_token_clear {
     fn the_other_login_refusal_is_rechecked_under_the_guard() {
         let home = HomeSandbox::new();
         cleared_profile("cl-race", false, true);
-        let dir = crate::profile::profile_dir("cl-race").expect("dir");
+        let dir = crate::profile::profile_dir(&crate::profile::ProfileName::from("cl-race"))
+            .expect("dir");
 
         // One attempt of the race. NOTHING between the guard acquire and the
         // join may panic: an unwound attempt would detach the worker, release
@@ -2042,7 +2058,7 @@ mod static_token_clear {
         // the return value instead.
         let attempt = || -> (bool, String) {
             crate::claude::write_session_token(
-                "cl-race",
+                &crate::profile::ProfileName::from("cl-race"),
                 "sk-ant-oat01-clear-race-mint0000",
                 crate::usage::now_ms() as i64 + 300 * 24 * 3_600_000,
             )
@@ -2061,7 +2077,10 @@ mod static_token_clear {
                 .expect("serialize login"),
             )
             .expect("store the login");
-            let guard = crate::runtime::RotationGuard::acquire("cl-race").expect("hold the lock");
+            let guard = crate::runtime::RotationGuard::acquire(&crate::profile::ProfileName::from(
+                "cl-race",
+            ))
+            .expect("hold the lock");
             let worker = std::thread::spawn(move || super::cmd_static_token_clear("cl-race", true));
             // Give the clear time to pass its pre-guard snapshot and park on
             // the guard; then take the login away and let it through.
@@ -2121,19 +2140,21 @@ mod static_token_clear {
         let home = HomeSandbox::new();
         cleared_profile("cl-mid", false, true);
         crate::claude::write_session_token(
-            "cl-mid",
+            &crate::profile::ProfileName::from("cl-mid"),
             "sk-ant-oat01-clear-mid-mint00000",
             crate::usage::now_ms() as i64 + 300 * 24 * 3_600_000,
         )
         .expect("mint");
-        let dir = crate::profile::profile_dir("cl-mid").expect("dir");
+        let dir =
+            crate::profile::profile_dir(&crate::profile::ProfileName::from("cl-mid")).expect("dir");
         let state = crate::profile::AppState {
             profiles: vec!["cl-mid".into()],
             active_profile: Some("cl-mid".into()),
             ..Default::default()
         };
         crate::profile::save_app_state(&state).expect("activate");
-        crate::claude::force_link_profile_credentials("cl-mid").expect("link");
+        crate::claude::force_link_profile_credentials(&crate::profile::ProfileName::from("cl-mid"))
+            .expect("link");
         let live = home.home().join(".claude").join(".credentials.json");
         assert_eq!(
             std::fs::read_link(&live).expect("live is a symlink"),
@@ -2167,7 +2188,8 @@ mod static_token_clear {
         let _home = HomeSandbox::new();
         cleared_profile("cl-flag", true, true);
         cmd_static_token_clear("cl-flag", true).expect("the disarm succeeds");
-        let p = crate::profile::load_profile("cl-flag").expect("reload");
+        let p = crate::profile::load_profile(&crate::profile::ProfileName::from("cl-flag"))
+            .expect("reload");
         assert!(!p.rolling_token, "the clear turned re-stamping off");
     }
 
@@ -2179,11 +2201,12 @@ mod static_token_clear {
     fn the_backup_slot_counts_as_the_last_credential() {
         let _home = HomeSandbox::new();
         cleared_profile("cl-last", false, false);
-        let dir = crate::profile::profile_dir("cl-last").expect("dir");
+        let dir = crate::profile::profile_dir(&crate::profile::ProfileName::from("cl-last"))
+            .expect("dir");
         std::fs::create_dir_all(&dir).expect("mkdir");
         // A live mint in the backup slot and nothing else: the one credential.
         crate::claude::write_session_token(
-            "cl-last",
+            &crate::profile::ProfileName::from("cl-last"),
             "sk-ant-oat01-last-credential-mint",
             crate::usage::now_ms() as i64,
         )
@@ -2221,7 +2244,7 @@ mod static_token_clear {
         cleared_profile("cl-none", false, true);
         cmd_static_token_clear("cl-none", true).expect("nothing to clear is success");
         assert!(
-            !crate::runtime::rotation_lock_path("cl-none")
+            !crate::runtime::rotation_lock_path(&crate::profile::ProfileName::from("cl-none"))
                 .expect("rotation lock path")
                 .exists(),
             "the no-op branch returns before the rotation guard — a lock file \
@@ -2238,7 +2261,8 @@ mod static_token_clear {
     fn clear_quarantines_a_misfilled_sidecar_instead_of_plain_deleting_it() {
         let _home = HomeSandbox::new();
         cleared_profile("cl-mf", false, true);
-        let dir = crate::profile::profile_dir("cl-mf").expect("dir");
+        let dir =
+            crate::profile::profile_dir(&crate::profile::ProfileName::from("cl-mf")).expect("dir");
         std::fs::create_dir_all(&dir).expect("mkdir");
         std::fs::write(
             dir.join("session-token.json"),
@@ -2288,7 +2312,9 @@ fn cli_delete_refuses_while_a_rotation_holds_the_lock() {
         .expect("create profile");
 
     // Another process mid-rotation: a locked handle on a separate fd.
-    let lock_path = crate::runtime::rotation_lock_path("cli-held").expect("rotation lock path");
+    let lock_path =
+        crate::runtime::rotation_lock_path(&crate::profile::ProfileName::from("cli-held"))
+            .expect("rotation lock path");
     crate::profile::mkdir_700(lock_path.parent().expect("lock parent")).expect("locks dir");
     let holder = crate::profile::open_state_file(&lock_path).expect("open holder handle");
     holder.lock().expect("hold the rotation lock");
@@ -2304,7 +2330,7 @@ fn cli_delete_refuses_while_a_rotation_holds_the_lock() {
     // Untouched state first: a guard taken for the wrong profile deletes the
     // account, and asserting the error first would abort before these run.
     assert!(
-        crate::profile::profile_dir("cli-held")
+        crate::profile::profile_dir(&crate::profile::ProfileName::from("cli-held"))
             .expect("profile dir")
             .exists(),
         "a refused delete leaves the profile directory on disk"
@@ -2312,7 +2338,7 @@ fn cli_delete_refuses_while_a_rotation_holds_the_lock() {
     assert!(
         load_config()
             .expect("reload state")
-            .find("cli-held")
+            .find(&crate::profile::ProfileName::from("cli-held"))
             .is_some(),
         "a refused delete leaves the profile record in the persisted state"
     );

@@ -10,7 +10,8 @@ use crate::testutil::HomeSandbox;
 /// sandbox, so this is the fixture spelling of "no rotation is in flight" — the
 /// contended direction is what the two refusal tests below drive.
 fn rotation_guard(name: &str) -> crate::runtime::RotationGuard {
-    rotation_guard_for_mutation(name).expect("uncontended rotation lock")
+    rotation_guard_for_mutation(&crate::profile::ProfileName::from(name))
+        .expect("uncontended rotation lock")
 }
 
 /// A locked handle on `name`'s rotation lock from a separate fd, standing in for
@@ -18,7 +19,8 @@ fn rotation_guard(name: &str) -> crate::runtime::RotationGuard {
 /// so this genuinely contends). Creates the locks directory the way
 /// `try_acquire` does, since a real holder made it on its way in.
 fn hold_rotation_lock(name: &str) -> std::fs::File {
-    let path = crate::runtime::rotation_lock_path(name).expect("rotation lock path");
+    let path = crate::runtime::rotation_lock_path(&crate::profile::ProfileName::from(name))
+        .expect("rotation lock path");
     crate::profile::mkdir_700(path.parent().expect("lock parent")).expect("locks dir");
     let holder = crate::profile::open_state_file(&path).expect("open holder handle");
     holder.lock().expect("hold the rotation lock");
@@ -136,11 +138,13 @@ fn switch_replaces_active_account_mirror_without_refusing() {
     crate::profile::save_app_state(&config.state).expect("persist state");
 
     // Must NOT bail — the live file is the active account's captured mirror.
-    switch_profile(&mut config, "xfx").expect("switch replaces the active-account mirror");
+    switch_profile(&mut config, &crate::profile::ProfileName::from("xfx"))
+        .expect("switch replaces the active-account mirror");
 
-    assert!(config.is_active("xfx"));
+    assert!(config.is_active(&crate::profile::ProfileName::from("xfx")));
     assert_eq!(
-        crate::claude::classify_credentials_link("xfx").expect("classify"),
+        crate::claude::classify_credentials_link(&crate::profile::ProfileName::from("xfx"))
+            .expect("classify"),
         crate::claude::LinkState::LinkedTo,
         "after the switch the live path resolves to xfx's stored creds",
     );
@@ -185,14 +189,18 @@ fn switch_to_a_missing_profile_bails_before_touching_the_live_link() {
     };
     config.state.active_profile = Some("keeper".into());
 
-    let err = switch_profile(&mut config, "ghost").expect_err("ghost must bail");
+    let err = switch_profile(&mut config, &crate::profile::ProfileName::from("ghost"))
+        .expect_err("ghost must bail");
     assert!(
         err.to_string().contains("not found"),
         "bail names the cause, got: {err}"
     );
-    assert!(config.is_active("keeper"), "active unchanged");
+    assert!(
+        config.is_active(&crate::profile::ProfileName::from("keeper")),
+        "active unchanged"
+    );
     assert!(live_path.exists(), "the live credentials file survives");
-    let stored = crate::profile::profile_dir("keeper")
+    let stored = crate::profile::profile_dir(&crate::profile::ProfileName::from("keeper"))
         .unwrap()
         .join("credentials.json");
     assert!(stored.exists(), "keeper's stored credentials survive");
@@ -253,18 +261,30 @@ fn switch_profile_refuses_a_target_deleted_on_disk() {
     let mut disk = crate::profile::load_config().expect("load disk config");
     disk.state.active_profile = None;
     let guard = rotation_guard("victim");
-    delete_profile(&mut disk, "victim", false, &guard).expect("delete");
+    delete_profile(
+        &mut disk,
+        &crate::profile::ProfileName::from("victim"),
+        false,
+        &guard,
+    )
+    .expect("delete");
     drop(guard);
 
-    let err = switch_profile(&mut stale, "victim").expect_err("a deleted target must be refused");
+    let err = switch_profile(&mut stale, &crate::profile::ProfileName::from("victim"))
+        .expect_err("a deleted target must be refused");
     assert_eq!(err.to_string(), "profile 'victim' not found");
-    assert!(stale.is_active("keeper"), "the active profile is unchanged");
+    assert!(
+        stale.is_active(&crate::profile::ProfileName::from("keeper")),
+        "the active profile is unchanged"
+    );
     assert!(
         live_path.exists(),
         "the live credentials file must survive (the gate fires before force-link)"
     );
     assert!(
-        !profile_dir("victim").expect("dir").exists(),
+        !profile_dir(&crate::profile::ProfileName::from("victim"))
+            .expect("dir")
+            .exists(),
         "the deleted target's directory must stay deleted"
     );
 }
@@ -292,13 +312,14 @@ fn switch_profile_refuses_a_disabled_target_and_leaves_active_unchanged() {
     };
     crate::profile::save_app_state(&config.state).expect("persist state");
 
-    let err = switch_profile(&mut config, "target").expect_err("a disabled target must be refused");
+    let err = switch_profile(&mut config, &crate::profile::ProfileName::from("target"))
+        .expect_err("a disabled target must be refused");
     assert_eq!(
         err.to_string(),
         "'target': account is disabled, run `clauth enable target`"
     );
     assert!(
-        config.is_active("active"),
+        config.is_active(&crate::profile::ProfileName::from("active")),
         "active profile must be unchanged"
     );
 }
@@ -370,7 +391,7 @@ fn auto_switch_if_needed_walks_off_a_broken_active() {
         Some(SwitchAction::To("b".to_string())),
         "a dead active with stale-headroom usage must still be walked away from"
     );
-    assert!(config.is_active("b"));
+    assert!(config.is_active(&crate::profile::ProfileName::from("b")));
 }
 
 /// The scoped trigger through the REAL UI one-shot: `auto_switch_if_needed`
@@ -447,7 +468,7 @@ fn auto_switch_if_needed_hops_off_a_scoped_blocked_active() {
         Some(SwitchAction::To("b".to_string())),
         "a healthy active with a spent per-model week must hop to the clear member"
     );
-    assert!(config.is_active("b"));
+    assert!(config.is_active(&crate::profile::ProfileName::from("b")));
 }
 
 /// Twin of the hop-off test above, but the only sibling is canceled: its
@@ -536,7 +557,7 @@ fn auto_switch_if_needed_does_not_hop_a_scoped_blocked_active_onto_a_canceled_me
         "a scoped-blocked active must not hop onto a canceled member reading idle headroom"
     );
     assert!(
-        config.is_active("a"),
+        config.is_active(&crate::profile::ProfileName::from("a")),
         "active must stay put when the only sibling is canceled"
     );
 }
@@ -603,7 +624,7 @@ fn auto_switch_if_needed_keeps_a_scoped_blocked_sink_parked() {
 
     let action = auto_switch_if_needed(&mut config, None).expect("auto switch");
     assert_eq!(action, None, "a pinned sink stays parked");
-    assert!(config.is_active("a"));
+    assert!(config.is_active(&crate::profile::ProfileName::from("a")));
 }
 
 #[test]
@@ -612,22 +633,42 @@ fn edit_profile_env_persists_to_config_toml() {
     let mut config = acct_config();
     let mut env = BTreeMap::new();
     env.insert("FOO".to_string(), "bar".to_string());
-    edit_profile_env(&mut config, "acct", env).expect("set env");
+    edit_profile_env(&mut config, &crate::profile::ProfileName::from("acct"), env)
+        .expect("set env");
 
     assert_eq!(
-        config.find("acct").unwrap().env.get("FOO"),
+        config
+            .find(&crate::profile::ProfileName::from("acct"))
+            .unwrap()
+            .env
+            .get("FOO"),
         Some(&"bar".to_string())
     );
-    let toml = std::fs::read_to_string(profile_dir("acct").unwrap().join("config.toml"))
-        .expect("config.toml written");
+    let toml = std::fs::read_to_string(
+        profile_dir(&crate::profile::ProfileName::from("acct"))
+            .unwrap()
+            .join("config.toml"),
+    )
+    .expect("config.toml written");
     assert!(
         toml.contains("FOO"),
         "custom env key persisted to config.toml"
     );
 
     // Clearing the map persists too.
-    edit_profile_env(&mut config, "acct", BTreeMap::new()).expect("clear env");
-    assert!(config.find("acct").unwrap().env.is_empty());
+    edit_profile_env(
+        &mut config,
+        &crate::profile::ProfileName::from("acct"),
+        BTreeMap::new(),
+    )
+    .expect("clear env");
+    assert!(
+        config
+            .find(&crate::profile::ProfileName::from("acct"))
+            .unwrap()
+            .env
+            .is_empty()
+    );
 }
 
 #[test]
@@ -639,14 +680,20 @@ fn edit_profile_env_strips_removed_keys_from_live_settings_when_active() {
     let mut env = BTreeMap::new();
     env.insert("KEEP".to_string(), "1".to_string());
     env.insert("DROP".to_string(), "2".to_string());
-    edit_profile_env(&mut config, "acct", env).expect("write both");
+    edit_profile_env(&mut config, &crate::profile::ProfileName::from("acct"), env)
+        .expect("write both");
     let live = crate::claude::claude_settings_env_keys().expect("read settings");
     assert!(live.contains(&"KEEP".to_string()) && live.contains(&"DROP".to_string()));
 
     // Removing DROP must strip it from the live settings.json, not leak it.
     let mut env2 = BTreeMap::new();
     env2.insert("KEEP".to_string(), "1".to_string());
-    edit_profile_env(&mut config, "acct", env2).expect("drop one");
+    edit_profile_env(
+        &mut config,
+        &crate::profile::ProfileName::from("acct"),
+        env2,
+    )
+    .expect("drop one");
     let live = crate::claude::claude_settings_env_keys().expect("read settings");
     assert!(live.contains(&"KEEP".to_string()));
     assert!(
@@ -655,7 +702,7 @@ fn edit_profile_env_strips_removed_keys_from_live_settings_when_active() {
     );
 }
 
-// ── set_profile_default_model (`clauth login --model`, the create-form row) ──
+// ── set_profile_default_model (`clauth login --model`, &crate::profile::ProfileName::from(the create-form row)) ──
 // (the ensure_login_profile tests were dropped with the fn — `clauth login` now
 //  mints tokens via the browser flow and captures a profile, rather than
 //  pre-creating a blank one; `--model` is applied to the captured profile.)
@@ -664,14 +711,28 @@ fn edit_profile_env_strips_removed_keys_from_live_settings_when_active() {
 fn set_profile_default_model_persists_to_config_toml() {
     let _home = HomeSandbox::new();
     let mut config = acct_config();
-    set_profile_default_model(&mut config, "acct", "opus").expect("set model");
+    set_profile_default_model(
+        &mut config,
+        &crate::profile::ProfileName::from("acct"),
+        "opus",
+    )
+    .expect("set model");
 
     assert_eq!(
-        config.find("acct").unwrap().models.default.as_deref(),
+        config
+            .find(&crate::profile::ProfileName::from("acct"))
+            .unwrap()
+            .models
+            .default
+            .as_deref(),
         Some("opus")
     );
-    let toml = std::fs::read_to_string(profile_dir("acct").unwrap().join("config.toml"))
-        .expect("config.toml written");
+    let toml = std::fs::read_to_string(
+        profile_dir(&crate::profile::ProfileName::from("acct"))
+            .unwrap()
+            .join("config.toml"),
+    )
+    .expect("config.toml written");
     assert!(toml.contains("opus"), "model persisted to config.toml");
 }
 
@@ -681,7 +742,7 @@ fn set_profile_default_model_preserves_alias_overrides() {
     let mut config = acct_config();
     edit_profile_model(
         &mut config,
-        "acct",
+        &crate::profile::ProfileName::from("acct"),
         ModelSettings {
             opus: Some("claude-opus-4-8".to_string()),
             ..ModelSettings::default()
@@ -689,9 +750,16 @@ fn set_profile_default_model_preserves_alias_overrides() {
     )
     .expect("seed opus alias");
 
-    set_profile_default_model(&mut config, "acct", "sonnet").expect("set default");
+    set_profile_default_model(
+        &mut config,
+        &crate::profile::ProfileName::from("acct"),
+        "sonnet",
+    )
+    .expect("set default");
 
-    let profile = config.find("acct").unwrap();
+    let profile = config
+        .find(&crate::profile::ProfileName::from("acct"))
+        .unwrap();
     assert_eq!(profile.models.default.as_deref(), Some("sonnet"));
     assert_eq!(
         profile.models.opus.as_deref(),
@@ -704,10 +772,25 @@ fn set_profile_default_model_preserves_alias_overrides() {
 fn set_profile_default_model_blank_clears_default() {
     let _home = HomeSandbox::new();
     let mut config = acct_config();
-    set_profile_default_model(&mut config, "acct", "opus").expect("set model");
-    set_profile_default_model(&mut config, "acct", "   ").expect("clear model");
+    set_profile_default_model(
+        &mut config,
+        &crate::profile::ProfileName::from("acct"),
+        "opus",
+    )
+    .expect("set model");
+    set_profile_default_model(
+        &mut config,
+        &crate::profile::ProfileName::from("acct"),
+        "   ",
+    )
+    .expect("clear model");
     assert!(
-        config.find("acct").unwrap().models.default.is_none(),
+        config
+            .find(&crate::profile::ProfileName::from("acct"))
+            .unwrap()
+            .models
+            .default
+            .is_none(),
         "blank input clears the default, mirroring the Setup tab's ⏎ commit"
     );
 }
@@ -725,7 +808,7 @@ fn edit_profile_preset_writes_endpoint_and_models_in_one_shot() {
 
     edit_profile_preset(
         &mut config,
-        "acct",
+        &crate::profile::ProfileName::from("acct"),
         Some("https://api.deepseek.com/anthropic".to_string()),
         ModelSettings {
             default: Some("deepseek-chat".to_string()),
@@ -734,7 +817,9 @@ fn edit_profile_preset_writes_endpoint_and_models_in_one_shot() {
     )
     .expect("preset applied");
 
-    let profile = config.find("acct").unwrap();
+    let profile = config
+        .find(&crate::profile::ProfileName::from("acct"))
+        .unwrap();
     assert_eq!(
         profile.base_url.as_deref(),
         Some("https://api.deepseek.com/anthropic"),
@@ -814,7 +899,9 @@ fn overwrite_captured_profile_keeps_config_and_history_swaps_credentials() {
     });
     save_profile(&target).expect("save target");
 
-    let history_path = profile_dir("acme").unwrap().join("usage_history.jsonl");
+    let history_path = profile_dir(&crate::profile::ProfileName::from("acme"))
+        .unwrap()
+        .join("usage_history.jsonl");
     std::fs::write(&history_path, b"{\"ts\":1}\n").expect("seed usage history");
 
     // Seed the transient fetch-state caches the overwrite must drop.
@@ -823,7 +910,11 @@ fn overwrite_captured_profile_keeps_config_and_history_swaps_credentials() {
         crate::profile_cache::THIRD_PARTY_CACHE_FILE,
         crate::throughput::THROUGHPUT_CACHE_FILE,
     ] {
-        crate::profile_cache::write_profile_cache("acme", file, &"stale");
+        crate::profile_cache::write_profile_cache(
+            &crate::profile::ProfileName::from("acme"),
+            file,
+            &"stale",
+        );
     }
 
     let mut config = AppConfig {
@@ -851,7 +942,12 @@ fn overwrite_captured_profile_keeps_config_and_history_swaps_credentials() {
         account_uuid: None,
     };
 
-    overwrite_captured_profile(&mut config, "acme", snapshot).expect("overwrite in place");
+    overwrite_captured_profile(
+        &mut config,
+        &crate::profile::ProfileName::from("acme"),
+        snapshot,
+    )
+    .expect("overwrite in place");
 
     assert_eq!(
         config.profiles.len(),
@@ -859,7 +955,7 @@ fn overwrite_captured_profile_keeps_config_and_history_swaps_credentials() {
         "no duplicate entry from a blind append"
     );
     let acme = config
-        .find("acme")
+        .find(&crate::profile::ProfileName::from("acme"))
         .expect("profile still present under the same name");
     assert_eq!(
         acme.access_token(),
@@ -919,7 +1015,11 @@ fn overwrite_captured_profile_keeps_config_and_history_swaps_credentials() {
         crate::profile_cache::THIRD_PARTY_CACHE_FILE,
         crate::throughput::THROUGHPUT_CACHE_FILE,
     ] {
-        let path = crate::profile_cache::profile_cache_path("acme", file).unwrap();
+        let path = crate::profile_cache::profile_cache_path(
+            &crate::profile::ProfileName::from("acme"),
+            file,
+        )
+        .unwrap();
         assert!(
             !path.exists(),
             "{file} must be dropped — it describes the old account"
@@ -950,15 +1050,22 @@ fn overwrite_captured_profile_does_not_auto_activate_a_disabled_profile() {
         profiles: vec![target],
     };
 
-    overwrite_captured_profile(&mut config, "acme", login_snapshot("fresh-refresh", None))
-        .expect("capture succeeds");
+    overwrite_captured_profile(
+        &mut config,
+        &crate::profile::ProfileName::from("acme"),
+        login_snapshot("fresh-refresh", None),
+    )
+    .expect("capture succeeds");
 
     assert_eq!(
         config.state.active_profile, None,
         "a disabled profile must never be auto-activated, even with no active profile at all"
     );
     assert_eq!(
-        config.find("acme").unwrap().access_token(),
+        config
+            .find(&crate::profile::ProfileName::from("acme"))
+            .unwrap()
+            .access_token(),
         Some("acc"),
         "the fresh credentials must still be captured"
     );
@@ -983,16 +1090,20 @@ fn armed_ttl_profile(name: &str, t0: u64) -> Profile {
     let profile = Profile::new(name.to_string(), None, None);
     save_profile(&profile).expect("save profile");
     crate::profile_cache::write_profile_cache(
-        name,
+        &crate::profile::ProfileName::from(name),
         crate::profile_cache::ACCOUNT_ID_CACHE_FILE,
         &"uuid-old-account".to_string(),
     );
     assert!(
-        crate::usage::take_profile_fetch(name, false, t0),
+        crate::usage::take_profile_fetch(&crate::profile::ProfileName::from(name), false, t0),
         "the first attempt arms the clock"
     );
     assert!(
-        !crate::usage::take_profile_fetch(name, false, t0 + 60_000),
+        !crate::usage::take_profile_fetch(
+            &crate::profile::ProfileName::from(name),
+            false,
+            t0 + 60_000
+        ),
         "precondition: the clock is armed and would mute /profile"
     );
     profile
@@ -1022,7 +1133,7 @@ fn inactive_config(profile: Profile) -> AppConfig {
 /// Read the on-disk identity anchor for `name`.
 fn anchor_of(name: &str) -> Option<String> {
     crate::profile_cache::load_profile_cache::<String>(
-        name,
+        &crate::profile::ProfileName::from(name),
         crate::profile_cache::ACCOUNT_ID_CACHE_FILE,
     )
 }
@@ -1052,14 +1163,18 @@ fn overwrite_captured_profile_anchors_the_account_it_committed() {
     save_profile(&target).expect("save target");
     let mut config = inactive_config(target);
     crate::usage::seed_login_anchor(
-        "swap",
+        &crate::profile::ProfileName::from("swap"),
         Some(&crate::profile::AccountId::from(
             "uuid-old-account".to_string(),
         )),
     );
 
-    overwrite_captured_profile(&mut config, "swap", login_snapshot("new", Some("uuid-new")))
-        .expect("overwrite in place");
+    overwrite_captured_profile(
+        &mut config,
+        &crate::profile::ProfileName::from("swap"),
+        login_snapshot("new", Some("uuid-new")),
+    )
+    .expect("overwrite in place");
 
     assert_eq!(
         anchor_of("swap").as_deref(),
@@ -1099,7 +1214,7 @@ fn a_snapshot_with_no_proven_identity_leaves_the_anchor_alone() {
     save_profile(&target).expect("save target");
     let mut config = inactive_config(target);
     crate::usage::seed_login_anchor(
-        "unproven",
+        &crate::profile::ProfileName::from("unproven"),
         Some(&crate::profile::AccountId::from(
             "uuid-existing".to_string(),
         )),
@@ -1108,8 +1223,12 @@ fn a_snapshot_with_no_proven_identity_leaves_the_anchor_alone() {
     // `capture_snapshot()` reads live creds off disk and proves no identity; a
     // failed login probe reports none either. Neither may mint OR clear an anchor
     // — a `None` stays the silent no-op it has always been.
-    overwrite_captured_profile(&mut config, "unproven", login_snapshot("new", None))
-        .expect("overwrite in place");
+    overwrite_captured_profile(
+        &mut config,
+        &crate::profile::ProfileName::from("unproven"),
+        login_snapshot("new", None),
+    )
+    .expect("overwrite in place");
 
     assert_eq!(
         anchor_of("unproven").as_deref(),
@@ -1126,7 +1245,7 @@ fn overwrite_captured_profile_expires_the_profile_ttl_clock() {
 
     overwrite_captured_profile(
         &mut config,
-        "ttl-swap",
+        &crate::profile::ProfileName::from("ttl-swap"),
         CaptureSnapshot {
             credentials: None,
             base_url: Some("https://api.example.com".to_string()),
@@ -1137,7 +1256,11 @@ fn overwrite_captured_profile_expires_the_profile_ttl_clock() {
     .expect("overwrite in place");
 
     assert!(
-        crate::usage::take_profile_fetch("ttl-swap", false, t0 + 120_000),
+        crate::usage::take_profile_fetch(
+            &crate::profile::ProfileName::from("ttl-swap"),
+            false,
+            t0 + 120_000
+        ),
         "the swapped-in account must pull its own /profile now, not up to an hour later"
     );
 }
@@ -1148,10 +1271,18 @@ fn clear_profile_credentials_expires_the_profile_ttl_clock() {
     let t0 = 1_000_000_000_000u64;
     let mut config = inactive_config(armed_ttl_profile("ttl-logout", t0));
 
-    clear_profile_credentials(&mut config, "ttl-logout").expect("log out");
+    clear_profile_credentials(
+        &mut config,
+        &crate::profile::ProfileName::from("ttl-logout"),
+    )
+    .expect("log out");
 
     assert!(
-        crate::usage::take_profile_fetch("ttl-logout", false, t0 + 120_000),
+        crate::usage::take_profile_fetch(
+            &crate::profile::ProfileName::from("ttl-logout"),
+            false,
+            t0 + 120_000
+        ),
         "a re-login into the blanked shell must pull its own tier, not the old account's clock"
     );
 }
@@ -1162,12 +1293,22 @@ fn delete_profile_expires_the_profile_ttl_clock() {
     let t0 = 1_000_000_000_000u64;
     let mut config = inactive_config(armed_ttl_profile("ttl-del", t0));
 
-    delete_profile(&mut config, "ttl-del", false, &rotation_guard("ttl-del")).expect("delete");
+    delete_profile(
+        &mut config,
+        &crate::profile::ProfileName::from("ttl-del"),
+        false,
+        &rotation_guard("ttl-del"),
+    )
+    .expect("delete");
 
     // `remove_dir_all` took the durable stamp; only the memo could survive here,
     // and it would mute the first /profile of a same-name relogin in this process.
     assert!(
-        crate::usage::take_profile_fetch("ttl-del", false, t0 + 120_000),
+        crate::usage::take_profile_fetch(
+            &crate::profile::ProfileName::from("ttl-del"),
+            false,
+            t0 + 120_000
+        ),
         "the memo must not outlive the profile it describes"
     );
 }
@@ -1180,20 +1321,28 @@ fn rename_profile_expires_the_old_names_ttl_clock_and_carries_the_stamp() {
 
     rename_profile(
         &mut config,
-        "ttl-ren-old",
-        "ttl-ren-new",
+        &crate::profile::ProfileName::from("ttl-ren-old"),
+        &crate::profile::ProfileName::from("ttl-ren-new"),
         &rotation_guard("ttl-ren-old"),
     )
     .expect("rename");
 
     assert!(
-        crate::usage::take_profile_fetch("ttl-ren-old", false, t0 + 120_000),
+        crate::usage::take_profile_fetch(
+            &crate::profile::ProfileName::from("ttl-ren-old"),
+            false,
+            t0 + 120_000
+        ),
         "the old name's memo is stranded over a stamp that moved away — expire it"
     );
     // Same account, same clock: the dir move carried the anchor and the stamp, so
     // the new name inherits the hour rather than paying a fresh /profile for it.
     assert!(
-        !crate::usage::take_profile_fetch("ttl-ren-new", false, t0 + 120_000),
+        !crate::usage::take_profile_fetch(
+            &crate::profile::ProfileName::from("ttl-ren-new"),
+            false,
+            t0 + 120_000
+        ),
         "a rename is not an account swap — the new name reuses the durable stamp"
     );
 }
@@ -1238,10 +1387,15 @@ fn overwrite_captured_profile_clears_auth_broken_quarantine() {
         api_key: None,
         account_uuid: None,
     };
-    overwrite_captured_profile(&mut config, "acme", snapshot).expect("overwrite");
+    overwrite_captured_profile(
+        &mut config,
+        &crate::profile::ProfileName::from("acme"),
+        snapshot,
+    )
+    .expect("overwrite");
 
     assert!(
-        !config.is_auth_broken("acme"),
+        !config.is_auth_broken(&crate::profile::ProfileName::from("acme")),
         "in-memory quarantine must lift with the fresh credentials"
     );
     let persisted = crate::profile::load_config().expect("reload").state;
@@ -1272,7 +1426,8 @@ fn overwrite_captured_profile_reapplies_live_state_when_active() {
         }),
     });
     save_profile(&acme).expect("save acme");
-    crate::claude::link_profile_credentials("acme").expect("link acme live");
+    crate::claude::link_profile_credentials(&crate::profile::ProfileName::from("acme"))
+        .expect("link acme live");
 
     let mut config = AppConfig {
         state: AppState {
@@ -1291,7 +1446,12 @@ fn overwrite_captured_profile_reapplies_live_state_when_active() {
         api_key: Some("new-api-key".to_string()),
         account_uuid: None,
     };
-    overwrite_captured_profile(&mut config, "acme", snapshot).expect("overwrite active profile");
+    overwrite_captured_profile(
+        &mut config,
+        &crate::profile::ProfileName::from("acme"),
+        snapshot,
+    )
+    .expect("overwrite active profile");
 
     let live_endpoint = crate::claude::read_claude_endpoint_config().expect("read live endpoint");
     assert_eq!(
@@ -1381,8 +1541,12 @@ fn overwriting_the_active_profile_replaces_a_regular_live_file() {
         api_key: None,
         account_uuid: None,
     };
-    overwrite_captured_profile(&mut config, "acme", snapshot)
-        .expect("overwrite must re-apply live state over a regular live file");
+    overwrite_captured_profile(
+        &mut config,
+        &crate::profile::ProfileName::from("acme"),
+        snapshot,
+    )
+    .expect("overwrite must re-apply live state over a regular live file");
 
     assert_eq!(
         crate::profile::read_json_file::<ClaudeCredentials>(&live_path)
@@ -1447,8 +1611,12 @@ fn overwriting_the_active_profile_with_no_credentials_clears_a_regular_live_file
         api_key: Some("new-api-key".to_string()),
         account_uuid: None,
     };
-    overwrite_captured_profile(&mut config, "acme", snapshot)
-        .expect("a third-party recapture of the active profile must not be refusable");
+    overwrite_captured_profile(
+        &mut config,
+        &crate::profile::ProfileName::from("acme"),
+        snapshot,
+    )
+    .expect("a third-party recapture of the active profile must not be refusable");
 
     assert!(
         live_path.symlink_metadata().is_err(),
@@ -1479,7 +1647,10 @@ fn delete_active_api_profile_unwires_settings_endpoint() {
     // create_blank_profile does not activate; mark it active and wire the live
     // settings.json the way a switch would, then delete it out from under that.
     config.state.active_profile = Some("api-acct".into());
-    let profile = config.find("api-acct").expect("profile present").clone();
+    let profile = config
+        .find(&crate::profile::ProfileName::from("api-acct"))
+        .expect("profile present")
+        .clone();
     crate::claude::apply_profile_to_claude_settings(&profile, &[]).expect("seed settings.json");
     assert_eq!(
         crate::claude::read_claude_endpoint_config()
@@ -1490,8 +1661,13 @@ fn delete_active_api_profile_unwires_settings_endpoint() {
         "precondition: active api key is wired into settings.json"
     );
 
-    delete_profile(&mut config, "api-acct", false, &rotation_guard("api-acct"))
-        .expect("delete active api profile");
+    delete_profile(
+        &mut config,
+        &crate::profile::ProfileName::from("api-acct"),
+        false,
+        &rotation_guard("api-acct"),
+    )
+    .expect("delete active api profile");
 
     let after = crate::claude::read_claude_endpoint_config().expect("read endpoint");
     assert_eq!(
@@ -1532,8 +1708,13 @@ fn delete_refuses_live_session_unless_forced() {
     let pid = crate::runtime::open_pid_file(&sessions.join("99999")).expect("open pid");
     pid.lock().expect("lock pid");
 
-    let err = delete_profile(&mut config, "busy", false, &rotation_guard("busy"))
-        .expect_err("a live session must block an unforced delete");
+    let err = delete_profile(
+        &mut config,
+        &crate::profile::ProfileName::from("busy"),
+        false,
+        &rotation_guard("busy"),
+    )
+    .expect_err("a live session must block an unforced delete");
     // Exact, and worded off the same `live session` noun as the `disable`
     // sibling below: one predicate (`has_live_session`) refusing in two nouns
     // is what sent an operator looking for two different conditions.
@@ -1542,14 +1723,23 @@ fn delete_refuses_live_session_unless_forced() {
         "'busy' has a live session, pass --force to delete it anyway"
     );
     assert!(
-        config.find("busy").is_some(),
+        config
+            .find(&crate::profile::ProfileName::from("busy"))
+            .is_some(),
         "the refused delete must leave the profile record intact"
     );
 
-    delete_profile(&mut config, "busy", true, &rotation_guard("busy"))
-        .expect("force overrides the live-session guard");
+    delete_profile(
+        &mut config,
+        &crate::profile::ProfileName::from("busy"),
+        true,
+        &rotation_guard("busy"),
+    )
+    .expect("force overrides the live-session guard");
     assert!(
-        config.find("busy").is_none(),
+        config
+            .find(&crate::profile::ProfileName::from("busy"))
+            .is_none(),
         "force must remove the profile despite the live session"
     );
 }
@@ -1581,7 +1771,10 @@ fn delete_refuses_while_a_rotation_holds_the_lock() {
     // Active, so the delete's unwire leg is armed: an api key in the live
     // settings.json is a write the refusal has to land ahead of.
     config.state.active_profile = Some("rotating".into());
-    let profile = config.find("rotating").expect("profile present").clone();
+    let profile = config
+        .find(&crate::profile::ProfileName::from("rotating"))
+        .expect("profile present")
+        .clone();
     crate::claude::apply_profile_to_claude_settings(&profile, &[]).expect("seed settings.json");
 
     let holder = hold_rotation_lock("rotating");
@@ -1590,18 +1783,29 @@ fn delete_refuses_while_a_rotation_holds_the_lock() {
     // first, mutation only if it was granted. Composed rather than asserted on
     // the helper alone, so a guard handed out under contention lets the delete
     // run and the untouched-state assertions below are what catch it.
-    let outcome = rotation_guard_for_mutation("rotating")
-        .and_then(|rotation| delete_profile(&mut config, "rotating", false, &rotation));
+    let outcome = rotation_guard_for_mutation(&crate::profile::ProfileName::from("rotating"))
+        .and_then(|rotation| {
+            delete_profile(
+                &mut config,
+                &crate::profile::ProfileName::from("rotating"),
+                false,
+                &rotation,
+            )
+        });
 
     // Untouched-state first, error second: a guard handed out under contention
     // runs the whole delete, and asserting the error first would abort the body
     // here and leave every line below unexercised.
     assert!(
-        config.find("rotating").is_some(),
+        config
+            .find(&crate::profile::ProfileName::from("rotating"))
+            .is_some(),
         "the refused delete must leave the profile record intact"
     );
     assert!(
-        profile_dir("rotating").expect("profile dir").exists(),
+        profile_dir(&crate::profile::ProfileName::from("rotating"))
+            .expect("profile dir")
+            .exists(),
         "the refused delete must leave the profile directory in place"
     );
     assert_eq!(
@@ -1624,7 +1828,7 @@ fn delete_refuses_while_a_rotation_holds_the_lock() {
     // holder against a rotation still spending the old refresh token. Driving
     // production's own acquire also proves the handle above locks the same path.
     assert!(
-        crate::runtime::RotationGuard::try_acquire("rotating")
+        crate::runtime::RotationGuard::try_acquire(&crate::profile::ProfileName::from("rotating"))
             .expect("try_acquire")
             .is_none(),
         "a same-name relogin must not mint a second holder while the rotation runs"
@@ -1632,10 +1836,17 @@ fn delete_refuses_while_a_rotation_holds_the_lock() {
 
     // Direction 2: the refusal is contention, not a permanent gate.
     drop(holder);
-    delete_profile(&mut config, "rotating", false, &rotation_guard("rotating"))
-        .expect("the delete goes through once the rotation releases");
+    delete_profile(
+        &mut config,
+        &crate::profile::ProfileName::from("rotating"),
+        false,
+        &rotation_guard("rotating"),
+    )
+    .expect("the delete goes through once the rotation releases");
     assert!(
-        config.find("rotating").is_none(),
+        config
+            .find(&crate::profile::ProfileName::from("rotating"))
+            .is_none(),
         "a released lock must let the same delete complete"
     );
 }
@@ -1659,17 +1870,33 @@ fn rename_refuses_while_a_rotation_holds_the_lock() {
 
     // Composed the way both production call sites are, for the reason the
     // delete twin states.
-    let outcome = rotation_guard_for_mutation("ren-old")
-        .and_then(|rotation| rename_profile(&mut config, "ren-old", "ren-new", &rotation));
+    let outcome = rotation_guard_for_mutation(&crate::profile::ProfileName::from("ren-old"))
+        .and_then(|rotation| {
+            rename_profile(
+                &mut config,
+                &crate::profile::ProfileName::from("ren-old"),
+                &crate::profile::ProfileName::from("ren-new"),
+                &rotation,
+            )
+        });
 
     // Untouched-state first, for the reason the delete twin states.
     assert!(
-        config.find("ren-old").is_some() && config.find("ren-new").is_none(),
+        config
+            .find(&crate::profile::ProfileName::from("ren-old"))
+            .is_some()
+            && config
+                .find(&crate::profile::ProfileName::from("ren-new"))
+                .is_none(),
         "the refused rename must leave the record under its old name"
     );
     assert!(
-        profile_dir("ren-old").expect("old dir").exists()
-            && !profile_dir("ren-new").expect("new dir").exists(),
+        profile_dir(&crate::profile::ProfileName::from("ren-old"))
+            .expect("old dir")
+            .exists()
+            && !profile_dir(&crate::profile::ProfileName::from("ren-new"))
+                .expect("new dir")
+                .exists(),
         "the refused rename must leave the directory where it was"
     );
     assert_eq!(
@@ -1682,13 +1909,15 @@ fn rename_refuses_while_a_rotation_holds_the_lock() {
     drop(holder);
     rename_profile(
         &mut config,
-        "ren-old",
-        "ren-new",
+        &crate::profile::ProfileName::from("ren-old"),
+        &crate::profile::ProfileName::from("ren-new"),
         &rotation_guard("ren-old"),
     )
     .expect("the rename goes through once the rotation releases");
     assert!(
-        config.find("ren-new").is_some(),
+        config
+            .find(&crate::profile::ProfileName::from("ren-new"))
+            .is_some(),
         "a released lock must let the same rename complete"
     );
 }
@@ -1721,15 +1950,27 @@ fn rename_refuses_a_live_session() {
     let pid = crate::runtime::open_pid_file(&sessions.join("99999")).expect("open pid");
     pid.lock().expect("lock pid");
 
-    let err = rename_profile(&mut config, "busy", "calm", &rotation_guard("busy"))
-        .expect_err("a live session must refuse the rename");
+    let err = rename_profile(
+        &mut config,
+        &crate::profile::ProfileName::from("busy"),
+        &crate::profile::ProfileName::from("calm"),
+        &rotation_guard("busy"),
+    )
+    .expect_err("a live session must refuse the rename");
     assert_eq!(err.to_string(), "'busy' has a live session, close it first");
     assert!(
-        config.find("busy").is_some() && config.find("calm").is_none(),
+        config
+            .find(&crate::profile::ProfileName::from("busy"))
+            .is_some()
+            && config
+                .find(&crate::profile::ProfileName::from("calm"))
+                .is_none(),
         "the refused rename must leave the record under its old name"
     );
     assert!(
-        profile_dir("busy").expect("old dir").exists(),
+        profile_dir(&crate::profile::ProfileName::from("busy"))
+            .expect("old dir")
+            .exists(),
         "the refused rename must leave the directory where it was"
     );
 }
@@ -1750,7 +1991,7 @@ fn rename_refuses_a_leftover_target_directory() {
 
     // A leftover: the target's directory exists with a cache file in it, but no
     // record names the target.
-    let leftover = profile_dir("taken").expect("target dir");
+    let leftover = profile_dir(&crate::profile::ProfileName::from("taken")).expect("target dir");
     std::fs::create_dir_all(&leftover).expect("mkdir leftover");
     std::fs::write(
         leftover.join(crate::profile_cache::THIRD_PARTY_CACHE_FILE),
@@ -1758,8 +1999,13 @@ fn rename_refuses_a_leftover_target_directory() {
     )
     .expect("write cache");
 
-    let err = rename_profile(&mut config, "src", "taken", &rotation_guard("src"))
-        .expect_err("a leftover target directory must refuse the rename");
+    let err = rename_profile(
+        &mut config,
+        &crate::profile::ProfileName::from("src"),
+        &crate::profile::ProfileName::from("taken"),
+        &rotation_guard("src"),
+    )
+    .expect_err("a leftover target directory must refuse the rename");
     let msg = err.to_string();
     assert!(
         msg.contains("'taken' already has a directory at")
@@ -1767,7 +2013,12 @@ fn rename_refuses_a_leftover_target_directory() {
         "the refusal must name the leftover and the way out, got: {msg}"
     );
     assert!(
-        config.find("src").is_some() && config.find("taken").is_none(),
+        config
+            .find(&crate::profile::ProfileName::from("src"))
+            .is_some()
+            && config
+                .find(&crate::profile::ProfileName::from("taken"))
+                .is_none(),
         "the refused rename must leave the record under its old name"
     );
 }
@@ -1790,24 +2041,31 @@ fn rename_retry_completes_the_record_when_the_old_dir_is_already_moved() {
 
     // The crash window: the dir move happened, the record rename did not.
     std::fs::rename(
-        profile_dir("mid-src").expect("old dir"),
-        profile_dir("mid-new").expect("new dir"),
+        profile_dir(&crate::profile::ProfileName::from("mid-src")).expect("old dir"),
+        profile_dir(&crate::profile::ProfileName::from("mid-new")).expect("new dir"),
     )
     .expect("simulate the stranded move");
 
     rename_profile(
         &mut config,
-        "mid-src",
-        "mid-new",
+        &crate::profile::ProfileName::from("mid-src"),
+        &crate::profile::ProfileName::from("mid-new"),
         &rotation_guard("mid-src"),
     )
     .expect("a stranded dir holding the profile's own content must not refuse");
     assert!(
-        config.find("mid-src").is_none() && config.find("mid-new").is_some(),
+        config
+            .find(&crate::profile::ProfileName::from("mid-src"))
+            .is_none()
+            && config
+                .find(&crate::profile::ProfileName::from("mid-new"))
+                .is_some(),
         "the retry completes the record rename instead of refusing"
     );
     assert!(
-        profile_dir("mid-new").expect("new dir").exists(),
+        profile_dir(&crate::profile::ProfileName::from("mid-new"))
+            .expect("new dir")
+            .exists(),
         "the moved directory stays put under the name the record now carries"
     );
 }
@@ -1820,13 +2078,15 @@ fn a_cache_write_does_not_resurrect_a_deleted_profiles_directory() {
     let _home = HomeSandbox::new();
 
     crate::profile_cache::write_profile_cache(
-        "ghost",
+        &crate::profile::ProfileName::from("ghost"),
         crate::profile_cache::THIRD_PARTY_CACHE_FILE,
         &serde_json::json!({"is_available": true}),
     );
 
     assert!(
-        !profile_dir("ghost").expect("ghost dir").exists(),
+        !profile_dir(&crate::profile::ProfileName::from("ghost"))
+            .expect("ghost dir")
+            .exists(),
         "a cache write must not create a directory for a name no record carries"
     );
 }
@@ -1852,10 +2112,18 @@ fn a_delete_does_not_release_the_lock_it_is_holding() {
     // Bound to a `let`, so the guard outlives the delete the way `cmd_delete`'s
     // does — it drops at end of scope, well after `remove_dir_all`.
     let own = rotation_guard("victim");
-    delete_profile(&mut config, "victim", false, &own).expect("delete");
+    delete_profile(
+        &mut config,
+        &crate::profile::ProfileName::from("victim"),
+        false,
+        &own,
+    )
+    .expect("delete");
 
     assert!(
-        !profile_dir("victim").expect("dir").exists(),
+        !profile_dir(&crate::profile::ProfileName::from("victim"))
+            .expect("dir")
+            .exists(),
         "the delete still removes the profile directory"
     );
     // A second THREAD: a fresh rank stack, the way another process arrives. The
@@ -1863,7 +2131,7 @@ fn a_delete_does_not_release_the_lock_it_is_holding() {
     // `try_lock` runs before `RankGuard::enter`, so it would mint the holder and
     // only then panic, which is evidence nobody can read.
     let minted = std::thread::spawn(|| {
-        crate::runtime::RotationGuard::try_acquire("victim")
+        crate::runtime::RotationGuard::try_acquire(&crate::profile::ProfileName::from("victim"))
             .expect("try_acquire")
             .is_some()
     })
@@ -1874,7 +2142,9 @@ fn a_delete_does_not_release_the_lock_it_is_holding() {
         "the delete's own guard must still be the only holder of 'victim'"
     );
     assert!(
-        !profile_dir("victim").expect("dir").exists(),
+        !profile_dir(&crate::profile::ProfileName::from("victim"))
+            .expect("dir")
+            .exists(),
         "and no arriving acquire may resurrect the deleted profile directory"
     );
 }
@@ -1892,12 +2162,13 @@ fn an_unopenable_rotation_lock_refuses_in_the_fault_vocabulary() {
     create_blank_profile(&mut config, "broken".to_string(), None, None, None).expect("create");
 
     // A regular file where the locks DIRECTORY belongs, so `mkdir_700` fails.
-    let lock = crate::runtime::rotation_lock_path("broken").expect("rotation lock path");
+    let lock = crate::runtime::rotation_lock_path(&crate::profile::ProfileName::from("broken"))
+        .expect("rotation lock path");
     let locks_dir = lock.parent().expect("lock parent");
     std::fs::create_dir_all(locks_dir.parent().expect("clauth dir")).expect("clauth dir");
     std::fs::write(locks_dir, b"not a directory").expect("occupy the locks dir path");
 
-    let err = match rotation_guard_for_mutation("broken") {
+    let err = match rotation_guard_for_mutation(&crate::profile::ProfileName::from("broken")) {
         Ok(_) => panic!("an unopenable lock must refuse"),
         Err(e) => e,
     };
@@ -1929,11 +2200,18 @@ fn a_case_only_rename_is_not_a_collision_with_itself() {
     };
     create_blank_profile(&mut config, "work".to_string(), None, None, None).expect("create");
 
-    rename_profile(&mut config, "work", "Work", &rotation_guard("work"))
-        .expect("an account may be re-spelled in another case");
+    rename_profile(
+        &mut config,
+        &crate::profile::ProfileName::from("work"),
+        &crate::profile::ProfileName::from("Work"),
+        &rotation_guard("work"),
+    )
+    .expect("an account may be re-spelled in another case");
 
     assert!(
-        config.find("Work").is_some(),
+        config
+            .find(&crate::profile::ProfileName::from("Work"))
+            .is_some(),
         "the new spelling is the one on record"
     );
 }
@@ -1955,7 +2233,12 @@ fn a_rename_onto_a_case_variant_of_another_account_is_refused() {
     create_blank_profile(&mut config, "work".to_string(), None, None, None).expect("create");
     create_blank_profile(&mut config, "work2".to_string(), None, None, None).expect("create");
 
-    let _ = rename_profile(&mut config, "work", "WORK2", &rotation_guard("work"));
+    let _ = rename_profile(
+        &mut config,
+        &crate::profile::ProfileName::from("work"),
+        &crate::profile::ProfileName::from("WORK2"),
+        &rotation_guard("work"),
+    );
 }
 
 /// The refusal an operator meets from `clauth delete` / the TUI and the one the
@@ -1976,7 +2259,7 @@ fn the_mutation_refusal_matches_the_rotation_lock_held_copy() {
     let _holder = hold_rotation_lock("shared");
 
     // `RotationGuard` is not `Debug`, so match rather than `expect_err`.
-    let refusal = match rotation_guard_for_mutation("shared") {
+    let refusal = match rotation_guard_for_mutation(&crate::profile::ProfileName::from("shared")) {
         Ok(_) => panic!("a held rotation lock must refuse"),
         Err(e) => e,
     };
@@ -2003,13 +2286,17 @@ fn disable_refuses_the_active_profile() {
     create_blank_profile(&mut config, "acme".to_string(), None, None, None).expect("create");
     config.state.active_profile = Some("acme".into());
 
-    let err = disable_profile(&mut config, "acme").expect_err("active profile must be refused");
+    let err = disable_profile(&mut config, &crate::profile::ProfileName::from("acme"))
+        .expect_err("active profile must be refused");
     assert_eq!(
         err.to_string(),
         "'acme' is the active account, switch away first"
     );
     assert!(
-        !config.find("acme").unwrap().is_disabled(),
+        !config
+            .find(&crate::profile::ProfileName::from("acme"))
+            .unwrap()
+            .is_disabled(),
         "a refused disable must leave the flag untouched"
     );
 }
@@ -2035,10 +2322,14 @@ fn disable_refuses_a_profile_with_a_live_session() {
     let pid = crate::runtime::open_pid_file(&sessions.join("99999")).expect("open pid");
     pid.lock().expect("lock pid");
 
-    let err = disable_profile(&mut config, "busy").expect_err("a live session must be refused");
+    let err = disable_profile(&mut config, &crate::profile::ProfileName::from("busy"))
+        .expect_err("a live session must be refused");
     assert_eq!(err.to_string(), "'busy' has a live session, close it first");
     assert!(
-        !config.find("busy").unwrap().is_disabled(),
+        !config
+            .find(&crate::profile::ProfileName::from("busy"))
+            .unwrap()
+            .is_disabled(),
         "a refused disable must leave the flag untouched"
     );
 }
@@ -2052,13 +2343,22 @@ fn disable_sets_the_flag_and_a_reload_observes_it() {
     };
     create_blank_profile(&mut config, "acme".to_string(), None, None, None).expect("create");
 
-    let changed = disable_profile(&mut config, "acme").expect("disable succeeds");
+    let changed = disable_profile(&mut config, &crate::profile::ProfileName::from("acme"))
+        .expect("disable succeeds");
     assert!(changed, "a fresh disable must report a real change");
-    assert!(config.find("acme").unwrap().is_disabled());
+    assert!(
+        config
+            .find(&crate::profile::ProfileName::from("acme"))
+            .unwrap()
+            .is_disabled()
+    );
 
     let reloaded = crate::profile::load_config().expect("reload from disk");
     assert!(
-        reloaded.find("acme").unwrap().is_disabled(),
+        reloaded
+            .find(&crate::profile::ProfileName::from("acme"))
+            .unwrap()
+            .is_disabled(),
         "the flag must survive a reload from disk"
     );
 }
@@ -2071,11 +2371,18 @@ fn disable_is_idempotent_on_an_already_disabled_profile() {
         profiles: Vec::new(),
     };
     create_blank_profile(&mut config, "acme".to_string(), None, None, None).expect("create");
-    disable_profile(&mut config, "acme").expect("first disable");
+    disable_profile(&mut config, &crate::profile::ProfileName::from("acme"))
+        .expect("first disable");
 
-    let changed = disable_profile(&mut config, "acme").expect("re-disable is not an error");
+    let changed = disable_profile(&mut config, &crate::profile::ProfileName::from("acme"))
+        .expect("re-disable is not an error");
     assert!(!changed, "a no-op disable must report no change");
-    assert!(config.find("acme").unwrap().is_disabled());
+    assert!(
+        config
+            .find(&crate::profile::ProfileName::from("acme"))
+            .unwrap()
+            .is_disabled()
+    );
 }
 
 #[test]
@@ -2102,18 +2409,32 @@ fn enable_clears_the_flag_leaving_everything_else_byte_identical() {
         profiles: vec![profile],
     };
 
-    let config_path = crate::profile::profile_subpath("acme", "config.toml").unwrap();
-    let creds_path = crate::profile::profile_subpath("acme", "credentials.json").unwrap();
+    let config_path =
+        crate::profile::profile_subpath(&crate::profile::ProfileName::from("acme"), "config.toml")
+            .unwrap();
+    let creds_path = crate::profile::profile_subpath(
+        &crate::profile::ProfileName::from("acme"),
+        "credentials.json",
+    )
+    .unwrap();
     let config_before = std::fs::read(&config_path).unwrap();
     let creds_before = std::fs::read(&creds_path).unwrap();
 
-    disable_profile(&mut config, "acme").expect("disable");
-    assert!(config.find("acme").unwrap().is_disabled());
+    disable_profile(&mut config, &crate::profile::ProfileName::from("acme")).expect("disable");
+    assert!(
+        config
+            .find(&crate::profile::ProfileName::from("acme"))
+            .unwrap()
+            .is_disabled()
+    );
 
-    let changed = enable_profile(&mut config, "acme").expect("enable succeeds");
+    let changed = enable_profile(&mut config, &crate::profile::ProfileName::from("acme"))
+        .expect("enable succeeds");
     assert!(changed, "a real re-enable must report a change");
 
-    let acme = config.find("acme").unwrap();
+    let acme = config
+        .find(&crate::profile::ProfileName::from("acme"))
+        .unwrap();
     assert!(!acme.is_disabled());
     assert_eq!(
         acme.env.get("FOO"),
@@ -2152,9 +2473,15 @@ fn enable_is_idempotent_on_an_already_enabled_profile() {
     };
     create_blank_profile(&mut config, "acme".to_string(), None, None, None).expect("create");
 
-    let changed = enable_profile(&mut config, "acme").expect("enable on an enabled profile");
+    let changed = enable_profile(&mut config, &crate::profile::ProfileName::from("acme"))
+        .expect("enable on an enabled profile");
     assert!(!changed, "a no-op enable must report no change");
-    assert!(!config.find("acme").unwrap().is_disabled());
+    assert!(
+        !config
+            .find(&crate::profile::ProfileName::from("acme"))
+            .unwrap()
+            .is_disabled()
+    );
 }
 
 /// #5: for an ACTIVE profile the settings-unwire (a fallible external write) must
@@ -2186,13 +2513,20 @@ fn delete_active_unwire_failure_keeps_profile_retryable() {
     let settings = home.home().join(".claude").join("settings.json");
     std::fs::create_dir_all(&settings).expect("settings.json as dir");
 
-    let result = delete_profile(&mut config, "api-acct", false, &rotation_guard("api-acct"));
+    let result = delete_profile(
+        &mut config,
+        &crate::profile::ProfileName::from("api-acct"),
+        false,
+        &rotation_guard("api-acct"),
+    );
     assert!(
         result.is_err(),
         "a failed settings unwire must fail the whole delete"
     );
     assert!(
-        config.find("api-acct").is_some(),
+        config
+            .find(&crate::profile::ProfileName::from("api-acct"))
+            .is_some(),
         "a failed unwire must leave the profile record intact and retryable"
     );
 }
@@ -2218,17 +2552,23 @@ fn clear_profile_api_key_keeps_base_url_and_active_status() {
     )
     .expect("create api profile");
     config.state.active_profile = Some("api-acct".into());
-    let profile = config.find("api-acct").expect("profile present").clone();
+    let profile = config
+        .find(&crate::profile::ProfileName::from("api-acct"))
+        .expect("profile present")
+        .clone();
     crate::claude::apply_profile_to_claude_settings(&profile, &[]).expect("seed settings.json");
     crate::profile_cache::write_profile_cache(
-        "api-acct",
+        &crate::profile::ProfileName::from("api-acct"),
         crate::profile_cache::THIRD_PARTY_CACHE_FILE,
         &"stale",
     );
 
-    clear_profile_api_key(&mut config, "api-acct").expect("clear api key");
+    clear_profile_api_key(&mut config, &crate::profile::ProfileName::from("api-acct"))
+        .expect("clear api key");
 
-    let profile = config.find("api-acct").expect("profile still present");
+    let profile = config
+        .find(&crate::profile::ProfileName::from("api-acct"))
+        .expect("profile still present");
     assert_eq!(profile.api_key, None, "api key dropped");
     assert_eq!(
         profile.base_url.as_deref(),
@@ -2250,7 +2590,7 @@ fn clear_profile_api_key_keeps_base_url_and_active_status() {
     assert_eq!(after.api_key, None, "live auth token stripped on log out");
 
     let cache = crate::profile_cache::profile_cache_path(
-        "api-acct",
+        &crate::profile::ProfileName::from("api-acct"),
         crate::profile_cache::THIRD_PARTY_CACHE_FILE,
     )
     .unwrap();
@@ -2259,7 +2599,8 @@ fn clear_profile_api_key_keeps_base_url_and_active_status() {
     // The leak fix drops a base_url at the LOAD boundary, so verify the shell
     // survives a reload too: a cleared PURE api account (no OAuth pair) keeps its
     // base_url and is not flipped to an OAuth profile.
-    let reloaded = crate::profile::load_profile("api-acct").expect("reload");
+    let reloaded = crate::profile::load_profile(&crate::profile::ProfileName::from("api-acct"))
+        .expect("reload");
     assert_eq!(
         reloaded.base_url.as_deref(),
         Some("https://api.example.com"),
@@ -2288,14 +2629,19 @@ fn clear_profile_credentials_blanks_active_profile_keeping_shell() {
         }),
     });
     save_profile(&acct).expect("save acct");
-    crate::claude::link_profile_credentials("acct").expect("link acct live");
+    crate::claude::link_profile_credentials(&crate::profile::ProfileName::from("acct"))
+        .expect("link acct live");
 
     for file in [
         crate::profile_cache::USAGE_CACHE_FILE,
         crate::profile_cache::THIRD_PARTY_CACHE_FILE,
         crate::throughput::THROUGHPUT_CACHE_FILE,
     ] {
-        crate::profile_cache::write_profile_cache("acct", file, &"stale");
+        crate::profile_cache::write_profile_cache(
+            &crate::profile::ProfileName::from("acct"),
+            file,
+            &"stale",
+        );
     }
 
     let mut config = AppConfig {
@@ -2308,9 +2654,12 @@ fn clear_profile_credentials_blanks_active_profile_keeping_shell() {
         profiles: vec![acct],
     };
 
-    clear_profile_credentials(&mut config, "acct").expect("clear credentials");
+    clear_profile_credentials(&mut config, &crate::profile::ProfileName::from("acct"))
+        .expect("clear credentials");
 
-    let profile = config.find("acct").expect("profile still present");
+    let profile = config
+        .find(&crate::profile::ProfileName::from("acct"))
+        .expect("profile still present");
     assert!(profile.credentials.is_none(), "credentials dropped");
     assert!(profile.auto_start, "shell preserved: auto_start");
     assert_eq!(
@@ -2328,7 +2677,9 @@ fn clear_profile_credentials_blanks_active_profile_keeping_shell() {
         "active profile deactivated"
     );
 
-    let cred_path = profile_dir("acct").unwrap().join("credentials.json");
+    let cred_path = profile_dir(&crate::profile::ProfileName::from("acct"))
+        .unwrap()
+        .join("credentials.json");
     assert!(!cred_path.exists(), "credentials.json removed");
 
     for file in [
@@ -2336,7 +2687,11 @@ fn clear_profile_credentials_blanks_active_profile_keeping_shell() {
         crate::profile_cache::THIRD_PARTY_CACHE_FILE,
         crate::throughput::THROUGHPUT_CACHE_FILE,
     ] {
-        let path = crate::profile_cache::profile_cache_path("acct", file).unwrap();
+        let path = crate::profile_cache::profile_cache_path(
+            &crate::profile::ProfileName::from("acct"),
+            file,
+        )
+        .unwrap();
         assert!(!path.exists(), "{file} must be dropped");
     }
 
@@ -2371,12 +2726,14 @@ fn clear_profile_credentials_non_active_and_no_sidecar_resurrection() {
     acct.credentials = Some(creds());
     save_profile(&acct).expect("save acct");
     // A rotation sidecar that never committed — the resurrection vector.
-    crate::profile::stage_rotated_credentials("acct", &creds()).expect("stage sidecar");
+    crate::profile::stage_rotated_credentials(&crate::profile::ProfileName::from("acct"), &creds())
+        .expect("stage sidecar");
 
     let mut other = Profile::new("other".to_string(), None, None);
     other.credentials = Some(creds());
     save_profile(&other).expect("save other");
-    crate::claude::link_profile_credentials("other").expect("link other live");
+    crate::claude::link_profile_credentials(&crate::profile::ProfileName::from("other"))
+        .expect("link other live");
 
     let mut config = AppConfig {
         state: AppState {
@@ -2391,7 +2748,8 @@ fn clear_profile_credentials_non_active_and_no_sidecar_resurrection() {
     // Persist the profile list so `load_config` below can find both by name.
     crate::profile::save_app_state(&config.state).expect("persist state");
 
-    clear_profile_credentials(&mut config, "acct").expect("clear credentials");
+    clear_profile_credentials(&mut config, &crate::profile::ProfileName::from("acct"))
+        .expect("clear credentials");
 
     // The active profile and its live link are untouched — only "acct" changed.
     assert_eq!(
@@ -2409,12 +2767,16 @@ fn clear_profile_credentials_non_active_and_no_sidecar_resurrection() {
 
     // Reload from disk: the sidecar must be gone, so the login stays deleted.
     let reloaded = crate::profile::load_config().expect("reload config");
-    let acct = reloaded.find("acct").expect("acct still present");
+    let acct = reloaded
+        .find(&crate::profile::ProfileName::from("acct"))
+        .expect("acct still present");
     assert!(
         acct.credentials.is_none(),
         "a lingering sidecar must not resurrect the blanked login"
     );
-    let cred_path = profile_dir("acct").unwrap().join("credentials.json");
+    let cred_path = profile_dir(&crate::profile::ProfileName::from("acct"))
+        .unwrap()
+        .join("credentials.json");
     assert!(
         !cred_path.exists(),
         "credentials.json stays gone after reload (sidecar not adopted)"
@@ -2450,7 +2812,7 @@ fn finish_switch_deletes_stale_oauth_account_block() {
     write_home_claude_json_with_identity();
 
     let mut config = acct_config();
-    finish_switch(&mut config, "acct").expect("finish_switch");
+    finish_switch(&mut config, &crate::profile::ProfileName::from("acct")).expect("finish_switch");
 
     let after: serde_json::Value =
         serde_json::from_slice(&std::fs::read(home_claude_json_path()).unwrap()).unwrap();
@@ -2476,7 +2838,8 @@ fn switch_off_also_deletes_stale_oauth_account_block() {
 
     let profile = Profile::new("acct".to_string(), None, None);
     save_profile(&profile).expect("save profile");
-    crate::claude::link_profile_credentials("acct").expect("link acct live");
+    crate::claude::link_profile_credentials(&crate::profile::ProfileName::from("acct"))
+        .expect("link acct live");
 
     let mut config = AppConfig {
         state: AppState {
@@ -2579,12 +2942,15 @@ fn reauth_overwrite_clears_broken_flag() {
         },
         profiles: vec![stale],
     };
-    config.set_auth_broken("xfx", true);
-    assert!(config.is_auth_broken("xfx"), "precondition: quarantined");
+    config.set_auth_broken(&crate::profile::ProfileName::from("xfx"), true);
+    assert!(
+        config.is_auth_broken(&crate::profile::ProfileName::from("xfx")),
+        "precondition: quarantined"
+    );
 
     overwrite_captured_profile(
         &mut config,
-        "xfx",
+        &crate::profile::ProfileName::from("xfx"),
         CaptureSnapshot {
             credentials: Some(oauth_creds("fresh-access")),
             base_url: None,
@@ -2595,12 +2961,14 @@ fn reauth_overwrite_clears_broken_flag() {
     .expect("re-auth overwrite");
 
     assert_eq!(
-        config.find("xfx").and_then(|p| p.access_token()),
+        config
+            .find(&crate::profile::ProfileName::from("xfx"))
+            .and_then(|p| p.access_token()),
         Some("fresh-access"),
         "credentials overwritten by re-auth",
     );
     assert!(
-        !config.is_auth_broken("xfx"),
+        !config.is_auth_broken(&crate::profile::ProfileName::from("xfx")),
         "auth-broken quarantine cleared by re-auth",
     );
 }
@@ -2635,7 +3003,8 @@ fn switch_cli_refuses_dead_target_with_login_hint() {
         profiles: vec![dead],
     };
 
-    let err = switch_profile_cli(config, "dead-acct").expect_err("a dead target must be refused");
+    let err = switch_profile_cli(config, &crate::profile::ProfileName::from("dead-acct"))
+        .expect_err("a dead target must be refused");
     assert!(
         err.to_string().contains("clauth login dead-acct"),
         "the refusal must name the recovery command, got: {err}",
@@ -2709,7 +3078,7 @@ mod identify_live_login_owner {
         // this helper's whole job, and a skipped write would read as "no anchor".
         crate::testutil::register_names(&[name]);
         crate::profile_cache::write_profile_cache(
-            name,
+            &crate::profile::ProfileName::from(name),
             crate::profile_cache::ACCOUNT_ID_CACHE_FILE,
             &uuid.to_string(),
         );
@@ -2873,8 +3242,14 @@ fn a_console_login_stores_the_session_and_leaves_the_api_key_alone() {
         Some("sk-sp-the-plan-key".to_string()),
     );
     let mut config = inactive_config(with_key);
-    store_console_login(&mut config, "qwen-keyed", session()).expect("store_console_login");
-    let loaded = crate::profile::load_profile("qwen-keyed").expect("load_profile");
+    store_console_login(
+        &mut config,
+        &crate::profile::ProfileName::from("qwen-keyed"),
+        session(),
+    )
+    .expect("store_console_login");
+    let loaded = crate::profile::load_profile(&crate::profile::ProfileName::from("qwen-keyed"))
+        .expect("load_profile");
     assert_eq!(
         loaded.api_key.as_deref(),
         Some("sk-sp-the-plan-key"),
@@ -2894,8 +3269,14 @@ fn a_console_login_stores_the_session_and_leaves_the_api_key_alone() {
     // product, so filling it would point this profile at the wrong endpoint.
     let no_key = Profile::new("qwen-bare".to_string(), Some(base.to_string()), None);
     let mut config = inactive_config(no_key);
-    store_console_login(&mut config, "qwen-bare", session()).expect("store_console_login");
-    let loaded = crate::profile::load_profile("qwen-bare").expect("load_profile");
+    store_console_login(
+        &mut config,
+        &crate::profile::ProfileName::from("qwen-bare"),
+        session(),
+    )
+    .expect("store_console_login");
+    let loaded = crate::profile::load_profile(&crate::profile::ProfileName::from("qwen-bare"))
+        .expect("load_profile");
     assert_eq!(loaded.api_key, None, "no key is written into an empty slot");
     assert!(loaded.console.is_some(), "the session still landed");
 }
@@ -2925,13 +3306,13 @@ fn moving_the_endpoint_off_alibaba_clears_the_console_session() {
     let mut config = inactive_config(p);
     edit_profile_endpoint(
         &mut config,
-        "moved",
+        &crate::profile::ProfileName::from("moved"),
         Some("https://api.z.ai/api/anthropic".to_string()),
         Some("zai-key".to_string()),
     )
     .expect("edit_profile_endpoint");
     assert!(
-        crate::profile::load_profile("moved")
+        crate::profile::load_profile(&crate::profile::ProfileName::from("moved"))
             .expect("load_profile")
             .console
             .is_none(),
@@ -2948,13 +3329,13 @@ fn moving_the_endpoint_off_alibaba_clears_the_console_session() {
     let mut config = inactive_config(p);
     edit_profile_endpoint(
         &mut config,
-        "stayed",
+        &crate::profile::ProfileName::from("stayed"),
         Some(alibaba.to_string()),
         Some("sk-sp-rotated".to_string()),
     )
     .expect("edit_profile_endpoint");
     assert!(
-        crate::profile::load_profile("stayed")
+        crate::profile::load_profile(&crate::profile::ProfileName::from("stayed"))
             .expect("load_profile")
             .console
             .is_some(),
@@ -2971,7 +3352,7 @@ fn moving_the_endpoint_off_alibaba_clears_the_console_session() {
     let mut config = inactive_config(p);
     overwrite_captured_profile(
         &mut config,
-        "reauthed",
+        &crate::profile::ProfileName::from("reauthed"),
         CaptureSnapshot {
             credentials: None,
             base_url: None,
@@ -2981,7 +3362,7 @@ fn moving_the_endpoint_off_alibaba_clears_the_console_session() {
     )
     .expect("overwrite_captured_profile");
     assert!(
-        crate::profile::load_profile("reauthed")
+        crate::profile::load_profile(&crate::profile::ProfileName::from("reauthed"))
             .expect("load_profile")
             .console
             .is_none(),

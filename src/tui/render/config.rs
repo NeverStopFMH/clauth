@@ -215,7 +215,7 @@ fn build_snap(app: &App, with_text: bool) -> Snap {
     }
     match cfg.profiles.get(app.profile_cursor) {
         Some(p) => {
-            let sidecar = crate::claude::sidecar_summary(p.name.as_str());
+            let sidecar = crate::claude::sidecar_summary(&p.name);
             Snap {
                 title: p.name.to_string(),
                 name: if with_text {
@@ -240,7 +240,7 @@ fn build_snap(app: &App, with_text: bool) -> Snap {
                 // Read per frame for the selected profile only, same as
                 // `session_token` below — a single small directory stat, not a
                 // per-profile loop.
-                has_live_session: crate::runtime::has_live_session(p.name.as_str()),
+                has_live_session: crate::runtime::has_live_session(&p.name),
                 // OAuth accounts carry a token; API accounts carry an api key. Either
                 // one flips the Login row to "re-login" and shows the log-out row.
                 // A console account's `log in` row captures the SESSION, so that
@@ -275,7 +275,7 @@ fn build_snap(app: &App, with_text: bool) -> Snap {
                 }),
                 rolling_token: matches!(&sidecar, Some((crate::claude::SidecarKind::Rolling, _))),
                 rolling_armed: p.rolling_token,
-                has_static_backup: crate::claude::has_static_backup(p.name.as_str()),
+                has_static_backup: crate::claude::has_static_backup(&p.name),
             }
         }
         None => Snap::blank("settings"),

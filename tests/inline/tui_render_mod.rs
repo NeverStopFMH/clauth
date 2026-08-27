@@ -626,7 +626,7 @@ fn usage_weekly_teach_keys_on_the_hard_cap_not_the_member_line() {
     let _home = crate::testutil::HomeSandbox::new();
     use crate::usage::{FetchStatus, UsageInfo, UsageWindow, epoch_secs_to_iso, now_epoch_secs};
     let mk_app = |seven_day: f64| {
-        let mut p = crate::testutil::blank_profile("a");
+        let mut p = crate::testutil::blank_profile(&crate::profile::ProfileName::from("a"));
         p.weekly_threshold = Some(90.0);
         // 5h spent (past its rotate threshold, live reset) so the `spent`
         // pill — the teach's gate — renders at all.
@@ -776,7 +776,9 @@ fn the_actions_hint_tracks_whether_the_menu_has_anything_in_it() {
             profiles: vec![ProfileName::from("acct")],
             ..AppState::default()
         },
-        profiles: vec![crate::testutil::blank_profile("acct")],
+        profiles: vec![crate::testutil::blank_profile(
+            &crate::profile::ProfileName::from("acct"),
+        )],
     });
     app.tab = Tab::Setup;
     handle_key(&mut app, crate::testutil::key(KeyCode::Enter));

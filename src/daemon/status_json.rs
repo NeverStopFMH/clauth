@@ -73,12 +73,8 @@ fn iso_from_ms(ms: u64) -> String {
 /// `armed` = in the chain AND currently active (the account auto-switch would
 /// rotate away from). `position` is 1-based.
 fn fallback_json(config: &AppConfig, p: &Profile) -> Option<serde_json::Value> {
-    let name = p.name.as_str();
-    let pos = config
-        .state
-        .fallback_chain
-        .iter()
-        .position(|n| n.as_str() == name)?;
+    let name = &p.name;
+    let pos = config.state.fallback_chain.iter().position(|n| n == name)?;
     Some(serde_json::json!({
         "position": pos + 1,
         "threshold": crate::fallback::threshold_for(p),
@@ -98,7 +94,7 @@ fn fallback_json(config: &AppConfig, p: &Profile) -> Option<serde_json::Value> {
 /// endpoint gate published a permanent `ok` over a dead token. The value set is
 /// unchanged, so the schema stays 1.
 fn auth_status_str(config: &AppConfig, p: &Profile, now_ms: i64) -> &'static str {
-    if config.is_auth_broken(p.name.as_str()) {
+    if config.is_auth_broken(&p.name) {
         return "broken";
     }
     if p.login_is_oauth() && p.access_token_expires_at().is_some_and(|exp| now_ms >= exp) {
@@ -127,9 +123,9 @@ pub(crate) fn build_status(
     let profiles: Vec<serde_json::Value> = config
         .profiles
         .iter()
-        .filter(|p| include_disabled || !p.is_disabled() || config.is_active(p.name.as_str()))
+        .filter(|p| include_disabled || !p.is_disabled() || config.is_active(&p.name))
         .map(|p| {
-            let name = p.name.as_str();
+            let name = &p.name;
             // Freshness reads each profile's OWN cache, through the one
             // selector every reader shares (`usage_cache_file` carries why).
             let mtime_ms = profile_cache_mtime_ms(name, usage_cache_file(p));
@@ -173,8 +169,8 @@ pub(crate) fn build_status(
             let fetch_status: Option<&'static str> = match live {
                 Some(sig) => sig
                     .status
-                    .get(name)
-                    .or_else(|| sig.third_party_status.get(name))
+                    .get(name.as_str())
+                    .or_else(|| sig.third_party_status.get(name.as_str()))
                     .copied()
                     .map(fetch_status_str)
                     .or_else(recorded_expired)
@@ -197,7 +193,11 @@ pub(crate) fn build_status(
                 None
             } else {
                 match live {
-                    Some(sig) => sig.next_refresh.get(name).copied().or_else(derived_next),
+                    Some(sig) => sig
+                        .next_refresh
+                        .get(name.as_str())
+                        .copied()
+                        .or_else(derived_next),
                     None => derived_next(),
                 }
             };
@@ -212,8 +212,8 @@ pub(crate) fn build_status(
             // streaks). Same predicate `scan_auto_switch` distrusts, so the
             // published flag and the switch decision cannot drift.
             let stale = match live {
-                Some(sig) => sig.status.get(name).copied().is_some_and(|s| {
-                    is_stuck_rate_limited(s, sig.streaks.get(name).copied().unwrap_or(0))
+                Some(sig) => sig.status.get(name.as_str()).copied().is_some_and(|s| {
+                    is_stuck_rate_limited(s, sig.streaks.get(name.as_str()).copied().unwrap_or(0))
                 }),
                 None => false,
             };

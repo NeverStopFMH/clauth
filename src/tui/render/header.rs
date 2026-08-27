@@ -58,7 +58,7 @@ struct ActiveGauge {
 
 fn active_gauge(app: &App) -> Option<ActiveGauge> {
     let cfg = app.config();
-    let name = cfg.state.active_profile.as_deref()?;
+    let name = cfg.state.active_profile.as_ref()?;
     let profile = cfg.find(name)?;
     let pct = if profile.is_oauth() {
         profile

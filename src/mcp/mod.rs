@@ -37,7 +37,7 @@ use serde::Deserialize;
 
 use crate::logline::logline;
 use crate::out::outln;
-use crate::profile::{AppConfig, Profile, load_config};
+use crate::profile::{AppConfig, Profile, ProfileName, load_config};
 use crate::profile_cache::{THIRD_PARTY_CACHE_FILE, USAGE_CACHE_FILE, load_profile_cache};
 use crate::profile_json::{
     ProfileWindows, oauth_windows, profile_windows, profile_windows_for, provider_label, tier_label,
@@ -120,7 +120,7 @@ fn throughput_row(m: crate::throughput::ModelSummary) -> serde_json::Value {
 /// only models a past `delegate` found degraded or recently rate-limited. A
 /// healthy row tells a picker nothing it would act on, and one operator's 19
 /// healthy rows measured 31% of the whole `profiles` response.
-fn throughput_warnings(profile: &str, now: i64) -> Vec<serde_json::Value> {
+fn throughput_warnings(profile: &ProfileName, now: i64) -> Vec<serde_json::Value> {
     crate::throughput::summary(profile, now)
         .into_iter()
         .filter(|m| m.degraded || m.rate_limited_recent)
@@ -132,7 +132,7 @@ fn throughput_warnings(profile: &str, now: i64) -> Vec<serde_json::Value> {
 /// cache (no caching across tool calls per the design). The roster's own rank
 /// reads this: it asks for the two figures it sorts on, and consults the
 /// third-party cache itself for an account that has no such window.
-fn load_windows(name: &str) -> (Option<UsageWindow>, Option<UsageWindow>) {
+fn load_windows(name: &ProfileName) -> (Option<UsageWindow>, Option<UsageWindow>) {
     match load_profile_cache::<UsageInfo>(name, USAGE_CACHE_FILE) {
         Some(u) => (u.five_hour, u.seven_day),
         None => (None, None),
@@ -205,7 +205,7 @@ fn row_windows_payload(windows: &ProfileWindows) -> serde_json::Value {
 /// target's own fetch leg writes, so a third-party target answers with its own
 /// figures instead of the `usage unknown` an OAuth-only read can only ever
 /// produce for it.
-fn quota_payload(name: &str) -> serde_json::Value {
+fn quota_payload(name: &ProfileName) -> serde_json::Value {
     dated_windows_payload(&profile_windows_for(name))
 }
 
@@ -213,7 +213,7 @@ fn quota_payload(name: &str) -> serde_json::Value {
 /// `profile_line`. The one builder keeps the all-scope roster and the
 /// session-scope row from disagreeing about what a profile is called.
 fn profile_row(p: &Profile, config: &AppConfig, now: i64) -> serde_json::Value {
-    let name = p.name.as_str();
+    let name = &p.name;
     // One read of this account's own cache, feeding the one carrier its figures
     // ride in. Reading it twice (once to date the row, once for the headline)
     // cost a second parse of the same file on every row of the roster.
@@ -278,7 +278,7 @@ fn profile_row(p: &Profile, config: &AppConfig, now: i64) -> serde_json::Value {
 /// The roster's sort key for one profile. A real window first (5h, the pool a
 /// `delegate` actually competes for, then 7d), then a third-party provider's own
 /// cached bars, then a wallet balance off its cached rows.
-fn roster_rank(name: &str) -> RosterRank {
+fn roster_rank(name: &ProfileName) -> RosterRank {
     let (five_h, seven_d) = load_windows(name);
     if let Some(w) = five_h.or(seven_d) {
         return RosterRank::Window(100.0 - w.utilization);
@@ -422,11 +422,11 @@ fn fold_active_live_usage(
             map
         }
     };
-    let active = config.state.active_profile.as_deref();
+    let active = config.state.active_profile.as_ref();
     let windows = active.map(profile_windows_for);
     map.insert(
         "live_usage".to_string(),
-        live_usage_json(active, windows.as_ref()),
+        live_usage_json(active.map(|n| n.as_str()), windows.as_ref()),
     );
     if let Some(delta) = digest.folded() {
         map.insert("since_your_last_call".to_string(), delta);
@@ -455,7 +455,7 @@ fn fold_active_live_usage(
 /// recovers a staged rotation under the cross-process state flock
 /// (`rank::State`, 500), a serialization point no fold path should sit
 /// inside.
-fn target_endpoint(name: &str) -> Option<String> {
+fn target_endpoint(name: &ProfileName) -> Option<String> {
     match crate::profile::stored_endpoint(name) {
         crate::profile::StoredEndpoint::Anthropic => Some("anthropic".to_string()),
         crate::profile::StoredEndpoint::Custom(url) => {
@@ -483,7 +483,7 @@ fn delegate_call_endpoint(target: &str, caller_env: &HashMap<String, String>) ->
     {
         return Some(render::base_url_host(url).to_string());
     }
-    target_endpoint(target)
+    target_endpoint(&ProfileName::from(target))
 }
 
 /// Fold the target profile's live usage into a delegate envelope (the sync
@@ -502,7 +502,7 @@ fn delegate_call_endpoint(target: &str, caller_env: &HashMap<String, String>) ->
 /// never have routed through.
 fn fold_delegate_live_usage(
     payload: serde_json::Value,
-    profile: &str,
+    profile: &ProfileName,
     endpoint: Option<String>,
     now: i64,
     digest: DigestMode<'_>,
@@ -811,7 +811,7 @@ mean a refusal."
         let resolved = crate::which::resolve_active(config);
         let mut rows = Vec::with_capacity(1);
         if let Some((name, source)) = resolved.as_ref()
-            && let Some(p) = config.find(name)
+            && let Some(p) = config.find(&ProfileName::from(name.clone()))
         {
             let mut row = profile_row(p, config, now_epoch_secs());
             row["source"] = serde_json::json!(source.as_str());
@@ -883,7 +883,7 @@ disturbing this session, use `delegate`."
             let config = std::sync::Arc::new(crate::lockorder::RankedMutex::new(config));
             let outcome = crate::actions::switch_profile_noninteractive(
                 &config,
-                &name,
+                &ProfileName::from(name.clone()),
                 on_divergence,
                 crate::oauth::refresh_result,
             );
@@ -1095,13 +1095,14 @@ Delegating spends the target account, so pick the account with `profiles` first.
                     // carries it. The blocking path runs the same three gates
                     // inside `run_delegate`; `resolve_fanout` runs them per
                     // fan-out member.
-                    let target = config.find(&name).ok_or_else(|| {
+                    let name_pn = ProfileName::from(name.clone());
+                    let target = config.find(&name_pn).ok_or_else(|| {
                         ErrorData::internal_error(
                             "resolved target missing from config".to_string(),
                             None,
                         )
                     })?;
-                    if let Err(reason) = preflight_target(target, &config, &name) {
+                    if let Err(reason) = preflight_target(target, &config, &name_pn) {
                         return Ok(delegate_refusal(&reason));
                     }
                     let extra_args = args.unwrap_or_default();
@@ -1155,7 +1156,7 @@ Delegating spends the target account, so pick the account with `profiles` first.
                             "started_at": started_at,
                             "status": "running",
                         }),
-                        &name,
+                        &ProfileName::from(name.clone()),
                         endpoint,
                         now_epoch_secs(),
                         DigestMode::Report(&self.digest),
@@ -1232,7 +1233,7 @@ Delegating spends the target account, so pick the account with `profiles` first.
                                 "started_at": started_at,
                                 "status": "running",
                             }),
-                            name,
+                            &ProfileName::from(name.clone()),
                             endpoint,
                             now,
                             DigestMode::Skip,
@@ -1361,7 +1362,7 @@ Delegating spends the target account, so pick the account with `profiles` first.
                                         "started_at": started_at,
                                         "status": "running",
                                     }),
-                                    &profile,
+                                    &ProfileName::from(profile.clone()),
                                     delegate_call_endpoint(&profile, &opts.env),
                                     now,
                                     DigestMode::Skip,
@@ -1466,7 +1467,7 @@ Delegating spends the target account, so pick the account with `profiles` first.
 
         let payload = fold_delegate_live_usage(
             envelope,
-            &target,
+            &ProfileName::from(target.clone()),
             endpoint,
             now_epoch_secs(),
             delegate_digest_mode(&self.digest, abandoned),
@@ -2059,7 +2060,7 @@ fn fold_fanout_rows(
             };
             fold_delegate_live_usage(
                 envelope,
-                name,
+                &ProfileName::from(name.clone()),
                 delegate_call_endpoint(name, caller_env),
                 now,
                 DigestMode::Skip,
@@ -2490,7 +2491,7 @@ fn fold_done_envelope(
                 "result": "job finished without an envelope",
             })
         }),
-        &record.profile,
+        &ProfileName::from(record.profile.clone()),
         // The call's own answer, recorded at the mint. Absent on a record an
         // older server wrote, which the fold reads as "cannot say": a
         // name-keyed read would assert the managed field's answer for a call
@@ -2548,7 +2549,7 @@ fn running_payload(job_id: &str, record: &jobs::JobRecord, now: u64) -> serde_js
         "status": "running",
         "profile": record.profile,
         "elapsed_secs": live.elapsed_secs,
-        "quota": quota_payload(&record.profile),
+        "quota": quota_payload(&ProfileName::from(record.profile.clone())),
     });
     if !live.recorded {
         return payload;
@@ -3500,15 +3501,16 @@ fn run_delegate(opts: DelegateOpts<'_>) -> std::result::Result<serde_json::Value
     let entered = Instant::now();
     let handoff = opts.handoff.clone();
     let config = load_config().map_err(|e| format!("failed to load config: {e}"))?;
+    let profile_name = ProfileName::from(opts.profile);
     let target = config
-        .find(opts.profile)
+        .find(&profile_name)
         .ok_or_else(|| profile_not_found(opts.profile, ProfileNotFoundFix::CallProfiles))?;
     // Mirrors `disable_profile`'s own live-session refusal from the other
     // direction: that guard stops disabling a profile mid-session, this one
     // stops opening a brand-new session on one already disabled. Also the
     // backstop for a background job whose target changed after its pre-flight,
     // since the config is re-loaded here. Guard rationale: `preflight_target`.
-    preflight_target(target, &config, opts.profile)?;
+    preflight_target(target, &config, &profile_name)?;
 
     if let Some(dir) = opts.cwd
         && !std::path::Path::new(dir).is_dir()
@@ -3535,7 +3537,7 @@ fn run_delegate(opts: DelegateOpts<'_>) -> std::result::Result<serde_json::Value
     let active_env_keys: Vec<String> = config
         .state
         .active_profile
-        .as_deref()
+        .as_ref()
         .and_then(|n| config.find(n))
         .map(|p| p.env.keys().cloned().collect())
         .unwrap_or_default();
@@ -3785,7 +3787,12 @@ fn run_delegate(opts: DelegateOpts<'_>) -> std::result::Result<serde_json::Value
             // the model as rate-limited (clauth never sees inference 429s any
             // other way).
             if let RateLimit::Yes { retry_after_s } = rate_limit_hint(&throttle_scan) {
-                crate::throughput::record_rate_limit(opts.profile, opts.model, retry_after_s, now);
+                crate::throughput::record_rate_limit(
+                    &ProfileName::from(opts.profile),
+                    opts.model,
+                    retry_after_s,
+                    now,
+                );
             }
             Ok(envelope)
         }
@@ -3802,7 +3809,7 @@ fn run_delegate(opts: DelegateOpts<'_>) -> std::result::Result<serde_json::Value
             {
                 if let RateLimit::Yes { retry_after_s } = rate_limit_hint(&envelope.to_string()) {
                     crate::throughput::record_rate_limit(
-                        opts.profile,
+                        &ProfileName::from(opts.profile),
                         opts.model,
                         retry_after_s,
                         now,
@@ -3902,7 +3909,7 @@ fn classify_run(
 fn preflight_target(
     profile: &Profile,
     config: &AppConfig,
-    name: &str,
+    name: &ProfileName,
 ) -> std::result::Result<(), String> {
     if profile.is_disabled() {
         return Err(format!(
@@ -3987,9 +3994,9 @@ fn resolve_fanout(config: &AppConfig, raw: &[String]) -> std::result::Result<Vec
     // with nothing to authenticate inference.
     for name in &resolved {
         let profile = config
-            .find(name)
+            .find(&ProfileName::from(name.clone()))
             .ok_or_else(|| profile_not_found(name, ProfileNotFoundFix::CallProfiles))?;
-        preflight_target(profile, config, name)?;
+        preflight_target(profile, config, &ProfileName::from(name.clone()))?;
     }
     Ok(resolved)
 }
@@ -4751,7 +4758,13 @@ fn record_throughput_from_envelope(
         .or_else(|| envelope.get("duration_ms"))
         .and_then(serde_json::Value::as_u64)
         .unwrap_or(0);
-    crate::throughput::record_success(profile, model, output_tokens, duration_ms, now);
+    crate::throughput::record_success(
+        &ProfileName::from(profile),
+        model,
+        output_tokens,
+        duration_ms,
+        now,
+    );
 }
 
 /// What a delegate-output scan found: whether it carries a rate-limit / 429
@@ -4788,7 +4801,7 @@ fn rate_limit_hint(text: &str) -> RateLimit {
 /// One-line throughput warning folded into a delegate payload's `live_usage`
 /// object, or `None` when nothing is degraded or rate-limited.
 fn throughput_note(profile: &str, now: i64) -> Option<String> {
-    let flagged: Vec<String> = crate::throughput::summary(profile, now)
+    let flagged: Vec<String> = crate::throughput::summary(&ProfileName::from(profile), now)
         .into_iter()
         .filter(|m| m.degraded || m.rate_limited_recent)
         .map(|m| {
@@ -4912,16 +4925,13 @@ fn build_instructions() -> String {
     let snapshots: Vec<ProfileSnapshot> = config
         .profiles
         .iter()
-        .map(|p| {
-            let name = p.name.as_str();
-            ProfileSnapshot {
-                name: name.to_string(),
-                active: config.is_active(name),
-                provider: provider_label(p),
-                base_url: p.base_url.clone(),
-                sub_type: tier_label(p),
-                rank: roster_rank(name),
-            }
+        .map(|p| ProfileSnapshot {
+            name: p.name.to_string(),
+            active: config.is_active(&p.name),
+            provider: provider_label(p),
+            base_url: p.base_url.clone(),
+            sub_type: tier_label(p),
+            rank: roster_rank(&p.name),
         })
         .collect();
 

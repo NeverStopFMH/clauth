@@ -21,7 +21,11 @@ fn vendor_profile(name: &str) -> Profile {
 /// `age`. Bytes rather than a serialized struct: every consumer reaches this
 /// file through the production reader, so the fixture must too.
 fn seed_provider_cache(name: &str, age: Duration) {
-    let path = profile_cache_path(name, THIRD_PARTY_CACHE_FILE).unwrap();
+    let path = profile_cache_path(
+        &crate::profile::ProfileName::from(name),
+        THIRD_PARTY_CACHE_FILE,
+    )
+    .unwrap();
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
     std::fs::write(&path, THIRD_PARTY_CACHE_BYTES).unwrap();
     set_mtime(&path, SystemTime::now() - age);
@@ -32,8 +36,13 @@ fn seed_usage_cache(name: &str, usage: &UsageInfo, age: Duration) {
     // The cache write is gated on the on-disk record; seeding this cache is the
     // helper's whole job, and the mtime below panics over a skipped write.
     crate::testutil::register_names(&[name]);
-    write_profile_cache(name, USAGE_CACHE_FILE, usage);
-    let path = profile_cache_path(name, USAGE_CACHE_FILE).unwrap();
+    write_profile_cache(
+        &crate::profile::ProfileName::from(name),
+        USAGE_CACHE_FILE,
+        usage,
+    );
+    let path =
+        profile_cache_path(&crate::profile::ProfileName::from(name), USAGE_CACHE_FILE).unwrap();
     set_mtime(&path, SystemTime::now() - age);
 }
 
@@ -54,7 +63,7 @@ fn profile_windows_reads_an_oauth_accounts_own_cache() {
     let _home = HomeSandbox::new();
     seed_usage_cache("kerry", &five_hour_at(12.0), Duration::from_secs(100));
 
-    match profile_windows(&blank_profile("kerry")) {
+    match profile_windows(&blank_profile(&crate::profile::ProfileName::from("kerry"))) {
         ProfileWindows::Oauth { usage, age_secs } => {
             assert_eq!(
                 usage.and_then(|u| u.five_hour).map(|w| w.utilization),
@@ -139,7 +148,7 @@ fn a_figure_older_than_any_refresh_cadence_reads_stale() {
         Duration::from_millis(MAX_LIVE_REFRESH_GAP_MS),
     );
     assert!(
-        !profile_windows(&blank_profile("kerry")).stale(),
+        !profile_windows(&blank_profile(&crate::profile::ProfileName::from("kerry"))).stale(),
         "an account still on the slowest legal cadence is not one nobody refreshes",
     );
 
@@ -148,7 +157,7 @@ fn a_figure_older_than_any_refresh_cadence_reads_stale() {
         &five_hour_at(12.0),
         Duration::from_millis(STALE_AFTER_MS) + Duration::from_secs(60),
     );
-    let windows = profile_windows(&blank_profile("kerry"));
+    let windows = profile_windows(&blank_profile(&crate::profile::ProfileName::from("kerry")));
     assert!(
         windows.stale(),
         "past the threshold nothing is refreshing it"
@@ -166,11 +175,19 @@ fn a_figure_older_than_any_refresh_cadence_reads_stale() {
 fn a_future_cache_stamp_carries_no_age_at_all() {
     let _home = HomeSandbox::new();
     crate::testutil::register_names(&["kerry"]);
-    write_profile_cache("kerry", USAGE_CACHE_FILE, &five_hour_at(12.0));
-    let path = profile_cache_path("kerry", USAGE_CACHE_FILE).unwrap();
+    write_profile_cache(
+        &crate::profile::ProfileName::from("kerry"),
+        USAGE_CACHE_FILE,
+        &five_hour_at(12.0),
+    );
+    let path = profile_cache_path(
+        &crate::profile::ProfileName::from("kerry"),
+        USAGE_CACHE_FILE,
+    )
+    .unwrap();
     set_mtime(&path, SystemTime::now() + Duration::from_secs(3600));
 
-    let windows = profile_windows(&blank_profile("kerry"));
+    let windows = profile_windows(&blank_profile(&crate::profile::ProfileName::from("kerry")));
     assert_eq!(
         windows.age_secs(),
         None,
@@ -192,7 +209,7 @@ fn a_future_cache_stamp_carries_no_age_at_all() {
 fn tier_label_reports_the_tier_of_a_canceled_account() {
     let _home = HomeSandbox::new();
     crate::testutil::register_names(&["kerry"]);
-    let profile = blank_profile("kerry");
+    let profile = blank_profile(&crate::profile::ProfileName::from("kerry"));
     let usage = UsageInfo {
         plan: Some(PlanInfo {
             tier: PlanTier::Free,
@@ -200,7 +217,11 @@ fn tier_label_reports_the_tier_of_a_canceled_account() {
         }),
         ..Default::default()
     };
-    write_profile_cache("kerry", USAGE_CACHE_FILE, &usage);
+    write_profile_cache(
+        &crate::profile::ProfileName::from("kerry"),
+        USAGE_CACHE_FILE,
+        &usage,
+    );
 
     assert_eq!(tier_label(&profile), Some("Free".to_string()));
 }
@@ -214,7 +235,7 @@ fn tier_label_reports_the_tier_of_a_canceled_account() {
 fn tier_label_never_substitutes_canceled_for_a_paid_tier() {
     let _home = HomeSandbox::new();
     crate::testutil::register_names(&["kerry"]);
-    let profile = blank_profile("kerry");
+    let profile = blank_profile(&crate::profile::ProfileName::from("kerry"));
     let usage = UsageInfo {
         plan: Some(PlanInfo {
             tier: PlanTier::Max(Some(20)),
@@ -222,7 +243,11 @@ fn tier_label_never_substitutes_canceled_for_a_paid_tier() {
         }),
         ..Default::default()
     };
-    write_profile_cache("kerry", USAGE_CACHE_FILE, &usage);
+    write_profile_cache(
+        &crate::profile::ProfileName::from("kerry"),
+        USAGE_CACHE_FILE,
+        &usage,
+    );
 
     assert_eq!(tier_label(&profile), Some("Max 20x".to_string()));
 }
@@ -233,7 +258,7 @@ fn tier_label_never_substitutes_canceled_for_a_paid_tier() {
 fn tier_label_reports_the_real_tier_when_not_canceled() {
     let _home = HomeSandbox::new();
     crate::testutil::register_names(&["kerry"]);
-    let profile = blank_profile("kerry");
+    let profile = blank_profile(&crate::profile::ProfileName::from("kerry"));
     let usage = UsageInfo {
         plan: Some(PlanInfo {
             tier: PlanTier::Max(Some(5)),
@@ -241,7 +266,11 @@ fn tier_label_reports_the_real_tier_when_not_canceled() {
         }),
         ..Default::default()
     };
-    write_profile_cache("kerry", USAGE_CACHE_FILE, &usage);
+    write_profile_cache(
+        &crate::profile::ProfileName::from("kerry"),
+        USAGE_CACHE_FILE,
+        &usage,
+    );
 
     assert_eq!(tier_label(&profile), Some("Max 5x".to_string()));
 }

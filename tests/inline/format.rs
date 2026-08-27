@@ -10,7 +10,7 @@ use crate::usage::PlanInfo;
 
 #[test]
 fn login_expired_shares_one_head_across_line_and_toast() {
-    let m = login_expired("work");
+    let m = login_expired(&crate::profile::ProfileName::from("work"));
     assert_eq!(
         m.line(),
         "login for 'work' has expired: refresh token revoked or invalid: run clauth login work"
@@ -29,7 +29,7 @@ fn login_expired_shares_one_head_across_line_and_toast() {
 #[test]
 fn refresh_transient_carries_the_error_in_the_detail() {
     let m = refresh_transient(
-        "flaky",
+        &crate::profile::ProfileName::from("flaky"),
         &Transient::new(
             Cause::Endpoint("could not reach anthropic"),
             Retry::Connection,
@@ -116,12 +116,14 @@ fn only_the_status_bearing_form_names_the_status() {
     );
 
     assert_eq!(
-        refresh_transient_cli("work", &t).line(),
+        refresh_transient_cli(&crate::profile::ProfileName::from("work"), &t).line(),
         "could not refresh 'work' before switching: anthropic is having trouble (HTTP 503): \
          retry in a moment"
     );
     assert!(
-        !refresh_transient("work", &t).line().contains("503"),
+        !refresh_transient(&crate::profile::ProfileName::from("work"), &t)
+            .line()
+            .contains("503"),
         "the non-CLI constructor must stay status-free"
     );
 
@@ -221,7 +223,7 @@ fn only_the_relogin_causes_read_as_permanent() {
 #[test]
 fn detail_returns_the_next_step_alone_and_falls_back_to_the_head() {
     assert_eq!(
-        login_expired("work").detail(),
+        login_expired(&crate::profile::ProfileName::from("work")).detail(),
         "refresh token revoked or invalid: run clauth login work"
     );
     let bare = Message {
@@ -278,7 +280,7 @@ fn local_stamp_renders_the_local_wall_clock_shape() {
 
 #[test]
 fn account_tier_reads_the_fetched_tier_only_the_canceled_marker_is_on_the_status_line() {
-    let mut canceled = crate::testutil::blank_profile("a");
+    let mut canceled = crate::testutil::blank_profile(&crate::profile::ProfileName::from("a"));
     canceled.usage = Some(crate::usage::UsageInfo {
         plan: Some(PlanInfo {
             tier: PlanTier::Free,
@@ -290,7 +292,7 @@ fn account_tier_reads_the_fetched_tier_only_the_canceled_marker_is_on_the_status
 
     // A genuine, never-subscribed free account looks the same here — the
     // canceled distinction lives on the status line, not the plan tier.
-    let mut free = crate::testutil::blank_profile("b");
+    let mut free = crate::testutil::blank_profile(&crate::profile::ProfileName::from("b"));
     free.usage = Some(crate::usage::UsageInfo {
         plan: Some(PlanInfo {
             tier: PlanTier::Free,
@@ -308,12 +310,12 @@ fn account_tier_reads_the_fetched_tier_only_the_canceled_marker_is_on_the_status
 #[test]
 fn account_tier_reports_no_tier_for_an_unfetched_plan() {
     // No credentials at all: nothing on disk claims a tier.
-    let bare = crate::testutil::blank_profile("a");
+    let bare = crate::testutil::blank_profile(&crate::profile::ProfileName::from("a"));
     assert_eq!(account_tier(&bare), None);
 
     // A token whose `subscription_type` is not one clauth classifies is the
     // same "we do not know" — never a fabricated tier.
-    let mut unclassified = crate::testutil::blank_profile("b");
+    let mut unclassified = crate::testutil::blank_profile(&crate::profile::ProfileName::from("b"));
     unclassified.credentials = Some(crate::profile::ClaudeCredentials {
         claude_ai_oauth: Some(crate::profile::OAuthToken {
             access_token: "at".into(),
@@ -327,7 +329,7 @@ fn account_tier_reports_no_tier_for_an_unfetched_plan() {
 
     // A fetched plan whose tier never classified, with no token claim to fall
     // through to, reads the same way.
-    let mut unknown_plan = crate::testutil::blank_profile("c");
+    let mut unknown_plan = crate::testutil::blank_profile(&crate::profile::ProfileName::from("c"));
     unknown_plan.usage = Some(crate::usage::UsageInfo {
         plan: Some(PlanInfo {
             tier: PlanTier::Unknown,
@@ -365,7 +367,7 @@ fn account_tier_falls_through_an_unclassified_fetched_plan_to_the_token() {
         })
     };
 
-    let mut unclassified = crate::testutil::blank_profile("a");
+    let mut unclassified = crate::testutil::blank_profile(&crate::profile::ProfileName::from("a"));
     unclassified.usage = plan(PlanTier::Unknown);
     unclassified.credentials = token("max");
     assert_eq!(
@@ -376,7 +378,7 @@ fn account_tier_falls_through_an_unclassified_fetched_plan_to_the_token() {
 
     // The other arm of the same branch: a fetched tier that DID classify still
     // wins over a disagreeing token, so the fall-through cannot invert priority.
-    let mut disagreeing = crate::testutil::blank_profile("b");
+    let mut disagreeing = crate::testutil::blank_profile(&crate::profile::ProfileName::from("b"));
     disagreeing.usage = plan(PlanTier::Max(Some(20)));
     disagreeing.credentials = token("pro");
     assert_eq!(
@@ -392,7 +394,7 @@ fn account_tier_falls_through_an_unclassified_fetched_plan_to_the_token() {
 /// pre-fetch source it has.
 #[test]
 fn account_tier_reads_back_a_free_logins_stored_token() {
-    let mut free = crate::testutil::blank_profile("a");
+    let mut free = crate::testutil::blank_profile(&crate::profile::ProfileName::from("a"));
     free.credentials = Some(crate::profile::ClaudeCredentials {
         claude_ai_oauth: Some(crate::profile::OAuthToken {
             access_token: "at".into(),
@@ -409,7 +411,7 @@ fn account_tier_reads_back_a_free_logins_stored_token() {
 /// the unfetched-plan change.
 #[test]
 fn account_tier_still_renders_every_known_tier() {
-    let mut fetched = crate::testutil::blank_profile("a");
+    let mut fetched = crate::testutil::blank_profile(&crate::profile::ProfileName::from("a"));
     fetched.usage = Some(crate::usage::UsageInfo {
         plan: Some(PlanInfo {
             tier: PlanTier::Max(Some(20)),
@@ -419,7 +421,7 @@ fn account_tier_still_renders_every_known_tier() {
     });
     assert_eq!(account_tier(&fetched), Some(PlanTier::Max(Some(20))));
 
-    let mut free = crate::testutil::blank_profile("b");
+    let mut free = crate::testutil::blank_profile(&crate::profile::ProfileName::from("b"));
     free.usage = Some(crate::usage::UsageInfo {
         plan: Some(PlanInfo {
             tier: PlanTier::Free,
@@ -429,7 +431,7 @@ fn account_tier_still_renders_every_known_tier() {
     });
     assert_eq!(account_tier(&free), Some(PlanTier::Free));
 
-    let mut token_only = crate::testutil::blank_profile("c");
+    let mut token_only = crate::testutil::blank_profile(&crate::profile::ProfileName::from("c"));
     token_only.credentials = Some(crate::profile::ClaudeCredentials {
         claude_ai_oauth: Some(crate::profile::OAuthToken {
             access_token: "at".into(),

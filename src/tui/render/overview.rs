@@ -463,7 +463,13 @@ fn render_overview_row(
     let reset_style = |label, window: Option<&UsageWindow>| {
         let window = window?;
         drain_reset_style(
-            drain_rate(app, &name_str, profile, label, window),
+            drain_rate(
+                app,
+                &crate::profile::ProfileName::from(name_str.clone()),
+                profile,
+                label,
+                window,
+            ),
             window_rate_unit(label),
             window,
         )
@@ -522,7 +528,11 @@ fn render_overview_row(
     }
     if widths.live > 0 {
         spans.push(gap(widths));
-        spans.push(live_cell(app.live_sessions.member(&name_str), widths.live));
+        spans.push(live_cell(
+            app.live_sessions
+                .member(&crate::profile::ProfileName::from(name_str.clone())),
+            widths.live,
+        ));
     }
 
     Line::from(spans)
@@ -821,7 +831,7 @@ fn projected_switch(app: &App, cfg: &AppConfig) -> Option<(SwitchAction, i64)> {
     if cfg.state.fallback_chain.len() <= 1 {
         return None;
     }
-    let active_name = cfg.state.active_profile.as_deref()?;
+    let active_name = cfg.state.active_profile.as_ref()?;
     let profile = cfg.find(active_name)?;
     let usage_info = profile.usage.as_ref()?;
     let usage = usage_info.five_hour.as_ref()?;
@@ -887,7 +897,7 @@ impl ChainRow {
 #[allow(clippy::too_many_arguments)]
 fn chain_row(
     cfg: &AppConfig,
-    name: &str,
+    name: &crate::profile::ProfileName,
     index: usize,
     last: usize,
     name_w: usize,
@@ -1045,7 +1055,7 @@ fn drain_reset_style(rate: Option<f64>, rate_unit: &str, window: &UsageWindow) -
 /// and a synthesized third-party window has no history to weigh.
 fn drain_rate(
     app: &App,
-    name: &str,
+    name: &crate::profile::ProfileName,
     profile: &Profile,
     label: &str,
     window: &UsageWindow,

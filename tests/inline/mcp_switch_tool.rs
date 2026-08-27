@@ -33,7 +33,8 @@ fn seed_active_linked() {
         }),
     });
     save_profile(&p).expect("save profile");
-    force_link_profile_credentials("active").expect("link active");
+    force_link_profile_credentials(&crate::profile::ProfileName::from("active"))
+        .expect("link active");
 
     let state = AppState {
         active_profile: Some("active".into()),

@@ -10,7 +10,7 @@ use crate::lock::with_state_lock;
 use crate::lockorder::{RankedMutex, rank};
 use crate::logline::logline;
 use crate::profile::{
-    AccountId, AppConfig, OAuthToken, clear_staged_credentials, save_profile,
+    AccountId, AppConfig, OAuthToken, ProfileName, clear_staged_credentials, save_profile,
     stage_rotated_credentials,
 };
 use crate::runtime::RotationGuard;
@@ -426,7 +426,10 @@ fn refresh_rejection_is_terminal(status: u16, body: &str) -> bool {
 /// across the HTTP refresh. `None` (→ [`REFRESH_SCOPES_FALLBACK`]) for an
 /// unknown profile or one without stored scopes. Callers must not already hold
 /// the config lock.
-pub(crate) fn stored_scopes(config: &crate::profile::ConfigHandle, name: &str) -> Option<String> {
+pub(crate) fn stored_scopes(
+    config: &crate::profile::ConfigHandle,
+    name: &ProfileName,
+) -> Option<String> {
     config.lock().ok()?.find(name)?.scopes_joined()
 }
 
@@ -652,7 +655,7 @@ impl KickResult {
 /// `None`.
 pub(crate) fn auto_start_kick(
     config: &crate::profile::ConfigHandle,
-    name: &str,
+    name: &ProfileName,
     access_token: &str,
     refresh_token: Option<&str>,
     access_expires_at: Option<i64>,
@@ -766,7 +769,7 @@ pub(crate) fn auto_start_kick(
 /// sites, one `Cause` arm: `format.rs` exists because this exact condition used
 /// to print a different sentence per surface, and `5391a4c` re-created that by
 /// rewording the gate's copy while leaving the two toasts on their own string.
-fn rotation_lock_unavailable(name: &str) -> crate::format::Transient {
+fn rotation_lock_unavailable(name: &ProfileName) -> crate::format::Transient {
     crate::format::Transient::new(
         crate::format::Cause::RotationLockUnavailable(name.to_string()),
         // The cause names its own next step; a second one contradicts it.
@@ -777,7 +780,7 @@ fn rotation_lock_unavailable(name: &str) -> crate::format::Transient {
 /// CLA-ROLL: a rolling-token sidecar could not be written or restored. The
 /// chain is fine; the file in front of it is not. See
 /// [`crate::format::Cause::SidecarWriteFailed`].
-fn sidecar_write_failed(name: &str) -> crate::format::Transient {
+fn sidecar_write_failed(name: &ProfileName) -> crate::format::Transient {
     crate::format::Transient::new(
         crate::format::Cause::SidecarWriteFailed(name.to_string()),
         // The cause names its own next step; a second one contradicts it.
@@ -795,7 +798,7 @@ fn sidecar_write_failed(name: &str) -> crate::format::Transient {
 /// operator hunting a fault that does not exist. Same contention-vs-fault
 /// split as `RotationLockUnavailable` (round 1) and `RotationLockHeld`
 /// (round 3), one lock further down.
-fn sidecar_repair_transient(name: &str, e: &anyhow::Error) -> crate::format::Transient {
+fn sidecar_repair_transient(name: &ProfileName, e: &anyhow::Error) -> crate::format::Transient {
     if e.chain()
         .any(|c| c.downcast_ref::<crate::lock::StateLockTimeout>().is_some())
     {
@@ -810,7 +813,7 @@ fn sidecar_repair_transient(name: &str, e: &anyhow::Error) -> crate::format::Tra
 /// CLA-ROLL: a live `clauth start` session is holding the ROTATING pair,
 /// because it started before the sidecar was armed. See
 /// [`crate::format::Cause::LiveSessionOnRotatingChain`].
-fn live_session_on_rotating_chain(name: &str) -> crate::format::Transient {
+fn live_session_on_rotating_chain(name: &ProfileName) -> crate::format::Transient {
     crate::format::Transient::new(
         crate::format::Cause::LiveSessionOnRotatingChain(name.to_string()),
         crate::format::Retry::Stated,
@@ -819,7 +822,7 @@ fn live_session_on_rotating_chain(name: &str) -> crate::format::Transient {
 
 /// CLA-ROLL: another holder has the rotation lock and this caller must not
 /// park behind it. See [`crate::format::Cause::RotationLockHeld`].
-fn rotation_lock_held(name: &str) -> crate::format::Transient {
+fn rotation_lock_held(name: &ProfileName) -> crate::format::Transient {
     crate::format::Transient::new(
         crate::format::Cause::RotationLockHeld(name.to_string()),
         // The cause names its own next step; a second one contradicts it.
@@ -829,7 +832,7 @@ fn rotation_lock_held(name: &str) -> crate::format::Transient {
 
 /// CLA-ROLL: the chain's recorded grant cannot be told from a mint, so the
 /// roll is refused. See [`crate::format::Cause::RollingGrantUnrecorded`].
-fn rolling_grant_unrecorded(name: &str) -> crate::format::Transient {
+fn rolling_grant_unrecorded(name: &ProfileName) -> crate::format::Transient {
     crate::format::Transient::new(
         crate::format::Cause::RollingGrantUnrecorded(name.to_string()),
         // Only a re-login fixes it, and the cause says so.
@@ -840,7 +843,7 @@ fn rolling_grant_unrecorded(name: &str) -> crate::format::Transient {
 /// CLA-ROLL: the sidecar holds a rotating pair with nothing live to heal it,
 /// and this caller must not fall into the blocking vanilla gate. See
 /// [`crate::format::Cause::SidecarMisfilled`].
-fn sidecar_misfilled(name: &str) -> crate::format::Transient {
+fn sidecar_misfilled(name: &ProfileName) -> crate::format::Transient {
     crate::format::Transient::new(
         crate::format::Cause::SidecarMisfilled(name.to_string()),
         // Only a re-capture fixes it, and the cause says so.
@@ -877,7 +880,7 @@ enum RotateOutcome {
 /// [`RotateOutcome::Persisted(false)`] silently.
 fn rotate_one_inner(
     config: &crate::profile::ConfigHandle,
-    name: &str,
+    name: &ProfileName,
     activity: Option<&ActivityStore>,
     sender: &OpResultSender,
 ) -> RotateOutcome {
@@ -959,7 +962,7 @@ fn rotate_one_inner(
 /// `clauth start` session does not exclude a profile: it shares the credential
 /// file a rotation writes, so it follows the new pair instead of being cut off
 /// from one.
-pub(crate) fn rotation_candidates(config: &AppConfig, force: bool) -> Vec<(String, String)> {
+pub(crate) fn rotation_candidates(config: &AppConfig, force: bool) -> Vec<(ProfileName, String)> {
     // force=true (t-key rotate-all) bypasses diverged-active: user wants every
     // account rotated, including the one CC is touching.
     let skip_active = !force && active_link_diverged(config);
@@ -970,7 +973,7 @@ pub(crate) fn rotation_candidates(config: &AppConfig, force: bool) -> Vec<(Strin
             if skip_active && config.is_active(&p.name) {
                 return None;
             }
-            Some((p.name.to_string(), p.refresh_token()?.to_string()))
+            Some((p.name.clone(), p.refresh_token()?.to_string()))
         })
         .collect()
 }
@@ -1017,7 +1020,7 @@ pub(crate) fn refresh_all(
 
     // Pair each handle with the name so the join loop can clear the activity
     // slot on panic — the closure consumes the name, so we keep a second copy.
-    let handles: Vec<(String, _)> = snapshots
+    let handles: Vec<(ProfileName, _)> = snapshots
         .into_iter()
         .map(|(name, _rt)| {
             let config = Arc::clone(config);
@@ -1038,13 +1041,13 @@ pub(crate) fn refresh_all(
     let mut refreshed = Vec::new();
     for (name, h) in handles {
         match h.join() {
-            Ok((n, RotateOutcome::Persisted(true))) => refreshed.push(n),
+            Ok((n, RotateOutcome::Persisted(true))) => refreshed.push(n.to_string()),
             // Guard-fail leg never emits an OpResult, so this pre-stamped slot
             // would freeze the spinner AND swallow the failure. Emit the Danger
             // toast (matches the pre-collapse worker) and clear.
             Ok((n, RotateOutcome::GuardUnavailable)) => {
                 let _ = sender.send(OpResult {
-                    name: n.clone(),
+                    name: n.to_string(),
                     outcome: Err(anyhow::anyhow!("{}", rotation_lock_unavailable(&n).text())),
                 });
                 clear_activity(activity, &n);
@@ -1076,7 +1079,7 @@ pub(crate) fn refresh_all(
 /// persisted.
 pub(crate) fn rotate_one(
     config: &crate::profile::ConfigHandle,
-    name: &str,
+    name: &ProfileName,
     refetch: &RefetchQueue,
     activity: &ActivityStore,
     sender: &OpResultSender,
@@ -1120,7 +1123,7 @@ pub(crate) fn rotate_one(
 /// The just-switched profile is active and freshly reconciled, so the diverged-
 /// active guard the steady-state path needs doesn't apply here; opt-in + OAuth
 /// is the whole gate.
-pub(crate) fn prime_window(config: &crate::profile::ConfigHandle, name: &str) -> bool {
+pub(crate) fn prime_window(config: &crate::profile::ConfigHandle, name: &ProfileName) -> bool {
     let (access_token, refresh_token, expires_at) = {
         #[allow(clippy::expect_used, reason = "mutex poisoning is unrecoverable")]
         let cfg = config.lock().expect("config mutex poisoned");
@@ -1187,7 +1190,7 @@ fn write_token_fields(oauth: &mut OAuthToken, tok: TokenResponse) {
 /// for rotation always has an OAuth block).
 pub(crate) fn apply_rotated_tokens_locked(
     config: &crate::profile::ConfigHandle,
-    name: &str,
+    name: &ProfileName,
     tok: TokenResponse,
 ) -> Result<()> {
     #[allow(clippy::expect_used, reason = "mutex poisoning is unrecoverable")]
@@ -1434,7 +1437,7 @@ fn set_stored_probe_not_before_for_test(key: &[u8; 32], not_before: u64) {
 
 pub(crate) fn try_adopt_live_rotation(
     config: &crate::profile::ConfigHandle,
-    name: &str,
+    name: &ProfileName,
     _rotation_guard: &crate::runtime::RotationGuard,
     identity: &dyn Fn(&str) -> Option<AccountId>,
 ) -> Option<(String, Option<String>)> {
@@ -1617,7 +1620,7 @@ pub(crate) fn try_adopt_live_rotation(
 /// foreign (a real CC re-login); an unreadable/unclassifiable state is
 /// treated as foreign so a state we cannot understand is never overwritten.
 #[cfg(target_os = "macos")]
-fn live_login_is_foreign(name: &str, old_access: &str) -> bool {
+fn live_login_is_foreign(name: &ProfileName, old_access: &str) -> bool {
     match crate::claude::classify_credentials_link(name) {
         Ok(crate::claude::LinkState::LinkedTo) | Ok(crate::claude::LinkState::Missing) => false,
         Ok(crate::claude::LinkState::Diverged) => {
@@ -1634,7 +1637,7 @@ fn live_login_is_foreign(name: &str, old_access: &str) -> bool {
 /// stale relative to what CC just wrote, so rotating them would leak a refresh
 /// chain nobody will use.
 fn active_link_diverged(config: &AppConfig) -> bool {
-    config.state.active_profile.as_deref().is_some_and(|name| {
+    config.state.active_profile.as_ref().is_some_and(|name| {
         matches!(
             classify_credentials_link(name).ok(),
             Some(LinkState::Diverged)
@@ -1688,7 +1691,7 @@ pub(crate) enum AuthGate {
 /// sibling worker cannot double-spend the single-use token.
 pub(crate) fn ensure_installable(
     config: &crate::profile::ConfigHandle,
-    name: &str,
+    name: &ProfileName,
     refresher: impl Fn(&str, Option<&str>) -> std::result::Result<TokenResponse, RefreshError>,
 ) -> AuthGate {
     // CLA-ROLL: rolling-token profiles own their entire install story in
@@ -1706,7 +1709,7 @@ pub(crate) fn ensure_installable(
 /// rotation guard.
 fn vanilla_install_gate(
     config: &crate::profile::ConfigHandle,
-    name: &str,
+    name: &ProfileName,
     refresher: impl Fn(&str, Option<&str>) -> std::result::Result<TokenResponse, RefreshError>,
 ) -> AuthGate {
     // CLA-SPLIT: a session-token profile installs its STATIC long-lived token
@@ -1834,7 +1837,7 @@ enum LockWait {
 ///     else Broken.
 fn rolling_install_gate(
     config: &crate::profile::ConfigHandle,
-    name: &str,
+    name: &ProfileName,
     refresher: impl Fn(&str, Option<&str>) -> std::result::Result<TokenResponse, RefreshError>,
     fresh_horizon_ms: i64,
     wait: LockWait,
@@ -2058,7 +2061,7 @@ fn rolling_install_gate(
 /// vanilla gate still reports arming failure via the sidecar check).
 pub(crate) fn arm_rolling_token(
     config: &crate::profile::ConfigHandle,
-    name: &str,
+    name: &ProfileName,
     refresher: impl Fn(&str, Option<&str>) -> std::result::Result<TokenResponse, RefreshError>,
 ) -> Result<()> {
     match rolling_install_gate(config, name, refresher, AUTH_GATE_GRACE_MS, LockWait::Block) {
@@ -2103,7 +2106,7 @@ pub(crate) const ROLLING_RESTAMP_HORIZON_MS: i64 = 2 * 60 * 60 * 1000;
 /// healthy backup sat unrepaired forever on any profile nobody switched to.
 /// Absent sidecars (arming is switch/rotation work) and exp-less claims stay
 /// not-due.
-pub(crate) fn rolling_sidecar_restamp_due(name: &str, now: i64) -> bool {
+pub(crate) fn rolling_sidecar_restamp_due(name: &ProfileName, now: i64) -> bool {
     match crate::claude::session_token_status(name) {
         Some(crate::claude::SessionTokenStatus::LongLived(Some(exp))) => {
             exp <= now + ROLLING_RESTAMP_HORIZON_MS
@@ -2124,7 +2127,7 @@ pub(crate) fn rolling_sidecar_restamp_due(name: &str, now: i64) -> bool {
 /// refresh token can ship through the rolling path.
 pub(crate) fn restamp_rolling_token(
     config: &crate::profile::ConfigHandle,
-    name: &str,
+    name: &ProfileName,
     refresher: impl Fn(&str, Option<&str>) -> std::result::Result<TokenResponse, RefreshError>,
 ) -> AuthGate {
     let gate = rolling_install_gate(
@@ -2170,7 +2173,7 @@ pub(crate) fn restamp_rolling_token(
 
 /// CLA-ROLL: whether `name` has the rolling token enabled. A poisoned config
 /// mutex or unknown profile reads `false` — the static/vanilla gates apply.
-fn profile_rolling_token(config: &crate::profile::ConfigHandle, name: &str) -> bool {
+fn profile_rolling_token(config: &crate::profile::ConfigHandle, name: &ProfileName) -> bool {
     config
         .lock()
         .ok()
@@ -2184,7 +2187,7 @@ fn profile_rolling_token(config: &crate::profile::ConfigHandle, name: &str) -> b
 /// be a rolling bearer in its last two hours just as well as the year-scale
 /// mint, and a log that says "the mint" over a bearer dying within the hour is
 /// the comfortable-looking lie this feature exists to remove.
-fn serving_desc(name: &str) -> &'static str {
+fn serving_desc(name: &ProfileName) -> &'static str {
     match crate::claude::sidecar_summary(name) {
         Some((crate::claude::SidecarKind::Mint, _)) => "the static long-lived mint",
         // Unreachable from the degrade paths (every caller guards on
@@ -2228,7 +2231,7 @@ enum RollAttempt {
 /// token could be clobbered by this call's older cloned access token.
 fn roll_from_stored_chain(
     config: &crate::profile::ConfigHandle,
-    name: &str,
+    name: &ProfileName,
     _rotation_guard: &RotationGuard,
     fresh_horizon_ms: i64,
 ) -> RollAttempt {
@@ -2273,7 +2276,7 @@ fn roll_from_stored_chain(
 )]
 fn oauth_shape(
     config: &crate::profile::ConfigHandle,
-    name: &str,
+    name: &ProfileName,
 ) -> std::result::Result<(Option<i64>, Option<String>, Option<String>, bool), AuthGate> {
     let Ok(cfg) = config.lock() else {
         // A poisoned mutex means another thread panicked; it does not clear on
@@ -2332,7 +2335,11 @@ fn horizon_expiring(expires_at: Option<i64>, flagged: bool, horizon_ms: i64) -> 
 /// (mirrors `carry_external_rotation`; a wrong lift self-corrects when the
 /// carried pair's own refresh 400s). Unreadable or tokenless disk state is a
 /// no-op: the in-memory shape stays the best available truth.
-fn adopt_disk_rotation(config: &crate::profile::ConfigHandle, name: &str, _guard: &RotationGuard) {
+fn adopt_disk_rotation(
+    config: &crate::profile::ConfigHandle,
+    name: &ProfileName,
+    _guard: &RotationGuard,
+) {
     let Ok(disk) = crate::profile::load_profile(name) else {
         return;
     };
@@ -2364,7 +2371,7 @@ fn adopt_disk_rotation(config: &crate::profile::ConfigHandle, name: &str, _guard
 /// cannot reuse pre-guard data.
 fn gate_under_guard(
     config: &crate::profile::ConfigHandle,
-    name: &str,
+    name: &ProfileName,
     refresher: impl Fn(&str, Option<&str>) -> std::result::Result<TokenResponse, RefreshError>,
     guard: &RotationGuard,
     fresh_horizon_ms: i64,
@@ -2424,7 +2431,11 @@ fn gate_under_guard(
 /// config older than a concurrent CLI delete/rename/login, and writing the full
 /// stale list would resurrect a deleted profile's row or rewind an edit to some
 /// other profile in the same file.
-pub(crate) fn mark_auth_broken(config: &crate::profile::ConfigHandle, name: &str, broken: bool) {
+pub(crate) fn mark_auth_broken(
+    config: &crate::profile::ConfigHandle,
+    name: &ProfileName,
+    broken: bool,
+) {
     let Ok(mut cfg) = config.lock() else {
         return;
     };

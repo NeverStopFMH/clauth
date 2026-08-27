@@ -112,7 +112,7 @@ fn live_oauth(refresh: Option<&str>) -> ClaudeCredentials {
 
 /// The CLA-SPLIT lookup for a tree where no profile carries a sidecar — the
 /// shape every pre-split test resolves under.
-fn no_sidecars(_name: &str) -> Option<String> {
+fn no_sidecars(_name: &crate::profile::ProfileName) -> Option<String> {
     None
 }
 
@@ -120,7 +120,9 @@ fn no_sidecars(_name: &str) -> Option<String> {
 /// standing in for `claude::installed_session_token`'s disk read. The real one
 /// already filters mis-filled sidecars out, so anything listed here is a token a
 /// switch would genuinely install.
-fn sidecars(pairs: &'static [(&'static str, &'static str)]) -> impl Fn(&str) -> Option<String> {
+fn sidecars(
+    pairs: &'static [(&'static str, &'static str)],
+) -> impl Fn(&crate::profile::ProfileName) -> Option<String> {
     move |name| {
         pairs
             .iter()
@@ -165,7 +167,7 @@ fn matches_profile_by_refresh_token() {
     );
     assert_eq!(
         match_by_refresh_token(&config, "rt-personal"),
-        Some("personal")
+        Some(&crate::profile::ProfileName::from("personal"))
     );
 }
 
@@ -185,7 +187,10 @@ fn ties_break_on_active_profile() {
         ],
         Some("second"),
     );
-    assert_eq!(match_by_refresh_token(&config, "rt-shared"), Some("second"));
+    assert_eq!(
+        match_by_refresh_token(&config, "rt-shared"),
+        Some(&crate::profile::ProfileName::from("second"))
+    );
 }
 
 #[test]
@@ -194,19 +199,28 @@ fn endpoint_profiles_without_oauth_are_skipped() {
         vec![endpoint_profile("api"), oauth_profile("work", "rt-work")],
         None,
     );
-    assert_eq!(match_by_refresh_token(&config, "rt-work"), Some("work"));
+    assert_eq!(
+        match_by_refresh_token(&config, "rt-work"),
+        Some(&crate::profile::ProfileName::from("work"))
+    );
 }
 
 #[test]
 fn attributes_unmatched_login_to_credential_less_active() {
     let config = config_with(
-        vec![oauth_profile("work", "rt-work"), blank_profile("new")],
+        vec![
+            oauth_profile("work", "rt-work"),
+            blank_profile(&crate::profile::ProfileName::from("new")),
+        ],
         Some("new"),
     );
     let live = live_oauth(Some("rt-fresh"));
     assert_eq!(
         resolve_profile(&config, Some(&live), false, None, &no_sidecars),
-        Some(("new", Source::CredentialLessActive))
+        Some((
+            &crate::profile::ProfileName::from("new"),
+            Source::CredentialLessActive
+        ))
     );
 }
 
@@ -215,14 +229,17 @@ fn token_match_wins_over_credential_less_active() {
     let config = config_with(
         vec![
             oauth_profile("personal", "rt-personal"),
-            blank_profile("new"),
+            blank_profile(&crate::profile::ProfileName::from("new")),
         ],
         Some("new"),
     );
     let live = live_oauth(Some("rt-personal"));
     assert_eq!(
         resolve_profile(&config, Some(&live), false, None, &no_sidecars),
-        Some(("personal", Source::RefreshMatch))
+        Some((
+            &crate::profile::ProfileName::from("personal"),
+            Source::RefreshMatch
+        ))
     );
 }
 
@@ -238,7 +255,10 @@ fn no_attribution_when_active_profile_has_creds() {
 
 #[test]
 fn no_attribution_when_no_active_profile() {
-    let config = config_with(vec![blank_profile("new")], None);
+    let config = config_with(
+        vec![blank_profile(&crate::profile::ProfileName::from("new"))],
+        None,
+    );
     let live = live_oauth(Some("rt-fresh"));
     assert_eq!(
         resolve_profile(&config, Some(&live), false, None, &no_sidecars),
@@ -250,11 +270,17 @@ fn no_attribution_when_no_active_profile() {
 fn attributes_credential_less_active_without_loaded_refresh_token() {
     // active credential-less profile owns the session even when the loaded
     // file carries no refresh token (API-key/endpoint auth carries none).
-    let config = config_with(vec![blank_profile("new")], Some("new"));
+    let config = config_with(
+        vec![blank_profile(&crate::profile::ProfileName::from("new"))],
+        Some("new"),
+    );
     let live = live_oauth(None);
     assert_eq!(
         resolve_profile(&config, Some(&live), false, None, &no_sidecars),
-        Some(("new", Source::CredentialLessActive))
+        Some((
+            &crate::profile::ProfileName::from("new"),
+            Source::CredentialLessActive
+        ))
     );
 }
 
@@ -265,7 +291,10 @@ fn attributes_api_key_active_when_credentials_file_absent() {
     let config = config_with(vec![endpoint_profile("api")], Some("api"));
     assert_eq!(
         resolve_profile(&config, None, false, None, &no_sidecars),
-        Some(("api", Source::CredentialLessActive))
+        Some((
+            &crate::profile::ProfileName::from("api"),
+            Source::CredentialLessActive
+        ))
     );
 }
 
@@ -274,7 +303,10 @@ fn no_credential_less_attribution_inside_session() {
     // inside a session (CLAUDE_CONFIG_DIR set), creds belong to the runtime profile —
     // suppress attribution so a credential-less active isn't incorrectly credited
     let config = config_with(
-        vec![oauth_profile("work", "rt-work"), blank_profile("active")],
+        vec![
+            oauth_profile("work", "rt-work"),
+            blank_profile(&crate::profile::ProfileName::from("active")),
+        ],
         Some("active"),
     );
     let live = live_oauth(Some("rt-from-runtime"));
@@ -288,13 +320,19 @@ fn no_credential_less_attribution_inside_session() {
 fn token_match_still_works_inside_session() {
     // token-exact match is always valid, even inside a session
     let config = config_with(
-        vec![oauth_profile("work", "rt-work"), blank_profile("active")],
+        vec![
+            oauth_profile("work", "rt-work"),
+            blank_profile(&crate::profile::ProfileName::from("active")),
+        ],
         Some("active"),
     );
     let live = live_oauth(Some("rt-work"));
     assert_eq!(
         resolve_profile(&config, Some(&live), true, None, &no_sidecars),
-        Some(("work", Source::RefreshMatch))
+        Some((
+            &crate::profile::ProfileName::from("work"),
+            Source::RefreshMatch
+        ))
     );
 }
 
@@ -302,23 +340,35 @@ fn token_match_still_works_inside_session() {
 fn resolves_started_profile_in_runtime_session() {
     // `clauth start <blank>`: credential-less started profile owns the runtime session
     let config = config_with(
-        vec![oauth_profile("work", "rt-work"), blank_profile("new")],
+        vec![
+            oauth_profile("work", "rt-work"),
+            blank_profile(&crate::profile::ProfileName::from("new")),
+        ],
         Some("work"),
     );
     let live = live_oauth(Some("rt-fresh"));
     assert_eq!(
         resolve_profile(&config, Some(&live), true, Some("new"), &no_sidecars),
-        Some(("new", Source::SessionDir))
+        Some((
+            &crate::profile::ProfileName::from("new"),
+            Source::SessionDir
+        ))
     );
 }
 
 #[test]
 fn started_profile_resolves_with_no_loaded_creds() {
     // no creds yet (pre-first-login) — started profile still owns the session
-    let config = config_with(vec![blank_profile("new")], Some("work"));
+    let config = config_with(
+        vec![blank_profile(&crate::profile::ProfileName::from("new"))],
+        Some("work"),
+    );
     assert_eq!(
         resolve_profile(&config, None, true, Some("new"), &no_sidecars),
-        Some(("new", Source::SessionDir))
+        Some((
+            &crate::profile::ProfileName::from("new"),
+            Source::SessionDir
+        ))
     );
 }
 
@@ -328,14 +378,17 @@ fn token_match_wins_over_started_profile() {
     let config = config_with(
         vec![
             oauth_profile("personal", "rt-personal"),
-            blank_profile("new"),
+            blank_profile(&crate::profile::ProfileName::from("new")),
         ],
         Some("new"),
     );
     let live = live_oauth(Some("rt-personal"));
     assert_eq!(
         resolve_profile(&config, Some(&live), true, Some("new"), &no_sidecars),
-        Some(("personal", Source::RefreshMatch))
+        Some((
+            &crate::profile::ProfileName::from("personal"),
+            Source::RefreshMatch
+        ))
     );
 }
 
@@ -371,7 +424,7 @@ fn disabled_profile_is_never_resolved_as_credential_less_active() {
     // Belt-and-suspenders: even if a disabled profile were somehow still the
     // active one (a pre-existing on-disk state from before this gate
     // existed), `which` must not attribute the session to it.
-    let mut disabled = blank_profile("acme");
+    let mut disabled = blank_profile(&crate::profile::ProfileName::from("acme"));
     disabled.disabled = true;
     let config = config_with(vec![disabled], Some("acme"));
     let live = live_oauth(None);
@@ -397,7 +450,10 @@ fn session_token_install_is_attributed_to_its_profile() {
             None,
             &sidecars(&[("work", "oat-work")])
         ),
-        Some(("work", Source::SessionTokenMatch))
+        Some((
+            &crate::profile::ProfileName::from("work"),
+            Source::SessionTokenMatch
+        ))
     );
 }
 
@@ -434,7 +490,10 @@ fn session_token_match_wins_over_credential_less_active() {
     // Same precedence the refresh tier already has: an exact credential match is
     // more precise than "the active profile stores nothing".
     let config = config_with(
-        vec![oauth_profile("work", "rt-work"), blank_profile("new")],
+        vec![
+            oauth_profile("work", "rt-work"),
+            blank_profile(&crate::profile::ProfileName::from("new")),
+        ],
         Some("new"),
     );
     let live = live_session_token("oat-work");
@@ -446,7 +505,10 @@ fn session_token_match_wins_over_credential_less_active() {
             None,
             &sidecars(&[("work", "oat-work")])
         ),
-        Some(("work", Source::SessionTokenMatch))
+        Some((
+            &crate::profile::ProfileName::from("work"),
+            Source::SessionTokenMatch
+        ))
     );
 }
 
@@ -455,7 +517,10 @@ fn session_token_ties_break_on_the_active_profile() {
     // One mint captured into two profiles (a duplicated account). The active one
     // is the honest answer for the live slot.
     let config = config_with(
-        vec![oauth_profile("work", "rt-work"), blank_profile("copy")],
+        vec![
+            oauth_profile("work", "rt-work"),
+            blank_profile(&crate::profile::ProfileName::from("copy")),
+        ],
         Some("copy"),
     );
     let live = live_session_token("oat-shared");
@@ -467,7 +532,10 @@ fn session_token_ties_break_on_the_active_profile() {
             None,
             &sidecars(&[("work", "oat-shared"), ("copy", "oat-shared")])
         ),
-        Some(("copy", Source::SessionTokenMatch))
+        Some((
+            &crate::profile::ProfileName::from("copy"),
+            Source::SessionTokenMatch
+        ))
     );
 }
 
@@ -485,7 +553,10 @@ fn session_token_match_still_works_inside_a_session() {
             None,
             &sidecars(&[("work", "oat-work")])
         ),
-        Some(("work", Source::SessionTokenMatch))
+        Some((
+            &crate::profile::ProfileName::from("work"),
+            Source::SessionTokenMatch
+        ))
     );
 }
 
@@ -554,7 +625,11 @@ fn cache_plan(name: &str, tier: PlanTier, status: Option<&str>) {
         }),
         ..Default::default()
     };
-    write_profile_cache(name, USAGE_CACHE_FILE, &usage);
+    write_profile_cache(
+        &crate::profile::ProfileName::from(name),
+        USAGE_CACHE_FILE,
+        &usage,
+    );
 }
 
 /// `which --json`'s `tier` is `null` when nothing on disk claims a tier, which
@@ -829,7 +904,10 @@ fn session_profile_none_for_non_runtime_path() {
 fn resolve_global_ignores_claude_config_dir_in_the_readers_env() {
     let home = crate::testutil::HomeSandbox::new();
     let config = config_with(
-        vec![blank_profile("global"), blank_profile("started")],
+        vec![
+            blank_profile(&crate::profile::ProfileName::from("global")),
+            blank_profile(&crate::profile::ProfileName::from("started")),
+        ],
         Some("global"),
     );
     let runtime_dir = home

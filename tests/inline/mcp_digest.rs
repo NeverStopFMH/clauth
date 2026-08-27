@@ -64,15 +64,25 @@ fn seed_state(active: &str, at: SystemTime) {
         ..Default::default()
     })
     .expect("save state");
-    crate::profile_cache::write_profile_cache(active, USAGE_CACHE_FILE, &UsageInfo::default());
-    let cache = crate::profile_cache::profile_cache_path(active, USAGE_CACHE_FILE)
-        .expect("usage cache path");
+    crate::profile_cache::write_profile_cache(
+        &crate::profile::ProfileName::from(active),
+        USAGE_CACHE_FILE,
+        &UsageInfo::default(),
+    );
+    let cache = crate::profile_cache::profile_cache_path(
+        &crate::profile::ProfileName::from(active),
+        USAGE_CACHE_FILE,
+    )
+    .expect("usage cache path");
     set_mtime(&cache, at);
 }
 
 fn third_party_cache_path(name: &str) -> std::path::PathBuf {
-    crate::profile_cache::profile_cache_path(name, THIRD_PARTY_CACHE_FILE)
-        .expect("third-party cache path")
+    crate::profile_cache::profile_cache_path(
+        &crate::profile::ProfileName::from(name),
+        THIRD_PARTY_CACHE_FILE,
+    )
+    .expect("third-party cache path")
 }
 
 /// A saved api-key profile as the active one, with the provider cache its own
@@ -384,7 +394,8 @@ fn seed_switchable_pair() {
         });
         save_profile(&p).expect("save profile");
     }
-    force_link_profile_credentials("active").expect("link active");
+    force_link_profile_credentials(&crate::profile::ProfileName::from("active"))
+        .expect("link active");
     save_app_state(&AppState {
         active_profile: Some("active".into()),
         profiles: vec!["active".into(), "target".into()],
@@ -572,8 +583,11 @@ fn a_third_party_profiles_leftover_oauth_cache_is_not_the_file_watched() {
     let _home = HomeSandbox::new();
     seed_api_key_state("vendor", "https://api.deepseek.com/anthropic", t0());
     seed_credentials_file(t0());
-    let stale_oauth_cache =
-        crate::profile_cache::profile_cache_path("vendor", USAGE_CACHE_FILE).expect("cache path");
+    let stale_oauth_cache = crate::profile_cache::profile_cache_path(
+        &crate::profile::ProfileName::from("vendor"),
+        USAGE_CACHE_FILE,
+    )
+    .expect("cache path");
     std::fs::write(&stale_oauth_cache, b"{}").expect("leftover oauth cache");
     set_mtime(&stale_oauth_cache, t0());
     let server = ClauthServer::new();
@@ -893,7 +907,7 @@ fn an_abandoned_blocking_delegate_reply_never_consumes_the_digest() {
     let fold = |abandoned: bool| {
         fold_delegate_live_usage(
             serde_json::json!({"profile": "work", "result": "done"}),
-            "work",
+            &crate::profile::ProfileName::from("work"),
             delegate_call_endpoint("work", &std::collections::HashMap::new()),
             0,
             super::delegate_digest_mode(&tracker, abandoned),

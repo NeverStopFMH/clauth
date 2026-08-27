@@ -234,7 +234,7 @@ fn build_status_auth_status_ok_expiring_broken() {
         state: AppState::default(),
         profiles: vec![ok, expiring, broken],
     };
-    config.set_auth_broken("broken", true);
+    config.set_auth_broken(&crate::profile::ProfileName::from("broken"), true);
 
     let v = build_status(&config, 300_000, None, false);
     let profiles = v["profiles"].as_array().unwrap();
@@ -341,7 +341,7 @@ fn build_status_third_party_freshness_from_its_own_cache() {
     // Warm third-party cache, no OAuth cache: the profile is fetched.
     crate::testutil::register_names(&["zai"]);
     crate::profile_cache::write_profile_cache(
-        "zai",
+        &crate::profile::ProfileName::from("zai"),
         crate::profile_cache::THIRD_PARTY_CACHE_FILE,
         &crate::providers::ThirdPartyStats {
             is_available: true,
@@ -400,7 +400,7 @@ fn build_status_nulls_next_refresh_for_a_spent_skipped_account() {
     // Warm the OAuth usage cache with a live 100%-capped 5h window.
     crate::testutil::register_names(&["maxed"]);
     crate::profile_cache::write_profile_cache(
-        "maxed",
+        &crate::profile::ProfileName::from("maxed"),
         crate::profile_cache::USAGE_CACHE_FILE,
         &crate::usage::UsageInfo {
             five_hour: Some(crate::usage::UsageWindow {
@@ -633,7 +633,7 @@ fn build_status_reports_a_recorded_dead_credential_without_a_daemon() {
     // A cache written just now: the mtime derivation calls this "Fresh".
     crate::testutil::register_names(&["qwen"]);
     crate::profile_cache::write_profile_cache(
-        "qwen",
+        &crate::profile::ProfileName::from("qwen"),
         crate::profile_cache::THIRD_PARTY_CACHE_FILE,
         &crate::providers::ThirdPartyStats {
             is_available: true,
@@ -654,7 +654,7 @@ fn build_status_reports_a_recorded_dead_credential_without_a_daemon() {
     // Record the verdict against the credential the profile holds.
     let fp = crate::usage::profile_credential_fingerprint(&dead.profiles[0])
         .expect("a console-credentialed profile has a fingerprint");
-    crate::profile_cache::write_auth_expired("qwen", fp);
+    crate::profile_cache::write_auth_expired(&crate::profile::ProfileName::from("qwen"), fp);
 
     let v = build_status(&dead, 300_000, None, false);
     assert_eq!(
@@ -703,7 +703,7 @@ fn build_status_leaves_a_never_fetched_profile_unknown() {
 fn build_status_rolling_token_is_the_sidecar_content_not_the_config_flag() {
     let _home = HomeSandbox::new();
     let name = "roll-truth";
-    let dir = crate::profile::profile_dir(name).expect("dir");
+    let dir = crate::profile::profile_dir(&crate::profile::ProfileName::from(name)).expect("dir");
     std::fs::create_dir_all(&dir).expect("mkdir");
     let config_with_flag = |rolling_token: bool| {
         let mut p = oauth_profile(name);
@@ -765,7 +765,7 @@ fn build_status_rolling_token_is_the_sidecar_content_not_the_config_flag() {
 fn build_status_rolling_token_is_false_for_a_misfill() {
     let _home = HomeSandbox::new();
     let name = "roll-misfill";
-    let dir = crate::profile::profile_dir(name).expect("dir");
+    let dir = crate::profile::profile_dir(&crate::profile::ProfileName::from(name)).expect("dir");
     std::fs::create_dir_all(&dir).expect("mkdir");
     let mut p = oauth_profile(name);
     p.rolling_token = true;

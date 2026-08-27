@@ -362,7 +362,8 @@ fn a_session_snapshot_needs_no_global_active_profile() {
         snapshot_chain(&config).is_none(),
         "fixture: the global builder must be the one that gives up here"
     );
-    let snap = snapshot_session_chain(&config, "a", &launch).expect("a session snapshot");
+    let snap = snapshot_session_chain(&config, &crate::profile::ProfileName::from("a"), &launch)
+        .expect("a session snapshot");
     assert_eq!(snap.active, "a", "the session's own member plays `active`");
     assert_eq!(
         snap.chain
@@ -389,7 +390,8 @@ fn a_session_snapshot_keeps_the_sessions_own_disabled_member_resolvable() {
     );
     let launch = LaunchTransport::of(&profile_with_util("a", None, None));
 
-    let snap = snapshot_session_chain(&config, "b", &launch).expect("a session snapshot");
+    let snap = snapshot_session_chain(&config, &crate::profile::ProfileName::from("b"), &launch)
+        .expect("a session snapshot");
     assert_eq!(
         snap.chain
             .iter()
@@ -401,7 +403,8 @@ fn a_session_snapshot_keeps_the_sessions_own_disabled_member_resolvable() {
 
     // …and a disabled member the session is NOT on is still dropped as a
     // candidate, exactly as the global builder drops it.
-    let snap = snapshot_session_chain(&config, "a", &launch).expect("a session snapshot");
+    let snap = snapshot_session_chain(&config, &crate::profile::ProfileName::from("a"), &launch)
+        .expect("a session snapshot");
     assert_eq!(
         snap.chain
             .iter()
@@ -434,7 +437,8 @@ fn a_session_snapshot_drops_a_member_the_executor_would_refuse() {
     config.state.fallback_chain.push("ghost".into());
     let launch = LaunchTransport::of(&profile_with_util("a", None, None));
 
-    let snap = snapshot_session_chain(&config, "a", &launch).expect("a session snapshot");
+    let snap = snapshot_session_chain(&config, &crate::profile::ProfileName::from("a"), &launch)
+        .expect("a session snapshot");
     assert_eq!(
         snap.chain
             .iter()
@@ -471,7 +475,9 @@ fn a_session_snapshot_is_none_for_a_member_outside_the_chain() {
     config.state.fallback_chain = vec!["b".into()];
     let launch = LaunchTransport::of(&profile_with_util("a", None, None));
 
-    assert!(snapshot_session_chain(&config, "a", &launch).is_none());
+    assert!(
+        snapshot_session_chain(&config, &crate::profile::ProfileName::from("a"), &launch).is_none()
+    );
 }
 
 #[test]
@@ -834,7 +840,7 @@ fn soonest_resume_skips_an_auth_broken_member_holding_an_idle_window() {
         ],
         "reachable",
     );
-    config.set_auth_broken("dead", true);
+    config.set_auth_broken(&crate::profile::ProfileName::from("dead"), true);
     let (name, eta) = soonest_resume(&config).expect("reachable member is hard-exhausted");
     assert_eq!(name, "reachable", "the auth-broken member must be skipped");
     assert!((1700..=1800).contains(&eta), "eta ~1800s, got {eta}");
@@ -1172,7 +1178,7 @@ fn next_target_skips_broken_member_picks_next() {
         ],
         "a",
     );
-    config.set_auth_broken("b", true);
+    config.set_auth_broken(&crate::profile::ProfileName::from("b"), true);
     assert_eq!(
         next_target(&config, None),
         Some(SwitchAction::To("c".into()))
@@ -1189,7 +1195,7 @@ fn next_target_returns_none_when_only_alternative_is_broken() {
         ],
         "a",
     );
-    config.set_auth_broken("b", true);
+    config.set_auth_broken(&crate::profile::ProfileName::from("b"), true);
     assert_eq!(next_target(&config, None), None);
 }
 
@@ -1205,7 +1211,7 @@ fn auto_switch_skips_broken_member_picks_next() {
         ],
         "a",
     );
-    config.set_auth_broken("b", true);
+    config.set_auth_broken(&crate::profile::ProfileName::from("b"), true);
     let snap = snapshot_chain(&config).expect("snapshot");
     assert!(snap.broken.iter().any(|n| n == "b"));
     let store = store_with_utils(&[("a", 100.0), ("b", 10.0), ("c", 10.0)]);
@@ -1228,7 +1234,7 @@ fn next_target_broken_sink_wrap_off_switches_off() {
         "a",
     );
     config.state.switch_off_when_spent = true;
-    config.set_auth_broken("b", true);
+    config.set_auth_broken(&crate::profile::ProfileName::from("b"), true);
     assert_eq!(next_target(&config, None), Some(SwitchAction::Off));
 }
 
@@ -1436,7 +1442,9 @@ fn blocked_reason_reports_canceled_first() {
         vec![profile_with_usage("a", Some(95.0), Some(canceled_usage()))],
         "a",
     );
-    let profile = config.find("a").expect("profile");
+    let profile = config
+        .find(&crate::profile::ProfileName::from("a"))
+        .expect("profile");
     assert_eq!(
         blocked_reason(&config, profile, None),
         Some(BlockedReason::Canceled),
@@ -1444,7 +1452,9 @@ fn blocked_reason_reports_canceled_first() {
 
     // A genuine free account (no canceled status) with headroom is NOT blocked.
     let config = config_with_chain(vec![profile_with_util("a", Some(95.0), Some(20.0))], "a");
-    let profile = config.find("a").expect("profile");
+    let profile = config
+        .find(&crate::profile::ProfileName::from("a"))
+        .expect("profile");
     assert_eq!(blocked_reason(&config, profile, None), None);
 }
 
@@ -1470,7 +1480,7 @@ fn auto_switch_broken_active_walks_away_despite_stale_headroom() {
         ],
         "a",
     );
-    config.set_auth_broken("a", true);
+    config.set_auth_broken(&crate::profile::ProfileName::from("a"), true);
     let snap = snapshot_chain(&config).expect("snapshot");
     let store = store_with_infos(vec![
         // The active's last-ever read: maxed on a window that has since
@@ -2640,8 +2650,8 @@ fn auto_switch_broken_active_without_viable_member_never_wraps_off() {
         "a",
     );
     config.state.switch_off_when_spent = true;
-    config.set_auth_broken("a", true);
-    config.set_auth_broken("b", true); // the only sibling is dead too
+    config.set_auth_broken(&crate::profile::ProfileName::from("a"), true);
+    config.set_auth_broken(&crate::profile::ProfileName::from("b"), true); // the only sibling is dead too
     let snap = snapshot_chain(&config).expect("snapshot");
     let store = store_with_infos(vec![
         ("a", usage_info(Some(window(100.0, Some(expired_reset()))))),
@@ -2662,8 +2672,8 @@ fn auto_switch_broken_and_exhausted_active_still_wraps_off() {
         "a",
     );
     config.state.switch_off_when_spent = true;
-    config.set_auth_broken("a", true);
-    config.set_auth_broken("b", true);
+    config.set_auth_broken(&crate::profile::ProfileName::from("a"), true);
+    config.set_auth_broken(&crate::profile::ProfileName::from("b"), true);
     let snap = snapshot_chain(&config).expect("snapshot");
     let store = store_with_infos(vec![
         ("a", usage_info(Some(window(100.0, Some(live_reset()))))),
@@ -2693,7 +2703,7 @@ fn next_target_skips_broken_last_resort_member() {
         Some(SwitchAction::To("b".into())),
         "base case: the last-resort pass migrates to the sink"
     );
-    config.set_auth_broken("b", true);
+    config.set_auth_broken(&crate::profile::ProfileName::from("b"), true);
     assert_eq!(
         next_target(&config, None),
         None,
@@ -2928,7 +2938,8 @@ fn next_target_burn_aware_none_rate_falls_back_to_static_threshold() {
 /// shape `crate::profile::load_usage_history` parses. Takes the sandbox so the
 /// write can only land in a sandboxed home, never the real one.
 fn write_history(_home: &crate::testutil::HomeSandbox, name: &str, entries: &[(u64, UsageInfo)]) {
-    let path = crate::profile::profile_history_path(name).expect("history path");
+    let path = crate::profile::profile_history_path(&crate::profile::ProfileName::from(name))
+        .expect("history path");
     std::fs::create_dir_all(path.parent().expect("parent dir")).expect("mkdir");
     let mut body = String::new();
     for (ts, usage) in entries {
@@ -2997,7 +3008,8 @@ fn burn_aware_never_holds_the_active_where_static_switches_on_both_walks() {
     // standing in for the caller's in-memory `history_cache` lookup
     // (`App::active_burn_rate`) that feeds the real UI-thread call site.
     let active_window = window(96.0, Some(live_reset()));
-    let rate = burn_rate_for_profile("a", &active_window).expect("rate computed from history");
+    let rate = burn_rate_for_profile(&crate::profile::ProfileName::from("a"), &active_window)
+        .expect("rate computed from history");
     assert!((rate - 600.0).abs() < 1.0, "expected ~600 %/h, got {rate}");
 
     // Burn-aware: 96% is over the 95% threshold, so the static check inside the
@@ -3513,7 +3525,9 @@ fn both_windows(five: f64, seven: f64) -> UsageInfo {
 #[test]
 fn candidate_exclusion_and_dead_first_chip_stay_coupled() {
     fn dead_first_chip(config: &AppConfig, name: &str) -> bool {
-        let cand = config.find(name).expect("candidate is resolvable");
+        let cand = config
+            .find(&crate::profile::ProfileName::from(name))
+            .expect("candidate is resolvable");
         matches!(
             blocked_reason(config, cand, None),
             Some(BlockedReason::Disabled | BlockedReason::Canceled | BlockedReason::AuthBroken)
@@ -3523,10 +3537,16 @@ fn candidate_exclusion_and_dead_first_chip_stay_coupled() {
     // dead-first verdict must agree for a resolvable non-active candidate.
     let assert_coupled = |config: &AppConfig, name: &str| {
         assert_eq!(
-            candidate_excluded(config, name),
+            candidate_excluded(config, &crate::profile::ProfileName::from(name)),
             dead_first_chip(config, name),
             "walk skip and dead-first chip disagree for {name}: {:?}",
-            blocked_reason(config, config.find(name).expect("resolvable"), None)
+            blocked_reason(
+                config,
+                config
+                    .find(&crate::profile::ProfileName::from(name))
+                    .expect("resolvable"),
+                None
+            )
         );
     };
     let keeper = || mark_fresh(profile_with_util("keep", Some(90.0), Some(10.0)));
@@ -3540,9 +3560,18 @@ fn candidate_exclusion_and_dead_first_chip_stay_coupled() {
         "keep",
     );
     assert_coupled(&config, "cand");
-    assert!(candidate_excluded(&config, "cand"));
+    assert!(candidate_excluded(
+        &config,
+        &crate::profile::ProfileName::from("cand")
+    ));
     assert_eq!(
-        blocked_reason(&config, config.find("cand").expect("cand"), None),
+        blocked_reason(
+            &config,
+            config
+                .find(&crate::profile::ProfileName::from("cand"))
+                .expect("cand"),
+            None
+        ),
         Some(BlockedReason::Disabled)
     );
 
@@ -3554,7 +3583,13 @@ fn candidate_exclusion_and_dead_first_chip_stay_coupled() {
     config.state.auth_broken.push("cand".into());
     assert_coupled(&config, "cand");
     assert_eq!(
-        blocked_reason(&config, config.find("cand").expect("cand"), None),
+        blocked_reason(
+            &config,
+            config
+                .find(&crate::profile::ProfileName::from("cand"))
+                .expect("cand"),
+            None
+        ),
         Some(BlockedReason::AuthBroken)
     );
 
@@ -3568,7 +3603,13 @@ fn candidate_exclusion_and_dead_first_chip_stay_coupled() {
     );
     assert_coupled(&config, "cand");
     assert_eq!(
-        blocked_reason(&config, config.find("cand").expect("cand"), None),
+        blocked_reason(
+            &config,
+            config
+                .find(&crate::profile::ProfileName::from("cand"))
+                .expect("cand"),
+            None
+        ),
         Some(BlockedReason::Canceled)
     );
 
@@ -3581,9 +3622,18 @@ fn candidate_exclusion_and_dead_first_chip_stay_coupled() {
         "keep",
     );
     assert_coupled(&config, "cand");
-    assert!(!candidate_excluded(&config, "cand"));
+    assert!(!candidate_excluded(
+        &config,
+        &crate::profile::ProfileName::from("cand")
+    ));
     assert_eq!(
-        blocked_reason(&config, config.find("cand").expect("cand"), None),
+        blocked_reason(
+            &config,
+            config
+                .find(&crate::profile::ProfileName::from("cand"))
+                .expect("cand"),
+            None
+        ),
         None
     );
 
@@ -3598,12 +3648,18 @@ fn candidate_exclusion_and_dead_first_chip_stay_coupled() {
     );
     assert_coupled(&config, "cand");
     assert!(
-        !candidate_excluded(&config, "cand"),
+        !candidate_excluded(&config, &crate::profile::ProfileName::from("cand")),
         "a member blocked only by usage stays a walk candidate"
     );
     assert!(
         matches!(
-            blocked_reason(&config, config.find("cand").expect("cand"), None),
+            blocked_reason(
+                &config,
+                config
+                    .find(&crate::profile::ProfileName::from("cand"))
+                    .expect("cand"),
+                None
+            ),
             Some(BlockedReason::FiveHour { .. })
         ),
         "usage exhaustion is a non-dead-first chip"
@@ -3644,12 +3700,14 @@ fn every_blocked_reason_variant_stays_coupled_to_candidate_excluded() {
                           kick_lift: Option<i64>,
                           expected: &dyn Fn(&BlockedReason) -> bool,
                           label: &str| {
-        let cand = config.find("cand").expect("candidate is resolvable");
+        let cand = config
+            .find(&crate::profile::ProfileName::from("cand"))
+            .expect("candidate is resolvable");
         let reason = blocked_reason(config, cand, kick_lift)
             .unwrap_or_else(|| panic!("{label}: blocked_reason returned None"));
         assert!(expected(&reason), "{label}: got {reason:?}");
         assert_eq!(
-            candidate_excluded(config, "cand"),
+            candidate_excluded(config, &crate::profile::ProfileName::from("cand")),
             dead_first(&reason),
             "{label}: walk skip and dead-first chip disagree, got {reason:?}"
         );

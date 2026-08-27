@@ -63,7 +63,7 @@ fn oauth_creds(access: &str) -> ClaudeCredentials {
 
 /// A blank profile with a live-token credential block attached.
 fn profile_with_creds(name: &str, access: &str) -> Profile {
-    let mut p = blank_profile(name);
+    let mut p = blank_profile(&crate::profile::ProfileName::from(name));
     p.credentials = Some(oauth_creds(access));
     p
 }
@@ -95,7 +95,8 @@ fn daemon_for(config: AppConfig) -> Daemon {
 /// Symlink `~/.claude/.credentials.json` at the profile's stored credentials so
 /// the active link classifies as `LinkedTo` (clean — no unsaved divergence).
 fn link_active_clean(name: &str) {
-    crate::claude::force_link_profile_credentials(name).expect("link active credentials");
+    crate::claude::force_link_profile_credentials(&crate::profile::ProfileName::from(name))
+        .expect("link active credentials");
 }
 
 /// Write `~/.claude/.credentials.json` as a REGULAR file with an access token
@@ -266,7 +267,7 @@ fn drain_pending_switch_proceeds_over_a_logged_out_shell() {
         "the live slot now holds the target's stored login"
     );
     // The empty shell was never captured over the outgoing store.
-    let alpha_store = crate::profile::profile_dir("alpha")
+    let alpha_store = crate::profile::profile_dir(&crate::profile::ProfileName::from("alpha"))
         .expect("alpha dir")
         .join("credentials.json");
     let stored: ClaudeCredentials =
@@ -317,7 +318,8 @@ fn drain_pending_switch_proceeds_over_a_stale_clauth_symlink() {
             subscription_type: None,
         }),
     };
-    let alpha_dir = crate::profile::profile_dir("alpha").expect("alpha dir");
+    let alpha_dir = crate::profile::profile_dir(&crate::profile::ProfileName::from("alpha"))
+        .expect("alpha dir");
     std::fs::write(
         alpha_dir.join("session-token.json"),
         serde_json::to_vec(&sidecar).expect("serialize sidecar"),
@@ -379,7 +381,8 @@ fn drain_pending_switch_proceeds_over_a_macos_regular_file_mirror() {
             subscription_type: None,
         }),
     };
-    let alpha_dir = crate::profile::profile_dir("alpha").expect("alpha dir");
+    let alpha_dir = crate::profile::profile_dir(&crate::profile::ProfileName::from("alpha"))
+        .expect("alpha dir");
     std::fs::write(
         alpha_dir.join("session-token.json"),
         serde_json::to_vec(&sidecar).expect("serialize sidecar"),
@@ -484,7 +487,7 @@ fn drain_pending_switch_drops_a_vanished_target() {
     );
     // Alpha's stored credentials survive on disk (the pre-fix second tick
     // nulled them via the logged-out misread).
-    let stored = crate::profile::profile_dir("alpha")
+    let stored = crate::profile::profile_dir(&crate::profile::ProfileName::from("alpha"))
         .unwrap()
         .join("credentials.json");
     assert!(stored.exists(), "alpha's stored credentials survive");
@@ -510,7 +513,11 @@ fn busy_target_requeued_not_dropped() {
 
     // User switch to beta arrives while beta is mid-fetch.
     stage_switch(&daemon, "beta");
-    mark_activity(&daemon.activity, "beta", ProfileActivity::Fetching);
+    mark_activity(
+        &daemon.activity,
+        &crate::profile::ProfileName::from("beta"),
+        ProfileActivity::Fetching,
+    );
     daemon.drain_pending_switch();
 
     assert_eq!(
@@ -525,7 +532,7 @@ fn busy_target_requeued_not_dropped() {
     );
 
     // Fetch completes → the re-queued switch lands on the next tick.
-    clear_activity(&daemon.activity, "beta");
+    clear_activity(&daemon.activity, &crate::profile::ProfileName::from("beta"));
     daemon.drain_pending_switch();
     assert_eq!(
         active_of(&daemon).as_deref(),
@@ -663,7 +670,11 @@ fn switch_failure_backoff_dedups_log_over_many_ticks() {
 
     stage_switch(&daemon, "beta");
     // beta never goes idle → every attempt fails with the same reason.
-    mark_activity(&daemon.activity, "beta", ProfileActivity::Fetching);
+    mark_activity(
+        &daemon.activity,
+        &crate::profile::ProfileName::from("beta"),
+        ProfileActivity::Fetching,
+    );
 
     for _ in 0..30 {
         daemon.drain_pending_switch();
@@ -773,10 +784,10 @@ fn backoff_gate_gives_up_when_the_retry_window_closes() {
 /// uncapped sibling should surface.
 #[test]
 fn uncapped_spenders_excludes_disabled_includes_enabled_sibling() {
-    let mut disabled = blank_profile("off");
+    let mut disabled = blank_profile(&crate::profile::ProfileName::from("off"));
     disabled.max_auto_spend = Some(5.0);
     disabled.disabled = true;
-    let mut enabled = blank_profile("on");
+    let mut enabled = blank_profile(&crate::profile::ProfileName::from("on"));
     enabled.max_auto_spend = Some(5.0);
 
     let config = AppConfig {
@@ -962,8 +973,15 @@ fn drain_pending_switch_drops_a_target_deleted_after_enqueue() {
     stage_switch(&daemon, "beta");
 
     let mut disk = crate::profile::load_config().expect("load disk config");
-    let guard = crate::runtime::RotationGuard::acquire("beta").expect("rotation guard");
-    crate::actions::delete_profile(&mut disk, "beta", false, &guard).expect("delete");
+    let guard = crate::runtime::RotationGuard::acquire(&crate::profile::ProfileName::from("beta"))
+        .expect("rotation guard");
+    crate::actions::delete_profile(
+        &mut disk,
+        &crate::profile::ProfileName::from("beta"),
+        false,
+        &guard,
+    )
+    .expect("delete");
     drop(guard);
 
     daemon.drain_pending_switch();
@@ -978,7 +996,9 @@ fn drain_pending_switch_drops_a_target_deleted_after_enqueue() {
         "a deleted target is dropped, not re-queued"
     );
     assert!(
-        !crate::profile::profile_dir("beta").expect("dir").exists(),
+        !crate::profile::profile_dir(&crate::profile::ProfileName::from("beta"))
+            .expect("dir")
+            .exists(),
         "the deleted target's directory must stay deleted"
     );
 }
@@ -1004,8 +1024,15 @@ fn drain_pending_switch_does_not_resurrect_a_deleted_row() {
     stage_switch(&daemon, "beta");
 
     let mut disk = crate::profile::load_config().expect("load disk config");
-    let guard = crate::runtime::RotationGuard::acquire("gamma").expect("rotation guard");
-    crate::actions::delete_profile(&mut disk, "gamma", false, &guard).expect("delete");
+    let guard = crate::runtime::RotationGuard::acquire(&crate::profile::ProfileName::from("gamma"))
+        .expect("rotation guard");
+    crate::actions::delete_profile(
+        &mut disk,
+        &crate::profile::ProfileName::from("gamma"),
+        false,
+        &guard,
+    )
+    .expect("delete");
     drop(guard);
 
     daemon.drain_pending_switch();
@@ -1017,7 +1044,9 @@ fn drain_pending_switch_does_not_resurrect_a_deleted_row() {
     );
     let reloaded = crate::profile::load_config().expect("reload");
     assert!(
-        reloaded.find("gamma").is_none(),
+        reloaded
+            .find(&crate::profile::ProfileName::from("gamma"))
+            .is_none(),
         "the deleted profile's row must not come back through the switch's state save"
     );
 }
@@ -1045,8 +1074,15 @@ fn drain_pending_switch_off_does_not_resurrect_a_deleted_row() {
         .expect("pending_switch_off") = true;
 
     let mut disk = crate::profile::load_config().expect("load disk config");
-    let guard = crate::runtime::RotationGuard::acquire("gamma").expect("rotation guard");
-    crate::actions::delete_profile(&mut disk, "gamma", false, &guard).expect("delete");
+    let guard = crate::runtime::RotationGuard::acquire(&crate::profile::ProfileName::from("gamma"))
+        .expect("rotation guard");
+    crate::actions::delete_profile(
+        &mut disk,
+        &crate::profile::ProfileName::from("gamma"),
+        false,
+        &guard,
+    )
+    .expect("delete");
     drop(guard);
 
     daemon.drain_pending_switch_off();
@@ -1058,7 +1094,9 @@ fn drain_pending_switch_off_does_not_resurrect_a_deleted_row() {
     );
     let reloaded = crate::profile::load_config().expect("reload");
     assert!(
-        reloaded.find("gamma").is_none(),
+        reloaded
+            .find(&crate::profile::ProfileName::from("gamma"))
+            .is_none(),
         "the deleted profile's row must not come back through the switch-off state save"
     );
 }

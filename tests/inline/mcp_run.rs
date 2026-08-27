@@ -136,7 +136,8 @@ fn run_delegate_refuses_a_disabled_target_before_acquiring_a_runtime() {
     };
     crate::actions::create_blank_profile(&mut config, "off".to_string(), None, None, None)
         .expect("create profile");
-    crate::actions::disable_profile(&mut config, "off").expect("disable profile");
+    crate::actions::disable_profile(&mut config, &crate::profile::ProfileName::from("off"))
+        .expect("disable profile");
 
     let err = run_delegate(DelegateOpts {
         profile: "off",
@@ -186,7 +187,7 @@ fn run_delegate_refuses_an_auth_broken_target_before_acquiring_a_runtime() {
     crate::actions::create_blank_profile(&mut config, "quarantined".to_string(), None, None, None)
         .expect("create profile");
     assert!(
-        config.set_auth_broken("quarantined", true),
+        config.set_auth_broken(&crate::profile::ProfileName::from("quarantined"), true),
         "fixture control: the profile was not already quarantined",
     );
     crate::profile::save_app_state(&config.state).expect("persist the quarantine");
@@ -207,7 +208,10 @@ fn run_delegate_refuses_an_auth_broken_target_before_acquiring_a_runtime() {
         handoff: None,
     })
     .expect_err("a quarantined target must be refused");
-    assert_eq!(err, crate::format::login_expired("quarantined").line());
+    assert_eq!(
+        err,
+        crate::format::login_expired(&crate::profile::ProfileName::from("quarantined")).line()
+    );
 
     assert!(
         !home
@@ -574,7 +578,9 @@ fn run_delegate_does_not_refuse_an_env_authenticated_third_party_profile() {
         None,
     )
     .expect("create profile");
-    let profile = config.find_mut("ds-env").expect("profile created");
+    let profile = config
+        .find_mut(&crate::profile::ProfileName::from("ds-env"))
+        .expect("profile created");
     profile.env.insert(
         "ANTHROPIC_AUTH_TOKEN".to_string(),
         "sk-env-test".to_string(),
@@ -719,7 +725,7 @@ fn resolve_fanout_refuses_an_auth_broken_member_by_name() {
     crate::actions::create_blank_profile(&mut config, "dead".to_string(), None, None, None)
         .expect("create profile");
     assert!(
-        config.set_auth_broken("dead", true),
+        config.set_auth_broken(&crate::profile::ProfileName::from("dead"), true),
         "fixture control: the member was not already quarantined",
     );
 
@@ -731,7 +737,10 @@ fn resolve_fanout_refuses_an_auth_broken_member_by_name() {
         .collect();
     let err =
         resolve_fanout(&config, &raw).expect_err("a quarantined member refuses the whole fan-out");
-    assert_eq!(err, crate::format::login_expired("dead").line());
+    assert_eq!(
+        err,
+        crate::format::login_expired(&crate::profile::ProfileName::from("dead")).line()
+    );
 }
 
 /// Gate ORDER, pinned because nothing else can hold it: a target that is both
@@ -748,9 +757,10 @@ fn a_disabled_and_quarantined_target_refuses_as_disabled() {
     };
     crate::actions::create_blank_profile(&mut config, "both".to_string(), None, None, None)
         .expect("create profile");
-    crate::actions::disable_profile(&mut config, "both").expect("disable profile");
+    crate::actions::disable_profile(&mut config, &crate::profile::ProfileName::from("both"))
+        .expect("disable profile");
     assert!(
-        config.set_auth_broken("both", true),
+        config.set_auth_broken(&crate::profile::ProfileName::from("both"), true),
         "fixture control: the profile was not already quarantined",
     );
 
@@ -780,7 +790,7 @@ fn a_quarantined_and_keyless_third_party_target_refuses_as_keyless() {
     )
     .expect("create profile");
     assert!(
-        config.set_auth_broken("ds-both", true),
+        config.set_auth_broken(&crate::profile::ProfileName::from("ds-both"), true),
         "fixture control: the profile was not already quarantined",
     );
 
@@ -813,14 +823,17 @@ fn a_quarantined_keyed_third_party_target_stays_on_the_auth_broken_arm() {
     )
     .expect("create profile");
     assert!(
-        config.set_auth_broken("ds-keyq", true),
+        config.set_auth_broken(&crate::profile::ProfileName::from("ds-keyq"), true),
         "fixture control: the profile was not already quarantined",
     );
 
     let raw = vec!["ds-keyq".to_string()];
     let err =
         resolve_fanout(&config, &raw).expect_err("a quarantined member refuses the whole fan-out");
-    assert_eq!(err, crate::format::login_expired("ds-keyq").line());
+    assert_eq!(
+        err,
+        crate::format::login_expired(&crate::profile::ProfileName::from("ds-keyq")).line()
+    );
 }
 
 #[test]
@@ -1230,7 +1243,11 @@ fn a_running_check_on_a_third_party_target_reports_that_accounts_own_figures() {
     .expect("save third-party profile");
     // Shaped-from-a-capture provider-cache bytes through the production reader:
     // the consumer must parse the shape the fetch leg actually writes.
-    let cache = crate::profile_cache::profile_cache_path("vendor", THIRD_PARTY_CACHE_FILE).unwrap();
+    let cache = crate::profile_cache::profile_cache_path(
+        &crate::profile::ProfileName::from("vendor"),
+        THIRD_PARTY_CACHE_FILE,
+    )
+    .unwrap();
     std::fs::write(&cache, crate::testutil::DEEPSEEK_CACHE_BYTES).expect("provider cache");
     seed_running("d-vendor-0", "vendor", now_ms());
 
@@ -1259,8 +1276,11 @@ fn a_generic_api_key_target_answers_with_the_figures_clauth_holds() {
         Some("sk-fixture".to_string()),
     ))
     .expect("save generic api-key profile");
-    let cache =
-        crate::profile_cache::profile_cache_path("litellm", THIRD_PARTY_CACHE_FILE).unwrap();
+    let cache = crate::profile_cache::profile_cache_path(
+        &crate::profile::ProfileName::from("litellm"),
+        THIRD_PARTY_CACHE_FILE,
+    )
+    .unwrap();
     std::fs::write(&cache, crate::testutil::THIRD_PARTY_CACHE_BYTES).expect("provider cache");
     seed_running("d-generic-0", "litellm", now_ms());
 
@@ -1272,7 +1292,7 @@ fn a_generic_api_key_target_answers_with_the_figures_clauth_holds() {
 
     let folded = render::delegate_prose(&fold_delegate_live_usage(
         serde_json::json!({"is_error": false, "result": "ok"}),
-        "litellm",
+        &crate::profile::ProfileName::from("litellm"),
         delegate_call_endpoint("litellm", &HashMap::new()),
         0,
         DigestMode::Skip,
@@ -1311,7 +1331,7 @@ fn an_env_authored_endpoint_qualifies_the_cost_clause() {
     let priced = |name: &str| {
         render::delegate_prose(&fold_delegate_live_usage(
             serde_json::json!({"is_error": false, "result": "ok", "total_cost_usd": 2.06}),
-            name,
+            &crate::profile::ProfileName::from(name),
             delegate_call_endpoint(name, &HashMap::new()),
             0,
             DigestMode::Skip,
@@ -1339,7 +1359,7 @@ fn an_unreadable_profile_config_prices_as_endpoint_unknown() {
 
     let prose = render::delegate_prose(&fold_delegate_live_usage(
         serde_json::json!({"is_error": false, "result": "ok", "total_cost_usd": 2.06}),
-        "never-stored",
+        &crate::profile::ProfileName::from("never-stored"),
         delegate_call_endpoint("never-stored", &HashMap::new()),
         0,
         DigestMode::Skip,
@@ -1396,7 +1416,7 @@ fn a_delegate_env_override_qualifies_the_blocking_reply_cost_clause() {
     };
     let prose = render::delegate_prose(&fold_delegate_live_usage(
         envelope(),
-        "work",
+        &crate::profile::ProfileName::from("work"),
         delegate_call_endpoint("work", &caller_env),
         0,
         DigestMode::Skip,
@@ -1407,7 +1427,7 @@ fn a_delegate_env_override_qualifies_the_blocking_reply_cost_clause() {
     );
     let control = render::delegate_prose(&fold_delegate_live_usage(
         envelope(),
-        "work",
+        &crate::profile::ProfileName::from("work"),
         delegate_call_endpoint("work", &HashMap::new()),
         0,
         DigestMode::Skip,
@@ -1530,7 +1550,11 @@ fn a_running_check_renders_a_bar_shaped_provider_cache_too() {
         Some("sk-fixture".to_string()),
     ))
     .expect("save third-party profile");
-    let cache = crate::profile_cache::profile_cache_path("bars", THIRD_PARTY_CACHE_FILE).unwrap();
+    let cache = crate::profile_cache::profile_cache_path(
+        &crate::profile::ProfileName::from("bars"),
+        THIRD_PARTY_CACHE_FILE,
+    )
+    .unwrap();
     std::fs::write(&cache, crate::testutil::THIRD_PARTY_BARS_CACHE_BYTES).expect("provider cache");
     seed_running("d-bars-0", "bars", now_ms());
 
@@ -1562,7 +1586,11 @@ fn a_windows_publishing_provider_is_never_denied_over_a_bar_less_response() {
         Some("sk-fixture".to_string()),
     ))
     .expect("save alibaba profile");
-    let cache = crate::profile_cache::profile_cache_path("qwen", THIRD_PARTY_CACHE_FILE).unwrap();
+    let cache = crate::profile_cache::profile_cache_path(
+        &crate::profile::ProfileName::from("qwen"),
+        THIRD_PARTY_CACHE_FILE,
+    )
+    .unwrap();
     std::fs::write(&cache, crate::testutil::ALIBABA_NO_BARS_CACHE_BYTES).expect("provider cache");
     seed_running("d-qwen-0", "qwen", now_ms());
 
@@ -2611,7 +2639,7 @@ fn fold_delegate_live_usage_wraps_non_objects_and_folds_objects() {
     ] {
         let folded = fold_delegate_live_usage(
             scalar.clone(),
-            "work",
+            &crate::profile::ProfileName::from("work"),
             delegate_call_endpoint("work", &HashMap::new()),
             0,
             DigestMode::Report(&digest),
@@ -2628,7 +2656,7 @@ fn fold_delegate_live_usage_wraps_non_objects_and_folds_objects() {
     // An object envelope folds in place and keeps its own fields.
     let folded = fold_delegate_live_usage(
         serde_json::json!({"profile": "work", "is_error": false, "result": "all done"}),
-        "work",
+        &crate::profile::ProfileName::from("work"),
         delegate_call_endpoint("work", &HashMap::new()),
         0,
         DigestMode::Report(&digest),
@@ -2656,18 +2684,25 @@ fn a_folded_live_usage_clause_dates_the_figure_it_carries() {
         }),
         ..Default::default()
     };
-    let cache_path =
-        crate::profile_cache::profile_cache_path("work", USAGE_CACHE_FILE).expect("cache path");
+    let cache_path = crate::profile_cache::profile_cache_path(
+        &crate::profile::ProfileName::from("work"),
+        USAGE_CACHE_FILE,
+    )
+    .expect("cache path");
 
     crate::testutil::register_names(&["work"]);
-    crate::profile_cache::write_profile_cache("work", USAGE_CACHE_FILE, &usage);
+    crate::profile_cache::write_profile_cache(
+        &crate::profile::ProfileName::from("work"),
+        USAGE_CACHE_FILE,
+        &usage,
+    );
     crate::testutil::set_mtime(
         &cache_path,
         std::time::SystemTime::now() - Duration::from_secs(240),
     );
     let fresh = render::delegate_prose(&fold_delegate_live_usage(
         serde_json::json!({"is_error": false, "result": "ok"}),
-        "work",
+        &crate::profile::ProfileName::from("work"),
         delegate_call_endpoint("work", &HashMap::new()),
         0,
         DigestMode::Skip,
@@ -2686,7 +2721,7 @@ fn a_folded_live_usage_clause_dates_the_figure_it_carries() {
     );
     let stale = render::delegate_prose(&fold_delegate_live_usage(
         serde_json::json!({"is_error": false, "result": "ok"}),
-        "work",
+        &crate::profile::ProfileName::from("work"),
         delegate_call_endpoint("work", &HashMap::new()),
         0,
         DigestMode::Skip,
@@ -4714,7 +4749,7 @@ fn roster_rank_reports_free_percent_from_the_best_known_window() {
 
     // 5h wins when both are cached: it is the pool a delegate competes for.
     write_profile_cache(
-        "both",
+        &crate::profile::ProfileName::from("both"),
         USAGE_CACHE_FILE,
         &UsageInfo {
             five_hour: Some(window(70.0)),
@@ -4722,18 +4757,24 @@ fn roster_rank_reports_free_percent_from_the_best_known_window() {
             ..Default::default()
         },
     );
-    assert_eq!(roster_rank("both"), RosterRank::Window(30.0));
+    assert_eq!(
+        roster_rank(&crate::profile::ProfileName::from("both")),
+        RosterRank::Window(30.0)
+    );
 
     // 7d carries it when the 5h window is absent.
     write_profile_cache(
-        "weekly",
+        &crate::profile::ProfileName::from("weekly"),
         USAGE_CACHE_FILE,
         &UsageInfo {
             seven_day: Some(window(25.0)),
             ..Default::default()
         },
     );
-    assert_eq!(roster_rank("weekly"), RosterRank::Window(75.0));
+    assert_eq!(
+        roster_rank(&crate::profile::ProfileName::from("weekly")),
+        RosterRank::Window(75.0)
+    );
 
     // A third-party provider has no `windows`, but its own bars carry the same
     // percentages, and 5h still outranks 7d.
@@ -4745,7 +4786,7 @@ fn roster_rank_reports_free_percent_from_the_best_known_window() {
         total: None,
     };
     write_profile_cache(
-        "bars",
+        &crate::profile::ProfileName::from("bars"),
         THIRD_PARTY_CACHE_FILE,
         &ThirdPartyStats {
             is_available: true,
@@ -4756,14 +4797,17 @@ fn roster_rank_reports_free_percent_from_the_best_known_window() {
             best_effort: false,
         },
     );
-    assert_eq!(roster_rank("bars"), RosterRank::Window(92.0));
+    assert_eq!(
+        roster_rank(&crate::profile::ProfileName::from("bars")),
+        RosterRank::Window(92.0)
+    );
 
     // A balance-only provider ranks on its wallet instead, carrying the currency
     // so `roster_lines` can keep two of them from ever being compared. The row is
     // labelled the way the generic scanner passes an endpoint's own `total` key
     // through — the spelling DeepSeek no longer uses, and still a wallet.
     write_profile_cache(
-        "balance",
+        &crate::profile::ProfileName::from("balance"),
         THIRD_PARTY_CACHE_FILE,
         &ThirdPartyStats {
             is_available: true,
@@ -4779,13 +4823,16 @@ fn roster_rank_reports_free_percent_from_the_best_known_window() {
         },
     );
     assert_eq!(
-        roster_rank("balance"),
+        roster_rank(&crate::profile::ProfileName::from("balance")),
         RosterRank::Balance {
             currency: "CNY".to_string(),
             amount: 1117.10,
         }
     );
-    assert_eq!(roster_rank("never-cached"), RosterRank::Unknown);
+    assert_eq!(
+        roster_rank(&crate::profile::ProfileName::from("never-cached")),
+        RosterRank::Unknown
+    );
 }
 
 /// The wallet parse is deliberately strict. It reads whichever row a provider
@@ -4847,7 +4894,7 @@ fn a_two_wallet_profile_ranks_on_the_first_currency_listed() {
     };
     // DeepSeek's real shape for a dual-wallet account: USD block, then CNY.
     write_profile_cache(
-        "both-wallets",
+        &crate::profile::ProfileName::from("both-wallets"),
         THIRD_PARTY_CACHE_FILE,
         &ThirdPartyStats {
             is_available: true,
@@ -4865,7 +4912,7 @@ fn a_two_wallet_profile_ranks_on_the_first_currency_listed() {
         },
     );
     assert_eq!(
-        roster_rank("both-wallets"),
+        roster_rank(&crate::profile::ProfileName::from("both-wallets")),
         RosterRank::Balance {
             currency: "USD".to_string(),
             amount: 1.19,
@@ -6328,7 +6375,12 @@ fn the_blocking_delegate_folds_its_digest_on_the_abandoned_bit() {
 fn throughput_note_drops_the_prefix_and_the_default_placeholder() {
     let _home = HomeSandbox::new();
     crate::testutil::register_names(&["defaulted", "blank", "spacey", "padded", "named"]);
-    crate::throughput::record_rate_limit("defaulted", Some("default"), Some(10), 1_000);
+    crate::throughput::record_rate_limit(
+        &crate::profile::ProfileName::from("defaulted"),
+        Some("default"),
+        Some(10),
+        1_000,
+    );
     assert_eq!(
         throughput_note("defaulted", 1_000),
         Some("⚠ rate-limited (retry ~10s)".to_string())
@@ -6336,12 +6388,22 @@ fn throughput_note_drops_the_prefix_and_the_default_placeholder() {
 
     // An empty or whitespace-only model is the same non-name as `default`, so
     // neither renders and no double space leaks into the warning.
-    crate::throughput::record_rate_limit("blank", Some(""), Some(10), 1_000);
+    crate::throughput::record_rate_limit(
+        &crate::profile::ProfileName::from("blank"),
+        Some(""),
+        Some(10),
+        1_000,
+    );
     assert_eq!(
         throughput_note("blank", 1_000),
         Some("⚠ rate-limited (retry ~10s)".to_string())
     );
-    crate::throughput::record_rate_limit("spacey", Some("   "), Some(10), 1_000);
+    crate::throughput::record_rate_limit(
+        &crate::profile::ProfileName::from("spacey"),
+        Some("   "),
+        Some(10),
+        1_000,
+    );
     assert_eq!(
         throughput_note("spacey", 1_000),
         Some("⚠ rate-limited (retry ~10s)".to_string())
@@ -6349,7 +6411,12 @@ fn throughput_note_drops_the_prefix_and_the_default_placeholder() {
 
     // A whitespace-padded model is still a real name: it renders trimmed,
     // with no double space.
-    crate::throughput::record_rate_limit("padded", Some("  claude-opus-4  "), Some(10), 1_000);
+    crate::throughput::record_rate_limit(
+        &crate::profile::ProfileName::from("padded"),
+        Some("  claude-opus-4  "),
+        Some(10),
+        1_000,
+    );
     assert_eq!(
         throughput_note("padded", 1_000),
         Some("⚠ claude-opus-4 rate-limited (retry ~10s)".to_string())
@@ -6357,9 +6424,27 @@ fn throughput_note_drops_the_prefix_and_the_default_placeholder() {
 
     // An old fast sample sets the best; two recent slow ones pull the
     // recency-weighted pace below half of it, so the row reads degraded.
-    crate::throughput::record_success("named", Some("deepseek-chat"), 100, 1_000, 1_000);
-    crate::throughput::record_success("named", Some("deepseek-chat"), 10, 1_000, 1_000);
-    crate::throughput::record_success("named", Some("deepseek-chat"), 10, 1_000, 1_000);
+    crate::throughput::record_success(
+        &crate::profile::ProfileName::from("named"),
+        Some("deepseek-chat"),
+        100,
+        1_000,
+        1_000,
+    );
+    crate::throughput::record_success(
+        &crate::profile::ProfileName::from("named"),
+        Some("deepseek-chat"),
+        10,
+        1_000,
+        1_000,
+    );
+    crate::throughput::record_success(
+        &crate::profile::ProfileName::from("named"),
+        Some("deepseek-chat"),
+        10,
+        1_000,
+        1_000,
+    );
     assert_eq!(
         throughput_note("named", 1_000),
         Some("⚠ deepseek-chat slow (~25 tok/s)".to_string())

@@ -19,7 +19,7 @@ use signal_hook::consts::signal::{SIGINT, SIGTERM};
 use signal_hook::iterator::{Handle as SignalHandle, Signals};
 
 use crate::logline::logline;
-use crate::profile::AppConfig;
+use crate::profile::{AppConfig, ProfileName};
 use crate::runtime::{Isolation, ProfileRuntime};
 use crate::spinner::Spinner;
 
@@ -81,7 +81,7 @@ pub(crate) fn rescue_teardown(
 /// execute a per-session credential swap. Split from the gate so BOTH causes are
 /// exercised from a Linux run: `cfg!(target_os = "macos")` and [`LinkMode::Fake`]
 /// are each unreachable there.
-fn unsupported_host_refusal(name: &str, why: crate::runtime::SwapUnsupported) -> String {
+fn unsupported_host_refusal(name: &ProfileName, why: crate::runtime::SwapUnsupported) -> String {
     format!(
         "'{name}': --with-fallback needs a per-session credential swap, but {why}; start without it"
     )
@@ -105,7 +105,7 @@ fn refuse_unless_chain_eligible(
     isolation: Isolation,
     is_macos: bool,
 ) -> Result<()> {
-    let name = profile.name.as_str();
+    let name = &profile.name;
     // clap already refuses the flag pair, so this is for a caller that bypasses
     // it: `chain_opt_in_survives` drops an isolated opt-in silently, which is the
     // one outcome every gate here exists to prevent.
@@ -166,7 +166,7 @@ fn refuse_unless_chain_eligible(
 
 pub(crate) fn run(
     config: &AppConfig,
-    name: &str,
+    name: &ProfileName,
     claude_args: &[String],
     isolation: Isolation,
     workspace: Option<&Path>,
@@ -199,7 +199,7 @@ pub(crate) fn run(
     let active_env_keys: Vec<String> = config
         .state
         .active_profile
-        .as_deref()
+        .as_ref()
         .and_then(|n| config.find(n))
         .map(|p| p.env.keys().cloned().collect())
         .unwrap_or_default();

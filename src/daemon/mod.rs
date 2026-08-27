@@ -338,7 +338,7 @@ pub(crate) fn status_oneshot(include_disabled: bool) -> Result<()> {
 /// The shell / first-login / clauth-symlink exemptions all live in
 /// [`crate::claude::live_diverged_and_unsaved`]; a read that errors outright
 /// maps to `false` (proceed) here.
-fn active_diverged_unsaved(active: &str) -> bool {
+fn active_diverged_unsaved(active: &crate::profile::ProfileName) -> bool {
     crate::claude::live_diverged_and_unsaved(active).unwrap_or(false)
 }
 
@@ -429,8 +429,7 @@ impl Daemon {
             .expect("config mutex poisoned")
             .state
             .active_profile
-            .as_deref()
-            .map(str::to_string);
+            .clone();
         if let Some(active) = active {
             let _ = link_profile_credentials(&active);
         }

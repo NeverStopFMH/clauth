@@ -20,7 +20,7 @@ use crate::oauth;
 use crate::out::{out, outln};
 use crate::profile::{
     AccountId, AppConfig, ClaudeCredentials, ConsoleCredential, DivergenceChoice, ModelSettings,
-    Profile, load_app_state, profile_dir, save_app_state, save_profile,
+    Profile, ProfileName, load_app_state, profile_dir, save_app_state, save_profile,
 };
 use crate::providers::Provider;
 use crate::runtime::RotationGuard;
@@ -73,7 +73,7 @@ pub(crate) fn validate_profile_name(
 /// write, so a concurrent `disable_profile` can't land in the gap — a
 /// pre-lock check in a CLI/MCP wrapper is a friendly early error at best,
 /// never the authoritative one.
-fn ensure_switch_target_ok(config: &AppConfig, name: &str) -> Result<()> {
+fn ensure_switch_target_ok(config: &AppConfig, name: &ProfileName) -> Result<()> {
     // Fresh membership, not just the in-memory list: a caller can hold a config
     // older than a concurrent CLI delete/rename (the daemon reloads once a
     // tick). This must run FIRST — `switch_profile` then calls
@@ -93,7 +93,7 @@ fn ensure_switch_target_ok(config: &AppConfig, name: &str) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn switch_profile(config: &mut AppConfig, name: &str) -> Result<()> {
+pub(crate) fn switch_profile(config: &mut AppConfig, name: &ProfileName) -> Result<()> {
     with_state_lock(|| {
         ensure_switch_target_ok(config, name)?;
         if config.is_active(name) {
@@ -117,7 +117,7 @@ pub(crate) fn switch_profile(config: &mut AppConfig, name: &str) -> Result<()> {
         // branch is only reachable uncaptured via the scheduler — where refusing,
         // not dropping, is the safe outcome.) A logged-out shell holds no login to
         // strand, so it too forfeits the refuse-guard.
-        let uncaptured_relogin = match config.state.active_profile.as_deref() {
+        let uncaptured_relogin = match config.state.active_profile.as_ref() {
             Some(active) => live_diverged_and_unsaved(active)?,
             None => false,
         };
@@ -135,7 +135,7 @@ pub(crate) fn switch_profile(config: &mut AppConfig, name: &str) -> Result<()> {
 /// capturing the foreign live file into any profile. Bypasses the non-force
 /// `link_profile_credentials` refuse-guard (which exists to protect an
 /// un-captured re-login) precisely because the caller chose to drop it.
-pub(crate) fn switch_profile_discard(config: &mut AppConfig, target: &str) -> Result<()> {
+pub(crate) fn switch_profile_discard(config: &mut AppConfig, target: &ProfileName) -> Result<()> {
     with_state_lock(|| {
         ensure_switch_target_ok(config, target)?;
         if config.is_active(target) {
@@ -147,7 +147,7 @@ pub(crate) fn switch_profile_discard(config: &mut AppConfig, target: &str) -> Re
 }
 
 /// Force-snapshot the outgoing creds then force the symlink. CLI prompt path only.
-pub(crate) fn switch_profile_reconciled(config: &mut AppConfig, name: &str) -> Result<()> {
+pub(crate) fn switch_profile_reconciled(config: &mut AppConfig, name: &ProfileName) -> Result<()> {
     with_state_lock(|| {
         ensure_switch_target_ok(config, name)?;
         if config.is_active(name) {
@@ -161,14 +161,14 @@ pub(crate) fn switch_profile_reconciled(config: &mut AppConfig, name: &str) -> R
 
 /// CLI switch: relink (reconciling diverged live file via `[Y/n]` prompt), then
 /// prime the 5h window. No token rotation — stale chains rotate lazily on first use.
-pub(crate) fn switch_profile_cli(config: AppConfig, canonical: &str) -> Result<()> {
+pub(crate) fn switch_profile_cli(config: AppConfig, canonical: &ProfileName) -> Result<()> {
     let outgoing = config.state.active_profile.clone();
 
     // Diverged link = CC re-logged and wrote a regular file; must reconcile
     // (capture into outgoing profile) rather than refuse. A logged-out shell is
     // exempt: capturing its blank tokens would destroy the outgoing profile's
     // stored login.
-    let reconciled = match outgoing.as_deref() {
+    let reconciled = match outgoing.as_ref() {
         Some(active) => live_diverged_and_unsaved(active)?,
         None => false,
     };
@@ -265,7 +265,7 @@ pub(crate) fn switch_profile_cli(config: AppConfig, canonical: &str) -> Result<(
 /// offline (production callers pass [`oauth::refresh_result`]).
 pub(crate) fn switch_profile_noninteractive(
     config: &crate::profile::ConfigHandle,
-    target: &str,
+    target: &ProfileName,
     on_divergence: Option<DivergenceChoice>,
     refresher: impl Fn(
         &str,
@@ -314,7 +314,7 @@ pub(crate) fn switch_profile_noninteractive(
     // A logged-out shell is no divergence to resolve: skip the default and take
     // the plain switch, which replaces the empty file.
     let diverged = match previous.as_deref() {
-        Some(active) => live_diverged_and_unsaved(active)?,
+        Some(active) => live_diverged_and_unsaved(&ProfileName::from(active.to_string()))?,
         None => false,
     };
 
@@ -365,12 +365,12 @@ pub(crate) fn switch_off(config: &mut AppConfig) -> Result<()> {
     })
 }
 
-fn finish_switch(config: &mut AppConfig, name: &str) -> Result<()> {
+fn finish_switch(config: &mut AppConfig, name: &ProfileName) -> Result<()> {
     // Capture outgoing env keys before active_profile is reassigned.
     let prev_env_keys: Vec<String> = config
         .state
         .active_profile
-        .as_deref()
+        .as_ref()
         .and_then(|n| config.find(n))
         .map(|p| p.env.keys().cloned().collect())
         .unwrap_or_default();
@@ -380,20 +380,20 @@ fn finish_switch(config: &mut AppConfig, name: &str) -> Result<()> {
     // re-derives it from the just-relinked credentials instead of showing
     // the wrong account until its next `/login`.
     crate::claude_json::strip_home_oauth_account()?;
-    config.state.active_profile = Some(name.into());
+    config.state.active_profile = Some(name.clone());
     // Fresh state, not the whole in-memory list: a daemon drain may hold a
     // config older than a concurrent CLI delete/rename/login, and re-serializing
     // it would resurrect a deleted row or rewind an edit. Only the active marker
     // is this leg's own change, so read the current profiles.toml and change
     // that one field.
     let mut state = load_app_state()?;
-    state.active_profile = Some(name.into());
+    state.active_profile = Some(name.clone());
     save_app_state(&state)
 }
 
 pub(crate) fn edit_profile_endpoint(
     config: &mut AppConfig,
-    name: &str,
+    name: &ProfileName,
     base_url: Option<String>,
     api_key: Option<String>,
 ) -> Result<()> {
@@ -451,7 +451,7 @@ pub(crate) fn edit_profile_endpoint(
 /// session, and a new login can be a different account entirely.
 pub(crate) fn store_console_login(
     config: &mut AppConfig,
-    name: &str,
+    name: &ProfileName,
     console: ConsoleCredential,
 ) -> Result<()> {
     with_state_lock(|| {
@@ -472,7 +472,7 @@ pub(crate) fn store_console_login(
 /// picks it up on its next settings read. Mirrors [`edit_profile_endpoint`].
 pub(crate) fn edit_profile_model(
     config: &mut AppConfig,
-    name: &str,
+    name: &ProfileName,
     models: ModelSettings,
 ) -> Result<()> {
     with_state_lock(|| {
@@ -503,7 +503,7 @@ pub(crate) fn edit_profile_model(
 /// [`edit_profile_model`] would.
 pub(crate) fn edit_profile_preset(
     config: &mut AppConfig,
-    name: &str,
+    name: &ProfileName,
     base_url: Option<String>,
     models: ModelSettings,
 ) -> Result<()> {
@@ -540,7 +540,7 @@ pub(crate) fn edit_profile_preset(
 /// entry into the live file. Mirrors [`edit_profile_model`].
 pub(crate) fn edit_profile_env(
     config: &mut AppConfig,
-    name: &str,
+    name: &ProfileName,
     env: BTreeMap<String, String>,
 ) -> Result<()> {
     with_state_lock(|| {
@@ -613,7 +613,7 @@ pub(crate) fn classify_env_key(
 /// outside `Config`, so the acquisition has to happen before the config lock. The
 /// guard parameter makes a caller with no lock a compile error; what makes a
 /// caller who takes it in the wrong ORDER fail is `lockorder`'s assertion.
-pub(crate) fn rotation_guard_for_mutation(name: &str) -> Result<RotationGuard> {
+pub(crate) fn rotation_guard_for_mutation(name: &ProfileName) -> Result<RotationGuard> {
     match RotationGuard::try_acquire(name) {
         Ok(Some(guard)) => Ok(guard),
         Ok(None) => bail!("'{name}' has a token rotation in progress, retry in a moment"),
@@ -636,8 +636,8 @@ pub(crate) fn rotation_guard_for_mutation(name: &str) -> Result<RotationGuard> {
 /// names, so `new` cannot carry one of its own.
 pub(crate) fn rename_profile(
     config: &mut AppConfig,
-    old: &str,
-    new: &str,
+    old: &ProfileName,
+    new: &ProfileName,
     _rotation: &RotationGuard,
 ) -> Result<()> {
     // Asserted rather than stated in prose: every caller today rejects a
@@ -649,7 +649,7 @@ pub(crate) fn rename_profile(
     // an account through `canonical_name`, which folds, so `work` and `WORK`
     // resolve to one account while occupying two directories.
     debug_assert!(
-        config.canonical_name(new).is_none_or(|n| n == old),
+        config.canonical_name(new).is_none_or(|n| n == old.as_str()),
         "rename target '{new}' already names an account"
     );
     with_state_lock(|| {
@@ -720,7 +720,7 @@ pub(crate) fn rename_profile(
 /// an in-flight rotation is a different hazard that no confirmation makes safe.
 pub(crate) fn delete_profile(
     config: &mut AppConfig,
-    name: &str,
+    name: &ProfileName,
     force: bool,
     _rotation: &RotationGuard,
 ) -> Result<()> {
@@ -790,7 +790,7 @@ pub(crate) fn delete_profile(
 /// an account that's already off never trips them (e.g. one that's also
 /// currently active from before this feature). Returns `Ok(true)` when it
 /// flips the flag and persists.
-pub(crate) fn disable_profile(config: &mut AppConfig, name: &str) -> Result<bool> {
+pub(crate) fn disable_profile(config: &mut AppConfig, name: &ProfileName) -> Result<bool> {
     with_state_lock(|| {
         let profile = config
             .find(name)
@@ -817,7 +817,7 @@ pub(crate) fn disable_profile(config: &mut AppConfig, name: &str) -> Result<bool
 ///
 /// Idempotent: an already-enabled account returns `Ok(false)` with no write
 /// and no error. Returns `Ok(true)` when it clears the flag and persists.
-pub(crate) fn enable_profile(config: &mut AppConfig, name: &str) -> Result<bool> {
+pub(crate) fn enable_profile(config: &mut AppConfig, name: &ProfileName) -> Result<bool> {
     with_state_lock(|| {
         let profile = config
             .find_mut(name)
@@ -867,7 +867,11 @@ pub(crate) fn create_blank_profile(
 /// The api key IS copied: it is a per-endpoint setting the Setup tab edits like
 /// any other field, and a duplicate of an api account with no key cannot talk
 /// to anything.
-pub(crate) fn duplicate_profile(config: &mut AppConfig, source: &str, name: String) -> Result<()> {
+pub(crate) fn duplicate_profile(
+    config: &mut AppConfig,
+    source: &ProfileName,
+    name: String,
+) -> Result<()> {
     with_state_lock(|| {
         let src = config.find(source).context("profile not found")?;
         let mut profile = Profile::new(name, src.base_url.clone(), src.api_key.clone());
@@ -895,7 +899,7 @@ pub(crate) fn duplicate_profile(config: &mut AppConfig, source: &str, name: Stri
 /// routed into that session's runtime settings from the first launch.
 pub(crate) fn set_profile_default_model(
     config: &mut AppConfig,
-    name: &str,
+    name: &ProfileName,
     raw_model: &str,
 ) -> Result<()> {
     let mut models = config
@@ -1017,9 +1021,10 @@ pub(crate) fn capture_into_profile(
         api_key,
         account_uuid,
     } = snapshot;
+    let name = ProfileName::from(name);
     let seed_name = name.clone();
     with_state_lock(|| {
-        let mut profile = Profile::new(name.clone(), base_url, api_key);
+        let mut profile = Profile::new(name.to_string(), base_url, api_key);
         profile.credentials = credentials;
         save_profile(&profile)?;
         config.add(profile);
@@ -1029,7 +1034,7 @@ pub(crate) fn capture_into_profile(
 
         if config.state.active_profile.is_none() {
             link_profile_credentials(&name)?;
-            config.state.active_profile = Some(name.into());
+            config.state.active_profile = Some(name.clone());
         }
         save_app_state(&config.state)
     })?;
@@ -1051,9 +1056,10 @@ pub(crate) fn create_profile_from_login(
     credentials: ClaudeCredentials,
     account_uuid: Option<AccountId>,
 ) -> Result<()> {
+    let name = ProfileName::from(name);
     let seed_name = name.clone();
     with_state_lock(|| {
-        let mut profile = Profile::new(name.clone(), None, None);
+        let mut profile = Profile::new(name.to_string(), None, None);
         profile.models.default = model
             .as_deref()
             .map(str::trim)
@@ -1065,7 +1071,7 @@ pub(crate) fn create_profile_from_login(
 
         if config.state.active_profile.is_none() {
             link_profile_credentials(&name)?;
-            config.state.active_profile = Some(name.into());
+            config.state.active_profile = Some(name.clone());
         }
         save_app_state(&config.state)
     })?;
@@ -1093,7 +1099,7 @@ pub(crate) fn create_profile_from_login(
 /// whoever finally commits it.
 pub(crate) fn overwrite_captured_profile(
     config: &mut AppConfig,
-    name: &str,
+    name: &ProfileName,
     snapshot: CaptureSnapshot,
 ) -> Result<()> {
     let CaptureSnapshot {
@@ -1144,7 +1150,7 @@ pub(crate) fn overwrite_captured_profile(
         let disabled = config.find(name).is_some_and(Profile::is_disabled);
         if config.state.active_profile.is_none() && !disabled {
             link_profile_credentials(name)?;
-            config.state.active_profile = Some(name.into());
+            config.state.active_profile = Some(name.clone());
         } else if was_active {
             // The overwritten profile is (and stays) the active one: unlike a
             // brand-new capture, `save_profile` just rewrote credentials.json
@@ -1207,7 +1213,7 @@ pub(crate) fn overwrite_captured_profile(
 /// produces. Keeps name, model, env, and chain slot. When it's the active
 /// profile, clear the live `~/.claude` link and deactivate — a credential-less
 /// profile can't be meaningfully active, and the honest state is "no active".
-pub(crate) fn clear_profile_credentials(config: &mut AppConfig, name: &str) -> Result<()> {
+pub(crate) fn clear_profile_credentials(config: &mut AppConfig, name: &ProfileName) -> Result<()> {
     with_state_lock(|| {
         let was_active = config.is_active(name);
         let profile = config
@@ -1257,7 +1263,7 @@ pub(crate) fn clear_profile_credentials(config: &mut AppConfig, name: &str) -> R
 /// the live `settings.json` (removing `ANTHROPIC_AUTH_TOKEN`) when the account is
 /// active — so a running `claude` loses the token too. The account stays active:
 /// its base url is still wired, only the key is gone.
-pub(crate) fn clear_profile_api_key(config: &mut AppConfig, name: &str) -> Result<()> {
+pub(crate) fn clear_profile_api_key(config: &mut AppConfig, name: &ProfileName) -> Result<()> {
     with_state_lock(|| {
         let base_url = config.find(name).and_then(|p| p.base_url.clone());
         edit_profile_endpoint(config, name, base_url, None)?;

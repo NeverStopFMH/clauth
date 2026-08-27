@@ -204,11 +204,14 @@ fn resume_profile_choice(
 
 /// Resolve a chosen profile name to its canonical spelling, or an error listing
 /// the available names — mirrors `main::resolve_or_bail`.
-fn resolve_profile_name(config: &AppConfig, chosen: &str) -> Result<String> {
-    config.canonical_name(chosen).ok_or_else(|| {
-        let available = config.names().join(", ");
-        anyhow::anyhow!("profile '{chosen}' not found\navailable: {available}")
-    })
+fn resolve_profile_name(config: &AppConfig, chosen: &str) -> Result<crate::profile::ProfileName> {
+    config
+        .canonical_name(chosen)
+        .map(crate::profile::ProfileName::from)
+        .ok_or_else(|| {
+            let available = config.names().join(", ");
+            anyhow::anyhow!("profile '{chosen}' not found\navailable: {available}")
+        })
 }
 
 /// The candidate list [`prompt_profile`] offers, plus the resolved default:

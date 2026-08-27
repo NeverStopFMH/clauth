@@ -12,7 +12,7 @@
 //!    `display_name`, `console_url` (the page an operator mints the key on —
 //!    cite where the vendor publishes it, since a wrong one sends someone to
 //!    another product), [`ThirdPartyTarget::throttle_key`], and
-//!    [`fetch_third_party_usage`]'s match arms.
+//!    [`Provider::fetch`].
 //! 3. Decide what the fetch AUTHENTICATES with before writing it. The api key is
 //!    not a given: Alibaba's reads inference only and every quota surface
 //!    ignores it, so [`alibaba`] runs on a separate per-profile console session
@@ -118,6 +118,23 @@ impl Provider {
             }
         }
     }
+
+    /// Fetch this provider's usage. `api_key` authorises every provider except
+    /// Alibaba: its quota lives behind the per-profile console session
+    /// (`console`), and its api key reads inference only.
+    fn fetch(
+        self,
+        api_key: &str,
+        console: Option<&ConsoleCredential>,
+    ) -> Result<ThirdPartyStats, ThirdPartyError> {
+        match self {
+            Self::DeepSeek => deepseek::fetch(api_key),
+            Self::Zai => zai::fetch(api_key),
+            // The api key is not a quota credential here — the console session is.
+            Self::Alibaba => alibaba::fetch(console),
+            Self::OpenRouter => openrouter::fetch(api_key),
+        }
+    }
 }
 
 /// What a third-party scheduler entry fetches against: a recognised provider
@@ -215,13 +232,7 @@ pub(crate) fn fetch_third_party_usage(
     hint: Option<&str>,
 ) -> Result<ThirdPartyStats, ThirdPartyError> {
     match target {
-        ThirdPartyTarget::Known { provider, console } => match provider {
-            Provider::DeepSeek => deepseek::fetch(api_key),
-            Provider::Zai => zai::fetch(api_key),
-            // The api key is not a quota credential here — the console session is.
-            Provider::Alibaba => alibaba::fetch(console.as_ref()),
-            Provider::OpenRouter => openrouter::fetch(api_key),
-        },
+        ThirdPartyTarget::Known { provider, console } => provider.fetch(api_key, console.as_ref()),
         ThirdPartyTarget::Generic { base_url } => generic::fetch(base_url, api_key, hint),
     }
 }

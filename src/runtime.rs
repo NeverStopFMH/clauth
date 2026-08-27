@@ -878,7 +878,7 @@ fn gc_one_pair(runtime: &Path, sessions: &Path) -> Result<()> {
 /// Every profile's SHARED runtime dirs: each live session's `runtime-<sid>` plus
 /// a legacy bare `runtime` an earlier release left behind. Isolated dirs are
 /// excluded — both config reconcilers walk this, and neither may reach an
-/// isolated copy (each states why at its own `known_paths`). Fail-soft: an
+/// isolated copy (why at [`crate::jsonsync::runtime_files_under`]). Fail-soft: an
 /// unreadable root or profile contributes nothing. Runs on the ~10 Hz watchdog
 /// tick, so it allocates only the paths it returns.
 pub(crate) fn shared_runtime_dirs() -> Vec<PathBuf> {

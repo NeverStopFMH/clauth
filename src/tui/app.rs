@@ -4085,7 +4085,14 @@ fn recompute_plugin_checks(app: &mut App, refresh_version: bool) {
             runtime_detail.push(String::new());
             runtime_detail.push("[f] relink credentials".to_string());
         }
-        _ => {}
+        // The other fixes are produced on their own check rows (wire / herdr /
+        // install), never on this one; `None` is a healthy or inactive link.
+        // Named, so a new `PluginFix` variant fails the build instead of a
+        // silent no-op.
+        Some(
+            PluginFix::WireMcpServers | PluginFix::HealHerdrConfig(_) | PluginFix::InstallPlugin,
+        ) => {}
+        None => {}
     }
     checks.push(Check {
         label: "runtime",
@@ -7125,7 +7132,22 @@ fn apply_model_field(models: &mut ModelSettings, field: ConfigRow, raw: &str) {
         ConfigRow::HaikuModel => models.haiku = scalar,
         ConfigRow::FableModel => models.fable = scalar,
         ConfigRow::SubagentModel => models.subagent = scalar,
-        _ => {}
+        // The other rows carry no `ModelSettings` field and never route here
+        // (`commit_model_field` is the only caller). Named, so a new
+        // `ConfigRow` variant fails the build instead of a silent no-op.
+        ConfigRow::Name
+        | ConfigRow::AutoStart
+        | ConfigRow::BaseUrl
+        | ConfigRow::ApiKey
+        | ConfigRow::ModelOverrideAdd
+        | ConfigRow::EnvEntry(_)
+        | ConfigRow::EnvAdd
+        | ConfigRow::Login
+        | ConfigRow::DeleteCreds
+        | ConfigRow::ClearSessionToken
+        | ConfigRow::Disabled
+        | ConfigRow::Delete
+        | ConfigRow::Create => {}
     }
 }
 

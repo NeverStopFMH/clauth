@@ -86,15 +86,17 @@ fn draw_selector(frame: &mut Frame<'_>, area: Rect, app: &App) {
         rows.push(selector_row(
             check.health,
             check.label,
-            theme::body(),
-            // Checks are dot-only in the list; the dot color carries the verdict
-            // and the full readout lives in the detail pane.
-            "",
-            0,
-            idx == app.plugin.cursor,
-            focused,
-            content_w,
-            check.fix.is_some(),
+            SelectorRow {
+                label_style: theme::body(),
+                // Checks are dot-only in the list; the dot color carries the
+                // verdict and the full readout lives in the detail pane.
+                value: "",
+                label_pad: 0,
+                selected: idx == app.plugin.cursor,
+                focused,
+                content_w,
+                has_fix: check.fix.is_some(),
+            },
         ));
     }
 
@@ -120,23 +122,36 @@ fn window_start(focus: usize, viewport: usize, total: usize) -> usize {
     }
 }
 
-/// One selector row: `❯ ● label   value`. Checks render dot + label only
-/// (`value` empty); profile rows pad the label to `label_pad` so their values
-/// line up in a column. The hover tint spans the full content width when
-/// selected (the ratatui filler-tint gotcha); the caret shows only in the
-/// focused pane.
-#[allow(clippy::too_many_arguments)]
-fn selector_row(
-    health: Health,
-    label: &str,
+/// The display context for one selector row — label styling, value, alignment
+/// pad, selection and focus, pane width, and the fix-marker reservation.
+/// Grouped so [`selector_row`] stays under clippy's argument limit without an
+/// ad-hoc `#[allow]`.
+#[derive(Clone, Copy)]
+struct SelectorRow<'a> {
     label_style: Style,
-    value: &str,
+    value: &'a str,
     label_pad: usize,
     selected: bool,
     focused: bool,
     content_w: usize,
     has_fix: bool,
-) -> Line<'static> {
+}
+
+/// One selector row: `❯ ● label   value`. Checks render dot + label only
+/// (`value` empty); profile rows pad the label to `label_pad` so their values
+/// line up in a column. The hover tint spans the full content width when
+/// selected (the ratatui filler-tint gotcha); the caret shows only in the
+/// focused pane.
+fn selector_row(health: Health, label: &str, row: SelectorRow<'_>) -> Line<'static> {
+    let SelectorRow {
+        label_style,
+        value,
+        label_pad,
+        selected,
+        focused,
+        content_w,
+        has_fix,
+    } = row;
     let tint = selected.then(theme::bg_hover);
     let with_bg = |style: Style| match tint {
         Some(color) => style.bg(color),

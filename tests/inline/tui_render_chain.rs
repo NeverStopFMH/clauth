@@ -78,15 +78,10 @@ fn all_exhausted_shows_resumes_hint_under_any_selected_member() {
     let on_a = member_detail(
         &cfg,
         &crate::profile::ProfileName::from("a"),
-        false,
-        0,
-        false,
-        None,
-        None,
-        None,
-        60,
-        None,
-        Default::default(),
+        MemberCard {
+            width: 60,
+            ..Default::default()
+        },
     )
     .0;
     let hint_a = resumes_line(&on_a).expect("resumes hint renders while viewing member a");
@@ -95,15 +90,10 @@ fn all_exhausted_shows_resumes_hint_under_any_selected_member() {
     let on_b = member_detail(
         &cfg,
         &crate::profile::ProfileName::from("b"),
-        false,
-        0,
-        false,
-        None,
-        None,
-        None,
-        60,
-        None,
-        Default::default(),
+        MemberCard {
+            width: 60,
+            ..Default::default()
+        },
     )
     .0;
     let hint_b = resumes_line(&on_b).expect("resumes hint renders while viewing member b");
@@ -120,15 +110,10 @@ fn partially_exhausted_chain_hides_resumes_hint() {
     let lines = member_detail(
         &cfg,
         &crate::profile::ProfileName::from("a"),
-        false,
-        0,
-        false,
-        None,
-        None,
-        None,
-        60,
-        None,
-        Default::default(),
+        MemberCard {
+            width: 60,
+            ..Default::default()
+        },
     )
     .0;
     assert!(
@@ -155,15 +140,12 @@ fn last_resort_hint_wraps_on_a_narrow_pane() {
     let lines = member_detail(
         &cfg,
         &crate::profile::ProfileName::from("a"),
-        true,
-        lr,
-        false,
-        None,
-        None,
-        None,
-        28,
-        None,
-        Default::default(),
+        MemberCard {
+            focused: true,
+            row_cursor: lr,
+            width: 28,
+            ..Default::default()
+        },
     )
     .0;
     let texts: Vec<String> = lines.iter().map(line_text).collect();
@@ -196,15 +178,12 @@ fn last_resort_hint_names_the_currently_marked_member() {
     let lines = member_detail(
         &cfg,
         &crate::profile::ProfileName::from("a"),
-        true,
-        4,
-        false,
-        None,
-        None,
-        None,
-        80,
-        None,
-        Default::default(),
+        MemberCard {
+            focused: true,
+            row_cursor: 4,
+            width: 80,
+            ..Default::default()
+        },
     )
     .0;
     let hint = lines
@@ -224,15 +203,12 @@ fn usage_gate_rows_hint_the_current_state() {
         member_detail(
             &cfg,
             &crate::profile::ProfileName::from("a"),
-            true,
-            cursor,
-            false,
-            None,
-            None,
-            None,
-            80,
-            None,
-            Default::default(),
+            MemberCard {
+                focused: true,
+                row_cursor: cursor,
+                width: 80,
+                ..Default::default()
+            },
         )
         .0
         .iter()
@@ -294,15 +270,10 @@ fn scoped_spent_pill_names_the_window_and_respects_the_gate() {
     let lines = member_detail(
         &cfg,
         &crate::profile::ProfileName::from("a"),
-        false,
-        0,
-        false,
-        None,
-        None,
-        None,
-        80,
-        None,
-        Default::default(),
+        MemberCard {
+            width: 80,
+            ..Default::default()
+        },
     )
     .0;
     let pill = lines
@@ -316,15 +287,10 @@ fn scoped_spent_pill_names_the_window_and_respects_the_gate() {
     let lines = member_detail(
         &cfg,
         &crate::profile::ProfileName::from("a"),
-        false,
-        0,
-        false,
-        None,
-        None,
-        None,
-        80,
-        None,
-        Default::default(),
+        MemberCard {
+            width: 80,
+            ..Default::default()
+        },
     )
     .0;
     assert!(
@@ -403,15 +369,12 @@ fn last_resort_value_aligns_with_other_rows() {
     let texts: Vec<String> = member_detail(
         &cfg,
         &crate::profile::ProfileName::from("a"),
-        true,
-        1,
-        false,
-        None,
-        None,
-        None,
-        60,
-        None,
-        Default::default(),
+        MemberCard {
+            focused: true,
+            row_cursor: 1,
+            width: 60,
+            ..Default::default()
+        },
     )
     .0
     .iter()
@@ -464,15 +427,12 @@ fn max_spend_row_renders_off_at_zero_and_dollars_when_set() {
         member_detail(
             c,
             &crate::profile::ProfileName::from("a"),
-            true,
-            1,
-            false,
-            None,
-            None,
-            None,
-            60,
-            None,
-            Default::default(),
+            MemberCard {
+                focused: true,
+                row_cursor: 1,
+                width: 60,
+                ..Default::default()
+            },
         )
         .0
         .iter()
@@ -684,15 +644,10 @@ fn blocked_member_shows_the_worst_reason_pill() {
     let lines = member_detail(
         &cfg,
         &crate::profile::ProfileName::from("a"),
-        false,
-        0,
-        false,
-        None,
-        None,
-        None,
-        60,
-        None,
-        Default::default(),
+        MemberCard {
+            width: 60,
+            ..Default::default()
+        },
     )
     .0;
     let pill = line_text(&lines[0]);
@@ -720,15 +675,11 @@ fn kick_rejected_member_shows_the_claude_code_blocked_pill() {
     let lines = member_detail(
         &cfg,
         &crate::profile::ProfileName::from("a"),
-        false,
-        0,
-        false,
-        None,
-        None,
-        None,
-        60,
-        Some(until),
-        Default::default(),
+        MemberCard {
+            kick_lift: Some(until),
+            width: 60,
+            ..Default::default()
+        },
     )
     .0;
     let pill = line_text(&lines[0]);
@@ -770,15 +721,10 @@ fn headroom_member_shows_no_reason_pill() {
     let lines = member_detail(
         &cfg,
         &crate::profile::ProfileName::from("a"),
-        false,
-        0,
-        false,
-        None,
-        None,
-        None,
-        60,
-        None,
-        Default::default(),
+        MemberCard {
+            width: 60,
+            ..Default::default()
+        },
     )
     .0;
     let first = line_text(&lines[0]);
@@ -812,15 +758,10 @@ fn member_detail_rows_start_indexes_the_first_fallback_row_at_every_header_heigh
         let (lines, rows_start) = member_detail(
             cfg,
             &crate::profile::ProfileName::from("a"),
-            false,
-            0,
-            false,
-            None,
-            None,
-            None,
-            width,
-            None,
-            Default::default(),
+            MemberCard {
+                width,
+                ..Default::default()
+            },
         );
         let first_row_at = lines
             .iter()
@@ -1029,15 +970,10 @@ fn member_detail_stacks_the_health_pill_under_disabled() {
     let (lines, _) = member_detail(
         &cfg,
         &crate::profile::ProfileName::from("a"),
-        false,
-        0,
-        false,
-        None,
-        None,
-        None,
-        60,
-        None,
-        Default::default(),
+        MemberCard {
+            width: 60,
+            ..Default::default()
+        },
     );
     let block: Vec<String> = lines.iter().take(4).map(line_text).collect();
     assert_eq!(
@@ -1059,15 +995,10 @@ fn member_detail_stacks_the_health_pill_under_disabled() {
     let (lines, _) = member_detail(
         &enabled,
         &crate::profile::ProfileName::from("a"),
-        false,
-        0,
-        false,
-        None,
-        None,
-        None,
-        60,
-        None,
-        Default::default(),
+        MemberCard {
+            width: 60,
+            ..Default::default()
+        },
     );
     assert_eq!(
         lines.iter().take(2).map(line_text).collect::<Vec<_>>(),
@@ -1205,15 +1136,12 @@ fn max_spend_dims_when_spend_budget_is_off() {
     let off = member_detail(
         &cfg,
         &crate::profile::ProfileName::from("a"),
-        true,
-        2,
-        false,
-        None,
-        None,
-        None,
-        60,
-        None,
-        Default::default(),
+        MemberCard {
+            focused: true,
+            row_cursor: 2,
+            width: 60,
+            ..Default::default()
+        },
     )
     .0;
     let off_val = off
@@ -1230,15 +1158,12 @@ fn max_spend_dims_when_spend_budget_is_off() {
     let on = member_detail(
         &cfg,
         &crate::profile::ProfileName::from("a"),
-        true,
-        2,
-        false,
-        None,
-        None,
-        None,
-        60,
-        None,
-        Default::default(),
+        MemberCard {
+            focused: true,
+            row_cursor: 2,
+            width: 60,
+            ..Default::default()
+        },
     )
     .0;
     let on_val = on
@@ -1262,15 +1187,12 @@ fn weekly_at_row_distinguishes_default_override_and_gated_off() {
         member_detail(
             &cfg,
             &crate::profile::ProfileName::from("a"),
-            true,
-            1,
-            false,
-            None,
-            None,
-            None,
-            80,
-            None,
-            Default::default(),
+            MemberCard {
+                focused: true,
+                row_cursor: 1,
+                width: 80,
+                ..Default::default()
+            },
         )
         .0
         .iter()
@@ -1333,15 +1255,12 @@ fn weekly_at_default_reminder_only_shows_when_value_differs_from_default() {
         member_detail(
             &cfg,
             &crate::profile::ProfileName::from("a"),
-            true,
-            1,
-            false,
-            None,
-            None,
-            None,
-            80,
-            None,
-            Default::default(),
+            MemberCard {
+                focused: true,
+                row_cursor: 1,
+                width: 80,
+                ..Default::default()
+            },
         )
         .0
         .iter()
@@ -1386,16 +1305,18 @@ fn edit_glyph_is_bold_like_the_selection_caret() {
     let line = detail_row(
         FallbackRow::Threshold,
         true,
-        80.0,
-        None,
-        98.0,
-        true,
-        true,
-        false,
-        false,
-        0.0,
-        false,
-        false,
+        MemberRow {
+            threshold: 80.0,
+            weekly_override: None,
+            weekly_default: 98.0,
+            check_weekly: true,
+            check_scoped: true,
+            last_resort: false,
+            preferred: false,
+            max_spend: 0.0,
+            spend_budget: false,
+            armed_remove: false,
+        },
         Some(&input),
     );
     let glyph = &line.spans[0];
@@ -1650,15 +1571,11 @@ fn the_member_card_places_the_session_block_above_the_five_hour_gauge() {
     let (lines, rows_start) = member_detail(
         &cfg,
         &crate::profile::ProfileName::from("a"),
-        false,
-        0,
-        false,
-        None,
-        None,
-        None,
-        60,
-        None,
-        sessions,
+        MemberCard {
+            sessions,
+            width: 60,
+            ..Default::default()
+        },
     );
     let texts = card_texts(&lines);
 
@@ -1815,15 +1732,11 @@ fn member_detail_rows_start_clears_the_session_block_at_every_height() {
             let (lines, rows_start) = member_detail(
                 &cfg,
                 &crate::profile::ProfileName::from("a"),
-                false,
-                0,
-                false,
-                None,
-                None,
-                None,
-                width,
-                None,
-                sessions,
+                MemberCard {
+                    sessions,
+                    width,
+                    ..Default::default()
+                },
             );
             let first_row_at = lines
                 .iter()

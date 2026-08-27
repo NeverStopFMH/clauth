@@ -176,15 +176,17 @@ fn draw_chain_detail(frame: &mut Frame<'_>, area: Rect, app: &App) {
                 let (lines, rows_start) = member_detail(
                     &cfg,
                     &name,
-                    detail_focused,
-                    app.fallback_detail_cursor,
-                    app.fallback_armed_remove,
-                    app.fallback_threshold_draft.as_ref(),
-                    app.fallback_max_spend_draft.as_ref(),
-                    app.fallback_weekly_draft.as_ref(),
-                    inner_w,
-                    kick_lift,
-                    app.live_sessions.member(&name),
+                    MemberCard {
+                        focused: detail_focused,
+                        row_cursor: app.fallback_detail_cursor,
+                        armed_remove: app.fallback_armed_remove,
+                        editing: app.fallback_threshold_draft.as_ref(),
+                        max_spend_editing: app.fallback_max_spend_draft.as_ref(),
+                        weekly_editing: app.fallback_weekly_draft.as_ref(),
+                        width: inner_w,
+                        kick_lift,
+                        sessions: app.live_sessions.member(&name),
+                    },
                 );
                 (name.to_string(), true, lines, rows_start)
             }
@@ -483,23 +485,41 @@ fn pill_block(pills: Vec<(Vec<Span<'static>>, String)>, width: usize) -> Vec<Lin
     lines
 }
 
-/// Live-session count, 5h gauge with threshold tick, headroom figure, and the
-/// inline `rotate at` threshold stepper/editor + `last resort` toggle + `remove` rows.
-/// Caret only when focused.
-#[allow(clippy::too_many_arguments)]
-fn member_detail(
-    cfg: &AppConfig,
-    name: &crate::profile::ProfileName,
+/// The member card's render context — pane focus, cursor, edit drafts, width,
+/// the kick lift, and the live-session tally. Grouped so [`member_detail`]
+/// stays under clippy's argument limit without an ad-hoc `#[allow]`.
+#[derive(Clone, Copy, Default)]
+struct MemberCard<'a> {
     focused: bool,
     row_cursor: usize,
     armed_remove: bool,
-    editing: Option<&InputState>,
-    max_spend_editing: Option<&InputState>,
-    weekly_editing: Option<&InputState>,
+    editing: Option<&'a InputState>,
+    max_spend_editing: Option<&'a InputState>,
+    weekly_editing: Option<&'a InputState>,
     width: usize,
     kick_lift: Option<i64>,
     sessions: crate::live_sessions::MemberSessions,
+}
+
+/// Live-session count, 5h gauge with threshold tick, headroom figure, and the
+/// inline `rotate at` threshold stepper/editor + `last resort` toggle + `remove` rows.
+/// Caret only when focused.
+fn member_detail(
+    cfg: &AppConfig,
+    name: &crate::profile::ProfileName,
+    card: MemberCard<'_>,
 ) -> (Vec<Line<'static>>, usize) {
+    let MemberCard {
+        focused,
+        row_cursor,
+        armed_remove,
+        editing,
+        max_spend_editing,
+        weekly_editing,
+        width,
+        kick_lift,
+        sessions,
+    } = card;
     let Some(profile) = cfg.find(name) else {
         return (
             vec![Line::from(Span::styled(
@@ -598,16 +618,18 @@ fn member_detail(
         let line = detail_row(
             *row,
             selected,
-            threshold,
-            profile.weekly_threshold,
-            cfg.state.weekly_switch_threshold_pct(),
-            profile.check_weekly,
-            profile.check_scoped,
-            profile.last_resort,
-            profile.preferred,
-            profile.max_auto_spend.unwrap_or(0.0),
-            cfg.state.spend_budget_switching,
-            armed_remove,
+            MemberRow {
+                threshold,
+                weekly_override: profile.weekly_threshold,
+                weekly_default: cfg.state.weekly_switch_threshold_pct(),
+                check_weekly: profile.check_weekly,
+                check_scoped: profile.check_scoped,
+                last_resort: profile.last_resort,
+                preferred: profile.preferred,
+                max_spend: profile.max_auto_spend.unwrap_or(0.0),
+                spend_budget: cfg.state.spend_budget_switching,
+                armed_remove,
+            },
             row_editing,
         );
         lines.push(if selected {
@@ -818,10 +840,12 @@ fn max_spend_hint(cfg: &AppConfig, name: &crate::profile::ProfileName, ceiling: 
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn detail_row(
-    row: FallbackRow,
-    selected: bool,
+/// The member values one FALLBACK_ROWS row renders, read off the member's
+/// `Profile` and the chain-wide `AppState` in [`member_detail`]. Grouped so
+/// [`detail_row`] stays under clippy's argument limit without an ad-hoc
+/// `#[allow]`.
+#[derive(Clone, Copy)]
+struct MemberRow {
     threshold: f64,
     weekly_override: Option<f64>,
     weekly_default: f64,
@@ -832,8 +856,26 @@ fn detail_row(
     max_spend: f64,
     spend_budget: bool,
     armed_remove: bool,
+}
+
+fn detail_row(
+    row: FallbackRow,
+    selected: bool,
+    values: MemberRow,
     editing: Option<&InputState>,
 ) -> Line<'static> {
+    let MemberRow {
+        threshold,
+        weekly_override,
+        weekly_default,
+        check_weekly,
+        check_scoped,
+        last_resort,
+        preferred,
+        max_spend,
+        spend_budget,
+        armed_remove,
+    } = values;
     let arrow = if editing.is_some() {
         Span::styled(format!("{} ", theme::edit_glyph()), theme::accent().bold())
     } else if selected {

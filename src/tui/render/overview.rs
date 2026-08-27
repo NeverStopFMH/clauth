@@ -760,7 +760,17 @@ fn fallback_flow_lines(app: &App, width: usize) -> Vec<Line<'static>> {
                 .filter(|(target, _)| target.as_str() == name.as_str())
                 .map(|(_, secs)| *secs);
             chain_row(
-                &cfg, name, i, last, name_w, gauge_w, thr_w, reason, switch_eta,
+                &cfg,
+                name,
+                ChainRowCtx {
+                    index: i,
+                    last,
+                    name_w,
+                    gauge_w,
+                    thr_w,
+                    reason,
+                    switch_eta,
+                },
             )
         })
         .collect();
@@ -894,10 +904,11 @@ impl ChainRow {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn chain_row(
-    cfg: &AppConfig,
-    name: &crate::profile::ProfileName,
+/// The geometry and trailer context one fallback-flow row renders under —
+/// position in the chain, the width budget, the blocked reason, and the
+/// projected switch eta. Grouped so [`chain_row`] stays under clippy's
+/// argument limit without an ad-hoc `#[allow]`.
+struct ChainRowCtx {
     index: usize,
     last: usize,
     name_w: usize,
@@ -905,7 +916,18 @@ fn chain_row(
     thr_w: usize,
     reason: Option<BlockedReason>,
     switch_eta: Option<i64>,
-) -> ChainRow {
+}
+
+fn chain_row(cfg: &AppConfig, name: &crate::profile::ProfileName, ctx: ChainRowCtx) -> ChainRow {
+    let ChainRowCtx {
+        index,
+        last,
+        name_w,
+        gauge_w,
+        thr_w,
+        reason,
+        switch_eta,
+    } = ctx;
     let active = cfg.is_active(name);
     let rail = if index == 0 && last == 0 {
         "╶"

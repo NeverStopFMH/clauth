@@ -36,6 +36,16 @@ fn toggles() -> RowState {
     }
 }
 
+fn tunables() -> RowTunables {
+    RowTunables {
+        refresh_interval_ms: 60_000,
+        weekly_pct: 95.0,
+        burn_floor_pct: 98.0,
+        burn_horizon_ms: 60_000,
+        default_divergence: None,
+    }
+}
+
 #[test]
 fn key_cell_is_uniform_width() {
     for key in ["theme", "weekly limit", "on mismatch", "refresh spent"] {
@@ -53,17 +63,7 @@ fn key_cell_is_uniform_width() {
 fn every_blurred_row_starts_its_value_at_the_shared_column() {
     let value_col = 2 + KEY_W + KEY_GUTTER;
     for r in GLOBAL_CONFIG_ROWS {
-        let line = line_text(&detail_row(
-            r,
-            false,
-            toggles(),
-            60_000,
-            95.0,
-            98.0,
-            60_000,
-            None,
-            None,
-        ));
+        let line = line_text(&detail_row(r, false, toggles(), tunables(), None));
         let before: String = line.chars().take(value_col).collect();
         assert!(
             before.ends_with(&" ".repeat(KEY_GUTTER)),
@@ -82,17 +82,7 @@ fn every_blurred_row_starts_its_value_at_the_shared_column() {
 #[test]
 fn selection_caret_is_bold_like_every_other_card() {
     let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
-    let line = detail_row(
-        GlobalConfigRow::Theme,
-        true,
-        toggles(),
-        60_000,
-        95.0,
-        98.0,
-        60_000,
-        None,
-        None,
-    );
+    let line = detail_row(GlobalConfigRow::Theme, true, toggles(), tunables(), None);
     let caret = &line.spans[0];
     assert!(
         caret.style.add_modifier.contains(Modifier::BOLD),
@@ -208,11 +198,7 @@ fn refresh_spent_renders_as_a_toggle_not_a_cycle() {
         GlobalConfigRow::RefreshSpentAccounts,
         false,
         toggles(),
-        60_000,
-        95.0,
-        98.0,
-        60_000,
-        None,
+        tunables(),
         None,
     ));
     assert!(on.contains(theme::toggle_on()), "on state glyph: {on}");
@@ -227,11 +213,7 @@ fn refresh_spent_renders_as_a_toggle_not_a_cycle() {
         GlobalConfigRow::RefreshSpentAccounts,
         false,
         off,
-        60_000,
-        95.0,
-        98.0,
-        60_000,
-        None,
+        tunables(),
         None,
     ));
     assert!(
@@ -256,11 +238,7 @@ fn money_spent_dims_when_spend_budget_is_off() {
         GlobalConfigRow::SwitchOffWhenBudgetSpent,
         false,
         toggles(), // spend_budget: false
-        60_000,
-        95.0,
-        98.0,
-        60_000,
-        None,
+        tunables(),
         None,
     );
     assert!(
@@ -278,11 +256,7 @@ fn money_spent_dims_when_spend_budget_is_off() {
         GlobalConfigRow::SwitchOffWhenBudgetSpent,
         true,
         on,
-        60_000,
-        95.0,
-        98.0,
-        60_000,
-        None,
+        tunables(),
         None,
     ));
     assert!(
@@ -297,12 +271,12 @@ fn money_spent_hint_states_the_halt_not_inertness() {
     // and states what the setting does. `toggles()` has switch-off-when-spent on.
     let hint = row_hint(
         GlobalConfigRow::SwitchOffWhenBudgetSpent,
-        None,
         toggles(),
-        90_000,
-        98.0,
-        98.0,
-        60_000,
+        RowTunables {
+            refresh_interval_ms: 90_000,
+            weekly_pct: 98.0,
+            ..tunables()
+        },
     )
     .expect("the money-spent row carries a behavior hint");
     assert!(!hint.contains("inert"), "gate clause dropped: {hint}");
@@ -317,11 +291,11 @@ fn a_non_default_value_shows_a_faint_default_reminder() {
         GlobalConfigRow::RefreshInterval,
         false,
         toggles(),
-        30_000,
-        98.0,
-        98.0,
-        60_000,
-        None,
+        RowTunables {
+            refresh_interval_ms: 30_000,
+            weekly_pct: 98.0,
+            ..tunables()
+        },
         None,
     ));
     assert!(
@@ -332,11 +306,11 @@ fn a_non_default_value_shows_a_faint_default_reminder() {
         GlobalConfigRow::RefreshInterval,
         false,
         toggles(),
-        90_000,
-        98.0,
-        98.0,
-        60_000,
-        None,
+        RowTunables {
+            refresh_interval_ms: 90_000,
+            weekly_pct: 98.0,
+            ..tunables()
+        },
         None,
     ));
     assert!(
@@ -351,23 +325,22 @@ fn a_non_default_value_shows_a_faint_default_reminder() {
 fn value_rows_interpolate_the_live_value_into_their_hint() {
     let refresh = row_hint(
         GlobalConfigRow::RefreshInterval,
-        None,
         toggles(),
-        30_000,
-        98.0,
-        98.0,
-        60_000,
+        RowTunables {
+            refresh_interval_ms: 30_000,
+            weekly_pct: 98.0,
+            ..tunables()
+        },
     )
     .expect("refresh row has a hint");
     assert!(refresh.contains("every 30s"), "{refresh}");
     let weekly = row_hint(
         GlobalConfigRow::WeeklyThreshold,
-        None,
         toggles(),
-        90_000,
-        95.0,
-        98.0,
-        60_000,
+        RowTunables {
+            refresh_interval_ms: 90_000,
+            ..tunables()
+        },
     )
     .expect("weekly row has a hint");
     assert!(weekly.contains("95%"), "{weekly}");
@@ -382,7 +355,7 @@ fn value_rows_interpolate_the_live_value_into_their_hint() {
 fn burn_tunables_dim_when_burn_aware_is_off() {
     let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
     for r in [GlobalConfigRow::BurnFloor, GlobalConfigRow::BurnHorizon] {
-        let dimmed = detail_row(r, false, toggles(), 60_000, 95.0, 98.0, 60_000, None, None);
+        let dimmed = detail_row(r, false, toggles(), tunables(), None);
         assert!(
             dimmed
                 .spans
@@ -394,9 +367,7 @@ fn burn_tunables_dim_when_burn_aware_is_off() {
 
         let mut on = toggles();
         on.burn_aware = true;
-        let live = line_text(&detail_row(
-            r, true, on, 60_000, 95.0, 98.0, 60_000, None, None,
-        ));
+        let live = line_text(&detail_row(r, true, on, tunables(), None));
         assert!(
             live.contains('['),
             "{r:?} burn-aware on: live + focused brackets the active preset: {live}"
@@ -417,11 +388,7 @@ fn rotation_row_is_live_on_every_platform() {
         GlobalConfigRow::PreemptiveRotation,
         false,
         toggles(),
-        60_000,
-        95.0,
-        98.0,
-        60_000,
-        None,
+        tunables(),
         None,
     );
     assert!(
@@ -437,12 +404,12 @@ fn rotation_row_is_live_on_every_platform() {
     for (state, want) in [(toggles(), "rejects"), (on, "before it expires")] {
         let hint = row_hint(
             GlobalConfigRow::PreemptiveRotation,
-            None,
             state,
-            90_000,
-            98.0,
-            98.0,
-            60_000,
+            RowTunables {
+                refresh_interval_ms: 90_000,
+                weekly_pct: 98.0,
+                ..tunables()
+            },
         )
         .expect("the rotation row carries a hint");
         assert!(
@@ -534,11 +501,7 @@ fn reset_display_row_shows_all_three_shapes() {
             GlobalConfigRow::ResetShape,
             true,
             rows,
-            60_000,
-            95.0,
-            98.0,
-            60_000,
-            None,
+            tunables(),
             None,
         ));
         assert!(
@@ -560,11 +523,7 @@ fn clock_row_dims_until_a_reset_renders_a_clock() {
         GlobalConfigRow::ClockNotation,
         false,
         toggles(),
-        60_000,
-        95.0,
-        98.0,
-        60_000,
-        None,
+        tunables(),
         None,
     );
     assert!(
@@ -583,11 +542,7 @@ fn clock_row_dims_until_a_reset_renders_a_clock() {
             GlobalConfigRow::ClockNotation,
             true,
             rows,
-            60_000,
-            95.0,
-            98.0,
-            60_000,
-            None,
+            tunables(),
             None,
         ));
         assert!(
@@ -601,9 +556,7 @@ fn clock_row_dims_until_a_reset_renders_a_clock() {
 /// changes on screen, and the notation hint is where "local timezone" is stated.
 #[test]
 fn reset_rows_hints_track_their_value() {
-    let hint = |rows: RowState, row| {
-        row_hint(row, None, rows, 60_000, 95.0, 98.0, 60_000).expect("row has a hint")
-    };
+    let hint = |rows: RowState, row| row_hint(row, rows, tunables()).expect("row has a hint");
     let mut rows = toggles();
     assert!(hint(rows, GlobalConfigRow::ResetShape).contains("how long"));
     rows.reset_display = ResetDisplay::Clock;

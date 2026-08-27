@@ -58,13 +58,18 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
             clock_format: state.clock_format(),
         }
     };
-    let refresh_interval_ms = app
-        .refresh_interval
-        .load(std::sync::atomic::Ordering::Relaxed);
-    let weekly_pct = app.config().state.weekly_switch_threshold_pct();
-    let burn_floor_pct = app.config().state.burn_switch_floor_pct();
-    let burn_horizon_ms = app.config().state.burn_horizon_cap_ms();
-    let default_divergence = app.config().state.default_divergence;
+    let tunables = {
+        let state = &app.config().state;
+        RowTunables {
+            refresh_interval_ms: app
+                .refresh_interval
+                .load(std::sync::atomic::Ordering::Relaxed),
+            weekly_pct: state.weekly_switch_threshold_pct(),
+            burn_floor_pct: state.burn_switch_floor_pct(),
+            burn_horizon_ms: state.burn_horizon_cap_ms(),
+            default_divergence: state.default_divergence,
+        }
+    };
     let cursor = app
         .global_config_cursor
         .min(GLOBAL_CONFIG_ROWS.len().saturating_sub(1));
@@ -98,17 +103,7 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
             GlobalConfigRow::WeeklyThreshold => weekly_editing,
             _ => None,
         };
-        let line = detail_row(
-            *row,
-            selected,
-            rows,
-            refresh_interval_ms,
-            weekly_pct,
-            burn_floor_pct,
-            burn_horizon_ms,
-            default_divergence,
-            row_editing,
-        );
+        let line = detail_row(*row, selected, rows, tunables, row_editing);
         match row_editing {
             Some(input) => {
                 // The native terminal cursor owns the caret; the row renders plain
@@ -131,17 +126,7 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
                 } else {
                     line
                 });
-                if selected
-                    && let Some(tip) = row_hint(
-                        *row,
-                        default_divergence,
-                        rows,
-                        refresh_interval_ms,
-                        weekly_pct,
-                        burn_floor_pct,
-                        burn_horizon_ms,
-                    )
-                {
+                if selected && let Some(tip) = row_hint(*row, rows, tunables) {
                     lines.extend(help_tooltip_lines(&tip, inner.width as usize));
                 }
             }
@@ -189,15 +174,26 @@ struct RowState {
     clock_format: ClockFormat,
 }
 
-fn row_hint(
-    row: GlobalConfigRow,
-    default_divergence: Option<DivergenceChoice>,
-    rows: RowState,
+/// The numeric tunables the Config tab's rows render, gathered once per draw.
+/// Bundled for the same argument-budget reason as [`RowState`]; [`row_hint`]
+/// reads the same bundle, so the two stay in sync as rows accumulate.
+#[derive(Clone, Copy)]
+struct RowTunables {
     refresh_interval_ms: u64,
     weekly_pct: f64,
     burn_floor_pct: f64,
     burn_horizon_ms: u64,
-) -> Option<String> {
+    default_divergence: Option<DivergenceChoice>,
+}
+
+fn row_hint(row: GlobalConfigRow, rows: RowState, tunables: RowTunables) -> Option<String> {
+    let RowTunables {
+        refresh_interval_ms,
+        weekly_pct,
+        burn_floor_pct,
+        burn_horizon_ms,
+        default_divergence,
+    } = tunables;
     // The default + units live on the row as a faint span (only when the value
     // is off its default), so the hint states behavior alone, interpolating the
     // live value. Rows another toggle makes inert render dimmed and keep their
@@ -279,18 +275,20 @@ fn row_hint(
     Some(tip)
 }
 
-#[allow(clippy::too_many_arguments)]
 fn detail_row(
     row: GlobalConfigRow,
     selected: bool,
     rows: RowState,
-    refresh_interval_ms: u64,
-    weekly_pct: f64,
-    burn_floor_pct: f64,
-    burn_horizon_ms: u64,
-    default_divergence: Option<DivergenceChoice>,
+    tunables: RowTunables,
     editing: Option<&InputState>,
 ) -> Line<'static> {
+    let RowTunables {
+        refresh_interval_ms,
+        weekly_pct,
+        burn_floor_pct,
+        burn_horizon_ms,
+        default_divergence,
+    } = tunables;
     let arrow = if editing.is_some() {
         Span::styled(format!("{} ", theme::edit_glyph()), theme::accent().bold())
     } else if selected {

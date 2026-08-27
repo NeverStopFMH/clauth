@@ -1315,13 +1315,15 @@ fn chain_row_switch_hint_rides_the_target_row() {
     let row = chain_row(
         &cfg,
         &crate::profile::ProfileName::from("a"),
-        0,
-        0,
-        8,
-        GAUGE_W,
-        3,
-        None,
-        Some(7200),
+        ChainRowCtx {
+            index: 0,
+            last: 0,
+            name_w: 8,
+            gauge_w: GAUGE_W,
+            thr_w: 3,
+            reason: None,
+            switch_eta: Some(7200),
+        },
     );
     let base = row.base_width();
     let line = row.into_line(base + TRAILER_GAP, 60);
@@ -1357,13 +1359,15 @@ fn chain_row_marks_a_homecoming_onto_preferred_with_the_house_glyph() {
         let row = chain_row(
             &cfg,
             &crate::profile::ProfileName::from(name),
-            0,
-            0,
-            8,
-            GAUGE_W,
-            3,
-            None,
-            Some(7200),
+            ChainRowCtx {
+                index: 0,
+                last: 0,
+                name_w: 8,
+                gauge_w: GAUGE_W,
+                thr_w: 3,
+                reason: None,
+                switch_eta: Some(7200),
+            },
         );
         let base = row.base_width();
         line_text(&row.into_line(base + TRAILER_GAP, 60))
@@ -1467,13 +1471,15 @@ fn chain_row_shows_both_switch_hint_and_reason_marker_when_they_fit() {
     let row = chain_row(
         &cfg,
         &crate::profile::ProfileName::from("a"),
-        0,
-        0,
-        8,
-        GAUGE_W,
-        3,
-        Some(BlockedReason::AuthBroken),
-        Some(7200),
+        ChainRowCtx {
+            index: 0,
+            last: 0,
+            name_w: 8,
+            gauge_w: GAUGE_W,
+            thr_w: 3,
+            reason: Some(BlockedReason::AuthBroken),
+            switch_eta: Some(7200),
+        },
     );
     let col = row.base_width() + TRAILER_GAP;
     let text = line_text(&row.into_line(col, 60));
@@ -1498,13 +1504,15 @@ fn chain_row_drops_switch_hint_before_reason_marker_when_narrow() {
         chain_row(
             &cfg,
             &crate::profile::ProfileName::from("a"),
-            0,
-            0,
-            8,
-            GAUGE_W,
-            3,
-            Some(BlockedReason::AuthBroken),
-            Some(7200),
+            ChainRowCtx {
+                index: 0,
+                last: 0,
+                name_w: 8,
+                gauge_w: GAUGE_W,
+                thr_w: 3,
+                reason: Some(BlockedReason::AuthBroken),
+                switch_eta: Some(7200),
+            },
         )
     };
     let col = build().base_width() + TRAILER_GAP;

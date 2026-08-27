@@ -1696,17 +1696,37 @@ fn usage_prose_keeps_a_cache_total_that_disagrees_with_its_breakdown() {
     );
 }
 
-/// An empty usage key renders `(unnamed)` rather than a blank span, so the
-/// figure stays visible with a name a reader can act on; a nested empty key
-/// reads the same in its path, and a string figure takes the marker too.
+/// An empty or all-whitespace usage key renders `(unnamed)` rather than a
+/// blank span, so the figure stays visible with a name a reader can act on; a
+/// nested blank key reads the same in its path, and a string figure takes the
+/// marker too. A key with real content keeps its own spelling, edge
+/// whitespace included.
 #[test]
 fn usage_prose_names_an_empty_key_rather_than_rendering_empty_backticks() {
     assert_eq!(usage_prose(&serde_json::json!({"": 5})), "`(unnamed)` 5");
+    assert_eq!(usage_prose(&serde_json::json!({" ": 5})), "`(unnamed)` 5");
+    assert_eq!(
+        usage_prose(&serde_json::json!({"a b": {" ": 5}})),
+        "`a b.(unnamed)` 5"
+    );
+    assert_eq!(usage_prose(&serde_json::json!({" x ": 5})), "` x ` 5");
     assert_eq!(
         usage_prose(&serde_json::json!({"a": {"": 5}})),
         "`a.(unnamed)` 5"
     );
     assert_eq!(usage_prose(&serde_json::json!({"": "x"})), "`(unnamed)` x");
+}
+
+/// The finished envelope carries the blank-key rule through to the line the
+/// model reads, not only into `usage_prose`'s own output.
+#[test]
+fn envelope_prose_names_a_blank_usage_key() {
+    let e = serde_json::json!({
+        "is_error": false,
+        "result": "done",
+        "usage": {" ": 5},
+    });
+    assert_eq!(envelope_prose(&e), "finished: done, usage: `(unnamed)` 5");
 }
 
 /// The cut walks scalars, not bytes: a multi-byte char at the boundary is

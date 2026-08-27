@@ -1126,12 +1126,12 @@ const USAGE_BUDGET: usize = 320;
 /// dotted path locates a figure for reading, never for round-tripping: a
 /// dotted key and a nesting render the same (`{"a.b":1}` and `{"a":{"b":1}}`),
 /// and an array index joins the path the same way, so `{"a":[1]}` and
-/// `{"a":{"0":1}}` collide too; an empty key segment reads `(unnamed)` rather
-/// than a blank span, so a figure whose key is blank still renders a name a
-/// reader can act on. Survivor order is claude's wire order, which
-/// `serde_json`'s `preserve_order` feature keeps in the object map. The joined
-/// clause is then cut to `USAGE_BUDGET` characters, ending with `…` only on
-/// overflow.
+/// `{"a":{"0":1}}` collide too; an empty or all-whitespace key segment reads
+/// `(unnamed)` rather than a blank span, so a figure whose key is blank still
+/// renders a name a reader can act on. Survivor order is claude's wire
+/// order, which `serde_json`'s `preserve_order` feature keeps in the object
+/// map. The joined clause is then cut to `USAGE_BUDGET` characters, ending
+/// with `…` only on overflow.
 fn usage_prose(u: &Value) -> String {
     let Some(obj) = u.as_object() else {
         return "unknown".to_string();
@@ -1204,13 +1204,19 @@ fn value_as_number(v: &Value) -> Option<f64> {
     }
 }
 
-/// One dotted-path segment. An empty key names nothing, so the segment that
-/// would render as a blank span reads `(unnamed)` instead — the figure stays
-/// visible with a name a reader can act on. A literal key spelled `(unnamed)`
-/// collides with the sentinel, and any borrowed name collides with some
-/// spellable key, so no figure vanishes either way.
+/// One dotted-path segment. A key that is empty or all whitespace names
+/// nothing, so the segment that would render as a blank span reads `(unnamed)`
+/// instead — the figure stays visible with a name a reader can act on. A key
+/// with real content keeps its own spelling, edge whitespace included. A
+/// literal key spelled `(unnamed)` collides with the sentinel, and any
+/// borrowed name collides with some spellable key, so no figure vanishes
+/// either way.
 fn path_segment(seg: &str) -> &str {
-    if seg.is_empty() { "(unnamed)" } else { seg }
+    if seg.trim().is_empty() {
+        "(unnamed)"
+    } else {
+        seg
+    }
 }
 
 /// A string that spells a finite number, or `None`. `"83930"`, `" 83930 "`
@@ -1231,9 +1237,9 @@ fn string_figure(s: &str) -> Option<(String, f64)> {
 
 /// Walk one usage value to its surviving figures, pushing one clause each. An
 /// object key or array index joins the path with a dot; arrays recurse, so a
-/// figure inside an array keeps its own path. An empty key segment reads
-/// `(unnamed)` rather than a blank span. A composite with no surviving
-/// figure pushes nothing, and its top-level key drops.
+/// figure inside an array keeps its own path. An empty or all-whitespace key
+/// segment reads `(unnamed)` rather than a blank span. A composite with no
+/// surviving figure pushes nothing, and its top-level key drops.
 fn leaf_clauses(path: &str, v: &Value, out: &mut Vec<String>) {
     match v {
         Value::Array(a) => {

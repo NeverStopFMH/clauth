@@ -329,8 +329,10 @@ pub(crate) fn build_status(
     live: Option<&LiveSignals>,
     include_disabled: bool,
 ) -> serde_json::Value {
-    let now = now_ms();
     let profiles = build_profile_entries(config, interval_ms, live, include_disabled);
+    // Stamped after the entries build (each entry reads its own clock) so
+    // `generated_at` never precedes the instant a per-entry verdict was judged at.
+    let now = now_ms();
 
     serde_json::json!({
         "schema": SCHEMA_VERSION,

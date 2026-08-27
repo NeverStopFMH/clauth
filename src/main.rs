@@ -172,17 +172,7 @@ fn dispatch(cli: Cli) -> Result<()> {
             status,
             // The default's explicit spelling: nothing to branch on.
             no_standby: _,
-        } => {
-            if status {
-                daemon::status_probe()
-            } else if replace {
-                daemon::serve(daemon::StartMode::Replace)
-            } else if standby {
-                daemon::serve(daemon::StartMode::Standby)
-            } else {
-                daemon::serve(daemon::StartMode::ExitIfRunning)
-            }
-        }
+        } => cmd_daemon(standby, replace, status),
         Command::Status {
             json: _,
             all,
@@ -196,45 +186,71 @@ fn dispatch(cli: Cli) -> Result<()> {
         // the parse pin in `tests/inline/cli.rs`, and the leg it points at is
         // pinned hermetically by the fake-`claude` tests.
         Command::SelfHeal => plugin_host::self_heal(),
-        Command::Complete => {
-            completions::print_profile_names();
-            Ok(())
-        }
+        Command::Complete => cmd_complete(),
         Command::ApiKey { profile } => cmd_api_key(&profile),
         Command::Completions { target, shell } => cmd_completions(&target, shell.as_deref()),
-        Command::Herdr { cmd } => match cmd {
-            cli::HerdrCommand::Install {
-                key,
-                no_config,
-                yes,
-            } => {
-                // The knob lives in profiles.toml (`AppState.herdr`), so the
-                // row the plugin writes matches the TUI's setting. A missing
-                // or unreadable file answers the default, never an error.
-                let delegate_row_text = crate::profile::load_config()
-                    .map(|config| config.state.herdr.delegate_row_text)
-                    .unwrap_or_else(|_| crate::profile::HerdrSettings::default().delegate_row_text);
-                herdr::install(key.as_deref(), no_config, yes, delegate_row_text)
-            }
-            cli::HerdrCommand::Uninstall { no_config, yes } => herdr::uninstall(no_config, yes),
-            cli::HerdrCommand::Config { cmd } => match cmd {
-                cli::HerdrConfigCommand::Get { key } => herdr::config_get(&key),
-            },
+        Command::Herdr { cmd } => cmd_herdr(cmd),
+        Command::Run { .. } => cmd_run(),
+        Command::External(words) => cmd_external(&words),
+    }
+}
+
+fn cmd_daemon(standby: bool, replace: bool, status: bool) -> Result<()> {
+    if status {
+        daemon::status_probe()
+    } else if replace {
+        daemon::serve(daemon::StartMode::Replace)
+    } else if standby {
+        daemon::serve(daemon::StartMode::Standby)
+    } else {
+        daemon::serve(daemon::StartMode::ExitIfRunning)
+    }
+}
+
+fn cmd_complete() -> Result<()> {
+    completions::print_profile_names();
+    Ok(())
+}
+
+fn cmd_herdr(cmd: cli::HerdrCommand) -> Result<()> {
+    match cmd {
+        cli::HerdrCommand::Install {
+            key,
+            no_config,
+            yes,
+        } => {
+            // The knob lives in profiles.toml (`AppState.herdr`), so the
+            // row the plugin writes matches the TUI's setting. A missing
+            // or unreadable file answers the default, never an error.
+            let delegate_row_text = crate::profile::load_config()
+                .map(|config| config.state.herdr.delegate_row_text)
+                .unwrap_or_else(|_| crate::profile::HerdrSettings::default().delegate_row_text);
+            herdr::install(key.as_deref(), no_config, yes, delegate_row_text)
+        }
+        cli::HerdrCommand::Uninstall { no_config, yes } => herdr::uninstall(no_config, yes),
+        cli::HerdrCommand::Config { cmd } => match cmd {
+            cli::HerdrConfigCommand::Get { key } => herdr::config_get(&key),
         },
-        Command::Run { .. } => anyhow::bail!(
-            "`clauth run` isn't a command; for a headless delegate use \
-             `clauth start <profile> -p \"<prompt>\"` (or the MCP `delegate` tool)"
-        ),
-        // A bare word is a profile name. More than one word is nothing clauth
-        // knows: a usage error rather than the old help-and-exit-0, so a typo
-        // is distinguishable from success to a calling script.
-        Command::External(words) => match words.as_slice() {
-            [name] => cmd_switch(name),
-            _ => Err(usage_error(format!(
-                "unrecognized command '{}'; run `clauth --help` for the command list",
-                words.join(" ")
-            ))),
-        },
+    }
+}
+
+fn cmd_run() -> Result<()> {
+    anyhow::bail!(
+        "`clauth run` isn't a command; for a headless delegate use \
+         `clauth start <profile> -p \"<prompt>\"` (or the MCP `delegate` tool)"
+    )
+}
+
+// A bare word is a profile name. More than one word is nothing clauth
+// knows: a usage error rather than the old help-and-exit-0, so a typo
+// is distinguishable from success to a calling script.
+fn cmd_external(words: &[String]) -> Result<()> {
+    match words {
+        [name] => cmd_switch(name),
+        _ => Err(usage_error(format!(
+            "unrecognized command '{}'; run `clauth --help` for the command list",
+            words.join(" ")
+        ))),
     }
 }
 

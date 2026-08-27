@@ -143,12 +143,11 @@ impl Ledger {
     /// `lastComputedDate` and the ledger's `recorded_through`. Days at or before
     /// it are already durable (base or ledger), so the sweep can skip them.
     pub(crate) fn effective_cutoff(&self, last_computed_date: Option<&str>) -> Option<String> {
-        match (last_computed_date, self.recorded_through.as_deref()) {
-            (Some(a), Some(b)) => Some(if a >= b { a } else { b }.to_owned()),
-            (Some(a), None) => Some(a.to_owned()),
-            (None, Some(b)) => Some(b.to_owned()),
-            (None, None) => None,
-        }
+        last_computed_date
+            .into_iter()
+            .chain(self.recorded_through.as_deref())
+            .max()
+            .map(str::to_owned)
     }
 
     /// Fold the ledger's recorded days into `base` (already holding stats-cache

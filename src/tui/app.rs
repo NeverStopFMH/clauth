@@ -614,7 +614,7 @@ pub(crate) struct DivergenceForm {
     /// that profile is NOT the active one. Surfaces a first-class "switch to
     /// it" action — the near-always-right resolution for a CC re-login into a
     /// known account, which the generic three options all get wrong.
-    pub(crate) sibling: Option<String>,
+    pub(crate) sibling: Option<ProfileName>,
     pub(crate) cursor: usize,
 }
 
@@ -626,7 +626,7 @@ pub(crate) struct DivergenceNotice {
     pub(crate) active: String,
     /// Locally identified owner of the live login when it is a NON-active
     /// profile (see [`DivergenceForm::sibling`]); drives the banner wording.
-    pub(crate) sibling: Option<String>,
+    pub(crate) sibling: Option<ProfileName>,
     /// SipHash of the live access token at identification time — the memo that
     /// keeps the 1Hz poll from re-running the owner lookup while the live login
     /// is unchanged.
@@ -665,7 +665,7 @@ impl DivergenceForm {
     pub(crate) fn actions(&self) -> Vec<DivergenceAction> {
         let mut v = Vec::with_capacity(4);
         if let Some(owner) = &self.sibling {
-            v.push(DivergenceAction::SwitchToOwner(owner.clone()));
+            v.push(DivergenceAction::SwitchToOwner(owner.to_string()));
         }
         v.extend([
             DivergenceAction::Choice(DivergenceChoice::Overwrite),
@@ -4368,7 +4368,7 @@ fn begin_capture(app: &mut App, from_divergence: bool) {
     };
     let existing_match = {
         let cfg = app.config();
-        find_matching_oauth_profile(&cfg, snapshot.credentials.as_ref()).map(str::to_string)
+        find_matching_oauth_profile(&cfg, snapshot.credentials.as_ref())
     };
     if let Some(existing) = existing_match {
         app.modals.push(Modal::Confirm(ConfirmState {
@@ -8566,7 +8566,7 @@ fn open_divergence_target_picker(app: &mut App) {
             .collect();
         let live = read_claude_credentials().ok().flatten();
         let preselect = find_matching_oauth_profile(&cfg, live.as_ref())
-            .and_then(|m| targets.iter().position(|n| n == m))
+            .and_then(|m| targets.iter().position(|n| n.as_str() == m.as_str()))
             .map_or(0, |i| i + 1);
         (targets, preselect)
     };

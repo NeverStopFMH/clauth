@@ -943,7 +943,7 @@ pub(crate) fn set_profile_default_model(
 /// active) — the same as no match, so the configured default applies unchanged.
 /// The tier can never manufacture the one harmful outcome — auto-capturing a
 /// sibling's login into the wrong profile — so its worst case is the banner.
-pub(crate) fn identify_live_login_owner(config: &AppConfig) -> Option<String> {
+pub(crate) fn identify_live_login_owner(config: &AppConfig) -> Option<ProfileName> {
     let live = read_claude_credentials().ok().flatten()?;
     let live_access = live.access_token().filter(|t| !t.is_empty());
     let live_refresh = live.refresh_token().filter(|t| !t.is_empty());
@@ -953,7 +953,7 @@ pub(crate) fn identify_live_login_owner(config: &AppConfig) -> Option<String> {
         (live_refresh.is_some() && p.refresh_token() == live_refresh)
             || (live_access.is_some() && p.access_token() == live_access)
     }) {
-        return Some(owner.name.as_str().to_string());
+        return Some(owner.name.clone());
     }
 
     // Tier 2 — account uuid: a sibling's CC re-login mints fresh tokens tier 1
@@ -964,23 +964,23 @@ pub(crate) fn identify_live_login_owner(config: &AppConfig) -> Option<String> {
             &p.name,
             crate::profile_cache::ACCOUNT_ID_CACHE_FILE,
         )?;
-        (!anchor.trim().is_empty() && anchor == live_uuid).then(|| p.name.as_str().to_string())
+        (!anchor.trim().is_empty() && anchor == live_uuid).then(|| p.name.clone())
     })
 }
 
 /// Returns a profile whose `refresh_token` matches `live`. Matches on refresh
 /// token only (stable identity); access tokens rotate and would produce false
 /// misses and duplicate profiles.
-pub(crate) fn find_matching_oauth_profile<'a>(
-    config: &'a AppConfig,
+pub(crate) fn find_matching_oauth_profile(
+    config: &AppConfig,
     live: Option<&ClaudeCredentials>,
-) -> Option<&'a str> {
+) -> Option<ProfileName> {
     let live_refresh = live?.refresh_token().filter(|t| !t.is_empty())?;
     config
         .profiles
         .iter()
         .find(|p| p.refresh_token() == Some(live_refresh))
-        .map(|p| p.name.as_str())
+        .map(|p| p.name.clone())
 }
 
 #[derive(Debug, Clone)]

@@ -135,20 +135,20 @@ Also in this bucket, both from the contributor's review of the previous revision
 
 ## Refactors landing in parallel (maintainer-side, on `mommy`)
 
-A `clean-rust` sweep on 2026-07-27 found a set of patterns that this series would otherwise duplicate across two harnesses. They are NOT a gate on the fork and they are not scope on the series: they land on `mommy` while the series is in flight, each as its own commit, sequenced so they arrive before the phase whose diff they shrink. Listed here so a rebase is never a surprise.
+A `clean-rust` sweep on 2026-07-27 found a set of patterns that this series would otherwise duplicate across two harnesses. They are NOT a gate on the fork and they are not scope on the series: they land on `mommy` while the series is in flight, each as its own commit, sequenced so they arrive before the phase whose diff they shrink. Seven of the eight landed 2026-08-27 (shas in the table); only `AccountId` remains. Listed here so a rebase is never a surprise.
 
-| refactor | lands before | why it matters to this series |
+| refactor | landed / lands before | why it matters to this series |
 |---|---|---|
-| `AppState`/`Profile` slots private behind writers taking a lock witness | phase 1 | the codex state type is born with the guarded surface instead of inheriting today's all-`pub(crate)` slots. This one CHANGES phase 1: do not copy `AppState`'s current shape |
-| `ProfileName` at the API boundary (public fns take `&str` today, so the newtype is cosmetic) | phase 1 | cross-file name uniqueness is exactly the case where a typed parameter catches "passed the other harness's name" |
-| reconciler dedup in `jsonsync` (`known_paths` and the `LAST_SYNCED` mtime fast-path are duplicated between `settings_sync.rs:85,150` and `claude_json.rs:62,71`) | phase 1 | folded fix 2 becomes one edit on a shared helper |
+| `AppState`/`Profile` slots private behind writers taking a lock witness | landed `6a68c7aa` (2026-08-27) | the codex state type is born with the guarded surface instead of inheriting today's all-`pub(crate)` slots. This one CHANGES phase 1: do not copy `AppState`'s current shape |
+| `ProfileName` at the API boundary (public fns take `&str` today, so the newtype is cosmetic) | landed `f9f42bfc` (2026-08-27) | cross-file name uniqueness is exactly the case where a typed parameter catches "passed the other harness's name" |
+| reconciler dedup in `jsonsync` (`known_paths` and the `LAST_SYNCED` mtime fast-path are duplicated between `settings_sync.rs:85,150` and `claude_json.rs:62,71`) | landed `e2e93363` (2026-08-27) | folded fix 2 becomes one edit on a shared helper |
 | `AccountId` newtype over the bare-`String` account-uuid equality checks | phase 2 | the identity comparisons multiply across two state files with no compile-time guard against an argument-order swap |
-| `SessionSwap::publish_swap` extracted, with the existing `holds::<State>()` rank assert on entry | phase 3 | the cross-function sequencing contracts around the swap live in prose today. A codex runtime that calls a primitive cannot inherit prose |
-| `ShutdownFlag` newtype over `SessionSwap`'s bare `AtomicBool` (`runtime.rs:1305`) | phase 3 | the Acquire/Release contract travels in the type instead of being re-derived per carrier |
-| typed-view consolidation across `list.rs`, `which.rs`, `profile_json.rs`, `format::account_tier` | phase 6 | the daemon writes a shape two readers re-index untyped. All three tier axes are now closed: the `canceled` override in `2000338`, then form and freshness together in `5673eca`, which moved `which --json` onto `tier_label` so every JSON surface answers from the same helper. `endpoint_label` was renamed `account_tier` and its base-url branch deleted outright (it had gone unreachable behind both callers' `is_oauth()` gates); it now returns a typed `PlanTier`, not a string, so it already stopped multiplying the untyped-`Value` pattern. What is left here is `list.rs`/`which.rs`/`profile_json.rs`'s own untyped `Value` indexing, which additive codex columns would triple |
-| one shared login-flag table behind the three completion dialects | phase 6 | a `--codex` flag otherwise means hand-editing `bash`, `zsh`, and `fish` separately |
+| `SessionSwap::publish_swap` extracted, with the existing `holds::<State>()` rank assert on entry | landed `f8eb04f3` (2026-08-27) | the cross-function sequencing contracts around the swap live in prose today. A codex runtime that calls a primitive cannot inherit prose |
+| `ShutdownFlag` newtype over `SessionSwap`'s bare `AtomicBool` (`runtime.rs:1305`) | landed `884b0fbc` (2026-08-27) | the Acquire/Release contract travels in the type instead of being re-derived per carrier |
+| typed-view consolidation across `list.rs`, `which.rs`, `profile_json.rs`, `format::account_tier` | landed `94c7e9cf` (2026-08-27) | the daemon writes a shape two readers re-index untyped. All three tier axes are now closed: the `canceled` override in `2000338`, then form and freshness together in `5673eca`, which moved `which --json` onto `tier_label` so every JSON surface answers from the same helper. `endpoint_label` was renamed `account_tier` and its base-url branch deleted outright (it had gone unreachable behind both callers' `is_oauth()` gates); it now returns a typed `PlanTier`, not a string, so it already stopped multiplying the untyped-`Value` pattern. What is left here is `list.rs`/`which.rs`/`profile_json.rs`'s own untyped `Value` indexing, which additive codex columns would triple |
+| one shared login-flag table behind the three completion dialects | landed `3c47b23a` (2026-08-27) | a `--codex` flag otherwise means hand-editing `bash`, `zsh`, and `fish` separately |
 
-The rest of the sweep has no codex multiplier and is scheduled independently.
+The rest of the sweep has no codex multiplier; all but three rows landed 2026-08-27.
 
 ## Parity map
 

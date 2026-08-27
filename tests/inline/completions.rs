@@ -19,14 +19,14 @@ fn every_shell_completes_start_isolated_flag() {
     // (script body, the flag token as each shell spells its `start` branch)
     let cases = [
         (
-            BASH,
+            &BASH,
             "\"${COMP_WORDS[1]}\" = \"start\" ] && [ \"${cur:0:2}\" = \"--\"",
         ),
         (
-            ZSH,
+            &ZSH,
             "\"${words[2]}\" == start ]] && _values 'flag' '--isolated",
         ),
-        (FISH, "__fish_seen_subcommand_from start\" -a --isolated"),
+        (&FISH, "__fish_seen_subcommand_from start\" -a --isolated"),
     ];
     for (script, branch) in cases {
         assert!(
@@ -49,18 +49,18 @@ fn every_shell_completes_start_isolated_flag() {
 #[test]
 fn every_shell_completes_start_with_fallback_flag() {
     let cases = [
-        (BASH, "--isolated --with-fallback"),
+        (&BASH, "--isolated --with-fallback"),
         // Anchored on the preceding sibling INSIDE the backslash-continued
         // block. zsh's describe entry is position-free on its own, so a needle
         // made only of it stays green while the line is moved under another
         // subcommand's branch and the flag stops being offered under `start`.
         (
-            ZSH,
+            &ZSH,
             "'--isolated[clean isolated runtime; drops operator config]' \\\n            \
              '--with-fallback[follow the fallback chain",
         ),
         (
-            FISH,
+            &FISH,
             "__fish_seen_subcommand_from start\" -a --with-fallback",
         ),
     ];
@@ -84,7 +84,7 @@ fn every_shell_completes_start_with_fallback_flag() {
 /// which is a property of this pair and not of the check.
 #[test]
 fn no_shell_offers_the_removed_rescue_flags() {
-    for (shell, script) in [("bash", BASH), ("zsh", ZSH), ("fish", FISH)] {
+    for (shell, script) in [("bash", &BASH), ("zsh", &ZSH), ("fish", &FISH)] {
         for flag in ["--rescue", "--no-rescue"] {
             assert!(
                 !offers_token(script, flag),
@@ -118,9 +118,12 @@ fn bash_and_zsh_complete_a_profile_after_start_with_fallback() {
 #[test]
 fn every_shell_completes_login_setup_token_flag() {
     let cases = [
-        (BASH, "--base-url --api-key --setup-token"),
-        (ZSH, "'--setup-token[capture a claude setup-token"),
-        (FISH, "__fish_seen_subcommand_from login\" -a --setup-token"),
+        (&BASH, "--base-url --api-key --setup-token"),
+        (&ZSH, "'--setup-token[capture a claude setup-token"),
+        (
+            &FISH,
+            "__fish_seen_subcommand_from login\" -a --setup-token",
+        ),
     ];
     for (script, gated) in cases {
         assert!(
@@ -134,6 +137,65 @@ fn every_shell_completes_login_setup_token_flag() {
     }
 }
 
+/// The scripts no longer spell the login flags themselves — the built statics
+/// splice `crate::cli::LOGIN_FLAGS` over the marker. A script still carrying
+/// it got an empty splice: every login completion missing, which the grammar
+/// walk below also reds, but one report per flag.
+#[test]
+fn no_script_carries_the_login_flags_marker() {
+    for (shell, script) in [("bash", &BASH), ("zsh", &ZSH), ("fish", &FISH)] {
+        assert!(
+            !script.contains(LOGIN_FLAGS_MARKER),
+            "{shell} still carries the raw {LOGIN_FLAGS_MARKER} marker",
+        );
+    }
+}
+
+/// The splice must drop no entry: every `LOGIN_FLAGS` flag is offered by every
+/// dialect. (That it is gated to `login` is the grammar walk's job below.)
+#[test]
+fn every_login_flag_is_offered_by_all_three_scripts() {
+    for (shell, script) in [("bash", &BASH), ("zsh", &ZSH), ("fish", &FISH)] {
+        for flag in crate::cli::LOGIN_FLAGS {
+            assert!(script.contains(flag), "{shell} must offer {flag}");
+        }
+    }
+}
+
+/// `LOGIN_FLAGS` is spliced into every script, so a stale entry would complete
+/// a spelling clap refuses — the rescue-flags class, on a list only this test
+/// reads. The grammar walk pins the other direction (a new clap flag missing
+/// from the scripts); this pins the list to clap's own `login` args.
+#[test]
+fn login_flags_matches_claps_login_args() {
+    use clap::CommandFactory as _;
+
+    let command = crate::cli::Cli::command();
+    let login = command.find_subcommand("login").expect("login subcommand");
+    // Both spellings of one clap arg (`--yes` and `-y`) are separate
+    // completion entries, so collect long and short each rather than one
+    // spelling per argument.
+    let mut clap_flags: Vec<String> = login
+        .get_arguments()
+        .flat_map(|a| {
+            a.get_long()
+                .map(|l| format!("--{l}"))
+                .into_iter()
+                .chain(a.get_short().map(|s| format!("-{s}")))
+        })
+        .collect();
+    clap_flags.sort_unstable();
+    let mut ours: Vec<String> = crate::cli::LOGIN_FLAGS
+        .iter()
+        .map(|f| (*f).to_string())
+        .collect();
+    ours.sort_unstable();
+    assert_eq!(
+        ours, clap_flags,
+        "LOGIN_FLAGS must be exactly clap's login flags"
+    );
+}
+
 /// `clauth herdr install` and `clauth herdr uninstall` are the only herdr
 /// subcommands whose flags the scripts offer, so the flag branches must track
 /// them: after `clauth herdr config get <key>` clap refuses `--key
@@ -142,12 +204,15 @@ fn every_shell_completes_login_setup_token_flag() {
 fn herdr_flags_are_offered_only_under_install_and_uninstall() {
     let cases = [
         (
-            BASH,
+            &BASH,
             r#""${COMP_WORDS[1]}" = "herdr" ] && [ "${COMP_WORDS[2]}" = "install" ]"#,
         ),
-        (ZSH, r#""${words[2]}" == herdr && "${words[3]}" == install"#),
         (
-            FISH,
+            &ZSH,
+            r#""${words[2]}" == herdr && "${words[3]}" == install"#,
+        ),
+        (
+            &FISH,
             "__fish_seen_subcommand_from herdr; and __fish_seen_subcommand_from install\" -a --key",
         ),
     ];
@@ -164,15 +229,15 @@ fn herdr_flags_are_offered_only_under_install_and_uninstall() {
     // that arm on the subcommand too.
     for (script, branch) in [
         (
-            BASH,
+            &BASH,
             r#""${COMP_WORDS[1]}" = "herdr" ] && [ "${COMP_WORDS[2]}" = "uninstall" ]"#,
         ),
         (
-            ZSH,
+            &ZSH,
             r#""${words[2]}" == herdr && "${words[3]}" == uninstall"#,
         ),
         (
-            FISH,
+            &FISH,
             "__fish_seen_subcommand_from herdr; and __fish_seen_subcommand_from uninstall\" -a --no-config",
         ),
     ] {
@@ -269,7 +334,7 @@ fn every_visible_subcommand_and_long_flag_is_offered_by_all_three_scripts() {
     );
 
     let mut missing: Vec<String> = Vec::new();
-    for (shell, script) in [("bash", BASH), ("zsh", ZSH), ("fish", FISH)] {
+    for (shell, script) in [("bash", &BASH), ("zsh", &ZSH), ("fish", &FISH)] {
         for (owner, token) in &expected {
             // A subcommand's own name is offered by the first-word branch; only
             // its flags live under the branch named after it.
@@ -412,7 +477,7 @@ trailing --after-chain
 /// whole-script fallback.
 #[test]
 fn subcommand_branch_isolates_one_subcommand_or_reports_none() {
-    for (shell, script) in [("bash", BASH), ("zsh", ZSH), ("fish", FISH)] {
+    for (shell, script) in [("bash", &BASH), ("zsh", &ZSH), ("fish", &FISH)] {
         let list = subcommand_branch(shell, script, "list")
             .unwrap_or_else(|| panic!("{shell} must have a `list` branch"));
         assert!(offers_token(&list, "--all"), "{shell}: list offers --all");
@@ -654,9 +719,9 @@ fn every_completion_script_parses_in_its_own_shell() {
     let strict = std::env::var("CLAUTH_REQUIRE_SHELL_LINT").as_deref() == Ok("1");
     let mut parsed: Vec<&str> = Vec::new();
     for (shell, bin, args, script, ext) in [
-        ("bash", "bash", &["-n"][..], BASH, ".bash"),
-        ("zsh", "zsh", &["-n"][..], ZSH, ".zsh"),
-        ("fish", "fish", &["--no-execute"][..], FISH, ".fish"),
+        ("bash", "bash", &["-n"][..], &BASH, ".bash"),
+        ("zsh", "zsh", &["-n"][..], &ZSH, ".zsh"),
+        ("fish", "fish", &["--no-execute"][..], &FISH, ".fish"),
     ] {
         match parse_check(bin, args, script, ext) {
             None => {

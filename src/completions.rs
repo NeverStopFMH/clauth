@@ -1,11 +1,13 @@
 use std::fs;
+use std::sync::LazyLock;
 
 use anyhow::{Context, Result, bail};
 
+use crate::cli::LOGIN_FLAGS;
 use crate::out::{errln, out, outln};
 use crate::profile::{home_dir, load_config};
 
-const BASH: &str = r#"_clauth() {
+const BASH_TEMPLATE: &str = r#"_clauth() {
     local cur prev
     cur="${COMP_WORDS[COMP_CWORD]}"
     prev="${COMP_WORDS[COMP_CWORD-1]}"
@@ -16,7 +18,7 @@ const BASH: &str = r#"_clauth() {
     elif [ "$prev" = "--theme" ]; then
         COMPREPLY=( $(compgen -W "full compatible" -- "${cur}") )
     elif [ "${COMP_WORDS[1]}" = "login" ] && [ "${cur:0:2}" = "--" ]; then
-        COMPREPLY=( $(compgen -W "--base-url --api-key --setup-token --yes -y --model" -- "${cur}") )
+        COMPREPLY=( $(compgen -W "__CLATHA_LOGIN_FLAGS__" -- "${cur}") )
     elif [ "${COMP_WORDS[1]}" = "start" ] && [ "${cur:0:2}" = "--" ]; then
         COMPREPLY=( $(compgen -W "--isolated --with-fallback" -- "${cur}") )
     elif [ "${COMP_WORDS[1]}" = "daemon" ] && [ "${cur:0:2}" = "--" ]; then
@@ -63,7 +65,7 @@ const BASH: &str = r#"_clauth() {
 complete -F _clauth clauth
 "#;
 
-const ZSH: &str = r#"#compdef clauth
+const ZSH_TEMPLATE: &str = r#"#compdef clauth
 _clauth() {
     if (( CURRENT == 2 )); then
         local -a profiles
@@ -127,7 +129,7 @@ _clauth() {
     elif (( CURRENT >= 3 )) && [[ "${words[2]}" == resume ]]; then
         _values 'flag' '--profile[resume under this profile instead of prompting]'
     elif (( CURRENT >= 4 )) && [[ "${words[2]}" == login ]]; then
-        _values 'flag' '--base-url[API base url]' '--api-key[API key (prompted echo-off if omitted)]' '--setup-token[capture a claude setup-token mint as a long-lived login]' '--yes[replace an existing long-lived token unprompted]' '-y[replace an existing long-lived token unprompted]' '--model[set the default model before signing in]'
+        _values 'flag' __CLATHA_LOGIN_FLAGS__
     elif (( CURRENT >= 4 )) && [[ "${words[2]}" == delete ]]; then
         _values 'flag' '--yes[skip the confirm prompt]' '-y[skip the confirm prompt]' '--force[override the live-session guard]'
     elif (( CURRENT >= 4 )) && [[ "${words[2]}" == static-token ]]; then
@@ -149,7 +151,7 @@ _clauth() {
 _clauth "$@"
 "#;
 
-const FISH: &str = r#"function __clauth_profiles
+const FISH_TEMPLATE: &str = r#"function __clauth_profiles
     clauth __complete 2>/dev/null
 end
 complete -c clauth -f
@@ -192,12 +194,7 @@ complete -c clauth -f -n "__fish_seen_subcommand_from sessions" -a --json -d "Em
 complete -c clauth -f -n "__fish_seen_subcommand_from jobs" -a --json -d "Emit the stable machine-readable array"
 complete -c clauth -f -n "__fish_seen_subcommand_from sessions" -a --tokens -d "Add token totals + cost; reads every transcript in full"
 complete -c clauth -f -n "__fish_seen_subcommand_from resume" -a --profile -d "Resume under this profile instead of prompting"
-complete -c clauth -f -n "__fish_seen_subcommand_from login" -a --base-url -d "API base url"
-complete -c clauth -f -n "__fish_seen_subcommand_from login" -a --api-key -d "API key (prompted echo-off if omitted)"
-complete -c clauth -f -n "__fish_seen_subcommand_from login" -a --setup-token -d "Capture a claude setup-token mint as a long-lived login"
-complete -c clauth -f -n "__fish_seen_subcommand_from login" -a --yes -d "Replace an existing long-lived token unprompted"
-complete -c clauth -f -n "__fish_seen_subcommand_from login" -a -y -d "Replace an existing long-lived token unprompted"
-complete -c clauth -f -n "__fish_seen_subcommand_from login" -a --model -d "Set default model before signing in"
+__CLATHA_LOGIN_FLAGS__
 complete -c clauth -f -n "__fish_seen_subcommand_from delete" -a --yes -d "Skip the confirm prompt"
 complete -c clauth -f -n "__fish_seen_subcommand_from delete" -a -y -d "Skip the confirm prompt"
 complete -c clauth -f -n "__fish_seen_subcommand_from delete" -a --force -d "Override the live-session guard"
@@ -217,11 +214,85 @@ complete -c clauth -f -n "__fish_seen_subcommand_from daemon" -a --replace -d "T
 complete -c clauth -f -n "__fish_seen_subcommand_from daemon" -a --status -d "Print the running daemon, or exit 1 when none is"
 "#;
 
+/// The placeholder each script carries where its `login` flag list goes; the
+/// built scripts below splice `crate::cli::LOGIN_FLAGS` over it, so a script
+/// that still shows the marker never got its login completions.
+const LOGIN_FLAGS_MARKER: &str = "__CLATHA_LOGIN_FLAGS__";
+
+/// `login` flag help, per dialect: zsh's `_values` spec and fish's `-d` copy
+/// differ in casing and wording, so the help stays here while the flag NAMES
+/// stay in `crate::cli::LOGIN_FLAGS`. A flag without an entry still completes,
+/// bare.
+const ZSH_LOGIN_DESCS: &[(&str, &str)] = &[
+    ("--base-url", "API base url"),
+    ("--api-key", "API key (prompted echo-off if omitted)"),
+    (
+        "--setup-token",
+        "capture a claude setup-token mint as a long-lived login",
+    ),
+    ("--yes", "replace an existing long-lived token unprompted"),
+    ("-y", "replace an existing long-lived token unprompted"),
+    ("--model", "set the default model before signing in"),
+];
+
+const FISH_LOGIN_DESCS: &[(&str, &str)] = &[
+    ("--base-url", "API base url"),
+    ("--api-key", "API key (prompted echo-off if omitted)"),
+    (
+        "--setup-token",
+        "Capture a claude setup-token mint as a long-lived login",
+    ),
+    ("--yes", "Replace an existing long-lived token unprompted"),
+    ("-y", "Replace an existing long-lived token unprompted"),
+    ("--model", "Set default model before signing in"),
+];
+
+fn desc_of<'a>(descs: &'a [(&str, &str)], flag: &str) -> Option<&'a str> {
+    descs.iter().find(|(f, _)| *f == flag).map(|(_, d)| *d)
+}
+
+fn bash_login_flags() -> String {
+    LOGIN_FLAGS.join(" ")
+}
+
+fn zsh_login_flags() -> String {
+    LOGIN_FLAGS
+        .iter()
+        .map(|f| match desc_of(ZSH_LOGIN_DESCS, f) {
+            Some(d) => format!("'{f}[{d}]'"),
+            None => format!("'{f}'"),
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn fish_login_flags() -> String {
+    LOGIN_FLAGS
+        .iter()
+        .map(|f| match desc_of(FISH_LOGIN_DESCS, f) {
+            Some(d) => format!(
+                "complete -c clauth -f -n \"__fish_seen_subcommand_from login\" -a {f} -d \"{d}\""
+            ),
+            None => {
+                format!("complete -c clauth -f -n \"__fish_seen_subcommand_from login\" -a {f}")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+static BASH: LazyLock<String> =
+    LazyLock::new(|| BASH_TEMPLATE.replace(LOGIN_FLAGS_MARKER, &bash_login_flags()));
+static ZSH: LazyLock<String> =
+    LazyLock::new(|| ZSH_TEMPLATE.replace(LOGIN_FLAGS_MARKER, &zsh_login_flags()));
+static FISH: LazyLock<String> =
+    LazyLock::new(|| FISH_TEMPLATE.replace(LOGIN_FLAGS_MARKER, &fish_login_flags()));
+
 pub(crate) fn print_script(shell: &str) -> Result<()> {
     let script = match shell {
-        "bash" => BASH,
-        "zsh" => ZSH,
-        "fish" => FISH,
+        "bash" => BASH.as_str(),
+        "zsh" => ZSH.as_str(),
+        "fish" => FISH.as_str(),
         _ => bail!("unsupported shell '{shell}', expected: bash, zsh, fish"),
     };
     out!("{script}");
@@ -244,8 +315,8 @@ pub(crate) fn install(shell: Option<&str>) -> Result<()> {
     };
 
     match shell.as_str() {
-        "bash" => install_rc("bash", BASH, ".bashrc"),
-        "zsh" => install_rc("zsh", ZSH, ".zshrc"),
+        "bash" => install_rc("bash", &BASH, ".bashrc"),
+        "zsh" => install_rc("zsh", &ZSH, ".zshrc"),
         "fish" => install_fish(),
         s => bail!("unsupported shell '{s}', expected: bash, zsh, fish"),
     }
@@ -381,7 +452,7 @@ fn install_fish() -> Result<()> {
     let dir = home.join(".config").join("fish").join("completions");
     fs::create_dir_all(&dir)?;
     let path = dir.join("clauth.fish");
-    fs::write(&path, FISH).with_context(|| format!("failed to write {}", path.display()))?;
+    fs::write(&path, &*FISH).with_context(|| format!("failed to write {}", path.display()))?;
     Ok(())
 }
 

@@ -402,6 +402,18 @@ pub(crate) struct LoginArgs {
     pub(crate) model: Option<String>,
 }
 
+/// `login` flags in completion order. The single source the bash/zsh/fish
+/// scripts in `completions.rs` splice in, so a new login flag is added here
+/// and nowhere else.
+pub(crate) const LOGIN_FLAGS: &[&str] = &[
+    "--base-url",
+    "--api-key",
+    "--setup-token",
+    "--yes",
+    "-y",
+    "--model",
+];
+
 impl LoginArgs {
     /// API-key mode: capture a base_url + api_key pair instead of browser OAuth.
     pub(crate) fn is_api_mode(&self) -> bool {

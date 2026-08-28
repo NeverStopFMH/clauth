@@ -425,8 +425,8 @@ pub(crate) fn format_pct(pct: f64) -> String {
 /// The one LOCAL prose-stamp formatter: an epoch-seconds instant as
 /// `YYYY-MM-DD HH:MM:SS` in the operator's local wall clock. A second spelling
 /// of a LOCAL stamp is a bug in its caller, not a new helper. Machine timestamps
-/// that stay UTC by design — the daemon `logline!` prefix and `clauth sessions`
-/// (its JSON `updated` and table column) — do not route through here.
+/// that stay UTC by design — the daemon `logline!` prefix and `clauth sessions
+/// --json`'s `updated` — do not route through here.
 /// Returns `None` when the instant falls outside chrono's representable range.
 pub(crate) fn local_stamp(epoch: i64) -> Option<String> {
     let naive = DateTime::from_timestamp(epoch, 0)?

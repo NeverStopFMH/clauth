@@ -211,18 +211,117 @@ fn the_table_carries_the_token_columns_only_under_tokens() {
         Some(&price_table(&[("claude-sonnet-4", 0.003, 0.015)])),
     );
     let session = &groups[0].sessions[0];
+    let now = SystemTime::UNIX_EPOCH + Duration::from_secs(3_000 + 3_600);
 
-    let plain = session_row(session, false);
+    let plain = session_row(session, false, now);
     assert!(
         !plain.contains("150") && !plain.contains('$'),
         "the default row carries neither figure: {plain}"
     );
     assert!(plain.contains("hello"), "it still carries the preview");
 
-    let annotated = session_row(session, true);
+    let annotated = session_row(session, true, now);
     assert!(
         annotated.contains("150") && annotated.contains("$1.05"),
         "--tokens adds both cells: {annotated}"
+    );
+}
+
+// ── the stamp cell: local wall clock + age ──
+
+/// The human row renders `updated` as LOCAL wall clock paired with its
+/// relative age (the 2026-08-22 ruling) — never the ISO machine stamp the
+/// JSON row keeps. The expected stamp derives through chrono's own `format`
+/// rather than the crate's formatter, so the pin is a second derivation of
+/// the same claim and holds in any zone; where the fixture instant's local
+/// spelling differs from its UTC one, the UTC digits must be ABSENT (when
+/// the two spellings coincide there is no second spelling to ban).
+#[test]
+fn the_table_stamp_renders_local_wall_clock_with_a_relative_age() {
+    let sb = HomeSandbox::new();
+    let a = sb.home().join(".claude/projects/-w-a/aaaa-1111.jsonl");
+    write_jsonl(&a, &[user_line("aaaa-1111", "/ws/a", "hello")]);
+    // 2026-06-21T00:00:00Z, with a `now` exactly 3h 12m later — the age cell
+    // is deterministic by construction.
+    let updated = SystemTime::UNIX_EPOCH + Duration::from_secs(1_782_000_000);
+    let now = updated + Duration::from_secs(11_520);
+    set_mtime(&a, updated);
+
+    let groups = build_listing(false);
+    let session = &groups[0].sessions[0];
+    let row = session_row(session, false, now);
+
+    let local = chrono::DateTime::from_timestamp(1_782_000_000, 0)
+        .unwrap()
+        .with_timezone(&chrono::Local)
+        .format("%Y-%m-%d %H:%M:%S")
+        .to_string();
+    assert!(
+        row.contains(&format!("{local} · 3h 12m ago")),
+        "the row renders the local stamp paired with its age: {row}"
+    );
+    assert!(
+        !row.contains("+00:00"),
+        "no machine offset marker survives in the human row: {row}"
+    );
+    // Compared spelling-on-spelling, never via a run-instant offset read: a
+    // DST zone (Atlantic/Azores) reads +00 at the fixture instant while the
+    // RUN instant is -01, and that read would fire the guard over two
+    // identical spellings.
+    let utc = chrono::DateTime::from_timestamp(1_782_000_000, 0)
+        .unwrap()
+        .format("%Y-%m-%d %H:%M:%S")
+        .to_string();
+    if local != utc {
+        assert!(
+            !row.contains(&utc),
+            "the stamp renders UTC digits, not local wall clock: {row}"
+        );
+    }
+}
+
+/// The human row and the JSON `updated` field disagree on shape BY DESIGN
+/// (owner ruling 2026-08-22: `--json` keeps the documented ISO-8601 UTC).
+/// Pinned BOTH directions — the ISO spelling must not reach the human row,
+/// the local spelling must not reach the JSON field — so an edit that
+/// "aligns" either surface reds this test.
+#[test]
+fn the_human_row_and_json_disagree_on_the_stamp_shape_by_design() {
+    let sb = HomeSandbox::new();
+    let a = sb.home().join(".claude/projects/-w-a/aaaa-1111.jsonl");
+    write_jsonl(&a, &[user_line("aaaa-1111", "/ws/a", "hello")]);
+    let updated = SystemTime::UNIX_EPOCH + Duration::from_secs(1_782_000_000);
+    let now = updated + Duration::from_secs(11_520);
+    set_mtime(&a, updated);
+
+    let groups = build_listing(false);
+    let session = &groups[0].sessions[0];
+    let human = session_row(session, false, now);
+    let json_updated = session_json_row(session)["updated"]
+        .as_str()
+        .expect("updated is a string")
+        .to_string();
+
+    assert!(
+        json_updated.contains('T') && json_updated.ends_with("+00:00"),
+        "the json field keeps the documented ISO-8601 UTC shape: {json_updated}"
+    );
+    let local = chrono::DateTime::from_timestamp(1_782_000_000, 0)
+        .unwrap()
+        .with_timezone(&chrono::Local)
+        .format("%Y-%m-%d %H:%M:%S")
+        .to_string();
+    assert!(
+        human.contains(&format!("{local} · 3h 12m ago")),
+        "the human row renders the local stamp and its age: {human}"
+    );
+    assert!(
+        !human.contains(&json_updated),
+        "the ISO spelling must not reach the human row: {human}"
+    );
+    assert!(
+        !json_updated.contains(&local),
+        "the local spelling must not reach the json field: {json_updated}"
     );
 }
 

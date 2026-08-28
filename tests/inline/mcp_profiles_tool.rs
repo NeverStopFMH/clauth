@@ -78,7 +78,7 @@ fn names_filter_selects_one_profile_case_insensitively() {
     assert_eq!(
         lines(&call_profiles(None, None)),
         vec![
-            "- solo (active) [anthropic]: usage unknown; tier unknown",
+            "- solo (global active) [anthropic]: usage unknown; tier unknown",
             "- vendor [DeepSeek, api.deepseek.com]: usage unknown; no api key",
         ],
         "fixture control: both profiles are visible unfiltered",
@@ -145,7 +145,10 @@ fn quiet_fields_are_absent_and_the_endpoint_prints_as_a_host() {
     let mut rows = text.lines();
 
     let solo = rows.next().expect("solo line");
-    assert!(solo.starts_with("- solo (active) [anthropic]"), "{solo}");
+    assert!(
+        solo.starts_with("- solo (global active) [anthropic]"),
+        "{solo}"
+    );
     assert!(
         !solo.contains("live session"),
         "no live session, so the flag must not appear",
@@ -173,7 +176,10 @@ fn quiet_fields_are_absent_and_the_endpoint_prints_as_a_host() {
         solo.contains("usage unknown") && solo.contains("tier unknown"),
         "a null window and a null tier read as unknown, never drop out: {solo}",
     );
-    assert!(solo.contains("(active)"), "the active marker is present");
+    assert!(
+        solo.contains("(global active)"),
+        "the active marker is present"
+    );
 }
 
 /// Three profiles spanning the auth states: an OAuth account, a keyed
@@ -236,7 +242,7 @@ fn prose_names_the_keyless_profile_and_leaves_the_others_unchanged() {
     assert_eq!(
         lines,
         vec![
-            "- solo (active) [anthropic]: usage unknown; tier unknown".to_string(),
+            "- solo (global active) [anthropic]: usage unknown; tier unknown".to_string(),
             "- keyed [DeepSeek, api.deepseek.com]: usage unknown".to_string(),
             "- keyless [DeepSeek, api.deepseek.com]: usage unknown; no api key".to_string(),
         ],
@@ -289,7 +295,7 @@ fn roster_flags_name_each_state_and_leave_a_clean_row_unchanged() {
     assert_eq!(
         lines(&call_profiles(None, None)),
         vec![
-            "- solo (active) [anthropic]: usage unknown; tier unknown".to_string(),
+            "- solo (global active) [anthropic]: usage unknown; tier unknown".to_string(),
             "- off [anthropic]: usage unknown; tier unknown; disabled".to_string(),
             "- dead [anthropic]: usage unknown; tier unknown; login expired".to_string(),
             "- gone [anthropic, Free]: usage unknown; subscription canceled".to_string(),
@@ -385,7 +391,7 @@ fn session_scope_resolves_the_tier_through_the_which_tiers() {
     let text = first_text(&result);
     let row = text.lines().next().expect("the session row");
     assert!(
-        row.starts_with("- kerry (active) [anthropic, Free]"),
+        row.starts_with("- kerry (global active) [anthropic, Free]"),
         "one row, resolved to the seeded account with the CACHED tier: {row}",
     );
     assert!(
@@ -394,14 +400,14 @@ fn session_scope_resolves_the_tier_through_the_which_tiers() {
     );
     // The live-usage fold names the CONFIGURED active profile. Here that is the
     // same account the row resolved to, so its clause would restate the row's
-    // own headroom word for word and is dropped — the row's `(active)` marker
+    // own headroom word for word and is dropped — the row's `(global active)` marker
     // already says the two are one account.
     assert!(
         !text.contains("active profile `kerry`"),
         "one account must not spell its headroom twice on one line: {text}",
     );
     assert!(
-        row.contains("(active)"),
+        row.contains("(global active)"),
         "and what the dropped clause said is still on the row: {row}",
     );
 }
@@ -437,7 +443,7 @@ fn a_generic_api_key_row_reports_its_own_figures_and_claims_no_anthropic_plan() 
     let row = lines(&call_profiles(None, None)).remove(0);
     assert_eq!(
         row,
-        "- litellm (active) [anthropic, 127.0.0.1:4000, local endpoint]: \
+        "- litellm (global active) [anthropic, 127.0.0.1:4000, local endpoint]: \
          no 5h/7d limits; total: 31.45 CNY",
         "the account's own cached figures, no claim about a plan it cannot have, and the \
          locality marker its loopback base url earns — pinned here on a row the production \
@@ -496,7 +502,7 @@ fn a_bars_carrying_z_ai_row_renders_the_headline_alone() {
 
     let row = lines(&call_profiles(None, None)).remove(0);
     assert!(
-        row.starts_with("- glm (active) [Z.ai, api.z.ai]: "),
+        row.starts_with("- glm (global active) [Z.ai, api.z.ai]: "),
         "the row is the z.ai roster row: {row}",
     );
     assert!(
@@ -577,7 +583,7 @@ fn a_single_wallet_profile_renders_unchanged() {
         "the single wallet is the rendered figure, as before: {row}",
     );
     assert!(
-        row.starts_with("- one (active) [DeepSeek, api.deepseek.com]: "),
+        row.starts_with("- one (global active) [DeepSeek, api.deepseek.com]: "),
         "the row's identity half is untouched by the ruling: {row}",
     );
 }
@@ -639,7 +645,7 @@ fn an_env_authored_endpoint_renders_its_host_in_the_roster_row() {
     assert_eq!(
         rows,
         vec![
-            "- envhost (active) [anthropic, localhost:4000, local endpoint]: \
+            "- envhost (global active) [anthropic, localhost:4000, local endpoint]: \
              usage unknown; tier unknown"
                 .to_string()
         ],
@@ -675,7 +681,7 @@ fn a_third_party_session_row_claims_no_unknown_it_structurally_has_none_of() {
     let text = first_text(&call_profiles(None, Some("session")));
     let row = text.lines().next().expect("the session row");
     assert!(
-        row.starts_with("- vendor (active) [DeepSeek, api.deepseek.com]"),
+        row.starts_with("- vendor (global active) [DeepSeek, api.deepseek.com]"),
         "the session resolves to the third-party account: {row}",
     );
     assert!(
@@ -699,6 +705,10 @@ fn session_scope_reply_carries_the_session_notes() {
     seed_canceled_account();
     let runtime = home.home().join(".clauth/profiles/kerry/runtime-4242-1");
     std::fs::create_dir_all(&runtime).expect("runtime dir");
+    // The runtime-paths note renders only when the probe finds a shared entry;
+    // an empty tree reads `NothingShared` and earns none, so the fixture poses
+    // one copy-mode entry.
+    std::fs::write(runtime.join("CLAUDE.md"), "").expect("CLAUDE.md copy");
     let _dir = ConfigDirSandbox::new(&home, &runtime);
 
     let text = first_text(&call_profiles(None, Some("session")));

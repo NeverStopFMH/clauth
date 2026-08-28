@@ -5749,6 +5749,12 @@ fn a_batch_cancel_renders_one_verdict_per_asked_job_and_the_hedge_last() {
         text.contains("`d-784001-0` running") && text.contains("`d-784002-0` unknown"),
         "the still-alive lane reports running and the unheld one unknown: {text}"
     );
+    assert!(
+        text.ends_with(
+            "1 unknown job id(s): use monitor without `job_ids` to list the existing jobs."
+        ),
+        "the cancel-mode batch carries the same unknown-id tail clause as the plain batch: {text}"
+    );
 }
 
 /// A Done file far older than anything this call could have caused renders no

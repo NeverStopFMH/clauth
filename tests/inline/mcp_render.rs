@@ -126,7 +126,11 @@ fn third_party_headline_unavailable_when_empty() {
 #[test]
 fn instructions_block_emits_stable_roster_router_and_safety_prose() {
     let profiles = vec![snapshot("work", true), snapshot("personal", false)];
-    let out = instructions_block(&profiles, &SessionAuth::Global, None);
+    let out = instructions_block(
+        &profiles,
+        &SessionAuth::Global,
+        crate::runtime::LinkProbe::NothingShared,
+    );
 
     // identity: a global session IS the global link, so the header names the
     // active profile as the session's own account.
@@ -328,9 +332,10 @@ fn session_auth_variants_shape_switch_note_and_runtime_paths() {
     // or describe a foreign tree it has never read.
     //
     // The note states the transport the caller probed (`runtime::link_mode_of`),
-    // one arm per mode plus a both-transports fallback. Each arm is pinned on
-    // its own literal so a reword cannot silently fold one transport into the
-    // other, and the consequence stays in every arm.
+    // one arm per verdict: `Real` and `Fake` each state their transport,
+    // `Mixed` names both, and `NothingShared` renders no note. Each arm is
+    // pinned on its own literal so a reword cannot silently fold one transport
+    // into the other, and the consequence stays in every rendered arm.
     let profiles = vec![snapshot("work", false), snapshot("personal", true)];
 
     // Symlink host: the shared entries are links, so existing-file edits land
@@ -338,7 +343,7 @@ fn session_auth_variants_shape_switch_note_and_runtime_paths() {
     let runtime_block = instructions_block(
         &profiles,
         &SessionAuth::IsolatedRuntime("work".into()),
-        Some(crate::runtime::LinkMode::Real),
+        crate::runtime::LinkProbe::Real,
     );
     assert!(
         runtime_block.contains("runtime paths:"),
@@ -372,7 +377,7 @@ fn session_auth_variants_shape_switch_note_and_runtime_paths() {
     let copy_block = instructions_block(
         &profiles,
         &SessionAuth::IsolatedRuntime("work".into()),
-        Some(crate::runtime::LinkMode::Fake),
+        crate::runtime::LinkProbe::Fake,
     );
     assert!(
         copy_block.contains("this host keeps a copy"),
@@ -391,19 +396,39 @@ fn session_auth_variants_shape_switch_note_and_runtime_paths() {
         "a fresh file propagates on a copy host: {copy_block}",
     );
 
-    // Undecidable: both transports, no mode-specific clause.
-    let unknown_block = instructions_block(
+    // Mixed: the entries disagree, so the note names both transports.
+    let mixed_block = instructions_block(
         &profiles,
         &SessionAuth::IsolatedRuntime("work".into()),
-        None,
+        crate::runtime::LinkProbe::Mixed,
     );
     assert!(
-        unknown_block.contains("recursive copy"),
-        "the undecidable arm names both transports: {unknown_block}",
+        mixed_block.contains("recursive copy"),
+        "the Mixed arm names both transports: {mixed_block}",
     );
     assert!(
-        unknown_block.contains("reaches the global file"),
-        "the consequence stays in the fallback arm too: {unknown_block}",
+        mixed_block.contains("reaches the global file"),
+        "the consequence stays in the Mixed arm too: {mixed_block}",
+    );
+
+    // NothingShared: a tree sharing no entry has no mirror paths to describe,
+    // so the tier earns no note rather than a hedge about a layout it lacks.
+    let empty_block = instructions_block(
+        &profiles,
+        &SessionAuth::IsolatedRuntime("work".into()),
+        crate::runtime::LinkProbe::NothingShared,
+    );
+    assert!(
+        runtime_paths_note(
+            &SessionAuth::IsolatedRuntime("work".into()),
+            crate::runtime::LinkProbe::NothingShared,
+        )
+        .is_none(),
+        "an empty tree earns no runtime-paths note",
+    );
+    assert!(
+        !empty_block.contains("runtime paths:"),
+        "and the block states nothing about paths the tree does not share: {empty_block}",
     );
 
     // The block's identity line and roster markers, resolved per tier: the
@@ -436,13 +461,19 @@ unaffected)"
         "the isolated switch consequence must survive a prose edit: {runtime_block}",
     );
 
-    for (other, mode) in [
-        (SessionAuth::Global, None),
-        (SessionAuth::IsolatedCustom, None),
+    for (other, probe) in [
+        (
+            SessionAuth::Global,
+            crate::runtime::LinkProbe::NothingShared,
+        ),
+        (
+            SessionAuth::IsolatedCustom,
+            crate::runtime::LinkProbe::NothingShared,
+        ),
     ] {
-        assert!(runtime_paths_note(&other, mode).is_none());
+        assert!(runtime_paths_note(&other, probe).is_none());
         assert!(
-            !instructions_block(&profiles, &other, mode).contains("runtime paths:"),
+            !instructions_block(&profiles, &other, probe).contains("runtime paths:"),
             "only an isolated `clauth start` runtime may claim the runtime layout",
         );
     }
@@ -454,7 +485,7 @@ unaffected)"
     let both = instructions_block(
         &[snapshot("work", true)],
         &SessionAuth::IsolatedRuntime("work".into()),
-        None,
+        crate::runtime::LinkProbe::NothingShared,
     );
     assert!(
         both.contains("work (global active, this session)"),
@@ -464,7 +495,11 @@ unaffected)"
     // The custom tier's own arms: its identity line and its `(global active)`
     // marker are the only claims a foreign `CLAUDE_CONFIG_DIR` makes, and no
     // assertion above reaches them.
-    let custom = instructions_block(&profiles, &SessionAuth::IsolatedCustom, None);
+    let custom = instructions_block(
+        &profiles,
+        &SessionAuth::IsolatedCustom,
+        crate::runtime::LinkProbe::NothingShared,
+    );
     assert!(
         custom.contains("custom `CLAUDE_CONFIG_DIR`"),
         "the custom header must survive a prose edit: {custom}",
@@ -481,7 +516,7 @@ unaffected)"
     // The bans that held the old two-mode note hold the new one too: the note
     // never constructs a runtime path, never names a path clauth does not build,
     // and never spells a transport as universal.
-    for block in [&runtime_block, &copy_block, &unknown_block] {
+    for block in [&runtime_block, &copy_block, &mixed_block] {
         assert!(
             !block.contains("/runtime/"),
             "no constructed runtime path: {block}"
@@ -680,7 +715,7 @@ fn profiles_prose_renders_each_row_with_unknown_for_null_fields() {
     let text = profiles_prose(&serde_json::json!({"profiles": [solo, vendor]}));
     assert_eq!(
         text,
-        "- solo (active) [anthropic]: usage unknown; tier unknown\n\
+        "- solo (global active) [anthropic]: usage unknown; tier unknown\n\
          - vendor [DeepSeek, api.deepseek.com]: no 5h/7d limits; api balance: 31.45 CNY; \
          live session; throughput: `deepseek-chat` 12.3 tok/s (degraded)"
     );
@@ -1211,8 +1246,8 @@ fn session_scope_prose_names_the_row_its_source_and_usage() {
     });
     assert_eq!(
         profiles_prose(&same_account),
-        "- kerry (active) [anthropic, Free]: 5h 12% used (cached 4m ago); source `session_dir`",
-        "one account, one headroom clause: the row already marks it `(active)`, its age rides the row",
+        "- kerry (global active) [anthropic, Free]: 5h 12% used (cached 4m ago); source `session_dir`",
+        "one account, one headroom clause: the row already marks it `(global active)`, its age rides the row",
     );
 
     // A session pinned to a profile the config is NOT active on: two accounts,
@@ -1235,7 +1270,7 @@ fn session_scope_prose_names_the_row_its_source_and_usage() {
     });
     assert_eq!(
         profiles_prose(&moved),
-        "- kerry (active) [anthropic, Free]: 5h 12% used (cached 4m ago); source `session_dir`; \
+        "- kerry (global active) [anthropic, Free]: 5h 12% used (cached 4m ago); source `session_dir`; \
          since your last call: active profile none → `kerry`; usage cache refreshed"
     );
 }
@@ -2221,6 +2256,39 @@ fn monitor_batch_prose_derives_the_unknown_clause_from_the_payload_count() {
         "job `d-1-0` unknown\nsince your last call: credentials file rewritten\n\
          1 unknown job id(s): use monitor without `job_ids` to list the existing jobs."
     );
+}
+
+/// A tail clause on an otherwise-empty batch must not open the reply with a
+/// blank line: both tail pushes — the digest and the unknown-count clause —
+/// prepend their newline only when the block already holds content. The
+/// producer never emits an empty batch (the empty-`job_ids` refusal runs
+/// first), so this is a render-level guard, pinned on hand-built payloads.
+#[test]
+fn monitor_batch_prose_never_opens_with_a_blank_line() {
+    let unknown = serde_json::json!({
+        "results": [],
+        "unknown_job_id_count": 1,
+    });
+    let prose = monitor_batch_prose(&unknown);
+    assert!(
+        !prose.starts_with('\n'),
+        "the unknown-count clause on an empty batch must not open with a blank line: {prose:?}"
+    );
+    assert_eq!(
+        prose,
+        "1 unknown job id(s): use monitor without `job_ids` to list the existing jobs."
+    );
+
+    let digest = serde_json::json!({
+        "results": [],
+        "since_your_last_call": {"credentials": true},
+    });
+    let prose = monitor_batch_prose(&digest);
+    assert!(
+        !prose.starts_with('\n'),
+        "the digest clause on an empty batch must not open with a blank line: {prose:?}"
+    );
+    assert_eq!(prose, "since your last call: credentials file rewritten");
 }
 
 /// A cancelled run is not a timed-out one, and the verdict word is the first

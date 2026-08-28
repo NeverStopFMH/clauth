@@ -1737,52 +1737,49 @@ fn detect_link_mode_returns_real_on_unix() {
 
 /// The read-only twin of [`detect_link_mode`]: `link_mode_of` observes the tree
 /// an acquire already built rather than testing what this process may create.
-/// Each verdict is driven through a real on-disk shape, and an empty dir reads
-/// as undecidable, never as a guessed transport.
+/// One verdict per probe shape, each driven through a real on-disk layout: an
+/// empty dir reads `NothingShared`, two plain entries `Fake`, a link beside a
+/// copy `Mixed`, two links `Real`. `Mixed` is the rename-replace hazard the
+/// probe exists to catch: an atomic-save edit of `CLAUDE.md` leaves a plain
+/// file beside a `skills` link on a symlink host, and trusting either entry
+/// would state the wrong transport.
 #[test]
 fn link_mode_of_reads_the_transport_off_the_existing_tree() {
     let tmp = tempfile::tempdir().expect("tempdir");
     assert_eq!(
         link_mode_of(Some(tmp.path())),
-        None,
-        "an empty dir answers nothing",
+        LinkProbe::NothingShared,
+        "an empty dir shares nothing",
     );
 
-    // Copy mode: a plain file in the shared slot.
+    // Copy mode: both shared slots plain.
     fs::write(tmp.path().join("CLAUDE.md"), b"x").expect("write shared entry");
+    fs::create_dir(tmp.path().join("skills")).expect("create skills copy");
     assert_eq!(
         link_mode_of(Some(tmp.path())),
-        Some(LinkMode::Fake),
-        "a plain file means the copy mirror",
+        LinkProbe::Fake,
+        "two plain entries mean the copy mirror",
     );
 
-    // Symlink mode: the same slot as a link. Unix CI always grants symlinks.
+    // Symlink mode: the same slots as links. Unix CI always grants symlinks.
     #[cfg(unix)]
     {
         let target = tmp.path().join("target");
         fs::write(&target, b"x").expect("write target");
         fs::remove_file(tmp.path().join("CLAUDE.md")).expect("remove copy");
+        fs::remove_dir(tmp.path().join("skills")).expect("remove skills copy");
         std::os::unix::fs::symlink(&target, tmp.path().join("CLAUDE.md"))
             .expect("link shared entry");
+        std::os::unix::fs::symlink(&target, tmp.path().join("skills")).expect("link skills entry");
         assert_eq!(
             link_mode_of(Some(tmp.path())),
-            Some(LinkMode::Real),
-            "a link means the symlink transport",
+            LinkProbe::Real,
+            "two links mean the symlink transport",
         );
     }
 
-    // The `skills` fallback answers when `CLAUDE.md` is absent.
-    let empty = tempfile::tempdir().expect("tempdir");
-    fs::create_dir(empty.path().join("skills")).expect("create skills");
-    assert_eq!(
-        link_mode_of(Some(empty.path())),
-        Some(LinkMode::Fake),
-        "the skills slot answers when CLAUDE.md is absent",
-    );
-
-    // Disagreement answers nothing: a rename-replace edit of CLAUDE.md on a
-    // symlink host leaves one link and one plain file, and trusting either
-    // would state the wrong transport. The fallback prose is true under both.
+    // Disagreement is its own verdict, never whichever entry the probe checked
+    // first. The hedge prose is true under either.
     let mixed = tempfile::tempdir().expect("tempdir");
     fs::write(mixed.path().join("CLAUDE.md"), b"x").expect("write copy entry");
     #[cfg(unix)]
@@ -1792,12 +1789,25 @@ fn link_mode_of_reads_the_transport_off_the_existing_tree() {
         std::os::unix::fs::symlink(&target, mixed.path().join("skills")).expect("link skills");
         assert_eq!(
             link_mode_of(Some(mixed.path())),
-            None,
-            "one link plus one copy is undecidable",
+            LinkProbe::Mixed,
+            "one link plus one copy reads Mixed",
         );
     }
 
-    assert_eq!(link_mode_of(None), None, "no config dir answers nothing");
+    // One entry present answers with that entry's verdict.
+    let one = tempfile::tempdir().expect("tempdir");
+    fs::create_dir(one.path().join("skills")).expect("create skills");
+    assert_eq!(
+        link_mode_of(Some(one.path())),
+        LinkProbe::Fake,
+        "the skills slot answers when CLAUDE.md is absent",
+    );
+
+    assert_eq!(
+        link_mode_of(None),
+        LinkProbe::NothingShared,
+        "no config dir shares nothing",
+    );
 }
 
 // ── HOME-mutating tests ────────────────────────────────────────────────────────

@@ -77,45 +77,64 @@ pub(crate) enum LinkMode {
     Fake,
 }
 
+/// What [`link_mode_of`] observed: one verdict per probe shape, so the MCP
+/// note states the transport it actually saw rather than hedging over every
+/// possibility or guessing off one entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LinkProbe {
+    /// Both shared entries are symlinks: the real transport.
+    Real,
+    /// Both shared entries are plain files or dirs: the copy transport.
+    Fake,
+    /// Neither shared entry exists: no mirror paths to describe.
+    NothingShared,
+    /// The entries disagree: one links, the other is a copy.
+    Mixed,
+}
+
 /// The transport an EXISTING runtime tree was built with, read off the entries
 /// the tree shares with `~/.claude` (`CLAUDE.md` and `skills`). A link means
-/// [`LinkMode::Real`], a plain file or dir means [`LinkMode::Fake`], and neither
-/// entry existing means the probe cannot answer. The sibling of the acquire-time
+/// [`LinkProbe::Real`], a plain file or dir means [`LinkProbe::Fake`], neither
+/// entry existing means [`LinkProbe::NothingShared`], and the two entries
+/// disagreeing means [`LinkProbe::Mixed`]. The sibling of the acquire-time
 /// privilege probe [`detect_link_mode`], which tests what THIS process may
 /// create; this one observes the tree already in front of a later process. The
 /// MCP instructions block states the probe's answer instead of spelling both
 /// transports every session. Costs two stats at most, so callers re-run it per
 /// reply rather than caching.
 ///
-/// Both entries must agree, or the probe answers nothing: the real-mode watchdog
+/// `Mixed` must not resolve to one entry's verdict: the real-mode watchdog
 /// repairs only `.credentials.json`, so a rename-replace edit of `CLAUDE.md`
 /// (atomic-save editors, the model's own tooling — the note itself invites
-/// editing it) permanently swaps that entry's link for a plain file on a symlink
-/// host. A probe trusting the first entry would then state the wrong transport
-/// and the wrong new-file rule. Disagreement falls back to the both-transports
-/// prose, which is true under either. With one entry present, its verdict
-/// stands: there is nothing else to check it against.
-pub(crate) fn link_mode_of(config_dir: Option<&Path>) -> Option<LinkMode> {
-    let dir = config_dir?;
-    let mut verdict: Option<LinkMode> = None;
+/// editing it) permanently swaps that entry's link for a plain file on a
+/// symlink host. A probe trusting the first entry would then state the wrong
+/// transport and the wrong new-file rule, so disagreement names both
+/// transports instead, which is true under either. With one entry present,
+/// its verdict stands: there is nothing else to check it against. A missing
+/// config dir reads `NothingShared`: there is no tree to describe.
+pub(crate) fn link_mode_of(config_dir: Option<&Path>) -> LinkProbe {
+    let Some(dir) = config_dir else {
+        return LinkProbe::NothingShared;
+    };
+    let mut verdict: Option<LinkProbe> = None;
     for entry in ["CLAUDE.md", "skills"] {
         let Ok(meta) = std::fs::symlink_metadata(dir.join(entry)) else {
             continue;
         };
         let seen = if meta.file_type().is_symlink() {
-            LinkMode::Real
+            LinkProbe::Real
         } else if meta.is_file() || meta.is_dir() {
-            LinkMode::Fake
+            LinkProbe::Fake
         } else {
             continue;
         };
         match verdict {
             None => verdict = Some(seen),
             Some(prev) if prev == seen => {}
-            Some(_) => return None,
+            Some(_) => return LinkProbe::Mixed,
         }
     }
-    verdict
+    verdict.unwrap_or(LinkProbe::NothingShared)
 }
 
 /// Whether a session inherits the operator's full `~/.claude/` (memory,

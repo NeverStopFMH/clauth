@@ -807,8 +807,8 @@ mean a refusal."
         let auth = crate::which::session_auth();
         prose.push_str("\n\n");
         prose.push_str(&render::switch_effect_note(&auth));
-        let mode = crate::runtime::link_mode_of(crate::which::session_config_dir().as_deref());
-        if let Some(note) = render::runtime_paths_note(&auth, mode) {
+        let probe = crate::runtime::link_mode_of(crate::which::session_config_dir().as_deref());
+        if let Some(note) = render::runtime_paths_note(&auth, probe) {
             prose.push_str("\n\n");
             prose.push_str(&note);
         }
@@ -5043,8 +5043,8 @@ fn build_instructions() -> String {
         .collect();
 
     let auth = crate::which::session_auth();
-    let mode = crate::runtime::link_mode_of(crate::which::session_config_dir().as_deref());
-    render::instructions_block(&snapshots, &auth, mode)
+    let probe = crate::runtime::link_mode_of(crate::which::session_config_dir().as_deref());
+    render::instructions_block(&snapshots, &auth, probe)
 }
 
 /// Whether this `clauth mcp` process should hold a bare-session marker. Pure, so

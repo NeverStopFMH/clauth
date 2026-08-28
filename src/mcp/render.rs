@@ -9,7 +9,7 @@ use serde_json::Value;
 
 use crate::format::{format_pct, humanize_span, local_stamp};
 use crate::providers::ThirdPartyStats;
-use crate::runtime::LinkMode;
+use crate::runtime::LinkProbe;
 use crate::usage::{humanize_duration, iso_to_epoch_secs, now_epoch_secs};
 use crate::which::SessionAuth;
 
@@ -405,8 +405,13 @@ pub(crate) fn switch_effect_note(auth: &SessionAuth) -> String {
 /// so "mostly symlinks" was false there and a `readlink -f` nudge had nothing to
 /// resolve. The two transports differ on new files too: a fresh file under a
 /// symlink host's tree stays local and dies with the session, while the copy
-/// mirror propagates one-sided files, so each mode states its own rule. With no
-/// shared entry to probe, the note falls back to naming both transports.
+/// mirror propagates one-sided files, so each transport arm states its own rule.
+///
+/// One arm per probe verdict: `Real` states the symlink transport, `Fake` the
+/// copy transport, `Mixed` — the entries disagree — names both transports
+/// (true under either), and `NothingShared` renders no note at all: a tree
+/// sharing no entry has no mirror paths to describe, and the hedge would state
+/// a rule for a layout the tree does not carry.
 ///
 /// The note names `$CLAUDE_CONFIG_DIR` rather than a constructed path: the real
 /// dir carries a per-session suffix (`runtime-<sid>`, the sid being `<pid>-<seq>`),
@@ -419,25 +424,26 @@ pub(crate) fn switch_effect_note(auth: &SessionAuth) -> String {
 /// `Global` has no runtime dir, and `IsolatedCustom` is a foreign
 /// `CLAUDE_CONFIG_DIR` whose layout clauth does not own, so neither may claim
 /// this layout. Pure mapping; the caller resolves the [`SessionAuth`] and probes
-/// the mode.
-pub(crate) fn runtime_paths_note(auth: &SessionAuth, mode: Option<LinkMode>) -> Option<String> {
+/// the verdict.
+pub(crate) fn runtime_paths_note(auth: &SessionAuth, probe: LinkProbe) -> Option<String> {
     let SessionAuth::IsolatedRuntime(name) = auth else {
         return None;
     };
-    let transport = match mode {
-        Some(LinkMode::Real) => {
+    let transport = match probe {
+        LinkProbe::Real => {
             "this host symlinks, so an edit to an existing file reaches the global file every \
 profile loads. files you create here stay here and die with the session."
         }
-        Some(LinkMode::Fake) => {
+        LinkProbe::Fake => {
             "this host keeps a copy, so an edit reaches the global file at the watchdog's sync \
 cadence."
         }
-        None => {
+        LinkProbe::Mixed => {
             "symlinks where the host allows them, a recursive copy the watchdog reconciles where \
 it does not. so an edit reaches the global file every profile loads, instantly on a symlink \
 host, at the watchdog's cadence on a copy host."
         }
+        LinkProbe::NothingShared => return None,
     };
     Some(format!(
         "runtime paths: `$CLAUDE_CONFIG_DIR` (profile `{name}`) mirrors the global `~/.claude`. \
@@ -513,7 +519,7 @@ const MODELS_NOTE: &str = "some providers alias claude model names to their own 
 pub(crate) fn instructions_block(
     profiles: &[ProfileSnapshot],
     auth: &SessionAuth,
-    mode: Option<LinkMode>,
+    probe: LinkProbe,
 ) -> String {
     let mut out = String::new();
     out.push_str(
@@ -528,7 +534,7 @@ window.\n\n",
     }
     out.push_str(MODELS_NOTE);
     out.push_str("\n\n");
-    if let Some(note) = runtime_paths_note(auth, mode) {
+    if let Some(note) = runtime_paths_note(auth, probe) {
         out.push_str(&note);
         out.push_str("\n\n");
     }
@@ -948,7 +954,7 @@ fn profile_line(row: &Value) -> String {
     let mut out = format!(
         "- {}{} [{}]: {}",
         name,
-        if active { " (active)" } else { "" },
+        if active { " (global active)" } else { "" },
         bracket.join(", "),
         windows_prose(&row["windows"]),
     );
@@ -1035,7 +1041,7 @@ pub(crate) fn profiles_prose(p: &Value) -> String {
         // The live-usage fold names the CONFIGURED active profile, which this
         // scope's row need not be. When they are the same account the clause
         // restates the row's own headroom word for word, and the row already
-        // marks it `(active)`, so the second copy is dropped rather than
+        // marks it `(global active)`, so the second copy is dropped rather than
         // rendered twice on one line. What must not drop with it is the age:
         // the row's figures are the ones the clause would date, and the row
         // renders `stale` itself, so the age rides the row BEFORE the source
@@ -1740,8 +1746,7 @@ pub(crate) fn monitor_batch_prose(p: &Value) -> String {
         .join("\n");
     let digest = digest_prose(&p["since_your_last_call"]);
     if !digest.is_empty() {
-        out.push('\n');
-        out.push_str(&digest);
+        push_tail_clause(&mut out, &digest);
     }
     // The count is the payload's figure, never a recount of the rows: that
     // contract is what keeps the clause to exactly one however many ids the
@@ -1751,12 +1756,24 @@ pub(crate) fn monitor_batch_prose(p: &Value) -> String {
         .and_then(Value::as_u64)
         .filter(|n| *n > 0)
     {
-        out.push('\n');
-        out.push_str(&format!(
-            "{n} unknown job id(s): use monitor without `job_ids` to list the existing jobs."
-        ));
+        push_tail_clause(
+            &mut out,
+            &format!(
+                "{n} unknown job id(s): use monitor without `job_ids` to list the existing jobs."
+            ),
+        );
     }
     out
+}
+
+/// Append one tail clause, separated from the block by a newline only when the
+/// block already holds content, so a clause on an otherwise-empty reply never
+/// opens it with a blank line.
+fn push_tail_clause(out: &mut String, clause: &str) {
+    if !out.is_empty() {
+        out.push('\n');
+    }
+    out.push_str(clause);
 }
 
 #[cfg(test)]

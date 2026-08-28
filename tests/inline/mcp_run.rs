@@ -4941,51 +4941,48 @@ fn roster_rank_reports_free_percent_from_the_best_known_window() {
     );
 }
 
-/// The wallet parse is deliberately strict. It reads whichever row a provider
-/// singles out as its balance, and every one writes something into one — z.ai's
-/// counts tokens under the `total` spelling. Anything that is
-/// not exactly one finite amount and one currency code describes no wallet, and
-/// a loose parse would mint a rank out of it and order the roster on token counts.
+/// The two-wallet ruling (owner 2026-08-28): a profile whose cached rows carry
+/// the empty USD wallet BEFORE the funded CNY one ranks on the funded wallet —
+/// zero-amount wallets drop, the first funded one is the pick. Driven from the
+/// captured cache bytes through the production cache writer, never a
+/// hand-built `ThirdPartyStats`.
 #[test]
-fn parse_balance_takes_an_amount_and_a_currency_and_nothing_else() {
-    assert_eq!(parse_balance("31.45 USD"), Some(("USD".to_string(), 31.45)));
+fn a_two_wallet_profile_ranks_on_its_funded_wallet() {
+    use crate::testutil::{
+        CAPTURED_ONE_WALLET_DS_CACHE, CAPTURED_TWO_WALLET_DS_CACHE,
+        write_captured_third_party_cache,
+    };
+
+    let _home = HomeSandbox::new();
+    crate::testutil::register_names(&["two-wallet", "one-wallet"]);
+    write_captured_third_party_cache("two-wallet", CAPTURED_TWO_WALLET_DS_CACHE);
+    write_captured_third_party_cache("one-wallet", CAPTURED_ONE_WALLET_DS_CACHE);
+
     assert_eq!(
-        parse_balance("1117.65 CNY"),
-        Some(("CNY".to_string(), 1117.65))
+        roster_rank(&crate::profile::ProfileName::from("two-wallet")),
+        RosterRank::Balance {
+            currency: "CNY".to_string(),
+            amount: 498.18,
+        },
+        "0.00 USD sits first in the cache; the rank must drop it and keep the funded wallet",
     );
-    for junk in [
-        "123.4M  (1.2k calls)", // z.ai's token total
-        "balance unavailable",
-        "31.45",
-        "31.45 USD extra",
-        "USD 31.45",
-        "31.45 U",
-        "31.45 TOOLONG",
-        "31.45 US1",
-        // A non-finite amount must never rank: it outranks (inf) or sinks
-        // below (nan) every real wallet in its currency group.
-        "nan USD",
-        "inf USD",
-        "infinity CNY",
-        "-inf USD",
-        "",
-    ] {
-        assert_eq!(parse_balance(junk), None, "must not rank on `{junk}`");
-    }
-    // Exponent and explicit-sign forms parse as finite numbers, so they stay
-    // accepted: they order sanely, and refusing them would silently drop the
-    // wallet rank of an unknown provider that spelled its total that way.
-    assert_eq!(parse_balance("1e3 USD"), Some(("USD".to_string(), 1000.0)));
-    assert_eq!(parse_balance("+1.5 USD"), Some(("USD".to_string(), 1.5)));
-    // An overdrawn openrouter wallet: the sign parses and the negated-amount
-    // sort key puts it after every positive wallet in its currency group.
-    assert_eq!(parse_balance("-0.20 USD"), Some(("USD".to_string(), -0.2)));
+    // One-wallet control: nothing to drop, the rank is the wallet as cached.
+    assert_eq!(
+        roster_rank(&crate::profile::ProfileName::from("one-wallet")),
+        RosterRank::Balance {
+            currency: "CNY".to_string(),
+            amount: 3640.55,
+        },
+        "a single-wallet profile ranks exactly as it did before the ruling",
+    );
 }
 
-/// A profile holding two wallets joins exactly one currency group: the first its
-/// provider lists. Appearing in both would double a name in the roster, and
-/// picking the larger would be the cross-currency compare this whole design
-/// refuses to make.
+/// A profile holding two FUNDED wallets joins exactly one currency group: the
+/// first funded one its provider lists. Appearing in both would double a name
+/// in the roster, and picking the larger would be the cross-currency compare
+/// this whole design refuses to make — so row order, never amount, breaks the
+/// tie, and dropping zero-amount wallets (the ruling above) changes nothing
+/// here.
 #[test]
 fn a_two_wallet_profile_ranks_on_the_first_currency_listed() {
     use crate::profile_cache::{THIRD_PARTY_CACHE_FILE, write_profile_cache};

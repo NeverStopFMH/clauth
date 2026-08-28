@@ -43,10 +43,75 @@ pub(crate) use deepseek::BALANCE_ROW_LABEL as DEEPSEEK_BALANCE_ROW_LABEL;
 /// Whether a `StatRow` label names the account's spendable balance, in either
 /// spelling a cache on disk can carry: the current [`DEEPSEEK_BALANCE_ROW_LABEL`],
 /// or the legacy `total` an older clauth wrote and the generic scanner still
-/// passes an endpoint's own key through as. The three readers that single the
-/// wallet row out all ask this, so a rename lives in one place.
+/// passes an endpoint's own key through as. Every reader that singles the
+/// wallet row out — the overview balance column, the MCP roster's rank and its
+/// rendered figure — asks this, so a rename lives in one place.
 pub(crate) fn is_balance_row(label: &str) -> bool {
     label == DEEPSEEK_BALANCE_ROW_LABEL || label == "total"
+}
+
+/// One wallet parsed off a cached balance row: `"1132.60 CNY"` → currency
+/// `CNY`, amount `1132.6`. The row's own `label` and `value` ride along for
+/// the surfaces that render the row rather than the figure.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct Wallet {
+    pub(crate) label: String,
+    pub(crate) value: String,
+    pub(crate) currency: String,
+    pub(crate) amount: f64,
+}
+
+/// Parse one balance row's value: `"31.45 USD"` → `("USD", 31.45)`: one finite
+/// amount plus one 2-5 letter ASCII currency code. The narrowness is the
+/// point: a balance row carrying anything else (z.ai's `123.4M  (1.2k calls)`,
+/// a second word, `nan`/`inf`) describes no wallet. A loose parse would invent
+/// one to rank on.
+pub(crate) fn parse_balance(value: &str) -> Option<(String, f64)> {
+    let mut parts = value.split_whitespace();
+    let amount: f64 = parts.next()?.parse().ok()?;
+    if !amount.is_finite() {
+        return None;
+    }
+    let currency = parts.next()?;
+    if parts.next().is_some()
+        || !(2..=5).contains(&currency.len())
+        || !currency.chars().all(|c| c.is_ascii_alphabetic())
+    {
+        return None;
+    }
+    Some((currency.to_string(), amount))
+}
+
+/// Every balance row parsed into a [`Wallet`], in row order — zero-amount
+/// wallets included, so a surface can still render an all-empty account's
+/// figure. [`funded_wallets`] is this minus the wallets that carry no headroom.
+pub(crate) fn balance_wallets(rows: &[StatRow]) -> Vec<Wallet> {
+    rows.iter()
+        .filter(|r| is_balance_row(&r.label))
+        .filter_map(|r| {
+            let (currency, amount) = parse_balance(&r.value)?;
+            Some(Wallet {
+                label: r.label.clone(),
+                value: r.value.clone(),
+                currency,
+                amount,
+            })
+        })
+        .collect()
+}
+
+/// [`balance_wallets`] with the wallets that carry no headroom dropped: a
+/// wallet whose amount is not above zero names a pool nothing is left to
+/// spend from, and dropping it compares nothing across currencies (owner
+/// ruling 2026-08-28). The first element — ROW order, never amount, so two
+/// funded wallets of different currencies are never compared — is the wallet
+/// the MCP roster ranks the account on and its rendered figure reports; the
+/// overview balance column shows the whole list.
+pub(crate) fn funded_wallets(rows: &[StatRow]) -> Vec<Wallet> {
+    balance_wallets(rows)
+        .into_iter()
+        .filter(|w| w.amount > 0.0)
+        .collect()
 }
 
 use serde::{Deserialize, Serialize};

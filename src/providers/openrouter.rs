@@ -139,9 +139,7 @@ fn stats(credits: &CreditsData, key: Option<&KeyData>) -> ThirdPartyStats {
     }
 }
 
-/// `1.5` → `"1.50 USD"` — the `amount currency` shape the roster's
-/// `parse_balance` reads (a `$` prefix would parse as no wallet). An overdrawn
-/// remaining formats negative (`-0.20 USD`), which the same parse ranks last.
+/// `1.5` → `"1.50 USD"` — the `amount currency` shape `parse_balance` reads (a `$` prefix would parse as no wallet). An overdrawn remaining formats negative (`-0.20 USD`), which the funded-wallet selection drops, so the roster ranks the account `Unknown`.
 fn dollars(n: f64) -> String {
     format!("{n:.2} USD")
 }

@@ -141,6 +141,88 @@ fn disk_cache_missing_reads_as_none() {
     );
 }
 
+// ── balance-wallet selection ──────────────────────────────────────────────────
+
+/// The wallet parse is deliberately strict. It reads whichever row a provider
+/// singles out as its balance, and every one writes something into one — z.ai's
+/// counts tokens under the `total` spelling. Anything that is
+/// not exactly one finite amount and one currency code describes no wallet, and
+/// a loose parse would mint a rank out of it and order the roster on token counts.
+#[test]
+fn parse_balance_takes_an_amount_and_a_currency_and_nothing_else() {
+    assert_eq!(parse_balance("31.45 USD"), Some(("USD".to_string(), 31.45)));
+    assert_eq!(
+        parse_balance("1117.65 CNY"),
+        Some(("CNY".to_string(), 1117.65))
+    );
+    for junk in [
+        "123.4M  (1.2k calls)", // z.ai's token total
+        "balance unavailable",
+        "31.45",
+        "31.45 USD extra",
+        "USD 31.45",
+        "31.45 U",
+        "31.45 TOOLONG",
+        "31.45 US1",
+        // A non-finite amount must never rank: it outranks (inf) or sinks
+        // below (nan) every real wallet in its currency group.
+        "nan USD",
+        "inf USD",
+        "infinity CNY",
+        "-inf USD",
+        "",
+    ] {
+        assert_eq!(parse_balance(junk), None, "must not rank on `{junk}`");
+    }
+    // Exponent and explicit-sign forms parse as finite numbers, so they stay
+    // accepted: they order sanely, and refusing them would silently drop the
+    // wallet rank of an unknown provider that spelled its total that way.
+    assert_eq!(parse_balance("1e3 USD"), Some(("USD".to_string(), 1000.0)));
+    assert_eq!(parse_balance("+1.5 USD"), Some(("USD".to_string(), 1.5)));
+    // An overdrawn openrouter wallet: the sign parses and the negated-amount
+    // sort key puts it after every positive wallet in its currency group.
+    assert_eq!(parse_balance("-0.20 USD"), Some(("USD".to_string(), -0.2)));
+}
+
+/// The selector the ruling (2026-08-28) is built on, driven from the captured
+/// two-wallet cache: the empty USD wallet drops, the funded CNY one stays, and
+/// the row's own label and value ride along for the surfaces that render them.
+#[test]
+fn funded_wallets_drops_empty_wallets_and_keeps_row_order() {
+    let stats: ThirdPartyStats =
+        serde_json::from_str(crate::testutil::CAPTURED_TWO_WALLET_DS_CACHE)
+            .expect("captured cache parses");
+    let funded = funded_wallets(&stats.rows);
+    assert_eq!(
+        funded,
+        vec![Wallet {
+            label: "api balance".to_string(),
+            value: "498.18 CNY".to_string(),
+            currency: "CNY".to_string(),
+            amount: 498.18,
+        }],
+        "the 0.00 USD wallet carries no headroom and must not survive the selection",
+    );
+}
+
+/// [`balance_wallets`] keeps the zero-amount wallets [`funded_wallets`] drops:
+/// an all-empty account still renders its figure, so the raw list must stay
+/// available to the surface that draws it.
+#[test]
+fn balance_wallets_keeps_zero_amount_wallets_in_row_order() {
+    let stats: ThirdPartyStats =
+        serde_json::from_str(crate::testutil::CAPTURED_TWO_WALLET_DS_CACHE)
+            .expect("captured cache parses");
+    let all = balance_wallets(&stats.rows);
+    assert_eq!(
+        all.iter()
+            .map(|w| (w.value.as_str(), w.amount))
+            .collect::<Vec<_>>(),
+        vec![("0.00 USD", 0.0), ("498.18 CNY", 498.18)],
+        "both wallets parse, in the cache's own row order",
+    );
+}
+
 // ── api_origin ───────────────────────────────────────────────────────────────
 
 #[test]

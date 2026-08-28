@@ -564,37 +564,27 @@ fn any_deepseek(app: &App) -> bool {
 }
 
 /// DeepSeek balance total strings (e.g. `"1.71 USD"`, `"100.00 CNY"`) to show
-/// in the overview cell, sorted by numeric amount descending. All balances above
-/// 0 are included; when none are above 0, only the highest one is returned.
-/// Empty when there is no cached snapshot or no balance row.
-fn deepseek_balances_to_show(profile: &Profile) -> Vec<&str> {
-    let mut parsed: Vec<(f64, &str)> = profile
-        .third_party_usage
-        .as_ref()
-        .map(|s| &s.rows)
-        .into_iter()
-        .flatten()
-        .filter(|r| crate::providers::is_balance_row(&r.label))
-        .filter_map(|r| {
-            let (amount_str, _) = r.value.rsplit_once(' ')?;
-            let amount: f64 = amount_str.parse().ok()?;
-            Some((amount, r.value.as_str()))
-        })
-        .collect();
-    if parsed.is_empty() {
+/// in the overview cell, sorted by numeric amount descending. All funded
+/// wallets are included; when none are funded, only the highest one is
+/// returned — an account with no funds is still a real account, and a blank
+/// cell would read as no-data. Empty when there is no cached snapshot or no
+/// balance row. The wallet set is the shared
+/// [`crate::providers::funded_wallets`] selection, so this column and the MCP
+/// roster's rank drop the same zero-amount wallets.
+fn deepseek_balances_to_show(profile: &Profile) -> Vec<String> {
+    let Some(stats) = profile.third_party_usage.as_ref() else {
         return Vec::new();
+    };
+    let mut wallets = crate::providers::funded_wallets(&stats.rows);
+    let no_funded = wallets.is_empty();
+    if no_funded {
+        wallets = crate::providers::balance_wallets(&stats.rows);
     }
-    parsed.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
-    let above_zero: Vec<&str> = parsed
-        .iter()
-        .filter(|(a, _)| *a > 0.0)
-        .map(|(_, s)| *s)
-        .collect();
-    if above_zero.is_empty() {
-        vec![parsed[0].1]
-    } else {
-        above_zero
+    wallets.sort_by(|a, b| b.amount.total_cmp(&a.amount));
+    if no_funded {
+        wallets.truncate(1);
     }
+    wallets.into_iter().map(|w| w.value).collect()
 }
 
 /// The 5h-column cell for a DeepSeek profile: its total balance bracketed and
@@ -615,7 +605,7 @@ fn deepseek_balance_cell(profile: &Profile, width: usize, amount_w: usize) -> Ve
         .iter()
         .map(|b| match b.rsplit_once(' ') {
             Some((amount, currency)) => format!("{amount:<amount_w$} {currency}"),
-            None => (*b).to_string(),
+            None => b.clone(),
         })
         .collect::<Vec<_>>()
         .join(", ");

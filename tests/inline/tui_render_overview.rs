@@ -301,6 +301,37 @@ fn deepseek_profile(name: &str, totals: &[&str]) -> Profile {
     }
 }
 
+/// A DeepSeek profile whose cached rows come from a captured
+/// `third_party_cache.json` (see the `CAPTURED_*_DS_CACHE` constants in
+/// [`crate::testutil`]): the bytes go through the production cache writer and
+/// reader into the field a live app's `apply_usage` fills, so the render path
+/// is driven by captured bytes rather than a hand-built `ThirdPartyStats`.
+fn deepseek_profile_from_cache(name: &str, captured: &str) -> Profile {
+    let base = deepseek_profile(name, &[]);
+    // The cache writer skips names the on-disk record doesn't carry, so the
+    // profile and the state list must exist before the captured bytes land.
+    crate::profile::save_profile(&base).expect("save profile");
+    crate::profile::save_app_state(&crate::profile::AppState {
+        profiles: vec![name.into()],
+        ..Default::default()
+    })
+    .expect("save state");
+    crate::testutil::write_captured_third_party_cache(name, captured);
+    let stats = crate::profile_cache::load_profile_cache::<crate::providers::ThirdPartyStats>(
+        &crate::profile::ProfileName::from(name),
+        crate::profile_cache::THIRD_PARTY_CACHE_FILE,
+    )
+    .expect("captured cache written and readable");
+    Profile {
+        name: name.into(),
+        base_url: Some("https://api.deepseek.com/anthropic".into()),
+        api_key: Some("k".into()),
+        provider: Some(crate::providers::Provider::DeepSeek),
+        third_party_usage: Some(stats),
+        ..deepseek_profile(name, &[])
+    }
+}
+
 /// A chain-eligible OAuth profile with a live 5h window at `util`%, resetting
 /// in `reset_secs`.
 fn profile(name: &str, threshold: f64, util: f64, reset_secs: i64) -> Profile {
@@ -1954,6 +1985,58 @@ fn deepseek_multi_currency_only_shows_above_zero() {
     assert!(
         cell.contains("CNY") && !cell.contains("USD"),
         "only the above-zero balance renders: {cell:?}"
+    );
+}
+
+/// The two-wallet ruling (owner 2026-08-28) on the overview column: a profile
+/// whose captured cache carries the empty USD wallet first renders the funded
+/// CNY wallet only, through the same shared selector the MCP roster ranks on.
+#[test]
+fn deepseek_two_wallet_renders_only_the_funded_wallet() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let app = App::new(config_with(
+        vec![deepseek_profile_from_cache(
+            "tw",
+            crate::testutil::CAPTURED_TWO_WALLET_DS_CACHE,
+        )],
+        None,
+        vec![],
+    ));
+    let widths = OverviewWidths::new(120, &app);
+    let row = render_overview_row(&app, 0, &widths, false, false);
+    let cell = five_hour_cell_text(&widths, true, &row);
+    assert!(
+        cell.contains("498.18 CNY"),
+        "the funded wallet is the rendered figure: {cell:?}",
+    );
+    // The currency token, not the amount string: the cell's alignment pads the
+    // amount, so an asserted `0.00 USD` substring is one the renderer can never
+    // produce for a dropped wallet and the absence leg would pin nothing.
+    assert!(
+        !cell.contains("USD"),
+        "the empty wallet must not render: {cell:?}",
+    );
+}
+
+/// One-wallet control for the ruling: a profile whose captured cache carries a
+/// single funded wallet renders exactly as it did before the rule.
+#[test]
+fn deepseek_single_wallet_renders_unchanged() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let app = App::new(config_with(
+        vec![deepseek_profile_from_cache(
+            "one",
+            crate::testutil::CAPTURED_ONE_WALLET_DS_CACHE,
+        )],
+        None,
+        vec![],
+    ));
+    let widths = OverviewWidths::new(120, &app);
+    let row = render_overview_row(&app, 0, &widths, false, false);
+    let cell = five_hour_cell_text(&widths, true, &row);
+    assert!(
+        cell.contains("3640.55 CNY"),
+        "the single wallet is the rendered figure, as before: {cell:?}",
     );
 }
 

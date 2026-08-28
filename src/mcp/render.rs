@@ -327,9 +327,11 @@ fn roster_lines(profiles: &[ProfileSnapshot], auth: &SessionAuth) -> String {
 
 /// One-line cached headline for a third-party profile from
 /// `third_party_cache.json`: non-empty bars join as `label pct%`, else the first
-/// stat row that carries a value; the plan label prefixes the line when present.
-/// Value-less rows (e.g. DeepSeek's `USD balance` heading) are skipped so the
-/// headline never renders a dangling `label:` with nothing after it.
+/// funded wallet row (an empty wallet a two-wallet provider lists first must not
+/// win the headline over the funded one), else the first stat row that carries a
+/// value; the plan label prefixes the line when present. Value-less rows (e.g.
+/// DeepSeek's `USD balance` heading) are skipped so the headline never renders a
+/// dangling `label:` with nothing after it.
 pub(crate) fn third_party_headline(s: &ThirdPartyStats) -> String {
     let body = if !s.bars.is_empty() {
         s.bars
@@ -337,6 +339,8 @@ pub(crate) fn third_party_headline(s: &ThirdPartyStats) -> String {
             .map(|b| format!("{} {}", b.label, format_pct(b.pct)))
             .collect::<Vec<_>>()
             .join(", ")
+    } else if let Some(wallet) = crate::providers::funded_wallets(&s.rows).into_iter().next() {
+        format!("{}: {}", wallet.label, wallet.value)
     } else if let Some(row) = s.rows.iter().find(|r| !r.value.is_empty()) {
         if row.label.is_empty() {
             row.value.clone()

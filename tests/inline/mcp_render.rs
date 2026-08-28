@@ -99,6 +99,16 @@ fn third_party_headline_skips_value_less_heading_row() {
     assert_eq!(third_party_headline(&s), "api balance: $4.20");
 }
 
+/// The two-wallet ruling (owner 2026-08-28) at the headline: the empty USD
+/// wallet a two-wallet cache lists first must not win the rendered figure
+/// over the funded CNY one. Driven from the captured cache bytes.
+#[test]
+fn third_party_headline_prefers_a_funded_wallet_over_an_empty_one() {
+    let s: ThirdPartyStats = serde_json::from_str(crate::testutil::CAPTURED_TWO_WALLET_DS_CACHE)
+        .expect("captured cache parses");
+    assert_eq!(third_party_headline(&s), "api balance: 498.18 CNY");
+}
+
 #[test]
 fn third_party_headline_bare_plan_when_no_bars_or_rows() {
     // plan present, nothing else, still available → just the plan label.

@@ -878,6 +878,38 @@ pub(crate) const ALIBABA_NO_BARS_CACHE_BYTES: &str = r#"{"is_available":true,"ro
 /// every bar carries the same five fields parses this one wrong.
 pub(crate) const THIRD_PARTY_BARS_CACHE_BYTES: &str = r#"{"is_available":true,"rows":[{"label":"30d","value":"","kind":"heading"},{"label":"search-prime","value":"12 / 100","kind":"body"},{"label":"web-reader","value":"3 / 100","kind":"body"},{"label":"zread","value":"0 / 50","kind":"body"},{"label":"7d tokens","value":"","kind":"heading"},{"label":"GLM-5.3","value":"80.1M","kind":"body"},{"label":"GLM-5.2","value":"40.2M","kind":"body"},{"label":"GLM-4.7","value":"3.1M","kind":"body"},{"label":"total","value":"123.4M  (1.2k calls)","kind":"faint"}],"bars":[{"label":"5h","pct":12.5,"resets_at":"2026-08-15T12:00:00Z"},{"label":"7d","pct":48.0,"resets_at":"2026-08-20T00:00:00Z"},{"label":"30d","pct":3.0,"resets_at":"2026-09-01T00:00:00Z","used":123.4,"total":4000.0}],"plan":"pro","best_effort":false}"#;
 
+/// A real two-wallet DeepSeek cache: the empty USD wallet FIRST, the funded
+/// CNY wallet second. Captured 2026-08-28 from the operator's `DS6` profile's
+/// `third_party_cache.json` (every figure verbatim), with the two wallet
+/// blocks reordered to the USD-first order `DS8`'s cache held after its
+/// 2026-08-17 17:59 fetch — the API's own `balance_infos` order is not stable,
+/// an account can hold two wallets and the provider lists them in its own
+/// order. No live cache held the empty-first order when this fixture was cut,
+/// so the fixture is captured bytes written through the production writer,
+/// never a hand-built `ThirdPartyStats`.
+pub(crate) const CAPTURED_TWO_WALLET_DS_CACHE: &str = r#"{"is_available":true,"rows":[{"label":"USD balance","value":"","kind":"heading"},{"label":"api balance","value":"0.00 USD","kind":"body"},{"label":"granted","value":"0.00 USD","kind":"body"},{"label":"topped up","value":"0.00 USD","kind":"body"},{"label":"CNY balance","value":"","kind":"heading"},{"label":"api balance","value":"498.18 CNY","kind":"body"},{"label":"granted","value":"0.00 CNY","kind":"body"},{"label":"topped up","value":"498.18 CNY","kind":"body"}],"bars":[],"best_effort":false}"#;
+
+/// A real one-wallet DeepSeek cache, captured verbatim 2026-08-28 from the
+/// operator's `D1` profile's `third_party_cache.json`. The one-wallet control
+/// for the two-wallet ruling: nothing to drop, the figure must render exactly
+/// as before.
+pub(crate) const CAPTURED_ONE_WALLET_DS_CACHE: &str = r#"{"is_available":true,"rows":[{"label":"CNY balance","value":"","kind":"heading"},{"label":"api balance","value":"3640.55 CNY","kind":"body"},{"label":"granted","value":"0.00 CNY","kind":"body"},{"label":"topped up","value":"3640.55 CNY","kind":"body"}],"bars":[],"best_effort":false}"#;
+
+/// Parse a captured `third_party_cache.json` and write it at `name`'s
+/// sandboxed path through the production cache writer — the same route the
+/// fetch leg takes — so a consumer is driven by captured bytes, never a
+/// hand-built [`crate::providers::ThirdPartyStats`] that mirrors the reader's
+/// own guess.
+pub(crate) fn write_captured_third_party_cache(name: &str, json: &str) {
+    let parsed: crate::providers::ThirdPartyStats =
+        serde_json::from_str(json).expect("captured cache parses");
+    crate::profile_cache::write_profile_cache(
+        &crate::profile::ProfileName::from(name),
+        crate::profile_cache::THIRD_PARTY_CACHE_FILE,
+        &parsed,
+    );
+}
+
 /// A live-session registry row with every field a fixture rarely varies already
 /// filled: one non-isolated, chain-following session of `profile` that has never
 /// swapped. Callers override the fields their case is actually about.

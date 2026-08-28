@@ -511,6 +511,77 @@ fn a_bars_carrying_z_ai_row_renders_the_headline_alone() {
     );
 }
 
+/// The two-wallet ruling (owner 2026-08-28) on the roster's RENDERED figure: a
+/// profile whose cache carries the empty USD wallet first must report the
+/// funded wallet's figure on the row a model reads — the empty wallet's `0.00
+/// USD` is what once read a live account as dead. Driven from the captured
+/// cache bytes through the production cache writer and the real `profiles`
+/// reply.
+#[test]
+fn a_two_wallet_profile_renders_its_funded_wallet_figure() {
+    let _home = HomeSandbox::new();
+    save_profile(&Profile::new(
+        "tw".to_string(),
+        Some("https://api.deepseek.com/anthropic".to_string()),
+        Some("sk-fixture".to_string()),
+    ))
+    .expect("save tw");
+    save_app_state(&AppState {
+        active_profile: Some("tw".into()),
+        profiles: vec!["tw".into()],
+        ..Default::default()
+    })
+    .expect("save state");
+    crate::testutil::write_captured_third_party_cache(
+        "tw",
+        crate::testutil::CAPTURED_TWO_WALLET_DS_CACHE,
+    );
+
+    let row = lines(&call_profiles(None, None)).remove(0);
+    assert!(
+        row.contains("api balance: 498.18 CNY"),
+        "the funded wallet is the rendered figure: {row}",
+    );
+    assert!(
+        !row.contains("0.00 USD"),
+        "the empty wallet must not render: {row}",
+    );
+}
+
+/// One-wallet control for the ruling: a profile whose cache carries a single
+/// funded wallet renders exactly as it did before the rule — same figure,
+/// same row shape.
+#[test]
+fn a_single_wallet_profile_renders_unchanged() {
+    let _home = HomeSandbox::new();
+    save_profile(&Profile::new(
+        "one".to_string(),
+        Some("https://api.deepseek.com/anthropic".to_string()),
+        Some("sk-fixture".to_string()),
+    ))
+    .expect("save one");
+    save_app_state(&AppState {
+        active_profile: Some("one".into()),
+        profiles: vec!["one".into()],
+        ..Default::default()
+    })
+    .expect("save state");
+    crate::testutil::write_captured_third_party_cache(
+        "one",
+        crate::testutil::CAPTURED_ONE_WALLET_DS_CACHE,
+    );
+
+    let row = lines(&call_profiles(None, None)).remove(0);
+    assert!(
+        row.contains("api balance: 3640.55 CNY"),
+        "the single wallet is the rendered figure, as before: {row}",
+    );
+    assert!(
+        row.starts_with("- one (active) [DeepSeek, api.deepseek.com]: "),
+        "the row's identity half is untouched by the ruling: {row}",
+    );
+}
+
 /// The same refusal on the PRODUCTION path: a `base_url` carrying credentials
 /// reaches the roster through `save_profile` -> `profile_row` -> `profile_line`,
 /// and the rendered row must name the real host with no userinfo riding on it.

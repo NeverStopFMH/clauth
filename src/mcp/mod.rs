@@ -277,7 +277,8 @@ fn profile_row(p: &Profile, config: &AppConfig, now: i64) -> serde_json::Value {
 
 /// The roster's sort key for one profile. A real window first (5h, the pool a
 /// `delegate` actually competes for, then 7d), then a third-party provider's own
-/// cached bars, then a wallet balance off its cached rows.
+/// cached bars, then the first funded wallet off its cached rows — zero-amount
+/// wallets drop, the same selection the overview balance column makes.
 fn roster_rank(name: &ProfileName) -> RosterRank {
     let (five_h, seven_d) = load_windows(name);
     if let Some(w) = five_h.or(seven_d) {
@@ -294,36 +295,13 @@ fn roster_rank(name: &ProfileName) -> RosterRank {
     {
         return RosterRank::Window(100.0 - bar.pct);
     }
-    stats
-        .rows
-        .iter()
-        .find(|r| crate::providers::is_balance_row(&r.label))
-        .and_then(|r| parse_balance(&r.value))
-        .map_or(RosterRank::Unknown, |(currency, amount)| {
-            RosterRank::Balance { currency, amount }
+    crate::providers::funded_wallets(&stats.rows)
+        .into_iter()
+        .next()
+        .map_or(RosterRank::Unknown, |w| RosterRank::Balance {
+            currency: w.currency,
+            amount: w.amount,
         })
-}
-
-/// `"31.45 USD"` → `("USD", 31.45)`: one finite amount plus one 2-5 letter
-/// ASCII currency code. The narrowness is the point: a balance row carrying
-/// anything else (z.ai's `123.4M  (1.2k calls)`, a second word, `nan`/`inf`)
-/// describes no wallet. A loose parse would invent one to rank on.
-/// `roster_rank` takes the FIRST such row, which is what lands a profile
-/// holding two wallets in exactly one currency group.
-fn parse_balance(value: &str) -> Option<(String, f64)> {
-    let mut parts = value.split_whitespace();
-    let amount: f64 = parts.next()?.parse().ok()?;
-    if !amount.is_finite() {
-        return None;
-    }
-    let currency = parts.next()?;
-    if parts.next().is_some()
-        || !(2..=5).contains(&currency.len())
-        || !currency.chars().all(|c| c.is_ascii_alphabetic())
-    {
-        return None;
-    }
-    Some((currency.to_string(), amount))
 }
 
 /// A `delegate` argument/validation refusal: one `{is_error, result}` envelope

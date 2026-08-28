@@ -11,7 +11,11 @@
 //! two differ. A second emit, the headroom nudge, rides the same subcommand: a
 //! parent-scope `Task` (agent-spawn) fire whose account's 5h window is
 //! exhausted, or burning toward the cap, with nothing left to catch the
-//! failure earns it (r8 gate; r7 shipped the static form).
+//! failure earns it (r8 gate; r7 shipped the static form). r9: the switched
+//! spelling appends the new account's live 5h window percent — the same
+//! disk-cache read the nudge uses — so the reader no longer has to call
+//! `profiles` for the deciding figure; a usage-less account keeps the
+//! sentence unchanged.
 //!
 //! **Not the MCP `instructions` block.** That block is built once per process,
 //! so it cannot carry a mid-conversation change at all, and rewriting the front
@@ -110,7 +114,11 @@ const RESOLUTION_TTL: Duration = Duration::from_secs(60);
 /// `update.rs` already puts on a downloaded asset.
 const MAX_PAYLOAD_BYTES: u64 = 10 * 1024 * 1024;
 
-/// The two spellings, behind one renderer so they cannot drift apart.
+/// The two spellings, behind one renderer so they cannot drift apart. The
+/// switched spelling carries an optional headroom clause (r9, reviewzy entry
+/// E4, 2026-08-28): the new account's live 5h window percent when the disk
+/// cache holds one, omitted — the sentence byte-identical to the pre-r9
+/// spelling — when it does not.
 ///
 /// The noun is "session", by owner ruling on 2026-08-21, superseding an earlier
 /// one here that said "conversation" and never "session". Carry the cost that
@@ -122,7 +130,12 @@ enum Note<'a> {
     /// A new Claude Code process picked this conversation up on another account.
     Resumed { now: &'a str, before: &'a str },
     /// The account moved under a conversation that was already running.
-    Switched { from: &'a str, to: &'a str },
+    Switched {
+        from: &'a str,
+        to: &'a str,
+        /// The new account's live 5h window percent, when a figure exists.
+        used: Option<f64>,
+    },
 }
 
 impl Note<'_> {
@@ -131,7 +144,19 @@ impl Note<'_> {
             Note::Resumed { now, before } => format!(
                 "clauth note: session resumed under `{now}`; earlier turns ran under `{before}`."
             ),
-            Note::Switched { from, to } => format!(
+            Note::Switched {
+                from,
+                to,
+                used: Some(used),
+            } => format!(
+                "clauth note: the active profile for this session switched from `{from}` to `{to}`; its 5h window is {pct}% used.",
+                pct = crate::format::format_pct(used).trim_end_matches('%'),
+            ),
+            Note::Switched {
+                from,
+                to,
+                used: None,
+            } => format!(
                 "clauth note: the active profile for this session switched from `{from}` to `{to}`."
             ),
         }
@@ -499,8 +524,9 @@ fn note_for(
     // Peek UNLOCKED, only to decide whether the slow half is needed. `resolve`
     // goes through `load_config`, which chmod-walks the whole `~/.clauth` tree,
     // and that must never run inside the hold below.
-    let fresh = match load_record(&path) {
-        Some(peek) if peek.cache_holds(watch) => None,
+    let peek = load_record(&path);
+    let fresh = match peek.as_ref().filter(|p| p.cache_holds(watch)) {
+        Some(_) => None,
         // Stamped BEFORE the resolve, never after it and never at write time.
         // Both later instants overstate the observation: the lock wait sits
         // after the resolve, and the resolve itself is milliseconds during
@@ -523,6 +549,31 @@ fn note_for(
             Some((resolve(), taken_at))
         }
     };
+
+    // The account a switch would name as the new one — the peek's cached
+    // answer on a closed gate, this fire's own resolve on an open one — and
+    // the headroom figure for it, gathered BEFORE the hold: a usage-cache read
+    // must not run inside the read-modify-write. The peek is not the verdict
+    // (the copy under the lock outranks it), so the figure carries its account
+    // and the emit below uses it only when the note's `to` is that account — a
+    // figure read for the wrong account is a false claim, and omission is this
+    // module's failure direction. Gated on a possible change: in the common
+    // path, `told` equal to the candidate means no note fires and the read is
+    // wasted; the documented stamp-inversion corner can still announce a false
+    // reversal with the gather skipped, clause-less — omission, not a wrong
+    // figure.
+    let candidate = match &fresh {
+        None => peek.as_ref().and_then(|p| p.resolved.as_deref()),
+        Some((answer, _)) => answer.as_deref(),
+    };
+    let switched_headroom = candidate
+        .filter(|account| peek.as_ref().and_then(|p| p.told.as_deref()) != Some(*account))
+        .and_then(|account| {
+            switched_headroom_pct(account).map(|used| SwitchedHeadroom {
+                account: account.to_string(),
+                used,
+            })
+        });
 
     let _hold = ScopeLock::acquire();
     // Re-read INSIDE the hold. The peek above may be another writer's stale
@@ -564,7 +615,10 @@ fn note_for(
             answer
         }
     };
-    let note = decide(payload, &mut record, current.as_deref());
+    let used = switched_headroom
+        .filter(|h| current.as_deref() == Some(h.account.as_str()))
+        .map(|h| h.used);
+    let note = decide(payload, &mut record, current.as_deref(), used);
     if stored.as_ref() != Some(&record) && store_record(&path, &record).is_err() {
         // The record IS the suppression mechanism, so a note that cannot be
         // remembered is re-emitted on every tool call for the life of the
@@ -642,8 +696,15 @@ fn inherited_baseline(payload: &Payload) -> Option<String> {
 }
 
 /// The change test, against the record this scope carries. `current` is `None`
-/// when clauth cannot attribute the loaded credentials.
-fn decide(payload: &Payload, record: &mut NoteRecord, current: Option<&str>) -> Option<String> {
+/// when clauth cannot attribute the loaded credentials. `used` is the new
+/// account's live 5h window percent — `None` renders the switched sentence
+/// without the headroom clause, the pre-r9 spelling for a usage-less account.
+fn decide(
+    payload: &Payload,
+    record: &mut NoteRecord,
+    current: Option<&str>,
+    used: Option<f64>,
+) -> Option<String> {
     // An unattributable credential is not evidence that anything moved: a
     // disabled profile, a `claude login` clauth holds no copy of, and a config
     // it could not parse all land here. Leaving `told` standing is what keeps a
@@ -691,6 +752,7 @@ fn decide(payload: &Payload, record: &mut NoteRecord, current: Option<&str>) -> 
                         let note = Note::Switched {
                             from: before,
                             to: current,
+                            used,
                         }
                         .render();
                         Some(tell(record, current, note))
@@ -723,6 +785,7 @@ fn decide(payload: &Payload, record: &mut NoteRecord, current: Option<&str>) -> 
             let note = Note::Switched {
                 from: before,
                 to: current,
+                used,
             }
             .render();
             Some(tell(record, current, note))
@@ -741,6 +804,46 @@ fn tell(record: &mut NoteRecord, account: &str, note: String) -> String {
     record.told = Some(account.to_string());
     record.last_note = Some(note.clone());
     note
+}
+
+/// The figure the account-changed note appends: which account it was read for,
+/// and that account's live 5h window percent.
+///
+/// One pair, not a bare figure: the read happens on the UNLOCKED peek, whose
+/// answer the copy under the scope lock can outrank, so the emit uses the
+/// figure only when the note's `to` is the account it was read for. Every
+/// `told` write that can reach the store lands the account the fire resolved —
+/// a differing creation baseline is rewritten by the emit before it is stored
+/// — so a persisted record has `told` and `resolved` equal whenever both are
+/// Some: the pairing's drop branch is unreachable today. It exists to turn a
+/// future writer that breaks that into an omitted clause, never a false
+/// figure.
+struct SwitchedHeadroom {
+    account: String,
+    used: f64,
+}
+
+/// The new account's live 5h window percent off the disk usage cache — the
+/// account-changed note's figure (r9, reviewzy entry E4). The same read class
+/// as the nudge's [`headroom_of`], by name where that one takes a loaded
+/// profile: [`crate::profile_json::profile_windows_for`] (the read
+/// `chain_would_act` uses) plus the liveness predicate [`crate::usage::five_hour_live`]
+/// it applies. `None` when there is no figure to name: no cached OAuth usage —
+/// api-key and third-party accounts have no 5h pool — or a cached window that
+/// has lapsed, whose percent belongs to a pool that is open again and would be
+/// a false claim about "its 5h window".
+fn switched_headroom_pct(account: &str) -> Option<f64> {
+    let crate::profile_json::ProfileWindows::Oauth {
+        usage: Some(usage), ..
+    } = crate::profile_json::profile_windows_for(&crate::profile::ProfileName::from(account))
+    else {
+        return None;
+    };
+    let now = crate::usage::now_epoch_secs();
+    if !crate::usage::five_hour_live(&usage, now) {
+        return None;
+    }
+    Some(usage.five_hour.as_ref()?.utilization)
 }
 
 // ── the headroom nudge ─────────────────────────────────────────────────────

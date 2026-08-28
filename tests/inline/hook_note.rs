@@ -67,9 +67,14 @@ fn unknown() -> Option<String> {
 const SWITCHED: &str =
     "clauth note: the active profile for this session switched from `kerry` to `cld`.";
 
-/// The shipped copy, byte for byte. 25 and 22 tokens against opus-4-8, counted
-/// with the literal placeholders `old` and `new` in place of the two account
-/// names rather than the ones shown here, so a reworded one is a re-count.
+/// The shipped copy, byte for byte. All three spellings counted against
+/// opus-4-8 via cloudify's `token-count.mjs` on their placeholder spellings —
+/// `old`/`new`/`100` standing in for the names and figure, the `%` literal:
+/// ``clauth note: session resumed under `new`; earlier turns ran under `old`.``
+/// counts 25, ``clauth note: the active profile for this session switched from
+/// `old` to `new`.`` counts 22, and ``clauth note: the active profile for this
+/// session switched from `old` to `new`; its 5h window is 100% used.`` counts
+/// 33. A reworded one is a re-count.
 #[test]
 fn both_note_spellings_render_the_shipped_copy() {
     assert_eq!(
@@ -84,9 +89,22 @@ fn both_note_spellings_render_the_shipped_copy() {
         Note::Switched {
             from: "kerry",
             to: "cld",
+            used: None,
         }
         .render(),
         SWITCHED,
+    );
+    // The E4 clause (2026-08-28), byte for byte: the `%` is literal in the
+    // copy, the figure a bare number.
+    assert_eq!(
+        Note::Switched {
+            from: "kerry",
+            to: "cld",
+            used: Some(62.0),
+        }
+        .render(),
+        "clauth note: the active profile for this session switched from `kerry` \
+         to `cld`; its 5h window is 62% used.",
     );
 }
 
@@ -475,6 +493,153 @@ fn a_note_that_cannot_be_recorded_is_not_emitted() {
         load_record(&record_path("conv-nostore", None).expect("path")).and_then(|r| r.told),
         Some("kerry".to_string()),
         "and the record still holds the account it last managed to remember",
+    );
+}
+
+// ── the account-changed note's headroom figure (r9) ─────────────────────────
+
+/// A blank profile whose disk usage cache holds a live 5h window at `pct` —
+/// the bytes `switched_headroom_pct` reads. The profile itself is required,
+/// not optional: the cache writer skips names the on-disk profile record does
+/// not carry, so seeding the cache alone writes nothing.
+fn seed_headroom(name: &str, pct: f64) {
+    let mut config = crate::profile::AppConfig {
+        state: crate::profile::AppState::default(),
+        profiles: Vec::new(),
+    };
+    crate::actions::create_blank_profile(&mut config, name.to_string(), None, None, None)
+        .expect("create profile");
+
+    let now_secs = crate::usage::now_epoch_secs();
+    write_profile_cache(
+        &ProfileName::from(name),
+        USAGE_CACHE_FILE,
+        &crate::usage::UsageInfo {
+            five_hour: Some(crate::usage::UsageWindow {
+                utilization: pct,
+                resets_at: Some(crate::usage::epoch_secs_to_iso(now_secs + 3600)),
+            }),
+            ..Default::default()
+        },
+    );
+}
+
+/// The E4-approved copy, byte for byte, with the placeholders filled: the
+/// switched sentence plus the new account's cached 5h window percent, gathered
+/// off the disk cache through the real readers. Both accounts carry figures
+/// and they differ, so the pin also shows the figure named is the NEW
+/// account's — reading the old account's cache would print 33.
+#[test]
+fn an_account_change_names_the_new_accounts_headroom() {
+    let _home = HomeSandbox::new();
+    seed_headroom("kerry", 33.0);
+    seed_headroom("cld", 62.0);
+    let fire = payload("PostToolUse", "conv-headroom");
+
+    note_for(&fire, &watch(1, 0), &kerry);
+    assert_eq!(
+        note_for(&fire, &watch(2, 0), &cld).as_deref(),
+        Some(
+            "clauth note: the active profile for this session switched from \
+             `kerry` to `cld`; its 5h window is 62% used.",
+        ),
+    );
+
+    // The compact-with-change arm is the switched spelling's second render
+    // site; the clause must land there too.
+    let mut compacted = payload("SessionStart", "conv-headroom");
+    compacted.source = Some("compact".to_string());
+    assert_eq!(
+        note_for(&compacted, &watch(3, 0), &kerry).as_deref(),
+        Some(
+            "clauth note: the active profile for this session switched from \
+             `cld` to `kerry`; its 5h window is 33% used.",
+        ),
+    );
+}
+
+/// A subagent spawned BEFORE the move has no record of its own, so the gather
+/// gate finds no `told` on the peek — the clause must still land on the note
+/// the subagent hears. This is the load-bearing arm of the `told != candidate`
+/// gate: it may not read as "no baseline, nothing can fire".
+#[test]
+fn a_subagent_that_predates_the_move_hears_the_clause() {
+    let _home = HomeSandbox::new();
+    seed_headroom("kerry", 33.0);
+    seed_headroom("cld", 62.0);
+    let main = payload("UserPromptSubmit", "conv-sub-clause");
+    note_for(&main, &watch(1, 0), &kerry);
+
+    let mut sub = payload("PostToolUse", "conv-sub-clause");
+    sub.agent_id = Some("a4a894a1be41b92bf".to_string());
+    assert_eq!(
+        note_for(&sub, &watch(2, 0), &cld).as_deref(),
+        Some(
+            "clauth note: the active profile for this session switched from \
+             `kerry` to `cld`; its 5h window is 62% used.",
+        ),
+    );
+}
+
+/// The E4 omit rule: a new account with no cached usage figure keeps the
+/// sentence byte-identical to the pre-r9 spelling. The clause is omitted,
+/// never rendered with a made-up figure.
+#[test]
+fn a_usage_less_account_keeps_the_sentence_unchanged() {
+    let _home = HomeSandbox::new();
+    let fire = payload("PostToolUse", "conv-nocache");
+    note_for(&fire, &watch(1, 0), &kerry);
+    assert_eq!(
+        note_for(&fire, &watch(2, 0), &cld).as_deref(),
+        Some(SWITCHED),
+    );
+}
+
+/// A cached window that has already lapsed has no figure to name: its percent
+/// belongs to a pool that is open again, and printing it would be the false
+/// claim about "its 5h window" the note exists to prevent.
+#[test]
+fn a_lapsed_window_omits_the_clause() {
+    let _home = HomeSandbox::new();
+    seed_headroom("cld", 62.0);
+    let now_secs = crate::usage::now_epoch_secs();
+    write_profile_cache(
+        &ProfileName::from("cld"),
+        USAGE_CACHE_FILE,
+        &crate::usage::UsageInfo {
+            five_hour: Some(crate::usage::UsageWindow {
+                utilization: 62.0,
+                resets_at: Some(crate::usage::epoch_secs_to_iso(now_secs - 3600)),
+            }),
+            ..Default::default()
+        },
+    );
+    let fire = payload("PostToolUse", "conv-lapsed");
+    note_for(&fire, &watch(1, 0), &kerry);
+    assert_eq!(
+        note_for(&fire, &watch(2, 0), &cld).as_deref(),
+        Some(SWITCHED)
+    );
+}
+
+/// The resume spelling stays unchanged, clause or not: a resume onto an
+/// account WITH a cached figure still renders the pre-r9 sentence — the
+/// headroom clause is the switched spelling's alone.
+#[test]
+fn a_resume_never_carries_the_headroom_clause() {
+    let _home = HomeSandbox::new();
+    seed_headroom("DS4", 62.0);
+    note_for(
+        &payload("UserPromptSubmit", "conv-resume-headroom"),
+        &watch(1, 0),
+        &|| Some("z.ai".to_string()),
+    );
+
+    let mut resumed = payload("SessionStart", "conv-resume-headroom");
+    resumed.source = Some("resume".to_string());
+    assert_eq!(
+        note_for(&resumed, &watch(2, 0), &|| Some("DS4".to_string())).as_deref(),
+        Some("clauth note: session resumed under `DS4`; earlier turns ran under `z.ai`."),
     );
 }
 

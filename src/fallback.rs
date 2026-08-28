@@ -852,10 +852,24 @@ pub(crate) struct ChainSnapshot {
 /// short-circuits anyway, so callers can skip evaluation on `None`.
 pub(crate) fn snapshot_chain(config: &AppConfig) -> Option<ChainSnapshot> {
     let active = config.state.active_profile.as_ref().cloned()?;
-    if !config.state.fallback_chain.iter().any(|n| n == &active) {
+    snapshot_chain_from(config, &active)
+}
+
+/// [`snapshot_chain`] anchored on an explicit member instead of the global
+/// active. The headroom nudge's replay (`hook_note::chain_would_act`) is the
+/// one caller: its gate reads the account the session's credentials RESOLVE
+/// to, which a pinned runtime session or a divergence can keep apart from
+/// `active_profile`, and a walk anchored on the global active would answer
+/// about a switch that never moves that session. Same `None` contract, same
+/// walk — the anchor is the only difference.
+pub(crate) fn snapshot_chain_from(
+    config: &AppConfig,
+    member: &ProfileName,
+) -> Option<ChainSnapshot> {
+    if !config.state.fallback_chain.iter().any(|n| n == member) {
         return None;
     }
-    Some(build_chain_snapshot(config, active, &|_| false))
+    Some(build_chain_snapshot(config, member.clone(), &|_| false))
 }
 
 /// [`snapshot_chain`] for ONE live session: the same chain, evaluated from the

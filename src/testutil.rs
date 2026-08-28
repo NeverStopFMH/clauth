@@ -804,10 +804,9 @@ pub(crate) fn blank_profile(name: &crate::profile::ProfileName) -> crate::profil
 /// Write `entries` as a profile's `usage_history.jsonl` — the on-disk shape
 /// `profile::load_usage_history` parses — so a fixture can give an account a
 /// measured burn rate without running a fetch. Timestamps are `now_ms`-space
-/// epoch milliseconds. Takes the sandbox so the write can only land in a
-/// sandboxed home, never the real one.
+/// epoch milliseconds. The write resolves under the process HOME: the caller's
+/// `HomeSandbox` (the HOME pin) is what keeps it off a real `~/.clauth`.
 pub(crate) fn write_usage_history(
-    _home: &HomeSandbox,
     name: &crate::profile::ProfileName,
     entries: &[(u64, crate::usage::UsageInfo)],
 ) {

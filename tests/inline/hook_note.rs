@@ -125,6 +125,29 @@ fn the_envelope_echoes_the_event_that_produced_it() {
     }
 }
 
+/// `run()`'s wiring: whatever earned the turn — one note or two — leaves the
+/// process as ONE envelope, never two JSON documents on stdout (two documents
+/// would parse as none). The join is what puts both notes into one
+/// `additionalContext`, and the rendered payload is one parseable document.
+#[test]
+fn two_earned_notes_join_into_one_envelope() {
+    let joined = joined_envelope(
+        "PostToolUse",
+        &["first note".to_string(), "second note".to_string()],
+    );
+    assert_eq!(
+        joined,
+        serde_json::json!({
+            "hookSpecificOutput": {
+                "hookEventName": "PostToolUse",
+                "additionalContext": "first note\n\nsecond note",
+            }
+        }),
+    );
+    serde_json::from_str::<serde_json::Value>(&joined.to_string())
+        .expect("one JSON document, never two");
+}
+
 #[test]
 fn the_first_fire_is_a_baseline_and_a_move_is_announced_once() {
     let _home = HomeSandbox::new();
@@ -1045,7 +1068,7 @@ fn a_future_timestamp_from_a_clock_step_does_not_freeze_the_answer() {
     );
 }
 
-// ── the headroom nudge (r7) ─────────────────────────────────────────────────
+// ── the headroom nudge ──────────────────────────────────────────────────────
 
 /// A live, exhausted, rate-bearing window read at `now`, resetting `resets_in`
 /// seconds later. One instance is reused across the fires of a test so every
@@ -1162,8 +1185,8 @@ fn the_nudge_re_arms_on_a_window_reset_and_on_a_verdict_flip() {
 }
 
 /// Every arm of the gate that keeps the note silent: a switch the chain would
-/// land, a window with no measured rate — silence either way (r7's static
-/// check could only have answered silence too; the copy's `{rate}`/`{when}`
+/// land, a window with no measured rate — silence either way (a no-rate
+/// window was silent under r7 either way; the copy's `{rate}`/`{when}`
 /// placeholders have no figures to fill) — and a rate that reaches the cap
 /// only after the reset (the copy's cap claim would be false). A silent
 /// verdict also writes no record — nothing was learned.
@@ -1190,7 +1213,8 @@ fn a_chain_target_a_missing_rate_and_a_late_cap_each_stay_silent() {
     assert_eq!(
         nudge_note(&fire, &no_rate),
         None,
-        "at the threshold with no measured rate: silence, as r7's deleted static check answered",
+        "at the threshold with no measured rate: silence — r7's deleted static \
+         check answered true here, and the rate filter after it silenced the emit",
     );
 
     let no_rate_below = NudgeRead {
@@ -1339,19 +1363,19 @@ fn a_subagent_or_non_task_fire_is_never_nudge_eligible() {
     let mut sub = task_fire("conv-scope");
     sub.agent_id = Some("a4a894a1be41b92bf".to_string());
     assert!(
-        read_nudge(&sub).is_none(),
+        read_nudge(&sub, None).is_none(),
         "a subagent fire answers for nobody"
     );
 
     let mut bash = task_fire("conv-scope");
     bash.tool_name = Some("Bash".to_string());
     assert!(
-        read_nudge(&bash).is_none(),
+        read_nudge(&bash, None).is_none(),
         "only the agent-spawn tool earns it"
     );
 
     assert!(
-        read_nudge(&payload("PostToolUse", "conv-scope")).is_none(),
+        read_nudge(&payload("PostToolUse", "conv-scope"), None).is_none(),
         "a fire carrying no tool name cannot be a Task fire",
     );
 }
@@ -1399,13 +1423,13 @@ fn seed_chain_with_active_at(active_pct: f64) {
 
 /// Three distinct samples inside the lookback, rising to the live 97% — enough
 /// for a measured rate without predicting what the regression answers.
-fn seed_burn_history(home: &HomeSandbox) {
-    seed_burn_history_samples(home, 88.0, 93.0, 96.0);
+fn seed_burn_history() {
+    seed_burn_history_samples(88.0, 93.0, 96.0);
 }
 
 /// The same history, with the three older samples named explicitly — the
 /// below-threshold fixtures need a steeper rise than the 97% one.
-fn seed_burn_history_samples(home: &HomeSandbox, oldest: f64, middle: f64, newest: f64) {
+fn seed_burn_history_samples(oldest: f64, middle: f64, newest: f64) {
     let now_ms = crate::usage::now_ms();
     let at = |pct: f64| crate::usage::UsageInfo {
         five_hour: Some(crate::usage::UsageWindow {
@@ -1415,7 +1439,6 @@ fn seed_burn_history_samples(home: &HomeSandbox, oldest: f64, middle: f64, newes
         ..Default::default()
     };
     crate::testutil::write_usage_history(
-        home,
         &ProfileName::from("a"),
         &[
             (now_ms - 3_000_000, at(oldest)),
@@ -1430,14 +1453,14 @@ fn seed_burn_history_samples(home: &HomeSandbox, oldest: f64, middle: f64, newes
 /// hand-built `NudgeRead`.
 #[test]
 fn the_real_reader_replays_the_decision_leg_over_the_disk_cache() {
-    let home = HomeSandbox::new();
+    let _home = HomeSandbox::new();
     seed_exhausted_chain();
-    seed_burn_history(&home);
+    seed_burn_history();
     let fire = task_fire("conv-real");
 
     // b is a clear chain member: the leg would switch onto it, so the nudge
     // stays silent.
-    let read = read_nudge(&fire).expect("eligible and readable");
+    let read = read_nudge(&fire, None).expect("eligible and readable");
     assert!(
         read.headroom.is_some(),
         "the active window reached the reader"
@@ -1455,7 +1478,7 @@ fn the_real_reader_replays_the_decision_leg_over_the_disk_cache() {
     config.state.fallback_chain = vec![ProfileName::from("a")];
     crate::profile::save_app_state(&config.state).expect("save chain");
 
-    let read = read_nudge(&fire).expect("still eligible");
+    let read = read_nudge(&fire, None).expect("still eligible");
     assert!(!read.chain_acts, "the walk has nowhere to point");
     let note = nudge_note(&fire, &read).expect("the nudge fires");
     assert!(
@@ -1480,9 +1503,9 @@ fn the_real_reader_replays_the_decision_leg_over_the_disk_cache() {
 /// would be skipped and `chain_acts` would read false, the pin this test reds.
 #[test]
 fn a_below_threshold_projection_fire_still_replays_the_chain_walk() {
-    let home = HomeSandbox::new();
+    let _home = HomeSandbox::new();
     seed_chain_with_active_at(92.0);
-    seed_burn_history_samples(&home, 80.0, 86.0, 90.0);
+    seed_burn_history_samples(80.0, 86.0, 90.0);
     let mut config = crate::profile::load_config().expect("reload");
     config.state.burn_aware_switching = true;
     config.state.burn_switch_floor_pct = Some(90.0);
@@ -1491,7 +1514,7 @@ fn a_below_threshold_projection_fire_still_replays_the_chain_walk() {
     crate::profile::save_app_state(&config.state).expect("save state");
     let fire = task_fire("conv-walk-below");
 
-    let read = read_nudge(&fire).expect("eligible and readable");
+    let read = read_nudge(&fire, None).expect("eligible and readable");
     assert!(
         read.chain_acts,
         "the walk ran on a below-threshold projection-arm fire"
@@ -1500,6 +1523,70 @@ fn a_below_threshold_projection_fire_still_replays_the_chain_walk() {
         nudge_note(&fire, &read),
         None,
         "a covered session stays silent"
+    );
+}
+
+/// The walk anchors on the account the gate resolved, never the global
+/// active. A pinned runtime session sits on the profile its own
+/// `CLAUDE_CONFIG_DIR` names even after a switch moves `active_profile`
+/// elsewhere, and a walk anchored on the global active answers "the chain
+/// would act" about that switch — which never moves this session. Here the
+/// session resolves to `a`, not a chain member at all, while the global
+/// active `b` is exhausted and `c` is clear: the global walk would land
+/// `b -> c`, but nothing catches the session on `a`, whose own window is
+/// burning to the cap, so the nudge must land.
+#[test]
+fn a_switch_that_never_moves_a_pinned_session_does_not_suppress_its_nudge() {
+    let home = HomeSandbox::new();
+    // Three profiles; the chain covers only `b` and `c`, and `b` is the
+    // global active. The session's own account, `a`, sits outside the chain.
+    let mut config = crate::profile::AppConfig {
+        state: crate::profile::AppState::default(),
+        profiles: Vec::new(),
+    };
+    crate::actions::create_blank_profile(&mut config, "a".to_string(), None, None, None)
+        .expect("create a");
+    crate::actions::create_blank_profile(&mut config, "b".to_string(), None, None, None)
+        .expect("create b");
+    crate::actions::create_blank_profile(&mut config, "c".to_string(), None, None, None)
+        .expect("create c");
+    config.state.active_profile = Some(ProfileName::from("b"));
+    config.state.fallback_chain = vec![ProfileName::from("b"), ProfileName::from("c")];
+    crate::profile::save_app_state(&config.state).expect("save state");
+
+    let now_secs = crate::usage::now_epoch_secs();
+    let live_at = |pct: f64| crate::usage::UsageInfo {
+        five_hour: Some(crate::usage::UsageWindow {
+            utilization: pct,
+            resets_at: Some(crate::usage::epoch_secs_to_iso(now_secs + 3600)),
+        }),
+        ..Default::default()
+    };
+    // The session's own window at 97% with a measured burn; `b` exhausted and
+    // `c` clear, so the walk anchored on the GLOBAL active would land a switch.
+    write_profile_cache(&ProfileName::from("a"), USAGE_CACHE_FILE, &live_at(97.0));
+    write_profile_cache(&ProfileName::from("b"), USAGE_CACHE_FILE, &live_at(97.0));
+    write_profile_cache(&ProfileName::from("c"), USAGE_CACHE_FILE, &live_at(10.0));
+    seed_burn_history();
+
+    // Pinned runtime on `a`, no registry row: nothing may move it, and the
+    // reader's row check stays silent — the fire is eligible.
+    let _dir = crate::testutil::ConfigDirSandbox::new(
+        &home,
+        &home.home().join(".clauth/profiles/a/runtime-456-7"),
+    );
+    let fire = task_fire("conv-pinned");
+
+    let read = read_nudge(&fire, None).expect("eligible and readable");
+    assert!(
+        !read.chain_acts,
+        "the walk is anchored on the resolved account `a`, outside the chain: \
+         nothing would catch the session"
+    );
+    let note = nudge_note(&fire, &read).expect("the nudge fires");
+    assert!(
+        note.starts_with("clauth note: 5h window 97% used ("),
+        "the session's own window earns it: {note}",
     );
 }
 
@@ -1512,17 +1599,17 @@ fn a_below_threshold_projection_fire_still_replays_the_chain_walk() {
 fn an_armed_session_silences_the_reader_before_any_read() {
     let home = HomeSandbox::new();
     seed_exhausted_chain();
-    seed_burn_history(&home);
+    seed_burn_history();
     let fire = task_fire("conv-armed");
     assert!(
-        read_nudge(&fire).is_some(),
+        read_nudge(&fire, None).is_some(),
         "unarmed on the same tree: eligible"
     );
 
     let mut sub = task_fire("conv-armed");
     sub.agent_id = Some("a4a894a1be41b92bf".to_string());
     assert!(
-        read_nudge(&sub).is_none(),
+        read_nudge(&sub, None).is_none(),
         "a subagent fire answers for nobody, same tree",
     );
 
@@ -1549,7 +1636,7 @@ fn an_armed_session_silences_the_reader_before_any_read() {
     .expect("row");
 
     assert!(
-        read_nudge(&fire).is_none(),
+        read_nudge(&fire, None).is_none(),
         "the armed row silences the reader before any other read",
     );
 }

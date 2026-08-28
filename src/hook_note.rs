@@ -330,11 +330,10 @@ fn watch_now() -> Watch {
     }
 }
 
-/// The account this conversation's credentials resolve to, through the same tier
+/// The account a loaded config's credentials resolve to, through the same tier
 /// walk `clauth which` uses.
-fn resolve_account() -> Option<String> {
-    let config = crate::profile::load_config().ok()?;
-    crate::which::resolve_active(&config).map(|(name, _)| name)
+fn resolve_account(config: &crate::profile::AppConfig) -> Option<String> {
+    crate::which::resolve_active(config).map(|(name, _)| name)
 }
 
 pub(crate) fn run() -> Result<()> {
@@ -349,11 +348,25 @@ pub(crate) fn run() -> Result<()> {
     let Some(payload) = parse_payload(&input) else {
         return Ok(());
     };
+    // One `load_config` per fire, shared by its two consumers — the account
+    // note's resolve (gate-open only) and the nudge reader (every eligible
+    // `Task` fire). A gate-open `Task` fire paid it twice before, ~3.1-5.9 ms
+    // per load (the chmod-walk, priced in the module doc). Lazy, so a fire
+    // that opens neither consumer never loads; a failed load is retried by
+    // the reader exactly as it was before, off the same bytes microseconds
+    // later.
+    let config: std::cell::OnceCell<Option<crate::profile::AppConfig>> = std::cell::OnceCell::new();
+    let resolve = || {
+        config
+            .get_or_init(|| crate::profile::load_config().ok())
+            .as_ref()
+            .and_then(resolve_account)
+    };
     let mut notes: Vec<String> = Vec::new();
-    if let Some(note) = note_for(&payload, &watch_now(), &resolve_account) {
+    if let Some(note) = note_for(&payload, &watch_now(), &resolve) {
         notes.push(note);
     }
-    if let Some(read) = read_nudge(&payload)
+    if let Some(read) = read_nudge(&payload, config.get().and_then(|loaded| loaded.as_ref()))
         && let Some(note) = nudge_note(&payload, &read)
     {
         notes.push(note);
@@ -362,13 +375,18 @@ pub(crate) fn run() -> Result<()> {
     // as none, and one `additionalContext` field carries both notes when both
     // earned the turn.
     if !notes.is_empty() {
-        emit(&payload.event, &notes.join("\n\n"));
+        outln!("{}", joined_envelope(&payload.event, &notes));
     }
     Ok(())
 }
 
-fn emit(event: &str, note: &str) {
-    outln!("{}", envelope(event, note));
+/// [`envelope`] over the fire's earned notes joined — whatever earned the turn,
+/// one note or two, renders as ONE `additionalContext` field and so ONE JSON
+/// document on stdout (two documents would parse as none). Split from the
+/// print for the same reason [`envelope`] is: the join is assertable without
+/// capturing stdout.
+fn joined_envelope(event: &str, notes: &[String]) -> serde_json::Value {
+    envelope(event, &notes.join("\n\n"))
 }
 
 /// The hook's output payload, split from the print so its field shapes are
@@ -896,7 +914,12 @@ struct NudgeFigures {
 /// all: not a parent-scope `Task` call, or a session the fallback chain is
 /// allowed to move. Every read here is lock-free disk IO, run before the scope
 /// lock, like the account resolution it sits beside.
-fn read_nudge(payload: &Payload) -> Option<NudgeRead> {
+///
+/// `shared` is the fire's one `load_config` — `run()` passes the load its
+/// account-note resolve already took (or that load's failure, which the
+/// reader then retries); `None` makes the reader load its own — the common
+/// gate-closed fire, and the test seam.
+fn read_nudge(payload: &Payload, shared: Option<&crate::profile::AppConfig>) -> Option<NudgeRead> {
     // Subagent fires are the one scope this never answers for: the reader that
     // decides to spawn again is the parent, and a shared flag would let the
     // first subagent fire consume the note.
@@ -920,17 +943,30 @@ fn read_nudge(payload: &Payload) -> Option<NudgeRead> {
     {
         return None;
     }
-    let config = crate::profile::load_config().ok()?;
+    let owned;
+    let config = match shared {
+        Some(config) => config,
+        // The fire's shared load never happened (the account note's gate
+        // stayed closed) or failed — and the test seam. Load afresh, exactly
+        // as this reader always did.
+        None => {
+            owned = crate::profile::load_config().ok()?;
+            &owned
+        }
+    };
     // The account this conversation runs on, through the same tier walk the
     // account note resolves with — never `config.state.active_profile`, which
-    // a runtime session or a divergence can differ from.
-    let (account, _) = crate::which::resolve_active(&config)?;
-    let profile = config.find(&crate::profile::ProfileName::from(account))?;
+    // a runtime session or a divergence can differ from. The walk below
+    // anchors on the SAME account: `snapshot_chain`'s global-active anchor
+    // would answer about a switch that never moves a pinned session.
+    let (account, _) = crate::which::resolve_active(config)?;
+    let anchor = crate::profile::ProfileName::from(account);
+    let profile = config.find(&anchor)?;
     let headroom = headroom_of(profile);
     let chain_acts = headroom
         .as_ref()
         .is_some_and(|h| projection_arm(h).is_some())
-        && chain_would_act(&config);
+        && chain_would_act(config, &anchor);
     Some(NudgeRead {
         headroom,
         chain_acts,
@@ -1012,8 +1048,8 @@ const NUDGE_BURN_FLOOR_PCT: f64 = 50.0;
 /// projection arm subsumes (`used >= threshold` implies the floor conjunct).
 /// The weekly arm of the leg's predicate is deliberately not part of this
 /// gate either: the note names the 5h window, so only the 5h window's own
-/// projection is its premise. `None` for a no-rate window — r7's static
-/// check, deleted now, could only have answered it silence anyway: see
+/// projection is its premise — which leaves the copy's 429 claim uncovered for an account whose 429s come from the 7d cap, the deliberate price of that premise. `None` for a no-rate window — r7's static check, deleted
+/// now, could only have ended the fire in silence anyway: see
 /// [`nudge_figures`].
 fn projection_arm(h: &Headroom) -> Option<f64> {
     let rate = h.rate.filter(|r| *r > 0.0)?;
@@ -1037,11 +1073,13 @@ fn projection_arm(h: &Headroom) -> Option<f64> {
 /// static threshold — the r8 upgrade over r7's `window_exhausted` gate. The
 /// static threshold check itself is deleted; the todo's last sentence ("no
 /// rate leaves the static threshold check alone") is honored behaviorally,
-/// not structurally. r7's check answered silence for a no-rate account — its
-/// rate filter sat after it and bailed first — and so does r8's gate, which a
-/// no-rate window reaches only through [`projection_arm`]'s `None`: the
-/// approved copy's `{rate}`/`{when}` placeholders have no figures to fill,
-/// so nothing can render, and nothing a no-rate account hears changes.
+/// not structurally. A no-rate account was silent under r7 either way —
+/// below the threshold the check bailed itself, at the threshold it answered
+/// true and the rate filter after it silenced the emit — and so does r8's
+/// gate, which a no-rate window reaches only through [`projection_arm`]'s
+/// `None`: the approved copy's `{rate}`/`{when}` placeholders have no
+/// figures to fill, so nothing can render, and nothing a no-rate account
+/// hears changes.
 fn nudge_figures(read: &NudgeRead) -> Option<NudgeFigures> {
     let h = read.headroom.as_ref()?;
     if read.chain_acts {
@@ -1049,12 +1087,12 @@ fn nudge_figures(read: &NudgeRead) -> Option<NudgeFigures> {
     }
     let rate = projection_arm(h)?;
     let when = if h.used >= 100.0 {
-        // Already at the cap: the projected instant is the present.
+        // Already at the cap: the projected instant is the present — the computation below answers identically for every input the API can produce (its utilization stays within 0..=100; at exactly 100 the seconds-to-cap is zero), so this branch is intent, never a pinnable split.
         h.now
     } else {
         // The copy's `{when}` — the cap instant at the measured rate. A figure,
-        // never a gate: the arm above has already pinned it inside the window,
-        // so it cannot overshoot `resets_at`.
+        // never a gate: the arm above has already pinned it at-or-inside the
+        // window, so it cannot overshoot `resets_at`. The one equality case — `secs_to_cap == secs_left`, a measure-zero f64 boundary — renders `when == reset`: the copy then says "reaches its cap" at the reset instant, not before it.
         let secs_to_cap = ((100.0 - h.used) / rate * 3600.0) as i64;
         h.now.saturating_add(secs_to_cap)
     };
@@ -1085,23 +1123,31 @@ fn render_nudge(f: &NudgeFigures) -> Option<String> {
 }
 
 /// The decision leg's walk replayed over the disk cache: `true` when the daemon
-/// would land a switch — or a wrap-off sign-out — instead of the refusal. Same
-/// call the leg makes, `fallback::next_auto_switch_target`, fed a store
-/// hydrated from the caches the daemon's own store is persisted to and
-/// hydrated from; a member with no cached OAuth usage reads exactly as it
-/// reads in the real store (absent entry = headroom). The `Arc<RankedMutex>`
-/// wrapper is the entry point's signature, not shared state: the mutex is
-/// process-private, never contended, locked only for the walk's own snapshot
-/// clone, and taken while this process holds no other rank — so no rank in the
-/// global order is acquired in a context that could invert it. The walk's
-/// `fresh` and `kick_rejected` channels stay empty, which the snapshot type
-/// documents as "not config state": freshness is a preference the any-fresh
-/// pass renders moot, and a kick-rejected member reads as headroom here where
-/// the live leg would walk around it — a bounded corner this note trades for
-/// reusing the leg rather than reimplementing it.
-fn chain_would_act(config: &crate::profile::AppConfig) -> bool {
-    let Some(snapshot) = crate::fallback::snapshot_chain(config) else {
-        // No active, or the active is outside the chain: the leg would do
+/// would land a switch — or a wrap-off sign-out — instead of the refusal.
+/// Anchored on `anchor` — the account the gate resolved — never the global
+/// active: a pinned runtime session can resolve to a member a switch never
+/// moves, and a walk anchored on the global active would answer "the chain
+/// would act" about that switch
+/// ([`crate::fallback::snapshot_chain_from`]). Same call the leg makes,
+/// `fallback::next_auto_switch_target`, fed a store hydrated from the caches
+/// the daemon's own store is persisted to and hydrated from; a member with no
+/// cached OAuth usage reads exactly as it reads in the real store (absent
+/// entry = headroom). The `Arc<RankedMutex>` wrapper is the entry point's
+/// signature, not shared state: the mutex is process-private, never
+/// contended, locked only for the walk's own snapshot clone, and taken while
+/// this process holds no other rank — so no rank in the global order is
+/// acquired in a context that could invert it. The walk's `fresh` and
+/// `kick_rejected` channels stay empty, which the snapshot type documents as
+/// "not config state": freshness is a preference the any-fresh pass renders
+/// moot, and a kick-rejected member reads as headroom here where the live
+/// leg would walk around it — a bounded corner this note trades for reusing
+/// the leg rather than reimplementing it. The live leg's `reading_is_actionable` pre-gate is absent too (no `StatusStore` in a hook process); that omission can only SUPPRESS — a stale reading the live leg would ignore reads as actionable here, and `chain_acts` true never emits.
+fn chain_would_act(
+    config: &crate::profile::AppConfig,
+    anchor: &crate::profile::ProfileName,
+) -> bool {
+    let Some(snapshot) = crate::fallback::snapshot_chain_from(config, anchor) else {
+        // The resolved account is outside the chain: the leg would do
         // nothing, which is exactly "nothing would catch".
         return false;
     };

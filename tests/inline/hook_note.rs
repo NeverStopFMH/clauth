@@ -2,6 +2,8 @@
 
 use super::*;
 
+use crate::profile::ProfileName;
+use crate::profile_cache::{USAGE_CACHE_FILE, write_profile_cache};
 use crate::testutil::HomeSandbox;
 
 /// A payload carrying only what these tests vary.
@@ -10,9 +12,17 @@ fn payload(event: &str, session: &str) -> Payload {
         event: event.to_string(),
         session_id: session.to_string(),
         agent_id: None,
+        tool_name: None,
         source: None,
         transcript: None,
     }
+}
+
+/// A parent-scope `Task` (agent-spawn) fire — the one call the nudge gates on.
+fn task_fire(session: &str) -> Payload {
+    let mut fire = payload("PostToolUse", session);
+    fire.tool_name = Some("Task".to_string());
+    fire
 }
 
 /// A stamp set whose two halves move INDEPENDENTLY, so a test can pin which
@@ -868,4 +878,419 @@ fn a_future_timestamp_from_a_clock_step_does_not_freeze_the_answer() {
         Some("cld"),
         "and the fresh answer must land rather than being thrown away",
     );
+}
+
+// ── the headroom nudge (r7) ─────────────────────────────────────────────────
+
+/// A live, exhausted, rate-bearing window read at `now`, resetting `resets_in`
+/// seconds later. One instance is reused across the fires of a test so every
+/// verdict shares a window identity and a second-boundary step cannot re-arm it.
+fn headroom(used: f64, rate: f64, resets_in: i64) -> Headroom {
+    let now = crate::usage::now_epoch_secs();
+    Headroom {
+        used,
+        threshold: 95.0,
+        resets_at: now + resets_in,
+        rate: Some(rate),
+        now,
+    }
+}
+
+fn nudge_read(used: f64, rate: f64, resets_in: i64, chain_acts: bool) -> NudgeRead {
+    NudgeRead {
+        headroom: Some(headroom(used, rate, resets_in)),
+        chain_acts,
+    }
+}
+
+/// The approved copy, byte for byte, with the placeholders the gate computed:
+/// used, the measured rate, the projected cap instant, the reset. The two
+/// stamps render through the crate's one local-stamp formatter, so the pin
+/// asserts the WIRING — which instants reach the copy — while `local_stamp`'s
+/// own shape is pinned in its module; the copy's literal text is pinned here
+/// in full. 97% at 5%/h caps in (100-97)/5 h = 2160 s, inside the 3600 s left.
+#[test]
+fn a_task_past_the_threshold_with_nowhere_to_go_emits_the_approved_copy() {
+    let _home = HomeSandbox::new();
+    let fire = task_fire("conv-nudge");
+    let read = nudge_read(97.0, 5.0, 3600, false);
+    let h = read.headroom.expect("a window");
+
+    let note = nudge_note(&fire, &read).expect("the nudge fires");
+    let when = crate::format::local_stamp(h.now + 2160).expect("stamp");
+    let reset = crate::format::local_stamp(h.resets_at).expect("stamp");
+    assert_eq!(
+        note,
+        format!(
+            "clauth note: 5h window 97% used (5.0%/h). at this rate, it reaches \
+             its cap {when}, resets {reset}. no fallback is set; further agent \
+             spawns may fail with 429s.",
+        ),
+    );
+}
+
+/// The record is the suppression mechanism: an unchanged verdict stays silent
+/// across fires and across record reloads — a fresh hook process is exactly a
+/// fresh record read off the same bytes — and the state that buys the silence
+/// is on disk, not in memory.
+#[test]
+fn an_unchanged_verdict_does_not_re_emit_across_fires_or_reloads() {
+    let _home = HomeSandbox::new();
+    let fire = task_fire("conv-again");
+    let read = nudge_read(97.0, 5.0, 3600, false);
+    let window = read.headroom.expect("a window").resets_at;
+
+    nudge_note(&fire, &read).expect("the first fire emits");
+    assert_eq!(
+        nudge_note(&fire, &read),
+        None,
+        "the same window under the same verdict stays silent",
+    );
+
+    let path = record_path("conv-again", None).expect("path");
+    let stored = load_record(&path).expect("a record");
+    assert_eq!(
+        stored.nudge.as_ref().map(|s| (s.resets_at, s.emitted)),
+        Some((Some(window), true)),
+        "the emitted state for this window is on disk",
+    );
+
+    // The reload proof: the next fire reads the record back off disk, and the
+    // state it finds there suppresses it all the same.
+    assert_eq!(nudge_note(&fire, &read), None);
+}
+
+/// Two re-arms, both keyed on the stored window identity: the window rolling
+/// over (a different reset instant) and the verdict flipping false then true
+/// again inside one window. r8's projection gate inherits both shapes
+/// unchanged — the field holds the identity and the emission state, nothing
+/// more is needed to re-arm.
+#[test]
+fn the_nudge_re_arms_on_a_window_reset_and_on_a_verdict_flip() {
+    let _home = HomeSandbox::new();
+    let fire = task_fire("conv-rearm");
+    let base = headroom(97.0, 5.0, 3600);
+    let spent = NudgeRead {
+        headroom: Some(base),
+        chain_acts: false,
+    };
+    // The same window, now under the threshold: a silent verdict.
+    let quiet = NudgeRead {
+        headroom: Some(Headroom { used: 60.0, ..base }),
+        chain_acts: false,
+    };
+
+    nudge_note(&fire, &spent).expect("fires");
+    assert_eq!(nudge_note(&fire, &spent), None);
+
+    nudge_note(&fire, &quiet);
+    assert!(
+        nudge_note(&fire, &spent).is_some(),
+        "the verdict flipped false and back: the same window re-announces",
+    );
+
+    // A different reset instant is a different window, told or not.
+    assert!(
+        nudge_note(&fire, &nudge_read(97.0, 5.0, 7200, false)).is_some(),
+        "a new window re-arms by identity",
+    );
+}
+
+/// Every arm of the gate that keeps the note silent: a switch the chain would
+/// land, a window with no measured rate, a rate that reaches the cap only
+/// after the reset (the copy's cap claim would be false), and a window under
+/// the static threshold whose rate would cap it inside the window — that last
+/// fixture is the only one only `window_exhausted` can silence, so deleting
+/// the threshold conjunct reds it. A silent verdict also writes no record —
+/// nothing was learned.
+#[test]
+fn a_chain_target_a_missing_rate_and_a_late_cap_each_stay_silent() {
+    let _home = HomeSandbox::new();
+    let fire = task_fire("conv-quiet");
+    let path = record_path("conv-quiet", None).expect("path");
+
+    assert_eq!(
+        nudge_note(&fire, &nudge_read(97.0, 5.0, 3600, true)),
+        None,
+        "a usable next chain member means a switch lands instead of the refusal",
+    );
+    assert!(!path.exists(), "a silent verdict writes no record");
+
+    let no_rate = NudgeRead {
+        headroom: Some(Headroom {
+            rate: None,
+            ..headroom(97.0, 2.0, 3600)
+        }),
+        chain_acts: false,
+    };
+    assert_eq!(
+        nudge_note(&fire, &no_rate),
+        None,
+        "no measured rate: no projection to fill the placeholders from",
+    );
+
+    // 0.1%/h from 97% needs 30 h; the window resets in 5 h — the reset wins.
+    assert_eq!(
+        nudge_note(&fire, &nudge_read(97.0, 0.1, 5 * 3600, false)),
+        None,
+    );
+
+    // 80% at 30%/h caps in 2400 s, inside the 7200 s left: every other gate
+    // passes, so the STATIC threshold alone is what silences this fire.
+    assert_eq!(
+        nudge_note(&fire, &nudge_read(80.0, 30.0, 7200, false)),
+        None,
+    );
+}
+
+/// The record IS the suppression mechanism for the nudge exactly as it is for
+/// the account note: a verdict that cannot be remembered is not emitted. A
+/// directory occupying the record's path makes the atomic rename fail.
+#[test]
+fn a_nudge_that_cannot_be_recorded_is_not_emitted() {
+    let _home = HomeSandbox::new();
+    let fire = task_fire("conv-nostore-nudge");
+    let path = record_path("conv-nostore-nudge", None).expect("path");
+    std::fs::create_dir_all(&path).expect("occupy the record's path");
+
+    assert_eq!(nudge_note(&fire, &nudge_read(97.0, 5.0, 3600, false)), None,);
+}
+
+/// The tool name is the field the gate keys on, and a present-but-unusable one
+/// reads as absent: it cannot spell `Task`, and refusing the whole payload over
+/// it would take the account note down with it.
+#[test]
+fn the_tool_name_reaches_the_parser_leniently() {
+    let parsed = parse_payload(
+        r#"{"hook_event_name":"PostToolUse","session_id":"ok-1","tool_name":"Task"}"#,
+    )
+    .expect("parses");
+    assert_eq!(parsed.tool_name.as_deref(), Some("Task"));
+
+    let absent =
+        parse_payload(r#"{"hook_event_name":"PostToolUse","session_id":"ok-1"}"#).expect("parses");
+    assert_eq!(absent.tool_name, None);
+
+    let unusable =
+        parse_payload(r#"{"hook_event_name":"PostToolUse","session_id":"ok-1","tool_name":12345}"#)
+            .expect("still parses — lenient, unlike agent_id");
+    assert_eq!(unusable.tool_name, None);
+}
+
+/// Records written before the field existed must keep parsing: the serde
+/// default is the upgrade gate.
+#[test]
+fn a_record_without_the_nudge_field_still_parses() {
+    let _home = HomeSandbox::new();
+    let path = record_path("conv-old", None).expect("path");
+    std::fs::create_dir_all(path.parent().expect("dir")).expect("mkdir");
+    std::fs::write(&path, br#"{"told":"kerry","last_note":null}"#).expect("an old record");
+
+    let record = load_record(&path).expect("old bytes parse");
+    assert_eq!(record.told.as_deref(), Some("kerry"));
+    assert_eq!(
+        record.nudge, None,
+        "the default for a field that never existed"
+    );
+}
+
+/// The scope gate and the tool gate live in the reader, before any disk read:
+/// a subagent fire, or any tool that is not `Task`, is never nudge-eligible.
+#[test]
+fn a_subagent_or_non_task_fire_is_never_nudge_eligible() {
+    let _home = HomeSandbox::new();
+
+    let mut sub = task_fire("conv-scope");
+    sub.agent_id = Some("a4a894a1be41b92bf".to_string());
+    assert!(
+        read_nudge(&sub).is_none(),
+        "a subagent fire answers for nobody"
+    );
+
+    let mut bash = task_fire("conv-scope");
+    bash.tool_name = Some("Bash".to_string());
+    assert!(
+        read_nudge(&bash).is_none(),
+        "only the agent-spawn tool earns it"
+    );
+
+    assert!(
+        read_nudge(&payload("PostToolUse", "conv-scope")).is_none(),
+        "a fire carrying no tool name cannot be a Task fire",
+    );
+}
+
+// ── the real reader: disk cache + registry + decision-leg replay ────────────
+
+/// A real tree: `a` is the active profile with a live 5h window at 97%; `b` is
+/// a clear chain member; the chain is `[a, b]`. Every figure the replay and
+/// the gate read comes off the seeded disk bytes through the production
+/// readers — nothing is asserted from a hand-computed rate.
+fn seed_exhausted_chain() {
+    let mut config = crate::profile::AppConfig {
+        state: crate::profile::AppState::default(),
+        profiles: Vec::new(),
+    };
+    crate::actions::create_blank_profile(&mut config, "a".to_string(), None, None, None)
+        .expect("create a");
+    crate::actions::create_blank_profile(&mut config, "b".to_string(), None, None, None)
+        .expect("create b");
+    config.state.active_profile = Some(ProfileName::from("a"));
+    config.state.fallback_chain = vec![ProfileName::from("a"), ProfileName::from("b")];
+    crate::profile::save_app_state(&config.state).expect("save state");
+
+    let now_secs = crate::usage::now_epoch_secs();
+    let live_at = |pct: f64| crate::usage::UsageInfo {
+        five_hour: Some(crate::usage::UsageWindow {
+            utilization: pct,
+            resets_at: Some(crate::usage::epoch_secs_to_iso(now_secs + 3600)),
+        }),
+        ..Default::default()
+    };
+    write_profile_cache(&ProfileName::from("a"), USAGE_CACHE_FILE, &live_at(97.0));
+    write_profile_cache(&ProfileName::from("b"), USAGE_CACHE_FILE, &live_at(10.0));
+}
+
+/// Three distinct samples inside the lookback, rising to the live 97% — enough
+/// for a measured rate without predicting what the regression answers.
+fn seed_burn_history(home: &HomeSandbox) {
+    let now_ms = crate::usage::now_ms();
+    let at = |pct: f64| crate::usage::UsageInfo {
+        five_hour: Some(crate::usage::UsageWindow {
+            utilization: pct,
+            resets_at: None,
+        }),
+        ..Default::default()
+    };
+    crate::testutil::write_usage_history(
+        home,
+        &ProfileName::from("a"),
+        &[
+            (now_ms - 3_000_000, at(88.0)),
+            (now_ms - 1_800_000, at(93.0)),
+            (now_ms - 60_000, at(96.0)),
+        ],
+    );
+}
+
+/// Verify lines 1 and 2 through the REAL reader: the disk cache, the burn
+/// history, and the decision-leg walk replayed over the same bytes — not a
+/// hand-built `NudgeRead`.
+#[test]
+fn the_real_reader_replays_the_decision_leg_over_the_disk_cache() {
+    let home = HomeSandbox::new();
+    seed_exhausted_chain();
+    seed_burn_history(&home);
+    let fire = task_fire("conv-real");
+
+    // b is a clear chain member: the leg would switch onto it, so the nudge
+    // stays silent.
+    let read = read_nudge(&fire).expect("eligible and readable");
+    assert!(
+        read.headroom.is_some(),
+        "the active window reached the reader"
+    );
+    assert!(read.chain_acts, "the walk saw a target to switch to");
+    assert_eq!(
+        nudge_note(&fire, &read),
+        None,
+        "a covered session stays silent"
+    );
+
+    // The chain holds only the spent active: the leg has nowhere to point, and
+    // the nudge lands in that turn's context.
+    let mut config = crate::profile::load_config().expect("reload");
+    config.state.fallback_chain = vec![ProfileName::from("a")];
+    crate::profile::save_app_state(&config.state).expect("save chain");
+
+    let read = read_nudge(&fire).expect("still eligible");
+    assert!(!read.chain_acts, "the walk has nowhere to point");
+    let note = nudge_note(&fire, &read).expect("the nudge fires");
+    assert!(
+        note.starts_with("clauth note: 5h window 97% used ("),
+        "the used figure is the disk-cached one: {note}",
+    );
+    assert!(
+        note.ends_with(". no fallback is set; further agent spawns may fail with 429s."),
+        "the approved tail: {note}",
+    );
+}
+
+/// (c): a session the chain may move is covered by the account note one tool
+/// call after the move, so its registry row silences the whole reader before
+/// any other read. Both directions off the same fixture, so the `None` is the
+/// row's doing, not the tree's — and a subagent fire stays silent on the same
+/// tree a parent-scope fire reads.
+#[test]
+fn an_armed_session_silences_the_reader_before_any_read() {
+    let home = HomeSandbox::new();
+    seed_exhausted_chain();
+    seed_burn_history(&home);
+    let fire = task_fire("conv-armed");
+    assert!(
+        read_nudge(&fire).is_some(),
+        "unarmed on the same tree: eligible"
+    );
+
+    let mut sub = task_fire("conv-armed");
+    sub.agent_id = Some("a4a894a1be41b92bf".to_string());
+    assert!(
+        read_nudge(&sub).is_none(),
+        "a subagent fire answers for nobody, same tree",
+    );
+
+    // The hook child finds its row through the runtime sid in CLAUDE_CONFIG_DIR
+    // (the payload's session_id is Claude Code's conversation id).
+    let _dir = crate::testutil::ConfigDirSandbox::new(
+        &home,
+        &home.home().join(".clauth/profiles/a/runtime-123-1"),
+    );
+    crate::live_sessions::register(&crate::live_sessions::LiveSession {
+        session_id: "123-1".to_string(),
+        start_profile: "a".to_string(),
+        pid: std::process::id(),
+        started_at: 0,
+        cwd: None,
+        isolated: false,
+        follows_chain: true,
+        intended_member: None,
+        chain_cursor: None,
+        current_member: None,
+        last_swap_at: None,
+        launch_store: None,
+    })
+    .expect("row");
+
+    assert!(
+        read_nudge(&fire).is_none(),
+        "the armed row silences the reader before any other read",
+    );
+}
+
+/// The sid parser is the nudge's door into the registry: only a per-session
+/// runtime dir name yields a row key, and the legacy bare stems plus unrelated
+/// names all read as "no row" — which is also "not armed".
+#[test]
+fn the_runtime_dir_sid_parser_accepts_only_per_session_dirs() {
+    assert_eq!(
+        crate::runtime::sid_of_runtime_dir_name("runtime-123-4").as_deref(),
+        Some("123-4"),
+    );
+    assert_eq!(
+        crate::runtime::sid_of_runtime_dir_name("runtime-isolated-123-4").as_deref(),
+        Some("123-4"),
+    );
+    for bare in [
+        "runtime",
+        "runtime-isolated",
+        "sessions-1-2",
+        "runtime-x",
+        "profiles",
+    ] {
+        assert_eq!(
+            crate::runtime::sid_of_runtime_dir_name(bare),
+            None,
+            "{bare}"
+        );
+    }
 }

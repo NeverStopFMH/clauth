@@ -7,8 +7,10 @@
 //! and a `--with-fallback` session executes a credential swap mid-run. One
 //! predicate answers all three — which account this conversation's credentials
 //! resolve to right now, against the last value clauth told this conversation —
-//! so this reads a hook payload on stdin and emits `additionalContext` only when
-//! those two differ.
+//! so this reads a hook payload on stdin and emits `additionalContext` when those
+//! two differ. A second emit, the headroom nudge, rides the same subcommand: a
+//! parent-scope `Task` (agent-spawn) fire whose account's 5h window is exhausted
+//! with nothing left to catch the failure earns it (r7).
 //!
 //! **Not the MCP `instructions` block.** That block is built once per process,
 //! so it cannot carry a mid-conversation change at all, and rewriting the front
@@ -45,6 +47,15 @@
 //!   `agent_id` and so shares one record, which is why the read-modify-write
 //!   below is flock-held (measured by review: 4 concurrent fires emitted the
 //!   note 2-4 times in 30 of 30 trials before the lock).
+//!
+//! - **The nudge says what the chain cannot save.** A `Task` fire spends the
+//!   same 5h pool an agent spawn is refused against, and nothing in the turn's
+//!   context names the window before the 429 lands. The nudge answers "would a
+//!   switch catch this": the static exhaustion gate r7 ships (swapped for the
+//!   burn projection in r8), the fallback-chain walk replayed over the disk
+//!   cache, and the live-session registry's `follows_chain` — a session the
+//!   chain may move already hears about the move one tool call after it lands.
+//!   Suppression and re-arm ride the same record the account note uses.
 //!
 //! A failure is silence at exit 0 wherever this module can make it one, because
 //! a hook that errors on a tool call breaks the conversation it exists to
@@ -136,6 +147,9 @@ struct Payload {
     /// Present only on a fire from inside a subagent, which is what makes it the
     /// per-call scope key.
     agent_id: Option<String>,
+    /// `PostToolUse` only: the tool that fired. `Task` is Claude Code's
+    /// agent-spawn tool, the one call the headroom nudge gates on.
+    tool_name: Option<String>,
     /// `SessionStart` only. Claude Code documents five: `startup`, `resume`,
     /// `clear`, `compact`, `fork`. Anything this does not recognise rebaselines
     /// silently, because every source Claude Code has added so far marks a
@@ -178,6 +192,26 @@ struct NoteRecord {
     /// This conversation's transcript, for the sweep.
     #[serde(default)]
     transcript: Option<PathBuf>,
+    /// The headroom nudge's last-emitted state (r7). `None` on every record
+    /// written before the field existed — the `#[serde(default)]` upgrade gate
+    /// that keeps old records parsing.
+    #[serde(default)]
+    nudge: Option<NudgeState>,
+}
+
+/// The headroom nudge's memory for this scope: which 5h window the last verdict
+/// was taken against, and whether the note was emitted for it. A verdict is
+/// "unchanged" per WINDOW, never forever: a different `resets_at` (the window
+/// rolled over) re-arms, and a silent verdict on a window that was told flips
+/// `emitted` back so a later true verdict in the same window re-announces —
+/// the two re-arms r8's projection gate inherits unchanged.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct NudgeState {
+    /// The window's reset instant, epoch seconds — the identity comparison.
+    #[serde(default)]
+    resets_at: Option<i64>,
+    #[serde(default)]
+    emitted: bool,
 }
 
 impl NoteRecord {
@@ -289,8 +323,20 @@ pub(crate) fn run() -> Result<()> {
     let Some(payload) = parse_payload(&input) else {
         return Ok(());
     };
+    let mut notes: Vec<String> = Vec::new();
     if let Some(note) = note_for(&payload, &watch_now(), &resolve_account) {
-        emit(&payload.event, &note);
+        notes.push(note);
+    }
+    if let Some(read) = read_nudge(&payload)
+        && let Some(note) = nudge_note(&payload, &read)
+    {
+        notes.push(note);
+    }
+    // One envelope, whatever fired: two JSON documents on stdout would parse
+    // as none, and one `additionalContext` field carries both notes when both
+    // earned the turn.
+    if !notes.is_empty() {
+        emit(&payload.event, &notes.join("\n\n"));
     }
     Ok(())
 }
@@ -339,10 +385,19 @@ fn parse_payload(input: &str) -> Option<Payload> {
     if !is_echoable_event(event) {
         return None;
     }
+    // Lenient where `agent_id` is strict: a present-but-unusable tool name is
+    // not a filename risk and cannot spell `Task`, so it reads as absent and
+    // simply never earns the nudge — refusing the whole payload over it would
+    // take the account note down with it.
+    let tool_name = value
+        .get("tool_name")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string);
     Some(Payload {
         event: event.to_string(),
         session_id,
         agent_id,
+        tool_name,
         source: value
             .get("source")
             .and_then(serde_json::Value::as_str)
@@ -541,8 +596,12 @@ fn note_for(
 /// The deadline is also what keeps a NESTED acquisition soft — `flock` blocks a
 /// second fd in the same process, so a future caller that takes this around
 /// something already holding it degrades after the wait instead of hanging.
-/// Today there is no such nesting: `note_for` and `gc_conversation_records` are
-/// the only holders and neither reaches the other.
+/// Today there is no such nesting: `note_for`, `nudge_note` and
+/// `gc_conversation_records` are the only holders and none reaches another.
+/// `nudge_note` holds across the same shape as `note_for` — a record read,
+/// the verdict, an `atomic_write_600` and a log-file append — and its
+/// expensive reads (the config load, the cache reads, the chain-walk replay)
+/// all run before the acquisition, in `read_nudge`.
 struct ScopeLock {
     /// Held open for the guard's lifetime and never read: closing the fd is what
     /// releases the flock, so the binding IS the lock. Named like `StateLock`'s
@@ -681,6 +740,321 @@ fn tell(record: &mut NoteRecord, account: &str, note: String) -> String {
     record.told = Some(account.to_string());
     record.last_note = Some(note.clone());
     note
+}
+
+// ── the headroom nudge (r7) ─────────────────────────────────────────────────
+
+/// The nudge gate's inputs, gathered OUTSIDE the scope lock exactly like the
+/// account resolution: the disk cache reads and the decision-leg replay below
+/// must not run inside the read-modify-write hold.
+#[derive(Clone, Copy)]
+struct NudgeRead {
+    /// (a): the resolved account's live 5h window plus its own threshold, the
+    /// measured burn rate, and the instant it was read. `None` when the account
+    /// is unattributable, carries no cached window, or its window is not live
+    /// (a lapsed window means the pool is open again) — any of which answers
+    /// the gate "no" rather than failing the fire.
+    headroom: Option<Headroom>,
+    /// (b): the decision leg's walk replayed over the disk cache — `true` when
+    /// a switch, or a wrap-off sign-out, would land instead of the refusal.
+    /// Recomputed only when the static gate already passed, since it costs one
+    /// cache read per chain member.
+    chain_acts: bool,
+}
+
+/// The active account's live 5h window, as the gate and the renderer read it.
+#[derive(Clone, Copy)]
+struct Headroom {
+    used: f64,
+    threshold: f64,
+    /// `resets_at` as epoch seconds — both the render input and the window
+    /// identity the suppression state keys on.
+    resets_at: i64,
+    /// Measured burn %/h, `None` until enough distinct samples exist.
+    rate: Option<f64>,
+    /// When the window was read, so the figures are projected from one
+    /// consistent instant rather than a second clock read later in the fire.
+    now: i64,
+}
+
+/// The figures the approved copy's placeholders render.
+#[derive(Clone, Copy)]
+struct NudgeFigures {
+    used: f64,
+    rate: f64,
+    /// Projected cap instant, epoch seconds.
+    when: i64,
+    /// The window's reset instant, epoch seconds.
+    reset: i64,
+}
+
+/// Gather the nudge's inputs. `None` for a fire that is not nudge-eligible at
+/// all: not a parent-scope `Task` call, or a session the fallback chain is
+/// allowed to move. Every read here is lock-free disk IO, run before the scope
+/// lock, like the account resolution it sits beside.
+fn read_nudge(payload: &Payload) -> Option<NudgeRead> {
+    // Subagent fires are the one scope this never answers for: the reader that
+    // decides to spawn again is the parent, and a shared flag would let the
+    // first subagent fire consume the note.
+    if payload.agent_id.is_some() || payload.tool_name.as_deref() != Some("Task") {
+        return None;
+    }
+    // A session the chain may move already hears about the move one tool call
+    // after it lands — the account note's own job. The registry row is keyed by
+    // the clauth runtime sid, which this hook child reaches through the
+    // `CLAUDE_CONFIG_DIR` `clauth start` sets (the payload's `session_id` is
+    // Claude Code's conversation id, a different namespace). One lock-free row
+    // read; no runtime dir (a bare `claude`) means no row, and no chain may
+    // move a bare session either.
+    if crate::which::session_config_dir()
+        .as_deref()
+        .and_then(std::path::Path::file_name)
+        .and_then(std::ffi::OsStr::to_str)
+        .and_then(crate::runtime::sid_of_runtime_dir_name)
+        .and_then(|sid| crate::live_sessions::get(&sid))
+        .is_some_and(|row| row.follows_chain)
+    {
+        return None;
+    }
+    let config = crate::profile::load_config().ok()?;
+    // The account this conversation runs on, through the same tier walk the
+    // account note resolves with — never `config.state.active_profile`, which
+    // a runtime session or a divergence can differ from.
+    let (account, _) = crate::which::resolve_active(&config)?;
+    let profile = config.find(&crate::profile::ProfileName::from(account))?;
+    let headroom = headroom_of(profile);
+    let chain_acts = headroom.as_ref().is_some_and(window_exhausted) && chain_would_act(&config);
+    Some(NudgeRead {
+        headroom,
+        chain_acts,
+    })
+}
+
+/// The resolved account's live 5h window off the disk cache the scheduler
+/// persists, plus the threshold and rate the gate and renderer need. `None` for
+/// an api-key/third-party account too: its failure mode is the provider's own
+/// bars, not the Anthropic 5h pool the copy names.
+fn headroom_of(profile: &crate::profile::Profile) -> Option<Headroom> {
+    let crate::profile_json::ProfileWindows::Oauth {
+        usage: Some(usage), ..
+    } = crate::profile_json::profile_windows(profile)
+    else {
+        return None;
+    };
+    let now = crate::usage::now_epoch_secs();
+    if !crate::usage::five_hour_live(&usage, now) {
+        return None;
+    }
+    let window = usage.five_hour.as_ref()?;
+    let resets_at = window
+        .resets_at
+        .as_deref()
+        .and_then(crate::usage::iso_to_epoch_secs)?;
+    Some(Headroom {
+        used: window.utilization,
+        threshold: crate::fallback::threshold_for(profile),
+        resets_at,
+        rate: burn_rate(profile, window),
+        now,
+    })
+}
+
+/// The measured 5h burn (%/h): the durable per-profile history plus the live
+/// sample, through the same recency-weighted computation and the same three
+/// constants the decision leg's `fallback::burn_rate_for_profile` runs. That
+/// function is private to `fallback.rs`; this is its whole body, and the burn
+/// module is the shared codepath.
+fn burn_rate(profile: &crate::profile::Profile, window: &crate::usage::UsageWindow) -> Option<f64> {
+    let pair = ("5h", window);
+    crate::usage::compute_burn_rates_from_history(
+        &crate::profile::load_usage_history(&profile.name),
+        std::slice::from_ref(&pair),
+        crate::usage::BURN_LOOKBACK_MS,
+        crate::usage::BURN_MIN_SAMPLES,
+        crate::usage::BURN_GAP_CUT_MS,
+    )
+    .remove("5h")
+    .flatten()
+}
+
+/// The nudge's headroom gate — r7's INTERIM form, swapped for the burn
+/// projection in r8: the swap lands HERE.
+///
+/// The predicate is the STATIC arm of the exact call the fallback decision leg
+/// makes on the active account — `fallback::next_auto_switch_target` (what
+/// `usage::scheduler`'s scan legs run) → `is_exhausted_active_from_usage`,
+/// whose mode-off verdict is a live window at or past the account's own
+/// threshold. Picked over the config-side `fallback::is_exhausted_active`,
+/// which reads `Profile::usage` — a field only the TUI's `apply_usage` ever
+/// fills, so outside it every account answers false. The leg's store is
+/// hydrated from and persisted to `usage_cache.json`; this process holds no
+/// store, so [`headroom_of`] reads the same bytes off disk. The weekly arm of
+/// the leg's predicate is deliberately not part of this gate: the note names
+/// the 5h window, so only the 5h window's own exhaustion is its premise.
+fn window_exhausted(h: &Headroom) -> bool {
+    h.used >= h.threshold
+}
+
+/// The gate whole. The approved copy's own constraint — "emitted only when the
+/// projection reaches the cap before the reset" — makes the within-window half
+/// part of r7, not r8: a window whose rate would reach 100% only after it
+/// resets makes the copy's cap claim false, and a window with no measured rate
+/// has no projection to fill the placeholders from. Both stay silent.
+fn nudge_figures(read: &NudgeRead) -> Option<NudgeFigures> {
+    let h = read.headroom.as_ref()?;
+    if read.chain_acts || !window_exhausted(h) {
+        return None;
+    }
+    let rate = h.rate.filter(|r| *r > 0.0)?;
+    let secs_left = h.resets_at.saturating_sub(h.now);
+    let when = if h.used >= 100.0 {
+        // Already at the cap: the projected instant is the present.
+        h.now
+    } else {
+        let secs_to_cap = ((100.0 - h.used) / rate * 3600.0) as i64;
+        if secs_to_cap > secs_left {
+            return None;
+        }
+        h.now.saturating_add(secs_to_cap)
+    };
+    Some(NudgeFigures {
+        used: h.used,
+        rate,
+        when,
+        reset: h.resets_at,
+    })
+}
+
+/// The shipped copy, byte for byte — reviewzy-approved human_text (project
+/// clauth, entry on this file titled "new nudge copy: headroom exhaustion
+/// after an agent spawn", 2026-08-28). Never reword. The two instants render
+/// through [`crate::format::local_stamp`], the crate's one LOCAL prose-stamp
+/// formatter (owner ruling 2026-08-22); `None` — silence — when a stamp
+/// cannot render.
+fn render_nudge(f: &NudgeFigures) -> Option<String> {
+    let when = crate::format::local_stamp(f.when)?;
+    let reset = crate::format::local_stamp(f.reset)?;
+    Some(format!(
+        "clauth note: 5h window {}% used ({:.1}%/h). at this rate, it reaches its cap {}, resets {}. no fallback is set; further agent spawns may fail with 429s.",
+        crate::format::format_pct(f.used).trim_end_matches('%'),
+        f.rate,
+        when,
+        reset,
+    ))
+}
+
+/// The decision leg's walk replayed over the disk cache: `true` when the daemon
+/// would land a switch — or a wrap-off sign-out — instead of the refusal. Same
+/// call the leg makes, `fallback::next_auto_switch_target`, fed a store
+/// hydrated from the caches the daemon's own store is persisted to and
+/// hydrated from; a member with no cached OAuth usage reads exactly as it
+/// reads in the real store (absent entry = headroom). The `Arc<RankedMutex>`
+/// wrapper is the entry point's signature, not shared state: the mutex is
+/// process-private, never contended, locked only for the walk's own snapshot
+/// clone, and taken while this process holds no other rank — so no rank in the
+/// global order is acquired in a context that could invert it. The walk's
+/// `fresh` and `kick_rejected` channels stay empty, which the snapshot type
+/// documents as "not config state": freshness is a preference the any-fresh
+/// pass renders moot, and a kick-rejected member reads as headroom here where
+/// the live leg would walk around it — a bounded corner this note trades for
+/// reusing the leg rather than reimplementing it.
+fn chain_would_act(config: &crate::profile::AppConfig) -> bool {
+    let Some(snapshot) = crate::fallback::snapshot_chain(config) else {
+        // No active, or the active is outside the chain: the leg would do
+        // nothing, which is exactly "nothing would catch".
+        return false;
+    };
+    let usage: std::collections::HashMap<String, crate::usage::UsageInfo> = snapshot
+        .chain
+        .iter()
+        .filter_map(
+            |m| match crate::profile_json::profile_windows_for(&m.name) {
+                crate::profile_json::ProfileWindows::Oauth {
+                    usage: Some(usage), ..
+                } => Some((m.name.to_string(), *usage)),
+                _ => None,
+            },
+        )
+        .collect();
+    let store: crate::usage::UsageStore =
+        std::sync::Arc::new(crate::lockorder::RankedMutex::new(usage));
+    crate::fallback::next_auto_switch_target(&snapshot, &store).is_some()
+}
+
+/// The nudge verdict against the state this scope remembers.
+enum NudgeOutcome {
+    Emit(NudgeFigures),
+    /// Silent this fire. `rearm` when the verdict flipped false on a window
+    /// that was told, so a later true verdict in the same window re-announces.
+    Silent {
+        rearm: bool,
+    },
+}
+
+fn nudge_outcome(read: &NudgeRead, state: &Option<NudgeState>) -> NudgeOutcome {
+    let Some(figures) = nudge_figures(read) else {
+        let rearm = read.headroom.as_ref().is_some_and(|h| {
+            state
+                .as_ref()
+                .is_some_and(|s| s.resets_at == Some(h.resets_at) && s.emitted)
+        });
+        return NudgeOutcome::Silent { rearm };
+    };
+    if state
+        .as_ref()
+        .is_some_and(|s| s.resets_at == Some(figures.reset) && s.emitted)
+    {
+        NudgeOutcome::Silent { rearm: false }
+    } else {
+        NudgeOutcome::Emit(figures)
+    }
+}
+
+/// Decide whether this fire earns the nudge and store what it learned: its own
+/// read-modify-write on the SAME record the account note uses, under the same
+/// scope lock — a verdict that cannot be remembered is suppressed exactly like
+/// an account note, because the record is the suppression mechanism. The
+/// account note's own emit is not this function's to drop, so the two run as
+/// separate lock cycles rather than one shared hold.
+fn nudge_note(payload: &Payload, read: &NudgeRead) -> Option<String> {
+    let path = record_path(&payload.session_id, None).ok()?;
+    let _hold = ScopeLock::acquire();
+    let stored = load_record(&path);
+    let mut record = stored.clone().unwrap_or_default();
+    if payload.transcript.is_some() {
+        record.transcript = payload.transcript.clone();
+    }
+    match nudge_outcome(read, &record.nudge) {
+        NudgeOutcome::Emit(figures) => {
+            let rendered = render_nudge(&figures)?;
+            record.nudge = Some(NudgeState {
+                resets_at: Some(figures.reset),
+                emitted: true,
+            });
+            if stored.as_ref() != Some(&record) && store_record(&path, &record).is_err() {
+                crate::logline::to_logfile(format_args!(
+                    "hook-note: cannot persist {}; staying silent",
+                    path.display()
+                ));
+                return None;
+            }
+            Some(rendered)
+        }
+        NudgeOutcome::Silent { rearm } => {
+            if rearm {
+                if let Some(state) = record.nudge.as_mut() {
+                    state.emitted = false;
+                }
+                if stored.as_ref() != Some(&record) && store_record(&path, &record).is_err() {
+                    crate::logline::to_logfile(format_args!(
+                        "hook-note: cannot persist {}; staying silent",
+                        path.display()
+                    ));
+                }
+            }
+            None
+        }
+    }
 }
 
 /// Drop the records of conversations that are gone, from the same sweep that

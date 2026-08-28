@@ -801,6 +801,30 @@ pub(crate) fn blank_profile(name: &crate::profile::ProfileName) -> crate::profil
     }
 }
 
+/// Write `entries` as a profile's `usage_history.jsonl` — the on-disk shape
+/// `profile::load_usage_history` parses — so a fixture can give an account a
+/// measured burn rate without running a fetch. Timestamps are `now_ms`-space
+/// epoch milliseconds. Takes the sandbox so the write can only land in a
+/// sandboxed home, never the real one.
+pub(crate) fn write_usage_history(
+    _home: &HomeSandbox,
+    name: &crate::profile::ProfileName,
+    entries: &[(u64, crate::usage::UsageInfo)],
+) {
+    let path = crate::profile::profile_history_path(name).expect("history path");
+    let Some(parent) = path.parent() else {
+        return;
+    };
+    std::fs::create_dir_all(parent).expect("mkdir history dir");
+    let mut body = String::new();
+    for (ts, usage) in entries {
+        let line = serde_json::json!({ "ts": ts, "name": name, "usage": usage });
+        body.push_str(&line.to_string());
+        body.push('\n');
+    }
+    std::fs::write(&path, body).expect("write history");
+}
+
 /// Put `names` in the on-disk profile list without creating profile content.
 /// For fixtures that drive legs which re-read the record — the cache-write
 /// gate, the acquire gate — but do not need per-profile files. Idempotent.

@@ -239,6 +239,20 @@ pub(crate) fn is_shared_runtime_dir_name(name: &str) -> bool {
     is_runtime_dir_name(name) && !name.starts_with(ISOLATED_RUNTIME_STEM)
 }
 
+/// The sid of a PER-SESSION runtime dir name (`runtime-<sid>` or the isolated
+/// flavor's), `None` for the legacy bare stems and unrelated names. The same
+/// strict family as [`is_runtime_dir_name`], so the split cannot drift apart
+/// from the predicate GC deletes by. Used by the hook-note's headroom nudge,
+/// which reaches its own live-session registry row through the sid it derives
+/// from its `CLAUDE_CONFIG_DIR`.
+pub(crate) fn sid_of_runtime_dir_name(name: &str) -> Option<String> {
+    let rest = name.strip_prefix(RUNTIME_STEM)?;
+    let rest = rest.strip_prefix("-isolated").unwrap_or(rest);
+    rest.strip_prefix('-')
+        .filter(|s| is_session_id(s))
+        .map(str::to_string)
+}
+
 /// The sessions dir paired with a runtime dir of this name, per the module's one
 /// layout rule: `runtime<rest>` ↔ `sessions<rest>`. Deliberately loose about
 /// what `<rest>` is; callers that DELETE gate on [`is_runtime_dir_name`] first.

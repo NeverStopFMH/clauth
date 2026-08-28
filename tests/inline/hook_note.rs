@@ -997,12 +997,11 @@ fn the_nudge_re_arms_on_a_window_reset_and_on_a_verdict_flip() {
 }
 
 /// Every arm of the gate that keeps the note silent: a switch the chain would
-/// land, a window with no measured rate, a rate that reaches the cap only
-/// after the reset (the copy's cap claim would be false), and a window under
-/// the static threshold whose rate would cap it inside the window — that last
-/// fixture is the only one only `window_exhausted` can silence, so deleting
-/// the threshold conjunct reds it. A silent verdict also writes no record —
-/// nothing was learned.
+/// land, a window with no measured rate — silence either way (r7's static
+/// check could only have answered silence too; the copy's `{rate}`/`{when}`
+/// placeholders have no figures to fill) — and a rate that reaches the cap
+/// only after the reset (the copy's cap claim would be false). A silent
+/// verdict also writes no record — nothing was learned.
 #[test]
 fn a_chain_target_a_missing_rate_and_a_late_cap_each_stay_silent() {
     let _home = HomeSandbox::new();
@@ -1026,7 +1025,22 @@ fn a_chain_target_a_missing_rate_and_a_late_cap_each_stay_silent() {
     assert_eq!(
         nudge_note(&fire, &no_rate),
         None,
-        "no measured rate: no projection to fill the placeholders from",
+        "at the threshold with no measured rate: silence, as r7's deleted static check answered",
+    );
+
+    let no_rate_below = NudgeRead {
+        headroom: Some(Headroom {
+            used: 80.0,
+            rate: None,
+            ..headroom(97.0, 2.0, 3600)
+        }),
+        chain_acts: false,
+    };
+    assert_eq!(
+        nudge_note(&fire, &no_rate_below),
+        None,
+        "below the threshold with no measured rate: silence either way, exactly \
+         as r7's static check answered",
     );
 
     // 0.1%/h from 97% needs 30 h; the window resets in 5 h — the reset wins.
@@ -1034,11 +1048,68 @@ fn a_chain_target_a_missing_rate_and_a_late_cap_each_stay_silent() {
         nudge_note(&fire, &nudge_read(97.0, 0.1, 5 * 3600, false)),
         None,
     );
+}
 
-    // 80% at 30%/h caps in 2400 s, inside the 7200 s left: every other gate
-    // passes, so the STATIC threshold alone is what silences this fire.
+/// Verify 1: the r8 arm — a window BELOW the static threshold whose measured
+/// rate still reaches the cap before the reset emits (r7's gate silenced it;
+/// that is the whole point of the projection). 74% at 30%/h caps in
+/// (100-74)/30 h = 3120 s, inside the 7200 s left, and the figures pin the
+/// wiring for this new emit path the same way the 97% fixture pins the
+/// threshold-side one.
+#[test]
+fn a_below_threshold_window_whose_rate_caps_before_the_reset_emits() {
+    let _home = HomeSandbox::new();
+    let fire = task_fire("conv-proj");
+    let read = nudge_read(74.0, 30.0, 7200, false);
+    let h = read.headroom.expect("a window");
+
+    let note = nudge_note(&fire, &read).expect("the projection arm fires");
+    let when = crate::format::local_stamp(h.now + 3120).expect("stamp");
+    let reset = crate::format::local_stamp(h.resets_at).expect("stamp");
     assert_eq!(
-        nudge_note(&fire, &nudge_read(80.0, 30.0, 7200, false)),
+        note,
+        format!(
+            "clauth note: 5h window 74% used (30.0%/h). at this rate, it reaches \
+             its cap {when}, resets {reset}. no fallback is set; further agent \
+             spawns may fail with 429s.",
+        ),
+    );
+
+    // The r7 fixture re-pinned: 80% at 30%/h caps in 2400 s, inside the
+    // 7200 s left, and r7 silenced it on the static threshold alone — the one
+    // leg only `window_exhausted` owned. The projection arm now emits it.
+    assert!(
+        nudge_note(
+            &task_fire("conv-proj-80"),
+            &nudge_read(80.0, 30.0, 7200, false)
+        )
+        .is_some(),
+        "a below-threshold window whose rate caps inside the window emits",
+    );
+}
+
+/// Verify 2: the same 74% at a rate that reaches the cap only after the reset
+/// stays silent — the approved copy's cap claim would be false. 2%/h needs
+/// 13 h from 74%; the window resets in 2 h.
+#[test]
+fn a_below_threshold_window_whose_rate_misses_the_reset_stays_silent() {
+    let _home = HomeSandbox::new();
+    let fire = task_fire("conv-slow");
+    assert_eq!(nudge_note(&fire, &nudge_read(74.0, 2.0, 7200, false)), None,);
+}
+
+/// Verify 3: the floor guard the projection shares with the fallback leg. The
+/// window-relative rate reads high early, and without the floor this 40%
+/// window's 300%/h would "reach the cap" inside the 7200 s left — the smaller
+/// tiers' false fire the guard exists to bound. 40% sits under
+/// `NUDGE_BURN_FLOOR_PCT` (50, half the cap) and under the threshold, so the
+/// floor conjunct is the only thing silencing it: deleting it reds this test.
+#[test]
+fn the_projection_floor_keeps_a_low_window_with_a_huge_early_rate_silent() {
+    let _home = HomeSandbox::new();
+    let fire = task_fire("conv-floor");
+    assert_eq!(
+        nudge_note(&fire, &nudge_read(40.0, 300.0, 7200, false)),
         None,
     );
 }
@@ -1127,6 +1198,12 @@ fn a_subagent_or_non_task_fire_is_never_nudge_eligible() {
 /// the gate read comes off the seeded disk bytes through the production
 /// readers — nothing is asserted from a hand-computed rate.
 fn seed_exhausted_chain() {
+    seed_chain_with_active_at(97.0);
+}
+
+/// The same tree with the active's cached window at `active_pct` instead of
+/// 97% — the below-threshold fixtures, whose gate reads the same bytes.
+fn seed_chain_with_active_at(active_pct: f64) {
     let mut config = crate::profile::AppConfig {
         state: crate::profile::AppState::default(),
         profiles: Vec::new(),
@@ -1147,13 +1224,23 @@ fn seed_exhausted_chain() {
         }),
         ..Default::default()
     };
-    write_profile_cache(&ProfileName::from("a"), USAGE_CACHE_FILE, &live_at(97.0));
+    write_profile_cache(
+        &ProfileName::from("a"),
+        USAGE_CACHE_FILE,
+        &live_at(active_pct),
+    );
     write_profile_cache(&ProfileName::from("b"), USAGE_CACHE_FILE, &live_at(10.0));
 }
 
 /// Three distinct samples inside the lookback, rising to the live 97% — enough
 /// for a measured rate without predicting what the regression answers.
 fn seed_burn_history(home: &HomeSandbox) {
+    seed_burn_history_samples(home, 88.0, 93.0, 96.0);
+}
+
+/// The same history, with the three older samples named explicitly — the
+/// below-threshold fixtures need a steeper rise than the 97% one.
+fn seed_burn_history_samples(home: &HomeSandbox, oldest: f64, middle: f64, newest: f64) {
     let now_ms = crate::usage::now_ms();
     let at = |pct: f64| crate::usage::UsageInfo {
         five_hour: Some(crate::usage::UsageWindow {
@@ -1166,9 +1253,9 @@ fn seed_burn_history(home: &HomeSandbox) {
         home,
         &ProfileName::from("a"),
         &[
-            (now_ms - 3_000_000, at(88.0)),
-            (now_ms - 1_800_000, at(93.0)),
-            (now_ms - 60_000, at(96.0)),
+            (now_ms - 3_000_000, at(oldest)),
+            (now_ms - 1_800_000, at(middle)),
+            (now_ms - 60_000, at(newest)),
         ],
     );
 }
@@ -1213,6 +1300,41 @@ fn the_real_reader_replays_the_decision_leg_over_the_disk_cache() {
     assert!(
         note.ends_with(". no fallback is set; further agent spawns may fail with 429s."),
         "the approved tail: {note}",
+    );
+}
+
+/// The chain-walk pre-gate keyed on the static threshold in r7 must key on the
+/// projection arm in r8: a fire BELOW the threshold whose projection would
+/// emit still has to run the walk, or the copy's "no fallback is set" claim
+/// fires over a chain that would switch. The leg acts below the threshold only
+/// with burn-aware switching armed and the floor at its 90 band minimum, so
+/// this fixture sets both plus a 1 h poll horizon: the active sits at 92% with
+/// a rate that projects past 100 inside the seeded hour, the leg's own
+/// projection then judges it exhausted, `b` is clear, and the walk must answer
+/// true — under the r7 pre-gate (`window_exhausted`, false at 92%) the walk
+/// would be skipped and `chain_acts` would read false, the pin this test reds.
+#[test]
+fn a_below_threshold_projection_fire_still_replays_the_chain_walk() {
+    let home = HomeSandbox::new();
+    seed_chain_with_active_at(92.0);
+    seed_burn_history_samples(&home, 80.0, 86.0, 90.0);
+    let mut config = crate::profile::load_config().expect("reload");
+    config.state.burn_aware_switching = true;
+    config.state.burn_switch_floor_pct = Some(90.0);
+    config.state.burn_horizon_cap_ms = Some(3_600_000);
+    config.state.refresh_interval_ms = 3_600_000;
+    crate::profile::save_app_state(&config.state).expect("save state");
+    let fire = task_fire("conv-walk-below");
+
+    let read = read_nudge(&fire).expect("eligible and readable");
+    assert!(
+        read.chain_acts,
+        "the walk ran on a below-threshold projection-arm fire"
+    );
+    assert_eq!(
+        nudge_note(&fire, &read),
+        None,
+        "a covered session stays silent"
     );
 }
 

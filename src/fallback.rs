@@ -421,7 +421,7 @@ fn burn_rate_for_profile(name: &ProfileName, window: &UsageWindow) -> Option<f64
 ///     bounding how far below `threshold` an early switch can land.
 ///   * `horizon_cap_ms`: the look-ahead is `min(interval_ms, horizon_cap_ms)`,
 ///     so a long poll cadence can't balloon the margin (it scales linearly with
-///     the look-ahead). Folded in here rather than in
+///     the look-ahead). Folded in [`projected_exhausted`] rather than in
 ///     [`crate::usage::project_utilization`] so that helper keeps its one job.
 fn is_exhausted_projected(
     util_pct: f64,
@@ -433,13 +433,40 @@ fn is_exhausted_projected(
 ) -> bool {
     match burn_pct_per_hour {
         Some(rate) => {
-            let horizon = interval_ms.min(horizon_cap_ms);
-            (util_pct >= floor_pct.min(threshold)
-                && crate::usage::project_utilization(util_pct, rate, horizon) >= 100.0)
-                || util_pct >= threshold
+            projected_exhausted(
+                util_pct,
+                threshold,
+                rate,
+                interval_ms,
+                floor_pct,
+                horizon_cap_ms,
+            ) || util_pct >= threshold
         }
         None => util_pct >= threshold,
     }
+}
+
+/// The floor-guarded projection arm of [`is_exhausted_projected`], on its own.
+///
+/// Split out because the headroom nudge's gate (`hook_note.rs`) is exactly
+/// this arm, over ITS OWN horizon — the seconds left until the window resets,
+/// never the poll interval — and must not re-derive the guard. The static
+/// half is deliberately not part of the nudge: for a rate-bearing window it
+/// is subsumed here anyway (`util_pct >= threshold` implies the floor
+/// conjunct), and the nudge emits only when the projection reaches the cap
+/// before the reset — its approved copy claims the cap instant, so a static
+/// fire whose projection misses the reset must stay silent.
+pub(crate) fn projected_exhausted(
+    util_pct: f64,
+    threshold: f64,
+    burn_pct_per_hour: f64,
+    interval_ms: u64,
+    floor_pct: f64,
+    horizon_cap_ms: u64,
+) -> bool {
+    let horizon = interval_ms.min(horizon_cap_ms);
+    util_pct >= floor_pct.min(threshold)
+        && crate::usage::project_utilization(util_pct, burn_pct_per_hour, horizon) >= 100.0
 }
 
 /// ACTIVE-only exhaustion check (issue #8 follow-up b). `burn_aware` off

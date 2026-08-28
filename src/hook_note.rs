@@ -9,8 +9,9 @@
 //! resolve to right now, against the last value clauth told this conversation —
 //! so this reads a hook payload on stdin and emits `additionalContext` when those
 //! two differ. A second emit, the headroom nudge, rides the same subcommand: a
-//! parent-scope `Task` (agent-spawn) fire whose account's 5h window is exhausted
-//! with nothing left to catch the failure earns it (r7).
+//! parent-scope `Task` (agent-spawn) fire whose account's 5h window is
+//! exhausted, or burning toward the cap, with nothing left to catch the
+//! failure earns it (r8 gate; r7 shipped the static form).
 //!
 //! **Not the MCP `instructions` block.** That block is built once per process,
 //! so it cannot carry a mid-conversation change at all, and rewriting the front
@@ -51,11 +52,11 @@
 //! - **The nudge says what the chain cannot save.** A `Task` fire spends the
 //!   same 5h pool an agent spawn is refused against, and nothing in the turn's
 //!   context names the window before the 429 lands. The nudge answers "would a
-//!   switch catch this": the static exhaustion gate r7 ships (swapped for the
-//!   burn projection in r8), the fallback-chain walk replayed over the disk
-//!   cache, and the live-session registry's `follows_chain` — a session the
-//!   chain may move already hears about the move one tool call after it lands.
-//!   Suppression and re-arm ride the same record the account note uses.
+//!   switch catch this": the burn-projection gate r8 ships, the fallback-chain
+//!   walk replayed over the disk cache, and the live-session registry's
+//!   `follows_chain` — a session the chain may move already hears about the
+//!   move one tool call after it lands. Suppression and re-arm ride the same
+//!   record the account note uses.
 //!
 //! A failure is silence at exit 0 wherever this module can make it one, because
 //! a hook that errors on a tool call breaks the conversation it exists to
@@ -742,7 +743,7 @@ fn tell(record: &mut NoteRecord, account: &str, note: String) -> String {
     note
 }
 
-// ── the headroom nudge (r7) ─────────────────────────────────────────────────
+// ── the headroom nudge ─────────────────────────────────────────────────────
 
 /// The nudge gate's inputs, gathered OUTSIDE the scope lock exactly like the
 /// account resolution: the disk cache reads and the decision-leg replay below
@@ -757,8 +758,8 @@ struct NudgeRead {
     headroom: Option<Headroom>,
     /// (b): the decision leg's walk replayed over the disk cache — `true` when
     /// a switch, or a wrap-off sign-out, would land instead of the refusal.
-    /// Recomputed only when the static gate already passed, since it costs one
-    /// cache read per chain member.
+    /// Recomputed only when the projection arm already passed, since it costs
+    /// one cache read per chain member.
     chain_acts: bool,
 }
 
@@ -823,7 +824,10 @@ fn read_nudge(payload: &Payload) -> Option<NudgeRead> {
     let (account, _) = crate::which::resolve_active(&config)?;
     let profile = config.find(&crate::profile::ProfileName::from(account))?;
     let headroom = headroom_of(profile);
-    let chain_acts = headroom.as_ref().is_some_and(window_exhausted) && chain_would_act(&config);
+    let chain_acts = headroom
+        .as_ref()
+        .is_some_and(|h| projection_arm(h).is_some())
+        && chain_would_act(&config);
     Some(NudgeRead {
         headroom,
         chain_acts,
@@ -877,44 +881,78 @@ fn burn_rate(profile: &crate::profile::Profile, window: &crate::usage::UsageWind
     .flatten()
 }
 
-/// The nudge's headroom gate — r7's INTERIM form, swapped for the burn
-/// projection in r8: the swap lands HERE.
+/// The projection arm's floor, half the cap. Below it the window's unspent
+/// half outweighs the spent one, and the window-relative rate's early high
+/// reading — the exact regime `fallback::is_exhausted_projected`'s floor guard
+/// exists to bound — is the whole of the projection's base, so a fire from
+/// there is noise, not a warning. The fallback's own configured floor
+/// (`burn_switch_floor_pct`, default 98, band 90+) is deliberately not it: it
+/// bounds a SWITCH's wasted headroom and, sitting above the default threshold,
+/// clamps the projection arm out of every below-threshold window — which is
+/// the whole point of the r8 gate.
+const NUDGE_BURN_FLOOR_PCT: f64 = 50.0;
+
+/// The projection arm — the rate-bearing half of the r8 gate — shared by
+/// [`read_nudge`] (the chain-walk pre-gate: the walk costs one cache read per
+/// member, so it runs exactly when the gate could fire) and [`nudge_figures`]
+/// (the gate itself). One predicate, so the two cannot drift apart.
 ///
-/// The predicate is the STATIC arm of the exact call the fallback decision leg
-/// makes on the active account — `fallback::next_auto_switch_target` (what
-/// `usage::scheduler`'s scan legs run) → `is_exhausted_active_from_usage`,
-/// whose mode-off verdict is a live window at or past the account's own
-/// threshold. Picked over the config-side `fallback::is_exhausted_active`,
-/// which reads `Profile::usage` — a field only the TUI's `apply_usage` ever
-/// fills, so outside it every account answers false. The leg's store is
-/// hydrated from and persisted to `usage_cache.json`; this process holds no
-/// store, so [`headroom_of`] reads the same bytes off disk. The weekly arm of
-/// the leg's predicate is deliberately not part of this gate: the note names
-/// the 5h window, so only the 5h window's own exhaustion is its premise.
-fn window_exhausted(h: &Headroom) -> bool {
-    h.used >= h.threshold
+/// The active account's measured burn through `fallback::projected_exhausted`
+/// — the floor-guarded arm of the decision leg's `is_exhausted_projected`,
+/// shared rather than re-derived — over the seconds left until `resets_at`.
+/// The horizon is the window remainder, never a poll interval (the todo's own
+/// pin), so the fallback's horizon cap is not applied (`u64::MAX`); the
+/// floor ([`NUDGE_BURN_FLOOR_PCT`]) is the guard's own. Emit only when the
+/// projection reaches 100: the approved copy claims "it reaches its cap
+/// {when}", so a fire whose rate caps the window only after the reset stays
+/// silent — the constraint holds for the static threshold case too, which the
+/// projection arm subsumes (`used >= threshold` implies the floor conjunct).
+/// The weekly arm of the leg's predicate is deliberately not part of this
+/// gate either: the note names the 5h window, so only the 5h window's own
+/// projection is its premise. `None` for a no-rate window — r7's static
+/// check, deleted now, could only have answered it silence anyway: see
+/// [`nudge_figures`].
+fn projection_arm(h: &Headroom) -> Option<f64> {
+    let rate = h.rate.filter(|r| *r > 0.0)?;
+    let secs_left_ms = h.resets_at.saturating_sub(h.now) as u64 * 1000;
+    crate::fallback::projected_exhausted(
+        h.used,
+        h.threshold,
+        rate,
+        secs_left_ms,
+        NUDGE_BURN_FLOOR_PCT,
+        // The look-ahead IS the window remainder; no cap applies.
+        u64::MAX,
+    )
+    .then_some(rate)
 }
 
-/// The gate whole. The approved copy's own constraint — "emitted only when the
-/// projection reaches the cap before the reset" — makes the within-window half
-/// part of r7, not r8: a window whose rate would reach 100% only after it
-/// resets makes the copy's cap claim false, and a window with no measured rate
-/// has no projection to fill the placeholders from. Both stay silent.
+/// The gate whole — r8's projection form, replacing r7's static gate.
+///
+/// The projection arm emits: a rate-bearing window whose floor-guarded
+/// projection reaches the cap before the reset, whether or not it sits at the
+/// static threshold — the r8 upgrade over r7's `window_exhausted` gate. The
+/// static threshold check itself is deleted; the todo's last sentence ("no
+/// rate leaves the static threshold check alone") is honored behaviorally,
+/// not structurally. r7's check answered silence for a no-rate account — its
+/// rate filter sat after it and bailed first — and so does r8's gate, which a
+/// no-rate window reaches only through [`projection_arm`]'s `None`: the
+/// approved copy's `{rate}`/`{when}` placeholders have no figures to fill,
+/// so nothing can render, and nothing a no-rate account hears changes.
 fn nudge_figures(read: &NudgeRead) -> Option<NudgeFigures> {
     let h = read.headroom.as_ref()?;
-    if read.chain_acts || !window_exhausted(h) {
+    if read.chain_acts {
         return None;
     }
-    let rate = h.rate.filter(|r| *r > 0.0)?;
-    let secs_left = h.resets_at.saturating_sub(h.now);
+    let rate = projection_arm(h)?;
     let when = if h.used >= 100.0 {
         // Already at the cap: the projected instant is the present.
         h.now
     } else {
+        // The copy's `{when}` — the cap instant at the measured rate. A figure,
+        // never a gate: the arm above has already pinned it inside the window,
+        // so it cannot overshoot `resets_at`.
         let secs_to_cap = ((100.0 - h.used) / rate * 3600.0) as i64;
-        if secs_to_cap > secs_left {
-            return None;
-        }
         h.now.saturating_add(secs_to_cap)
     };
     Some(NudgeFigures {

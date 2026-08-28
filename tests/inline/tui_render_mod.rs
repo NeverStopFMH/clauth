@@ -1,3 +1,5 @@
+#![allow(clippy::unwrap_used, clippy::expect_used)]
+
 use super::*;
 use crate::profile::{AppConfig, AppState, Profile, ProfileName};
 use crate::status::{Impact, Incident, IncidentUpdate, UpdatePhase};
@@ -241,6 +243,73 @@ fn all_tabs_render() {
     assert!(detail.contains("components"), "components row renders");
     assert!(detail.contains('→'), "a transition arrow renders");
     app.status.focus = StatusFocus::List;
+}
+
+/// The status tab's incident stamps render LOCAL wall clock in the 2026-08-22
+/// ruling's `YYYY-MM-DD HH:MM:SS` shape — the `started` row and every timeline
+/// row. Both used to slice the UTC ISO (`jun 6, 10:14`), and a bare stamp in
+/// prose reads as local, so the unmarked rows were false off UTC. The expected
+/// strings derive through chrono's own `format` rather than the crate's
+/// formatter, so the pin is a second derivation of the same claim, not a copy
+/// of the code's arithmetic; it holds in any zone, UTC included (local equals
+/// UTC there, and the contract is satisfied by either).
+#[test]
+fn status_tab_incident_stamps_render_local_wall_clock() {
+    let _home = crate::testutil::HomeSandbox::new();
+    use crate::tui::app::Tab;
+
+    let incidents = demo_incidents();
+    let started_ms = incidents[0].started_ms;
+    let update_ms: Vec<u64> = incidents[0].updates.iter().map(|u| u.at_ms).collect();
+
+    let mut app = App::new(AppConfig {
+        state: AppState::default(),
+        profiles: vec![],
+    });
+    app.status.incidents = incidents;
+    app.tab = Tab::Status;
+    app.status.focus = StatusFocus::Detail;
+    let out = dump(&app, 90, 24);
+
+    let local_shape = |epoch_ms: u64| {
+        chrono::DateTime::from_timestamp((epoch_ms / 1000) as i64, 0)
+            .unwrap()
+            .with_timezone(&chrono::Local)
+            .format("%Y-%m-%d %H:%M:%S")
+            .to_string()
+    };
+
+    let started = local_shape(started_ms);
+    assert!(
+        out.contains(&started),
+        "started row renders the local stamp {started:?}:\n{out}"
+    );
+    for at_ms in update_ms {
+        let row = local_shape(at_ms);
+        assert!(
+            out.contains(&row),
+            "timeline row renders the local stamp {row:?}:\n{out}"
+        );
+    }
+    assert!(
+        !out.contains(" utc"),
+        "no stamp carries a utc marker after the local conversion:\n{out}"
+    );
+
+    // Where the runner's zone is off UTC, the same instants' UTC renderings
+    // must be ABSENT: a stamp that regressed to UTC digits in the 19-char
+    // shape would still satisfy a contains() on a UTC box. On a UTC runner
+    // local equals UTC, so there is no second spelling to ban.
+    if chrono::Local::now().offset().local_minus_utc() != 0 {
+        let utc_started = chrono::DateTime::from_timestamp((started_ms / 1000) as i64, 0)
+            .unwrap()
+            .format("%Y-%m-%d %H:%M:%S")
+            .to_string();
+        assert!(
+            !out.contains(&utc_started),
+            "the started stamp renders UTC digits, not local wall clock:\n{out}"
+        );
+    }
 }
 
 #[test]

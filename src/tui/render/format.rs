@@ -459,25 +459,6 @@ pub(super) fn relative_age(epoch_ms: u64) -> String {
     }
 }
 
-/// Lowercase clock label for an epoch-ms timestamp: `jun 5, 18:27`. A comma sits
-/// directly after the day, no space before it. With `utc = true` appends ` utc`
-/// (used only on the detail `started` row). All times are UTC.
-pub(super) fn clock_label(epoch_ms: u64, utc: bool) -> String {
-    // `epoch_secs_to_iso` → `YYYY-MM-DDTHH:MM:SS+00:00`.
-    let iso = crate::usage::epoch_secs_to_iso((epoch_ms / 1000) as i64);
-    let bytes = iso.as_bytes();
-    // Defensive: a malformed ISO string degrades to the raw value.
-    if bytes.len() < 16 || bytes[10] != b'T' {
-        return iso;
-    }
-    let mon = month_label(iso[5..7].parse().unwrap_or(1));
-    // Day without a leading zero.
-    let day: u32 = iso[8..10].parse().unwrap_or(0);
-    let hm = &iso[11..16];
-    let suffix = if utc { " utc" } else { "" };
-    format!("{mon} {day}, {hm}{suffix}")
-}
-
 use crate::spinner::SPINNER_FRAMES;
 
 pub(super) fn spinner_frame(tick: u64) -> &'static str {

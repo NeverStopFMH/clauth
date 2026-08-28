@@ -568,7 +568,8 @@ impl ResetDisplay {
 
 /// Wall-clock notation for the stamp [`ResetDisplay`] renders
 /// (`AppState.clock_format`). Defaults to 24-hour, matching the only other
-/// clock in the tree (`tui::render::format::clock_label`).
+/// clock in the tree (`crate::format::local_stamp`, the status tab's incident
+/// stamps, which are fixed 24-hour by the prose-stamp ruling).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) enum ClockFormat {
     /// `21:20`

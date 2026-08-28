@@ -1,3 +1,5 @@
+#![allow(clippy::unwrap_used, clippy::expect_used)]
+
 //! `fixed_split` truncation contract: content + pad always total `width`, and
 //! ANY dropped character is signalled with a trailing `…` — including the
 //! boundary case where the value is exactly one char over the window, which
@@ -577,9 +579,8 @@ fn stale_window_fades_only_fill_and_percent() {
 /// against a fixed epoch by `the_last_swap_age_renders_one_unit_and_a_date_past_
 /// thirty_days`; what this owns is the branch.
 ///
-/// `relative_age` also feeds the status tab's incident ages
-/// (`status.rs` `started` row + the detail timeline), so the arm protects three
-/// surfaces, not one.
+/// `relative_age` also feeds the status tab's incident ages (the list row and
+/// the detail header), so the arm protects three surfaces, not one.
 #[test]
 fn relative_age_switches_to_a_date_at_thirty_days() {
     const DAY_MS: u64 = 86_400_000;

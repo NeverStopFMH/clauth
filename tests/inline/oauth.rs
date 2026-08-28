@@ -876,7 +876,10 @@ mod keychain_mirror_gate {
     fn missing_live_file_is_not_foreign() {
         let _home = HomeSandbox::new();
         save_profile_with("alpha", "new-token");
-        assert!(!super::live_login_is_foreign("alpha", "old-token"));
+        assert!(!super::live_login_is_foreign(
+            &crate::profile::ProfileName::from("alpha"),
+            "old-token"
+        ));
     }
 
     #[test]
@@ -884,7 +887,10 @@ mod keychain_mirror_gate {
         let _home = HomeSandbox::new();
         save_profile_with("alpha", "new-token");
         write_live_file("new-token");
-        assert!(!super::live_login_is_foreign("alpha", "old-token"));
+        assert!(!super::live_login_is_foreign(
+            &crate::profile::ProfileName::from("alpha"),
+            "old-token"
+        ));
     }
 
     #[test]
@@ -895,7 +901,10 @@ mod keychain_mirror_gate {
         let _home = HomeSandbox::new();
         save_profile_with("alpha", "new-token");
         write_live_file("old-token");
-        assert!(!super::live_login_is_foreign("alpha", "old-token"));
+        assert!(!super::live_login_is_foreign(
+            &crate::profile::ProfileName::from("alpha"),
+            "old-token"
+        ));
     }
 
     #[test]
@@ -905,7 +914,10 @@ mod keychain_mirror_gate {
         let _home = HomeSandbox::new();
         save_profile_with("alpha", "new-token");
         write_live_file("someone-elses-token");
-        assert!(super::live_login_is_foreign("alpha", "old-token"));
+        assert!(super::live_login_is_foreign(
+            &crate::profile::ProfileName::from("alpha"),
+            "old-token"
+        ));
     }
 }
 

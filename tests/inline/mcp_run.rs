@@ -5453,7 +5453,7 @@ fn kill_verdict_renders_the_two_fixed_spellings() {
     );
 }
 
-/// A job the registry holds but the store does not yet carry is the cheapest
+/// A job the registry holds but the store does not carry is the cheapest
 /// honest drive of the still-alive verdict: the wait resolves at once with
 /// `unknown`, nothing died, and the reply still reports the ask and the failed
 /// kill with the seconds it actually waited — here zero, not the grace floor.
@@ -7345,12 +7345,11 @@ fn the_monitor_entry_names_the_listing_and_the_interrupted_delegate() {
 /// than being relaxed, because there is no weaker form of "name the exception"
 /// that still means anything.
 ///
-/// The grace is real and still unannounced. `effective_wait` floors a
-/// `cancel: true` call at `CANCEL_GRACE_SECS`, and no reply, refusal or doc says
-/// so now. The owner's replacement is a reply-side line naming the outcome per
-/// job (`killed {id} after {n}s` / `failed to kill {id} after {n}s`), which is
-/// the half a caller can act on; NOT built
-/// yet. Re-pin against the REPLY when it lands, never back onto `wait_secs`.
+/// The grace is real; no copy names its figure. The half a caller can act on
+/// is the reply's own note, one verdict per asked job it could account for
+/// (`killed {id} after {n}s` / `failed to kill {id} after {n}s`), the figure
+/// the observed wait, never the floor. That note is what this file pins —
+/// never `wait_secs`.
 ///
 /// `switch_profile`'s `case-insensitive` pin went the same day for the same
 /// kind of reason: the owner declined restoring the word to `name`'s doc, ruling

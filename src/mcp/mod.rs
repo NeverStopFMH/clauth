@@ -2500,10 +2500,11 @@ async fn monitor_one(
 
 /// The several-ids half of `monitor`'s job mode: one result per requested id
 /// in the order given. An absent id is its own `unknown` result, never a
-/// batch-level failure; a done id is evicted only after the whole batch
-/// rendered, so a mid-fold panic leaves every done file as its recoverable
-/// copy. The protocol-level error flag mirrors the per-result flags: any failed
-/// done envelope makes the whole batch an error.
+/// batch-level failure; the reply tail carries ONE unknown-count clause for
+/// the whole batch, however many rows read `unknown`. A done id is evicted
+/// only after the whole batch rendered, so a mid-fold panic leaves every done
+/// file as its recoverable copy. The protocol-level error flag mirrors the
+/// per-result flags: any failed done envelope makes the whole batch an error.
 async fn monitor_batch(
     job_ids: Vec<String>,
     wait: u64,
@@ -2523,9 +2524,13 @@ async fn monitor_batch(
     let mut results = Vec::with_capacity(outcomes.len());
     let mut delivered = Vec::new();
     let mut any_error = false;
+    let mut unknown_job_id_count = 0u64;
     for (id, outcome) in outcomes {
         let entry = match outcome {
-            WaitOutcome::Unknown => serde_json::json!({ "job_id": id, "status": "unknown" }),
+            WaitOutcome::Unknown => {
+                unknown_job_id_count += 1;
+                serde_json::json!({ "job_id": id, "status": "unknown" })
+            }
             WaitOutcome::Running(record) => running_payload(&id, &record, now_ms()),
             WaitOutcome::Done(record) => {
                 // No per-result digest: one rides the whole reply below.
@@ -2555,6 +2560,13 @@ async fn monitor_batch(
         results.push(entry);
     }
     let mut payload = serde_json::json!({ "results": results });
+    // Present only when some id was unknown, like `since_your_last_call`
+    // below: the prose spelling reads the count and names the cause ONCE at
+    // the tail, so an all-unknown cap batch grows the reply by exactly that
+    // one clause instead of one hedged cause per row.
+    if unknown_job_id_count > 0 {
+        payload["unknown_job_id_count"] = serde_json::json!(unknown_job_id_count);
+    }
     // One digest for the whole call, top-level beside `results` where every
     // other surface carries it: a batch IS one call, and the per-result folds
     // run `DigestMode::Skip` because a per-result report would consume the

@@ -2177,7 +2177,11 @@ fn monitor_batch_returns_one_result_per_id_in_order() {
         .map(|t| t.text.clone())
         .expect("results text");
     let lines: Vec<&str> = text.lines().collect();
-    assert_eq!(lines.len(), 3, "one line per requested id: {text}");
+    assert_eq!(
+        lines.len(),
+        4,
+        "one line per requested id plus the one tail clause: {text}"
+    );
 
     assert_eq!(
         lines[0], "job `d-b1-0` finished: all done",
@@ -2201,6 +2205,101 @@ fn monitor_batch_returns_one_result_per_id_in_order() {
         lines[2], "job `d-b3-0` unknown",
         "an absent id is reported per-id, never dropped"
     );
+    assert_eq!(
+        lines[3], "1 unknown job id(s): use monitor without `job_ids` to list the existing jobs.",
+        "the tail clause names the batch's unknown count once: {text}"
+    );
+}
+
+/// One unknown id among real ones names its cause exactly once, as ONE
+/// batch-level clause on the tail — and the unknown row itself stays bare,
+/// because the cause is the batch's, not the row's.
+#[test]
+fn monitor_batch_names_an_unknown_cause_once_at_the_tail() {
+    let _home = HomeSandbox::new();
+    jobs::write_done(
+        "d-cause-0",
+        "work",
+        1,
+        None,
+        serde_json::json!({"profile": "work", "is_error": false, "result": "all done"}),
+    )
+    .unwrap();
+    seed_running("d-cause-1", "work", now_ms());
+
+    let result = call_monitor_batch(vec!["d-cause-0", "d-cause-1", "d-cause-2"], Some(0));
+    assert_ne!(result.is_error, Some(true));
+    let text = result
+        .content
+        .first()
+        .and_then(|c| c.as_text())
+        .map(|t| t.text.clone())
+        .expect("results text");
+    assert_eq!(
+        text.matches("unknown job id(s): use monitor without `job_ids`")
+            .count(),
+        1,
+        "the cause clause renders once for the whole batch: {text}",
+    );
+    assert!(
+        text.ends_with(
+            "1 unknown job id(s): use monitor without `job_ids` to list the existing jobs."
+        ),
+        "the tail clause carries the batch's own count: {text}",
+    );
+    let row = text
+        .lines()
+        .find(|l| l.starts_with("job `d-cause-2`"))
+        .expect("the unknown id has its row");
+    assert_eq!(
+        row, "job `d-cause-2` unknown",
+        "a per-row unknown line carries no cause text: {row}"
+    );
+}
+
+/// An all-unknown cap batch grows the reply by exactly the one tail clause:
+/// 256 bare rows, no per-row cause text, one clause naming the count.
+#[test]
+fn monitor_batch_an_all_unknown_cap_batch_grows_by_exactly_one_clause() {
+    let _home = HomeSandbox::new();
+    let ids: Vec<String> = (0..256).map(|i| format!("d-none-{i}")).collect();
+    let result = call_monitor_batch(ids.iter().map(String::as_str).collect(), Some(0));
+    assert_ne!(
+        result.is_error,
+        Some(true),
+        "an all-unknown batch is not an error"
+    );
+    let text = result
+        .content
+        .first()
+        .and_then(|c| c.as_text())
+        .map(|t| t.text.clone())
+        .expect("results text");
+    let lines: Vec<&str> = text.lines().collect();
+    assert_eq!(
+        lines.len(),
+        257,
+        "256 rows plus exactly one tail clause: {text}"
+    );
+    assert_eq!(
+        text.matches("unknown job id(s): use monitor without `job_ids`")
+            .count(),
+        1,
+        "one clause, however many ids the batch holds: {text}",
+    );
+    assert!(
+        text.ends_with(
+            "256 unknown job id(s): use monitor without `job_ids` to list the existing jobs."
+        ),
+        "the clause names the full count: {text}",
+    );
+    for line in &lines[..256] {
+        let (_, verdict) = line.split_once("` ").expect("a row opens `job `<id>`");
+        assert_eq!(
+            verdict, "unknown",
+            "a per-row unknown line carries no cause text: {line}"
+        );
+    }
 }
 
 #[test]
@@ -2245,9 +2344,9 @@ fn monitor_batch_prose_is_one_block_with_one_line_per_job() {
         .collect();
     assert_eq!(
         lines.len(),
-        5,
-        "three named job lines, one wrapped line of the multi-line result, and \
-         the running job's own quoted tail line"
+        6,
+        "three named job lines, one wrapped line of the multi-line result, the \
+         running job's own quoted tail line, and the one unknown-count clause"
     );
     assert_eq!(
         lines[3], "    \"still compiling\"",
@@ -2529,8 +2628,13 @@ fn monitor_batch_never_evicts_a_mismatched_stored_job_id() {
         .expect("results text");
     assert_eq!(
         text.lines().collect::<Vec<_>>(),
-        vec!["job `d-mis-0` finished: stolen", "job `d-absent-0` unknown"],
-        "the result is reported under the caller-supplied id, envelope intact",
+        vec![
+            "job `d-mis-0` finished: stolen",
+            "job `d-absent-0` unknown",
+            "1 unknown job id(s): use monitor without `job_ids` to list the existing jobs.",
+        ],
+        "the result is reported under the caller-supplied id, envelope intact, \
+         with the batch's one unknown-count clause on the tail",
     );
     assert!(
         jobs::read("d-decoy-0").is_some(),

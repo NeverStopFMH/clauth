@@ -2148,6 +2148,71 @@ fn monitor_job_prose_renders_a_wrapped_scalar_self_report() {
     );
 }
 
+/// The several-ids prose names its unknown ids ONCE, at the tail, and the
+/// clause's figure is the payload's `unknown_job_id_count` — never a recount
+/// of the rows, which is what bounds an all-unknown cap batch to one clause.
+#[test]
+fn monitor_batch_prose_derives_the_unknown_clause_from_the_payload_count() {
+    let batch = serde_json::json!({
+        "results": [
+            {"job_id": "d-1-0", "status": "unknown"},
+            {"job_id": "d-2-0", "status": "unknown"},
+            {"job_id": "d-3-0", "status": "unknown"},
+        ],
+        "unknown_job_id_count": 3,
+    });
+    assert_eq!(
+        monitor_batch_prose(&batch),
+        "job `d-1-0` unknown\njob `d-2-0` unknown\njob `d-3-0` unknown\n\
+         3 unknown job id(s): use monitor without `job_ids` to list the existing jobs."
+    );
+
+    // The clause reads the payload's figure, not the rows: two unknown rows
+    // under a count of 1 render the count the payload carries.
+    let derived = serde_json::json!({
+        "results": [
+            {"job_id": "d-1-0", "status": "unknown"},
+            {"job_id": "d-2-0", "status": "unknown"},
+        ],
+        "unknown_job_id_count": 1,
+    });
+    assert_eq!(
+        monitor_batch_prose(&derived),
+        "job `d-1-0` unknown\njob `d-2-0` unknown\n\
+         1 unknown job id(s): use monitor without `job_ids` to list the existing jobs."
+    );
+
+    // No count in the payload, no clause — even over unknown rows: the prose
+    // derives the figure, never one of its own.
+    let uncounted = serde_json::json!({
+        "results": [{"job_id": "d-1-0", "status": "unknown"}],
+    });
+    assert_eq!(monitor_batch_prose(&uncounted), "job `d-1-0` unknown");
+
+    // A zero count is no cause to name, and a batch of known rows carries no
+    // clause at all.
+    let none = serde_json::json!({
+        "results": [
+            {"job_id": "d-1-0", "status": "done", "profile": "work",
+             "is_error": false, "result": "ok"},
+        ],
+        "unknown_job_id_count": 0,
+    });
+    assert_eq!(monitor_batch_prose(&none), "job `d-1-0` finished: ok");
+
+    // When a digest rides along it stays ahead of the tail clause.
+    let both = serde_json::json!({
+        "results": [{"job_id": "d-1-0", "status": "unknown"}],
+        "unknown_job_id_count": 1,
+        "since_your_last_call": {"credentials": true},
+    });
+    assert_eq!(
+        monitor_batch_prose(&both),
+        "job `d-1-0` unknown\nsince your last call: credentials file rewritten\n\
+         1 unknown job id(s): use monitor without `job_ids` to list the existing jobs."
+    );
+}
+
 /// A cancelled run is not a timed-out one, and the verdict word is the first
 /// thing a reader takes off the line. The salvage clauses already render here,
 /// so a cancel carries its partial and its resume handle for free.

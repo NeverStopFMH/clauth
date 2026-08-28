@@ -1701,9 +1701,10 @@ pub(super) fn kill_verdict(job_id: &str, killed: bool, waited_secs: u64) -> Stri
 }
 
 /// Prose for a `monitor` several-ids reply: one BLOCK per requested id, naming
-/// its id and state, then the batch's own digest clause on a last line when it
-/// carries one. A done line reuses the envelope spelling, a running line the
-/// shared running spelling, an absent id reads `unknown`.
+/// its id and state, then the batch's own digest clause when it carries one,
+/// then ONE unknown-count clause on the tail when the payload carries a
+/// positive `unknown_job_id_count`. A done line reuses the envelope spelling,
+/// a running line the shared running spelling, an absent id reads `unknown`.
 ///
 /// A block is usually one line but is not guaranteed to be: a done envelope's
 /// `result` carries the delegate's own newlines, and a running job with a tail
@@ -1737,6 +1738,19 @@ pub(crate) fn monitor_batch_prose(p: &Value) -> String {
     if !digest.is_empty() {
         out.push('\n');
         out.push_str(&digest);
+    }
+    // The count is the payload's figure, never a recount of the rows: that
+    // contract is what keeps the clause to exactly one however many ids the
+    // batch holds.
+    if let Some(n) = p
+        .get("unknown_job_id_count")
+        .and_then(Value::as_u64)
+        .filter(|n| *n > 0)
+    {
+        out.push('\n');
+        out.push_str(&format!(
+            "{n} unknown job id(s): use monitor without `job_ids` to list the existing jobs."
+        ));
     }
     out
 }

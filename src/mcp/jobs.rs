@@ -425,6 +425,22 @@ pub(crate) fn read(job_id: &str) -> Option<JobRecord> {
     serde_json::from_slice(&bytes).ok()
 }
 
+/// The collectable record's mtime, in epoch ms: the moment that record was
+/// finalized, since a Done file's only writer is [`write_atomic`]'s rename and
+/// everything after it removes the file rather than rewriting it. The cancel
+/// verdict dates a kill off this rather than the record's own `done_at`, which
+/// a file written by an older server may not carry.
+pub(crate) fn collectable_mtime_ms(job_id: &str) -> Option<u64> {
+    let path = job_path(job_id, RecordKind::Collectable).ok()?;
+    let mtime = std::fs::metadata(path).ok()?.modified().ok()?;
+    mtime
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_millis()
+        .try_into()
+        .ok()
+}
+
 /// Delete a job file (best-effort). Called after a fallback `monitor` collect
 /// hands the envelope back.
 pub(crate) fn remove(job_id: &str) {

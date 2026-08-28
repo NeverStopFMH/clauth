@@ -1687,6 +1687,19 @@ fn escape_quoted(s: &str) -> String {
     s.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
+/// One asked job's verdict for a cancelling `monitor`'s opening line: what the
+/// wait OBSERVED, with the seconds that call actually waited for that job —
+/// never the grace constant. The id takes the module's backtick convention;
+/// the owner record fixes the words. Both spellings render here and nowhere
+/// else, so the fixed pair cannot drift.
+pub(super) fn kill_verdict(job_id: &str, killed: bool, waited_secs: u64) -> String {
+    if killed {
+        format!("killed `{job_id}` after {waited_secs}s")
+    } else {
+        format!("failed to kill `{job_id}` after {waited_secs}s")
+    }
+}
+
 /// Prose for a `monitor` several-ids reply: one BLOCK per requested id, naming
 /// its id and state, then the batch's own digest clause on a last line when it
 /// carries one. A done line reuses the envelope spelling, a running line the

@@ -1549,20 +1549,7 @@ listing is where you find its id."
         let wait = effective_wait(wait_secs, progress.can_receive_progress(), cancel);
         // Asked BEFORE the wait, so the runs are already stopping while it runs
         // and this reply carries whatever they reached.
-        let note = cancel
-            .then(|| {
-                // Only over ids that could name a job file at all: a registry
-                // key is always a minted id, so an unsafe one is not an unheld
-                // job, and the batch already reports it as `unknown`.
-                let (asked, unheld): (Vec<String>, Vec<String>) = job_ids
-                    .iter()
-                    .flatten()
-                    .filter(|id| jobs::is_safe_job_id(id))
-                    .cloned()
-                    .partition(|id| cancel_job(id));
-                cancel_note(&asked, &unheld)
-            })
-            .filter(|note| !note.is_empty());
+        let mut watch = cancel.then(|| CancelWatch::ask(job_ids.as_deref().unwrap_or_default()));
         let reply = match job_ids {
             // One id keeps the single-job reply shape; several collect as a
             // batch. Both arms take a list `job_ids_refusal` already cleared.
@@ -1572,10 +1559,21 @@ listing is where you find its id."
                     wait,
                     &self.digest,
                     &mut progress,
+                    watch.as_mut(),
                 )
                 .await
             }
-            Some(ids) => monitor_batch(ids, wait, return_on, &self.digest, &mut progress).await,
+            Some(ids) => {
+                monitor_batch(
+                    ids,
+                    wait,
+                    return_on,
+                    &self.digest,
+                    &mut progress,
+                    watch.as_mut(),
+                )
+                .await
+            }
             // No ids: the state-waiting mode absorbed from the old `watch`
             // tool — the same digest, all three observables (see `WatchSet`)
             // — plus the listing, which is the one thing `job_ids` cannot ask
@@ -1600,6 +1598,9 @@ listing is where you find its id."
                 Ok(CallToolResult::success(single_block(prose)))
             }
         };
+        // Composed AFTER the wait: the verdicts say what it observed, per job,
+        // in the seconds this call actually waited for each.
+        let note = watch.map(CancelWatch::note).filter(|note| !note.is_empty());
         match note {
             Some(note) => reply.map(|r| prepend_note(r, &note)),
             None => reply,
@@ -2162,47 +2163,146 @@ fn cancel_job(job_id: &str) -> bool {
     }
 }
 
-/// The line a cancelling `monitor` opens with: which named jobs this server
-/// asked to stop, and which it holds no run for.
+/// A cancelling `monitor`'s ask, and the deaths its wait observed happen.
 ///
-/// It claims the ASK, never the outcome. Setting the flag is the whole of what
-/// this call did; the flag is read by the supervision loop, and between the
-/// registry entry and that loop sit `load_config`, the pre-flight and
-/// `ProfileRuntime::acquire` — which BLOCKS behind a live `clauth start` session
-/// on the same profile. A reply claiming "stopped" would print that word
-/// directly above a running row for the same id.
+/// The ask is set before the wait so the runs are already stopping while it
+/// runs; the verdict is read after it, and only as observed. Death instants
+/// are recorded where the wait loops first read a job file `Done` — the
+/// collect evicts a done file before the reply assembles, so that read is the
+/// only surviving witness — and are DATED off that file's mtime: a Done
+/// file's only writer is the finalize's atomic rename and everything after it
+/// removes the file, so the mtime is the moment the job finished. A death
+/// strictly before the ask renders no verdict at all — a death whose age the
+/// monotonic clock cannot represent included, since that can only predate
+/// this process: that job's collect row already reports its outcome, and a
+/// `killed` there would claim this call caused what it only witnessed. A job
+/// with no recorded death was alive when
+/// the wait gave up on it, whatever the flag intends: the flag is
+/// read by the supervision loop, and between the registry entry and that loop
+/// sit `load_config`, the pre-flight and `ProfileRuntime::acquire` — which
+/// BLOCKS behind a live `clauth start` session on the same profile. So the
+/// verdict says what was seen, never "stopped".
 ///
 /// An id the registry does not hold is NAMED rather than left to come back as a
 /// plain `running` row, which reads as "the cancel did nothing". Its causes are
 /// hedged the way [`unknown_job_reason`] hedges its own, because nothing here
 /// can tell them apart: the run may already be finalizing (its registry entry
 /// drops only after the result is on disk — [`Handoff::finalize`]), or it may
-/// belong to an earlier server process whose registry went with it.
-fn cancel_note(asked: &[String], unheld: &[String]) -> String {
-    let list = |ids: &[String]| {
-        ids.iter()
-            .map(|id| format!("`{id}`"))
-            .collect::<Vec<_>>()
-            .join(", ")
-    };
-    let mut clauses = Vec::new();
-    if !asked.is_empty() {
-        clauses.push(format!(
-            "asked {} to stop; each hands back whatever it had produced",
-            list(asked)
-        ));
+/// belong to an earlier server process whose registry went with it. No verdict
+/// renders for an unheld id: there is no run here to observe.
+struct CancelWatch {
+    /// The instant the ask completed — every flag set, so no verdict can
+    /// claim a death that preceded its own flag — and the point every per-job
+    /// figure counts from, so the reply's seconds are what this call waited,
+    /// never the grace floor.
+    asked_at: Instant,
+    asked: Vec<String>,
+    unheld: Vec<String>,
+    /// One entry per id the wait saw report `Done`. `None` inside an entry:
+    /// the death is real but its dating cannot place it at or after the ask,
+    /// so it renders no verdict. An id absent from the map never died here.
+    deaths: HashMap<String, Option<Instant>>,
+}
+
+impl CancelWatch {
+    /// Set every flag this call can set, and split the ids by whether this
+    /// server holds a run. Only over ids that could name a job file at all: a
+    /// registry key is always a minted id, so an unsafe one is not an unheld
+    /// job, and the batch already reports it as `unknown`.
+    fn ask(ids: &[String]) -> Self {
+        let (asked, unheld): (Vec<String>, Vec<String>) = ids
+            .iter()
+            .filter(|id| jobs::is_safe_job_id(id))
+            .cloned()
+            .partition(|id| cancel_job(id));
+        Self {
+            // Sampled once the last flag is set rather than when the ask
+            // begins: the gap is nothing to a seconds-truncated figure, and a
+            // death inside it must not read as caused.
+            asked_at: Instant::now(),
+            asked,
+            unheld,
+            deaths: HashMap::new(),
+        }
     }
-    if !unheld.is_empty() {
-        clauses.push(format!(
-            "no running delegate here for {}: it may already be finishing, or it may have been \
-             started by an earlier server process",
-            list(unheld)
-        ));
+
+    /// The wait loops' half: the first read that found this id `Done`, dated
+    /// off the file's mtime and rebuilt against the stamping read's clocks so
+    /// it compares with `asked_at` in the monotonic domain. `checked_sub`,
+    /// never `-`: an age older than the monotonic clock's origin is
+    /// unrepresentable, the subtraction would panic inside the tool handler
+    /// on a backing that cannot go below its origin, and such an age can only
+    /// mean the finalize preceded this process — so the stamp stays undated
+    /// and the no-verdict rule applies. An UNREADABLE mtime — a peer's
+    /// collect evicted the file between the read and the stamp — falls back
+    /// to the observation itself instead: the `Done` read already earned a
+    /// verdict, and `failed to kill` would be the false claim there. First
+    /// stamp wins, so a later re-read cannot move a death.
+    fn saw_done(&mut self, job_id: &str) {
+        let dated = jobs::collectable_mtime_ms(job_id).map(|at| {
+            Instant::now().checked_sub(Duration::from_millis(now_ms().saturating_sub(at)))
+        });
+        let died_at = match dated {
+            Some(dated) => dated,
+            None => Some(Instant::now()),
+        };
+        self.deaths.entry(job_id.to_string()).or_insert(died_at);
     }
-    if clauses.is_empty() {
-        return String::new();
+
+    /// The line a cancelling `monitor` opens with: the ask, then one verdict
+    /// per asked job that died at or after the ask, in the order named, then
+    /// the unheld hedge. The `failed`
+    /// figure runs to here because the note renders at the wait's own end,
+    /// which is the moment the call gave up on every job still unaccounted.
+    fn note(self) -> String {
+        let list = |ids: &[String]| {
+            ids.iter()
+                .map(|id| format!("`{id}`"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        let gave_up_at = Instant::now();
+        let mut clauses = Vec::new();
+        if !self.asked.is_empty() {
+            clauses.push(format!(
+                "asked {} to stop; each hands back whatever it had produced",
+                list(&self.asked)
+            ));
+            let verdicts = self
+                .asked
+                .iter()
+                .filter_map(|id| match self.deaths.get(id) {
+                    Some(Some(died_at)) if *died_at >= self.asked_at => Some(render::kill_verdict(
+                        id,
+                        true,
+                        died_at.duration_since(self.asked_at).as_secs(),
+                    )),
+                    // A death dated before the ask, or one the dating cannot
+                    // place: the struct doc's no-verdict rule.
+                    Some(_) => None,
+                    None => Some(render::kill_verdict(
+                        id,
+                        false,
+                        gave_up_at.duration_since(self.asked_at).as_secs(),
+                    )),
+                })
+                .collect::<Vec<_>>();
+            if !verdicts.is_empty() {
+                clauses.push(verdicts.join("; "));
+            }
+        }
+        if !self.unheld.is_empty() {
+            clauses.push(format!(
+                "no running delegate here for {}: it may already be finishing, or it may have been \
+                 started by an earlier server process",
+                list(&self.unheld)
+            ));
+        }
+        if clauses.is_empty() {
+            return String::new();
+        }
+        format!("{}.", clauses.join(". "))
     }
-    format!("{}.", clauses.join(". "))
 }
 
 /// Put a cancel report ahead of a reply's own prose, inside the SAME content
@@ -2356,6 +2456,7 @@ async fn monitor_one(
     wait: u64,
     digest: &DigestTracker,
     progress: &mut ProgressSink,
+    watch: Option<&mut CancelWatch>,
 ) -> Result<CallToolResult, ErrorData> {
     // The path join below is guarded by [`job_ids_refusal`], which every caller
     // runs before this one and which refuses a one-id list that is not a safe
@@ -2364,7 +2465,7 @@ async fn monitor_one(
     // A collect is the other moment a corpse matters — see
     // `jobs::gc_running_corpses`.
     jobs::gc_running_corpses(now_ms());
-    let outcome = wait_for_done(&job_id, wait, progress).await;
+    let outcome = wait_for_done(&job_id, wait, progress, watch).await;
 
     match outcome {
         WaitOutcome::Unknown => {
@@ -2409,6 +2510,7 @@ async fn monitor_batch(
     return_on: ReturnOn,
     digest: &DigestTracker,
     progress: &mut ProgressSink,
+    watch: Option<&mut CancelWatch>,
 ) -> Result<CallToolResult, ErrorData> {
     // The cap and the empty-list rule are [`job_ids_refusal`]'s, run by every
     // caller before this one and before any cancel.
@@ -2416,7 +2518,7 @@ async fn monitor_batch(
 
     // Same reason as the one-id arm, and the same narrow scope.
     jobs::gc_running_corpses(now_ms());
-    let outcomes = wait_for_batch(&job_ids, wait, return_on, progress).await;
+    let outcomes = wait_for_batch(&job_ids, wait, return_on, progress, watch).await;
 
     let mut results = Vec::with_capacity(outcomes.len());
     let mut delivered = Vec::new();
@@ -2667,13 +2769,19 @@ async fn wait_for_done(
     job_id: &str,
     deadline_secs: u64,
     progress: &mut ProgressSink,
+    mut watch: Option<&mut CancelWatch>,
 ) -> WaitOutcome {
     let start = Instant::now();
     let deadline = Duration::from_secs(deadline_secs);
     let mut cancelled = false;
     loop {
         match jobs::read(job_id) {
-            Some(r) if r.state == jobs::JobState::Done => return WaitOutcome::Done(r),
+            Some(r) if r.state == jobs::JobState::Done => {
+                if let Some(w) = watch.as_deref_mut() {
+                    w.saw_done(job_id);
+                }
+                return WaitOutcome::Done(r);
+            }
             Some(r) if cancelled || start.elapsed() >= deadline => {
                 return WaitOutcome::Running(r);
             }
@@ -2703,6 +2811,7 @@ async fn wait_for_batch(
     deadline_secs: u64,
     return_on: ReturnOn,
     progress: &mut ProgressSink,
+    mut watch: Option<&mut CancelWatch>,
 ) -> Vec<(String, WaitOutcome)> {
     let start = Instant::now();
     let deadline = Duration::from_secs(deadline_secs);
@@ -2725,6 +2834,9 @@ async fn wait_for_batch(
             match jobs::read(id) {
                 Some(r) if r.state == jobs::JobState::Done => {
                     any_done = true;
+                    if let Some(w) = watch.as_deref_mut() {
+                        w.saw_done(id);
+                    }
                     *slot = Some(WaitOutcome::Done(r));
                 }
                 Some(r) if cancelled || start.elapsed() >= deadline => {
@@ -2754,7 +2866,12 @@ async fn wait_for_batch(
         .zip(outcomes)
         .map(|(id, slot)| {
             let outcome = slot.unwrap_or_else(|| match jobs::read(id) {
-                Some(r) if r.state == jobs::JobState::Done => WaitOutcome::Done(r),
+                Some(r) if r.state == jobs::JobState::Done => {
+                    if let Some(w) = watch.as_deref_mut() {
+                        w.saw_done(id);
+                    }
+                    WaitOutcome::Done(r)
+                }
                 Some(r) => WaitOutcome::Running(r),
                 None => WaitOutcome::Unknown,
             });

@@ -1791,7 +1791,7 @@ fn return_on_all_waits_for_the_slowest_lane_and_any_does_not() {
 
     let start = std::time::Instant::now();
     let any = rt.block_on(async {
-        wait_for_batch(&ids, 3, ReturnOn::Any, &mut ProgressSink::none()).await
+        wait_for_batch(&ids, 3, ReturnOn::Any, &mut ProgressSink::none(), None).await
     });
     let any_elapsed = start.elapsed();
     assert!(
@@ -1802,7 +1802,7 @@ fn return_on_all_waits_for_the_slowest_lane_and_any_does_not() {
 
     let start = std::time::Instant::now();
     let all = rt.block_on(async {
-        wait_for_batch(&ids, 3, ReturnOn::All, &mut ProgressSink::none()).await
+        wait_for_batch(&ids, 3, ReturnOn::All, &mut ProgressSink::none(), None).await
     });
     let all_elapsed = start.elapsed();
     assert!(
@@ -1854,7 +1854,7 @@ fn a_cancelled_request_ends_every_wait_loop_early() {
     let mut sink = ProgressSink::none();
     let canceller = cancel_soon(&sink);
     let start = std::time::Instant::now();
-    let one = rt.block_on(wait_for_done("d-cancel-0", deadline_secs, &mut sink));
+    let one = rt.block_on(wait_for_done("d-cancel-0", deadline_secs, &mut sink, None));
     let elapsed = start.elapsed();
     canceller.join().expect("canceller thread");
     assert!(
@@ -1874,6 +1874,7 @@ fn a_cancelled_request_ends_every_wait_loop_early() {
         deadline_secs,
         ReturnOn::All,
         &mut sink,
+        None,
     ));
     let elapsed = start.elapsed();
     canceller.join().expect("canceller thread");
@@ -2290,8 +2291,9 @@ fn wait_for_batch_running_id_never_falls_out_as_unknown_at_deadline() {
         .build()
         .expect("runtime");
     for mode in [ReturnOn::Any, ReturnOn::All] {
-        let outcomes =
-            rt.block_on(async { wait_for_batch(&ids, 1, mode, &mut ProgressSink::none()).await });
+        let outcomes = rt.block_on(async {
+            wait_for_batch(&ids, 1, mode, &mut ProgressSink::none(), None).await
+        });
         assert!(
             matches!(&outcomes[0].1, WaitOutcome::Running(_)),
             "a still-running id at the deadline resolves running, never unknown ({mode:?})"
@@ -5153,7 +5155,9 @@ fn the_cancel_registry_holds_a_flag_only_while_the_run_is_registered() {
 /// `cancel: true` marks the named jobs and then runs the ordinary collect, so
 /// the caller receives what they produced in the same call. The job here is
 /// already finalized: the grace exists for a real run's teardown, and this test
-/// is about the cancel rather than the wait.
+/// is about the cancel rather than the wait. A death that predates the ask
+/// earns no verdict — the file's mtime dates the finalize before the call — so
+/// the note is the ask alone and the row below reports the outcome.
 #[test]
 fn cancelling_a_live_job_flips_its_flag_and_the_reply_says_so() {
     let _home = HomeSandbox::new();
@@ -5168,6 +5172,10 @@ fn cancelling_a_live_job_flips_its_flag_and_the_reply_says_so() {
     .unwrap();
     let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let _guard = super::CancelGuard::register(id, std::sync::Arc::clone(&flag));
+    // Past any clock-sampling noise, so the file's mtime sits strictly before
+    // the ask inside the call — without this the wall age can floor to 0 ms
+    // and the no-verdict expectation flakes.
+    std::thread::sleep(std::time::Duration::from_millis(100));
 
     let result = call_monitor_args(MonitorArgs {
         job_ids: Some(vec![id.to_string()]),
@@ -5192,6 +5200,19 @@ fn cancelling_a_live_job_flips_its_flag_and_the_reply_says_so() {
     assert!(
         text.contains("half an answer"),
         "and hands back what that job produced, in the same call: {text}"
+    );
+    let (note, _) = text
+        .split_once('\n')
+        .expect("the cancel note leads the reply");
+    assert_eq!(
+        note,
+        format!("asked `{id}` to stop; each hands back whatever it had produced."),
+        "a death that predates the ask renders no verdict: {text}"
+    );
+    assert_eq!(
+        result.content.len(),
+        1,
+        "the cancel report rides the reply's own single block"
     );
 }
 
@@ -5370,21 +5391,294 @@ fn cancelling_an_unsafe_job_id_refuses_it_rather_than_hedging_it() {
     );
 }
 
-/// The flag is read by the supervision loop, which does not exist until the
-/// child is spawned — and `ProfileRuntime::acquire` BLOCKS behind a live
-/// `clauth start` session on the same profile. So the reply can only claim the
-/// ask, never the outcome; asserting "stopped" put that word directly above a
-/// running row for the same id.
+/// The note claims the ask up front, and a verdict only for a death dated at
+/// or after the ask, off the job file's mtime. A death that predates the call
+/// — the finalize window — renders nothing: the collect row already reports
+/// that outcome, and a `killed` there would claim this call caused what it
+/// only witnessed. A death the wait did observe reads `killed`, carrying the
+/// seconds the call actually waited for it.
 #[test]
-fn the_cancel_report_claims_the_ask_and_never_the_outcome() {
-    let note = super::cancel_note(&["d-1-0".to_string()], &[]);
+fn the_cancel_report_claims_the_ask_and_only_the_verdicts_it_observed() {
+    let _home = HomeSandbox::new();
+    let id = "d-1-0";
+    let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let _guard = super::CancelGuard::register(id, std::sync::Arc::clone(&flag));
+    jobs::write_done(
+        id,
+        "work",
+        1,
+        None,
+        serde_json::json!({"profile": "work", "is_error": false, "result": "done long ago"}),
+    )
+    .unwrap();
+    // Past any clock-sampling noise, so the file's mtime sits strictly before
+    // the ask that follows.
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    let mut pre_ask = super::CancelWatch::ask(&[id.to_string()]);
+    pre_ask.saw_done(id);
+    assert_eq!(
+        pre_ask.note(),
+        format!("asked `{id}` to stop; each hands back whatever it had produced."),
+        "a death dated before the ask earns no verdict clause"
+    );
+    let mut watched = super::CancelWatch::ask(&[id.to_string()]);
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    jobs::write_done(
+        id,
+        "work",
+        1,
+        None,
+        serde_json::json!({"profile": "work", "is_error": false, "result": "done mid-wait"}),
+    )
+    .unwrap();
+    watched.saw_done(id);
     assert!(
-        note.contains("asked `d-1-0` to stop"),
-        "the observable is the ask: {note}"
+        watched.note().contains(&format!("killed `{id}` after 0s")),
+        "a death dated after the ask reads as killed, with its waited figure"
+    );
+}
+
+/// The owner-fixed verdict pair, rendered by the one function behind both
+/// spellings, ids in the module's backticks. The `10` here is an input, never
+/// the grace constant standing in for an observation.
+#[test]
+fn kill_verdict_renders_the_two_fixed_spellings() {
+    assert_eq!(
+        super::render::kill_verdict("d-9-0", true, 3),
+        "killed `d-9-0` after 3s"
+    );
+    assert_eq!(
+        super::render::kill_verdict("d-9-0", false, 10),
+        "failed to kill `d-9-0` after 10s"
+    );
+}
+
+/// A job the registry holds but the store does not yet carry is the cheapest
+/// honest drive of the still-alive verdict: the wait resolves at once with
+/// `unknown`, nothing died, and the reply still reports the ask and the failed
+/// kill with the seconds it actually waited — here zero, not the grace floor.
+#[test]
+fn a_job_alive_when_the_wait_ends_verdicts_failed_to_kill() {
+    let _home = HomeSandbox::new();
+    let id = "d-782000-0";
+    let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let _guard = super::CancelGuard::register(id, std::sync::Arc::clone(&flag));
+
+    let result = call_monitor_args(MonitorArgs {
+        job_ids: Some(vec![id.to_string()]),
+        wait_secs: Some(0),
+        return_on: None,
+        cancel: Some(true),
+    });
+    let text = result
+        .content
+        .first()
+        .and_then(|c| c.as_text())
+        .map(|t| t.text.clone())
+        .expect("reply text");
+    assert!(
+        text.contains(&format!("asked `{id}` to stop")),
+        "the reply claims the ask: {text}"
     );
     assert!(
-        !note.contains("stopped"),
-        "nothing here has read the flag yet: {note}"
+        text.contains(&format!("failed to kill `{id}` after 0s")),
+        "and reports the job it did not see die, with the seconds it waited: {text}"
+    );
+}
+
+/// The waited figure is observed per job, not floored: a job that dies
+/// partway through the wait reports the seconds this call actually waited for
+/// it. Driven on `wait_for_done` directly because the reply's grace floor buys
+/// teardown for a real run — paying ten seconds here would buy the same
+/// observation the mid-wait death below already shows.
+#[test]
+fn a_death_observed_mid_wait_reports_its_own_elapsed() {
+    let _home = HomeSandbox::new();
+    let id = "d-783000-0";
+    seed_running(id, "work", now_ms());
+    let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let _guard = super::CancelGuard::register(id, std::sync::Arc::clone(&flag));
+    let finisher = {
+        let id = id.to_string();
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(1100));
+            jobs::write_done(
+                &id,
+                "work",
+                1,
+                None,
+                serde_json::json!({"profile": "work", "is_error": false, "result": "mid-wait"}),
+            )
+            .unwrap();
+        })
+    };
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .build()
+        .expect("runtime");
+    let mut sink = ProgressSink::none();
+    let mut watch = super::CancelWatch::ask(&[id.to_string()]);
+    let outcome = rt.block_on(wait_for_done(id, 10, &mut sink, Some(&mut watch)));
+    finisher.join().expect("finisher thread");
+    assert!(
+        matches!(outcome, WaitOutcome::Done(_)),
+        "the wait ends on the death it observed"
+    );
+    let note = watch.note();
+    let waited = note
+        .rsplit_once(" after ")
+        .and_then(|(_, figure)| figure.trim_end_matches('.').strip_suffix('s'))
+        .and_then(|n| n.parse::<u64>().ok())
+        .expect("the verdict carries its waited seconds");
+    assert!(
+        (1..=3).contains(&waited),
+        "the figure is the observed wait ({waited}s), not the floor (10s): {note}"
+    );
+}
+
+/// The batch cancel reply, end to end: one verdict per asked job in the order
+/// named — the dying lane `killed` with its own waited figure, the lane still
+/// alive `failed to kill` with its figure up to the wait's early end — the
+/// verdicts joined `"; "`, and the unheld hedge last. `return_on: "any"` ends
+/// the wait on the dying lane, which is also the accepted early-end shape.
+#[test]
+fn a_batch_cancel_renders_one_verdict_per_asked_job_and_the_hedge_last() {
+    let _home = HomeSandbox::new();
+    let dying = "d-784000-0";
+    let alive = "d-784001-0";
+    let unheld = "d-784002-0";
+    seed_running(dying, "work", now_ms());
+    seed_running(alive, "work", now_ms());
+    let mut held = Vec::new();
+    for id in [dying, alive] {
+        let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        held.push((
+            super::CancelGuard::register(id, std::sync::Arc::clone(&flag)),
+            flag,
+        ));
+    }
+    let finisher = {
+        let dying = dying.to_string();
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(1100));
+            jobs::write_done(
+                &dying,
+                "work",
+                1,
+                None,
+                serde_json::json!({"profile": "work", "is_error": false, "result": "half an answer"}),
+            )
+            .unwrap();
+        })
+    };
+
+    let result = call_monitor_args(MonitorArgs {
+        job_ids: Some(vec![
+            dying.to_string(),
+            alive.to_string(),
+            unheld.to_string(),
+        ]),
+        wait_secs: Some(0),
+        return_on: Some("any".to_string()),
+        cancel: Some(true),
+    });
+    finisher.join().expect("finisher thread");
+    assert!(
+        held.iter()
+            .all(|(_, f)| f.load(std::sync::atomic::Ordering::Relaxed)),
+        "both asked jobs' flags were set"
+    );
+    assert_eq!(result.content.len(), 1, "one block, note included");
+    let text = result
+        .content
+        .first()
+        .and_then(|c| c.as_text())
+        .map(|t| t.text.clone())
+        .expect("reply text");
+    let (note, _) = text
+        .split_once('\n')
+        .expect("the cancel note leads the reply");
+    let clauses: Vec<&str> = note.split(". ").collect();
+    assert_eq!(
+        clauses.len(),
+        3,
+        "ask, verdicts, hedge — nothing else: {note}"
+    );
+    assert_eq!(
+        clauses[0],
+        "asked `d-784000-0`, `d-784001-0` to stop; each hands back whatever it had produced",
+        "the ask clause names both held jobs in the order given: {note}"
+    );
+    let figures: Vec<u64> = clauses[1]
+        .split("; ")
+        .map(|verdict| {
+            verdict
+                .rsplit(" after ")
+                .next()
+                .and_then(|figure| figure.strip_suffix('s'))
+                .and_then(|n| n.parse().ok())
+                .unwrap_or_else(|| panic!("no waited figure in {verdict:?}"))
+        })
+        .collect();
+    assert_eq!(
+        clauses[1],
+        format!(
+            "killed `d-784000-0` after {}s; failed to kill `d-784001-0` after {}s",
+            figures[0], figures[1]
+        ),
+        "one verdict per asked job, in the order named: {note}"
+    );
+    for figure in &figures {
+        assert!(
+            (1..=3).contains(figure),
+            "each figure is its job's observed wait ({figure}s), never the floor: {note}"
+        );
+    }
+    assert_eq!(
+        clauses[2],
+        "no running delegate here for `d-784002-0`: it may already be finishing, or it may have \
+         been started by an earlier server process.",
+        "the unheld hedge closes the note: {note}"
+    );
+    assert!(
+        text.contains("half an answer"),
+        "the dying lane's result rides the same reply: {text}"
+    );
+    assert!(
+        text.contains("`d-784001-0` running") && text.contains("`d-784002-0` unknown"),
+        "the still-alive lane reports running and the unheld one unknown: {text}"
+    );
+}
+
+/// A Done file far older than anything this call could have caused renders no
+/// verdict and does not panic: where the reconstructed age is representable
+/// it fails the `asked_at` gate, and where the monotonic clock cannot
+/// represent it at all the stamp stays undated — the same rule either way.
+/// That second arm is exactly the pre-reboot Done file the retention window
+/// can still collect, which is where an unchecked subtraction would take the
+/// handler down on a clock that cannot go below its origin.
+#[test]
+fn a_death_far_older_than_the_call_renders_no_verdict() {
+    let _home = HomeSandbox::new();
+    let id = "d-785000-0";
+    jobs::write_done(
+        id,
+        "work",
+        1,
+        None,
+        serde_json::json!({"profile": "work", "is_error": false, "result": "ancient"}),
+    )
+    .unwrap();
+    let path = jobs::jobs_dir().unwrap().join(format!("{id}.json"));
+    crate::testutil::set_mtime(&path, std::time::SystemTime::UNIX_EPOCH);
+    let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let _guard = super::CancelGuard::register(id, std::sync::Arc::clone(&flag));
+    let mut watch = super::CancelWatch::ask(&[id.to_string()]);
+    watch.saw_done(id);
+    assert_eq!(
+        watch.note(),
+        format!("asked `{id}` to stop; each hands back whatever it had produced."),
+        "a death this old earns no verdict, on either arm of the dating"
     );
 }
 

@@ -178,7 +178,7 @@ If the messages limiter is blocking Claude Code, a live 5h window will not clear
   status.json              # the daemon's published snapshot (see Daemon)
   clauth.log, daemon.log   # event lines from the TUI and the daemon
   completions/             # generated shell completion scripts
-  jobs/<id>.json           # backgrounded delegate jobs, GC'd after an hour
+  jobs/<id>.json           # backgrounded delegate jobs, GC'd after a day
   live_sessions/<sid>.json # one row per live `clauth start` session
   profiles/
     work/

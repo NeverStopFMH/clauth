@@ -90,15 +90,18 @@ const RECORDS_DIR: &str = "conversations";
 /// the box reap a live conversation's record — after which its next real account
 /// move is absorbed as a fresh baseline and never announced.
 ///
-/// It is measured from the record's MTIME, so the quantity it bounds is time
-/// since this scope last WROTE, not time since the transcript went missing. A
-/// conversation still opening the gate keeps rewriting the record and so never
-/// elapses it, which is the intent; the two only coincide for a scope that has
-/// gone quiet.
+/// It is measured from the record's MTIME, and every fire moves that mtime
+/// ([`touch_record`]) — except one whose record write failed, which logs its
+/// own suppression — so the quantity it bounds is time since this scope last
+/// FIRED, not time since the transcript went missing. A conversation still
+/// firing never elapses it, whatever its transcript's state, which is the
+/// intent; the two only coincide for a scope that has gone quiet.
 const MISSING_TRANSCRIPT_GRACE: Duration = Duration::from_secs(60 * 60);
 
-/// How long a record that never carried a `transcript_path` survives. Nothing
-/// can test such a record for liveness, so it ages out instead.
+/// How long a record that never carried a `transcript_path` survives. There is
+/// no transcript to test, so the fire-mtime ([`touch_record`]'s) is the only
+/// liveness signal such a record has — this is how long it may sit silent
+/// before it is reaped.
 const ORPHAN_RECORD_MAX_AGE: Duration = Duration::from_secs(30 * 24 * 60 * 60);
 
 /// How long a resolution may be reused before it is retaken regardless of the
@@ -212,7 +215,8 @@ struct NoteRecord {
     /// Never `Some(None)` in effect: an unattributed read is not cached at all.
     #[serde(default)]
     resolved: Option<String>,
-    /// When `resolved` was taken, for [`RESOLUTION_TTL`].
+    /// The instant the credential read behind `resolved` was taken, for
+    /// [`RESOLUTION_TTL`].
     #[serde(default)]
     resolved_at: Option<SystemTime>,
     /// This conversation's transcript, for the sweep.
@@ -330,10 +334,37 @@ fn watch_now() -> Watch {
     }
 }
 
+/// One account reading plus the instant its credential read was taken — the
+/// pair [`note_for`]'s staleness guard compares.
+struct Reading {
+    account: Option<String>,
+    taken_at: SystemTime,
+}
+
 /// The account a loaded config's credentials resolve to, through the same tier
-/// walk `clauth which` uses.
-fn resolve_account(config: &crate::profile::AppConfig) -> Option<String> {
-    crate::which::resolve_active(config).map(|(name, _)| name)
+/// walk `clauth which` uses, stamped with the instant of the credential read.
+/// The stamp is taken IMMEDIATELY before the resolve — the credential read is
+/// the first thing `resolve_active` does.
+///
+/// The stamp is the observation order two racing fires compare in
+/// [`note_for`], and it is taken here, at the read, rather than at the fire's
+/// start, because "when the resolve started" is only a PROXY for "when it
+/// looked": two fires starting together can read opposite sides of a switch
+/// landing inside their resolve windows, and with a start-of-resolve stamp the
+/// staler reading can carry the later stamp, pass the guard, and announce the
+/// reversal. Anchoring the stamp at the read makes a staler reading carry the
+/// earlier stamp by construction.
+///
+/// NOT a total guarantee. A switch landing inside the remaining window —
+/// between the stamp and the credential read, or between that read and a later
+/// tier's reads (the CLA-SPLIT sidecars) — still inverts, and the config half
+/// of the answer was read earlier, by `load_config`. The window is the read's
+/// own duration, against the whole resolve start the stamp used to be taken
+/// at, and an inversion still self-corrects at [`RESOLUTION_TTL`].
+fn resolve_account(config: &crate::profile::AppConfig) -> Reading {
+    let taken_at = SystemTime::now();
+    let account = crate::which::resolve_active(config).map(|(name, _)| name);
+    Reading { account, taken_at }
 }
 
 pub(crate) fn run() -> Result<()> {
@@ -360,7 +391,7 @@ pub(crate) fn run() -> Result<()> {
         config
             .get_or_init(|| crate::profile::load_config().ok())
             .as_ref()
-            .and_then(resolve_account)
+            .map(resolve_account)
     };
     let mut notes: Vec<String> = Vec::new();
     if let Some(note) = note_for(&payload, &watch_now(), &resolve) {
@@ -531,11 +562,11 @@ pub(crate) fn told_account(session_id: &str) -> Option<String> {
 /// Decide what this fire says and store what it learned.
 ///
 /// `resolve` is taken by reference so a test can count how often the gate lets it
-/// through; nothing else varies it.
+/// through and control the reading's stamp; nothing else varies it.
 fn note_for(
     payload: &Payload,
     watch: &Watch,
-    resolve: &dyn Fn() -> Option<String>,
+    resolve: &dyn Fn() -> Option<Reading>,
 ) -> Option<String> {
     let path = record_path(&payload.session_id, payload.agent_id.as_deref()).ok()?;
 
@@ -545,27 +576,10 @@ fn note_for(
     let peek = load_record(&path);
     let fresh = match peek.as_ref().filter(|p| p.cache_holds(watch)) {
         Some(_) => None,
-        // Stamped BEFORE the resolve, never after it and never at write time.
-        // Both later instants overstate the observation: the lock wait sits
-        // after the resolve, and the resolve itself is milliseconds during
-        // which a peer can observe and land.
-        //
-        // NOT a total guarantee, and do not read it as one. `taken_at` means
-        // "when I started looking" and is only a PROXY for "when I looked". It
-        // is right for the shape that matters — a fire that started earlier and
-        // finished later now defers — but inverts when two fires start together
-        // and read opposite sides of a switch landing inside their resolve
-        // windows, where the staler reading can carry the later stamp and still
-        // announce the reversal. Measured only as a MECHANISM, since the rate a
-        // harness reports for it tracks its own spawn order rather than
-        // production. The exposure is the resolve window (~1.5-3 ms) against the
-        // up-to-2 s lock wait this replaced, and it self-corrects at the TTL.
-        // Closing it means stamping inside `resolve_account` around the
-        // credential read, which is more invasive than the residual deserves.
-        _ => {
-            let taken_at = SystemTime::now();
-            Some((resolve(), taken_at))
-        }
+        // A fire that opens the gate resolves now; the reading carries its own
+        // stamp, taken at the credential read — [`resolve_account`] owns why it
+        // lives there and what it does not guarantee.
+        _ => resolve(),
     };
 
     // The account a switch would name as the new one — the peek's cached
@@ -582,7 +596,7 @@ fn note_for(
     // figure.
     let candidate = match &fresh {
         None => peek.as_ref().and_then(|p| p.resolved.as_deref()),
-        Some((answer, _)) => answer.as_deref(),
+        Some(reading) => reading.account.as_deref(),
     };
     let switched_headroom = candidate
         .filter(|account| peek.as_ref().and_then(|p| p.told.as_deref()) != Some(*account))
@@ -620,40 +634,71 @@ fn note_for(
         // above does. Overwriting instead let a slow fire announce the reversal
         // (`switched from cld to kerry` for a switch that never happened) and
         // cache its stale answer for the whole TTL.
-        Some((_, taken_at)) if record.holds_a_newer_observation_than(taken_at) => {
+        Some(Reading { taken_at, .. }) if record.holds_a_newer_observation_than(taken_at) => {
             record.resolved.clone()
         }
-        Some((answer, taken_at)) => {
+        Some(Reading { account, taken_at }) => {
             // Only an ATTRIBUTED answer is cached. See `NoteRecord::watch`.
-            if answer.is_some() {
+            if account.is_some() {
                 record.watch = Some(watch.clone());
-                record.resolved = answer.clone();
+                record.resolved = account.clone();
                 record.resolved_at = Some(taken_at);
             }
-            answer
+            account
         }
     };
     let used = switched_headroom
         .filter(|h| current.as_deref() == Some(h.account.as_str()))
         .map(|h| h.used);
     let note = decide(payload, &mut record, current.as_deref(), used);
-    if stored.as_ref() != Some(&record) && store_record(&path, &record).is_err() {
-        // The record IS the suppression mechanism, so a note that cannot be
-        // remembered is re-emitted on every tool call for the life of the
-        // conversation. Keyed on the write failing at all rather than on any one
-        // cause: a full disk and a read-only tree reach this the same way.
-        // The log FILE, not `logline!`. This runs once per tool call, so a
-        // persistent failure through the routed sink lands on a hook's
-        // (non-terminal) stderr once per fire — the same unbounded flood this
-        // suppression exists to prevent, moved onto the channel Claude Code
-        // shows the user. The file is size-rotated; stderr is not.
-        crate::logline::to_logfile(format_args!(
-            "hook-note: cannot persist {}; staying silent",
-            path.display()
-        ));
-        return None;
+    if stored.as_ref() != Some(&record) {
+        if store_record(&path, &record).is_err() {
+            // The record IS the suppression mechanism, so a note that cannot be
+            // remembered is re-emitted on every tool call for the life of the
+            // conversation. Keyed on the write failing at all rather than on any one
+            // cause: a full disk and a read-only tree reach this the same way.
+            // The log FILE, not `logline!`. This runs once per tool call, so a
+            // persistent failure through the routed sink lands on a hook's
+            // (non-terminal) stderr once per fire — the same unbounded flood this
+            // suppression exists to prevent, moved onto the channel Claude Code
+            // shows the user. The file is size-rotated; stderr is not.
+            crate::logline::to_logfile(format_args!(
+                "hook-note: cannot persist {}; staying silent",
+                path.display()
+            ));
+            return None;
+        }
+    } else {
+        // An unchanged record still means a LIVE fire: the sweep's grace reads
+        // this file's mtime, so every fire must move it or a conversation
+        // firing past the grace loses its baseline to the reap.
+        touch_record(&path);
     }
     note
+}
+
+/// Move a record's mtime to now without rewriting its bytes: the sweep's
+/// [`MISSING_TRANSCRIPT_GRACE`] measures this mtime, and it must mean "last
+/// FIRE". `note_for` rewrites only a record that changed, so an unchanged
+/// record's mtime would otherwise age mid-conversation and the sweep would
+/// reap a live scope's baseline — the defect this exists to close (measured:
+/// 0/40 announced against a reap-eligible record, 40/40 against a fresh one;
+/// see the sweep's doc). The unchanged record is the common fire, so the
+/// cheap open-and-stamp is the per-fire price the predicate needs. A failure
+/// degrades to the pre-touch behavior and is logged, because silent it would
+/// leave the sweep reaping live records with no trace of why.
+fn touch_record(path: &Path) {
+    if std::fs::File::options()
+        .write(true)
+        .open(path)
+        .and_then(|file| file.set_modified(SystemTime::now()))
+        .is_err()
+    {
+        crate::logline::to_logfile(format_args!(
+            "hook-note: cannot stamp the last fire on {}; the sweep may reap a live record",
+            path.display()
+        ));
+    }
 }
 
 /// An exclusive hold over the records dir for one read-modify-write.
@@ -1092,7 +1137,10 @@ fn nudge_figures(read: &NudgeRead) -> Option<NudgeFigures> {
     } else {
         // The copy's `{when}` — the cap instant at the measured rate. A figure,
         // never a gate: the arm above has already pinned it at-or-inside the
-        // window, so it cannot overshoot `resets_at`. The one equality case — `secs_to_cap == secs_left`, a measure-zero f64 boundary — renders `when == reset`: the copy then says "reaches its cap" at the reset instant, not before it.
+        // window, so it cannot overshoot `resets_at`. The one equality case —
+        // `secs_to_cap` equalling the window remainder, a measure-zero f64
+        // boundary — renders `when == reset`: the copy then says "reaches its
+        // cap" at the reset instant, not before it.
         let secs_to_cap = ((100.0 - h.used) / rate * 3600.0) as i64;
         h.now.saturating_add(secs_to_cap)
     };
@@ -1274,14 +1322,17 @@ pub(crate) fn gc_conversation_records() {
     // read-modify-write drops that write on the floor.
     //
     // What the lock does NOT cover, measured rather than reasoned: the reap
-    // costs a live scope its baseline with ZERO concurrency involved
+    // can cost a live scope its baseline with ZERO concurrency involved
     // (baseline, move, sweep, fire — the fire finds no record and rebaselines,
     // swallowing that one account change). 40 concurrent trials against a
-    // fresh record announced 40/40; against a reap-eligible one, 0/40. So the
-    // loss is caused by the reap predicate and not by any interleave, and the
-    // deletion is self-undoing — the fire recreates the record immediately. The
-    // real guard belongs on the predicate; this lock was never
-    // going to cover it.
+    // fresh record announced 40/40; against a reap-eligible one, 0/40. The
+    // loss is caused by the reap predicate's INPUT, not by any interleave, so
+    // this lock was never going to cover it. The guard lives in the writer:
+    // every fire moves its record's mtime ([`touch_record`]), so `age` below
+    // means time since this scope last FIRED, and a conversation still firing
+    // can never elapse the grace, whatever its transcript's state. The
+    // deletion stays self-undoing — the fire recreates the record immediately
+    // — which is what bounds a fire that neither wrote nor touched.
     let _hold = ScopeLock::acquire();
     let Ok(entries) = std::fs::read_dir(&dir) else {
         return;

@@ -51,17 +51,26 @@ fn unwritable_watch() -> Watch {
     }
 }
 
-fn kerry() -> Option<String> {
-    Some("kerry".to_string())
+/// An attributed-or-not account reading taken now — the shape every resolve
+/// returns, the stamp travelling with the answer.
+fn reading(account: Option<&str>) -> Option<Reading> {
+    Some(Reading {
+        account: account.map(str::to_string),
+        taken_at: SystemTime::now(),
+    })
 }
 
-fn cld() -> Option<String> {
-    Some("cld".to_string())
+fn kerry() -> Option<Reading> {
+    reading(Some("kerry"))
+}
+
+fn cld() -> Option<Reading> {
+    reading(Some("cld"))
 }
 
 /// clauth cannot attribute the loaded credentials.
-fn unknown() -> Option<String> {
-    None
+fn unknown() -> Option<Reading> {
+    reading(None)
 }
 
 const SWITCHED: &str =
@@ -125,10 +134,10 @@ fn the_envelope_echoes_the_event_that_produced_it() {
     }
 }
 
-/// `run()`'s wiring: whatever earned the turn — one note or two — leaves the
-/// process as ONE envelope, never two JSON documents on stdout (two documents
-/// would parse as none). The join is what puts both notes into one
-/// `additionalContext`, and the rendered payload is one parseable document.
+/// The join produces one envelope: whatever earned the turn — one note or two
+/// — joins into ONE `additionalContext`, so the rendered payload is one
+/// parseable JSON document. Pinned here because the join is assertable
+/// without stdout; `run()`'s single-`outln!` property is unpinned.
 #[test]
 fn two_earned_notes_join_into_one_envelope() {
     let joined = joined_envelope(
@@ -175,14 +184,14 @@ fn a_resume_under_another_account_names_the_earlier_turns() {
     note_for(
         &payload("UserPromptSubmit", "conv-2"),
         &watch(1, 0),
-        &|| Some("z.ai".to_string()),
+        &|| reading(Some("z.ai")),
     );
 
     let mut resumed = payload("SessionStart", "conv-2");
     resumed.source = Some("resume".to_string());
 
     assert_eq!(
-        note_for(&resumed, &watch(2, 0), &|| Some("DS4".to_string())).as_deref(),
+        note_for(&resumed, &watch(2, 0), &|| reading(Some("DS4"))).as_deref(),
         Some("clauth note: session resumed under `DS4`; earlier turns ran under `z.ai`."),
     );
 }
@@ -195,7 +204,7 @@ fn the_record_is_left_on_disk_for_the_next_process() {
     note_for(
         &payload("UserPromptSubmit", "conv-3"),
         &watch(1, 0),
-        &|| Some("z.ai".to_string()),
+        &|| reading(Some("z.ai")),
     );
 
     let stored =
@@ -655,13 +664,13 @@ fn a_resume_never_carries_the_headroom_clause() {
     note_for(
         &payload("UserPromptSubmit", "conv-resume-headroom"),
         &watch(1, 0),
-        &|| Some("z.ai".to_string()),
+        &|| reading(Some("z.ai")),
     );
 
     let mut resumed = payload("SessionStart", "conv-resume-headroom");
     resumed.source = Some("resume".to_string());
     assert_eq!(
-        note_for(&resumed, &watch(2, 0), &|| Some("DS4".to_string())).as_deref(),
+        note_for(&resumed, &watch(2, 0), &|| reading(Some("DS4"))).as_deref(),
         Some("clauth note: session resumed under `DS4`; earlier turns ran under `z.ai`."),
     );
 }
@@ -691,6 +700,46 @@ fn a_transcript_that_has_not_appeared_yet_keeps_its_record() {
     assert!(
         !path.exists(),
         "and is reaped once it has aged past the grace"
+    );
+}
+
+/// A scope still firing keeps its record across the sweep whatever its
+/// transcript's state: every fire moves the record's mtime (the touch), so
+/// the grace measures silence, not the transcript. The sequential shape that
+/// used to reap a live scope's baseline — age, sweep, fire — must now survive
+/// the sweep because the fire landed first, and the same record must still be
+/// reaped once the fires stop.
+#[test]
+fn a_still_firing_scope_survives_the_sweep_with_its_transcript_gone() {
+    let home = HomeSandbox::new();
+    let mut fire = payload("UserPromptSubmit", "conv-firing");
+    fire.transcript = Some(home.home().join("absent.jsonl"));
+    note_for(&fire, &watch(1, 0), &kerry);
+
+    // A fire with nothing to say — same watch, same account — changes no
+    // record bytes, so only the touch moves the mtime.
+    crate::testutil::set_mtime(
+        &record_path("conv-firing", None).expect("path"),
+        SystemTime::now() - MISSING_TRANSCRIPT_GRACE - std::time::Duration::from_secs(60),
+    );
+    note_for(&fire, &watch(1, 0), &kerry);
+
+    gc_conversation_records();
+    assert!(
+        record_path("conv-firing", None).expect("path").exists(),
+        "a scope still firing keeps its record across the sweep, transcript absent or not",
+    );
+
+    // The same record, once the fires stop: age it again with no fire in
+    // between, and it is reaped.
+    crate::testutil::set_mtime(
+        &record_path("conv-firing", None).expect("path"),
+        SystemTime::now() - MISSING_TRANSCRIPT_GRACE - std::time::Duration::from_secs(60),
+    );
+    gc_conversation_records();
+    assert!(
+        !record_path("conv-firing", None).expect("path").exists(),
+        "a scope that has genuinely gone quiet is still reaped",
     );
 }
 
@@ -903,9 +952,10 @@ fn watch_now_sees_the_credential_store_move() {
     );
 }
 
-/// The no-transcript arm of the sweep. Nothing can test such a record for
-/// liveness, so it ages out — and no fixture reached this branch at all, which
-/// let both a disabled reap and an inverted comparison survive the whole suite.
+/// The no-transcript arm of the sweep. The fire-mtime is the only liveness
+/// signal such a record has, so it ages out once the fires stop — and no
+/// fixture reached this branch at all, which let both a disabled reap and an
+/// inverted comparison survive the whole suite.
 #[test]
 fn a_record_that_never_carried_a_transcript_ages_out() {
     let _home = HomeSandbox::new();
@@ -1017,13 +1067,19 @@ fn a_fire_carrying_the_older_observation_defers_to_the_record() {
     // strictly between this fire's `taken_at` and now — a hand-written FUTURE
     // stamp would instead exercise the clock-step case the guard now refuses.
     let stale_observation_racing_a_peer = || {
+        // The stamp travels with the reading, so this fire's own reading is
+        // stamped BEFORE the peer's write lands — the older observation it is.
+        let taken_at = SystemTime::now();
         std::thread::sleep(Duration::from_millis(5));
         let path = record_path("conv-stale", None).expect("path");
         let mut peer = load_record(&path).expect("a record");
         peer.resolved = Some("cld".to_string());
         peer.resolved_at = Some(SystemTime::now());
         store_record(&path, &peer).expect("the peer lands first");
-        kerry() // this fire's own, older reading
+        Some(Reading {
+            account: Some("kerry".to_string()),
+            taken_at,
+        }) // this fire's own, older reading
     };
 
     assert_eq!(
@@ -1377,6 +1433,58 @@ fn a_subagent_or_non_task_fire_is_never_nudge_eligible() {
     assert!(
         read_nudge(&payload("PostToolUse", "conv-scope"), None).is_none(),
         "a fire carrying no tool name cannot be a Task fire",
+    );
+}
+
+/// The `shared = Some(_)` arm: `run()` hands the fire's one `load_config` to
+/// the reader, and the arm must read THAT config, never re-load the disk one.
+/// Here the two diverge — the disk config's active is `b`, the shared
+/// config's is `a` — and only `a` carries a cached window, so the arm answers
+/// `a`'s window or nothing.
+#[test]
+fn the_shared_config_arm_reads_the_shared_config_not_the_disk() {
+    let _home = HomeSandbox::new();
+    let mut config = crate::profile::AppConfig {
+        state: crate::profile::AppState::default(),
+        profiles: Vec::new(),
+    };
+    crate::actions::create_blank_profile(&mut config, "a".to_string(), None, None, None)
+        .expect("create a");
+    crate::actions::create_blank_profile(&mut config, "b".to_string(), None, None, None)
+        .expect("create b");
+    config.state.active_profile = Some(ProfileName::from("b"));
+    crate::profile::save_app_state(&config.state).expect("save state");
+
+    let now_secs = crate::usage::now_epoch_secs();
+    write_profile_cache(
+        &ProfileName::from("a"),
+        USAGE_CACHE_FILE,
+        &crate::usage::UsageInfo {
+            five_hour: Some(crate::usage::UsageWindow {
+                utilization: 97.0,
+                resets_at: Some(crate::usage::epoch_secs_to_iso(now_secs + 3600)),
+            }),
+            ..Default::default()
+        },
+    );
+
+    // The shared config diverges from the disk state without ever being saved.
+    let mut shared = crate::profile::load_config().expect("load");
+    shared.state.active_profile = Some(ProfileName::from("a"));
+
+    let fire = task_fire("conv-shared");
+    let read = read_nudge(&fire, Some(&shared)).expect("eligible");
+    assert_eq!(
+        read.headroom.map(|h| h.used),
+        Some(97.0),
+        "the shared config's active `a` carries the cached window",
+    );
+
+    let disk_read = read_nudge(&fire, None).expect("eligible");
+    assert!(
+        disk_read.headroom.is_none(),
+        "the disk config's active `b` carries no window, so a re-load would \
+         have answered no headroom",
     );
 }
 

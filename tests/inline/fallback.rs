@@ -2957,9 +2957,8 @@ fn next_target_burn_aware_none_rate_falls_back_to_static_threshold() {
 }
 
 /// Writes `entries` as `usage_history.jsonl` lines for `name` — the on-disk
-/// shape `crate::profile::load_usage_history` parses. Takes the sandbox so the
-/// write can only land in a sandboxed home, never the real one.
-fn write_history(_home: &crate::testutil::HomeSandbox, name: &str, entries: &[(u64, UsageInfo)]) {
+/// shape `crate::profile::load_usage_history` parses.
+fn write_history(name: &str, entries: &[(u64, UsageInfo)]) {
     let path = crate::profile::profile_history_path(&crate::profile::ProfileName::from(name))
         .expect("history path");
     std::fs::create_dir_all(path.parent().expect("parent dir")).expect("mkdir");
@@ -2991,7 +2990,6 @@ fn burn_aware_never_holds_the_active_where_static_switches_on_both_walks() {
     let now = crate::usage::now_ms();
     // Perfectly linear climb, 36 → 96 over 6 minutes = 600 %/h.
     write_history(
-        &_home,
         "a",
         &[
             (

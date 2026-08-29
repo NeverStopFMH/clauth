@@ -296,15 +296,18 @@ fn status_tab_incident_stamps_render_local_wall_clock() {
         "no stamp carries a utc marker after the local conversion:\n{out}"
     );
 
-    // Where the runner's zone is off UTC, the same instants' UTC renderings
-    // must be ABSENT: a stamp that regressed to UTC digits in the 19-char
-    // shape would still satisfy a contains() on a UTC box. On a UTC runner
-    // local equals UTC, so there is no second spelling to ban.
-    if chrono::Local::now().offset().local_minus_utc() != 0 {
-        let utc_started = chrono::DateTime::from_timestamp((started_ms / 1000) as i64, 0)
-            .unwrap()
-            .format("%Y-%m-%d %H:%M:%S")
-            .to_string();
+    // Where the zone spells the fixture instant differently from UTC, the
+    // UTC digits must be ABSENT: a stamp that regressed to UTC in the 19-char
+    // shape would still satisfy a contains() on a UTC box. Compared
+    // spelling-on-spelling, never via a run-instant offset read: a DST zone
+    // whose offset differs between the fixture instant and the run instant
+    // would fire the guard over two identical spellings. On a UTC runner the
+    // two spellings coincide, so there is no second spelling to ban.
+    let utc_started = chrono::DateTime::from_timestamp((started_ms / 1000) as i64, 0)
+        .unwrap()
+        .format("%Y-%m-%d %H:%M:%S")
+        .to_string();
+    if started != utc_started {
         assert!(
             !out.contains(&utc_started),
             "the started stamp renders UTC digits, not local wall clock:\n{out}"

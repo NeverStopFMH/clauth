@@ -427,13 +427,20 @@ fn session_row(s: &SessionInfo, tokens: bool, now: SystemTime) -> String {
     // dwarfs any OS's); the dash is the table's no-data glyph, never a UTC
     // fallback — a bare stamp reads as local.
     let updated = crate::format::local_stamp(secs).unwrap_or_else(|| "-".to_string());
-    let age = crate::usage::humanize_duration(
-        now.duration_since(s.updated)
-            .map(|d| d.as_secs() as i64)
-            .unwrap_or(0),
-    );
+    let age_secs = now
+        .duration_since(s.updated)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    // `humanize_duration` spells ≤0 `now`, so the ` ago` pairing must skip
+    // the non-positive ages: a sub-second-fresh file or a future mtime would
+    // render `now ago`.
+    let age = if age_secs <= 0 {
+        "now".to_string()
+    } else {
+        format!("{} ago", crate::usage::humanize_duration(age_secs))
+    };
     format!(
-        "  {id:<8}  {profile:<12}  {updated} · {age} ago{usage}  {preview}",
+        "  {id:<8}  {profile:<12}  {updated} · {age}{usage}  {preview}",
         id = short_id(&s.id),
         profile = s.last_ran_profile.as_deref().unwrap_or("-"),
         preview = preview_pair(s),

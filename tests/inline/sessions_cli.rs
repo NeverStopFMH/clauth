@@ -265,9 +265,10 @@ fn the_table_stamp_renders_local_wall_clock_with_a_relative_age() {
         "no machine offset marker survives in the human row: {row}"
     );
     // Compared spelling-on-spelling, never via a run-instant offset read: a
-    // DST zone (Atlantic/Azores) reads +00 at the fixture instant while the
-    // RUN instant is -01, and that read would fire the guard over two
-    // identical spellings.
+    // DST zone (Atlantic/Azores) reads +00 at the fixture instant, and the
+    // run instant reads -01 only inside the winter standard-time window
+    // (each year, roughly the last Sunday of October to the last Sunday of
+    // March); that read would fire the guard over two identical spellings.
     let utc = chrono::DateTime::from_timestamp(1_782_000_000, 0)
         .unwrap()
         .format("%Y-%m-%d %H:%M:%S")
@@ -278,6 +279,49 @@ fn the_table_stamp_renders_local_wall_clock_with_a_relative_age() {
             "the stamp renders UTC digits, not local wall clock: {row}"
         );
     }
+}
+
+/// The age half of the pairing: a zero or negative age renders `· now`, never
+/// `now ago` — `humanize_duration` spells ≤0 `now`, so the generic ` ago`
+/// pairing would stutter over a sub-second-fresh file or a future mtime, both
+/// routine rows. A positive age keeps the full `· 3h 12m ago` pairing.
+#[test]
+fn the_stamp_age_renders_now_for_non_positive_ages_and_ago_for_positive() {
+    let sb = HomeSandbox::new();
+    let a = sb.home().join(".claude/projects/-w-a/aaaa-1111.jsonl");
+    write_jsonl(&a, &[user_line("aaaa-1111", "/ws/a", "hello")]);
+    let updated = SystemTime::UNIX_EPOCH + Duration::from_secs(1_782_000_000);
+    set_mtime(&a, updated);
+
+    let groups = build_listing(false);
+    let session = &groups[0].sessions[0];
+
+    // Zero age: `now` sits exactly on the mtime, the same whole-second a
+    // sub-second-fresh file truncates to.
+    let zero = session_row(session, false, updated);
+    assert!(zero.contains("· now"), "zero age renders `now`: {zero}");
+    assert!(!zero.contains("now ago"), "zero age never stutters: {zero}");
+
+    // Negative age: a future mtime (the clock behind the file) is the same
+    // ≤0 branch, not `now ago`.
+    let behind = updated - Duration::from_secs(60);
+    let future = session_row(session, false, behind);
+    assert!(
+        future.contains("· now"),
+        "a future mtime renders `now`: {future}"
+    );
+    assert!(
+        !future.contains("now ago"),
+        "a future mtime never stutters: {future}"
+    );
+
+    // Positive age: the full pairing survives the ≤0 branch.
+    let ahead = updated + Duration::from_secs(11_520);
+    let positive = session_row(session, false, ahead);
+    assert!(
+        positive.contains("· 3h 12m ago"),
+        "a positive age keeps the full pairing: {positive}"
+    );
 }
 
 /// The human row and the JSON `updated` field disagree on shape BY DESIGN

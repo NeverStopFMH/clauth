@@ -96,7 +96,11 @@ fn each_stored_shape_reads_as_its_own_phase() {
     write_running(&live_spec("d-blocking-0", NOW - 30_000)).unwrap();
     seed_done("d-fin-0", NOW - 600_000, NOW - 120_000);
     // Silent past the corpse window, which is what makes a record an orphan.
-    write_running(&spec("d-dead-0", NOW - (3600 + 600) * 1000 - 60_000)).unwrap();
+    write_running(&spec(
+        "d-dead-0",
+        NOW - crate::mcp::jobs::RUNNING_TTL_MS - 60_000,
+    ))
+    .unwrap();
 
     let rows = rows(NOW);
 

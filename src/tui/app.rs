@@ -1311,13 +1311,14 @@ pub(crate) struct PluginState {
     /// subscribe to and no event to wait for. Read-only: the TUI never writes
     /// this store, and never sweeps it.
     ///
-    /// The cost is one readdir plus a parse per file. `jobs::MAX_RETAINED` does
-    /// NOT bound that from here: the cap is applied only by the startup sweep
-    /// inside a `clauth mcp` process, which the TUI neither runs nor depends on
-    /// having run, and the count spans both record spellings. What the directory
-    /// really holds is whatever the last such startup trimmed it to, plus every
-    /// job written since. Measured at the cap against the 1 s tick, 256 records
-    /// over ~5 MB of envelopes, best of 5 warm: **~3 ms release, ~20 ms debug**.
+    /// The cost is one readdir plus a parse per file. No count cap bounds that
+    /// from here: retention is the two TTLs (`jobs::DONE_TTL_MS` /
+    /// `jobs::RUNNING_TTL_MS`), applied only by the startup sweep inside a
+    /// `clauth mcp` process, which the TUI neither runs nor depends on having
+    /// run, and the count spans both record spellings. What the directory
+    /// really holds is whatever the last such startup expired, plus every job
+    /// written since. Measured against the 1 s tick with 256 records over
+    /// ~5 MB of envelopes, best of 5 warm: **~3 ms release, ~20 ms debug**.
     /// Written as a bound rather than to two figures on purpose — two
     /// independent runs on this box landed 2.2 ms and 3.2 ms release, neither on
     /// a quiet machine, so a point figure would read as stale to the next person

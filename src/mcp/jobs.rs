@@ -40,13 +40,13 @@ use serde::{Deserialize, Serialize};
 
 use crate::profile::clauth_dir;
 
-/// Retain a `done` file this long AFTER IT FINISHES before GC reaps it; long
-/// enough that a slow poller can still collect a result the auto-delivery hook
-/// already delivered. Measured from `done_at`, not from the mint: a delegate
-/// that ran for hours is already hours old the instant it finalizes, so a
-/// mint-anchored TTL would expire every long run's salvage envelope before
-/// anyone could read it.
-pub(super) const DONE_TTL_MS: u64 = 60 * 60 * 1000; // 1h
+/// Retain a `done` file this long AFTER IT FINISHES before GC reaps it: a day,
+/// so a result survives a reboot and the overnight gap between sessions — the
+/// slow poller the auto-delivery hook already served is the same one returning
+/// the next morning. Measured from `done_at`, not from the mint: a
+/// mint-anchored TTL would expire every long run's salvage envelope the instant
+/// it finalizes, since the run's age is already whatever the run cost.
+pub(super) const DONE_TTL_MS: u64 = 24 * 60 * 60 * 1000; // 24h
 /// A `running` file SILENT this long is orphaned (its server died mid-job); reap
 /// it.
 ///
@@ -55,45 +55,50 @@ pub(super) const DONE_TTL_MS: u64 = 60 * 60 * 1000; // 1h
 /// have had its file deleted under it, and answered `unknown job_id` while its
 /// child kept spending the account.
 ///
+/// The window is a day plus a 600 s grace, and the day is the point rather than
+/// a deadline derivation: a record whose server died — crash, kill, reboot —
+/// stays resolvable for a day, so the `session_id` it carries can still be
+/// collected and resumed the next morning. Nothing a healthy run does comes
+/// near it: a streaming run is killed by its own idle guard (≤ 3600 s,
+/// `mcp`'s `MAX_RUN_TIMEOUT_SECS`) once silent, and a pinned-`--output-format`
+/// one by its wall clock (also ≤ 3600 s), so once a run has spawned, only a
+/// dead server keeps its record silent for anything close to a day. The 600 s
+/// grace, carried over from the old 3600+600 s window, covers the heartbeat
+/// throttle, the kill and the teardown before `write_done` lands.
+///
 /// "Silent" is measured from the record's own mint (`recorded_at`), not the
 /// run's birth. A blocking delegate handed off mid-flight keeps a `started_at`
 /// from arbitrarily long before its file existed, so anchoring on that would
-/// mint a two-hour run already expired — and a pinned-format one, which never
+/// mint a long run already expired — and a pinned-format one, which never
 /// heartbeats at all, would be reaped by every reader for the rest of its life.
 ///
-/// The two background shapes reach 3600 + 600 s by different routes, and only
-/// the first one heartbeats:
+/// What CAN sit silent that long under a server that is still alive is the
+/// pre-spawn delay: `ProfileRuntime::acquire` blocks behind a `clauth start`
+/// session on the same profile, for as long as that session lasts, and the
+/// reader thread that writes the beats has not spawned yet. Both background
+/// shapes spend that delay silent-since-mint — a streaming run is still inside
+/// the acquire with no child, while a pinned-format one can be well past it,
+/// since the same block plus its 3600 s wall already sits a long run past the
+/// old window with the child spending. The day covers both where 3600+600 s
+/// could not, for a block under roughly a day; `acquire` blocks for as long as
+/// that session lasts, so a block past the day can still overrun it and a live
+/// run's record then reads as a corpse. A blocking run's
+/// [`RecordKind::Liveness`] record is minted at
+/// the spawn, so the delay is outside its clock entirely and its silence is
+/// bounded by the run's own guards. A handed-off run adds no third exposure:
+/// its clock starts at the crossing, which is strictly after the spawn, so it
+/// is bounded by whichever of the two shapes it already is.
+pub(crate) const RUNNING_TTL_MS: u64 = (24 * 60 * 60 + 600) * 1000;
+/// The bound on one `monitor` `job_ids` list, keeping one response from growing
+/// without limit.
 ///
-/// - **Streaming.** `read_stdout` rewrites this file on every line it consumes,
-///   so the record's own stamp tracks the run, and the supervision loop kills it
-///   once it has been quiet for `idle_secs` — caller-set, clamped to
-///   `MAX_RUN_TIMEOUT_SECS` (3600 s). 600 s of slack covers the heartbeat
-///   throttle, the kill and the teardown before `write_done` lands.
-/// - **Pinned `--output-format`.** `read_stdout` drains the pipe whole and never
-///   consults the heartbeat sink, so `last_output_at` stays `0` for this run's
-///   entire life and the anchor is its mint. What bounds it is the wall clock it
-///   always has (also ≤ 3600 s), not any liveness it emits.
-///
-/// A blocking run's [`RecordKind::Liveness`] record is a third shape and the
-/// cheapest of the three: it is minted at the SPAWN rather than at the reserve,
-/// so the pre-spawn delay is outside its clock entirely and what bounds it is
-/// the run's own deadline.
-///
-/// So the silent window this must cover is the pre-spawn delay for a streaming
-/// run, and the pre-spawn delay PLUS the whole run for a pinned-format one. Both
-/// can overrun it, from the same cause — `ProfileRuntime::acquire` blocks behind
-/// a `clauth start` session on the same profile, for as long as that session
-/// lasts — and they differ in what is alive when the reap lands: a streaming run
-/// is still inside that acquire with no child, while a pinned-format one can be
-/// well past it, since a 700 s block plus its 3600 s wall already puts the record
-/// 4300 s silent-since-mint with the child 3600 s in and still spending. Both
-/// exposures are exactly what the age rule carried. A handed-off run adds no
-/// third one: its clock starts at the crossing, which is strictly after the
-/// spawn, so it is bounded by whichever of the two shapes it already is.
-const RUNNING_TTL_MS: u64 = (3600 + 600) * 1000;
-/// Hard cap on retained job files; newest kept, older reaped. Also the cap on
-/// one `monitor` `job_ids` list: the store holds at most this many files, so a
-/// longer list could not resolve more ids.
+/// It no longer caps the store itself: retention is the two TTLs' job alone, so
+/// the store may exceed this by whatever a day produces. The count cap that
+/// used to stand here evicted by the retention anchor and was removed for it: a
+/// day's jobs can exceed 256 on a busy box, and an anchor-sorted eviction drops
+/// the record a crashed run left behind — the one this file must outlive its
+/// server for — while shorter, newer ones survive. Never re-add a count
+/// eviction that can touch a record its TTL still protects.
 pub(crate) const MAX_RETAINED: usize = 256;
 
 /// Per-process counter making two job ids minted in the same millisecond differ.
@@ -164,6 +169,16 @@ pub(crate) struct JobRecord {
     /// managed field's answer for a call that may have gone elsewhere.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) endpoint: Option<String>,
+    /// The child's own session id, off the first streamed event that carried
+    /// one: the resume handle a crashed run's record must outlive its server
+    /// for. The stdout reader captures it long before any crash and the
+    /// heartbeat writes it, so a `running` record a killed server left behind
+    /// carries the exact value a `delegate({resume})` accepts. `None` before
+    /// the first event names one, on a record an older server wrote (the
+    /// `default`), and on a `done` record — a killed run's salvage envelope
+    /// carries the handle inside the envelope instead.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) session_id: Option<String>,
     /// The wall-clock ceiling this run actually launched under, resolved once by
     /// `resolve_deadlines`. `0` is never a run about to be killed: it means this
     /// run HAS no wall clock, which is the normal streaming case, or — paired
@@ -197,10 +212,10 @@ pub(crate) struct JobRecord {
     /// are derived from it, while its file has existed only since the crossing.
     ///
     /// [`retention_anchor`] needs the later of the two, or a run handed off
-    /// after two hours is minted already past [`RUNNING_TTL_MS`] and the very
-    /// next `monitor` reaps the record it came to read. `0` on a file written
-    /// before this field existed, where `started_at` was the mint and the
-    /// fallback is exact.
+    /// past the window is minted already expired and the very next `monitor`
+    /// reaps the record it came to read. `0` on a file written before this
+    /// field existed, where `started_at` was the mint and the fallback is
+    /// exact.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub(crate) recorded_at: u64,
     /// A bounded single-line tail of the delegate's assistant text.
@@ -340,6 +355,21 @@ pub(crate) fn write_running(spec: &RunningSpec) -> Result<()> {
 /// heartbeating into is minted before its first beat resolves one, and the same
 /// single reader thread does every beat either way.
 pub(crate) fn write_heartbeat(spec: &RunningSpec, last_output_at: u64, tail: &str) -> Result<()> {
+    write_heartbeat_with_session(spec, last_output_at, tail, None)
+}
+
+/// [`write_heartbeat`] plus the child's own session id, for the one beat caller
+/// that has one: the streamed reader thread, which captured it off the first
+/// event carrying one. The value rides the capture, so every beat after that
+/// first event rewrites it back onto the record until the run ends; a beat
+/// before it writes `None`. [`write_heartbeat`] is the spelling for every other
+/// caller, and keeps `None`.
+pub(crate) fn write_heartbeat_with_session(
+    spec: &RunningSpec,
+    last_output_at: u64,
+    tail: &str,
+    session_id: Option<&str>,
+) -> Result<()> {
     write_atomic(
         &JobRecord {
             job_id: spec.job_id.clone(),
@@ -350,6 +380,7 @@ pub(crate) fn write_heartbeat(spec: &RunningSpec, last_output_at: u64, tail: &st
             timeout_secs: spec.timeout_secs,
             idle_secs: spec.idle_secs,
             endpoint: spec.endpoint.clone(),
+            session_id: session_id.map(str::to_string),
             last_output_at,
             recorded_at: spec.recorded_at,
             tail: tail.to_string(),
@@ -403,6 +434,7 @@ pub(crate) fn write_done(
             started_at,
             envelope: Some(envelope),
             endpoint,
+            session_id: None,
             timeout_secs: 0,
             idle_secs: None,
             last_output_at: 0,
@@ -475,8 +507,8 @@ pub(crate) fn remove_liveness(job_id: &str) {
 
 /// Best-effort GC at server startup: drop `done` files past their TTL and
 /// `running` files silent past [`RUNNING_TTL_MS`] (orphaned by a dead server),
-/// sweep stray `.tmp` from a crash mid-write, then cap the retained count to the
-/// newest [`MAX_RETAINED`].
+/// and sweep stray `.tmp` from a crash mid-write. Nothing is evicted by count:
+/// the store is bounded by the two TTLs alone (see [`MAX_RETAINED`]).
 pub(crate) fn gc(now: u64) {
     sweep(now, Scope::Everything);
 }
@@ -484,12 +516,12 @@ pub(crate) fn gc(now: u64) {
 /// The narrower sweep a `monitor` collect runs: `running` files a dead server
 /// orphaned, and nothing else.
 ///
-/// A reader must never destroy what it came for. The Done TTL, the `.tmp` sweep
-/// and the retention cap all buy nothing before a read and can only delete a
-/// result the caller is asking for, so they stay at startup. What DOES belong
-/// here is the corpse: [`RUNNING_TTL_MS`] already knows a file whose server died
-/// mid-job is dead, and until now `serve()` was the only place that knowledge
-/// was ever applied, so a corpse polled `running` forever.
+/// A reader must never destroy what it came for. The Done TTL and the `.tmp`
+/// sweep buy nothing before a read and can only delete a result the caller is
+/// asking for, so they stay at startup. What DOES belong here is the corpse:
+/// [`RUNNING_TTL_MS`] already knows a file whose server died mid-job is dead,
+/// and until now `serve()` was the only place that knowledge was ever applied,
+/// so a corpse polled `running` forever.
 pub(crate) fn gc_running_corpses(now: u64) {
     sweep(now, Scope::RunningCorpses);
 }
@@ -506,15 +538,16 @@ enum Scope {
 /// existed; a `running` record's freshest heartbeat, falling back to its mint
 /// before the first line of output arrives.
 ///
-/// One anchor for the TTL and the cap together, because they answer the same
-/// question — which records are the stale ones — and mixing stamps is what the
-/// TTL itself got wrong twice: sorted on the mint, the cap evicts a long
-/// delegate's fresh, never-read result ahead of a short run's older one, and
-/// [`RUNNING_TTL_MS`] reaped a live long run for having started a while ago.
+/// One anchor for the TTLs, because they answer the same question — which
+/// records are the stale ones — and mixing stamps is what retention got wrong
+/// twice: the count cap this store once carried, sorted on the mint, evicted a
+/// long delegate's fresh, never-read result ahead of a short run's older one,
+/// and [`RUNNING_TTL_MS`] reaped a live long run for having started a while
+/// ago.
 ///
 /// A `Running` record takes the latest of its three stamps rather than the two
 /// it used to, because a hand-off separated the run's birth from the record's:
-/// on `started_at` alone, a delegate handed off after two hours is minted
+/// on `started_at` alone, a delegate handed off past the window is minted
 /// already expired and the next reader sweeps it. `recorded_at` is `0` on a file
 /// written before that field, where the mint WAS `started_at` and the pair
 /// collapses back to the old rule exactly.
@@ -669,7 +702,7 @@ impl StoredJob {
 /// Every record in the store, newest-mattering first.
 ///
 /// READ-ONLY, and that is the contract rather than an implementation detail: no
-/// Done TTL, no `.tmp` sweep, no retention cap, no corpse reap. A reader that
+/// Done TTL, no `.tmp` sweep, no corpse reap. A reader that
 /// destroys what it came for is the defect this store has shipped twice, so
 /// every destructive rule stays in [`gc`] / [`gc_running_corpses`] where a
 /// caller asks for it by name. An unreadable file is skipped, never deleted.
@@ -828,7 +861,6 @@ fn sweep(now: u64, scope: Scope) {
     let Ok(entries) = std::fs::read_dir(&dir) else {
         return;
     };
-    let mut kept: Vec<(u64, PathBuf)> = Vec::new();
     for entry in entries.flatten() {
         let path = entry.path();
         if path.extension().and_then(|e| e.to_str()) != Some("json") {
@@ -848,24 +880,12 @@ fn sweep(now: u64, scope: Scope) {
             }
             continue;
         };
-        let anchor = retention_anchor(&record);
         let expired = match record.state {
-            JobState::Done => full && now.saturating_sub(anchor) > DONE_TTL_MS,
+            JobState::Done => full && now.saturating_sub(retention_anchor(&record)) > DONE_TTL_MS,
             JobState::Running => running_is_silent(&record, now),
         };
         if expired {
             let _ = std::fs::remove_file(&path);
-        } else {
-            kept.push((anchor, path));
-        }
-    }
-    if full && kept.len() > MAX_RETAINED {
-        // Sorted on the SAME anchor the TTL above reads: newest-mattering
-        // kept, so a long delegate's fresh result is not evicted ahead of a
-        // short run's older one just because it started earlier.
-        kept.sort_by_key(|k| std::cmp::Reverse(k.0));
-        for (_, path) in kept.into_iter().skip(MAX_RETAINED) {
-            let _ = std::fs::remove_file(path);
         }
     }
 }

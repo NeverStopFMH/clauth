@@ -3816,6 +3816,94 @@ fn the_stdout_reader_throttles_the_heartbeat_sink() {
     );
 }
 
+/// A crashed run's record carries the resume handle: the reader captures the
+/// child's session id off the first streamed event that names one, and the
+/// heartbeat writer stamps it onto the running record — so what a killed server
+/// left on disk is the same value a salvage envelope would hand a caller for
+/// `delegate({resume})`. Driven through the production pair (`read_stdout`'s
+/// capture plus the jobs writer), never a hand-built record.
+#[test]
+fn a_streamed_session_id_round_trips_through_the_running_record() {
+    let _home = HomeSandbox::new();
+    let started_at = now_ms();
+    let spec = running_spec("d-stream-0", "work", started_at);
+    jobs::write_running(&spec).unwrap();
+    assert_eq!(
+        jobs::read("d-stream-0").expect("record").session_id,
+        None,
+        "the mint precedes the first event, so it carries no session id yet",
+    );
+
+    // The stream's first event names the session, the same shape a real
+    // `system/init` event carries; the id is a real session id's shape.
+    let stream = concat!(
+        r#"{"type":"system","subtype":"init","session_id":"28d9c6c3-84c4-4b64-9c0e-31f3ad85dd28"}"#,
+        "\n",
+        r#"{"type":"stream_event","session_id":"28d9c6c3-84c4-4b64-9c0e-31f3ad85dd28","event":{"delta":{"type":"text_delta","text":"thinking"}}}"#,
+        "\n",
+    );
+    let progress = super::AtomicU64::new(0);
+    let mut sink = |capture: &super::StreamCapture| {
+        // The production beat: what `run_delegate`'s reader thread writes on
+        // every throttle slice.
+        let _ = jobs::write_heartbeat_with_session(
+            &spec,
+            now_ms(),
+            &super::tail_line(capture),
+            capture.session_id.as_deref(),
+        );
+    };
+    let capture = super::read_stdout(
+        std::io::Cursor::new(stream.as_bytes()),
+        true,
+        std::time::Instant::now(),
+        &progress,
+        Some(&mut sink),
+    );
+
+    let id = capture
+        .session_id
+        .as_deref()
+        .expect("the stream named a session");
+    let record = jobs::read("d-stream-0").expect("record");
+    assert_eq!(
+        record.session_id.as_deref(),
+        Some(id),
+        "the running record carries the exact value the capture held — the one \
+         `delegate({{resume}})` accepts, byte for byte",
+    );
+}
+
+/// The production beat is the wiring the round-trip test above mirrors: the
+/// reader thread's heartbeat must write the session id its capture holds, or a
+/// crashed run's record carries no resume handle however well the store
+/// round-trips a value handed it directly. The closure lives inside
+/// `run_delegate`, which cannot run without a real `claude` child, so the pin is
+/// a source scan — the same mechanism the reader-join guarantee uses.
+#[test]
+fn the_production_heartbeat_passes_the_captured_session_id() {
+    let src = include_str!("../../src/mcp/mod.rs");
+    let body = src
+        .split_once("fn run_delegate(")
+        .expect("run_delegate is defined")
+        .1;
+    let beat = body
+        .split_once("let mut beat = |capture: &StreamCapture| {")
+        .expect("the heartbeat closure exists")
+        .1
+        .split_once("read_stdout(h, streaming, start, &progress")
+        .expect("the beat closure ends at the reader spawn")
+        .0;
+    assert!(
+        beat.contains("write_heartbeat_with_session"),
+        "the production beat writes through the session-carrying writer: {beat}",
+    );
+    assert!(
+        beat.contains("capture.session_id.as_deref()"),
+        "and passes the value the capture holds: {beat}",
+    );
+}
+
 /// The sinkless arm is the purity seam this test needs, never a shape a
 /// server-produced delegate takes: every run passes a sink, and a run beats
 /// once it OWNS a record. Passing `None` here keeps `read_stdout` pure under
@@ -4469,9 +4557,9 @@ fn the_wait_cap_clamps_without_a_progress_token() {
 }
 
 /// `unknown job_id` conflated five causes and named none. Each branch says what
-/// the caller can do about it; (2) already collected and (4) dropped past the
-/// retention cap leave nothing on disk to tell them apart, so they share a
-/// branch rather than inventing a distinction.
+/// the caller can do about it; already collected and auto-delivered leave
+/// nothing on disk to tell them apart, so they share a branch rather than
+/// inventing a distinction.
 #[test]
 fn an_unknown_job_id_names_which_cause_it_was() {
     let _home = crate::testutil::HomeSandbox::new();
@@ -4489,14 +4577,14 @@ fn an_unknown_job_id_names_which_cause_it_was() {
 
     // Minted through the producer so the id really decodes to the stamp below;
     // a hand-spelled decimal id would parse as a far-future base-36 stamp and
-    // take the under-an-hour branch instead.
-    let swept = unknown_job_reason(&jobs::new_job_id(now - 2 * 60 * 60 * 1000), now);
+    // take the fresh branch instead.
+    let swept = unknown_job_reason(&jobs::new_job_id(now - 25 * 60 * 60 * 1000), now);
     assert!(
         swept.contains("swept") && swept.contains("re-run"),
         "an id older than the done TTL names the sweep and the fix: {swept}",
     );
     // Collection leads even on the aged branch: every collect evicts, while the
-    // hour-after-finish sweep runs at startup alone, so on a session that has
+    // day-after-finish sweep runs at startup alone, so on a session that has
     // been up a while the sweep is the rarer cause of the two.
     assert!(
         swept.find("already collected") < swept.find("swept"),
@@ -6564,10 +6652,11 @@ fn a_reserved_run_is_already_across_the_seam_and_a_hand_off_cannot_move_it() {
 ///
 /// `monitor` sweeps running corpses before every collect, and a `Running`
 /// record's retention is silence measured from an anchor. Anchor that on the
-/// RUN's birth and a delegate handed off after two hours is minted already past
-/// `RUNNING_TTL_MS`: the next collect deletes the file and answers `unknown
-/// job_id` for a run whose child is still spending — the M1 defect walking back
-/// in through the hand-off door, on exactly the long runs M3 exists to rescue.
+/// RUN's birth and a delegate handed off past `RUNNING_TTL_MS` — a day and its
+/// 600 s grace — is minted already expired: the next collect deletes the file
+/// and answers `unknown job_id` for a run whose child is still spending — the
+/// M1 defect walking back in through the hand-off door, on exactly the long
+/// runs M3 exists to rescue.
 /// A pinned-`--output-format` run never heartbeats at all, so for that shape
 /// EVERY collect would reap it until the finalize wrote the done record back.
 ///
@@ -6581,7 +6670,7 @@ fn a_handed_off_run_is_not_reaped_by_the_monitor_that_comes_to_read_it() {
     // Older than the corpse window, which M1 made an ordinary age: a streaming
     // delegate has no wall clock, so nothing bounds how long one may run.
     let mut mint = mint_spec("work");
-    mint.started_at = now_ms().saturating_sub(4_300_000);
+    mint.started_at = now_ms().saturating_sub(jobs::RUNNING_TTL_MS + 5 * 60 * 1000);
     let handoff = super::Handoff::blocking(mint);
     handoff.mark_spawned();
     let super::Abandoned::HandedOff(job_id) = handoff.hand_off() else {
@@ -7042,7 +7131,7 @@ fn the_listing_dates_every_state_by_the_stamp_that_state_makes_worth_reading() {
     .unwrap();
     seed_done_at("d-fin-0", "acct", now - 900_000, now - 90_500, "");
     // Silent past the corpse window, which is what makes a record an orphan.
-    seed_running("d-dead-0", "acct", now - (3600 + 600) * 1000 - 200_500);
+    seed_running("d-dead-0", "acct", now - jobs::RUNNING_TTL_MS - 200_500);
 
     let text = monitor_state_text();
     let line = |id: &str| -> String {
@@ -7065,7 +7154,7 @@ fn the_listing_dates_every_state_by_the_stamp_that_state_makes_worth_reading() {
     // An orphan by when anything last wrote to it.
     assert_eq!(
         line("d-dead-0").trim(),
-        "job `d-dead-0` orphaned on `acct`, last seen 1h 13m ago",
+        "job `d-dead-0` orphaned on `acct`, last seen 1d 0h ago",
     );
     // And the two dead ones carry no elapsed figure — asserted per LINE, so the
     // live row's own `elapsed` cannot satisfy it.

@@ -1,8 +1,8 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-//! Disk job-store coverage: atomic write/read roundtrip, id safety, eviction,
-//! and GC of expired / orphaned / oversized state. Home-sandboxed so files land
-//! in a tempdir, never the real `~/.clauth/jobs`.
+//! Disk job-store coverage: atomic write/read roundtrip, id safety, and GC of
+//! expired / orphaned state. Home-sandboxed so files land in a tempdir, never
+//! the real `~/.clauth/jobs`.
 
 use super::*;
 use crate::testutil::HomeSandbox;
@@ -104,6 +104,7 @@ fn a_job_file_from_an_older_server_still_parses() {
     assert_eq!(r.last_output_at, 0);
     assert_eq!(r.tail, "");
     assert_eq!(r.done_at, 0, "no finish stamp either");
+    assert_eq!(r.session_id, None, "and no session id");
 }
 
 /// A heartbeat rewrites the SAME running record: the identity and whichever
@@ -225,8 +226,7 @@ fn promote_moves_the_spelling_and_keeps_the_id() {
 }
 
 /// A blocking run's record rides the same GC as any other: the extension is
-/// still `.json`, so the corpse rule and the retention cap reach it with no arm
-/// of their own.
+/// still `.json`, so the corpse rule reaches it with no arm of its own.
 #[test]
 fn a_liveness_record_is_swept_on_the_same_rules_as_any_other_running_one() {
     let _home = HomeSandbox::new();
@@ -338,19 +338,19 @@ fn gc_reaps_expired_running_and_done_keeps_fresh() {
     assert!(read("d-old-run").is_none(), "orphaned running reaped");
 }
 
-/// The Done TTL retains a file for an hour after it FINISHES, which is what its
-/// own doc promises a slow poller. Measured from the mint instead, any delegate
-/// that ran for over an hour is already expired the instant it finalizes, and
-/// the next sweep destroys the salvage envelope.
+/// The Done TTL retains a file for a day after it FINISHES, which is what its
+/// own doc promises a poller returning after a reboot. Measured from the mint
+/// instead, any delegate that ran for over a day is already expired the instant
+/// it finalizes, and the next sweep destroys the salvage envelope.
 #[test]
 fn the_done_ttl_measures_from_the_finish_not_the_mint() {
     let _home = HomeSandbox::new();
     let now = 10_000_000_000u64;
 
-    // Minted two hours ago, finished a moment ago: a run killed at its wall
+    // Minted two days ago, finished a moment ago: a run killed at its wall
     // clock, or any long delegate.
     seed_done_at("d-long-run", now - 2 * DONE_TTL_MS, Some(now - 1000));
-    // Minted a moment ago, finished over an hour ago — impossible in practice,
+    // Minted a moment ago, finished past the TTL — impossible in practice,
     // but it pins that the FINISH is what the rule reads.
     seed_done_at("d-stale-finish", now - 1000, Some(now - DONE_TTL_MS - 1));
     // No `done_at` at all: a file an older server wrote, which must keep
@@ -364,9 +364,65 @@ fn the_done_ttl_measures_from_the_finish_not_the_mint() {
         read("d-long-run").is_some(),
         "a long run's envelope survives its own length"
     );
-    assert!(read("d-stale-finish").is_none(), "an hour past the finish");
+    assert!(read("d-stale-finish").is_none(), "a day past the finish");
     assert!(read("d-legacy-done").is_none(), "old file, old rule");
     assert!(read("d-legacy-fresh").is_some(), "old file, still fresh");
+}
+
+/// The two windows pinned in literal days, so a TTL that slips back under them
+/// reds here rather than riding the constants the tests above express
+/// themselves in. A day is the line this task draws: a record written by a
+/// killed server still resolves a day later, and a done record expires at a
+/// day, not an hour.
+#[test]
+fn the_windows_hold_for_a_day_each() {
+    let _home = HomeSandbox::new();
+    let now = 10_000_000_000u64;
+    const DAY_MS: u64 = 24 * 60 * 60 * 1000;
+
+    // The last thing a killed server wrote, exactly a day ago.
+    write_heartbeat_with_session(
+        &spec("d-day-run", "p", now - DAY_MS),
+        now - DAY_MS,
+        "last beat before the crash",
+        Some("sess-day-1"),
+    )
+    .unwrap();
+    // A done record a day old.
+    seed_done_at("d-day-done", now - DAY_MS, Some(now - DAY_MS));
+
+    gc(now);
+
+    let run = read("d-day-run").expect("a crashed run's record still resolves a day later");
+    assert_eq!(run.state, JobState::Running);
+    assert_eq!(
+        run.session_id.as_deref(),
+        Some("sess-day-1"),
+        "and carries the resume handle it captured",
+    );
+    let listed = list(now);
+    let row = listed
+        .iter()
+        .find(|j| j.record.job_id == "d-day-run")
+        .expect("the day-old record is listed");
+    assert_eq!(
+        row.liveness,
+        JobLiveness::Running,
+        "a day of silence is inside the window, so no reader may call it a corpse",
+    );
+    assert!(
+        read("d-day-done").is_some(),
+        "a day-old done record still resolves",
+    );
+
+    // Past the day, the done TTL expires it; the day-old survivors above are
+    // the half of the pin a 1 h TTL would have failed.
+    seed_done_at("d-stale-done", now - DAY_MS - 1, Some(now - DAY_MS - 1));
+    gc(now);
+    assert!(
+        read("d-stale-done").is_none(),
+        "a done record past the day is reaped"
+    );
 }
 
 /// A streaming delegate has no wall clock, so "older than the max delegate
@@ -417,7 +473,7 @@ fn a_job_still_talking_survives_the_corpse_sweep_however_old_it_is() {
 /// The collect path runs a NARROWER sweep than startup: it reaps only the
 /// `running` corpses a dead server orphaned, which is the whole reason finding 6
 /// wanted a sweep there. Reaping `done` before a read destroys the envelope the
-/// call came for, and the `.tmp` sweep and retention cap buy nothing at all.
+/// call came for, and the `.tmp` sweep buys nothing at all.
 #[test]
 fn the_corpse_sweep_touches_only_orphaned_running_files() {
     let _home = HomeSandbox::new();
@@ -460,77 +516,51 @@ fn gc_sweeps_stray_tmp_files() {
     assert!(!dir.join("d-1-0.json.tmp").exists(), "stray tmp swept");
 }
 
+/// A day of jobs can exceed [`MAX_RETAINED`] on a busy box, and no count cap may
+/// evict a record its TTL still protects: the cap this store used to carry,
+/// sorted on the same anchor the TTL reads, dropped a crashed run's record while
+/// shorter, newer ones survived. The store is bounded by the two TTLs alone, so
+/// a store over the cap keeps every fresh record.
 #[test]
-fn gc_caps_retained_to_newest() {
+fn the_store_keeps_more_than_the_cap_while_the_ttls_protect_them() {
     let _home = HomeSandbox::new();
     let now = 10_000_000_000u64;
     let total = MAX_RETAINED + 5;
     for i in 0..total {
-        // Both stamps rise with i, so low i are the oldest either way and the
-        // cap's ordering is the only thing under test here. `write_done` would
-        // stamp every finish at the real clock, which leaves 261 records the
-        // cap cannot order at all.
+        // Both stamps rise with i, so low i are the oldest either way. The rule
+        // under test is about stamps a test has to choose; `write_done` would
+        // stamp every finish at the real clock.
         let age = total as u64 - i as u64;
-        seed_done_at(&format!("d-cap-{i}"), now - age, Some(now - age));
+        seed_done_at(&format!("d-day-{i}"), now - age, Some(now - age));
     }
     gc(now);
 
-    let remaining = std::fs::read_dir(jobs_dir().unwrap())
-        .unwrap()
-        .flatten()
-        .count();
-    assert_eq!(remaining, MAX_RETAINED, "capped to MAX_RETAINED newest");
-    assert!(read("d-cap-0").is_none(), "oldest reaped");
-    assert!(
-        read(&format!("d-cap-{}", total - 1)).is_some(),
-        "newest kept"
-    );
-}
-
-/// The cap keeps the newest jobs by the same stamp the TTL retains from: a long
-/// delegate's fresh, never-read result must not be evicted ahead of a short
-/// run's older one just because it was minted earlier.
-#[test]
-fn the_retention_cap_keeps_the_newest_finish_not_the_newest_mint() {
-    let _home = HomeSandbox::new();
-    let now = 10_000_000_000u64;
-
-    // The long run: minted an hour before the rest, finished most recently.
-    seed_done_at("d-long", now - 3_600_000, Some(now - 60_000));
-    // The short runs: all minted in the last 30s, all finished before it.
-    for i in 0..MAX_RETAINED {
-        seed_done_at(
-            &format!("d-short-{i}"),
-            now - 30_000 + i as u64,
-            Some(now - 300_000 + i as u64),
-        );
-    }
-
-    gc(now); // MAX_RETAINED + 1 files: exactly one is evicted
-
-    assert!(
-        read("d-long").is_some(),
-        "the newest RESULT survives the cap, whatever its mint"
-    );
-    assert!(
-        read("d-short-0").is_none(),
-        "the oldest result is the one evicted"
-    );
     assert_eq!(
-        std::fs::read_dir(jobs_dir().unwrap()).unwrap().count(),
-        MAX_RETAINED,
-        "capped to MAX_RETAINED"
+        std::fs::read_dir(jobs_dir().unwrap())
+            .unwrap()
+            .flatten()
+            .count(),
+        total,
+        "nothing is evicted by count while its TTL protects it",
+    );
+    assert!(
+        read("d-day-0").is_some(),
+        "the oldest fresh record survives a store over the cap",
+    );
+    assert!(
+        read(&format!("d-day-{}", total - 1)).is_some(),
+        "and so does the newest"
     );
 }
 
 /// The listing reads and NOTHING else. Not the Done TTL, not the `.tmp` sweep,
-/// not the retention cap, not the corpse reap — every one of them is somebody
-/// asking for a sweep by name, and a reader that reaps what it came for is the
-/// defect this store has shipped twice.
+/// not the corpse reap — every one of them is somebody asking for a sweep by
+/// name, and a reader that reaps what it came for is the defect this store has
+/// shipped twice.
 ///
 /// The fixture is deliberately made of records every destructive rule wants:
-/// a `done` file hours past its TTL, a `running` corpse, a stray `.tmp`, and one
-/// record more than the retention cap.
+/// a `done` file a day past its TTL, a `running` corpse, a stray `.tmp`,
+/// and a store past [`MAX_RETAINED`] records.
 #[test]
 fn the_listing_destroys_nothing_it_reads() {
     let _home = HomeSandbox::new();
@@ -561,7 +591,7 @@ fn the_listing_destroys_nothing_it_reads() {
     // reds the comparison below instead of short-circuiting on this line.
     assert!(
         before.len() > MAX_RETAINED,
-        "fixture control: the store is over the cap, so a sweep here would show",
+        "fixture control: a store this size would show a sweep here",
     );
 
     let listed = list(now);

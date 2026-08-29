@@ -2315,14 +2315,13 @@ const AWAIT_JOB_DEADLINE_SECS: u64 = 4200;
 
 /// Most rows the state mode's listing names before it stops naming them.
 ///
-/// The store retains [`jobs::MAX_RETAINED`], and spending 256 rows on a caller
-/// who asked whether clauth's state had moved is the cost this surface was
-/// reworked to refuse.
+/// Spending hundreds of rows on a caller who asked whether clauth's state had
+/// moved is the cost this surface was reworked to refuse.
 ///
 /// **This bound deliberately CUTS ACROSS the store's retention rule, and that is
 /// the point rather than a cost.** The rows arrive from [`jobs::list_banded`],
 /// so a stale live run is kept and a fresher finished one dropped — the exact
-/// trade the retention cap would refuse, because retention answers "which record
+/// trade the retention rule would refuse, because retention answers "which record
 /// is least worth keeping" while this answers "which row must a reader not
 /// lose". An earlier version of this comment argued the opposite, that the bound
 /// agreed with retention; that reasoning is what shipped a listing which evicted
@@ -2400,9 +2399,10 @@ fn listing_row(job: &jobs::StoredJob, now: u64) -> serde_json::Value {
 /// failing the whole batch, and `wait_for_batch` keeps it away from the path
 /// join.
 fn job_ids_refusal(job_ids: &[String]) -> Option<String> {
-    // The cap mirrors the job store's own retention: GC keeps at most
-    // `MAX_RETAINED` files, so a longer list could not resolve more ids, and the
-    // bound keeps one response from growing without limit.
+    // A bound on one response, no longer a mirror of the store's own retention:
+    // the store can hold more than this many records (the TTLs bound it alone),
+    // but a call naming thousands of ids is a response-size footgun and this
+    // keeps it from growing without limit.
     if job_ids.len() > jobs::MAX_RETAINED {
         // The fix clause names the split the caller can make, and formats the
         // SAME `MAX_RETAINED` value the ceiling does, never a hardcoded
@@ -2693,14 +2693,23 @@ fn job_id_minted_at(token: &str) -> Option<u64> {
 /// Only the FIRST branch is a derivation, and only of the SHAPE: a token that is
 /// not `d-<base36>-<digits>` was never a clauth job at all. Past that gate the
 /// stamp bounds a job's age and nothing more — it cannot say which cause fired,
-/// since a job minted two hours ago may equally have been collected five minutes
+/// since a job minted a day ago may equally have been collected five minutes
 /// ago, and it cannot even say the id was minted, because the base-36 stamp
 /// admits any lowercase word. So both age branches hedge every cause they name
 /// AND carry the never-minted one, rather than asserting a cause and telling the
 /// caller to spend another window on it. Which of the two a caller lands in is
-/// the stamp's accident: already-collected and dropped-past-the-cap share the
-/// fresh branch because nothing on disk survives either, and the sweep leads the
-/// aged one.
+/// the stamp's accident: the aged branch (the stamp older than
+/// [`jobs::DONE_TTL_MS`]) is the only one a sweep can explain — both reaps run
+/// from a day back, so a younger id cannot have been swept — and collection
+/// leads there because every collect evicts while the sweep runs at startup
+/// alone.
+///
+/// Both branches' copy still describes the old retention: the aged branch
+/// says "over an hour old / swept an hour after it finished" for a branch
+/// entered only past a day, and the fresh branch names the retired store cap.
+/// The clauses survive only as model-facing copy pending replacement through
+/// the copy-approval flow — do not restore the 1 h TTL or a cap to justify
+/// them.
 fn unknown_job_reason(job_id: &str, now: u64) -> String {
     // Checked FIRST, because it is the one cause this function can actually
     // know. Everything below hedges; this does not. A blocking delegate's record
@@ -2734,7 +2743,7 @@ fn unknown_job_reason(job_id: &str, now: u64) -> String {
                     `d-<base36-ms>-<counter>`)";
     if now.saturating_sub(minted_at) > jobs::DONE_TTL_MS {
         // Collection leads even here. Every collect evicts through
-        // `jobs::remove`; the hour-after-finish sweep runs at startup alone
+        // `jobs::remove`; the day-after-finish sweep runs at startup alone
         // (`jobs::gc`), so on a session that has been up a while the sweep is
         // the rarer of the two rather than the likelier.
         return format!(
@@ -3772,7 +3781,16 @@ fn run_delegate(opts: DelegateOpts<'_>) -> std::result::Result<serde_json::Value
             Some(handoff) => {
                 let mut beat = |capture: &StreamCapture| {
                     if let Some(spec) = handoff.spec() {
-                        let _ = jobs::write_heartbeat(&spec, now_ms(), &tail_line(capture));
+                        // The session id arrives HERE, mid-run, and rides the
+                        // capture from its first event on: the record this
+                        // thread rewrites is the only place a crashed run's
+                        // resume handle survives, so every beat carries it.
+                        let _ = jobs::write_heartbeat_with_session(
+                            &spec,
+                            now_ms(),
+                            &tail_line(capture),
+                            capture.session_id.as_deref(),
+                        );
                     }
                 };
                 read_stdout(h, streaming, start, &progress, Some(&mut beat))

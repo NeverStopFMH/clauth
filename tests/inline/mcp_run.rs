@@ -4591,7 +4591,7 @@ fn an_unknown_job_id_names_which_cause_it_was() {
         "the likelier cause leads: {swept}",
     );
     assert!(
-        swept.contains("stamp reads over an hour old"),
+        swept.contains("stamp reads over a day old"),
         "the age is attributed to the stamp, never asserted as a mint: {swept}",
     );
 
@@ -4603,13 +4603,10 @@ fn an_unknown_job_id_names_which_cause_it_was() {
     // presuppose a job that never existed.
     let aged_word = unknown_job_reason("d-day-1", now);
     let fresh_word = unknown_job_reason("d-notebook-1", now);
-    // The cap needle is the whole phrase, never the bare number: the id is
-    // interpolated into this same string, and the process-global counter spells
-    // `256` often enough (256, 1256, 2560..2569, ...) that a bare needle binds
-    // to the id instead of to `MAX_RETAINED`.
-    let cap = format!("{} newest jobs", jobs::MAX_RETAINED);
+    // The sweep claim is the branch discriminator: only the aged branch names
+    // it, and the fresh branch must not, since both reaps run from a day back.
     assert!(
-        aged_word.contains("swept") && fresh_word.contains(&cap),
+        aged_word.contains("swept") && !fresh_word.contains("swept"),
         "fixture control: the two words really take opposite age branches: \
          {aged_word} / {fresh_word}",
     );
@@ -4622,8 +4619,10 @@ fn an_unknown_job_id_names_which_cause_it_was() {
 
     let collected = unknown_job_reason(&jobs::new_job_id(now - 1000), now);
     assert!(
-        collected.contains("already collected") && collected.contains(&cap),
-        "a fresh id names collection and the retention cap together: {collected}",
+        collected.contains("already collected")
+            && !collected.contains("swept")
+            && !collected.contains("newest jobs"),
+        "a fresh id names collection and nothing the store no longer does: {collected}",
     );
     for reason in [&never, &swept, &collected] {
         assert!(

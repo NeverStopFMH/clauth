@@ -2703,13 +2703,6 @@ fn job_id_minted_at(token: &str) -> Option<u64> {
 /// from a day back, so a younger id cannot have been swept — and collection
 /// leads there because every collect evicts while the sweep runs at startup
 /// alone.
-///
-/// Both branches' copy still describes the old retention: the aged branch
-/// says "over an hour old / swept an hour after it finished" for a branch
-/// entered only past a day, and the fresh branch names the retired store cap.
-/// The clauses survive only as model-facing copy pending replacement through
-/// the copy-approval flow — do not restore the 1 h TTL or a cap to justify
-/// them.
 fn unknown_job_reason(job_id: &str, now: u64) -> String {
     // Checked FIRST, because it is the one cause this function can actually
     // know. Everything below hedges; this does not. A blocking delegate's record
@@ -2747,16 +2740,14 @@ fn unknown_job_reason(job_id: &str, now: u64) -> String {
         // (`jobs::gc`), so on a session that has been up a while the sweep is
         // the rarer of the two rather than the likelier.
         return format!(
-            "unknown job_id: {job_id} — most likely {collected}; its stamp reads over an hour \
-             old, so it may also have been swept an hour after it finished. {unminted}. check \
+            "unknown job_id: {job_id} — most likely {collected}; its stamp reads over a day \
+             old, so it may also have been swept a day after it finished. {unminted}. check \
              this session's earlier replies before re-running the delegate"
         );
     }
     format!(
-        "unknown job_id: {job_id} — most likely {collected}, or dropped once the store passed \
-         its {} \
-         newest jobs. {unminted}. check this session's earlier replies for the result",
-        jobs::MAX_RETAINED
+        "unknown job_id: {job_id} — most likely {collected}. \
+         {unminted}. check this session's earlier replies for the result"
     )
 }
 

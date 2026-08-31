@@ -250,13 +250,390 @@
           </article>
         </section>
 
-        <!-- Remaining tabs: built in follow-up iterations -->
-        <section x-show="tab === 'usage'"><p>Coming soon.</p></section>
-        <section x-show="tab === 'tokens'"><p>Coming soon.</p></section>
-        <section x-show="tab === 'setup'"><p>Coming soon.</p></section>
-        <section x-show="tab === 'config'"><p>Coming soon.</p></section>
-        <section x-show="tab === 'status'"><p>Coming soon.</p></section>
-        <section x-show="tab === 'plugin'"><p>Coming soon.</p></section>
+        <!-- Usage -->
+        <section x-show="tab === 'usage'">
+          <article x-show="status">
+            <div class="fallback-layout">
+              <div class="fallback-chain-list">
+                <template x-for="p in (status ? status.profiles : [])" :key="p.name">
+                  <div
+                    class="chain-row"
+                    :class="{ selected: usageSelected === p.name }"
+                    @click="usageSelected = p.name"
+                  >
+                    <span x-text="p.name"></span>
+                  </div>
+                </template>
+              </div>
+              <div class="fallback-detail" x-show="usageProfile()">
+                <template x-if="usageProfile()">
+                  <div>
+                    <div class="row" style="display: flex; justify-content: space-between; align-items: center">
+                      <h3 x-text="usageProfile().name"></h3>
+                      <span class="pill" :class="usageProfile().auth_status === 'ok' ? 'active' : 'blocked'" x-text="usageProfile().auth_status"></span>
+                    </div>
+                    <p style="font-size: 0.85rem; opacity: 0.7">
+                      <span x-text="usageProfile().tier || usageProfile().provider"></span> ·
+                      fetch: <span x-text="usageProfile().fetch_status || 'never'"></span>
+                    </p>
+                    <template x-for="w in usageProfile().windows" :key="w.label">
+                      <div style="margin-bottom: 1rem">
+                        <div style="display: flex; justify-content: space-between; font-size: 0.85rem; margin-bottom: 4px">
+                          <span x-text="w.label"></span>
+                          <span x-text="fmtPct(w.utilization_pct) + (w.resets_at ? ' · resets in ' + fmtReset(w.resets_at) : '')"></span>
+                        </div>
+                        <span class="gauge-track" style="display: block; height: 8px">
+                          <span
+                            class="gauge-fill"
+                            :class="gaugeClass(w.utilization_pct, 100)"
+                            :style="{ width: w.utilization_pct + '%' }"
+                          ></span>
+                        </span>
+                      </div>
+                    </template>
+                    <p x-show="usageProfile().windows.length === 0" style="opacity: 0.6">No usage windows cached yet.</p>
+                  </div>
+                </template>
+              </div>
+            </div>
+          </article>
+        </section>
+
+        <!-- Config -->
+        <section x-show="tab === 'config'">
+          <article x-show="configData">
+            <template x-if="configData">
+              <div class="field-grid">
+                <label>Theme</label>
+                <select @change="patchConfig('theme', $event.target.value)">
+                  <option value="full" :selected="configData.theme === 'full'">full</option>
+                  <option value="compatible" :selected="configData.theme === 'compatible'">compatible</option>
+                </select>
+
+                <label>Reset display</label>
+                <select @change="patchConfig('reset_display', $event.target.value)">
+                  <option value="relative" :selected="configData.reset_display === 'relative'">relative</option>
+                  <option value="clock" :selected="configData.reset_display === 'clock'">clock</option>
+                  <option value="both" :selected="configData.reset_display === 'both'">both</option>
+                </select>
+
+                <label>Clock format</label>
+                <select @change="patchConfig('clock_format', $event.target.value)">
+                  <option value="24h" :selected="configData.clock_format === '24h'">24h</option>
+                  <option value="12h" :selected="configData.clock_format === '12h'">12h</option>
+                </select>
+
+                <label>Divergence default</label>
+                <select @change="$event.target.value && patchConfig('default_divergence', $event.target.value)">
+                  <option value="" :selected="!configData.default_divergence" disabled>ask (default; not settable here yet)</option>
+                  <option value="Overwrite" :selected="configData.default_divergence === 'Overwrite'">overwrite</option>
+                  <option value="NewProfile" :selected="configData.default_divergence === 'NewProfile'">new profile</option>
+                  <option value="Discard" :selected="configData.default_divergence === 'Discard'">discard</option>
+                </select>
+
+                <label>Stop when all spent</label>
+                <input
+                  type="checkbox"
+                  role="switch"
+                  :checked="configData.switch_off_when_spent"
+                  @change="patchConfig('switch_off_when_spent', $event.target.checked)"
+                />
+
+                <label>Weekly threshold</label>
+                <div>
+                  <input
+                    type="range"
+                    min="50"
+                    max="100"
+                    :value="configData.weekly_switch_threshold"
+                    @change="patchConfig('weekly_switch_threshold', Number($event.target.value))"
+                  />
+                  <span x-text="configData.weekly_switch_threshold + '%'"></span>
+                </div>
+
+                <label>Refresh interval</label>
+                <input
+                  type="number"
+                  min="1000"
+                  step="1000"
+                  :value="configData.refresh_interval_ms"
+                  @change="patchConfig('refresh_interval_ms', Number($event.target.value))"
+                />
+
+                <label>Burn-aware switching</label>
+                <input
+                  type="checkbox"
+                  role="switch"
+                  :checked="configData.burn_aware_switching"
+                  @change="patchConfig('burn_aware_switching', $event.target.checked)"
+                />
+
+                <label>Burn floor</label>
+                <div>
+                  <input
+                    type="range"
+                    min="0"
+                    max="100"
+                    :value="configData.burn_switch_floor_pct"
+                    @change="patchConfig('burn_switch_floor_pct', Number($event.target.value))"
+                  />
+                  <span x-text="configData.burn_switch_floor_pct + '%'"></span>
+                </div>
+
+                <label>Burn horizon cap</label>
+                <input
+                  type="number"
+                  min="1000"
+                  step="1000"
+                  :value="configData.burn_horizon_cap_ms"
+                  @change="patchConfig('burn_horizon_cap_ms', Number($event.target.value))"
+                />
+
+                <label>Spend-budget switching</label>
+                <input
+                  type="checkbox"
+                  role="switch"
+                  :checked="configData.spend_budget_switching"
+                  @change="patchConfig('spend_budget_switching', $event.target.checked)"
+                />
+
+                <label>Stop when budget spent</label>
+                <input
+                  type="checkbox"
+                  role="switch"
+                  :checked="configData.switch_off_when_budget_spent"
+                  @change="patchConfig('switch_off_when_budget_spent', $event.target.checked)"
+                />
+
+                <label>Preemptive rotation</label>
+                <input
+                  type="checkbox"
+                  role="switch"
+                  :checked="configData.preemptive_rotation"
+                  @change="patchConfig('preemptive_rotation', $event.target.checked)"
+                />
+
+                <label>Refresh spent accounts</label>
+                <input
+                  type="checkbox"
+                  role="switch"
+                  :checked="configData.refresh_spent_accounts"
+                  @change="patchConfig('refresh_spent_accounts', $event.target.checked)"
+                />
+              </div>
+            </template>
+            <template x-for="(msg, field) in configFieldErrors" :key="field">
+              <div class="field-error" x-text="field + ': ' + msg"></div>
+            </template>
+          </article>
+        </section>
+
+        <!-- Tokens -->
+        <section x-show="tab === 'tokens'">
+          <p x-show="tokensError" x-text="tokensError"></p>
+          <article x-show="tokensData">
+            <template x-if="tokensData">
+              <div>
+                <div class="field-grid">
+                  <label>Input</label>
+                  <span x-text="fmtNumber(tokensData.total_input)"></span>
+                  <label>Output</label>
+                  <span x-text="fmtNumber(tokensData.total_output)"></span>
+                  <label>Cache read</label>
+                  <span x-text="fmtNumber(tokensData.total_cache_read)"></span>
+                  <label>Cache create</label>
+                  <span x-text="fmtNumber(tokensData.total_cache_create)"></span>
+                  <label>Sessions</label>
+                  <span x-text="tokensData.total_sessions"></span>
+                  <label>Messages</label>
+                  <span x-text="tokensData.total_messages"></span>
+                  <label>Cache hit rate</label>
+                  <span x-text="Math.round(tokensData.cache_hit_ratio * 100) + '%'"></span>
+                </div>
+
+                <h4 style="margin-top: 1.5rem">By model</h4>
+                <table>
+                  <thead>
+                    <tr>
+                      <th>model</th>
+                      <th>input</th>
+                      <th>output</th>
+                      <th>cache read</th>
+                      <th>cache create</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    <template x-for="m in tokensData.models" :key="m.model">
+                      <tr>
+                        <td x-text="m.model"></td>
+                        <td x-text="fmtNumber(m.input)"></td>
+                        <td x-text="fmtNumber(m.output)"></td>
+                        <td x-text="fmtNumber(m.cache_read)"></td>
+                        <td x-text="fmtNumber(m.cache_create)"></td>
+                      </tr>
+                    </template>
+                  </tbody>
+                </table>
+
+                <p style="font-size: 0.8rem; opacity: 0.6; margin-top: 1rem">
+                  Lifetime totals from the on-disk cache; today's in-flight activity is not yet folded in.
+                </p>
+              </div>
+            </template>
+          </article>
+        </section>
+
+        <!-- Setup -->
+        <section x-show="tab === 'setup'">
+          <article x-show="setupData">
+            <h3>Accounts</h3>
+            <table>
+              <thead>
+                <tr>
+                  <th>name</th>
+                  <th>base url</th>
+                  <th>api key</th>
+                  <th>disabled</th>
+                  <th></th>
+                </tr>
+              </thead>
+              <tbody>
+                <template x-for="p in (setupData ? setupData.profiles : [])" :key="p.name">
+                  <tr>
+                    <td x-text="p.name"></td>
+                    <template x-if="!endpointDrafts[p.name]">
+                      <td x-text="p.base_url || '—'" style="cursor: pointer" @click="startEndpointEdit(p)"></td>
+                    </template>
+                    <template x-if="endpointDrafts[p.name]">
+                      <td colspan="2">
+                        <input type="text" placeholder="base url" x-model="endpointDrafts[p.name].base_url" />
+                        <input
+                          type="password"
+                          placeholder="api key (re-enter to keep)"
+                          x-model="endpointDrafts[p.name].api_key"
+                        />
+                        <button style="font-size: 12px" @click="saveEndpointEdit(p.name, p.has_api_key)">save</button>
+                        <button class="outline" style="font-size: 12px" @click="cancelEndpointEdit(p.name)">cancel</button>
+                      </td>
+                    </template>
+                    <template x-if="!endpointDrafts[p.name]">
+                      <td style="cursor: pointer" @click="startEndpointEdit(p)" x-text="p.has_api_key ? 'set' : 'none'"></td>
+                    </template>
+                    <td>
+                      <input
+                        type="checkbox"
+                        role="switch"
+                        :checked="p.disabled"
+                        @change="toggleProfileDisabled(p.name, $event.target.checked)"
+                      />
+                    </td>
+                    <td style="display: flex; gap: 0.4rem">
+                      <button class="outline" style="font-size: 12px" @click="alibabaOpenFor = (alibabaOpenFor === p.name ? null : p.name)">
+                        console login
+                      </button>
+                      <button class="outline" style="font-size: 12px; color: #c25c5c" @click="deleteSetupProfile(p.name)">
+                        delete
+                      </button>
+                    </td>
+                  </tr>
+                </template>
+              </tbody>
+            </table>
+            <template x-for="(msg, field) in setupFieldErrors" :key="field">
+              <div class="field-error" x-text="field + ': ' + msg"></div>
+            </template>
+
+            <div x-show="alibabaOpenFor" style="margin-top: 1rem; padding-top: 1rem; border-top: 1px solid var(--pico-muted-border-color)">
+              <strong>Console login for <span x-text="alibabaOpenFor"></span></strong>
+              <div style="display: flex; gap: 0.5rem; align-items: center; margin-top: 0.5rem">
+                <select x-model="alibabaForm.site">
+                  <option value="domestic">domestic</option>
+                  <option value="international">international</option>
+                </select>
+                <input type="text" placeholder="region, e.g. cn-beijing" x-model="alibabaForm.region" />
+                <button @click="startAlibabaLogin(alibabaOpenFor)">start</button>
+              </div>
+              <div x-show="alibabaJob" style="margin-top: 0.5rem; font-size: 0.85rem">
+                <span x-show="alibabaJob && alibabaJob.status === 'pending'" x-text="'in progress… ' + alibabaJob.elapsed + 's'"></span>
+                <span x-show="alibabaJob && alibabaJob.status === 'succeeded'">done</span>
+                <span class="field-error" x-show="alibabaJob && alibabaJob.status === 'failed'" x-text="alibabaJob.error"></span>
+              </div>
+            </div>
+          </article>
+
+          <article>
+            <h3>Add account</h3>
+            <div class="field-grid">
+              <label>Name</label>
+              <input type="text" x-model="newProfile.name" />
+              <label>Base URL</label>
+              <input type="text" placeholder="leave blank for an OAuth account" x-model="newProfile.base_url" />
+              <label>API key</label>
+              <input type="password" placeholder="leave blank for an OAuth account" x-model="newProfile.api_key" />
+            </div>
+            <button style="margin-top: 0.75rem" @click="createProfile()">create</button>
+            <div class="field-error" x-show="createError" x-text="createError"></div>
+          </article>
+
+          <article>
+            <h3>OAuth login (new account)</h3>
+            <p style="font-size: 0.85rem; opacity: 0.7">Opens your browser to sign in with Claude, then adds the account under this name.</p>
+            <div style="display: flex; gap: 0.5rem; align-items: center">
+              <input type="text" placeholder="new account name" x-model="oauthName" />
+              <button @click="startOauthLogin()">log in with browser</button>
+            </div>
+            <div x-show="oauthJob" style="margin-top: 0.5rem; font-size: 0.85rem">
+              <span x-show="oauthJob && oauthJob.status === 'pending'" x-text="'waiting on the browser… ' + oauthJob.elapsed + 's'"></span>
+              <span x-show="oauthJob && oauthJob.status === 'succeeded'">signed in</span>
+              <span class="field-error" x-show="oauthJob && oauthJob.status === 'failed'" x-text="oauthJob.error"></span>
+            </div>
+          </article>
+        </section>
+
+        <!-- Status -->
+        <section x-show="tab === 'status'">
+          <article>
+            <p x-show="incidentsError" x-text="incidentsError"></p>
+            <div x-show="incidents && incidents.incidents.length === 0">No active incidents.</div>
+            <template x-for="inc in (incidents ? incidents.incidents : [])" :key="inc.id">
+              <div style="margin-bottom: 1rem; padding-bottom: 1rem; border-bottom: 1px solid var(--pico-muted-border-color)">
+                <div class="row" style="display: flex; justify-content: space-between">
+                  <strong x-text="inc.title"></strong>
+                  <span class="pill next" x-text="typeof inc.phase === 'string' ? inc.phase : JSON.stringify(inc.phase)"></span>
+                </div>
+                <div style="font-size: 0.8rem; opacity: 0.7">
+                  impact: <span x-text="typeof inc.impact === 'string' ? inc.impact : JSON.stringify(inc.impact)"></span>
+                </div>
+                <a :href="inc.link" target="_blank" rel="noopener" style="font-size: 0.8rem">details</a>
+              </div>
+            </template>
+          </article>
+        </section>
+
+        <!-- Plugin -->
+        <section x-show="tab === 'plugin'">
+          <article x-show="pluginData">
+            <template x-if="pluginData">
+              <div>
+                <div class="field-grid">
+                  <label>Installed</label>
+                  <span x-text="pluginData.installed ? 'yes' : 'no'"></span>
+                  <label>Marketplace</label>
+                  <span x-text="pluginData.marketplace_known ? 'known' : 'unknown'"></span>
+                  <label>MCP wiring</label>
+                  <span x-text="pluginData.mcp_wiring"></span>
+                  <label>Claude CLI</label>
+                  <span x-text="pluginData.claude_version || '—'"></span>
+                </div>
+                <div style="margin-top: 1rem; display: flex; gap: 0.5rem">
+                  <button :aria-busy="pluginBusy" :disabled="pluginBusy" @click="pluginInstall()">install</button>
+                  <button class="outline" :aria-busy="pluginBusy" :disabled="pluginBusy" @click="pluginSelfHeal()">self-heal</button>
+                </div>
+                <div class="field-error" x-show="pluginError" x-text="pluginError"></div>
+              </div>
+            </template>
+          </article>
+        </section>
       </main>
     </div>
 

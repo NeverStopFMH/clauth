@@ -31,6 +31,13 @@ function fmtReset(iso) {
   return `${days}d ${hours % 24}h`;
 }
 
+function fmtNumber(n) {
+  if (n === null || n === undefined) return "—";
+  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
+  if (n >= 1_000) return `${(n / 1_000).toFixed(1)}K`;
+  return String(n);
+}
+
 function windowFor(profile, label) {
   return (profile.windows || []).find((w) => w.label === label) || null;
 }
@@ -53,6 +60,27 @@ document.addEventListener("alpine:init", () => {
     fallbackSelected: null,
     fallbackAdding: false,
     fieldErrors: {},
+    pluginData: null,
+    pluginBusy: false,
+    pluginError: null,
+    incidents: null,
+    incidentsError: null,
+    _incidentsTimer: null,
+    usageSelected: null,
+    configData: null,
+    configFieldErrors: {},
+    tokensData: null,
+    tokensError: null,
+    setupData: null,
+    setupFieldErrors: {},
+    endpointDrafts: {},
+    newProfile: { name: "", base_url: "", api_key: "" },
+    createError: null,
+    oauthName: "",
+    oauthJob: null,
+    alibabaOpenFor: null,
+    alibabaForm: { site: "domestic", region: "" },
+    alibabaJob: null,
     toasts: [],
     _toastId: 0,
     _pollTimer: null,
@@ -71,6 +99,14 @@ document.addEventListener("alpine:init", () => {
     selectTab(id) {
       this.tab = id;
       if (id === "fallback") this.loadFallback();
+      if (id === "plugin") this.loadPlugin();
+      if (id === "status") this.loadIncidents();
+      if (id === "config") this.loadConfig();
+      if (id === "tokens") this.loadTokens();
+      if (id === "setup") this.loadSetup();
+      if (id === "usage" && !this.usageSelected && this.status && this.status.profiles.length > 0) {
+        this.usageSelected = this.status.profiles[0].name;
+      }
     },
 
     async fetchStatus() {
@@ -97,6 +133,7 @@ document.addEventListener("alpine:init", () => {
 
     fmtPct,
     fmtReset,
+    fmtNumber,
     windowFor,
     gaugeClass,
 
@@ -141,6 +178,11 @@ document.addEventListener("alpine:init", () => {
         else if (p.auth_status === "broken") state = "blocked";
         return { profile: p, pct, threshold: p.fallback.threshold, state };
       });
+    },
+
+    usageProfile() {
+      if (!this.status || !this.usageSelected) return null;
+      return this.status.profiles.find((p) => p.name === this.usageSelected) || null;
     },
 
     // ---- Fallback ----
@@ -232,6 +274,318 @@ document.addEventListener("alpine:init", () => {
       names.splice(index, 0, moved);
       this._dragIndex = null;
       this.setChain(names);
+    },
+
+    // ---- Plugin ----
+
+    async loadPlugin() {
+      try {
+        const res = await fetch("/api/plugin/status");
+        if (!res.ok) return;
+        this.pluginData = await res.json();
+      } catch {
+        // left as-is; selecting the tab again retries
+      }
+    },
+
+    async pluginInstall() {
+      this.pluginBusy = true;
+      this.pluginError = null;
+      try {
+        const res = await fetch("/api/plugin/install", { method: "POST" });
+        const body = await res.json().catch(() => ({}));
+        if (!res.ok) {
+          this.pluginError = body.error || `error ${res.status}`;
+        } else {
+          this.pushToast("plugin installed");
+          await this.loadPlugin();
+        }
+      } catch (e) {
+        this.pluginError = String(e);
+      } finally {
+        this.pluginBusy = false;
+      }
+    },
+
+    async pluginSelfHeal() {
+      this.pluginBusy = true;
+      this.pluginError = null;
+      try {
+        const res = await fetch("/api/plugin/self-heal", { method: "POST" });
+        const body = await res.json().catch(() => ({}));
+        if (!res.ok) {
+          this.pluginError = body.error || `error ${res.status}`;
+        } else {
+          this.pushToast("self-heal complete");
+          await this.loadPlugin();
+        }
+      } catch (e) {
+        this.pluginError = String(e);
+      } finally {
+        this.pluginBusy = false;
+      }
+    },
+
+    // ---- Config ----
+
+    async loadConfig() {
+      try {
+        const res = await fetch("/api/config");
+        if (!res.ok) return;
+        this.configData = await res.json();
+      } catch {
+        // left as-is; selecting the tab again retries
+      }
+    },
+
+    async patchConfig(field, value) {
+      try {
+        const res = await fetch("/api/config", {
+          method: "PATCH",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ [field]: value }),
+        });
+        if (!res.ok) {
+          const body = await res.json().catch(() => ({}));
+          this.configFieldErrors = { ...this.configFieldErrors, [field]: body.error || `error ${res.status}` };
+          return;
+        }
+        const rest = { ...this.configFieldErrors };
+        delete rest[field];
+        this.configFieldErrors = rest;
+        this.pushToast("saved");
+        await this.loadConfig();
+      } catch (e) {
+        this.configFieldErrors = { ...this.configFieldErrors, [field]: String(e) };
+      }
+    },
+
+    // ---- Setup ----
+
+    async loadSetup() {
+      try {
+        const res = await fetch("/api/profiles");
+        if (!res.ok) return;
+        this.setupData = await res.json();
+      } catch {
+        // left as-is; selecting the tab again retries
+      }
+    },
+
+    async createProfile() {
+      this.createError = null;
+      try {
+        const res = await fetch("/api/profiles", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            name: this.newProfile.name,
+            base_url: this.newProfile.base_url || null,
+            api_key: this.newProfile.api_key || null,
+          }),
+        });
+        const body = await res.json().catch(() => ({}));
+        if (!res.ok) {
+          this.createError = body.error || `error ${res.status}`;
+          return;
+        }
+        this.pushToast(`created ${this.newProfile.name}`);
+        this.newProfile = { name: "", base_url: "", api_key: "" };
+        await this.loadSetup();
+      } catch (e) {
+        this.createError = String(e);
+      }
+    },
+
+    // The backend patches base_url + api_key TOGETHER (see EndpointPatch in
+    // src/web/profiles.rs) — there is no "leave the key alone" value, so
+    // sending one without the other WOULD null out whichever is omitted.
+    // The UI never sees a stored key back (only `has_api_key`), so an edit
+    // always collects both fields explicitly rather than firing off a lone
+    // base_url change that could silently wipe an existing key.
+    startEndpointEdit(p) {
+      this.endpointDrafts = { ...this.endpointDrafts, [p.name]: { base_url: p.base_url || "", api_key: "" } };
+    },
+
+    cancelEndpointEdit(name) {
+      const rest = { ...this.endpointDrafts };
+      delete rest[name];
+      this.endpointDrafts = rest;
+    },
+
+    async saveEndpointEdit(name, hadApiKey) {
+      const draft = this.endpointDrafts[name];
+      const key = `${name}.endpoint`;
+      if (hadApiKey && !draft.api_key) {
+        this.setupFieldErrors = {
+          ...this.setupFieldErrors,
+          [key]: "re-enter the API key to save (it can't be read back, so it must be re-typed alongside any other change)",
+        };
+        return;
+      }
+      try {
+        const res = await fetch(`/api/profiles/${encodeURIComponent(name)}`, {
+          method: "PATCH",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ endpoint: { base_url: draft.base_url || null, api_key: draft.api_key || null } }),
+        });
+        if (!res.ok) {
+          const body = await res.json().catch(() => ({}));
+          this.setupFieldErrors = { ...this.setupFieldErrors, [key]: body.error || `error ${res.status}` };
+          return;
+        }
+        const rest = { ...this.setupFieldErrors };
+        delete rest[key];
+        this.setupFieldErrors = rest;
+        this.cancelEndpointEdit(name);
+        this.pushToast("saved");
+        await this.loadSetup();
+      } catch (e) {
+        this.setupFieldErrors = { ...this.setupFieldErrors, [key]: String(e) };
+      }
+    },
+
+    async toggleProfileDisabled(name, disabled) {
+      try {
+        const res = await fetch(`/api/profiles/${encodeURIComponent(name)}`, {
+          method: "PATCH",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ disabled }),
+        });
+        if (!res.ok) {
+          const body = await res.json().catch(() => ({}));
+          this.pushToast(`update failed: ${body.error || res.status}`);
+          return;
+        }
+        await this.loadSetup();
+      } catch (e) {
+        this.pushToast(`update failed: ${e}`);
+      }
+    },
+
+    async deleteSetupProfile(name) {
+      try {
+        const res = await fetch(`/api/profiles/${encodeURIComponent(name)}`, { method: "DELETE" });
+        if (!res.ok) {
+          const body = await res.json().catch(() => ({}));
+          this.pushToast(`delete failed: ${body.error || res.status}`);
+          return;
+        }
+        this.pushToast(`deleted ${name}`);
+        await this.loadSetup();
+      } catch (e) {
+        this.pushToast(`delete failed: ${e}`);
+      }
+    },
+
+    startJobPolling(jobId, stateKey) {
+      const startedAt = Date.now();
+      this[stateKey] = { id: jobId, status: "pending", elapsed: 0, error: null };
+      const tick = setInterval(() => {
+        if (!this[stateKey] || this[stateKey].id !== jobId) {
+          clearInterval(tick);
+          return;
+        }
+        this[stateKey] = { ...this[stateKey], elapsed: Math.round((Date.now() - startedAt) / 1000) };
+      }, 1000);
+      const poll = async () => {
+        if (!this[stateKey] || this[stateKey].id !== jobId) return;
+        try {
+          const res = await fetch(`/api/jobs/${jobId}`);
+          const body = await res.json().catch(() => ({}));
+          if (body.status === "succeeded") {
+            this[stateKey] = { ...this[stateKey], status: "succeeded" };
+            clearInterval(tick);
+            this.pushToast("login succeeded");
+            await this.loadSetup();
+            return;
+          }
+          if (body.status === "failed") {
+            this[stateKey] = { ...this[stateKey], status: "failed", error: body.error };
+            clearInterval(tick);
+            return;
+          }
+        } catch {
+          // transient network hiccup; keep polling
+        }
+        setTimeout(poll, 1500);
+      };
+      poll();
+    },
+
+    async startOauthLogin() {
+      if (!this.oauthName) return;
+      try {
+        const res = await fetch("/api/login/oauth", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ name: this.oauthName }),
+        });
+        const body = await res.json().catch(() => ({}));
+        if (!res.ok) {
+          this.pushToast(`login failed: ${body.error || res.status}`);
+          return;
+        }
+        this.startJobPolling(body.job_id, "oauthJob");
+      } catch (e) {
+        this.pushToast(`login failed: ${e}`);
+      }
+    },
+
+    async startAlibabaLogin(name) {
+      try {
+        const res = await fetch(`/api/profiles/${encodeURIComponent(name)}/login/alibaba`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ site: this.alibabaForm.site, region: this.alibabaForm.region }),
+        });
+        const body = await res.json().catch(() => ({}));
+        if (!res.ok) {
+          this.pushToast(`login failed: ${body.error || res.status}`);
+          return;
+        }
+        this.alibabaOpenFor = null;
+        this.startJobPolling(body.job_id, "alibabaJob");
+      } catch (e) {
+        this.pushToast(`login failed: ${e}`);
+      }
+    },
+
+    // ---- Tokens ----
+
+    async loadTokens() {
+      try {
+        const res = await fetch("/api/tokens");
+        if (!res.ok) {
+          this.tokensError = res.status === 503 ? "no token stats cached yet" : `error ${res.status}`;
+          return;
+        }
+        this.tokensData = await res.json();
+        this.tokensError = null;
+      } catch {
+        this.tokensError = "unreachable";
+      }
+    },
+
+    // ---- Status ----
+
+    async loadIncidents() {
+      try {
+        const res = await fetch("/api/status/incidents");
+        if (!res.ok) {
+          this.incidentsError = res.status === 503 ? "no feed cached yet" : `error ${res.status}`;
+          return;
+        }
+        this.incidents = await res.json();
+        this.incidentsError = null;
+      } catch {
+        this.incidentsError = "unreachable";
+      }
+      if (!this._incidentsTimer) {
+        this._incidentsTimer = setInterval(() => {
+          if (this.tab === "status" && document.visibilityState === "visible") this.loadIncidents();
+        }, 30000);
+      }
     },
   }));
 });

@@ -1,6 +1,6 @@
-//! End-to-end tests for the profile write endpoints: each drives a real
-//! spawned server, hitting real `actions.rs` calls against a sandboxed home,
-//! not just the route-dispatch logic in isolation.
+//! End-to-end tests for the profile endpoints: each drives a real spawned
+//! server, hitting real `actions.rs` calls against a sandboxed home, not
+//! just the route-dispatch logic in isolation.
 
 use std::sync::Arc;
 
@@ -299,6 +299,46 @@ fn patch_disables_and_reenables_a_profile() {
             .disabled
     );
     drop(cfg);
+    handle.stop();
+}
+
+#[test]
+fn list_includes_disabled_profiles_with_setup_only_fields() {
+    let _home = HomeSandbox::new();
+    let mut visible = Profile::new("visible".to_string(), None, None);
+    visible.base_url = Some("https://api.example.com".into());
+    visible.api_key = Some("sk-secret".into());
+    let mut hidden = Profile::new("hidden".to_string(), None, None);
+    hidden.disabled = true;
+    for p in [&visible, &hidden] {
+        crate::profile::save_profile(p).expect("save profile");
+    }
+    let state = AppState {
+        profiles: vec!["visible".into(), "hidden".into()],
+        ..AppState::default()
+    };
+    crate::profile::save_app_state(&state).expect("persist state");
+    let config = AppConfig {
+        state,
+        profiles: vec![visible, hidden],
+    };
+
+    let (handle, _config_handle) = start_with(config);
+    let url = format!("http://{}/api/profiles", handle.addr());
+    let mut response = ureq::get(&url).call().expect("list request");
+    assert_eq!(response.status().as_u16(), 200);
+    let text = response.body_mut().read_to_string().expect("body");
+    let body: serde_json::Value = serde_json::from_str(&text).expect("json body");
+    let names: Vec<&str> = body["profiles"]
+        .as_array()
+        .expect("profiles array")
+        .iter()
+        .map(|p| p["name"].as_str().expect("name"))
+        .collect();
+    assert_eq!(names, vec!["visible", "hidden"]);
+    assert_eq!(body["profiles"][0]["has_api_key"], true);
+    assert_eq!(body["profiles"][0]["base_url"], "https://api.example.com");
+    assert_eq!(body["profiles"][1]["disabled"], true);
     handle.stop();
 }
 

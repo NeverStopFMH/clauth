@@ -68,6 +68,40 @@ fn patch_persists_across_a_config_reload() {
 }
 
 #[test]
+fn get_reports_effective_defaults_on_a_blank_config() {
+    let _home = HomeSandbox::new();
+    let (handle, _config_handle) = start_with(blank_config());
+    let url = format!("http://{}/api/config", handle.addr());
+    let mut response = ureq::get(&url).call().expect("get request");
+    assert_eq!(response.status().as_u16(), 200);
+    let text = response.body_mut().read_to_string().expect("body");
+    let body: serde_json::Value = serde_json::from_str(&text).expect("json body");
+    assert!(body["theme"].is_null());
+    assert!(body["default_divergence"].is_null());
+    assert_eq!(body["weekly_switch_threshold"], 98.0);
+    assert_eq!(body["switch_off_when_spent"], false);
+    handle.stop();
+}
+
+#[test]
+fn get_reflects_a_prior_patch() {
+    let _home = HomeSandbox::new();
+    let (handle, _config_handle) = start_with(blank_config());
+    let url = format!("http://{}/api/config", handle.addr());
+    let response = ureq::patch(&url)
+        .header("Content-Type", "application/json")
+        .send(serde_json::json!({"theme": "compatible"}).to_string())
+        .expect("patch request");
+    assert_eq!(response.status().as_u16(), 200);
+
+    let mut response = ureq::get(&url).call().expect("get request");
+    let text = response.body_mut().read_to_string().expect("body");
+    let body: serde_json::Value = serde_json::from_str(&text).expect("json body");
+    assert_eq!(body["theme"], "compatible");
+    handle.stop();
+}
+
+#[test]
 fn patch_with_no_authorization_header_still_succeeds() {
     let _home = HomeSandbox::new();
     let (handle, _config_handle) = start_with(blank_config());

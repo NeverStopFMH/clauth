@@ -10,6 +10,41 @@ use tiny_http::StatusCode;
 use super::{RouteResult, error_body, ok_body, read_json_body};
 use crate::profile::{ConfigHandle, ProfileName};
 
+/// `GET /api/profiles` — every profile, including disabled ones, with the
+/// fields the Setup tab's edit form needs. `GET /api/status` won't do here:
+/// its `profiles[]` is the daemon's own published feed, which hides disabled
+/// accounts entirely (`include_disabled: false`) and carries no `env`/
+/// `disabled`/api-key-presence fields at all — that shape is contracted by
+/// `wiki/Daemon.md` for external readers, not meant to grow Setup-only
+/// fields. The API key's VALUE is never sent, only whether one is set, same
+/// as the TUI's own display convention for a stored key.
+pub(super) fn list(config: &ConfigHandle) -> RouteResult {
+    #[allow(
+        clippy::expect_used,
+        reason = "config mutex poisoning is unrecoverable"
+    )]
+    let cfg = config.lock().expect("config mutex poisoned");
+    let profiles: Vec<serde_json::Value> = cfg
+        .profiles
+        .iter()
+        .map(|p| {
+            serde_json::json!({
+                "name": p.name.as_ref(),
+                "base_url": p.base_url,
+                "has_api_key": p.api_key.is_some(),
+                "env": p.env,
+                "disabled": p.is_disabled(),
+                "auto_start": p.auto_start,
+                "provider": crate::profile_json::provider_label(p),
+            })
+        })
+        .collect();
+    Ok((
+        StatusCode(200),
+        serde_json::json!({ "profiles": profiles }).to_string(),
+    ))
+}
+
 #[derive(Deserialize)]
 struct SwitchRequest {
     name: String,

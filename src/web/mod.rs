@@ -5,9 +5,11 @@
 //! for the full design.
 
 mod auth;
+mod profiles;
 
 use std::sync::Arc;
 
+use serde::de::DeserializeOwned;
 use tiny_http::{Header, Method, Response, Server, StatusCode};
 
 use crate::profile::ConfigHandle;
@@ -18,6 +20,46 @@ pub(crate) use auth::load_or_create_token;
 /// bind target (tests use `127.0.0.1:0` for an OS-assigned free port) pass
 /// their own address to [`spawn`] instead of using this.
 pub(crate) const DEFAULT_PORT: u16 = 47893;
+
+/// A status code + JSON body — every route handler's return type. `Result`'s
+/// two arms are used purely for `?`-early-return convenience (a body-parse
+/// failure short-circuits past the business logic); [`resolve`] collapses
+/// both arms back into one, since a failure response is exactly as valid an
+/// HTTP response as a success one.
+pub(super) type RouteResult = Result<(StatusCode, String), (StatusCode, String)>;
+
+fn resolve(result: RouteResult) -> (StatusCode, String) {
+    match result {
+        Ok(r) | Err(r) => r,
+    }
+}
+
+/// `{"ok":true}`, the shape every successful write endpoint answers with —
+/// none of them have a natural payload to return beyond "it worked".
+pub(super) fn ok_body() -> String {
+    r#"{"ok":true}"#.to_string()
+}
+
+/// `{"error":"<msg>"}`, JSON-escaping `msg` so an error string that happens
+/// to contain a `"` or newline (an account name, a filesystem path) can't
+/// produce invalid JSON.
+pub(super) fn error_body(msg: &str) -> String {
+    serde_json::json!({ "error": msg }).to_string()
+}
+
+/// Parse the request body as JSON, or a 400 response reader/handlers `?`
+/// straight out of the route function.
+pub(super) fn read_json_body<T: DeserializeOwned>(
+    request: &mut tiny_http::Request,
+) -> Result<T, (StatusCode, String)> {
+    let mut body = String::new();
+    request
+        .as_reader()
+        .read_to_string(&mut body)
+        .map_err(|e| (StatusCode(400), error_body(&format!("failed to read body: {e}"))))?;
+    serde_json::from_str(&body)
+        .map_err(|e| (StatusCode(400), error_body(&format!("invalid JSON body: {e}"))))
+}
 
 /// A running server plus the means to stop it. [`Handle::stop`] breaks the
 /// accept loop out of its blocking `recv` and joins the thread, so tests that
@@ -86,25 +128,52 @@ pub(crate) fn spawn(config: ConfigHandle, token: String, addr: &str) -> std::io:
 }
 
 /// Route one request. Read routes answer unconditionally; write routes 401
-/// without a valid bearer token. The rest of the API lands in follow-up
-/// slices (see the design spec).
-fn handle_request(_config: &ConfigHandle, token: &str, request: tiny_http::Request) {
+/// without a valid bearer token, checked BEFORE the route body ever runs.
+fn handle_request(config: &ConfigHandle, token: &str, mut request: tiny_http::Request) {
     let method = request.method().clone();
     let url = request.url().to_string();
-    let response = match (&method, url.as_str()) {
-        (Method::Get, "/api/health") => json_response(StatusCode(200), r#"{"ok":true}"#),
-        (Method::Get, "/api/status") => status_response(),
-        (Method::Get, "/api/status/incidents") => incidents_response(),
-        _ if is_write_method(&method) && !request_is_authorized(&request, token) => {
-            json_response(StatusCode(401), r#"{"error":"unauthorized"}"#)
-        }
-        _ => json_response(StatusCode(404), r#"{"error":"not found"}"#),
+    let (status, body) = if is_write_method(&method) && !request_is_authorized(&request, token) {
+        (StatusCode(401), error_body("unauthorized"))
+    } else {
+        resolve(route(config, &method, &url, &mut request))
     };
-    let _ = request.respond(response);
+    let _ = request.respond(json_response(status, &body));
+}
+
+fn route(
+    config: &ConfigHandle,
+    method: &Method,
+    url: &str,
+    request: &mut tiny_http::Request,
+) -> RouteResult {
+    let path = url.split('?').next().unwrap_or(url);
+    match (method, path) {
+        (Method::Get, "/api/health") => Ok((StatusCode(200), r#"{"ok":true}"#.to_string())),
+        (Method::Get, "/api/status") => Ok(status_body()),
+        (Method::Get, "/api/status/incidents") => Ok(incidents_body()),
+        (Method::Post, "/api/profiles/switch") => profiles::switch(config, request),
+        (Method::Post, "/api/profiles/reorder") => profiles::reorder(config, request),
+        (Method::Post, "/api/profiles") => profiles::create(config, request),
+        (Method::Delete, p) if p.starts_with("/api/profiles/") => {
+            profiles::delete(config, path_tail(p, "/api/profiles/"), url)
+        }
+        (Method::Patch, p) if p.starts_with("/api/profiles/") => {
+            profiles::patch(config, path_tail(p, "/api/profiles/"), request)
+        }
+        _ => Err((StatusCode(404), error_body("not found"))),
+    }
 }
 
 fn is_write_method(method: &Method) -> bool {
     matches!(method, Method::Post | Method::Patch | Method::Delete)
+}
+
+/// The segment of `path` after `prefix` — the `{name}` in `/api/profiles/{name}`.
+/// Every character `validate_profile_name` allows (`[A-Za-z0-9._@+-]`) is a
+/// plain, unreserved URL path character with no percent-encoding, so no
+/// decoding step is needed here.
+fn path_tail<'a>(path: &'a str, prefix: &str) -> &'a str {
+    path.strip_prefix(prefix).unwrap_or(path)
 }
 
 /// `GET /api/status`: the same `~/.clauth/status.json` a daemon publishes
@@ -114,10 +183,10 @@ fn is_write_method(method: &Method) -> bool {
 /// `clauth status --json` and any other reader of the file already see. A
 /// 503 (not 404) when the file doesn't exist yet: the server binds before
 /// the first tick writes it, a startup window rather than a missing route.
-fn status_response() -> Response<std::io::Cursor<Vec<u8>>> {
+fn status_body() -> (StatusCode, String) {
     match read_status_file() {
-        Ok(body) => json_response(StatusCode(200), &body),
-        Err(_) => json_response(StatusCode(503), r#"{"error":"status not ready yet"}"#),
+        Ok(body) => (StatusCode(200), body),
+        Err(_) => (StatusCode(503), error_body("status not ready yet")),
     }
 }
 
@@ -129,15 +198,15 @@ fn read_status_file() -> std::io::Result<String> {
 /// `GET /api/status/incidents`: `~/.clauth/status_cache.json` verbatim — the
 /// Claude status-page feed's local cache (`{"fetched_at_ms", "incidents"}`),
 /// same "serve the file the background writer already maintains" pattern as
-/// [`status_response`]. 503 while nothing has been fetched yet (a fresh
-/// install, or the poller hasn't completed its first round).
-fn incidents_response() -> Response<std::io::Cursor<Vec<u8>>> {
+/// [`status_body`]. 503 while nothing has been fetched yet (a fresh install,
+/// or the poller hasn't completed its first round).
+fn incidents_body() -> (StatusCode, String) {
     let body = crate::status::cache_path()
         .ok_or(())
         .and_then(|path| std::fs::read_to_string(path).map_err(|_| ()));
     match body {
-        Ok(body) => json_response(StatusCode(200), &body),
-        Err(()) => json_response(StatusCode(503), r#"{"error":"no status feed cached yet"}"#),
+        Ok(body) => (StatusCode(200), body),
+        Err(()) => (StatusCode(503), error_body("no status feed cached yet")),
     }
 }
 

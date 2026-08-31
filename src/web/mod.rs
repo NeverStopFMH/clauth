@@ -5,7 +5,9 @@
 //! for the full design.
 
 mod auth;
+mod config;
 mod fallback;
+mod plugin;
 mod profiles;
 
 use std::sync::Arc;
@@ -162,6 +164,10 @@ fn route(
         (Method::Post, "/api/profiles/reorder") => profiles::reorder(config, request),
         (Method::Post, "/api/profiles") => profiles::create(config, request),
         (Method::Patch, "/api/fallback") => fallback::set_chain(config, request),
+        (Method::Patch, "/api/config") => config::patch(config, request),
+        (Method::Get, "/api/plugin/status") => Ok(plugin::status()),
+        (Method::Post, "/api/plugin/install") => Ok(plugin::install()),
+        (Method::Post, "/api/plugin/self-heal") => Ok(plugin::self_heal()),
         (Method::Delete, p) if p.starts_with("/api/profiles/") => {
             profiles::delete(config, path_tail(p, "/api/profiles/"), url)
         }

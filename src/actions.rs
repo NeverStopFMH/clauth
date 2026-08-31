@@ -19,8 +19,9 @@ use crate::lockorder::RankedMutex;
 use crate::oauth;
 use crate::out::{out, outln};
 use crate::profile::{
-    AccountId, AppConfig, ClaudeCredentials, ConsoleCredential, DivergenceChoice, ModelSettings,
-    Profile, ProfileName, load_app_state, profile_dir, save_app_state, save_profile,
+    AccountId, AppConfig, ClaudeCredentials, ClockFormat, ConsoleCredential, DivergenceChoice,
+    ModelSettings, Profile, ProfileName, ResetDisplay, ThemeName, load_app_state, profile_dir,
+    save_app_state, save_profile,
 };
 use crate::providers::Provider;
 use crate::runtime::RotationGuard;
@@ -1444,6 +1445,102 @@ pub(crate) fn toggle_preferred(
                 Err(e)
             }
         }
+    })
+}
+
+// ── Config tab ───────────────────────────────────────────────────────────────
+//
+// Unlike the fallback setters above, the TUI's own Config-tab keystrokes
+// (`cycle_theme`, `step_refresh_interval`, …) each compute the NEXT value in
+// a cycle/step before persisting — that "what comes after the current one"
+// logic is presentation, specific to a keyboard row, and stays in
+// `tui/app.rs`. The web dashboard's form fields hand over an exact end state
+// instead (a dropdown pick, a typed number), so there is no cycle logic to
+// share; only the persistence step is common, and it is cheap enough to
+// write fresh here as one patch + one save rather than thread a shared
+// setter through fourteen single-field TUI functions that don't otherwise
+// need one.
+
+/// A partial patch over the Config tab's global settings: every field
+/// `#[serde(default)]`-defaults to `None`, meaning "leave this alone" — only
+/// fields present in the request are written, in one [`save_app_state`] call.
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+pub(crate) struct ConfigPatch {
+    #[serde(default)]
+    pub(crate) theme: Option<ThemeName>,
+    #[serde(default)]
+    pub(crate) reset_display: Option<ResetDisplay>,
+    #[serde(default)]
+    pub(crate) clock_format: Option<ClockFormat>,
+    #[serde(default)]
+    pub(crate) default_divergence: Option<DivergenceChoice>,
+    #[serde(default)]
+    pub(crate) switch_off_when_spent: Option<bool>,
+    #[serde(default)]
+    pub(crate) weekly_switch_threshold: Option<f64>,
+    #[serde(default)]
+    pub(crate) refresh_interval_ms: Option<u64>,
+    #[serde(default)]
+    pub(crate) burn_aware_switching: Option<bool>,
+    #[serde(default)]
+    pub(crate) burn_switch_floor_pct: Option<f64>,
+    #[serde(default)]
+    pub(crate) burn_horizon_cap_ms: Option<u64>,
+    #[serde(default)]
+    pub(crate) spend_budget_switching: Option<bool>,
+    #[serde(default)]
+    pub(crate) switch_off_when_budget_spent: Option<bool>,
+    #[serde(default)]
+    pub(crate) preemptive_rotation: Option<bool>,
+    #[serde(default)]
+    pub(crate) refresh_spent_accounts: Option<bool>,
+}
+
+pub(crate) fn apply_config_patch(config: &mut AppConfig, patch: ConfigPatch) -> Result<()> {
+    with_state_lock(|_held| {
+        if let Some(v) = patch.theme {
+            config.state.theme = Some(v);
+        }
+        if let Some(v) = patch.reset_display {
+            config.state.reset_display = Some(v);
+        }
+        if let Some(v) = patch.clock_format {
+            config.state.clock_format = Some(v);
+        }
+        if let Some(v) = patch.default_divergence {
+            config.state.default_divergence = Some(v);
+        }
+        if let Some(v) = patch.switch_off_when_spent {
+            config.state.switch_off_when_spent = v;
+        }
+        if let Some(v) = patch.weekly_switch_threshold {
+            config.state.weekly_switch_threshold = Some(v);
+        }
+        if let Some(v) = patch.refresh_interval_ms {
+            config.state.refresh_interval_ms = v;
+        }
+        if let Some(v) = patch.burn_aware_switching {
+            config.state.burn_aware_switching = v;
+        }
+        if let Some(v) = patch.burn_switch_floor_pct {
+            config.state.burn_switch_floor_pct = Some(v);
+        }
+        if let Some(v) = patch.burn_horizon_cap_ms {
+            config.state.burn_horizon_cap_ms = Some(v);
+        }
+        if let Some(v) = patch.spend_budget_switching {
+            config.state.spend_budget_switching = v;
+        }
+        if let Some(v) = patch.switch_off_when_budget_spent {
+            config.state.switch_off_when_budget_spent = v;
+        }
+        if let Some(v) = patch.preemptive_rotation {
+            config.state.preemptive_rotation = v;
+        }
+        if let Some(v) = patch.refresh_spent_accounts {
+            config.state.refresh_spent_accounts = v;
+        }
+        save_app_state(&config.state)
     })
 }
 

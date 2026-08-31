@@ -17,7 +17,10 @@ struct SwitchRequest {
 
 pub(super) fn switch(config: &ConfigHandle, request: &mut tiny_http::Request) -> RouteResult {
     let body: SwitchRequest = read_json_body(request)?;
-    #[allow(clippy::expect_used, reason = "config mutex poisoning is unrecoverable")]
+    #[allow(
+        clippy::expect_used,
+        reason = "config mutex poisoning is unrecoverable"
+    )]
     let mut cfg = config.lock().expect("config mutex poisoned");
     crate::actions::switch_profile(&mut cfg, &ProfileName::from(body.name))
         .map(|()| (StatusCode(200), ok_body()))
@@ -32,7 +35,10 @@ struct ReorderRequest {
 
 pub(super) fn reorder(config: &ConfigHandle, request: &mut tiny_http::Request) -> RouteResult {
     let body: ReorderRequest = read_json_body(request)?;
-    #[allow(clippy::expect_used, reason = "config mutex poisoning is unrecoverable")]
+    #[allow(
+        clippy::expect_used,
+        reason = "config mutex poisoning is unrecoverable"
+    )]
     let mut cfg = config.lock().expect("config mutex poisoned");
     crate::actions::reorder_profile(&mut cfg, body.from, body.to)
         .map(|()| (StatusCode(200), ok_body()))
@@ -52,7 +58,10 @@ struct CreateRequest {
 
 pub(super) fn create(config: &ConfigHandle, request: &mut tiny_http::Request) -> RouteResult {
     let body: CreateRequest = read_json_body(request)?;
-    #[allow(clippy::expect_used, reason = "config mutex poisoning is unrecoverable")]
+    #[allow(
+        clippy::expect_used,
+        reason = "config mutex poisoning is unrecoverable"
+    )]
     let mut cfg = config.lock().expect("config mutex poisoned");
     let existing: Vec<&str> = cfg.profiles.iter().map(|p| p.name.as_str()).collect();
     if let Err(e) = crate::actions::validate_profile_name(&body.name, &existing, None) {
@@ -82,7 +91,10 @@ pub(super) fn delete(config: &ConfigHandle, name: &str, url: &str) -> RouteResul
         Ok(guard) => guard,
         Err(e) => return Err((StatusCode(423), error_body(&e.to_string()))),
     };
-    #[allow(clippy::expect_used, reason = "config mutex poisoning is unrecoverable")]
+    #[allow(
+        clippy::expect_used,
+        reason = "config mutex poisoning is unrecoverable"
+    )]
     let mut cfg = config.lock().expect("config mutex poisoned");
     crate::actions::delete_profile(&mut cfg, &name, force, &rotation)
         .map(|()| (StatusCode(200), ok_body()))
@@ -119,7 +131,10 @@ pub(super) fn patch(
 ) -> RouteResult {
     let body: PatchRequest = read_json_body(request)?;
     let name = ProfileName::from(name.to_string());
-    #[allow(clippy::expect_used, reason = "config mutex poisoning is unrecoverable")]
+    #[allow(
+        clippy::expect_used,
+        reason = "config mutex poisoning is unrecoverable"
+    )]
     let mut cfg = config.lock().expect("config mutex poisoned");
 
     if let Some(endpoint) = body.endpoint {

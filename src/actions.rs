@@ -1295,6 +1295,180 @@ pub(crate) fn reorder_profile(config: &mut AppConfig, from: usize, to: usize) ->
     })
 }
 
+// ── Fallback tab ─────────────────────────────────────────────────────────────
+//
+// The TUI's own fallback-detail keystrokes (`write_threshold`, `toggle_
+// preferred`, …) compute a value from the CURRENT one (step by ±5, flip a
+// bool) and then persist it; the web API instead receives an exact value
+// from a form, so these take the value already resolved rather than a
+// delta. The TUI wrappers call straight into these instead of duplicating
+// the persistence step.
+
+pub(crate) fn set_fallback_threshold(
+    config: &mut AppConfig,
+    name: &ProfileName,
+    value: f64,
+) -> Result<()> {
+    with_state_lock(|_held| {
+        let profile = config.find_mut(name).context("profile not found")?;
+        profile.fallback_threshold = Some(value);
+        save_profile(profile)
+    })
+}
+
+pub(crate) fn set_weekly_threshold(
+    config: &mut AppConfig,
+    name: &ProfileName,
+    value: Option<f64>,
+) -> Result<()> {
+    with_state_lock(|_held| {
+        let profile = config.find_mut(name).context("profile not found")?;
+        profile.weekly_threshold = value;
+        save_profile(profile)
+    })
+}
+
+pub(crate) fn set_max_auto_spend(
+    config: &mut AppConfig,
+    name: &ProfileName,
+    value: f64,
+) -> Result<()> {
+    with_state_lock(|_held| {
+        let profile = config.find_mut(name).context("profile not found")?;
+        profile.max_auto_spend = Some(value);
+        save_profile(profile)
+    })
+}
+
+/// Outcome of a radio-flag toggle (`preferred`/`last_resort`): which sibling,
+/// if any, the flag moved off of — `None` when the flag just turned off, or
+/// turned on with no other profile previously holding it.
+pub(crate) struct RadioToggleOutcome {
+    pub(crate) moved_from: Option<String>,
+}
+
+/// Flip `name`'s `last_resort` flag. The chain has ONE parking spot, so
+/// turning the mark on here clears it on every other profile (radio) and on
+/// `name`'s own `preferred` flag (the two never coexist on one profile). The
+/// target saves first; each cleared sibling then saves on its own, and a
+/// failed sibling clear leaves that one profile marked rather than lying
+/// about disk — same tolerance the fallback chain walk already has for a
+/// transiently double-marked chain.
+pub(crate) fn toggle_last_resort(
+    config: &mut AppConfig,
+    name: &ProfileName,
+) -> Result<RadioToggleOutcome> {
+    with_state_lock(|_held| {
+        let profile = config.find_mut(name).context("profile not found")?;
+        profile.last_resort = !profile.last_resort;
+        let now_on = profile.last_resort;
+        let cleared_preferred = now_on && profile.preferred;
+        if now_on {
+            profile.preferred = false;
+        }
+        match save_profile(profile) {
+            Ok(()) => {
+                let mut moved_from = None;
+                if now_on {
+                    for p in config
+                        .profiles
+                        .iter_mut()
+                        .filter(|p| p.last_resort && p.name != *name)
+                    {
+                        p.last_resort = false;
+                        match save_profile(p) {
+                            Ok(()) => {
+                                moved_from.get_or_insert_with(|| p.name.to_string());
+                            }
+                            Err(_) => p.last_resort = true,
+                        }
+                    }
+                }
+                Ok(RadioToggleOutcome { moved_from })
+            }
+            Err(e) => {
+                if let Some(p) = config.find_mut(name) {
+                    p.last_resort = !now_on;
+                    if cleared_preferred {
+                        p.preferred = true;
+                    }
+                }
+                Err(e)
+            }
+        }
+    })
+}
+
+/// Twin of [`toggle_last_resort`]: exclusive across the chain the same way,
+/// and reciprocally mutually exclusive — turning `preferred` on clears
+/// `last_resort` on the same profile.
+pub(crate) fn toggle_preferred(
+    config: &mut AppConfig,
+    name: &ProfileName,
+) -> Result<RadioToggleOutcome> {
+    with_state_lock(|_held| {
+        let profile = config.find_mut(name).context("profile not found")?;
+        profile.preferred = !profile.preferred;
+        let now_on = profile.preferred;
+        let cleared_last_resort = now_on && profile.last_resort;
+        if now_on {
+            profile.last_resort = false;
+        }
+        match save_profile(profile) {
+            Ok(()) => {
+                let mut moved_from = None;
+                if now_on {
+                    for p in config
+                        .profiles
+                        .iter_mut()
+                        .filter(|p| p.preferred && p.name != *name)
+                    {
+                        p.preferred = false;
+                        match save_profile(p) {
+                            Ok(()) => {
+                                moved_from.get_or_insert_with(|| p.name.to_string());
+                            }
+                            Err(_) => p.preferred = true,
+                        }
+                    }
+                }
+                Ok(RadioToggleOutcome { moved_from })
+            }
+            Err(e) => {
+                if let Some(p) = config.find_mut(name) {
+                    p.preferred = !now_on;
+                    if cleared_last_resort {
+                        p.last_resort = true;
+                    }
+                }
+                Err(e)
+            }
+        }
+    })
+}
+
+/// Replace the whole fallback chain membership + order in one write — the
+/// web dashboard's drag-to-reorder sends the complete new list rather than a
+/// from/to pair (unlike the TUI's ⇧↑/⇧↓, which moves one member at a time).
+/// A name newly entering the chain gets [`crate::fallback::DEFAULT_THRESHOLD`]
+/// seeded onto it when it has no threshold of its own yet, mirroring the
+/// TUI's `+ add` row.
+pub(crate) fn set_fallback_chain(config: &mut AppConfig, chain: Vec<ProfileName>) -> Result<()> {
+    with_state_lock(|_held| {
+        for name in &chain {
+            if !config.state.fallback_chain.contains(name)
+                && let Some(profile) = config.find_mut(name)
+                && profile.fallback_threshold.is_none()
+            {
+                profile.fallback_threshold = Some(crate::fallback::DEFAULT_THRESHOLD);
+                save_profile(profile)?;
+            }
+        }
+        config.state.fallback_chain = chain;
+        save_app_state(&config.state)
+    })
+}
+
 #[cfg(test)]
 #[path = "../tests/inline/actions.rs"]
 mod tests;

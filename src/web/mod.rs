@@ -5,6 +5,7 @@
 //! for the full design.
 
 mod auth;
+mod fallback;
 mod profiles;
 
 use std::sync::Arc;
@@ -53,12 +54,18 @@ pub(super) fn read_json_body<T: DeserializeOwned>(
     request: &mut tiny_http::Request,
 ) -> Result<T, (StatusCode, String)> {
     let mut body = String::new();
-    request
-        .as_reader()
-        .read_to_string(&mut body)
-        .map_err(|e| (StatusCode(400), error_body(&format!("failed to read body: {e}"))))?;
-    serde_json::from_str(&body)
-        .map_err(|e| (StatusCode(400), error_body(&format!("invalid JSON body: {e}"))))
+    request.as_reader().read_to_string(&mut body).map_err(|e| {
+        (
+            StatusCode(400),
+            error_body(&format!("failed to read body: {e}")),
+        )
+    })?;
+    serde_json::from_str(&body).map_err(|e| {
+        (
+            StatusCode(400),
+            error_body(&format!("invalid JSON body: {e}")),
+        )
+    })
 }
 
 /// A running server plus the means to stop it. [`Handle::stop`] breaks the
@@ -154,8 +161,15 @@ fn route(
         (Method::Post, "/api/profiles/switch") => profiles::switch(config, request),
         (Method::Post, "/api/profiles/reorder") => profiles::reorder(config, request),
         (Method::Post, "/api/profiles") => profiles::create(config, request),
+        (Method::Patch, "/api/fallback") => fallback::set_chain(config, request),
         (Method::Delete, p) if p.starts_with("/api/profiles/") => {
             profiles::delete(config, path_tail(p, "/api/profiles/"), url)
+        }
+        (Method::Patch, p) if p.ends_with("/fallback") && p.starts_with("/api/profiles/") => {
+            let name = path_tail(p, "/api/profiles/")
+                .strip_suffix("/fallback")
+                .unwrap_or_default();
+            fallback::patch_member(config, name, request)
         }
         (Method::Patch, p) if p.starts_with("/api/profiles/") => {
             profiles::patch(config, path_tail(p, "/api/profiles/"), request)

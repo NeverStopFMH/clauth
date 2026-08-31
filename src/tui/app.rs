@@ -5365,20 +5365,14 @@ fn write_weekly_override(app: &mut App, value: Option<f64>) {
     let Some(pos) = selected_chain_member(app) else {
         return;
     };
-    let save_err = {
+    let result = {
         let mut cfg = app.config();
         let Some(name) = cfg.state.fallback_chain.get(pos).cloned() else {
             return;
         };
-        match cfg.find_mut(&name) {
-            Some(profile) => {
-                profile.weekly_threshold = value;
-                save_profile(profile).err()
-            }
-            None => None,
-        }
+        crate::actions::set_weekly_threshold(&mut cfg, &name, value)
     };
-    if let Some(e) = save_err {
+    if let Err(e) = result {
         app.toast(ToastKind::Danger, format!("save failed\n{e}"));
     }
 }
@@ -5434,20 +5428,14 @@ fn write_max_spend(app: &mut App, value: f64) {
     let Some(pos) = selected_chain_member(app) else {
         return;
     };
-    let save_err = {
+    let result = {
         let mut cfg = app.config();
         let Some(name) = cfg.state.fallback_chain.get(pos).cloned() else {
             return;
         };
-        match cfg.find_mut(&name) {
-            Some(profile) => {
-                profile.max_auto_spend = Some(value);
-                save_profile(profile).err()
-            }
-            None => None,
-        }
+        crate::actions::set_max_auto_spend(&mut cfg, &name, value)
     };
-    if let Some(e) = save_err {
+    if let Err(e) = result {
         app.toast(ToastKind::Danger, format!("save failed\n{e}"));
     }
 }
@@ -5465,20 +5453,14 @@ fn write_threshold(app: &mut App, value: f64) {
     let Some(pos) = selected_chain_member(app) else {
         return;
     };
-    let save_err = {
+    let result = {
         let mut cfg = app.config();
         let Some(name) = cfg.state.fallback_chain.get(pos).cloned() else {
             return;
         };
-        match cfg.find_mut(&name) {
-            Some(profile) => {
-                profile.fallback_threshold = Some(value);
-                save_profile(profile).err()
-            }
-            None => None,
-        }
+        crate::actions::set_fallback_threshold(&mut cfg, &name, value)
     };
-    if let Some(e) = save_err {
+    if let Err(e) = result {
         app.toast(ToastKind::Danger, format!("save failed\n{e}"));
     }
 }
@@ -5563,74 +5545,24 @@ fn toggle_member_flag(app: &mut App, flag: MemberFlag) {
 }
 
 fn toggle_last_resort(app: &mut App) {
-    enum Outcome {
-        Missing,
-        Saved { moved_from: Option<String> },
-        SaveFailed(anyhow::Error),
-    }
     let Some(pos) = selected_chain_member(app) else {
         return;
     };
-    let outcome = {
+    let result = {
         let mut cfg = app.config();
         let Some(name) = cfg.state.fallback_chain.get(pos).cloned() else {
             return;
         };
-        match cfg.find_mut(&name) {
-            None => Outcome::Missing,
-            Some(profile) => {
-                profile.last_resort = !profile.last_resort;
-                let now_on = profile.last_resort;
-                // Never both on one profile: "park here to the end" and "always
-                // come home here" are contradictory. Clear preferred before the
-                // single save so the pair persists atomically; remember the
-                // prior value so a save failure rolls back both.
-                let cleared_preferred = now_on && profile.preferred;
-                if now_on {
-                    profile.preferred = false;
-                }
-                match save_profile(profile) {
-                    Ok(()) => {
-                        let mut moved_from = None;
-                        if now_on {
-                            for p in cfg
-                                .profiles
-                                .iter_mut()
-                                .filter(|p| p.last_resort && p.name != name)
-                            {
-                                p.last_resort = false;
-                                match save_profile(p) {
-                                    Ok(()) => {
-                                        moved_from.get_or_insert_with(|| p.name.to_string());
-                                    }
-                                    Err(_) => p.last_resort = true,
-                                }
-                            }
-                        }
-                        Outcome::Saved { moved_from }
-                    }
-                    Err(e) => {
-                        if let Some(p) = cfg.find_mut(&name) {
-                            p.last_resort = !now_on;
-                            if cleared_preferred {
-                                p.preferred = true;
-                            }
-                        }
-                        Outcome::SaveFailed(e)
-                    }
-                }
-            }
-        }
+        crate::actions::toggle_last_resort(&mut cfg, &name)
     };
-    match outcome {
-        Outcome::Missing => {}
-        Outcome::Saved { moved_from } => {
-            if let Some(prev) = moved_from {
+    match result {
+        Ok(outcome) => {
+            if let Some(prev) = outcome.moved_from {
                 app.toast(ToastKind::Info, format!("last resort moved from '{prev}'"));
             }
             app.refresh_tokens();
         }
-        Outcome::SaveFailed(e) => app.toast(ToastKind::Danger, format!("save failed\n{e}")),
+        Err(e) => app.toast(ToastKind::Danger, format!("save failed\n{e}")),
     }
 }
 
@@ -5640,72 +5572,24 @@ fn toggle_last_resort(app: &mut App) {
 /// and reciprocally mutually exclusive — turning preferred on clears
 /// last_resort on the same profile.
 fn toggle_preferred(app: &mut App) {
-    enum Outcome {
-        Missing,
-        Saved { moved_from: Option<String> },
-        SaveFailed(anyhow::Error),
-    }
     let Some(pos) = selected_chain_member(app) else {
         return;
     };
-    let outcome = {
+    let result = {
         let mut cfg = app.config();
         let Some(name) = cfg.state.fallback_chain.get(pos).cloned() else {
             return;
         };
-        match cfg.find_mut(&name) {
-            None => Outcome::Missing,
-            Some(profile) => {
-                profile.preferred = !profile.preferred;
-                let now_on = profile.preferred;
-                // Reciprocal of the clear in `toggle_last_resort` — the two
-                // flags never coexist on one profile.
-                let cleared_last_resort = now_on && profile.last_resort;
-                if now_on {
-                    profile.last_resort = false;
-                }
-                match save_profile(profile) {
-                    Ok(()) => {
-                        let mut moved_from = None;
-                        if now_on {
-                            for p in cfg
-                                .profiles
-                                .iter_mut()
-                                .filter(|p| p.preferred && p.name != name)
-                            {
-                                p.preferred = false;
-                                match save_profile(p) {
-                                    Ok(()) => {
-                                        moved_from.get_or_insert_with(|| p.name.to_string());
-                                    }
-                                    Err(_) => p.preferred = true,
-                                }
-                            }
-                        }
-                        Outcome::Saved { moved_from }
-                    }
-                    Err(e) => {
-                        if let Some(p) = cfg.find_mut(&name) {
-                            p.preferred = !now_on;
-                            if cleared_last_resort {
-                                p.last_resort = true;
-                            }
-                        }
-                        Outcome::SaveFailed(e)
-                    }
-                }
-            }
-        }
+        crate::actions::toggle_preferred(&mut cfg, &name)
     };
-    match outcome {
-        Outcome::Missing => {}
-        Outcome::Saved { moved_from } => {
-            if let Some(prev) = moved_from {
+    match result {
+        Ok(outcome) => {
+            if let Some(prev) = outcome.moved_from {
                 app.toast(ToastKind::Info, format!("preferred moved from '{prev}'"));
             }
             app.refresh_tokens();
         }
-        Outcome::SaveFailed(e) => app.toast(ToastKind::Danger, format!("save failed\n{e}")),
+        Err(e) => app.toast(ToastKind::Danger, format!("save failed\n{e}")),
     }
 }
 

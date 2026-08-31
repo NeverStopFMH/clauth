@@ -13,8 +13,8 @@ use ratatui::widgets::Paragraph;
 use super::super::app::App;
 use super::super::theme;
 use super::format::{
-    ResetFmt, activity_verb, is_past_reset, reset_in_secs_at, reset_phrase, spinner_frame,
-    spinner_style,
+    ResetFmt, absolute_reset_line, activity_verb, is_past_reset, reset_in_secs_at, reset_phrase,
+    spinner_frame, spinner_style,
 };
 use super::panes::{
     DIAG_AUTH_BROKEN, DIAG_BUDGET_SPENT, DIAG_CANCELED, DIAG_DISABLED, DIAG_KICK,
@@ -424,7 +424,7 @@ impl Stat {
             label_spans.push(Span::raw(" ".repeat(max_rate_w)));
         }
 
-        vec![
+        let mut lines = vec![
             Line::from({
                 let mut spans = label_spans;
                 spans.push(Span::raw(" ".repeat(header_pad)));
@@ -444,7 +444,18 @@ impl Stat {
                 spans
             }),
             Line::from(bar_line),
-        ]
+        ];
+        // A third line spelling out the same reset instant in US Eastern and
+        // China Standard Time — absolute, so it reads the same regardless of
+        // which zone the two ends of a remote/async workflow sit in. Only
+        // windows with a known reset stamp carry one (`extra`/`spend` rows
+        // never set `reset_secs`), and it drops silently once overdue.
+        if let Some(secs) = self.reset_secs
+            && let Some(abs) = absolute_reset_line(secs)
+        {
+            lines.push(Line::from(Span::styled(format!("  {abs}"), theme::faint())));
+        }
+        lines
     }
 }
 

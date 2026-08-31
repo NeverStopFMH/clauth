@@ -1,7 +1,9 @@
 //! Shared formatters and style helpers used across multiple screens.
 //! Screen-only helpers stay in their own modules.
 
-use chrono::{DateTime, Datelike, Local, NaiveDateTime, Timelike, Weekday};
+use chrono::{
+    DateTime, Datelike, Days, FixedOffset, Local, NaiveDate, NaiveDateTime, Timelike, Utc, Weekday,
+};
 use ratatui::style::{Color, Style};
 use ratatui::text::Span;
 
@@ -378,6 +380,98 @@ fn local_naive(epoch: i64) -> Option<NaiveDateTime> {
         DateTime::from_timestamp(epoch, 0)?
             .with_timezone(&Local)
             .naive_local(),
+    )
+}
+
+/// `[US] Resets 8/28/2026 14:30:00  [CN] Resets 8/29/2026 02:30:00` — the
+/// window's absolute reset instant spelled out in US Eastern time and China
+/// Standard Time, meant to sit on its own line below a window's bar. Unlike
+/// [`local_clock`], which reads the OPERATOR's own system zone, this pins two
+/// fixed zones regardless of where clauth runs, so a US-based and a
+/// China-based teammate read identical text. `None` once the window has
+/// already reset, mirroring [`clock_half`]'s `secs > 0` gate — an overdue
+/// reset must not be dressed up as a future stamp.
+pub(super) fn absolute_reset_line(secs: i64) -> Option<String> {
+    absolute_reset_line_at(secs, now_epoch_secs())
+}
+
+/// [`absolute_reset_line`] against a caller-supplied clock so a test can pin
+/// both the "now" and the target instant instead of racing the wall clock.
+pub(crate) fn absolute_reset_line_at(secs: i64, now: i64) -> Option<String> {
+    if secs <= 0 {
+        return None;
+    }
+    let target = now.checked_add(secs)?;
+    let utc = DateTime::from_timestamp(target, 0)?;
+    let us = FixedOffset::east_opt(us_eastern_offset_secs(utc))?;
+    // China Standard Time has not observed DST since 1991: a plain fixed
+    // offset is exact, unlike US Eastern above, which needs the DST calendar.
+    let cn = FixedOffset::east_opt(8 * 3600)?;
+    Some(format!(
+        "[US] Resets {}  [CN] Resets {}",
+        format_us_clock(utc.with_timezone(&us).naive_local()),
+        format_us_clock(utc.with_timezone(&cn).naive_local()),
+    ))
+}
+
+/// US Eastern's UTC offset at `utc`: `-4h` (EDT) inside the DST window,
+/// `-5h` (EST) outside it. No `chrono-tz` dependency for one hardcoded zone —
+/// the US DST calendar (2nd Sunday in March to 1st Sunday in November) has
+/// been fixed since the Energy Policy Act of 2005, so computing the two
+/// transition instants directly is cheaper than pulling in the full IANA
+/// database for a single zone.
+fn us_eastern_offset_secs(utc: DateTime<Utc>) -> i32 {
+    const STANDARD: i32 = -5 * 3600;
+    const DAYLIGHT: i32 = -4 * 3600;
+    let Some(start) = us_dst_start_utc(utc.year()) else {
+        return STANDARD;
+    };
+    let Some(end) = us_dst_end_utc(utc.year()) else {
+        return STANDARD;
+    };
+    if (start..end).contains(&utc) {
+        DAYLIGHT
+    } else {
+        STANDARD
+    }
+}
+
+/// DST begins the 2nd Sunday in March at 02:00 EST — 07:00 UTC, since the
+/// offset is still standard time at the instant the clocks jump forward.
+fn us_dst_start_utc(year: i32) -> Option<DateTime<Utc>> {
+    let date = nth_sunday_of_month(year, 3, 2)?;
+    Some(date.and_hms_opt(7, 0, 0)?.and_utc())
+}
+
+/// DST ends the 1st Sunday in November at 02:00 EDT — 06:00 UTC, since the
+/// offset is still daylight time at the instant the clocks fall back.
+fn us_dst_end_utc(year: i32) -> Option<DateTime<Utc>> {
+    let date = nth_sunday_of_month(year, 11, 1)?;
+    Some(date.and_hms_opt(6, 0, 0)?.and_utc())
+}
+
+/// The `nth` Sunday of `month` in `year` (1-indexed: `nth = 2` is the 2nd
+/// Sunday).
+fn nth_sunday_of_month(year: i32, month: u32, nth: u32) -> Option<NaiveDate> {
+    let first = NaiveDate::from_ymd_opt(year, month, 1)?;
+    let lead_days = (7 - first.weekday().num_days_from_sunday()) % 7;
+    first.checked_add_days(Days::new(u64::from(lead_days + 7 * (nth - 1))))
+}
+
+/// `8/28/2026 14:30:00` — the absolute stamp both zone lines in
+/// [`absolute_reset_line`] share: `M/D/YYYY` (no leading zeros on month/day),
+/// always seconds, always 24-hour (this is a fixed display format, not the
+/// operator's [`ClockFormat`] choice — a bare 12-hour clock reading the same
+/// on both sides of noon is the wrong thing to show two zones side by side).
+fn format_us_clock(dt: NaiveDateTime) -> String {
+    format!(
+        "{}/{}/{} {:02}:{:02}:{:02}",
+        dt.month(),
+        dt.day(),
+        dt.year(),
+        dt.hour(),
+        dt.minute(),
+        dt.second(),
     )
 }
 

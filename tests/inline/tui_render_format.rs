@@ -566,6 +566,114 @@ fn stale_window_fades_only_fill_and_percent() {
     );
 }
 
+// ── absolute US/CN reset stamp ──────────────────────────────────────────────
+//
+// `absolute_reset_line`: a fixed-zone pair (US Eastern, China Standard Time)
+// appended below a window's bar, independent of the operator's own system
+// zone and of the `ResetDisplay`/`ClockFormat` settings that `clock_half`
+// answers to.
+
+fn utc_secs(y: i32, m: u32, d: u32, h: u32, min: u32, s: u32) -> i64 {
+    NaiveDate::from_ymd_opt(y, m, d)
+        .expect("valid date")
+        .and_hms_opt(h, min, s)
+        .expect("valid time")
+        .and_utc()
+        .timestamp()
+}
+
+#[test]
+fn format_us_clock_has_no_leading_zeros_on_the_date_but_pads_the_24h_clock() {
+    assert_eq!(
+        format_us_clock(at(2026, 8, 28, 14, 30)),
+        "8/28/2026 14:30:00"
+    );
+    assert_eq!(format_us_clock(at(2026, 1, 5, 9, 5)), "1/5/2026 09:05:00");
+}
+
+/// 24-hour notation has a real zero hour: midnight reads `00`, noon reads
+/// `12` — no meridiem to disambiguate, unlike the operator-facing 12-hour
+/// clock `clock_text_h12_handles_midnight_and_noon` pins.
+#[test]
+fn format_us_clock_handles_midnight_and_noon() {
+    assert_eq!(format_us_clock(at(2026, 8, 28, 0, 0)), "8/28/2026 00:00:00");
+    assert_eq!(
+        format_us_clock(at(2026, 8, 28, 12, 0)),
+        "8/28/2026 12:00:00"
+    );
+}
+
+/// 2026's DST calendar (2nd Sunday in March to 1st Sunday in November) is
+/// public record — pinning it catches a formula slip (off-by-one week, wrong
+/// weekday) without needing a `chrono-tz` dependency to cross-check against.
+#[test]
+fn us_eastern_offset_matches_the_published_2026_dst_calendar() {
+    // One second before the spring-forward instant (07:00 UTC, Mar 8) is
+    // still standard time; the instant itself is already daylight time.
+    assert_eq!(
+        us_eastern_offset_secs(
+            DateTime::from_timestamp(utc_secs(2026, 3, 8, 6, 59, 59), 0).expect("valid instant")
+        ),
+        -5 * 3600
+    );
+    assert_eq!(
+        us_eastern_offset_secs(
+            DateTime::from_timestamp(utc_secs(2026, 3, 8, 7, 0, 0), 0).expect("valid instant")
+        ),
+        -4 * 3600
+    );
+    // One second before the fall-back instant (06:00 UTC, Nov 1) is still
+    // daylight time; the instant itself is already standard time.
+    assert_eq!(
+        us_eastern_offset_secs(
+            DateTime::from_timestamp(utc_secs(2026, 11, 1, 5, 59, 59), 0).expect("valid instant")
+        ),
+        -4 * 3600
+    );
+    assert_eq!(
+        us_eastern_offset_secs(
+            DateTime::from_timestamp(utc_secs(2026, 11, 1, 6, 0, 0), 0).expect("valid instant")
+        ),
+        -5 * 3600
+    );
+    // Deep midsummer and midwinter sanity checks.
+    assert_eq!(
+        us_eastern_offset_secs(
+            DateTime::from_timestamp(utc_secs(2026, 7, 4, 12, 0, 0), 0).expect("valid instant")
+        ),
+        -4 * 3600
+    );
+    assert_eq!(
+        us_eastern_offset_secs(
+            DateTime::from_timestamp(utc_secs(2026, 1, 4, 12, 0, 0), 0).expect("valid instant")
+        ),
+        -5 * 3600
+    );
+}
+
+/// End-to-end: a 7d-window reset at 2026-09-01T00:00:00Z (a real sample pulled
+/// from `/api/oauth/usage`) renders as US Eastern (daylight, `-4h`) and China
+/// Standard Time (`+8h`, fixed) twelve hours apart, matching the worked
+/// example this feature was requested against.
+#[test]
+fn absolute_reset_line_renders_both_zones_twelve_hours_apart() {
+    let now = utc_secs(2026, 8, 28, 0, 0, 0);
+    let resets_at = utc_secs(2026, 9, 1, 0, 0, 0);
+    let line = absolute_reset_line_at(resets_at - now, now).expect("future reset renders");
+    assert_eq!(
+        line,
+        "[US] Resets 8/31/2026 20:00:00  [CN] Resets 9/1/2026 08:00:00"
+    );
+}
+
+/// An overdue reset never renders a stamp — same rule `an_overdue_reset_never_
+/// renders_a_clock` pins for the operator-facing clock.
+#[test]
+fn absolute_reset_line_is_none_once_overdue() {
+    assert_eq!(absolute_reset_line_at(0, 1_000), None);
+    assert_eq!(absolute_reset_line_at(-60, 1_000), None);
+}
+
 /// The 30-day arm edge of `relative_age`, which the ladder pin in
 /// `tui_render_chain.rs` walks straight past: it steps 30s / 5m30 / 2h30 /
 /// 3d12h / 12d and then jumps to a fixed 2023 epoch, so nothing sits near the

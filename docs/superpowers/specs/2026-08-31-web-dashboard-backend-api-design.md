@@ -2,14 +2,43 @@
 
 ## Status
 
-Design approved by user (verbal walkthrough, 2026-08-31). Covers **Phase 1 only** — the
-embedded server + REST API inside `clauth daemon`. Two follow-on phases are out of scope
-for this document and get their own spec/plan cycle later:
+**Phase 1 implemented and merged to `main` (2026-08-31).** Design approved by user
+(verbal walkthrough, 2026-08-31), then built incrementally across several commits, one
+per tab. Two follow-on phases are out of scope for this document and get their own
+spec/plan cycle later:
 
 - **Phase 2** — the actual web frontend (static assets + JS) consuming this API, covering
   all 8 TUI tabs.
 - **Phase 3** — Windows autostart (Task Scheduler entry or a real Windows Service) so
   `clauth daemon` (with the web server embedded) comes up at boot with no terminal window.
+
+### Deviations from this design, found during implementation
+
+- **Login jobs are NOT `mcp/jobs.rs`.** This document originally said the OAuth/Alibaba
+  async login jobs would reuse the MCP `delegate` tool's disk-persisted job store. On
+  closer reading of `mcp/jobs.rs` while implementing, that store turned out to be shaped
+  entirely around a spawned `claude` subprocess (pid, heartbeat, streamed output, session
+  id) — none of which a login flow has. Built a small in-memory job store instead
+  (`web::jobs`: `start`/`finish`/`poll` over a `HashMap<String, JobStatus>`), scoped to
+  the daemon process's lifetime. Ranked as a new standalone leaf in `lockorder.rs`
+  (`WebJobs = 1900`).
+- **Config tab has no shared setter with the TUI.** The Fallback tab extraction (below)
+  worked because the TUI's fallback keystrokes and the new endpoints both needed "set this
+  field and persist." The Config tab's TUI keystrokes each compute a cycle/step "next
+  value" first (`cycle_theme`, `step_refresh_interval`, …) — presentation logic with
+  nothing for the web API (which receives an exact end state from a form) to share. Wrote
+  `actions::apply_config_patch` fresh instead of extracting from `tui/app.rs`.
+- **Setup's `PATCH /api/profiles/{name}` doesn't cover model routing or rename.** Model
+  settings (`edit_profile_model`) and `rename_profile` (which needs a `RotationGuard`
+  acquired before the config lock, like `delete_profile`) were left out of the first cut
+  to keep the endpoint's scope manageable — straightforward to add the same way the
+  existing fields were, when a frontend actually needs them.
+- **`plugin_host::install`/`self_heal` have no HTTP-level test.** Both shell out to the
+  real `claude` binary via `agentgear`; the sandboxed harness for that
+  (`testutil::FakeClaude`) is Unix-only (a PATH-shimmed shell script), so a cross-platform
+  test here would either skip on Windows or risk touching a real Claude Code install.
+  `GET /api/plugin/status` (pure reads) is tested; the two write endpoints are one-line
+  wrappers over functions `plugin_host`'s own test suite already covers.
 
 ## Motivation
 

@@ -14,7 +14,7 @@ const BASH_TEMPLATE: &str = r#"_clauth() {
     if [ "$COMP_CWORD" -eq 1 ]; then
         local profiles
         profiles=$(clauth __complete 2>/dev/null)
-        COMPREPLY=( $(compgen -W "${profiles} start login delete disable enable rolling-token static-token which list jobs sessions resume info daemon status mcp herdr completions --theme" -- "${cur}") )
+        COMPREPLY=( $(compgen -W "${profiles} start login delete disable enable rolling-token static-token which list jobs sessions resume info daemon status mcp herdr web completions --theme" -- "${cur}") )
     elif [ "$prev" = "--theme" ]; then
         COMPREPLY=( $(compgen -W "full compatible" -- "${cur}") )
     elif [ "${COMP_WORDS[1]}" = "login" ] && [ "${cur:0:2}" = "--" ]; then
@@ -39,6 +39,8 @@ const BASH_TEMPLATE: &str = r#"_clauth() {
         COMPREPLY=( $(compgen -W "--json" -- "${cur}") )
     elif [ "$COMP_CWORD" -eq 2 ] && [ "$prev" = "herdr" ]; then
         COMPREPLY=( $(compgen -W "install uninstall config" -- "${cur}") )
+    elif [ "$COMP_CWORD" -eq 2 ] && [ "$prev" = "web" ]; then
+        COMPREPLY=( $(compgen -W "url" -- "${cur}") )
     elif [ "$COMP_CWORD" -eq 3 ] && [ "${COMP_WORDS[1]}" = "herdr" ] && [ "${COMP_WORDS[2]}" = "config" ]; then
         COMPREPLY=( $(compgen -W "get" -- "${cur}") )
     elif [ "$COMP_CWORD" -eq 4 ] && [ "${COMP_WORDS[1]}" = "herdr" ] && [ "${COMP_WORDS[2]}" = "config" ] && [ "${COMP_WORDS[3]}" = "get" ]; then
@@ -89,6 +91,7 @@ _clauth() {
             'status[print the usage / auto-switch snapshot as JSON]' \
             'mcp[run the stdio MCP server]' \
             'herdr[install the herdr plugin and bind a key to it]' \
+            'web[the web dashboard clauth daemon serves]' \
             'completions[emit shell completion script]'
         _values 'option' '--theme[force a color depth instead of auto-detecting]'
     elif (( CURRENT >= 3 )) && [[ "${words[CURRENT-1]}" == "--theme" ]]; then
@@ -113,6 +116,8 @@ _clauth() {
             'config[print one herdr knob]'
     elif (( CURRENT == 4 )) && [[ "${words[2]}" == herdr && "${words[3]}" == config ]]; then
         _values 'subcommand' 'get[print the knob value on one line]'
+    elif (( CURRENT == 3 )) && [[ "${words[2]}" == web ]]; then
+        _values 'subcommand' 'url[print the dashboard'"'"'s bookmarkable URL]'
     elif (( CURRENT == 5 )) && [[ "${words[2]}" == herdr && "${words[3]}" == config && "${words[4]}" == get ]]; then
         _values 'key' 'popup_width[how the entrypoint pane opens]' 'pane_tag[publish the profile tag token]' 'tag_watch_secs[per-pane tag watcher interval]' 'border_label[split-pane border account label]' 'delegate_dot[delegate pane metadata]' 'delegate_row_text[delegate text beside the sidebar row]'
     elif (( CURRENT >= 4 )) && [[ "${words[2]}" == herdr && "${words[3]}" == install ]]; then
@@ -174,6 +179,8 @@ complete -c clauth -f -n __fish_is_first_token -a daemon -d "Run the headless sc
 complete -c clauth -f -n __fish_is_first_token -a status -d "Print the usage / auto-switch snapshot as JSON"
 complete -c clauth -f -n __fish_is_first_token -a mcp -d "Run the stdio MCP server"
 complete -c clauth -f -n __fish_is_first_token -a herdr -d "Install the herdr plugin, read its knobs, or uninstall it"
+complete -c clauth -f -n __fish_is_first_token -a web -d "The web dashboard clauth daemon serves"
+complete -c clauth -f -n "__fish_seen_subcommand_from web" -a url -d "Print the dashboard's bookmarkable URL"
 complete -c clauth -f -n "__fish_seen_subcommand_from herdr" -a install -d "Install the plugin and wire it into herdr's config"
 complete -c clauth -f -n "__fish_seen_subcommand_from herdr" -a uninstall -d "Remove the plugin and the config lines it added"
 complete -c clauth -f -n "__fish_seen_subcommand_from herdr" -a config -d "Print one herdr knob"

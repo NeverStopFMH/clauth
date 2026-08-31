@@ -240,6 +240,15 @@ pub(crate) enum Command {
         status: bool,
     },
 
+    /// The web dashboard `clauth daemon` serves on 127.0.0.1
+    ///
+    /// The dashboard itself only runs embedded inside `clauth daemon`; this
+    /// is just the small set of helper commands around it.
+    Web {
+        #[command(subcommand)]
+        cmd: WebCommand,
+    },
+
     /// Print the usage / auto-switch snapshot as JSON
     ///
     /// The same shape the daemon writes to ~/.clauth/status.json.
@@ -419,6 +428,17 @@ impl LoginArgs {
     pub(crate) fn is_api_mode(&self) -> bool {
         self.base_url.is_some() || self.api_key.is_some()
     }
+}
+
+/// `clauth web <cmd>`: helpers around the dashboard `clauth daemon` serves.
+#[derive(Subcommand, Debug)]
+pub(crate) enum WebCommand {
+    /// Print the dashboard's bookmarkable URL, token included
+    ///
+    /// Read-only pages need no token; this URL is only what a *write* action
+    /// (switching an account, editing config) needs. Bookmark it once — the
+    /// token is stable across daemon restarts, so the link keeps working.
+    Url,
 }
 
 /// `clauth herdr <cmd>`: install and uninstall the plugin and its config wiring.

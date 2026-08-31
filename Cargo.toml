@@ -67,6 +67,12 @@ clap = { version = "4.6.4", features = ["derive", "wrap_help"] }
 # copy-paste hint. Default features (derive + claude + embed) are exactly the
 # claude-only host clauth is; the embedded tree is the committed `plugins/` dir.
 agentgear = "0.1"
+# The local-only dashboard's embedded HTTP server (`clauth daemon`'s web tab).
+# Synchronous and near-dependency-free, matching this crate's existing style
+# (`ureq` for the one HTTP client it already has) instead of pulling in a full
+# async stack (`axum`/`tokio` full runtime) for a low-throughput 127.0.0.1-only
+# API.
+tiny_http = "0.12"
 
 [build-dependencies]
 # The version guard `build.rs` runs: fails the build when `plugins/.claude-plugin/

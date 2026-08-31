@@ -462,6 +462,29 @@ impl Daemon {
             interval,
         );
         self.spawn_scheduler();
+        self.spawn_web_server();
+    }
+
+    /// Start the dashboard's embedded HTTP server, best-effort: a bind
+    /// failure (e.g. something else already holds the port) costs the
+    /// dashboard, not the refresh/auto-switch loop this daemon exists for, so
+    /// it is logged and swallowed rather than propagated. The returned
+    /// [`crate::web::Handle`] is intentionally dropped — its accept-loop
+    /// thread holds its own `Arc` clone of the server, so it keeps serving
+    /// for the process lifetime with nothing left to hold onto.
+    fn spawn_web_server(&self) {
+        let token = match crate::web::load_or_create_token() {
+            Ok(token) => token,
+            Err(e) => {
+                logline!("clauth daemon: web dashboard token unavailable: {e}");
+                return;
+            }
+        };
+        let addr = format!("127.0.0.1:{}", crate::web::DEFAULT_PORT);
+        match crate::web::spawn(Arc::clone(&self.config), token, &addr) {
+            Ok(_handle) => logline!("clauth daemon: web dashboard listening on {addr}"),
+            Err(e) => logline!("clauth daemon: web dashboard failed to start on {addr}: {e}"),
+        }
     }
 
     /// Bundle scheduler `Arc`s and launch the background refresher (same call the

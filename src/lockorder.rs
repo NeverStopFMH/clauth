@@ -193,6 +193,15 @@ pub(crate) mod rank {
         /// unranked mutex, `profile::HOME_OVERRIDE`, which every `home_dir()`
         /// takes and releases with nothing under it.
         McpDigest = 1800;
+        /// Web dashboard's in-memory login-job store (`web::jobs::JobStore`):
+        /// the OAuth/Alibaba console login flows run on a background thread
+        /// and publish `Pending`/`Succeeded`/`Failed` here for `GET
+        /// /api/jobs/{id}` to poll. A true leaf — every acquisition is a
+        /// take-mutate-release insert/read with no other lock held under it;
+        /// the login flow itself (browser round trip, token exchange, the
+        /// `Config`-locked persistence of the result) all runs OUTSIDE this
+        /// lock, taken only for the instant before/after to publish status.
+        WebJobs = 1900;
     }
 }
 

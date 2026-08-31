@@ -7,6 +7,8 @@
 mod auth;
 mod config;
 mod fallback;
+mod jobs;
+mod login;
 mod plugin;
 mod profiles;
 
@@ -125,9 +127,10 @@ pub(crate) fn spawn(config: ConfigHandle, token: String, addr: &str) -> std::io:
         Server::http(addr).map_err(|e| std::io::Error::other(format!("web server bind: {e}")))?,
     );
     let accept_server = Arc::clone(&server);
+    let jobs_store = jobs::new_store();
     let join = std::thread::spawn(move || {
         for request in accept_server.incoming_requests() {
-            handle_request(&config, &token, request);
+            handle_request(&config, &jobs_store, &token, request);
         }
     });
     Ok(Handle {
@@ -138,19 +141,25 @@ pub(crate) fn spawn(config: ConfigHandle, token: String, addr: &str) -> std::io:
 
 /// Route one request. Read routes answer unconditionally; write routes 401
 /// without a valid bearer token, checked BEFORE the route body ever runs.
-fn handle_request(config: &ConfigHandle, token: &str, mut request: tiny_http::Request) {
+fn handle_request(
+    config: &ConfigHandle,
+    jobs_store: &jobs::JobStore,
+    token: &str,
+    mut request: tiny_http::Request,
+) {
     let method = request.method().clone();
     let url = request.url().to_string();
     let (status, body) = if is_write_method(&method) && !request_is_authorized(&request, token) {
         (StatusCode(401), error_body("unauthorized"))
     } else {
-        resolve(route(config, &method, &url, &mut request))
+        resolve(route(config, jobs_store, &method, &url, &mut request))
     };
     let _ = request.respond(json_response(status, &body));
 }
 
 fn route(
     config: &ConfigHandle,
+    jobs_store: &jobs::JobStore,
     method: &Method,
     url: &str,
     request: &mut tiny_http::Request,
@@ -163,11 +172,15 @@ fn route(
         (Method::Post, "/api/profiles/switch") => profiles::switch(config, request),
         (Method::Post, "/api/profiles/reorder") => profiles::reorder(config, request),
         (Method::Post, "/api/profiles") => profiles::create(config, request),
+        (Method::Post, "/api/login/oauth") => login::start_oauth(config, jobs_store, request),
         (Method::Patch, "/api/fallback") => fallback::set_chain(config, request),
         (Method::Patch, "/api/config") => config::patch(config, request),
         (Method::Get, "/api/plugin/status") => Ok(plugin::status()),
         (Method::Post, "/api/plugin/install") => Ok(plugin::install()),
         (Method::Post, "/api/plugin/self-heal") => Ok(plugin::self_heal()),
+        (Method::Get, p) if p.starts_with("/api/jobs/") => {
+            Ok(jobs::poll(jobs_store, path_tail(p, "/api/jobs/")))
+        }
         (Method::Delete, p) if p.starts_with("/api/profiles/") => {
             profiles::delete(config, path_tail(p, "/api/profiles/"), url)
         }
@@ -176,6 +189,12 @@ fn route(
                 .strip_suffix("/fallback")
                 .unwrap_or_default();
             fallback::patch_member(config, name, request)
+        }
+        (Method::Post, p) if p.ends_with("/login/alibaba") && p.starts_with("/api/profiles/") => {
+            let name = path_tail(p, "/api/profiles/")
+                .strip_suffix("/login/alibaba")
+                .unwrap_or_default();
+            login::start_alibaba(config, jobs_store, name, request)
         }
         (Method::Patch, p) if p.starts_with("/api/profiles/") => {
             profiles::patch(config, path_tail(p, "/api/profiles/"), request)

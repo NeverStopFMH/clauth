@@ -182,7 +182,6 @@ fn dispatch(cli: Cli) -> Result<()> {
             all,
             disabled,
         } => daemon::status_oneshot(all || disabled),
-        Command::Web { cmd } => cmd_web(cmd),
         Command::Mcp => mcp::serve(),
         Command::McpAwaitJob => mcp::await_job(),
         Command::HookProfileChangedNote => hook_note::run(),
@@ -215,19 +214,6 @@ fn cmd_daemon(standby: bool, replace: bool, status: bool) -> Result<()> {
 fn cmd_complete() -> Result<()> {
     completions::print_profile_names();
     Ok(())
-}
-
-/// `clauth web url`: print the dashboard's bookmarkable URL. Generates the
-/// token file on first call (same one `clauth daemon` will load once it
-/// starts serving), so this works whether or not a daemon is already up.
-fn cmd_web(cmd: cli::WebCommand) -> Result<()> {
-    match cmd {
-        cli::WebCommand::Url => {
-            let token = web::load_or_create_token()?;
-            outln!("http://127.0.0.1:{}/?token={token}", web::DEFAULT_PORT);
-            Ok(())
-        }
-    }
 }
 
 fn cmd_herdr(cmd: cli::HerdrCommand) -> Result<()> {

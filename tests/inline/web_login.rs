@@ -14,16 +14,10 @@ use crate::lockorder::RankedMutex;
 use crate::profile::{AppConfig, AppState, ConfigHandle, Profile};
 use crate::testutil::HomeSandbox;
 
-const TEST_TOKEN: &str = "test-token-0123456789";
-
 fn start_with(config: AppConfig) -> (crate::web::Handle, ConfigHandle) {
     let handle_config: ConfigHandle = Arc::new(RankedMutex::new(config));
-    let server = crate::web::spawn(
-        Arc::clone(&handle_config),
-        TEST_TOKEN.to_string(),
-        "127.0.0.1:0",
-    )
-    .expect("server binds");
+    let server =
+        crate::web::spawn(Arc::clone(&handle_config), "127.0.0.1:0").expect("server binds");
     (server, handle_config)
 }
 
@@ -45,31 +39,11 @@ fn oauth_login_rejects_a_duplicate_name_before_opening_a_browser() {
     let (handle, _config_handle) = start_with(config);
     let url = format!("http://{}/api/login/oauth", handle.addr());
     let err = ureq::post(&url)
-        .header("Authorization", &format!("Bearer {TEST_TOKEN}"))
         .header("Content-Type", "application/json")
         .send(serde_json::json!({"name": "taken"}).to_string())
         .expect_err("duplicate name");
     let ureq::Error::StatusCode(422) = err else {
         panic!("expected 422, got {err:?}");
-    };
-    handle.stop();
-}
-
-#[test]
-fn oauth_login_requires_a_token() {
-    let _home = HomeSandbox::new();
-    let config = AppConfig {
-        state: AppState::default(),
-        profiles: Vec::new(),
-    };
-    let (handle, _config_handle) = start_with(config);
-    let url = format!("http://{}/api/login/oauth", handle.addr());
-    let err = ureq::post(&url)
-        .header("Content-Type", "application/json")
-        .send(serde_json::json!({"name": "new-acct"}).to_string())
-        .expect_err("no token");
-    let ureq::Error::StatusCode(401) = err else {
-        panic!("expected 401, got {err:?}");
     };
     handle.stop();
 }
@@ -84,7 +58,6 @@ fn alibaba_login_rejects_an_unknown_profile_before_opening_a_browser() {
     let (handle, _config_handle) = start_with(config);
     let url = format!("http://{}/api/profiles/ghost/login/alibaba", handle.addr());
     let err = ureq::post(&url)
-        .header("Authorization", &format!("Bearer {TEST_TOKEN}"))
         .header("Content-Type", "application/json")
         .send(serde_json::json!({"site": "domestic", "region": "cn-beijing"}).to_string())
         .expect_err("unknown profile");
@@ -112,7 +85,6 @@ fn alibaba_login_rejects_an_unrecognized_site() {
     let (handle, _config_handle) = start_with(config);
     let url = format!("http://{}/api/profiles/acct/login/alibaba", handle.addr());
     let err = ureq::post(&url)
-        .header("Authorization", &format!("Bearer {TEST_TOKEN}"))
         .header("Content-Type", "application/json")
         .send(serde_json::json!({"site": "mars", "region": "cn-beijing"}).to_string())
         .expect_err("unrecognized site");

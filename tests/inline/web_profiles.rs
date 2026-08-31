@@ -8,18 +8,12 @@ use crate::lockorder::RankedMutex;
 use crate::profile::{AppConfig, AppState, ConfigHandle, Profile};
 use crate::testutil::HomeSandbox;
 
-const TEST_TOKEN: &str = "test-token-0123456789";
-
 /// Like `web::tests::start`, but keeps an `Arc` clone of the config so a test
 /// can inspect the mutated state after the HTTP round trip.
 fn start_with(config: AppConfig) -> (crate::web::Handle, ConfigHandle) {
     let handle_config: ConfigHandle = Arc::new(RankedMutex::new(config));
-    let server = crate::web::spawn(
-        Arc::clone(&handle_config),
-        TEST_TOKEN.to_string(),
-        "127.0.0.1:0",
-    )
-    .expect("server binds");
+    let server =
+        crate::web::spawn(Arc::clone(&handle_config), "127.0.0.1:0").expect("server binds");
     (server, handle_config)
 }
 
@@ -57,7 +51,6 @@ fn switch_moves_active_profile_and_persists() {
     let (handle, config_handle) = start_with(config);
     let url = format!("http://{}/api/profiles/switch", handle.addr());
     let response = ureq::post(&url)
-        .header("Authorization", &format!("Bearer {TEST_TOKEN}"))
         .header("Content-Type", "application/json")
         .send(serde_json::json!({"name": "beta"}).to_string())
         .expect("switch request");
@@ -88,7 +81,6 @@ fn switch_to_an_unknown_profile_is_a_422_and_leaves_state_untouched() {
     let (handle, config_handle) = start_with(config);
     let url = format!("http://{}/api/profiles/switch", handle.addr());
     let err = ureq::post(&url)
-        .header("Authorization", &format!("Bearer {TEST_TOKEN}"))
         .header("Content-Type", "application/json")
         .send(serde_json::json!({"name": "ghost"}).to_string())
         .expect_err("no such profile");
@@ -125,7 +117,6 @@ fn reorder_moves_a_profile_and_persists() {
     let (handle, config_handle) = start_with(config);
     let url = format!("http://{}/api/profiles/reorder", handle.addr());
     let response = ureq::post(&url)
-        .header("Authorization", &format!("Bearer {TEST_TOKEN}"))
         .header("Content-Type", "application/json")
         .send(serde_json::json!({"from": 0, "to": 2}).to_string())
         .expect("reorder request");
@@ -150,7 +141,6 @@ fn create_adds_an_api_key_profile_and_persists() {
     let (handle, config_handle) = start_with(config);
     let url = format!("http://{}/api/profiles", handle.addr());
     let response = ureq::post(&url)
-        .header("Authorization", &format!("Bearer {TEST_TOKEN}"))
         .header("Content-Type", "application/json")
         .send(
             serde_json::json!({
@@ -194,7 +184,6 @@ fn create_with_a_duplicate_name_is_rejected() {
     let (handle, _config_handle) = start_with(config);
     let url = format!("http://{}/api/profiles", handle.addr());
     let err = ureq::post(&url)
-        .header("Authorization", &format!("Bearer {TEST_TOKEN}"))
         .header("Content-Type", "application/json")
         .send(serde_json::json!({"name": "taken"}).to_string())
         .expect_err("duplicate name");
@@ -221,10 +210,7 @@ fn delete_removes_an_inactive_profile() {
 
     let (handle, config_handle) = start_with(config);
     let url = format!("http://{}/api/profiles/doomed", handle.addr());
-    let response = ureq::delete(&url)
-        .header("Authorization", &format!("Bearer {TEST_TOKEN}"))
-        .call()
-        .expect("delete request");
+    let response = ureq::delete(&url).call().expect("delete request");
     assert_eq!(response.status().as_u16(), 200);
 
     #[allow(clippy::unwrap_used, reason = "test-only")]
@@ -252,7 +238,6 @@ fn patch_sets_custom_env_vars() {
     let (handle, config_handle) = start_with(config);
     let url = format!("http://{}/api/profiles/envtest", handle.addr());
     let response = ureq::patch(&url)
-        .header("Authorization", &format!("Bearer {TEST_TOKEN}"))
         .header("Content-Type", "application/json")
         .send(serde_json::json!({"env": {"CUSTOM_FLAG": "1"}}).to_string())
         .expect("patch request");
@@ -261,7 +246,10 @@ fn patch_sets_custom_env_vars() {
     #[allow(clippy::unwrap_used, reason = "test-only")]
     let cfg = config_handle.lock().unwrap();
     let updated = cfg.find(&"envtest".into()).expect("profile still exists");
-    assert_eq!(updated.env.get("CUSTOM_FLAG").map(String::as_str), Some("1"));
+    assert_eq!(
+        updated.env.get("CUSTOM_FLAG").map(String::as_str),
+        Some("1")
+    );
     drop(cfg);
     handle.stop();
 }
@@ -284,7 +272,6 @@ fn patch_disables_and_reenables_a_profile() {
     let (handle, config_handle) = start_with(config);
     let url = format!("http://{}/api/profiles/toggleme", handle.addr());
     let response = ureq::patch(&url)
-        .header("Authorization", &format!("Bearer {TEST_TOKEN}"))
         .header("Content-Type", "application/json")
         .send(serde_json::json!({"disabled": true}).to_string())
         .expect("disable request");
@@ -292,24 +279,31 @@ fn patch_disables_and_reenables_a_profile() {
     {
         #[allow(clippy::unwrap_used, reason = "test-only")]
         let cfg = config_handle.lock().unwrap();
-        assert!(cfg.find(&"toggleme".into()).expect("still present").disabled);
+        assert!(
+            cfg.find(&"toggleme".into())
+                .expect("still present")
+                .disabled
+        );
     }
 
     let response = ureq::patch(&url)
-        .header("Authorization", &format!("Bearer {TEST_TOKEN}"))
         .header("Content-Type", "application/json")
         .send(serde_json::json!({"disabled": false}).to_string())
         .expect("enable request");
     assert_eq!(response.status().as_u16(), 200);
     #[allow(clippy::unwrap_used, reason = "test-only")]
     let cfg = config_handle.lock().unwrap();
-    assert!(!cfg.find(&"toggleme".into()).expect("still present").disabled);
+    assert!(
+        !cfg.find(&"toggleme".into())
+            .expect("still present")
+            .disabled
+    );
     drop(cfg);
     handle.stop();
 }
 
 #[test]
-fn write_routes_reject_a_missing_token() {
+fn write_routes_succeed_with_no_authorization_header() {
     let _home = HomeSandbox::new();
     let config = AppConfig {
         state: AppState::default(),
@@ -317,12 +311,10 @@ fn write_routes_reject_a_missing_token() {
     };
     let (handle, _config_handle) = start_with(config);
     let url = format!("http://{}/api/profiles", handle.addr());
-    let err = ureq::post(&url)
+    let response = ureq::post(&url)
         .header("Content-Type", "application/json")
         .send(serde_json::json!({"name": "x"}).to_string())
-        .expect_err("no token");
-    let ureq::Error::StatusCode(401) = err else {
-        panic!("expected 401, got {err:?}");
-    };
+        .expect("no auth gate anymore, this should succeed");
+    assert_eq!(response.status().as_u16(), 200);
     handle.stop();
 }

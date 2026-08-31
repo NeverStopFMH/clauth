@@ -7,16 +7,10 @@ use crate::lockorder::RankedMutex;
 use crate::profile::{AppConfig, AppState, ClockFormat, ConfigHandle, ResetDisplay, ThemeName};
 use crate::testutil::HomeSandbox;
 
-const TEST_TOKEN: &str = "test-token-0123456789";
-
 fn start_with(config: AppConfig) -> (crate::web::Handle, ConfigHandle) {
     let handle_config: ConfigHandle = Arc::new(RankedMutex::new(config));
-    let server = crate::web::spawn(
-        Arc::clone(&handle_config),
-        TEST_TOKEN.to_string(),
-        "127.0.0.1:0",
-    )
-    .expect("server binds");
+    let server =
+        crate::web::spawn(Arc::clone(&handle_config), "127.0.0.1:0").expect("server binds");
     (server, handle_config)
 }
 
@@ -33,7 +27,6 @@ fn patch_applies_only_the_fields_present() {
     let (handle, config_handle) = start_with(blank_config());
     let url = format!("http://{}/api/config", handle.addr());
     let response = ureq::patch(&url)
-        .header("Authorization", &format!("Bearer {TEST_TOKEN}"))
         .header("Content-Type", "application/json")
         .send(
             serde_json::json!({
@@ -64,7 +57,6 @@ fn patch_persists_across_a_config_reload() {
     let (handle, _config_handle) = start_with(blank_config());
     let url = format!("http://{}/api/config", handle.addr());
     let response = ureq::patch(&url)
-        .header("Authorization", &format!("Bearer {TEST_TOKEN}"))
         .header("Content-Type", "application/json")
         .send(serde_json::json!({"reset_display": "both"}).to_string())
         .expect("patch request");
@@ -76,16 +68,14 @@ fn patch_persists_across_a_config_reload() {
 }
 
 #[test]
-fn patch_with_no_token_is_rejected() {
+fn patch_with_no_authorization_header_still_succeeds() {
     let _home = HomeSandbox::new();
     let (handle, _config_handle) = start_with(blank_config());
     let url = format!("http://{}/api/config", handle.addr());
-    let err = ureq::patch(&url)
+    let response = ureq::patch(&url)
         .header("Content-Type", "application/json")
         .send(serde_json::json!({"theme": "full"}).to_string())
-        .expect_err("no token");
-    let ureq::Error::StatusCode(401) = err else {
-        panic!("expected 401, got {err:?}");
-    };
+        .expect("no auth gate anymore, this should succeed");
+    assert_eq!(response.status().as_u16(), 200);
     handle.stop();
 }

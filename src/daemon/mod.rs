@@ -473,15 +473,8 @@ impl Daemon {
     /// thread holds its own `Arc` clone of the server, so it keeps serving
     /// for the process lifetime with nothing left to hold onto.
     fn spawn_web_server(&self) {
-        let token = match crate::web::load_or_create_token() {
-            Ok(token) => token,
-            Err(e) => {
-                logline!("clauth daemon: web dashboard token unavailable: {e}");
-                return;
-            }
-        };
         let addr = format!("127.0.0.1:{}", crate::web::DEFAULT_PORT);
-        match crate::web::spawn(Arc::clone(&self.config), token, &addr) {
+        match crate::web::spawn(Arc::clone(&self.config), &addr) {
             Ok(_handle) => logline!("clauth daemon: web dashboard listening on {addr}"),
             Err(e) => logline!("clauth daemon: web dashboard failed to start on {addr}: {e}"),
         }

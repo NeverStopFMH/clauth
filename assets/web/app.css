@@ -1,0 +1,289 @@
+/* Small overrides layered on top of Pico.css — the handful of things a
+   classless framework has no element for: the app-wide max-width wrapper,
+   the fallback chain timeline, and the usage gauge bars. */
+
+body {
+  background: var(--pico-background-color);
+}
+
+.app-shell {
+  max-width: 1200px;
+  margin: 0 auto;
+  padding: 0 1rem 3rem;
+}
+
+.app-header {
+  background: var(--pico-card-background-color);
+  border: 1px solid var(--pico-card-border-color, var(--pico-muted-border-color));
+  border-radius: var(--pico-border-radius);
+  box-shadow: var(--pico-card-box-shadow, 0 1px 4px rgba(0, 0, 0, 0.08));
+  padding: 1rem 1.5rem 0;
+  margin: 1.5rem 0 2rem;
+}
+
+nav.app-nav {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  flex-wrap: wrap;
+  margin-bottom: 0.75rem;
+}
+
+nav.app-nav .brand {
+  font-weight: bold;
+  font-size: 1.1rem;
+}
+
+nav.app-nav .status-snippet {
+  font-size: 0.85rem;
+  opacity: 0.7;
+}
+
+.tab-bar {
+  display: flex;
+  gap: 0.25rem;
+  border-bottom: 2px solid var(--pico-muted-border-color);
+  flex-wrap: wrap;
+}
+
+main article {
+  margin-bottom: 1.5rem;
+}
+
+.tab-bar button {
+  background: none;
+  border: none;
+  border-bottom: 2px solid transparent;
+  margin-bottom: -2px;
+  padding: 0.5rem 0.9rem;
+  color: inherit;
+  opacity: 0.6;
+  cursor: pointer;
+}
+
+.tab-bar button.active {
+  opacity: 1;
+  border-bottom-color: var(--pico-primary);
+  color: var(--pico-primary);
+  font-weight: bold;
+}
+
+/* Usage gauge bar (Overview table + Fallback detail pane) */
+.gauge {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.5rem;
+  min-width: 140px;
+}
+
+.gauge-track {
+  position: relative;
+  flex: 1;
+  height: 8px;
+  border-radius: 4px;
+  background: var(--pico-muted-border-color);
+  overflow: visible;
+}
+
+.gauge-fill {
+  height: 100%;
+  border-radius: 4px;
+  background: var(--pico-primary);
+}
+
+.gauge-fill.warn {
+  background: #d89b5c;
+}
+
+.gauge-fill.danger {
+  background: #c25c5c;
+}
+
+.gauge-tick {
+  position: absolute;
+  top: -3px;
+  width: 2px;
+  height: 14px;
+  background: #c25c5c;
+}
+
+.gauge-label {
+  font-size: 0.8rem;
+  opacity: 0.7;
+  white-space: nowrap;
+}
+
+/* Fallback chain vertical timeline (Overview tab, read-only) */
+.chain-timeline {
+  position: relative;
+  padding-left: 28px;
+}
+
+.chain-timeline .rail {
+  position: absolute;
+  left: 10px;
+  top: 14px;
+  bottom: 14px;
+  width: 2px;
+  background: var(--pico-muted-border-color);
+}
+
+.chain-node {
+  position: relative;
+  margin-bottom: 20px;
+}
+
+.chain-node:last-child {
+  margin-bottom: 0;
+}
+
+.chain-node.blocked {
+  opacity: 0.55;
+}
+
+.chain-node .badge {
+  position: absolute;
+  left: -28px;
+  top: 0;
+  width: 22px;
+  height: 22px;
+  border-radius: 50%;
+  color: #fff;
+  font-size: 0.75rem;
+  font-weight: bold;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.chain-node .badge.active {
+  background: var(--pico-primary);
+}
+
+.chain-node .badge.next {
+  background: #d89b5c;
+}
+
+.chain-node .badge.blocked {
+  background: var(--pico-muted-border-color);
+  color: var(--pico-muted-color);
+  border: 1px dashed var(--pico-muted-color);
+}
+
+.chain-node .row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+
+.chain-node .pill {
+  font-size: 0.7rem;
+  padding: 2px 8px;
+  border-radius: 10px;
+}
+
+.chain-node .pill.active {
+  background: rgba(108, 142, 224, 0.15);
+  color: var(--pico-primary);
+}
+
+.chain-node .pill.next {
+  background: rgba(216, 155, 92, 0.15);
+  color: #b5773a;
+}
+
+.chain-node .pill.blocked {
+  background: rgba(200, 90, 90, 0.15);
+  color: #c25c5c;
+}
+
+.chain-caption {
+  margin-top: 1rem;
+  padding-top: 0.75rem;
+  border-top: 1px solid var(--pico-muted-border-color);
+  font-size: 0.8rem;
+  opacity: 0.7;
+}
+
+/* Fallback tab master-detail */
+.fallback-layout {
+  display: flex;
+  gap: 1.5rem;
+  min-height: 320px;
+}
+
+.fallback-chain-list {
+  width: 220px;
+  flex-shrink: 0;
+  border-right: 1px solid var(--pico-muted-border-color);
+  padding-right: 0.75rem;
+}
+
+.fallback-chain-list .chain-row {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.5rem;
+  border-radius: 6px;
+  margin-bottom: 0.35rem;
+  cursor: pointer;
+}
+
+.fallback-chain-list .chain-row.selected {
+  background: rgba(108, 142, 224, 0.12);
+  border: 1px solid var(--pico-primary);
+}
+
+.fallback-chain-list .chain-row .ord {
+  font-size: 0.75rem;
+  opacity: 0.6;
+  width: 20px;
+}
+
+.fallback-chain-list .add-row {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.5rem;
+  border-radius: 6px;
+  border: 1px dashed var(--pico-muted-border-color);
+  color: var(--pico-primary);
+  cursor: pointer;
+}
+
+.fallback-detail {
+  flex: 1;
+}
+
+.fallback-detail .field-grid {
+  display: grid;
+  grid-template-columns: 140px 1fr;
+  row-gap: 0.9rem;
+  align-items: center;
+}
+
+.field-error {
+  color: #c25c5c;
+  font-size: 0.8rem;
+  margin-top: 0.25rem;
+}
+
+/* Toasts */
+.toast-stack {
+  position: fixed;
+  top: 1rem;
+  right: 1rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  z-index: 100;
+}
+
+.toast {
+  background: var(--pico-primary);
+  color: var(--pico-primary-inverse);
+  padding: 0.5rem 1rem;
+  border-radius: 6px;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.2);
+}

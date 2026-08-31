@@ -1,0 +1,272 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>clauth</title>
+    <link rel="stylesheet" href="/vendor/pico.min.css" />
+    <link rel="stylesheet" href="/app.css" />
+  </head>
+  <body x-data="dashboard()" x-init="init()">
+    <div class="app-shell">
+      <header class="app-header">
+        <nav class="app-nav">
+          <span class="brand">clauth</span>
+          <span class="status-snippet" x-show="status">
+            <span x-text="status ? status.profiles.length : 0"></span> accounts ·
+            <span x-text="status && status.active_profile ? status.active_profile : 'none active'"></span>
+          </span>
+        </nav>
+        <div class="tab-bar">
+          <template x-for="t in tabs" :key="t.id">
+            <button :class="{ active: tab === t.id }" @click="selectTab(t.id)" x-text="t.label"></button>
+          </template>
+        </div>
+      </header>
+
+      <main>
+        <!-- Overview -->
+        <section x-show="tab === 'overview'">
+          <p x-show="statusError" x-text="statusError"></p>
+          <article x-show="status">
+          <table>
+            <thead>
+              <tr>
+                <th></th>
+                <th>account</th>
+                <th>type</th>
+                <th>5h</th>
+                <th>7d</th>
+                <th>live</th>
+                <th></th>
+              </tr>
+            </thead>
+            <tbody>
+              <template x-for="p in (status ? status.profiles : [])" :key="p.name">
+                <tr>
+                  <td x-text="statusMarker(p).glyph"></td>
+                  <td x-text="p.name"></td>
+                  <td x-text="p.tier || p.provider"></td>
+                  <td>
+                    <span class="gauge">
+                      <span class="gauge-track">
+                        <span
+                          class="gauge-fill"
+                          :class="gaugeClass(windowFor(p, '5h') && windowFor(p, '5h').utilization_pct, 100)"
+                          :style="{ width: (windowFor(p, '5h') ? windowFor(p, '5h').utilization_pct : 0) + '%' }"
+                        ></span>
+                      </span>
+                      <span
+                        class="gauge-label"
+                        x-text="fmtPct(windowFor(p, '5h') && windowFor(p, '5h').utilization_pct) + (windowFor(p, '5h') && windowFor(p, '5h').resets_at ? ' · ' + fmtReset(windowFor(p, '5h').resets_at) : '')"
+                      ></span>
+                    </span>
+                  </td>
+                  <td>
+                    <span class="gauge">
+                      <span class="gauge-track">
+                        <span
+                          class="gauge-fill"
+                          :class="gaugeClass(windowFor(p, '7d') && windowFor(p, '7d').utilization_pct, 100)"
+                          :style="{ width: (windowFor(p, '7d') ? windowFor(p, '7d').utilization_pct : 0) + '%' }"
+                        ></span>
+                      </span>
+                      <span
+                        class="gauge-label"
+                        x-text="fmtPct(windowFor(p, '7d') && windowFor(p, '7d').utilization_pct) + (windowFor(p, '7d') && windowFor(p, '7d').resets_at ? ' · ' + fmtReset(windowFor(p, '7d').resets_at) : '')"
+                      ></span>
+                    </span>
+                  </td>
+                  <td x-text="p.has_live_session ? '●' : ''"></td>
+                  <td>
+                    <button
+                      class="outline"
+                      :disabled="p.active || p.auth_status === 'broken'"
+                      @click="switchProfile(p.name)"
+                    >
+                      switch
+                    </button>
+                  </td>
+                </tr>
+              </template>
+            </tbody>
+          </table>
+          </article>
+
+          <article x-show="status">
+          <h3>Fallback chain</h3>
+          <div class="chain-timeline" x-show="chainNodes().length > 0">
+            <div class="rail"></div>
+            <template x-for="node in chainNodes()" :key="node.profile.name">
+              <div class="chain-node" :class="{ blocked: node.state === 'blocked' }">
+                <span
+                  class="badge"
+                  :class="node.state === 'active' ? 'active' : (node.state === 'blocked' ? 'blocked' : 'next')"
+                  x-text="node.profile.fallback.position"
+                ></span>
+                <div class="row">
+                  <strong x-text="node.profile.name"></strong>
+                  <span
+                    class="pill"
+                    :class="node.state === 'active' ? 'active' : (node.state === 'blocked' ? 'blocked' : 'next')"
+                    x-text="node.state === 'active' ? 'active now' : (node.state === 'blocked' ? 'login broken' : 'standby')"
+                  ></span>
+                </div>
+                <span class="gauge" x-show="node.state !== 'blocked'">
+                  <span class="gauge-track">
+                    <span
+                      class="gauge-fill"
+                      :class="gaugeClass(node.pct, node.threshold)"
+                      :style="{ width: (node.pct || 0) + '%' }"
+                    ></span>
+                    <span class="gauge-tick" :style="{ left: node.threshold + '%' }"></span>
+                  </span>
+                  <span class="gauge-label" x-text="fmtPct(node.pct) + ' / ' + node.threshold + '%'"></span>
+                </span>
+              </div>
+            </template>
+          </div>
+          <p class="chain-caption">
+            When every account is spent:
+            <strong x-text="status && status.wrap_off ? 'stop' : 'stay on the active account'"></strong>
+          </p>
+          </article>
+        </section>
+
+        <!-- Fallback -->
+        <section x-show="tab === 'fallback'">
+          <article x-show="fallbackData">
+          <div class="fallback-layout">
+            <div class="fallback-chain-list">
+              <template x-for="(m, idx) in (fallbackData ? fallbackData.chain : [])" :key="m.name">
+                <div
+                  class="chain-row"
+                  :class="{ selected: fallbackSelected === m.name }"
+                  draggable="true"
+                  @dragstart="dragStart(idx)"
+                  @dragover.prevent
+                  @drop="dragDrop(idx)"
+                  @click="fallbackSelected = m.name"
+                >
+                  <span>⠿</span>
+                  <span class="ord" x-text="'#' + (idx + 1)"></span>
+                  <span x-text="m.name"></span>
+                </div>
+              </template>
+              <div class="add-row" x-show="!fallbackAdding" @click="fallbackAdding = true">
+                <span>+</span><span>add account to chain</span>
+              </div>
+              <select x-show="fallbackAdding" @change="addCandidate($event.target.value)">
+                <option value="">choose an account…</option>
+                <template x-for="c in (fallbackData ? fallbackData.candidates : [])" :key="c">
+                  <option :value="c" x-text="c"></option>
+                </template>
+              </select>
+            </div>
+
+            <div class="fallback-detail" x-show="selectedFallbackMember()">
+              <template x-if="selectedFallbackMember()">
+                <div>
+                  <div class="row" style="display: flex; justify-content: space-between; align-items: center">
+                    <h3 x-text="selectedFallbackMember().name"></h3>
+                    <button class="outline" style="color: #c25c5c" @click="removeMember(selectedFallbackMember().name)">
+                      remove from chain
+                    </button>
+                  </div>
+
+                  <div class="gauge" style="width: 100%; margin-bottom: 1rem">
+                    <span class="gauge-track" style="height: 10px">
+                      <span
+                        class="gauge-fill"
+                        :class="gaugeClass(selectedFallbackMember().utilization_5h, selectedFallbackMember().threshold)"
+                        :style="{ width: (selectedFallbackMember().utilization_5h || 0) + '%' }"
+                      ></span>
+                      <span class="gauge-tick" :style="{ left: selectedFallbackMember().threshold + '%' }"></span>
+                    </span>
+                    <span
+                      class="gauge-label"
+                      x-text="fmtPct(selectedFallbackMember().utilization_5h) + ' / ' + selectedFallbackMember().threshold + '%'"
+                    ></span>
+                  </div>
+
+                  <div class="field-grid">
+                    <label>Switch threshold</label>
+                    <div>
+                      <input
+                        type="range"
+                        min="50"
+                        max="100"
+                        :value="selectedFallbackMember().threshold"
+                        @change="patchMember(selectedFallbackMember().name, 'threshold', Number($event.target.value))"
+                      />
+                      <span x-text="selectedFallbackMember().threshold + '%'"></span>
+                      <div class="field-error" x-show="fieldError(selectedFallbackMember().name, 'threshold')" x-text="fieldError(selectedFallbackMember().name, 'threshold')"></div>
+                    </div>
+
+                    <label>Weekly threshold</label>
+                    <div>
+                      <input
+                        type="range"
+                        min="50"
+                        max="100"
+                        :value="selectedFallbackMember().weekly_threshold"
+                        @change="patchMember(selectedFallbackMember().name, 'weekly_threshold', Number($event.target.value))"
+                      />
+                      <span x-text="selectedFallbackMember().weekly_threshold + '%'"></span>
+                      <div class="field-error" x-show="fieldError(selectedFallbackMember().name, 'weekly_threshold')" x-text="fieldError(selectedFallbackMember().name, 'weekly_threshold')"></div>
+                    </div>
+
+                    <label>Max auto spend</label>
+                    <div>
+                      <input
+                        type="text"
+                        placeholder="uncapped"
+                        :value="selectedFallbackMember().max_auto_spend"
+                        @change="patchMember(selectedFallbackMember().name, 'max_auto_spend', Number($event.target.value))"
+                      />
+                      <div class="field-error" x-show="fieldError(selectedFallbackMember().name, 'max_auto_spend')" x-text="fieldError(selectedFallbackMember().name, 'max_auto_spend')"></div>
+                    </div>
+
+                    <label>Last resort</label>
+                    <input
+                      type="checkbox"
+                      role="switch"
+                      :checked="selectedFallbackMember().last_resort"
+                      @change="patchMember(selectedFallbackMember().name, 'last_resort', $event.target.checked)"
+                    />
+
+                    <label>Preferred</label>
+                    <input
+                      type="checkbox"
+                      role="switch"
+                      :checked="selectedFallbackMember().preferred"
+                      @change="patchMember(selectedFallbackMember().name, 'preferred', $event.target.checked)"
+                    />
+                  </div>
+                </div>
+              </template>
+            </div>
+          </div>
+          </article>
+        </section>
+
+        <!-- Remaining tabs: built in follow-up iterations -->
+        <section x-show="tab === 'usage'"><p>Coming soon.</p></section>
+        <section x-show="tab === 'tokens'"><p>Coming soon.</p></section>
+        <section x-show="tab === 'setup'"><p>Coming soon.</p></section>
+        <section x-show="tab === 'config'"><p>Coming soon.</p></section>
+        <section x-show="tab === 'status'"><p>Coming soon.</p></section>
+        <section x-show="tab === 'plugin'"><p>Coming soon.</p></section>
+      </main>
+    </div>
+
+    <div class="toast-stack">
+      <template x-for="t in toasts" :key="t.id">
+        <div class="toast" x-text="t.text"></div>
+      </template>
+    </div>
+
+    <script defer src="/app.js"></script>
+    <script defer src="/vendor/alpine.min.js"></script>
+  </body>
+</html>

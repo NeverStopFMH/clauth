@@ -1,10 +1,16 @@
 //! The dashboard's embedded HTTP server: runs inside `clauth daemon`, bound
-//! to 127.0.0.1 only. Read endpoints are open; write endpoints require the
-//! bearer token from [`auth::load_or_create_token`]. See
-//! `docs/superpowers/specs/2026-08-31-web-dashboard-backend-api-design.md`
-//! for the full design.
+//! to 127.0.0.1 only. Every endpoint (read and write) is open — no auth. A
+//! malicious webpage in another tab can't reach these routes: every write
+//! endpoint only accepts an `application/json` body over a non-`GET` method,
+//! which forces a browser to send a CORS preflight first, and this server
+//! answers no CORS headers at all, so the preflight (and therefore the real
+//! request) never gets through. The only thing that CAN call these routes is
+//! a process already running as the same local user, which already has
+//! direct filesystem access to `~/.claude`/`~/.clauth`. See
+//! `docs/superpowers/specs/2026-08-31-web-dashboard-frontend-design.md`'s
+//! "Auth model: removed" section for the full rationale.
 
-mod auth;
+mod assets;
 mod config;
 mod fallback;
 mod jobs;
@@ -18,8 +24,6 @@ use serde::de::DeserializeOwned;
 use tiny_http::{Header, Method, Response, Server, StatusCode};
 
 use crate::profile::ConfigHandle;
-
-pub(crate) use auth::load_or_create_token;
 
 /// Default port the dashboard listens on. Callers that need a different
 /// bind target (tests use `127.0.0.1:0` for an OS-assigned free port) pass
@@ -122,7 +126,7 @@ impl Handle {
 /// `tiny_http::Server::http` accepts (`"127.0.0.1:47893"`, or `"127.0.0.1:0"`
 /// for tests). Returns once the socket is bound, so a caller can read
 /// [`Handle::addr`] immediately without racing the accept loop's startup.
-pub(crate) fn spawn(config: ConfigHandle, token: String, addr: &str) -> std::io::Result<Handle> {
+pub(crate) fn spawn(config: ConfigHandle, addr: &str) -> std::io::Result<Handle> {
     let server = Arc::new(
         Server::http(addr).map_err(|e| std::io::Error::other(format!("web server bind: {e}")))?,
     );
@@ -130,7 +134,7 @@ pub(crate) fn spawn(config: ConfigHandle, token: String, addr: &str) -> std::io:
     let jobs_store = jobs::new_store();
     let join = std::thread::spawn(move || {
         for request in accept_server.incoming_requests() {
-            handle_request(&config, &jobs_store, &token, request);
+            handle_request(&config, &jobs_store, request);
         }
     });
     Ok(Handle {
@@ -139,21 +143,21 @@ pub(crate) fn spawn(config: ConfigHandle, token: String, addr: &str) -> std::io:
     })
 }
 
-/// Route one request. Read routes answer unconditionally; write routes 401
-/// without a valid bearer token, checked BEFORE the route body ever runs.
 fn handle_request(
     config: &ConfigHandle,
     jobs_store: &jobs::JobStore,
-    token: &str,
     mut request: tiny_http::Request,
 ) {
     let method = request.method().clone();
     let url = request.url().to_string();
-    let (status, body) = if is_write_method(&method) && !request_is_authorized(&request, token) {
-        (StatusCode(401), error_body("unauthorized"))
-    } else {
-        resolve(route(config, jobs_store, &method, &url, &mut request))
-    };
+    let path = url.split('?').next().unwrap_or(&url);
+    if method == Method::Get
+        && let Some(response) = assets::serve(path)
+    {
+        let _ = request.respond(response);
+        return;
+    }
+    let (status, body) = resolve(route(config, jobs_store, &method, &url, &mut request));
     let _ = request.respond(json_response(status, &body));
 }
 
@@ -169,6 +173,7 @@ fn route(
         (Method::Get, "/api/health") => Ok((StatusCode(200), r#"{"ok":true}"#.to_string())),
         (Method::Get, "/api/status") => Ok(status_body()),
         (Method::Get, "/api/status/incidents") => Ok(incidents_body()),
+        (Method::Get, "/api/fallback") => fallback::list(config),
         (Method::Post, "/api/profiles/switch") => profiles::switch(config, request),
         (Method::Post, "/api/profiles/reorder") => profiles::reorder(config, request),
         (Method::Post, "/api/profiles") => profiles::create(config, request),
@@ -201,10 +206,6 @@ fn route(
         }
         _ => Err((StatusCode(404), error_body("not found"))),
     }
-}
-
-fn is_write_method(method: &Method) -> bool {
-    matches!(method, Method::Post | Method::Patch | Method::Delete)
 }
 
 /// The segment of `path` after `prefix` — the `{name}` in `/api/profiles/{name}`.
@@ -247,15 +248,6 @@ fn incidents_body() -> (StatusCode, String) {
         Ok(body) => (StatusCode(200), body),
         Err(()) => (StatusCode(503), error_body("no status feed cached yet")),
     }
-}
-
-fn request_is_authorized(request: &tiny_http::Request, token: &str) -> bool {
-    let header = request
-        .headers()
-        .iter()
-        .find(|h| h.field.equiv("Authorization"))
-        .map(|h| h.value.as_str());
-    auth::check_bearer(header, token)
 }
 
 #[allow(

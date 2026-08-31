@@ -14,15 +14,12 @@ use crate::lockorder::RankedMutex;
 use crate::profile::{AppConfig, AppState, ConfigHandle};
 use crate::testutil::HomeSandbox;
 
-const TEST_TOKEN: &str = "test-token-0123456789";
-
 fn start() -> (crate::web::Handle, ConfigHandle) {
     let config: ConfigHandle = Arc::new(RankedMutex::new(AppConfig {
         state: AppState::default(),
         profiles: Vec::new(),
     }));
-    let server = crate::web::spawn(Arc::clone(&config), TEST_TOKEN.to_string(), "127.0.0.1:0")
-        .expect("server binds");
+    let server = crate::web::spawn(Arc::clone(&config), "127.0.0.1:0").expect("server binds");
     (server, config)
 }
 

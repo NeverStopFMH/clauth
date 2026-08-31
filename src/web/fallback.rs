@@ -1,15 +1,68 @@
-//! Fallback tab write endpoints — thin wrappers over the `actions.rs`
-//! functions extracted from `tui/app.rs`'s own fallback-detail keystrokes.
+//! Fallback tab endpoints — a read (the per-member editable state the
+//! dashboard's form needs, which `GET /api/status`'s slim `fallback` object
+//! doesn't carry) plus the write endpoints extracted from `tui/app.rs`'s own
+//! fallback-detail keystrokes.
 
 use serde::Deserialize;
 use tiny_http::StatusCode;
 
 use super::{RouteResult, error_body, ok_body, read_json_body};
+use crate::fallback::{member_weekly_line, threshold_for};
 use crate::profile::{ConfigHandle, ProfileName};
 
 #[derive(Deserialize)]
 struct ChainRequest {
     chain: Vec<String>,
+}
+
+/// `GET /api/fallback` — every chain member's editable fallback fields, plus
+/// the profiles not yet in the chain (candidates for the "+ add" control).
+/// `GET /api/status`'s `profiles[].fallback` only carries `position`/
+/// `threshold`/`armed` (the daemon-facing contract documented in
+/// `wiki/Daemon.md`); the dashboard's Fallback tab additionally needs
+/// `weekly_threshold`/`max_auto_spend`/`preferred`/`last_resort` to populate
+/// its form, which are dashboard-only reads with no reason to grow that
+/// shared contract.
+pub(super) fn list(config: &ConfigHandle) -> RouteResult {
+    #[allow(
+        clippy::expect_used,
+        reason = "config mutex poisoning is unrecoverable"
+    )]
+    let cfg = config.lock().expect("config mutex poisoned");
+    let chain_soft = cfg.state.weekly_switch_threshold_pct();
+    let chain: Vec<serde_json::Value> = cfg
+        .state
+        .fallback_chain
+        .iter()
+        .filter_map(|name| cfg.find(name).map(|p| (name, p)))
+        .map(|(name, p)| {
+            let utilization_5h = p
+                .usage
+                .as_ref()
+                .and_then(|u| u.five_hour.as_ref())
+                .map(|w| w.utilization);
+            serde_json::json!({
+                "name": name.as_ref(),
+                "armed": cfg.is_active(name),
+                "utilization_5h": utilization_5h,
+                "threshold": threshold_for(p),
+                "weekly_threshold": member_weekly_line(p, chain_soft),
+                "max_auto_spend": p.max_auto_spend,
+                "preferred": p.preferred,
+                "last_resort": p.last_resort,
+            })
+        })
+        .collect();
+    let candidates: Vec<&str> = cfg
+        .profiles
+        .iter()
+        .map(|p| p.name.as_ref())
+        .filter(|name| !cfg.state.fallback_chain.iter().any(|n| n.as_ref() == *name))
+        .collect();
+    Ok((
+        StatusCode(200),
+        serde_json::json!({ "chain": chain, "candidates": candidates }).to_string(),
+    ))
 }
 
 /// `PATCH /api/fallback` — replaces the whole chain membership + order in

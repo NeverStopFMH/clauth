@@ -40,6 +40,14 @@ spec/plan cycle later:
   `GET /api/plugin/status` (pure reads) is tested; the two write endpoints are one-line
   wrappers over functions `plugin_host`'s own test suite already covers.
 
+### Superseded by Phase 2
+
+The "Auth model" section below (bearer token gating write endpoints) was **removed
+during Phase 2 design** — see `2026-08-31-web-dashboard-frontend-design.md`'s "Auth
+model: removed" section for the rationale and the resulting code changes
+(`src/web/auth.rs` deleted, `clauth web url` command deleted, etc.). Left in place here
+as a historical record of Phase 1's original design.
+
 ## Motivation
 
 The TUI (`clauth`) is keyboard-only — no mouse support anywhere in `src/tui/` today (no

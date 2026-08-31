@@ -86,13 +86,15 @@ pub(crate) fn spawn(config: ConfigHandle, token: String, addr: &str) -> std::io:
 }
 
 /// Route one request. Read routes answer unconditionally; write routes 401
-/// without a valid bearer token. Only `GET /api/health` exists so far — the
-/// rest of the API lands in follow-up slices (see the design spec).
+/// without a valid bearer token. The rest of the API lands in follow-up
+/// slices (see the design spec).
 fn handle_request(_config: &ConfigHandle, token: &str, request: tiny_http::Request) {
     let method = request.method().clone();
     let url = request.url().to_string();
     let response = match (&method, url.as_str()) {
         (Method::Get, "/api/health") => json_response(StatusCode(200), r#"{"ok":true}"#),
+        (Method::Get, "/api/status") => status_response(),
+        (Method::Get, "/api/status/incidents") => incidents_response(),
         _ if is_write_method(&method) && !request_is_authorized(&request, token) => {
             json_response(StatusCode(401), r#"{"error":"unauthorized"}"#)
         }
@@ -103,6 +105,40 @@ fn handle_request(_config: &ConfigHandle, token: &str, request: tiny_http::Reque
 
 fn is_write_method(method: &Method) -> bool {
     matches!(method, Method::Post | Method::Patch | Method::Delete)
+}
+
+/// `GET /api/status`: the same `~/.clauth/status.json` a daemon publishes
+/// every tick (`wiki/Daemon.md` is the read contract), served verbatim rather
+/// than rebuilt here — the daemon is already the single writer of that JSON,
+/// so reading its own file keeps this endpoint from ever drifting from what
+/// `clauth status --json` and any other reader of the file already see. A
+/// 503 (not 404) when the file doesn't exist yet: the server binds before
+/// the first tick writes it, a startup window rather than a missing route.
+fn status_response() -> Response<std::io::Cursor<Vec<u8>>> {
+    match read_status_file() {
+        Ok(body) => json_response(StatusCode(200), &body),
+        Err(_) => json_response(StatusCode(503), r#"{"error":"status not ready yet"}"#),
+    }
+}
+
+fn read_status_file() -> std::io::Result<String> {
+    let dir = crate::profile::clauth_dir().map_err(std::io::Error::other)?;
+    std::fs::read_to_string(dir.join(crate::daemon::STATUS_FILE))
+}
+
+/// `GET /api/status/incidents`: `~/.clauth/status_cache.json` verbatim — the
+/// Claude status-page feed's local cache (`{"fetched_at_ms", "incidents"}`),
+/// same "serve the file the background writer already maintains" pattern as
+/// [`status_response`]. 503 while nothing has been fetched yet (a fresh
+/// install, or the poller hasn't completed its first round).
+fn incidents_response() -> Response<std::io::Cursor<Vec<u8>>> {
+    let body = crate::status::cache_path()
+        .ok_or(())
+        .and_then(|path| std::fs::read_to_string(path).map_err(|_| ()));
+    match body {
+        Ok(body) => json_response(StatusCode(200), &body),
+        Err(()) => json_response(StatusCode(503), r#"{"error":"no status feed cached yet"}"#),
+    }
 }
 
 fn request_is_authorized(request: &tiny_http::Request, token: &str) -> bool {

@@ -63,7 +63,7 @@ const TICK: Duration = Duration::from_secs(1);
 /// ~5 min at the 1s tick — rare enough to be free, frequent enough to
 /// bound a busy log.
 const LOG_ROTATE_EVERY_TICKS: u64 = 300;
-const STATUS_FILE: &str = "status.json";
+pub(crate) const STATUS_FILE: &str = "status.json";
 const LOCK_FILE: &str = "clauthd.lock";
 /// The live daemon's pid, an UNLOCKED peer of [`LOCK_FILE`]. Kept out of the
 /// lock file itself because Windows locks are mandatory (`LockFileEx`): a

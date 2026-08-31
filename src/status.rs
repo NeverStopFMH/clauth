@@ -229,7 +229,7 @@ struct CacheFile {
 /// `~/.clauth/status_cache.json`. Resolved ONCE at spawn time and passed into
 /// the worker so the detached thread never re-resolves `home_dir()` later — that
 /// would race a test's `HOME_OVERRIDE` scope and could touch the real `~/.clauth`.
-fn cache_path() -> Option<std::path::PathBuf> {
+pub(crate) fn cache_path() -> Option<std::path::PathBuf> {
     clauth_dir().ok().map(|d| d.join("status_cache.json"))
 }
 

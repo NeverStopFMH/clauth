@@ -28,11 +28,13 @@ spec/plan cycle later:
   value" first (`cycle_theme`, `step_refresh_interval`, …) — presentation logic with
   nothing for the web API (which receives an exact end state from a form) to share. Wrote
   `actions::apply_config_patch` fresh instead of extracting from `tui/app.rs`.
-- **Setup's `PATCH /api/profiles/{name}` doesn't cover model routing or rename.** Model
-  settings (`edit_profile_model`) and `rename_profile` (which needs a `RotationGuard`
-  acquired before the config lock, like `delete_profile`) were left out of the first cut
-  to keep the endpoint's scope manageable — straightforward to add the same way the
-  existing fields were, when a frontend actually needs them.
+- **Setup's `PATCH /api/profiles/{name}` didn't originally cover model routing or
+  rename** — left out of the first cut to keep the endpoint's scope manageable. Added
+  during Phase 2 once the Setup tab needed them: `model` deserializes straight into
+  `ModelSettings`, and `rename` acquires a `RotationGuard` for the OLD name before the
+  config lock (same pattern as `delete_profile`) and is applied before any other field
+  in the same request, so a combined `{rename, env}` body lands the rest under the new
+  name.
 - **`plugin_host::install`/`self_heal` have no HTTP-level test.** Both shell out to the
   real `claude` binary via `agentgear`; the sandboxed harness for that
   (`testutil::FakeClaude`) is Unix-only (a PATH-shimmed shell script), so a cross-platform

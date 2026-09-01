@@ -303,6 +303,99 @@ fn patch_disables_and_reenables_a_profile() {
 }
 
 #[test]
+fn patch_sets_model_routing() {
+    let _home = HomeSandbox::new();
+    let target = Profile::new("modeltest".to_string(), None, None);
+    crate::profile::save_profile(&target).expect("save profile");
+    let state = AppState {
+        profiles: vec!["modeltest".into()],
+        ..AppState::default()
+    };
+    crate::profile::save_app_state(&state).expect("persist state");
+    let config = AppConfig {
+        state,
+        profiles: vec![target],
+    };
+
+    let (handle, config_handle) = start_with(config);
+    let url = format!("http://{}/api/profiles/modeltest", handle.addr());
+    let response = ureq::patch(&url)
+        .header("Content-Type", "application/json")
+        .send(serde_json::json!({"model": {"default": "claude-opus-4-6", "haiku": "claude-haiku-4-5"}}).to_string())
+        .expect("model patch request");
+    assert_eq!(response.status().as_u16(), 200);
+
+    #[allow(clippy::unwrap_used, reason = "test-only")]
+    let cfg = config_handle.lock().unwrap();
+    let updated = cfg.find(&"modeltest".into()).expect("still present");
+    assert_eq!(updated.models.default.as_deref(), Some("claude-opus-4-6"));
+    assert_eq!(updated.models.haiku.as_deref(), Some("claude-haiku-4-5"));
+    drop(cfg);
+    handle.stop();
+}
+
+#[test]
+fn patch_renames_a_profile() {
+    let _home = HomeSandbox::new();
+    let target = Profile::new("oldname".to_string(), None, None);
+    crate::profile::save_profile(&target).expect("save profile");
+    let state = AppState {
+        profiles: vec!["oldname".into()],
+        ..AppState::default()
+    };
+    crate::profile::save_app_state(&state).expect("persist state");
+    let config = AppConfig {
+        state,
+        profiles: vec![target],
+    };
+
+    let (handle, config_handle) = start_with(config);
+    let url = format!("http://{}/api/profiles/oldname", handle.addr());
+    let response = ureq::patch(&url)
+        .header("Content-Type", "application/json")
+        .send(serde_json::json!({"rename": "newname"}).to_string())
+        .expect("rename request");
+    assert_eq!(response.status().as_u16(), 200);
+
+    #[allow(clippy::unwrap_used, reason = "test-only")]
+    let cfg = config_handle.lock().unwrap();
+    assert!(cfg.find(&"oldname".into()).is_none());
+    assert!(cfg.find(&"newname".into()).is_some());
+    drop(cfg);
+    handle.stop();
+}
+
+#[test]
+fn patch_rejects_a_rename_onto_an_existing_name() {
+    let _home = HomeSandbox::new();
+    let a = Profile::new("a".to_string(), None, None);
+    let b = Profile::new("b".to_string(), None, None);
+    for p in [&a, &b] {
+        crate::profile::save_profile(p).expect("save profile");
+    }
+    let state = AppState {
+        profiles: vec!["a".into(), "b".into()],
+        ..AppState::default()
+    };
+    crate::profile::save_app_state(&state).expect("persist state");
+    let config = AppConfig {
+        state,
+        profiles: vec![a, b],
+    };
+
+    let (handle, _config_handle) = start_with(config);
+    let url = format!("http://{}/api/profiles/a", handle.addr());
+    let err = ureq::patch(&url)
+        .header("Content-Type", "application/json")
+        .send(serde_json::json!({"rename": "b"}).to_string())
+        .expect_err("duplicate rename target");
+    let ureq::Error::StatusCode(422) = err else {
+        panic!("expected 422, got {err:?}");
+    };
+    handle.stop();
+}
+
+#[test]
 fn list_includes_disabled_profiles_with_setup_only_fields() {
     let _home = HomeSandbox::new();
     let mut visible = Profile::new("visible".to_string(), None, None);

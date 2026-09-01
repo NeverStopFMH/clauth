@@ -36,6 +36,7 @@ pub(super) fn list(config: &ConfigHandle) -> RouteResult {
                 "disabled": p.is_disabled(),
                 "auto_start": p.auto_start,
                 "provider": crate::profile_json::provider_label(p),
+                "models": p.models,
             })
         })
         .collect();
@@ -142,7 +143,10 @@ pub(super) fn delete(config: &ConfigHandle, name: &str, url: &str) -> RouteResul
 /// (mirroring `edit_profile_endpoint`'s own signature) rather than as two
 /// independent optional fields, so there is no ambiguity between "leave this
 /// half alone" and "clear it" — editing the endpoint always sends the whole
-/// pair.
+/// pair. `model` deserializes straight into [`crate::profile::ModelSettings`]
+/// (already `#[serde(default)]` per field) — no wrapper needed. `rename` is
+/// applied FIRST, before any other field, so a request naming both `rename`
+/// and (say) `env` in one body lands the rest under the NEW name.
 #[derive(Deserialize, Default)]
 struct PatchRequest {
     #[serde(default)]
@@ -151,6 +155,10 @@ struct PatchRequest {
     env: Option<BTreeMap<String, String>>,
     #[serde(default)]
     disabled: Option<bool>,
+    #[serde(default)]
+    model: Option<crate::profile::ModelSettings>,
+    #[serde(default)]
+    rename: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -165,7 +173,29 @@ pub(super) fn patch(
     request: &mut tiny_http::Request,
 ) -> RouteResult {
     let body: PatchRequest = read_json_body(request)?;
-    let name = ProfileName::from(name.to_string());
+    let mut name = ProfileName::from(name.to_string());
+
+    if let Some(new_name) = body.rename {
+        // Acquired BEFORE the config lock, like `delete`'s own guard — a
+        // second acquisition at the config lock's rank while already holding
+        // it would be a lock-order violation.
+        let rotation = crate::actions::rotation_guard_for_mutation(&name)
+            .map_err(|e| (StatusCode(423), error_body(&e.to_string())))?;
+        let new_name = ProfileName::from(new_name);
+        #[allow(
+            clippy::expect_used,
+            reason = "config mutex poisoning is unrecoverable"
+        )]
+        let mut cfg = config.lock().expect("config mutex poisoned");
+        let existing: Vec<&str> = cfg.profiles.iter().map(|p| p.name.as_str()).collect();
+        crate::actions::validate_profile_name(new_name.as_ref(), &existing, Some(name.as_ref()))
+            .map_err(|e| (StatusCode(422), error_body(&e.to_string())))?;
+        crate::actions::rename_profile(&mut cfg, &name, &new_name, &rotation)
+            .map_err(|e| (StatusCode(422), error_body(&e.to_string())))?;
+        drop(cfg);
+        name = new_name;
+    }
+
     #[allow(
         clippy::expect_used,
         reason = "config mutex poisoning is unrecoverable"
@@ -179,6 +209,11 @@ pub(super) fn patch(
 
     if let Some(env) = body.env {
         crate::actions::edit_profile_env(&mut cfg, &name, env)
+            .map_err(|e| (StatusCode(422), error_body(&e.to_string())))?;
+    }
+
+    if let Some(model) = body.model {
+        crate::actions::edit_profile_model(&mut cfg, &name, model)
             .map_err(|e| (StatusCode(422), error_body(&e.to_string())))?;
     }
 

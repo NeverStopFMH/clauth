@@ -434,7 +434,16 @@
               <tbody>
                 <template x-for="p in (setupData ? setupData.profiles : [])" :key="p.name">
                   <tr>
-                    <td x-text="p.name"></td>
+                    <template x-if="!renameDrafts[p.name]">
+                      <td style="cursor: pointer" @click="startRename(p)" x-text="p.name"></td>
+                    </template>
+                    <template x-if="renameDrafts[p.name]">
+                      <td>
+                        <input type="text" x-model="renameDrafts[p.name]" @keydown.enter="saveRename(p.name)" />
+                        <button style="font-size: 12px" @click="saveRename(p.name)">save</button>
+                        <button class="outline" style="font-size: 12px" @click="cancelRename(p.name)">cancel</button>
+                      </td>
+                    </template>
                     <template x-if="!endpointDrafts[p.name]">
                       <td x-text="p.base_url || '—'" style="cursor: pointer" @click="startEndpointEdit(p)"></td>
                     </template>
@@ -462,6 +471,9 @@
                       />
                     </td>
                     <td style="display: flex; gap: 0.4rem">
+                      <button class="outline" style="font-size: 12px" @click="startModelEdit(p)">
+                        models
+                      </button>
                       <button class="outline" style="font-size: 12px" @click="alibabaOpenFor = (alibabaOpenFor === p.name ? null : p.name)">
                         console login
                       </button>
@@ -473,6 +485,28 @@
                 </template>
               </tbody>
             </table>
+
+            <div x-show="modelsOpenFor" style="margin-top: 1rem; padding-top: 1rem; border-top: 1px solid var(--pico-muted-border-color)">
+              <strong>Model routing for <span x-text="modelsOpenFor"></span></strong>
+              <div class="field-grid" style="margin-top: 0.5rem">
+                <label>Default</label>
+                <input type="text" placeholder="e.g. claude-opus-4-6" x-model="modelDraft.default" />
+                <label>Opus</label>
+                <input type="text" x-model="modelDraft.opus" />
+                <label>Sonnet</label>
+                <input type="text" x-model="modelDraft.sonnet" />
+                <label>Haiku</label>
+                <input type="text" x-model="modelDraft.haiku" />
+                <label>Fable</label>
+                <input type="text" x-model="modelDraft.fable" />
+                <label>Subagent</label>
+                <input type="text" x-model="modelDraft.subagent" />
+              </div>
+              <div style="margin-top: 0.5rem; display: flex; gap: 0.5rem">
+                <button @click="saveModelEdit(modelsOpenFor)">save</button>
+                <button class="outline" @click="modelsOpenFor = null">cancel</button>
+              </div>
+            </div>
             <template x-for="(msg, field) in setupFieldErrors" :key="field">
               <div class="field-error" x-text="field + ': ' + msg"></div>
             </template>

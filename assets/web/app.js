@@ -86,6 +86,9 @@ document.addEventListener("alpine:init", () => {
     setupData: null,
     setupFieldErrors: {},
     endpointDrafts: {},
+    renameDrafts: {},
+    modelsOpenFor: null,
+    modelDraft: {},
     newProfile: { name: "", base_url: "", api_key: "" },
     createError: null,
     oauthName: "",
@@ -440,6 +443,83 @@ document.addEventListener("alpine:init", () => {
         delete rest[key];
         this.setupFieldErrors = rest;
         this.cancelEndpointEdit(name);
+        this.pushToast("saved");
+        await this.loadSetup();
+      } catch (e) {
+        this.setupFieldErrors = { ...this.setupFieldErrors, [key]: String(e) };
+      }
+    },
+
+    startRename(p) {
+      this.renameDrafts = { ...this.renameDrafts, [p.name]: p.name };
+    },
+
+    cancelRename(name) {
+      const rest = { ...this.renameDrafts };
+      delete rest[name];
+      this.renameDrafts = rest;
+    },
+
+    async saveRename(name) {
+      const newName = this.renameDrafts[name];
+      const key = `${name}.rename`;
+      if (!newName || newName === name) {
+        this.cancelRename(name);
+        return;
+      }
+      try {
+        const res = await fetch(`/api/profiles/${encodeURIComponent(name)}`, {
+          method: "PATCH",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ rename: newName }),
+        });
+        if (!res.ok) {
+          const body = await res.json().catch(() => ({}));
+          this.setupFieldErrors = { ...this.setupFieldErrors, [key]: body.error || `error ${res.status}` };
+          return;
+        }
+        const rest = { ...this.setupFieldErrors };
+        delete rest[key];
+        this.setupFieldErrors = rest;
+        this.cancelRename(name);
+        this.pushToast(`renamed to ${newName}`);
+        await this.loadSetup();
+      } catch (e) {
+        this.setupFieldErrors = { ...this.setupFieldErrors, [key]: String(e) };
+      }
+    },
+
+    startModelEdit(p) {
+      this.modelsOpenFor = this.modelsOpenFor === p.name ? null : p.name;
+      this.modelDraft = { ...(p.models || {}) };
+    },
+
+    async saveModelEdit(name) {
+      const key = `${name}.model`;
+      try {
+        const res = await fetch(`/api/profiles/${encodeURIComponent(name)}`, {
+          method: "PATCH",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            model: {
+              default: this.modelDraft.default || null,
+              opus: this.modelDraft.opus || null,
+              sonnet: this.modelDraft.sonnet || null,
+              haiku: this.modelDraft.haiku || null,
+              fable: this.modelDraft.fable || null,
+              subagent: this.modelDraft.subagent || null,
+            },
+          }),
+        });
+        if (!res.ok) {
+          const body = await res.json().catch(() => ({}));
+          this.setupFieldErrors = { ...this.setupFieldErrors, [key]: body.error || `error ${res.status}` };
+          return;
+        }
+        const rest = { ...this.setupFieldErrors };
+        delete rest[key];
+        this.setupFieldErrors = rest;
+        this.modelsOpenFor = null;
         this.pushToast("saved");
         await this.loadSetup();
       } catch (e) {

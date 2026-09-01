@@ -252,51 +252,40 @@
 
         <!-- Usage -->
         <section x-show="tab === 'usage'">
-          <article x-show="status">
-            <div class="fallback-layout">
-              <div class="fallback-chain-list">
-                <template x-for="p in (status ? status.profiles : [])" :key="p.name">
-                  <div
-                    class="chain-row"
-                    :class="{ selected: usageSelected === p.name }"
-                    @click="usageSelected = p.name"
-                  >
-                    <span x-text="p.name"></span>
-                  </div>
-                </template>
-              </div>
-              <div class="fallback-detail" x-show="usageProfile()">
-                <template x-if="usageProfile()">
-                  <div>
-                    <div class="row" style="display: flex; justify-content: space-between; align-items: center">
-                      <h3 x-text="usageProfile().name"></h3>
-                      <span class="pill" :class="usageProfile().auth_status === 'ok' ? 'active' : 'blocked'" x-text="usageProfile().auth_status"></span>
+          <div class="usage-grid" x-show="status">
+            <template x-for="p in (status ? status.profiles : [])" :key="p.name">
+              <article class="usage-card" :class="{ active: p.active }">
+                <div class="row" style="display: flex; justify-content: space-between; align-items: center">
+                  <h3 style="margin: 0" x-text="p.name"></h3>
+                  <span class="pill" :class="p.auth_status === 'ok' ? 'active' : 'blocked'" x-text="p.auth_status"></span>
+                </div>
+                <p style="font-size: 0.85rem; opacity: 0.7">
+                  <span x-text="p.tier || p.provider"></span> ·
+                  fetch: <span x-text="p.fetch_status || 'never'"></span>
+                </p>
+                <template x-for="w in p.windows" :key="w.label">
+                  <div style="margin-bottom: 1rem">
+                    <div style="font-size: 0.85rem; margin-bottom: 4px">
+                      <strong x-text="w.label"></strong>
+                      <span
+                        style="margin-left: 1rem"
+                        x-text="fmtPct(w.utilization_pct) + (w.resets_at ? ' · resets in ' + fmtReset(w.resets_at) : '')"
+                      ></span>
                     </div>
-                    <p style="font-size: 0.85rem; opacity: 0.7">
-                      <span x-text="usageProfile().tier || usageProfile().provider"></span> ·
-                      fetch: <span x-text="usageProfile().fetch_status || 'never'"></span>
-                    </p>
-                    <template x-for="w in usageProfile().windows" :key="w.label">
-                      <div style="margin-bottom: 1rem">
-                        <div style="display: flex; justify-content: space-between; font-size: 0.85rem; margin-bottom: 4px">
-                          <span x-text="w.label"></span>
-                          <span x-text="fmtPct(w.utilization_pct) + (w.resets_at ? ' · resets in ' + fmtReset(w.resets_at) : '')"></span>
-                        </div>
-                        <span class="gauge-track" style="display: block; height: 8px">
-                          <span
-                            class="gauge-fill"
-                            :class="gaugeClass(w.utilization_pct, 100)"
-                            :style="{ width: w.utilization_pct + '%' }"
-                          ></span>
-                        </span>
-                      </div>
-                    </template>
-                    <p x-show="usageProfile().windows.length === 0" style="opacity: 0.6">No usage windows cached yet.</p>
+                    <span class="gauge-track" style="display: block; height: 8px">
+                      <span
+                        class="gauge-fill"
+                        :class="gaugeClass(w.utilization_pct, 100)"
+                        :style="{ width: w.utilization_pct + '%' }"
+                      ></span>
+                    </span>
+                    <div class="gauge-label" x-show="w.resets_at" x-text="fmtDualTz(w.resets_at)" style="margin-top: 4px"></div>
                   </div>
                 </template>
-              </div>
-            </div>
-          </article>
+                <p x-show="p.windows.length === 0" style="opacity: 0.6">No usage windows cached yet.</p>
+              </article>
+            </template>
+          </div>
         </section>
 
         <!-- Config -->
@@ -428,61 +417,6 @@
           </article>
         </section>
 
-        <!-- Tokens -->
-        <section x-show="tab === 'tokens'">
-          <p x-show="tokensError" x-text="tokensError"></p>
-          <article x-show="tokensData">
-            <template x-if="tokensData">
-              <div>
-                <div class="field-grid">
-                  <label>Input</label>
-                  <span x-text="fmtNumber(tokensData.total_input)"></span>
-                  <label>Output</label>
-                  <span x-text="fmtNumber(tokensData.total_output)"></span>
-                  <label>Cache read</label>
-                  <span x-text="fmtNumber(tokensData.total_cache_read)"></span>
-                  <label>Cache create</label>
-                  <span x-text="fmtNumber(tokensData.total_cache_create)"></span>
-                  <label>Sessions</label>
-                  <span x-text="tokensData.total_sessions"></span>
-                  <label>Messages</label>
-                  <span x-text="tokensData.total_messages"></span>
-                  <label>Cache hit rate</label>
-                  <span x-text="Math.round(tokensData.cache_hit_ratio * 100) + '%'"></span>
-                </div>
-
-                <h4 style="margin-top: 1.5rem">By model</h4>
-                <table>
-                  <thead>
-                    <tr>
-                      <th>model</th>
-                      <th>input</th>
-                      <th>output</th>
-                      <th>cache read</th>
-                      <th>cache create</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    <template x-for="m in tokensData.models" :key="m.model">
-                      <tr>
-                        <td x-text="m.model"></td>
-                        <td x-text="fmtNumber(m.input)"></td>
-                        <td x-text="fmtNumber(m.output)"></td>
-                        <td x-text="fmtNumber(m.cache_read)"></td>
-                        <td x-text="fmtNumber(m.cache_create)"></td>
-                      </tr>
-                    </template>
-                  </tbody>
-                </table>
-
-                <p style="font-size: 0.8rem; opacity: 0.6; margin-top: 1rem">
-                  Lifetime totals from the on-disk cache; today's in-flight activity is not yet folded in.
-                </p>
-              </div>
-            </template>
-          </article>
-        </section>
-
         <!-- Setup -->
         <section x-show="tab === 'setup'">
           <article x-show="setupData">
@@ -587,26 +521,6 @@
               <span x-show="oauthJob && oauthJob.status === 'succeeded'">signed in</span>
               <span class="field-error" x-show="oauthJob && oauthJob.status === 'failed'" x-text="oauthJob.error"></span>
             </div>
-          </article>
-        </section>
-
-        <!-- Status -->
-        <section x-show="tab === 'status'">
-          <article>
-            <p x-show="incidentsError" x-text="incidentsError"></p>
-            <div x-show="incidents && incidents.incidents.length === 0">No active incidents.</div>
-            <template x-for="inc in (incidents ? incidents.incidents : [])" :key="inc.id">
-              <div style="margin-bottom: 1rem; padding-bottom: 1rem; border-bottom: 1px solid var(--pico-muted-border-color)">
-                <div class="row" style="display: flex; justify-content: space-between">
-                  <strong x-text="inc.title"></strong>
-                  <span class="pill next" x-text="typeof inc.phase === 'string' ? inc.phase : JSON.stringify(inc.phase)"></span>
-                </div>
-                <div style="font-size: 0.8rem; opacity: 0.7">
-                  impact: <span x-text="typeof inc.impact === 'string' ? inc.impact : JSON.stringify(inc.impact)"></span>
-                </div>
-                <a :href="inc.link" target="_blank" rel="noopener" style="font-size: 0.8rem">details</a>
-              </div>
-            </template>
           </article>
         </section>
 

@@ -34,14 +34,24 @@ pub(super) fn serve(path: &str) -> Option<Response<Cursor<Vec<u8>>>> {
     Some(with_content_type(body, content_type))
 }
 
+/// No `Cache-Control` header at all left these five responses to the
+/// browser's heuristic caching, which could keep serving a stale
+/// `app.css`/`app.js` across a `clauth` upgrade (or, during development, across
+/// a plain server restart) since every asset is served from the same URL on
+/// every version. `no-cache` forces a revalidation round trip on every load —
+/// cheap for a local server — rather than trusting a heuristic lifetime.
 #[allow(
     clippy::expect_used,
     reason = "the header name/value are both compile-time-constant ASCII literals"
 )]
 fn with_content_type(body: &str, content_type: &str) -> Response<Cursor<Vec<u8>>> {
-    let header = Header::from_bytes(&b"Content-Type"[..], content_type.as_bytes())
+    let content_type_header = Header::from_bytes(&b"Content-Type"[..], content_type.as_bytes())
         .expect("static header name/value are always valid");
-    Response::from_string(body.to_string()).with_header(header)
+    let cache_header = Header::from_bytes(&b"Cache-Control"[..], &b"no-cache"[..])
+        .expect("static header name/value are always valid");
+    Response::from_string(body.to_string())
+        .with_header(content_type_header)
+        .with_header(cache_header)
 }
 
 #[cfg(test)]

@@ -9,6 +9,7 @@ use tiny_http::StatusCode;
 use super::{RouteResult, error_body, ok_body, read_json_body};
 use crate::fallback::{member_weekly_line, threshold_for};
 use crate::profile::{ConfigHandle, ProfileName};
+use crate::usage::LABEL_5H;
 
 #[derive(Deserialize)]
 struct ChainRequest {
@@ -36,11 +37,17 @@ pub(super) fn list(config: &ConfigHandle) -> RouteResult {
         .iter()
         .filter_map(|name| cfg.find(name).map(|p| (name, p)))
         .map(|(name, p)| {
-            let utilization_5h = p
-                .usage
-                .as_ref()
-                .and_then(|u| u.five_hour.as_ref())
-                .map(|w| w.utilization);
+            // Read the disk cache (same source `GET /api/status` publishes
+            // from), not the in-memory `Profile.usage` field: a daemon that
+            // stood down its own usage-fetch lease to another live process
+            // (TUI, another `clauth` instance) never populates its own
+            // in-memory copy, so reading that field here would show "no
+            // data" on Fallback while Overview/Usage — both status.json-
+            // sourced — show real numbers from the same account.
+            let utilization_5h = crate::profile_json::published_windows(name)
+                .into_iter()
+                .find(|w| w.label == LABEL_5H)
+                .map(|w| w.utilization_pct);
             serde_json::json!({
                 "name": name.as_ref(),
                 "armed": cfg.is_active(name),

@@ -17,7 +17,6 @@ mod jobs;
 mod login;
 mod plugin;
 mod profiles;
-mod tokens;
 
 use std::sync::Arc;
 
@@ -176,7 +175,6 @@ fn route(
         (Method::Get, "/api/status/incidents") => Ok(incidents_body()),
         (Method::Get, "/api/fallback") => fallback::list(config),
         (Method::Get, "/api/config") => config::get(config),
-        (Method::Get, "/api/tokens") => tokens::get(),
         (Method::Get, "/api/profiles") => profiles::list(config),
         (Method::Post, "/api/profiles/switch") => profiles::switch(config, request),
         (Method::Post, "/api/profiles/reorder") => profiles::reorder(config, request),

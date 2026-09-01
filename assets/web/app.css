@@ -69,27 +69,46 @@ main article {
   font-weight: bold;
 }
 
-/* Usage gauge bar (Overview table + Fallback detail pane) */
+/* Usage gauge bar. Default `.gauge-track` is a plain block that fills its
+   container's width (100%) — the shape a standalone bar wants (the Usage
+   tab's per-window bars, one block-level `.gauge-track` per row with no
+   flex wrapper). Inside the compact `.gauge` inline-flex wrapper (Overview
+   table cells, the Fallback chain timeline), the more specific
+   `.gauge .gauge-track` rule below pins it to a small fixed width instead:
+   a flex-grow factor only has something to grow into when its flex
+   container has a definite/constrained width, which an inline-flex `.gauge`
+   sitting in a shrink-to-fit context (a table cell with no fixed column
+   width) never has — the absolutely-positioned fill contributes nothing to
+   the track's own content size, so `flex: 1` collapsed the track to near
+   zero there. A fixed width sidesteps that flex-basis ambiguity entirely. */
 .gauge {
   display: inline-flex;
   align-items: center;
   gap: 0.5rem;
-  min-width: 140px;
 }
 
 .gauge-track {
   position: relative;
-  flex: 1;
+  width: 100%;
   height: 8px;
   border-radius: 4px;
   background: var(--pico-muted-border-color);
   overflow: visible;
 }
 
+.gauge .gauge-track {
+  width: 72px;
+  flex: none;
+}
+
 .gauge-fill {
+  display: block;
+  position: absolute;
+  left: 0;
+  top: 0;
   height: 100%;
   border-radius: 4px;
-  background: var(--pico-primary);
+  background: #6c8ee0;
 }
 
 .gauge-fill.warn {
@@ -204,6 +223,22 @@ main article {
   border-top: 1px solid var(--pico-muted-border-color);
   font-size: 0.8rem;
   opacity: 0.7;
+}
+
+/* Usage tab: one full-width card per account, stacked, no tab/click-through needed */
+.usage-grid {
+  display: flex;
+  flex-direction: column;
+  gap: 1rem;
+}
+
+.usage-card {
+  margin-bottom: 0;
+}
+
+.usage-card.active {
+  background: rgba(108, 142, 224, 0.28);
+  border-color: #6c8ee0;
 }
 
 /* Fallback tab master-detail */

@@ -4,11 +4,9 @@
 const TABS = [
   { id: "overview", label: "Overview" },
   { id: "usage", label: "Usage" },
-  { id: "tokens", label: "Tokens" },
   { id: "setup", label: "Setup" },
   { id: "fallback", label: "Fallback" },
   { id: "config", label: "Config" },
-  { id: "status", label: "Status" },
   { id: "plugin", label: "Plugin" },
 ];
 
@@ -31,11 +29,31 @@ function fmtReset(iso) {
   return `${days}d ${hours % 24}h`;
 }
 
-function fmtNumber(n) {
-  if (n === null || n === undefined) return "—";
-  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
-  if (n >= 1_000) return `${(n / 1_000).toFixed(1)}K`;
-  return String(n);
+// Mirrors the TUI's `absolute_reset_line` (src/tui/render/format.rs): the
+// same instant spelled out in US Eastern and China Standard Time, so a
+// US-based and a China-based reader see identical text regardless of the
+// machine's own timezone. `Intl` handles the US DST calendar for us instead
+// of reimplementing the transition-date math client-side.
+function fmtDualTz(iso) {
+  if (!iso) return "";
+  const date = new Date(iso);
+  if (Number.isNaN(date.getTime())) return "";
+  const fmt = (timeZone) => {
+    const parts = new Intl.DateTimeFormat("en-US", {
+      timeZone,
+      year: "numeric",
+      month: "numeric",
+      day: "numeric",
+      hour: "2-digit",
+      minute: "2-digit",
+      second: "2-digit",
+      hour12: false,
+    }).formatToParts(date);
+    const get = (type) => parts.find((p) => p.type === type)?.value ?? "";
+    const hour = get("hour") === "24" ? "00" : get("hour");
+    return `${get("month")}/${get("day")}/${get("year")} ${hour}:${get("minute")}:${get("second")}`;
+  };
+  return `[US] Resets ${fmt("America/New_York")}  [CN] Resets ${fmt("Asia/Shanghai")}`;
 }
 
 function windowFor(profile, label) {
@@ -63,14 +81,8 @@ document.addEventListener("alpine:init", () => {
     pluginData: null,
     pluginBusy: false,
     pluginError: null,
-    incidents: null,
-    incidentsError: null,
-    _incidentsTimer: null,
-    usageSelected: null,
     configData: null,
     configFieldErrors: {},
-    tokensData: null,
-    tokensError: null,
     setupData: null,
     setupFieldErrors: {},
     endpointDrafts: {},
@@ -100,13 +112,8 @@ document.addEventListener("alpine:init", () => {
       this.tab = id;
       if (id === "fallback") this.loadFallback();
       if (id === "plugin") this.loadPlugin();
-      if (id === "status") this.loadIncidents();
       if (id === "config") this.loadConfig();
-      if (id === "tokens") this.loadTokens();
       if (id === "setup") this.loadSetup();
-      if (id === "usage" && !this.usageSelected && this.status && this.status.profiles.length > 0) {
-        this.usageSelected = this.status.profiles[0].name;
-      }
     },
 
     async fetchStatus() {
@@ -133,7 +140,7 @@ document.addEventListener("alpine:init", () => {
 
     fmtPct,
     fmtReset,
-    fmtNumber,
+    fmtDualTz,
     windowFor,
     gaugeClass,
 
@@ -178,11 +185,6 @@ document.addEventListener("alpine:init", () => {
         else if (p.auth_status === "broken") state = "blocked";
         return { profile: p, pct, threshold: p.fallback.threshold, state };
       });
-    },
-
-    usageProfile() {
-      if (!this.status || !this.usageSelected) return null;
-      return this.status.profiles.find((p) => p.name === this.usageSelected) || null;
     },
 
     // ---- Fallback ----
@@ -551,41 +553,5 @@ document.addEventListener("alpine:init", () => {
       }
     },
 
-    // ---- Tokens ----
-
-    async loadTokens() {
-      try {
-        const res = await fetch("/api/tokens");
-        if (!res.ok) {
-          this.tokensError = res.status === 503 ? "no token stats cached yet" : `error ${res.status}`;
-          return;
-        }
-        this.tokensData = await res.json();
-        this.tokensError = null;
-      } catch {
-        this.tokensError = "unreachable";
-      }
-    },
-
-    // ---- Status ----
-
-    async loadIncidents() {
-      try {
-        const res = await fetch("/api/status/incidents");
-        if (!res.ok) {
-          this.incidentsError = res.status === 503 ? "no feed cached yet" : `error ${res.status}`;
-          return;
-        }
-        this.incidents = await res.json();
-        this.incidentsError = null;
-      } catch {
-        this.incidentsError = "unreachable";
-      }
-      if (!this._incidentsTimer) {
-        this._incidentsTimer = setInterval(() => {
-          if (this.tab === "status" && document.visibilityState === "visible") this.loadIncidents();
-        }, 30000);
-      }
-    },
   }));
 });

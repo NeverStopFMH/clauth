@@ -36,6 +36,17 @@ Scope note: the daemon carries **no external mutation surface**: no socket, no c
   - The lease is first-come and held for the process lifetime, no preemption, so the switch-decider never thrashes between processes; a waiter takes it over within one tick of the holder exiting (flock auto-release).
   - The daemon normally boots first and holds it, but a TUI already fetching keeps the lease until it closes, and the daemon then hydrates while still publishing `status.json` every tick.
 
+## Windows autostart
+
+`clauth autostart install` registers a Task Scheduler entry (trigger: at log
+on, `/RL LIMITED` — no admin) that runs this same `clauth.exe daemon` on
+every login, so the daemon (and the dashboard it now embeds) comes up with
+no terminal window and no manual `clauth daemon` each session. `clauth
+autostart uninstall` removes it; `clauth autostart status` prints whether
+it's registered. Windows only. Safe to install even when a `clauth daemon`
+is already running some other way: the singleton flock above makes a
+redundant launch a no-op, not a conflict.
+
 ## `~/.clauth/status.json`
 
 Written each scheduler tick and immediately after a switch lands. Atomic (`tmp` + rename into place), `0600`. **Never carries a token, secret, or key**: names, tiers, percentages, timestamps only.

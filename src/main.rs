@@ -1,5 +1,6 @@
 mod actions;
 mod alibaba_login;
+mod autostart;
 mod claude;
 mod claude_json;
 mod cli;
@@ -194,6 +195,7 @@ fn dispatch(cli: Cli) -> Result<()> {
         Command::ApiKey { profile } => cmd_api_key(&profile),
         Command::Completions { target, shell } => cmd_completions(&target, shell.as_deref()),
         Command::Herdr { cmd } => cmd_herdr(cmd),
+        Command::Autostart { cmd } => cmd_autostart(cmd),
         Command::Run { .. } => cmd_run(),
         Command::External(words) => cmd_external(&words),
     }
@@ -214,6 +216,14 @@ fn cmd_daemon(standby: bool, replace: bool, status: bool) -> Result<()> {
 fn cmd_complete() -> Result<()> {
     completions::print_profile_names();
     Ok(())
+}
+
+fn cmd_autostart(cmd: cli::AutostartCommand) -> Result<()> {
+    match cmd {
+        cli::AutostartCommand::Install { yes } => autostart::install(yes),
+        cli::AutostartCommand::Uninstall { yes } => autostart::uninstall(yes),
+        cli::AutostartCommand::Status => autostart::status(),
+    }
 }
 
 fn cmd_herdr(cmd: cli::HerdrCommand) -> Result<()> {

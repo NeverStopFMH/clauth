@@ -271,6 +271,17 @@ pub(crate) enum Command {
         cmd: HerdrCommand,
     },
 
+    /// Run `clauth daemon` at Windows login, with no visible terminal window
+    ///
+    /// Registers a Task Scheduler entry (trigger: at log on, limited/non-admin
+    /// run level) that launches this same `clauth.exe daemon` — the daemon's
+    /// own single-instance flock already makes a redundant launch a safe no-op,
+    /// so no extra guard is needed here. Windows only.
+    Autostart {
+        #[command(subcommand)]
+        cmd: AutostartCommand,
+    },
+
     /// Print a shell completion script, or install one
     ///
     /// `clauth completions <bash|zsh|fish>` prints the script to stdout.
@@ -479,4 +490,26 @@ pub(crate) enum HerdrConfigCommand {
         /// delegate_dot, delegate_row_text.
         key: String,
     },
+}
+
+/// `clauth autostart <cmd>`: register/remove/inspect the Windows Task
+/// Scheduler entry that runs `clauth daemon` at log on.
+#[derive(Subcommand, Debug)]
+pub(crate) enum AutostartCommand {
+    /// Create the scheduled task, replacing one already registered
+    Install {
+        /// Skip the confirm prompt. Required on a non-TTY stdin, which gets
+        /// no prompt.
+        #[arg(long, short = 'y')]
+        yes: bool,
+    },
+    /// Remove the scheduled task
+    Uninstall {
+        /// Skip the confirm prompt. Required on a non-TTY stdin, which gets
+        /// no prompt.
+        #[arg(long, short = 'y')]
+        yes: bool,
+    },
+    /// Print whether the scheduled task is currently registered
+    Status,
 }

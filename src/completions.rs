@@ -14,7 +14,7 @@ const BASH_TEMPLATE: &str = r#"_clauth() {
     if [ "$COMP_CWORD" -eq 1 ]; then
         local profiles
         profiles=$(clauth __complete 2>/dev/null)
-        COMPREPLY=( $(compgen -W "${profiles} start login delete disable enable rolling-token static-token which list jobs sessions resume info daemon status mcp herdr completions --theme" -- "${cur}") )
+        COMPREPLY=( $(compgen -W "${profiles} start login delete disable enable rolling-token static-token which list jobs sessions resume info daemon status mcp herdr autostart completions --theme" -- "${cur}") )
     elif [ "$prev" = "--theme" ]; then
         COMPREPLY=( $(compgen -W "full compatible" -- "${cur}") )
     elif [ "${COMP_WORDS[1]}" = "login" ] && [ "${cur:0:2}" = "--" ]; then
@@ -39,6 +39,8 @@ const BASH_TEMPLATE: &str = r#"_clauth() {
         COMPREPLY=( $(compgen -W "--json" -- "${cur}") )
     elif [ "$COMP_CWORD" -eq 2 ] && [ "$prev" = "herdr" ]; then
         COMPREPLY=( $(compgen -W "install uninstall config" -- "${cur}") )
+    elif [ "$COMP_CWORD" -eq 2 ] && [ "$prev" = "autostart" ]; then
+        COMPREPLY=( $(compgen -W "install uninstall status" -- "${cur}") )
     elif [ "$COMP_CWORD" -eq 3 ] && [ "${COMP_WORDS[1]}" = "herdr" ] && [ "${COMP_WORDS[2]}" = "config" ]; then
         COMPREPLY=( $(compgen -W "get" -- "${cur}") )
     elif [ "$COMP_CWORD" -eq 4 ] && [ "${COMP_WORDS[1]}" = "herdr" ] && [ "${COMP_WORDS[2]}" = "config" ] && [ "${COMP_WORDS[3]}" = "get" ]; then
@@ -47,6 +49,8 @@ const BASH_TEMPLATE: &str = r#"_clauth() {
         COMPREPLY=( $(compgen -W "--key --no-config --yes -y" -- "${cur}") )
     elif [ "${COMP_WORDS[1]}" = "herdr" ] && [ "${COMP_WORDS[2]}" = "uninstall" ] && [ "${cur:0:2}" = "--" ]; then
         COMPREPLY=( $(compgen -W "--no-config --yes -y" -- "${cur}") )
+    elif [ "${COMP_WORDS[1]}" = "autostart" ] && { [ "${COMP_WORDS[2]}" = "install" ] || [ "${COMP_WORDS[2]}" = "uninstall" ]; } && [ "${cur:0:2}" = "--" ]; then
+        COMPREPLY=( $(compgen -W "--yes -y" -- "${cur}") )
     elif [ "${COMP_WORDS[1]}" = "resume" ] && [ "${cur:0:2}" = "--" ]; then
         COMPREPLY=( $(compgen -W "--profile" -- "${cur}") )
     elif [ "${COMP_WORDS[1]}" = "delete" ] && [ "${cur:0:2}" = "--" ]; then
@@ -89,6 +93,7 @@ _clauth() {
             'status[print the usage / auto-switch snapshot as JSON]' \
             'mcp[run the stdio MCP server]' \
             'herdr[install the herdr plugin and bind a key to it]' \
+            'autostart[run clauth daemon at Windows log on]' \
             'completions[emit shell completion script]'
         _values 'option' '--theme[force a color depth instead of auto-detecting]'
     elif (( CURRENT >= 3 )) && [[ "${words[CURRENT-1]}" == "--theme" ]]; then
@@ -119,6 +124,12 @@ _clauth() {
         _values 'flag' '--key[key that opens the dashboard]' '--no-config[leave herdr'"'"'s config.toml alone]' '--yes[skip both confirm prompts]' '-y[skip both confirm prompts]'
     elif (( CURRENT >= 4 )) && [[ "${words[2]}" == herdr && "${words[3]}" == uninstall ]]; then
         _values 'flag' '--no-config[leave herdr'"'"'s config.toml alone]' '--yes[skip both confirm prompts]' '-y[skip both confirm prompts]'
+    elif (( CURRENT == 3 )) && [[ "${words[2]}" == autostart ]]; then
+        _values 'subcommand' 'install[register the scheduled task]' \
+            'uninstall[remove the scheduled task]' \
+            'status[print whether the task is registered]'
+    elif (( CURRENT >= 4 )) && [[ "${words[2]}" == autostart && "${words[3]}" == (install|uninstall) ]]; then
+        _values 'flag' '--yes[skip the confirm prompt]' '-y[skip the confirm prompt]'
     elif (( CURRENT == 3 )) && [[ "${words[2]}" == which ]]; then
         _values 'flag' '--json[emit JSON instead of plain name]'
     elif (( CURRENT == 3 )) && [[ "${words[2]}" == sessions ]]; then
@@ -184,6 +195,12 @@ complete -c clauth -f -n "__fish_seen_subcommand_from herdr; and __fish_seen_sub
 complete -c clauth -f -n "__fish_seen_subcommand_from herdr; and __fish_seen_subcommand_from install" -a --yes -d "Skip both confirm prompts"
 complete -c clauth -f -n "__fish_seen_subcommand_from herdr; and __fish_seen_subcommand_from uninstall" -a --no-config -d "Leave herdr's config.toml alone"
 complete -c clauth -f -n "__fish_seen_subcommand_from herdr; and __fish_seen_subcommand_from uninstall" -a --yes -d "Skip both confirm prompts"
+complete -c clauth -f -n __fish_is_first_token -a autostart -d "Run clauth daemon at Windows log on, no terminal window"
+complete -c clauth -f -n "__fish_seen_subcommand_from autostart" -a install -d "Register the scheduled task"
+complete -c clauth -f -n "__fish_seen_subcommand_from autostart" -a uninstall -d "Remove the scheduled task"
+complete -c clauth -f -n "__fish_seen_subcommand_from autostart" -a status -d "Print whether the task is registered"
+complete -c clauth -f -n "__fish_seen_subcommand_from autostart; and __fish_seen_subcommand_from install" -a --yes -d "Skip the confirm prompt"
+complete -c clauth -f -n "__fish_seen_subcommand_from autostart; and __fish_seen_subcommand_from uninstall" -a --yes -d "Skip the confirm prompt"
 complete -c clauth -f -n __fish_is_first_token -a --theme -d "Force a color depth instead of auto-detecting"
 complete -c clauth -f -n 'set -l t (commandline -opc); and test "$t[-1]" = "--theme"' -a "full compatible"
 complete -c clauth -f -n "__fish_seen_subcommand_from start login delete disable enable rolling-token static-token" -a "(__clauth_profiles)" -d Profile

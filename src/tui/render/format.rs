@@ -408,7 +408,7 @@ pub(crate) fn absolute_reset_line_at(secs: i64, now: i64) -> Option<String> {
     // offset is exact, unlike US Eastern above, which needs the DST calendar.
     let cn = FixedOffset::east_opt(8 * 3600)?;
     Some(format!(
-        "[US] Resets {}  [CN] Resets {}",
+        "[US] Resets {}        [CN] Resets {}",
         format_us_clock(utc.with_timezone(&us).naive_local()),
         format_us_clock(utc.with_timezone(&cn).naive_local()),
     ))

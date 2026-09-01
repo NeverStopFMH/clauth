@@ -662,7 +662,7 @@ fn absolute_reset_line_renders_both_zones_twelve_hours_apart() {
     let line = absolute_reset_line_at(resets_at - now, now).expect("future reset renders");
     assert_eq!(
         line,
-        "[US] Resets 8/31/2026 20:00:00  [CN] Resets 9/1/2026 08:00:00"
+        "[US] Resets 8/31/2026 20:00:00        [CN] Resets 9/1/2026 08:00:00"
     );
 }
 

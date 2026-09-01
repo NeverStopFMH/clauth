@@ -54,7 +54,12 @@ function fmtDualTz(iso) {
     const hour = get("hour") === "24" ? "00" : get("hour");
     return `${get("month")}/${get("day")}/${get("year")} ${hour}:${get("minute")}:${get("second")}`;
   };
-  return `[US] Resets ${fmt("America/New_York")}  [CN] Resets ${fmt("Asia/Shanghai")}`;
+  // Use U+00A0 (non-breaking space), not a plain space, in the gap below: this string lands
+  // in the DOM via x-text, and a browser collapses a run of regular spaces
+  // down to one when rendering text content, so a gap made of plain " "s
+  // renders as no gap at all.
+  const gap = "    ";
+  return `[US] Resets ${fmt("America/New_York")}${gap}[CN] Resets ${fmt("Asia/Shanghai")}`;
 }
 
 function windowFor(profile, label) {

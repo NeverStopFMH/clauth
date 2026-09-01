@@ -38,6 +38,7 @@
                 <th>5h</th>
                 <th>7d</th>
                 <th>live</th>
+                <th>next</th>
                 <th></th>
               </tr>
             </thead>
@@ -78,6 +79,7 @@
                     </span>
                   </td>
                   <td x-text="p.has_live_session ? '●' : ''"></td>
+                  <td style="font-size: 0.8rem; opacity: 0.7" x-text="fmtCountdown(p.next_refresh_at, nowTick)"></td>
                   <td>
                     <button
                       class="outline"
@@ -262,6 +264,9 @@
                 <p style="font-size: 0.85rem; opacity: 0.7">
                   <span x-text="p.tier || p.provider"></span> ·
                   fetch: <span x-text="p.fetch_status || 'never'"></span>
+                  <span x-show="fmtCountdown(p.next_refresh_at, nowTick)">
+                    · next in <span x-text="fmtCountdown(p.next_refresh_at, nowTick)"></span>
+                  </span>
                 </p>
                 <template x-for="w in p.windows" :key="w.label">
                   <div style="margin-bottom: 1rem">

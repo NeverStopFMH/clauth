@@ -11,6 +11,7 @@ const TABS = [
 ];
 
 const STATUS_POLL_MS = 3000;
+const TICK_MS = 1000;
 const LAST_TAB_KEY = "clauth.lastTab";
 
 function fmtPct(v) {
@@ -28,6 +29,21 @@ function fmtReset(iso) {
   if (hours < 24) return `${hours}h ${remMins}m`;
   const days = Math.floor(hours / 24);
   return `${days}d ${hours % 24}h`;
+}
+
+// Seconds until `next_refresh_at` (the next scheduled usage fetch, same
+// field the TUI's per-row timer counts down from), or "" once past/absent.
+// Takes `_tick` purely so the caller passes a reactive property (e.g.
+// `nowTick`) as an argument — Alpine only re-evaluates an x-text expression
+// when a property IT READS changes, and this function's own `Date.now()`
+// call is invisible to that tracking, so without a tracked argument the
+// countdown would only update on the next full status poll, not every
+// second.
+function fmtCountdown(iso, _tick) {
+  if (!iso) return "";
+  const ms = new Date(iso).getTime() - Date.now();
+  if (Number.isNaN(ms)) return "";
+  return `${Math.max(0, Math.round(ms / 1000))}s`;
 }
 
 // Mirrors the TUI's `absolute_reset_line` (src/tui/render/format.rs): the
@@ -105,7 +121,9 @@ document.addEventListener("alpine:init", () => {
     toasts: [],
     _toastId: 0,
     _pollTimer: null,
+    _tickTimer: null,
     _dragIndex: null,
+    nowTick: 0,
 
     init() {
       this.fetchStatus();
@@ -115,6 +133,12 @@ document.addEventListener("alpine:init", () => {
       document.addEventListener("visibilitychange", () => {
         if (document.visibilityState === "visible") this.fetchStatus();
       });
+      // Drives the next-refresh countdowns (Overview table, Usage cards):
+      // ticks every second regardless of the 3s status poll, so the
+      // countdown visibly counts down between polls rather than jumping.
+      this._tickTimer = setInterval(() => {
+        if (document.visibilityState === "visible") this.nowTick++;
+      }, TICK_MS);
 
       const savedTab = localStorage.getItem(LAST_TAB_KEY);
       if (savedTab && this.tabs.some((t) => t.id === savedTab)) {
@@ -156,6 +180,7 @@ document.addEventListener("alpine:init", () => {
     fmtPct,
     fmtReset,
     fmtDualTz,
+    fmtCountdown,
     windowFor,
     gaugeClass,
 

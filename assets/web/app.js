@@ -11,6 +11,7 @@ const TABS = [
 ];
 
 const STATUS_POLL_MS = 3000;
+const LAST_TAB_KEY = "clauth.lastTab";
 
 function fmtPct(v) {
   return v === null || v === undefined ? "—" : `${Math.round(v)}%`;
@@ -109,10 +110,16 @@ document.addEventListener("alpine:init", () => {
       document.addEventListener("visibilitychange", () => {
         if (document.visibilityState === "visible") this.fetchStatus();
       });
+
+      const savedTab = localStorage.getItem(LAST_TAB_KEY);
+      if (savedTab && this.tabs.some((t) => t.id === savedTab)) {
+        this.selectTab(savedTab);
+      }
     },
 
     selectTab(id) {
       this.tab = id;
+      localStorage.setItem(LAST_TAB_KEY, id);
       if (id === "fallback") this.loadFallback();
       if (id === "plugin") this.loadPlugin();
       if (id === "config") this.loadConfig();

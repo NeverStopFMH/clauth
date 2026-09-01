@@ -58,6 +58,19 @@ False)` (window style `0` = hidden) to launch `clauth.exe daemon` from
 `wscript.exe`, a GUI-subsystem host with no console of its own — no window,
 no stored credential. `uninstall` removes the script along with the task.
 
+On a network that needs a proxy to reach Anthropic at all, `install` also
+bakes `HTTP_PROXY`/`HTTPS_PROXY` into the launcher script via `WScript.Shell`'s
+`Environment("Process")`, scoped to just the one daemon process it starts —
+never the machine's persisted environment (no `setx`), so nothing else on the
+system is proxied. By default it snapshots whatever this terminal has set at
+the moment you run `install`; `clauth autostart install --proxy <url>` sets
+an exact value instead (used for both vars) regardless of the terminal's own
+environment. Either way, a Task-Scheduler-launched process starts from a
+fresh environment with none of a terminal's ad-hoc `set HTTP_PROXY=...`, so
+without this the daemon it starts would try to reach Anthropic directly and
+fail on a proxy-only connection. Re-run `install` whenever the proxy changes
+— the value is a static snapshot, not read fresh at every login.
+
 ## `~/.clauth/status.json`
 
 Written each scheduler tick and immediately after a switch lands. Atomic (`tmp` + rename into place), `0600`. **Never carries a token, secret, or key**: names, tiers, percentages, timestamps only.

@@ -279,7 +279,13 @@ pub(crate) enum Command {
     /// than directly: a "run only when logged on" task executes inside your
     /// desktop session, so a console `.exe` targeted directly would open a
     /// real, visible window there, same as double-clicking it. The wrapper
-    /// launches it hidden instead. The daemon's own single-instance flock
+    /// launches it hidden instead. `install` also snapshots `HTTP_PROXY`/
+    /// `HTTPS_PROXY` from its OWN terminal at install time and bakes them
+    /// into the wrapper, scoped to just the daemon process it starts — a
+    /// Task Scheduler launch otherwise starts from a fresh environment with
+    /// none of a terminal's ad-hoc proxy settings, which breaks every network
+    /// call on a connection that needs one. Run `install` again after your
+    /// proxy changes to refresh it. The daemon's own single-instance flock
     /// already makes a redundant launch a safe no-op, so no extra guard is
     /// needed here. Windows only.
     Autostart {
@@ -507,6 +513,11 @@ pub(crate) enum AutostartCommand {
         /// no prompt.
         #[arg(long, short = 'y')]
         yes: bool,
+        /// Proxy URL for HTTP_PROXY/HTTPS_PROXY, baked into the launcher for
+        /// just this task's process. Overrides auto-detecting from this
+        /// terminal's own environment; omit to keep that default.
+        #[arg(long, value_name = "URL")]
+        proxy: Option<String>,
     },
     /// Remove the scheduled task
     Uninstall {

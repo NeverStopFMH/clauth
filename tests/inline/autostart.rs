@@ -7,7 +7,7 @@ use super::*;
 
 #[test]
 fn launcher_script_runs_the_exe_hidden_with_the_daemon_subcommand() {
-    let script = launcher_script(r"C:\Program Files\clauth\clauth.exe");
+    let script = launcher_script(r"C:\Program Files\clauth\clauth.exe", &[]);
     assert!(
         script.contains(r#"shell.Run """C:\Program Files\clauth\clauth.exe"" daemon", 0, False"#)
     );
@@ -17,8 +17,50 @@ fn launcher_script_runs_the_exe_hidden_with_the_daemon_subcommand() {
 fn launcher_script_escapes_an_embedded_quote() {
     // Not a real Windows path, but exercises the escape rule rather than
     // assuming a path never contains one.
-    let script = launcher_script(r#"C:\weird"path\clauth.exe"#);
+    let script = launcher_script(r#"C:\weird"path\clauth.exe"#, &[]);
     assert!(script.contains(r#"C:\weird""path\clauth.exe"#));
+}
+
+#[test]
+fn launcher_script_sets_proxy_vars_on_the_process_environment_before_running() {
+    let script = launcher_script(
+        r"C:\clauth\clauth.exe",
+        &[
+            (
+                "HTTP_PROXY".to_string(),
+                "http://127.0.0.1:7890".to_string(),
+            ),
+            (
+                "HTTPS_PROXY".to_string(),
+                "http://127.0.0.1:7890".to_string(),
+            ),
+        ],
+    );
+    let set_line =
+        script.find("shell.Environment(\"Process\")(\"HTTP_PROXY\") = \"http://127.0.0.1:7890\"");
+    let run_line = script.find("shell.Run");
+    assert!(set_line.is_some(), "missing proxy assignment: {script}");
+    assert!(
+        set_line < run_line,
+        "proxy must be set before Run: {script}"
+    );
+    assert!(
+        script.contains(
+            "shell.Environment(\"Process\")(\"HTTPS_PROXY\") = \"http://127.0.0.1:7890\""
+        )
+    );
+}
+
+#[test]
+fn launcher_script_omits_environment_lines_with_no_proxy_vars() {
+    let script = launcher_script(r"C:\clauth\clauth.exe", &[]);
+    assert!(!script.contains("Environment"));
+}
+
+#[test]
+fn vbs_quote_doubles_embedded_quotes() {
+    assert_eq!(vbs_quote("plain"), "\"plain\"");
+    assert_eq!(vbs_quote(r#"a"b"#), "\"a\"\"b\"");
 }
 
 #[test]

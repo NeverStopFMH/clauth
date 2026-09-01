@@ -220,7 +220,7 @@ fn cmd_complete() -> Result<()> {
 
 fn cmd_autostart(cmd: cli::AutostartCommand) -> Result<()> {
     match cmd {
-        cli::AutostartCommand::Install { yes } => autostart::install(yes),
+        cli::AutostartCommand::Install { yes, proxy } => autostart::install(yes, proxy),
         cli::AutostartCommand::Uninstall { yes } => autostart::uninstall(yes),
         cli::AutostartCommand::Status => autostart::status(),
     }

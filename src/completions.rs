@@ -49,7 +49,9 @@ const BASH_TEMPLATE: &str = r#"_clauth() {
         COMPREPLY=( $(compgen -W "--key --no-config --yes -y" -- "${cur}") )
     elif [ "${COMP_WORDS[1]}" = "herdr" ] && [ "${COMP_WORDS[2]}" = "uninstall" ] && [ "${cur:0:2}" = "--" ]; then
         COMPREPLY=( $(compgen -W "--no-config --yes -y" -- "${cur}") )
-    elif [ "${COMP_WORDS[1]}" = "autostart" ] && { [ "${COMP_WORDS[2]}" = "install" ] || [ "${COMP_WORDS[2]}" = "uninstall" ]; } && [ "${cur:0:2}" = "--" ]; then
+    elif [ "${COMP_WORDS[1]}" = "autostart" ] && [ "${COMP_WORDS[2]}" = "install" ] && [ "${cur:0:2}" = "--" ]; then
+        COMPREPLY=( $(compgen -W "--yes -y --proxy" -- "${cur}") )
+    elif [ "${COMP_WORDS[1]}" = "autostart" ] && [ "${COMP_WORDS[2]}" = "uninstall" ] && [ "${cur:0:2}" = "--" ]; then
         COMPREPLY=( $(compgen -W "--yes -y" -- "${cur}") )
     elif [ "${COMP_WORDS[1]}" = "resume" ] && [ "${cur:0:2}" = "--" ]; then
         COMPREPLY=( $(compgen -W "--profile" -- "${cur}") )
@@ -128,7 +130,9 @@ _clauth() {
         _values 'subcommand' 'install[register the scheduled task]' \
             'uninstall[remove the scheduled task]' \
             'status[print whether the task is registered]'
-    elif (( CURRENT >= 4 )) && [[ "${words[2]}" == autostart && "${words[3]}" == (install|uninstall) ]]; then
+    elif (( CURRENT >= 4 )) && [[ "${words[2]}" == autostart && "${words[3]}" == install ]]; then
+        _values 'flag' '--yes[skip the confirm prompt]' '-y[skip the confirm prompt]' '--proxy[proxy URL baked into the launcher]'
+    elif (( CURRENT >= 4 )) && [[ "${words[2]}" == autostart && "${words[3]}" == uninstall ]]; then
         _values 'flag' '--yes[skip the confirm prompt]' '-y[skip the confirm prompt]'
     elif (( CURRENT == 3 )) && [[ "${words[2]}" == which ]]; then
         _values 'flag' '--json[emit JSON instead of plain name]'
@@ -200,6 +204,7 @@ complete -c clauth -f -n "__fish_seen_subcommand_from autostart" -a install -d "
 complete -c clauth -f -n "__fish_seen_subcommand_from autostart" -a uninstall -d "Remove the scheduled task"
 complete -c clauth -f -n "__fish_seen_subcommand_from autostart" -a status -d "Print whether the task is registered"
 complete -c clauth -f -n "__fish_seen_subcommand_from autostart; and __fish_seen_subcommand_from install" -a --yes -d "Skip the confirm prompt"
+complete -c clauth -f -n "__fish_seen_subcommand_from autostart; and __fish_seen_subcommand_from install" -a --proxy -d "Proxy URL baked into the launcher"
 complete -c clauth -f -n "__fish_seen_subcommand_from autostart; and __fish_seen_subcommand_from uninstall" -a --yes -d "Skip the confirm prompt"
 complete -c clauth -f -n __fish_is_first_token -a --theme -d "Force a color depth instead of auto-detecting"
 complete -c clauth -f -n 'set -l t (commandline -opc); and test "$t[-1]" = "--theme"' -a "full compatible"

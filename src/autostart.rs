@@ -40,6 +40,16 @@ use crate::profile::{clauth_dir, mkdir_700};
 const TASK_NAME: &str = "clauth-daemon";
 /// The generated hidden-launch script's filename, under `~/.clauth/`.
 const LAUNCHER_FILE: &str = "autostart_launch.vbs";
+/// Proxy env vars `install` snapshots from its own process at install time
+/// and bakes into the launcher script. A Task Scheduler-launched process
+/// starts from a fresh environment — it inherits none of the ad-hoc `set
+/// HTTP_PROXY=...` a user's own terminal carries, and clauth's network calls
+/// (usage fetches, OAuth) rely on exactly these being present for a network
+/// that needs a proxy to reach Anthropic at all. Scoped to the ONE launched
+/// process via `WScript.Shell`'s `Environment("Process")` rather than
+/// `setx`, which would persist the value system-wide for every future
+/// process on the machine, proxying tools that were never meant to be.
+const PROXY_VARS: &[&str] = &["HTTP_PROXY", "HTTPS_PROXY"];
 
 fn is_tty() -> bool {
     use std::io::IsTerminal as _;
@@ -76,18 +86,32 @@ fn launcher_path() -> Result<PathBuf> {
     Ok(clauth_dir()?.join(LAUNCHER_FILE))
 }
 
+/// A VBScript string literal: `"` doubled per VBScript's own escaping rule,
+/// wrapped in the enclosing quotes.
+fn vbs_quote(s: &str) -> String {
+    format!("\"{}\"", s.replace('"', "\"\""))
+}
+
 /// The VBScript that launches `exe_path daemon` with window style `0`
-/// (hidden). Split out from [`install`] so the generated source is
-/// unit-testable without touching the filesystem. `exe_path` is doubled-quote
-/// escaped per VBScript string-literal rules (a literal `"` inside a
-/// VBScript string is written `""`) — always a no-op for a real Windows
-/// path, but exact rather than assumed.
-fn launcher_script(exe_path: &str) -> String {
-    let escaped = exe_path.replace('"', "\"\"");
-    format!(
-        "Set shell = CreateObject(\"WScript.Shell\")\r\n\
-         shell.Run \"\"\"{escaped}\"\" daemon\", 0, False\r\n"
-    )
+/// (hidden), first setting each of `proxy_vars` on the shell's
+/// PROCESS-scoped environment — inherited by `exe_path` since it is spawned
+/// from this same shell object, and gone the moment this script's own
+/// process exits, unlike `setx`. Split out from [`install`] so the generated
+/// source is unit-testable without touching the filesystem.
+fn launcher_script(exe_path: &str, proxy_vars: &[(String, String)]) -> String {
+    let mut script = String::from("Set shell = CreateObject(\"WScript.Shell\")\r\n");
+    for (name, value) in proxy_vars {
+        script.push_str(&format!(
+            "shell.Environment(\"Process\")({}) = {}\r\n",
+            vbs_quote(name),
+            vbs_quote(value)
+        ));
+    }
+    let escaped_exe = exe_path.replace('"', "\"\"");
+    script.push_str(&format!(
+        "shell.Run \"\"\"{escaped_exe}\"\" daemon\", 0, False\r\n"
+    ));
+    script
 }
 
 /// The `schtasks /Create` argument list — split out from [`install`] so the
@@ -109,13 +133,43 @@ fn create_args(vbs_path: &str) -> Vec<String> {
     ]
 }
 
-pub(crate) fn install(yes: bool) -> Result<()> {
+pub(crate) fn install(yes: bool, proxy: Option<String>) -> Result<()> {
     require_windows()?;
     let exe = std::env::current_exe().context("failed to resolve clauth's own executable path")?;
     let exe = exe.to_string_lossy().into_owned();
 
+    // An explicit --proxy always wins over auto-detection: it is what the
+    // caller asked for, not a guess, and there is no reason to also carry
+    // whatever this terminal happens to have set alongside it.
+    let (proxy_vars, proxy_note): (Vec<(String, String)>, String) = match proxy {
+        Some(url) => (
+            PROXY_VARS
+                .iter()
+                .map(|&n| (n.to_string(), url.clone()))
+                .collect(),
+            format!(" (--proxy {url} baked into the launcher, scoped to just this task)"),
+        ),
+        None => {
+            let vars: Vec<(String, String)> = PROXY_VARS
+                .iter()
+                .filter_map(|&name| std::env::var(name).ok().map(|v| (name.to_string(), v)))
+                .collect();
+            let note = if vars.is_empty() {
+                String::new()
+            } else {
+                let names: Vec<&str> = vars.iter().map(|(n, _)| n.as_str()).collect();
+                format!(
+                    " ({} captured from this terminal and baked into the launcher, scoped to just this task)",
+                    names.join(", ")
+                )
+            };
+            (vars, note)
+        }
+    };
     if !confirm(
-        &format!("register a task that runs '{exe}' daemon at every log on (no visible window)?"),
+        &format!(
+            "register a task that runs '{exe}' daemon at every log on (no visible window){proxy_note}?"
+        ),
         yes,
     )? {
         return Ok(());
@@ -124,7 +178,7 @@ pub(crate) fn install(yes: bool) -> Result<()> {
     let dir = clauth_dir()?;
     mkdir_700(&dir).context("failed to create ~/.clauth")?;
     let vbs_path = launcher_path()?;
-    std::fs::write(&vbs_path, launcher_script(&exe))
+    std::fs::write(&vbs_path, launcher_script(&exe, &proxy_vars))
         .with_context(|| format!("failed to write {}", vbs_path.display()))?;
     let vbs_path = vbs_path.to_string_lossy().into_owned();
 

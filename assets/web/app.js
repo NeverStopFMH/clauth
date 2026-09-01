@@ -90,6 +90,24 @@ function gaugeClass(pct, threshold) {
   return "";
 }
 
+// `fetch_status` (src/usage/fetch.rs): "Fresh"/"Cached" are routine; the rest
+// mean the LAST successful reading is what's on screen, not a live one —
+// "RateLimited" specifically is Anthropic's own server returning HTTP 429 for
+// this account's token, not a clauth bug, so it's worth calling out distinctly
+// rather than blending into a generic "stale" label.
+function fetchStatusClass(status) {
+  if (status === "RateLimited" || status === "Failed" || status === "AuthExpired") return "danger";
+  if (status === "Cached") return "next";
+  return "";
+}
+
+function fetchStatusLabel(status) {
+  if (!status) return "never fetched";
+  if (status === "RateLimited") return "rate-limited by Anthropic (429)";
+  if (status === "AuthExpired") return "login expired";
+  return status;
+}
+
 document.addEventListener("alpine:init", () => {
   Alpine.data("dashboard", () => ({
     tabs: TABS,
@@ -181,6 +199,8 @@ document.addEventListener("alpine:init", () => {
     fmtReset,
     fmtDualTz,
     fmtCountdown,
+    fetchStatusClass,
+    fetchStatusLabel,
     windowFor,
     gaugeClass,
 

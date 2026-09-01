@@ -261,11 +261,11 @@
                   <h3 style="margin: 0" x-text="p.name"></h3>
                   <span class="pill" :class="p.auth_status === 'ok' ? 'active' : 'blocked'" x-text="p.auth_status"></span>
                 </div>
-                <p style="font-size: 0.85rem; opacity: 0.7">
-                  <span x-text="p.tier || p.provider"></span> ·
-                  fetch: <span x-text="p.fetch_status || 'never'"></span>
+                <p style="font-size: 0.85rem; opacity: 0.7; display: flex; align-items: center; gap: 0.4rem; flex-wrap: wrap">
+                  <span x-text="p.tier || p.provider"></span>
+                  <span class="pill" :class="fetchStatusClass(p.fetch_status)" x-text="fetchStatusLabel(p.fetch_status)"></span>
                   <span x-show="fmtCountdown(p.next_refresh_at, nowTick)">
-                    · next in <span x-text="fmtCountdown(p.next_refresh_at, nowTick)"></span>
+                    next in <span x-text="fmtCountdown(p.next_refresh_at, nowTick)"></span>
                   </span>
                 </p>
                 <template x-for="w in p.windows" :key="w.label">

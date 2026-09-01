@@ -196,23 +196,24 @@ main article {
   align-items: center;
 }
 
-.chain-node .pill {
+.pill {
   font-size: 0.7rem;
   padding: 2px 8px;
   border-radius: 10px;
 }
 
-.chain-node .pill.active {
+.pill.active {
   background: rgba(108, 142, 224, 0.15);
   color: var(--pico-primary);
 }
 
-.chain-node .pill.next {
+.pill.next {
   background: rgba(216, 155, 92, 0.15);
   color: #b5773a;
 }
 
-.chain-node .pill.blocked {
+.pill.blocked,
+.pill.danger {
   background: rgba(200, 90, 90, 0.15);
   color: #c25c5c;
 }

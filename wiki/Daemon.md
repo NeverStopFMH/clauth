@@ -47,6 +47,17 @@ it's registered. Windows only. Safe to install even when a `clauth daemon`
 is already running some other way: the singleton flock above makes a
 redundant launch a no-op, not a conflict.
 
+The task's target is a generated `~/.clauth/autostart_launch.vbs`, not
+`clauth.exe` directly. A "run only when logged on" task (no stored
+credential, the default and what `install` uses) executes inside your own
+desktop session, so a console `.exe` targeted directly would open a real,
+visible console window there — Task Scheduler only omits a window entirely
+in "run whether logged on or not" mode, which needs a stored Windows
+password. The generated script instead calls `WScript.Shell.Run(cmd, 0,
+False)` (window style `0` = hidden) to launch `clauth.exe daemon` from
+`wscript.exe`, a GUI-subsystem host with no console of its own — no window,
+no stored credential. `uninstall` removes the script along with the task.
+
 ## `~/.clauth/status.json`
 
 Written each scheduler tick and immediately after a switch lands. Atomic (`tmp` + rename into place), `0600`. **Never carries a token, secret, or key**: names, tiers, percentages, timestamps only.

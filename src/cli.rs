@@ -274,9 +274,14 @@ pub(crate) enum Command {
     /// Run `clauth daemon` at Windows login, with no visible terminal window
     ///
     /// Registers a Task Scheduler entry (trigger: at log on, limited/non-admin
-    /// run level) that launches this same `clauth.exe daemon` — the daemon's
-    /// own single-instance flock already makes a redundant launch a safe no-op,
-    /// so no extra guard is needed here. Windows only.
+    /// run level) that launches this same `clauth.exe daemon` through a small
+    /// generated VBScript wrapper (`~/.clauth/autostart_launch.vbs`) rather
+    /// than directly: a "run only when logged on" task executes inside your
+    /// desktop session, so a console `.exe` targeted directly would open a
+    /// real, visible window there, same as double-clicking it. The wrapper
+    /// launches it hidden instead. The daemon's own single-instance flock
+    /// already makes a redundant launch a safe no-op, so no extra guard is
+    /// needed here. Windows only.
     Autostart {
         #[command(subcommand)]
         cmd: AutostartCommand,

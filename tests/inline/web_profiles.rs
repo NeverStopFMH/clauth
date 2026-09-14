@@ -26,6 +26,7 @@ fn profile_with_credentials(name: &str) -> Profile {
             expires_at: None,
             scopes: None,
             subscription_type: None,
+            ..crate::profile::OAuthToken::default_extra()
         }),
     });
     crate::profile::save_profile(&p).expect("save profile");

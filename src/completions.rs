@@ -14,7 +14,7 @@ const BASH_TEMPLATE: &str = r#"_clauth() {
     if [ "$COMP_CWORD" -eq 1 ]; then
         local profiles
         profiles=$(clauth __complete 2>/dev/null)
-        COMPREPLY=( $(compgen -W "${profiles} start login delete disable enable rolling-token static-token which list jobs sessions resume info daemon status mcp herdr autostart completions --theme" -- "${cur}") )
+        COMPREPLY=( $(compgen -W "${profiles} start login capture delete disable enable rolling-token static-token which list jobs sessions resume info daemon status mcp herdr autostart completions --theme" -- "${cur}") )
     elif [ "$prev" = "--theme" ]; then
         COMPREPLY=( $(compgen -W "full compatible" -- "${cur}") )
     elif [ "${COMP_WORDS[1]}" = "login" ] && [ "${cur:0:2}" = "--" ]; then
@@ -22,12 +22,12 @@ const BASH_TEMPLATE: &str = r#"_clauth() {
     elif [ "${COMP_WORDS[1]}" = "start" ] && [ "${cur:0:2}" = "--" ]; then
         COMPREPLY=( $(compgen -W "--isolated --with-fallback" -- "${cur}") )
     elif [ "${COMP_WORDS[1]}" = "daemon" ] && [ "${cur:0:2}" = "--" ]; then
-        COMPREPLY=( $(compgen -W "--standby --no-standby --replace --status" -- "${cur}") )
+        COMPREPLY=( $(compgen -W "--standby --no-standby --replace --status --listen --cert --key --print-token --rotate-token" -- "${cur}") )
     elif [ "$prev" = "--isolated" ] || [ "$prev" = "--with-fallback" ] || [ "$prev" = "--profile" ]; then
         local profiles
         profiles=$(clauth __complete 2>/dev/null)
         COMPREPLY=( $(compgen -W "${profiles}" -- "${cur}") )
-    elif [ "$COMP_CWORD" -eq 2 ] && { [ "$prev" = "start" ] || [ "$prev" = "login" ] || [ "$prev" = "delete" ] || [ "$prev" = "disable" ] || [ "$prev" = "enable" ] || [ "$prev" = "rolling-token" ] || [ "$prev" = "static-token" ]; }; then
+    elif [ "$COMP_CWORD" -eq 2 ] && { [ "$prev" = "start" ] || [ "$prev" = "login" ] || [ "$prev" = "capture" ] || [ "$prev" = "delete" ] || [ "$prev" = "disable" ] || [ "$prev" = "enable" ] || [ "$prev" = "rolling-token" ] || [ "$prev" = "static-token" ]; }; then
         local profiles
         profiles=$(clauth __complete 2>/dev/null)
         COMPREPLY=( $(compgen -W "${profiles}" -- "${cur}") )
@@ -80,6 +80,7 @@ _clauth() {
         _values 'subcommand' \
             'start[launch claude with that profile]' \
             'login[log in via browser OAuth or an API key]' \
+            'capture[save the login Claude Code is using now as a new profile]' \
             'delete[remove a profile and its credentials]' \
             'disable[hide a profile from auto-switch and usage polling]' \
             'enable[restore a disabled profile]' \
@@ -100,7 +101,7 @@ _clauth() {
         _values 'option' '--theme[force a color depth instead of auto-detecting]'
     elif (( CURRENT >= 3 )) && [[ "${words[CURRENT-1]}" == "--theme" ]]; then
         _values 'tier' 'full[24-bit truecolor]' 'compatible[xterm-256 palette, safe on every terminal]'
-    elif (( CURRENT == 3 )) && [[ "${words[2]}" == (start|login|delete|disable|enable|rolling-token|static-token) ]]; then
+    elif (( CURRENT == 3 )) && [[ "${words[2]}" == (start|login|capture|delete|disable|enable|rolling-token|static-token) ]]; then
         local -a profiles
         profiles=("${(@f)$(clauth __complete 2>/dev/null)}")
         _describe 'profile' profiles
@@ -156,7 +157,12 @@ _clauth() {
             '--standby[wait and take over when the running daemon exits]' \
             '--no-standby[explicit spelling of the default]' \
             '--replace[terminate the running daemon and take over]' \
-            '--status[print the running daemon, or exit 1 when none is]'
+            '--status[print the running daemon, or exit 1 when none is]' \
+            '--listen[also serve the REST API over TLS, default 0.0.0.0:8443]' \
+            '--cert[serve this certificate instead of the lego one; needs --key]' \
+            '--key[private key for --cert]' \
+            '--print-token[print the REST API auth token and exit]' \
+            '--rotate-token[replace the REST API auth token and exit]'
     elif (( CURRENT >= 3 )) && [[ "${words[2]}" == status ]]; then
         _values 'flag' '--json[print the status snapshot as JSON]' '--all[also list disabled profiles]' '--disabled[also list disabled profiles]'
     elif (( CURRENT >= 3 )) && [[ "${words[2]}" == list ]]; then
@@ -173,6 +179,7 @@ complete -c clauth -f
 complete -c clauth -f -n __fish_is_first_token -a "(__clauth_profiles)" -d Profile
 complete -c clauth -f -n __fish_is_first_token -a start -d "Launch claude with that profile's runtime"
 complete -c clauth -f -n __fish_is_first_token -a login -d "Log in via browser OAuth or an API key"
+complete -c clauth -f -n __fish_is_first_token -a capture -d "Save the login Claude Code is using now as a new profile"
 complete -c clauth -f -n __fish_is_first_token -a delete -d "Remove a profile and its credentials"
 complete -c clauth -f -n __fish_is_first_token -a disable -d "Hide a profile from auto-switch and usage polling"
 complete -c clauth -f -n __fish_is_first_token -a enable -d "Restore a disabled profile"
@@ -208,7 +215,7 @@ complete -c clauth -f -n "__fish_seen_subcommand_from autostart; and __fish_seen
 complete -c clauth -f -n "__fish_seen_subcommand_from autostart; and __fish_seen_subcommand_from uninstall" -a --yes -d "Skip the confirm prompt"
 complete -c clauth -f -n __fish_is_first_token -a --theme -d "Force a color depth instead of auto-detecting"
 complete -c clauth -f -n 'set -l t (commandline -opc); and test "$t[-1]" = "--theme"' -a "full compatible"
-complete -c clauth -f -n "__fish_seen_subcommand_from start login delete disable enable rolling-token static-token" -a "(__clauth_profiles)" -d Profile
+complete -c clauth -f -n "__fish_seen_subcommand_from start login capture delete disable enable rolling-token static-token" -a "(__clauth_profiles)" -d Profile
 complete -c clauth -f -n "__fish_seen_subcommand_from start" -a --isolated -d "Clean isolated runtime; drops operator config"
 complete -c clauth -f -n "__fish_seen_subcommand_from start" -a --with-fallback -d "Follow the fallback chain; needs a running daemon"
 complete -c clauth -f -n "__fish_seen_subcommand_from which" -a --json -d "Emit JSON"
@@ -234,6 +241,11 @@ complete -c clauth -f -n "__fish_seen_subcommand_from daemon" -a --standby -d "W
 complete -c clauth -f -n "__fish_seen_subcommand_from daemon" -a --no-standby -d "Explicit spelling of the default"
 complete -c clauth -f -n "__fish_seen_subcommand_from daemon" -a --replace -d "Terminate the running daemon and take over"
 complete -c clauth -f -n "__fish_seen_subcommand_from daemon" -a --status -d "Print the running daemon, or exit 1 when none is"
+complete -c clauth -f -n "__fish_seen_subcommand_from daemon" -a --listen -d "Also serve the REST API over TLS, default 0.0.0.0:8443"
+complete -c clauth -f -n "__fish_seen_subcommand_from daemon" -a --cert -d "Serve this certificate instead of the lego one; needs --key"
+complete -c clauth -f -n "__fish_seen_subcommand_from daemon" -a --key -d "Private key for --cert"
+complete -c clauth -f -n "__fish_seen_subcommand_from daemon" -a --print-token -d "Print the REST API auth token and exit"
+complete -c clauth -f -n "__fish_seen_subcommand_from daemon" -a --rotate-token -d "Replace the REST API auth token and exit"
 "#;
 
 /// The placeholder each script carries where its `login` flag list goes; the

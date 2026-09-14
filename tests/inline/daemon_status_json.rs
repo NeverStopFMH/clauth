@@ -17,6 +17,7 @@ fn oauth_profile(name: &str) -> Profile {
             expires_at: None,
             scopes: None,
             subscription_type: Some("max".to_string()),
+            ..crate::profile::OAuthToken::default_extra()
         }),
     });
     p
@@ -69,6 +70,10 @@ fn build_status_top_level_shape_and_active() {
             "active",
             "auth_status",
             "auto_start",
+            // Additive (interleaved auto-start queue): the
+            // profile's queue slot and the queue's shared next-open estimate,
+            // `null` for a profile that holds no slot.
+            "auto_start_queue",
             "base_url",
             "bell_threshold",
             "fallback",
@@ -219,20 +224,20 @@ fn set_expiry(p: &mut Profile, expires_at: i64) {
 }
 
 #[test]
-fn build_status_auth_status_ok_expiring_broken() {
+fn build_status_auth_status_ok_expired_broken() {
     let _home = HomeSandbox::new();
     let now = crate::usage::now_ms() as i64;
 
     let mut ok = oauth_profile("ok");
     set_expiry(&mut ok, now + 3_600_000); // real life left → ok
-    let mut expiring = oauth_profile("expiring");
-    set_expiry(&mut expiring, now - 1_000); // past due, not flagged → expiring
+    let mut expired = oauth_profile("expired");
+    set_expiry(&mut expired, now - 1_000); // past due, not flagged → expired
     let mut broken = oauth_profile("broken");
     set_expiry(&mut broken, now - 1_000); // past due AND flagged → broken wins
 
     let mut config = AppConfig {
         state: AppState::default(),
-        profiles: vec![ok, expiring, broken],
+        profiles: vec![ok, expired, broken],
     };
     config.set_auth_broken(&crate::profile::ProfileName::from("broken"), true);
 
@@ -240,17 +245,17 @@ fn build_status_auth_status_ok_expiring_broken() {
     let profiles = v["profiles"].as_array().unwrap();
     let get = |n: &str| profiles.iter().find(|p| p["name"] == n).unwrap();
     assert_eq!(get("ok")["auth_status"], "ok");
-    assert_eq!(get("expiring")["auth_status"], "expiring");
+    assert_eq!(get("expired")["auth_status"], "expired");
     assert_eq!(
         get("broken")["auth_status"],
         "broken",
-        "broken outranks expiring"
+        "broken outranks expired"
     );
 }
 
 /// `auth_status` reports on the credential a profile STORES, not on where its
 /// requests route: a hybrid (OAuth pair + `base_url`) with a dead access token
-/// must publish `expiring`, while an endpoint-only profile has no token to expire.
+/// must publish `expired`, while an endpoint-only profile has no token to expire.
 #[test]
 fn build_status_auth_status_types_the_hybrid_on_its_credential() {
     let _home = HomeSandbox::new();
@@ -276,7 +281,7 @@ fn build_status_auth_status_types_the_hybrid_on_its_credential() {
     let get = |n: &str| profiles.iter().find(|p| p["name"] == n).unwrap();
     assert_eq!(
         get("hybrid")["auth_status"],
-        "expiring",
+        "expired",
         "a stored pair expires regardless of the endpoint it routes past"
     );
     assert_eq!(
@@ -311,13 +316,99 @@ fn build_status_pending_switch_reflects_live_signal() {
         next_refresh: &empty_next,
         streaks: &empty_streaks,
         pending_switch: Some("home"),
+        queue_anchor: None,
+        queue_blocked: &[],
     };
     let v = build_status(&config, 300_000, Some(&live), false);
     assert_eq!(v["pending_switch"], "home");
     assert_eq!(
         v["schema"], SCHEMA_VERSION,
-        "pending_switch is part of schema 1 — no bump"
+        "pending_switch is additive — no bump of its own"
     );
+}
+
+/// The queue object is pinned by VALUE, not key presence: `position` is the
+/// member's 1-based slot in the shared order, `next_open_at` round-trips to
+/// anchor + gap, and every null shape is spelled out — toggle off, not a
+/// member, and member-with-no-anchor. Publishing `null` for every position
+/// would otherwise survive the key-list test.
+#[test]
+fn build_status_auto_start_queue_positions_and_null_cases() {
+    let _home = HomeSandbox::new();
+    let queued = |name: &str| {
+        let mut p = oauth_profile(name);
+        p.auto_start = true;
+        p
+    };
+    let mut config = AppConfig {
+        state: AppState {
+            fallback_chain: vec!["a".into(), "b".into()],
+            auto_start_queue: true,
+            ..AppState::default()
+        },
+        profiles: vec![queued("a"), queued("b"), oauth_profile("c")],
+    };
+
+    let empty_status = std::collections::HashMap::new();
+    let empty_next = std::collections::HashMap::new();
+    let empty_streaks = std::collections::HashMap::new();
+    let anchor = 1_780_000_000i64;
+    let live = LiveSignals {
+        status: &empty_status,
+        third_party_status: &Default::default(),
+        next_refresh: &empty_next,
+        streaks: &empty_streaks,
+        pending_switch: None,
+        queue_anchor: Some(anchor),
+        queue_blocked: &[],
+    };
+    let queue_of = |v: &serde_json::Value, name: &str| -> serde_json::Value {
+        v["profiles"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|p| p["name"] == name)
+            .expect("profile published")["auto_start_queue"]
+            .clone()
+    };
+
+    let v = build_status(&config, 300_000, Some(&live), false);
+    assert_eq!(queue_of(&v, "a")["position"], 1);
+    assert_eq!(queue_of(&v, "b")["position"], 2);
+    // Round-trip rather than a formatted literal, so the pin is on the
+    // arithmetic (anchor + gap) and not on the ISO renderer.
+    let published = queue_of(&v, "a")["next_open_at"]
+        .as_str()
+        .expect("an anchored queue publishes a next-open stamp")
+        .to_string();
+    assert_eq!(
+        crate::usage::iso_to_epoch_secs(&published),
+        Some(anchor + crate::usage::queue_gap_secs(2, 300_000)),
+    );
+    assert_eq!(
+        queue_of(&v, "a")["next_open_at"],
+        queue_of(&v, "b")["next_open_at"],
+        "the estimate is the queue's, shared by every member"
+    );
+    // Null case 1: an OAuth profile that never opted into auto_start.
+    assert!(queue_of(&v, "c").is_null());
+
+    // Null case 2: a member with no anchor yet — the slot publishes, the
+    // stamp is null (reads as "due now").
+    let cold = LiveSignals {
+        queue_anchor: None,
+        ..live
+    };
+    let v = build_status(&config, 300_000, Some(&cold), false);
+    assert_eq!(queue_of(&v, "a")["position"], 1);
+    assert!(queue_of(&v, "a")["next_open_at"].is_null());
+
+    // Null case 3: the toggle off is a real off switch on the feed too.
+    config.state.auto_start_queue = false;
+    let v = build_status(&config, 300_000, Some(&live), false);
+    for name in ["a", "b", "c"] {
+        assert!(queue_of(&v, name).is_null());
+    }
 }
 
 /// An api-key profile's freshness derives from ITS cache
@@ -372,6 +463,8 @@ fn build_status_third_party_freshness_from_its_own_cache() {
         next_refresh: &empty_next,
         streaks: &empty_streaks,
         pending_switch: None,
+        queue_anchor: None,
+        queue_blocked: &[],
     };
     let v = build_status(&config, 300_000, Some(&live), false);
     let p = &v["profiles"].as_array().unwrap()[0];
@@ -428,11 +521,245 @@ fn build_status_nulls_next_refresh_for_a_spent_skipped_account() {
     );
 }
 
+/// A single-shot body derives `next_refresh_at` as mtime + interval. Once that
+/// stamp is past (`now >= stamp`) no live countdown vouches for it, so the field
+/// publishes `null` — pre-fix it published the overdue stamp, which reads as
+/// perpetually overdue (#74). Live-store stamps stay verbatim.
+#[test]
+fn build_status_nulls_a_past_derived_next_refresh() {
+    let _home = HomeSandbox::new();
+    let config = AppConfig {
+        state: AppState::default(),
+        profiles: vec![oauth_profile("work")],
+    };
+    crate::testutil::register_names(&["work"]);
+    crate::profile_cache::write_profile_cache(
+        &crate::profile::ProfileName::from("work"),
+        crate::profile_cache::USAGE_CACHE_FILE,
+        &crate::usage::UsageInfo {
+            five_hour: Some(crate::usage::UsageWindow {
+                utilization: 42.0,
+                resets_at: None,
+            }),
+            ..Default::default()
+        },
+    );
+    let path = crate::profile_cache::profile_cache_path(
+        &crate::profile::ProfileName::from("work"),
+        crate::profile_cache::USAGE_CACHE_FILE,
+    )
+    .unwrap();
+    // Back-date the cache by 2 × interval, so mtime + interval is a known
+    // interval_ms in the past (mtime and interval are both ms, pinned here).
+    let interval_ms = 300_000u64;
+    crate::testutil::set_mtime(
+        &path,
+        std::time::SystemTime::now() - std::time::Duration::from_millis(2 * interval_ms),
+    );
+
+    let v = build_status(&config, interval_ms, None, false);
+    let p = &v["profiles"].as_array().unwrap()[0];
+    assert!(
+        p["next_refresh_at"].is_null(),
+        "a past derived stamp must publish null, got: {p}"
+    );
+}
+
+/// A plan-only cache rewrite (`apply_outcome`'s `plan_refresh` write, the
+/// hourly `/profile` ride on a 429'd `/usage`) moves the file's mtime to NOW
+/// while the body's `fetched_at` still names the fetch that last read the
+/// account. `fetch_status` and `next_refresh_at` derived off the mtime, so
+/// that rewrite re-aged the account — Fresh again, countdown re-armed — the
+/// #74 "stale reading served as live" shape reached through the plan leg
+/// instead of a dead poller. Both fields derive off the body's own stamp
+/// (R8): the one clock a plan-only write provably does not move.
+#[test]
+fn build_status_does_not_re_age_a_plan_only_rewrite() {
+    let _home = HomeSandbox::new();
+    let config = AppConfig {
+        state: AppState::default(),
+        profiles: vec![oauth_profile("work")],
+    };
+    let interval_ms = 300_000u64;
+    crate::testutil::register_names(&["work"]);
+    let body = |fetched_at: Option<u64>| {
+        crate::profile_cache::write_profile_cache(
+            &crate::profile::ProfileName::from("work"),
+            crate::profile_cache::USAGE_CACHE_FILE,
+            &crate::usage::UsageInfo {
+                five_hour: Some(crate::usage::UsageWindow {
+                    utilization: 42.0,
+                    resets_at: Some("2999-01-01T00:00:00+00:00".to_string()),
+                }),
+                fetched_at,
+                ..Default::default()
+            },
+        );
+    };
+    // The plan-only shape: a body 4 intervals old under a file rewritten now.
+    // 20 min also clears this interval's staleness threshold
+    // (2 × max(300s, 5min) + 300s = 15min), so the age arm pins on the same
+    // body — it was already off the body (#74 R2); the re-age was these two
+    // fields alone.
+    let age_ms = 4 * interval_ms;
+    body(Some(crate::usage::now_ms() - age_ms));
+
+    let v = build_status(&config, interval_ms, None, false);
+    let row = &v["profiles"].as_array().unwrap()[0];
+    assert_eq!(
+        row["fetch_status"], "Cached",
+        "a rewrite is not a fetch: the status follows the body's stamp"
+    );
+    assert_eq!(
+        row["stale"], true,
+        "20 min past fetch is past the threshold"
+    );
+    assert_eq!(
+        row["next_refresh_at"],
+        serde_json::Value::Null,
+        "the last fetch's slot is 3 intervals past; a rewrite cannot re-arm it"
+    );
+    // The published stamp keeps naming the fetch, never the rewrite.
+    let published = row["fetched_at"].as_str().expect("a dated body publishes");
+    let published_ms = crate::usage::iso_to_epoch_secs(published).expect("ISO-8601") * 1000;
+    assert!(
+        crate::usage::now_ms().saturating_sub(u64::try_from(published_ms).expect("positive"))
+            > age_ms / 2,
+        "the published stamp must date the fetch, not the file: {published}"
+    );
+
+    // Control: same file, stamp moved to now — a real fetch. Fresh, countdown
+    // armed: the derivation still reads a live fetch correctly.
+    body(Some(crate::usage::now_ms()));
+    let v = build_status(&config, interval_ms, None, false);
+    let row = &v["profiles"].as_array().unwrap()[0];
+    assert_eq!(
+        row["fetch_status"], "Fresh",
+        "control: a live fetch is Fresh"
+    );
+    assert!(
+        !row["next_refresh_at"].is_null(),
+        "control: a live fetch has a pending refresh"
+    );
+
+    // An undatable body (a plan-only cold fill, a pre-`fetched_at` cache) has
+    // no stamp; the file's own write is its only clock and stays the fallback.
+    body(None);
+    let path = crate::profile_cache::profile_cache_path(
+        &crate::profile::ProfileName::from("work"),
+        crate::profile_cache::USAGE_CACHE_FILE,
+    )
+    .unwrap();
+    crate::testutil::set_mtime(
+        &path,
+        std::time::SystemTime::now() - std::time::Duration::from_millis(2 * interval_ms),
+    );
+    let v = build_status(&config, interval_ms, None, false);
+    assert_eq!(
+        v["profiles"].as_array().unwrap()[0]["fetch_status"],
+        "Cached",
+        "no stamp to trust, so the file's own write dates it"
+    );
+}
+
+/// The half a spent-skip gate keyed on `is_third_party` gets wrong: a GENERIC
+/// api-key endpoint (`provider` is `None`, so that predicate says false) is
+/// fetched on the cadence by the third-party leg, and `drop_spent_oauth` blanks
+/// the OAuth leg's countdown map alone — so a spent account is skipped on one
+/// leg while the other still has a refresh pending, and the feed published
+/// `null` over it.
+///
+/// The fixture is the HYBRID, which is the reachable shape: one Setup endpoint
+/// edit on a spent OAuth account (`edit_profile_endpoint`) keeps the pair, the
+/// key and the maxed `usage_cache.json`, so that reading is CURRENT rather than
+/// leftover and the OAuth leg is genuinely mid-skip.
+#[test]
+fn build_status_keeps_a_generic_api_key_countdown_over_a_maxed_oauth_cache() {
+    let _home = HomeSandbox::new();
+    let mut api = oauth_profile("litellm");
+    api.base_url = Some("http://127.0.0.1:4000".to_string());
+    api.api_key = Some("k".to_string());
+    api.provider = crate::providers::Provider::from_base_url(api.base_url.as_deref().unwrap());
+    assert!(
+        !api.is_third_party() && api.usage_cache_is_third_party(),
+        "fixture must be the case the two predicates disagree on",
+    );
+    let config = AppConfig {
+        state: AppState {
+            refresh_spent_accounts: false,
+            ..AppState::default()
+        },
+        profiles: vec![api],
+    };
+    crate::testutil::register_names(&["litellm"]);
+    // Current, not stale: the OAuth leg still polls this pair, and this is the
+    // reading `drop_spent_oauth` skips on.
+    crate::profile_cache::write_profile_cache(
+        &crate::profile::ProfileName::from("litellm"),
+        crate::profile_cache::USAGE_CACHE_FILE,
+        &crate::usage::UsageInfo {
+            five_hour: Some(crate::usage::UsageWindow {
+                utilization: 100.0,
+                resets_at: Some("2999-01-01T00:00:00+00:00".to_string()),
+            }),
+            ..Default::default()
+        },
+    );
+    // The cache this account's own leg writes.
+    crate::profile_cache::write_profile_cache(
+        &crate::profile::ProfileName::from("litellm"),
+        crate::profile_cache::THIRD_PARTY_CACHE_FILE,
+        &crate::providers::ThirdPartyStats {
+            is_available: true,
+            rows: vec![],
+            bars: vec![],
+            plan: None,
+            endpoint: None,
+            best_effort: false,
+        },
+    );
+
+    // Single-shot: derived off the third-party cache's mtime, not suppressed.
+    let single = build_status(&config, 300_000, None, false);
+    let p = &single["profiles"].as_array().unwrap()[0];
+    assert!(
+        !p["next_refresh_at"].is_null(),
+        "the third-party leg refreshes this account on the cadence: {p}"
+    );
+
+    // Live daemon: the countdown that leg published must reach the feed
+    // verbatim — a stamp the mtime derivation could not have produced, so this
+    // fails on suppression rather than on the two paths agreeing by accident.
+    let next: std::collections::HashMap<crate::usage::LegKey, u64> = [(
+        crate::usage::FetchLeg::ThirdParty.key(crate::profile::ProfileName::from("litellm")),
+        4_102_444_800_000,
+    )]
+    .into_iter()
+    .collect();
+    let empty_status = std::collections::HashMap::new();
+    let empty_streaks = std::collections::HashMap::new();
+    let live = LiveSignals {
+        status: &empty_status,
+        third_party_status: &Default::default(),
+        next_refresh: &next,
+        streaks: &empty_streaks,
+        pending_switch: None,
+        queue_anchor: None,
+        queue_blocked: &[],
+    };
+    let v = build_status(&config, 300_000, Some(&live), false);
+    let p = &v["profiles"].as_array().unwrap()[0];
+    assert_eq!(
+        p["next_refresh_at"], "2100-01-01T00:00:00+00:00",
+        "the live third-party countdown must reach the feed: {p}"
+    );
+}
+
 // RLS-1: the additive per-profile `stale` flag = the daemon distrusts this
 // reading as a deep-slot stuck RateLimited (live status RateLimited AND the 429
 // streak past the active cap) — the SAME predicate `scan_auto_switch` acts on,
-// so the published cue and the switch decision cannot drift. Additive: schema
-// stays 1; the single-shot (no streaks) is always false.
+// so the published cue and the switch decision cannot drift. Additive: the
+// single-shot (no streaks) is always false.
 #[test]
 fn build_status_stale_flags_a_deep_slot_stuck_rate_limited_profile() {
     use crate::usage::FetchStatus;
@@ -445,7 +772,7 @@ fn build_status_stale_flags_a_deep_slot_stuck_rate_limited_profile() {
         state: AppState::default(),
         profiles: vec![oauth_profile("work"), oauth_profile("home")],
     };
-    let next: HashMap<String, u64> = HashMap::new();
+    let next: HashMap<crate::usage::LegKey, u64> = HashMap::new();
     let deep = crate::usage::ACTIVE_CAP_MAX_STREAK + 1;
     let stale_of = |name: &str, v: &serde_json::Value| -> serde_json::Value {
         v["profiles"]
@@ -460,8 +787,8 @@ fn build_status_stale_flags_a_deep_slot_stuck_rate_limited_profile() {
     // single-shot (no daemon / no streaks) → stale is present-and-false.
     let none = build_status(&config, 300_000, None, false);
     assert_eq!(
-        none["schema"], 1,
-        "stale is additive — schema must not bump"
+        none["schema"], SCHEMA_VERSION,
+        "stale is additive — no bump of its own"
     );
     assert_eq!(
         stale_of("work", &none),
@@ -485,6 +812,8 @@ fn build_status_stale_flags_a_deep_slot_stuck_rate_limited_profile() {
         next_refresh: &next,
         streaks: &streaks,
         pending_switch: None,
+        queue_anchor: None,
+        queue_blocked: &[],
     };
     let v = build_status(&config, 300_000, Some(&live), false);
     assert_eq!(
@@ -508,12 +837,196 @@ fn build_status_stale_flags_a_deep_slot_stuck_rate_limited_profile() {
         next_refresh: &next,
         streaks: &streaks,
         pending_switch: None,
+        queue_anchor: None,
+        queue_blocked: &[],
     };
     let v = build_status(&config, 300_000, Some(&live), false);
     assert_eq!(
         stale_of("work", &v),
         false,
         "a shallow RateLimited reading is not stale"
+    );
+}
+
+/// The #74 age arm: past `2 × max(interval_ms, 5min) + interval` of cache age
+/// the reading is stale on the single-shot path too — the exact surface that
+/// reported `stale: false` at 22h. A live-maxed window under the spent-accounts
+/// opt-out cannot change by polling, so its age arm stays silent: only the
+/// opt-out skips it and the flag it would otherwise poll is still consulted.
+#[test]
+fn build_status_stale_flags_an_overdue_cache_on_the_single_shot_path() {
+    use crate::usage::FetchStatus;
+    let _home = HomeSandbox::new();
+    let mut config = AppConfig {
+        state: AppState::default(),
+        profiles: vec![oauth_profile("work")],
+    };
+    config.state.refresh_interval_ms = 90_000;
+    crate::testutil::register_names(&["work"]);
+    let stale_of = |name: &str, v: &serde_json::Value| -> serde_json::Value {
+        v["profiles"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|p| p["name"] == name)
+            .unwrap()["stale"]
+            .clone()
+    };
+    // Threshold at this interval: 2 × max(90s, the degraded ceiling) + 90s.
+    let ceiling_secs = crate::usage::DEGRADED_GAP_CEILING_MS / 1000;
+    let threshold_secs = 2 * ceiling_secs + 90;
+    let write = |utilization: f64, age_secs: u64| {
+        crate::profile_cache::write_profile_cache(
+            &crate::profile::ProfileName::from("work"),
+            crate::profile_cache::USAGE_CACHE_FILE,
+            &crate::usage::UsageInfo {
+                five_hour: Some(crate::usage::UsageWindow {
+                    utilization,
+                    resets_at: Some("2999-01-01T00:00:00+00:00".to_string()),
+                }),
+                fetched_at: Some(crate::usage::now_ms() - age_secs * 1000),
+                ..Default::default()
+            },
+        );
+    };
+    // Fresh and at-threshold → not stale; past it → stale on the single-shot.
+    write(42.0, threshold_secs - 60);
+    let v = build_status(&config, 90_000, None, false);
+    assert_eq!(
+        stale_of("work", &v),
+        false,
+        "a cache younger than the threshold is not stale"
+    );
+    write(42.0, threshold_secs + 60);
+    let v = build_status(&config, 90_000, None, false);
+    assert_eq!(
+        stale_of("work", &v),
+        true,
+        "past 2 × max(interval, 5min) + interval the single-shot publishes stale — #74's 22h reading"
+    );
+    assert_eq!(
+        v["schema"], SCHEMA_VERSION,
+        "the age arm is additive — no bump of its own"
+    );
+
+    // A body this feed cannot date publishes `stale` and NO `fetched_at`: the
+    // figures stay visible, and nothing claims to date them. Both undatable
+    // shapes take the arm, and the file's mtime stays at now throughout, so a
+    // regression back to mtime would read every case as fresh.
+    for (case, fetched_at) in [
+        ("no stamp", None),
+        ("future stamp", Some(crate::usage::now_ms() + 3_600_000)),
+    ] {
+        crate::profile_cache::write_profile_cache(
+            &crate::profile::ProfileName::from("work"),
+            crate::profile_cache::USAGE_CACHE_FILE,
+            &crate::usage::UsageInfo {
+                five_hour: Some(crate::usage::UsageWindow {
+                    utilization: 42.0,
+                    resets_at: Some("2999-01-01T00:00:00+00:00".to_string()),
+                }),
+                fetched_at,
+                ..Default::default()
+            },
+        );
+        let v = build_status(&config, 90_000, None, false);
+        let row = v["profiles"].as_array().unwrap()[0].clone();
+        assert_eq!(row["stale"], true, "{case}: an undatable body reads stale");
+        assert_eq!(
+            row["fetched_at"],
+            serde_json::Value::Null,
+            "{case}: the feed publishes no stamp it does not trust",
+        );
+        assert_eq!(
+            row["windows"].as_array().map(Vec::len),
+            Some(1),
+            "{case}: the figure it dates stays visible",
+        );
+    }
+
+    // The verdict qualifies a figure this feed publishes. An all-lapsed body
+    // publishes an empty `windows[]`, so no age can make it stale — this is the
+    // arm that separates the live-window predicate from a field count, which
+    // answers `true` for the same body.
+    crate::profile_cache::write_profile_cache(
+        &crate::profile::ProfileName::from("work"),
+        crate::profile_cache::USAGE_CACHE_FILE,
+        &crate::usage::UsageInfo {
+            five_hour: Some(crate::usage::UsageWindow {
+                utilization: 42.0,
+                resets_at: Some("2000-01-01T00:00:00+00:00".to_string()),
+            }),
+            fetched_at: Some(crate::usage::now_ms() - (threshold_secs + 60) * 1000),
+            ..Default::default()
+        },
+    );
+    let v = build_status(&config, 90_000, None, false);
+    let row = v["profiles"].as_array().unwrap()[0].clone();
+    assert_eq!(
+        row["windows"].as_array().map(Vec::len),
+        Some(0),
+        "fixture control: the lapsed row really is dropped from the feed",
+    );
+    assert_eq!(
+        stale_of("work", &v),
+        false,
+        "no published figure, so nothing for the marker to qualify"
+    );
+
+    // A live-maxed window under the spent-accounts opt-out is exempt from the
+    // age arm: its figure cannot change by polling, so age distrusts nothing.
+    config.state.refresh_spent_accounts = false;
+    write(100.0, threshold_secs + 60);
+    let v = build_status(&config, 90_000, None, false);
+    assert_eq!(
+        stale_of("work", &v),
+        false,
+        "a live-maxed window the opt-out skips is never age-stale"
+    );
+    // The two quadrants the maxed arm does not cover: a NON-maxed window under
+    // the opt-out still takes the age verdict (the exemption is keyed on the
+    // opt-out AND the live-maxed shape together, so the flag alone exempts
+    // nothing), and a live-maxed window with the opt-out ON takes the verdict
+    // too — the source derives the exemption only under
+    // `!refresh_spent_accounts && windows_maxed`.
+    write(42.0, threshold_secs + 60);
+    let v = build_status(&config, 90_000, None, false);
+    assert_eq!(
+        stale_of("work", &v),
+        true,
+        "a non-maxed window is age-stale even with spent accounts skipped"
+    );
+    config.state.refresh_spent_accounts = true;
+    write(100.0, threshold_secs + 60);
+    let v = build_status(&config, 90_000, None, false);
+    assert_eq!(
+        stale_of("work", &v),
+        true,
+        "the live-maxed exemption is inherited from the opt-out alone: with the \
+         opt-out on, a maxed window is still age-stale"
+    );
+    // The stuck-429 arm is untouched: the exemption shares the OR, it does not
+    // replace the flag. Pinned by its own test above.
+
+    // The age arm holds on the DAEMON feed too: same cache, live signals
+    // attached, no stuck-429 (Fresh store entry, no streaks) — an old body
+    // must read stale on the more-used surface, not only the single-shot.
+    config.state.refresh_spent_accounts = true;
+    write(42.0, threshold_secs + 60);
+    let live = LiveSignals {
+        status: &HashMap::from([("work".to_string(), FetchStatus::Fresh)]),
+        third_party_status: &Default::default(),
+        next_refresh: &HashMap::new(),
+        streaks: &HashMap::new(),
+        pending_switch: None,
+        queue_anchor: None,
+        queue_blocked: &[],
+    };
+    let v = build_status(&config, 90_000, Some(&live), false);
+    assert_eq!(
+        stale_of("work", &v),
+        true,
+        "an overdue cache reads stale on the live daemon feed too"
     );
 }
 
@@ -549,6 +1062,8 @@ fn build_status_publishes_the_third_party_legs_own_status() {
         next_refresh: &next,
         streaks: &streaks,
         pending_switch: None,
+        queue_anchor: None,
+        queue_blocked: &[],
     };
     let v = build_status(&config, 300_000, Some(&live), false);
     assert_eq!(
@@ -568,6 +1083,8 @@ fn build_status_publishes_the_third_party_legs_own_status() {
         next_refresh: &next,
         streaks: &streaks,
         pending_switch: None,
+        queue_anchor: None,
+        queue_blocked: &[],
     };
     let v = build_status(&config, 300_000, Some(&live), false);
     assert_eq!(v["profiles"][0]["fetch_status"], "RateLimited");
@@ -595,6 +1112,8 @@ fn build_status_prefers_the_oauth_leg_when_both_stores_carry_a_name() {
         next_refresh: &next,
         streaks: &streaks,
         pending_switch: None,
+        queue_anchor: None,
+        queue_blocked: &[],
     };
     let v = build_status(&config, 300_000, Some(&live), false);
     assert_eq!(v["profiles"][0]["fetch_status"], "Fresh");
@@ -720,6 +1239,7 @@ fn build_status_rolling_token_is_the_sidecar_content_not_the_config_flag() {
             expires_at: Some(crate::usage::now_ms() as i64 + 3_600_000),
             scopes: Some(scopes.into_iter().map(String::from).collect()),
             subscription_type: plan.map(String::from),
+            ..crate::profile::OAuthToken::default_extra()
         }),
     };
 
@@ -785,6 +1305,7 @@ fn build_status_rolling_token_is_false_for_a_misfill() {
                 "user:profile".to_string(),
             ]),
             subscription_type: Some("max".to_string()),
+            ..crate::profile::OAuthToken::default_extra()
         }),
     };
     std::fs::write(
@@ -844,4 +1365,121 @@ fn published_entries_deserialize_into_the_typed_contract() {
         .collect();
     win_keys.sort_unstable();
     assert_eq!(win_keys, ["label", "resets_at", "utilization_pct"]);
+}
+
+/// The feed must publish the queue the ELECTION is running, not a wider one.
+/// `auto_start_queue_members` drops switch-grade kick-blocked profiles, and the
+/// scheduler and the TUI both supply that set — the feed used to pass an empty
+/// one, so a blocked account kept a position and inflated `N` for as long as
+/// the limiter's advertised ceiling stood (hours, not the "one poll" the code
+/// claimed). Every OTHER member's `next_open_at` is then computed off the wrong
+/// `5h / N` and reads earlier than the gap actually applied (review round 4).
+///
+/// Both legs, because the two surfaces read the set from different places: a
+/// live daemon passes its in-memory blocks through `LiveSignals`, and the
+/// daemonless `status --json` re-derives them from the same `kick_block.json`
+/// caches the scheduler writes through — on the same `kick_block_switch_grade`
+/// predicate, which the third profile below pins by NOT being excluded.
+#[test]
+fn build_status_auto_start_queue_drops_switch_grade_kick_blocked_members() {
+    use crate::profile_cache::{KICK_BLOCK_CACHE_FILE, write_profile_cache};
+    use crate::usage::KickBlock;
+    let _home = HomeSandbox::new();
+    let queued = |name: &str| {
+        let mut p = oauth_profile(name);
+        p.auto_start = true;
+        p
+    };
+    let config = AppConfig {
+        state: AppState {
+            fallback_chain: vec!["a".into(), "b".into(), "c".into()],
+            auto_start_queue: true,
+            ..AppState::default()
+        },
+        profiles: vec![queued("a"), queued("b"), queued("c")],
+    };
+    let queue_of = |v: &serde_json::Value, name: &str| -> serde_json::Value {
+        v["profiles"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|p| p["name"] == name)
+            .expect("profile published")["auto_start_queue"]
+            .clone()
+    };
+
+    // Live leg: the scheduler's own blocked set, handed over.
+    let empty_status = std::collections::HashMap::new();
+    let empty_next = std::collections::HashMap::new();
+    let empty_streaks = std::collections::HashMap::new();
+    let anchor = 1_780_000_000i64;
+    let blocked = [crate::profile::ProfileName::from("b")];
+    let live = LiveSignals {
+        status: &empty_status,
+        third_party_status: &Default::default(),
+        next_refresh: &empty_next,
+        streaks: &empty_streaks,
+        pending_switch: None,
+        queue_anchor: Some(anchor),
+        queue_blocked: &blocked,
+    };
+    let v = build_status(&config, 300_000, Some(&live), false);
+    assert!(
+        queue_of(&v, "b").is_null(),
+        "a kick-blocked member holds no published slot, as it holds none in the election"
+    );
+    assert_eq!(queue_of(&v, "a")["position"], 1);
+    assert_eq!(
+        queue_of(&v, "c")["position"],
+        2,
+        "the members behind it close up rather than leaving a hole"
+    );
+    // The N the estimate is sized from, which is the half of this that a
+    // position assertion alone would miss.
+    let published = queue_of(&v, "a")["next_open_at"]
+        .as_str()
+        .expect("an anchored queue publishes a next-open stamp")
+        .to_string();
+    assert_eq!(
+        crate::usage::iso_to_epoch_secs(&published),
+        Some(anchor + crate::usage::queue_gap_secs(2, 300_000)),
+        "the gap is 5h/2, not the 5h/3 an un-excluded member would publish"
+    );
+
+    // Daemonless leg: the same verdict re-derived from disk. `c` gets a block
+    // that is NOT switch-grade (one 429, no `rejected`), so the predicate is
+    // pinned in both directions by the same run.
+    crate::testutil::register_names(&["a", "b", "c"]);
+    let far_ahead = crate::usage::now_epoch_secs() + 3600;
+    write_profile_cache(
+        &crate::profile::ProfileName::from("b"),
+        KICK_BLOCK_CACHE_FILE,
+        &KickBlock {
+            streak: 2,
+            rejected: true,
+            until: Some(far_ahead),
+            next_retry: far_ahead,
+        },
+    );
+    write_profile_cache(
+        &crate::profile::ProfileName::from("c"),
+        KICK_BLOCK_CACHE_FILE,
+        &KickBlock {
+            streak: 1,
+            rejected: false,
+            until: Some(far_ahead),
+            next_retry: far_ahead,
+        },
+    );
+    let v = build_status(&config, 300_000, None, false);
+    assert!(
+        queue_of(&v, "b").is_null(),
+        "`status --json` reads the same block off `kick_block.json`"
+    );
+    assert_eq!(queue_of(&v, "a")["position"], 1);
+    assert_eq!(
+        queue_of(&v, "c")["position"],
+        2,
+        "a burst 429 is not switch-grade and never costs a queue slot"
+    );
 }

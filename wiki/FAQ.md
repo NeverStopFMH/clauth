@@ -26,7 +26,7 @@
 
 **Usage numbers are stuck.** Only one clauth instance fetches at a time. If a daemon holds the lease, an open TUI reads its results instead of polling itself, and picks the lease back up within a tick of the daemon exiting. `clauth daemon --status` says whether one is up.
 
-**An account has a `×` next to it.** Its login was rejected for good, so it is quarantined and excluded from the chain. Run `clauth login <name>` to re-authenticate it.
+**An account has a `×` next to it.** Its login was rejected for good, so it is quarantined and excluded from the chain. Run `clauth login <name>` to re-authenticate it. On an account that authenticates by api key, what died is the stored subscription login its usage figures came from, so `clauth login <name> --api-key <key>` is the one that clears the quarantine against the credential that account actually runs on. A bare browser login clears it too and leaves the endpoint and key standing.
 
 **The chain will not switch to an account that looks fine.** Check the reason on its row. Weekly windows, per-model weekly windows, a spend ceiling, a canceled subscription, or a `disabled` flag all take a member out of rotation independently of its 5h number. The [exclusion table](Auto-Switch#excluded-members) lists all of them.
 
@@ -34,11 +34,11 @@
 
 **On macOS a switch does not reach my running session.** Claude Code reads the Keychain first there, and it deletes the credentials file once it migrates. clauth mirrors each fresh login into the Keychain for exactly this reason, but an account holding a live `clauth start` session is skipped by force-rotate, since its Keychain item belongs to that session's own config dir. [Security](Security#per-platform-behavior).
 
-**Claude Code does not show clauth's tools.** Open the Plugin tab. It checks `clauth` on `PATH`, the `mcpServers` entry, the plugin install record, and whether `clauth mcp` actually answers a handshake. <kbd>f</kbd> fixes the wiring rows.
+**Claude Code does not show clauth's tools.** Open the Plugin tab. It checks `clauth` on `PATH`, the `mcpServers` entry, the plugin install record, and whether `clauth mcp` actually answers a handshake. <kbd>f</kbd> on a row applies that row's fix: install the plugin at user scope, write the `mcpServers` entry into `~/.claude.json`, repair or relink the active account's credentials, or add clauth's keybinding and sidebar row to herdr's config.
 
 **A `delegate` run did nothing and the tree is unchanged.** A delegate spawns with the permission gate armed and nobody to answer it. Pass the permission flag through `args` for a delegate that writes files, and read the `permission_denials` array in the envelope. [Claude Code plugin](Claude-Code-Plugin#delegate).
 
-**My custom endpoint shows no usage bars.** Only DeepSeek, Z.ai, OpenRouter and Alibaba Model Studio have typed panels. Everything else gets a best-effort scan of the usual usage paths, which can come back empty. Press <kbd>r</kbd> to retry an endpoint clauth gave up on. An Alibaba account is the one case where an api key is not enough: run `clauth login <account>` to capture the console session its quota is read with ([Configuration](Configuration#the-alibaba-console-session)).
+**My custom endpoint shows no usage bars.** Only DeepSeek, Z.ai, OpenRouter, MiniMax and Alibaba Model Studio have typed panels. Everything else gets a best-effort scan of the usual usage paths, which can come back empty; the scan retries at most once every five minutes (or once per refresh interval, whichever is longer), and <kbd>r</kbd> forces one immediately. An Alibaba account is the one case where an api key is not enough: run `clauth login <account>` to capture the console session its quota is read with ([Configuration](Configuration#the-alibaba-console-session)).
 
 **The Tokens tab shows `$X+` instead of a figure.** Some model in that period has no published price, or the period reaches into days that carry no cache split. The number is a floor. [Tokens and cost](Tokens-And-Cost#period-lens).
 

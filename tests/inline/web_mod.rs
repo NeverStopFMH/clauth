@@ -134,6 +134,7 @@ fn manual_browser_check() {
             expires_at: None,
             scopes: None,
             subscription_type: None,
+            ..OAuthToken::default_extra()
         }),
     });
     alpha.usage = Some(UsageInfo {

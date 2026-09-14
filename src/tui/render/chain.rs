@@ -154,7 +154,7 @@ fn draw_chain_detail(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let selected = items
         .get(app.chain_cursor.min(items.len().saturating_sub(1)))
         .copied();
-    // Switch-grade kick blocks — read before the Config lock (rank order:
+    // Switch-grade kick blocks, read before the Config lock (rank order:
     // KickBlockState 230 < Config 400).
     let kick_lifts = switch_grade_kick_lifts(&app.kick_blocks);
 
@@ -439,8 +439,8 @@ fn live_session_lines(
     let Some(at) = sessions.last_swap_at else {
         return lines;
     };
-    // An AGE, so it reads through `relative_age` (single largest unit, ISO date
-    // past 30 days) rather than the two-unit `humanize_duration` the countdowns
+    // An AGE, so it reads through `relative_age` (single largest unit, local
+    // stamp past 30 days) rather than the two-unit `humanize_duration` the countdowns
     // use — a countdown is a duration, this is a point in the past.
     lines.push(Line::from(vec![
         Span::styled(key_cell("last swap", KEY_W, KEY_GUTTER), theme::label()),

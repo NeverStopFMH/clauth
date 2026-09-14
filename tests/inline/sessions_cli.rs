@@ -45,7 +45,6 @@ fn price_table(rows: &[(&str, f64, f64)]) -> crate::pricing::PriceTable {
         rows.iter()
             .map(|&(id, input, output)| crate::pricing::PricedModel {
                 id: id.to_owned(),
-                match_: crate::pricing::MatchClause::Equals(id.to_lowercase()),
                 prices: vec![crate::pricing::PriceEntry {
                     input,
                     output,
@@ -53,8 +52,12 @@ fn price_table(rows: &[(&str, f64, f64)]) -> crate::pricing::PriceTable {
                     cache_write: 0.0,
                     constraint: None,
                 }],
+                effective_at: None,
             })
             .collect(),
+        Vec::new(),
+        Vec::new(),
+        crate::pricing::CanonicalMap::default(),
         crate::tokens::today_date(),
         0,
         Vec::new(),

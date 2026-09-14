@@ -53,12 +53,7 @@ struct SwitchRequest {
 
 pub(super) fn switch(config: &ConfigHandle, request: &mut tiny_http::Request) -> RouteResult {
     let body: SwitchRequest = read_json_body(request)?;
-    #[allow(
-        clippy::expect_used,
-        reason = "config mutex poisoning is unrecoverable"
-    )]
-    let mut cfg = config.lock().expect("config mutex poisoned");
-    crate::actions::switch_profile(&mut cfg, &ProfileName::from(body.name))
+    crate::actions::switch_profile(config, &ProfileName::from(body.name))
         .map(|()| (StatusCode(200), ok_body()))
         .map_err(|e| (StatusCode(422), error_body(&e.to_string())))
 }

@@ -37,7 +37,10 @@ fn parse_exit_code(args: &[&str]) -> i32 {
 // ── the three shapes that are not plain subcommands ─────────────────────────
 
 /// A bare `clauth` selects no subcommand, which is what routes `dispatch` to
-/// the TUI.
+/// the TUI (on a terminal; a piped stdout prints the help instead — pinned
+/// against the real binary in `tests/bare_non_tty.rs`, since the arm reads
+/// `stdout().is_terminal()` live and an in-process pin would depend on the
+/// runner's own terminal).
 #[test]
 fn bare_invocation_selects_no_subcommand() {
     let cli = parse(&[]).expect("bare clauth must parse");
@@ -280,6 +283,16 @@ fn login_bare_name_is_oauth_mode() {
     assert!(!a.yes);
 }
 
+// ── capture ──────────────────────────────────────────────────────────────────
+
+#[test]
+fn capture_parses_with_a_profile_argument() {
+    let Command::Capture { profile } = command(&["capture", "acme"]) else {
+        panic!("capture must parse");
+    };
+    assert_eq!(profile, "acme");
+}
+
 #[test]
 fn login_accepts_a_short_alias_or_a_full_custom_model_id() {
     assert_eq!(
@@ -448,6 +461,59 @@ fn login_rejects_flag_shaped_profile_names_and_a_second_positional() {
     }
 }
 
+/// `--cert`/`--key` come as a pair, and only alongside `--listen`.
+///
+/// Both halves matter. A lone `--cert` would otherwise be accepted and then
+/// silently fall back to the lego certificate at startup, which is the failure
+/// the flag exists to avoid — the operator would be told the host has no
+/// certificate for a name they never asked it to use. And without `--listen`
+/// there is no listener for either file to serve, so accepting them would be a
+/// no-op that reads like configuration.
+#[test]
+fn cert_and_key_are_required_together_and_only_with_listen() {
+    for args in [
+        ["daemon", "--listen", "--cert", "/tmp/a.crt"].as_slice(),
+        ["daemon", "--listen", "--key", "/tmp/a.key"].as_slice(),
+        ["daemon", "--cert", "/tmp/a.crt", "--key", "/tmp/a.key"].as_slice(),
+        [
+            "daemon",
+            "--print-token",
+            "--cert",
+            "/tmp/a.crt",
+            "--key",
+            "/tmp/a.key",
+        ]
+        .as_slice(),
+    ] {
+        assert_eq!(parse_exit_code(args), 2, "{args:?} must be a usage error");
+    }
+
+    let Command::Daemon {
+        listen, cert, key, ..
+    } = command(&[
+        "daemon",
+        "--listen",
+        "--cert",
+        "/tmp/a.crt",
+        "--key",
+        "/tmp/a.key",
+    ])
+    else {
+        panic!("must parse");
+    };
+    assert!(
+        listen.is_some(),
+        "bare --listen still takes the default bind"
+    );
+    assert_eq!(
+        (cert.as_deref(), key.as_deref()),
+        (
+            Some(std::path::Path::new("/tmp/a.crt")),
+            Some(std::path::Path::new("/tmp/a.key"))
+        )
+    );
+}
+
 // ── delete / disable / enable ───────────────────────────────────────────────
 
 #[test]
@@ -589,6 +655,11 @@ fn daemon_modes_are_mutually_exclusive_and_default_to_exit_if_running() {
         no_standby,
         replace,
         status,
+        listen,
+        cert,
+        key,
+        print_token,
+        rotate_token,
     } = command(&["daemon"])
     else {
         panic!("must parse");
@@ -598,18 +669,35 @@ fn daemon_modes_are_mutually_exclusive_and_default_to_exit_if_running() {
         (false, false, false, false),
         "bare `clauth daemon` picks no mode, which dispatch reads as exit-if-running"
     );
+    assert_eq!(
+        (listen, print_token, rotate_token),
+        (None, false, false),
+        "the REST API is off unless an address is asked for"
+    );
+    assert_eq!(
+        (cert, key),
+        (None, None),
+        "TLS comes from this host's lego certificate unless both files are named"
+    );
 
     for (args, flag) in [
         (["daemon", "--standby"].as_slice(), "standby"),
         (["daemon", "--no-standby"].as_slice(), "no_standby"),
         (["daemon", "--replace"].as_slice(), "replace"),
         (["daemon", "--status"].as_slice(), "status"),
+        (["daemon", "--print-token"].as_slice(), "print_token"),
+        (["daemon", "--rotate-token"].as_slice(), "rotate_token"),
     ] {
         let Command::Daemon {
             standby,
             no_standby,
             replace,
             status,
+            listen,
+            cert: _,
+            key: _,
+            print_token,
+            rotate_token,
         } = command(args)
         else {
             panic!("{args:?} must parse");
@@ -619,6 +707,8 @@ fn daemon_modes_are_mutually_exclusive_and_default_to_exit_if_running() {
             ("no_standby", no_standby),
             ("replace", replace),
             ("status", status),
+            ("print_token", print_token),
+            ("rotate_token", rotate_token),
         ];
         for (name, value) in set {
             assert_eq!(
@@ -628,16 +718,28 @@ fn daemon_modes_are_mutually_exclusive_and_default_to_exit_if_running() {
                 name == flag
             );
         }
+        assert_eq!(listen, None, "{args:?} asks for no listener");
     }
 
-    // Every pair conflicts, so no invocation can ask for two start modes.
+    // Every pair conflicts, so no invocation can ask for two start modes, and
+    // neither one-shot (--status, --print-token, --rotate-token) can be asked
+    // for alongside anything else.
     for pair in [
         ["--standby", "--no-standby"],
         ["--standby", "--replace"],
         ["--standby", "--status"],
+        ["--standby", "--print-token"],
+        ["--standby", "--rotate-token"],
         ["--no-standby", "--replace"],
         ["--no-standby", "--status"],
+        ["--no-standby", "--print-token"],
+        ["--no-standby", "--rotate-token"],
         ["--replace", "--status"],
+        ["--replace", "--print-token"],
+        ["--replace", "--rotate-token"],
+        ["--status", "--print-token"],
+        ["--status", "--rotate-token"],
+        ["--print-token", "--rotate-token"],
     ] {
         assert_eq!(
             parse_exit_code(&["daemon", pair[0], pair[1]]),
@@ -646,6 +748,120 @@ fn daemon_modes_are_mutually_exclusive_and_default_to_exit_if_running() {
         );
     }
     assert_eq!(parse_exit_code(&["daemon", "--nope"]), 2);
+}
+
+/// `--listen` is orthogonal to the start modes (a supervised daemon still
+/// serves the API) but not to the one-shots, which print and exit.
+#[test]
+fn listen_parses_an_address_and_composes_with_the_start_modes() {
+    let Command::Daemon { listen, .. } = command(&["daemon", "--listen", "0.0.0.0:8443"]) else {
+        panic!("must parse");
+    };
+    assert_eq!(
+        listen,
+        Some(std::net::SocketAddr::from(([0, 0, 0, 0], 8443))),
+        "clap parses the address, so a typo fails before the daemon starts"
+    );
+
+    let Command::Daemon { listen, .. } = command(&["daemon", "--listen", "127.0.0.1:9000"]) else {
+        panic!("must parse");
+    };
+    assert_eq!(
+        listen,
+        Some(std::net::SocketAddr::from(([127, 0, 0, 1], 9000)))
+    );
+
+    for mode in ["--standby", "--no-standby", "--replace"] {
+        let Command::Daemon { listen, .. } = command(&["daemon", mode, "--listen", "0.0.0.0:8443"])
+        else {
+            panic!("daemon {mode} --listen must parse");
+        };
+        assert!(listen.is_some(), "{mode} should not conflict with --listen");
+    }
+
+    for one_shot in ["--status", "--print-token", "--rotate-token"] {
+        assert_eq!(
+            parse_exit_code(&["daemon", one_shot, "--listen", "0.0.0.0:8443"]),
+            2,
+            "daemon {one_shot} --listen must be refused as a conflict"
+        );
+    }
+
+    for bad in ["8443", "not-an-address", "0.0.0.0", "0.0.0.0:99999"] {
+        assert_eq!(
+            parse_exit_code(&["daemon", "--listen", bad]),
+            2,
+            "--listen {bad:?} must be refused at parse time"
+        );
+    }
+}
+
+/// A value-less `--listen` binds [`crate::cli::DEFAULT_LISTEN`], and taking no
+/// value must not make the flag start swallowing the argument after it.
+#[test]
+fn bare_listen_defaults_to_every_interface_without_eating_the_next_flag() {
+    let default = crate::cli::DEFAULT_LISTEN
+        .parse::<std::net::SocketAddr>()
+        .expect("DEFAULT_LISTEN must be a parseable address");
+
+    let Command::Daemon { listen, .. } = command(&["daemon", "--listen"]) else {
+        panic!("bare `daemon --listen` must parse");
+    };
+    assert_eq!(
+        listen,
+        Some(default),
+        "a value-less --listen takes the documented default"
+    );
+
+    // The flag is still opt-in: nothing about the default leaks into a `daemon`
+    // that never asked for a listener.
+    let Command::Daemon { listen, .. } = command(&["daemon"]) else {
+        panic!("must parse");
+    };
+    assert_eq!(listen, None, "no --listen still means no listener");
+
+    // `num_args = 0..=1` is the risk here: a following flag must be read as a
+    // flag, not consumed as the address, in either order.
+    for mode in ["--standby", "--no-standby", "--replace"] {
+        let Command::Daemon {
+            listen,
+            standby,
+            no_standby,
+            replace,
+            ..
+        } = command(&["daemon", "--listen", mode])
+        else {
+            panic!("daemon --listen {mode} must parse");
+        };
+        assert_eq!(
+            listen,
+            Some(default),
+            "--listen {mode} must default, not swallow {mode}"
+        );
+        assert!(
+            standby || no_standby || replace,
+            "{mode} must still register as a start mode after a bare --listen"
+        );
+
+        let Command::Daemon { listen, .. } = command(&["daemon", mode, "--listen"]) else {
+            panic!("daemon {mode} --listen must parse");
+        };
+        assert_eq!(
+            listen,
+            Some(default),
+            "{mode} then a bare --listen defaults"
+        );
+    }
+
+    // The one-shots conflict with the shorthand exactly as they do with the
+    // spelled-out address.
+    for one_shot in ["--status", "--print-token", "--rotate-token"] {
+        assert_eq!(
+            parse_exit_code(&["daemon", one_shot, "--listen"]),
+            2,
+            "daemon {one_shot} --listen must be refused as a conflict"
+        );
+    }
 }
 
 #[test]
@@ -961,6 +1177,11 @@ fn an_absent_daemon_reports_exit_one_not_the_usage_code() {
             no_standby: false,
             replace: false,
             status: true,
+            listen: None,
+            cert: None,
+            key: None,
+            print_token: false,
+            rotate_token: false,
         }),
     })
     .expect_err("no daemon is running in the sandbox");
@@ -1106,7 +1327,7 @@ mod bad_profile_name_is_a_usage_error {
 
 #[test]
 fn collect_api_endpoint_trims_flag_values() {
-    let (base, key) = collect_api_endpoint(Some("  https://api.x  "), Some("  sk-y  "))
+    let (base, key) = collect_api_endpoint(Some("  https://api.x  "), Some("  sk-y  "), false)
         .expect("both flags present, no prompt");
     assert_eq!(base.as_deref(), Some("https://api.x"));
     assert_eq!(key.as_deref(), Some("sk-y"));
@@ -1115,11 +1336,11 @@ fn collect_api_endpoint_trims_flag_values() {
 #[test]
 fn collect_api_endpoint_rejects_empty_flag_values() {
     assert!(
-        collect_api_endpoint(Some("   "), Some("sk")).is_err(),
+        collect_api_endpoint(Some("   "), Some("sk"), false).is_err(),
         "a blank --base-url must bail, not create an empty-endpoint profile"
     );
     assert!(
-        collect_api_endpoint(Some("https://x"), Some("")).is_err(),
+        collect_api_endpoint(Some("https://x"), Some(""), false).is_err(),
         "a blank --api-key must bail, not store an empty key"
     );
 }
@@ -1128,12 +1349,195 @@ fn collect_api_endpoint_rejects_empty_flag_values() {
 fn collect_api_endpoint_rejects_control_chars_in_key() {
     // The key is minted verbatim into a request header; a CRLF would inject one.
     assert!(
-        collect_api_endpoint(Some("https://x"), Some("sk-a\r\nX-Evil: 1")).is_err(),
+        collect_api_endpoint(Some("https://x"), Some("sk-a\r\nX-Evil: 1"), false).is_err(),
         "a control-char key must bail at capture, not persist a header-injecting value"
     );
     assert!(
-        collect_api_endpoint(Some("https://x"), Some("sk a b")).is_err(),
+        collect_api_endpoint(Some("https://x"), Some("sk a b"), false).is_err(),
         "interior whitespace in a key is a bad paste"
+    );
+}
+
+// ── api-mode reauth arm: pure routing pins ──────────────────────────────────
+// The arm's two decisions are extracted pure (`resolve_reauth_base_url`,
+// `api_reauth_snapshot`) so the routing is pinned without touching stdin: a
+// test whose outcome depended on the runner's terminal red under a pty
+// (the confirm prompt eats libtest's capture and declines) and hung on a
+// developer terminal.
+
+fn acme_with_chain() -> crate::profile::Profile {
+    let mut acme = crate::profile::Profile::new(
+        "acme".to_string(),
+        Some("https://api.deepseek.com/anthropic".to_string()),
+        Some("sk-old".to_string()),
+    );
+    acme.credentials = Some(crate::profile::ClaudeCredentials {
+        claude_ai_oauth: Some(crate::profile::OAuthToken {
+            access_token: "stored-access".to_string(),
+            refresh_token: Some("stored-refresh".to_string()),
+            expires_at: None,
+            scopes: None,
+            subscription_type: None,
+            ..crate::profile::OAuthToken::default_extra()
+        }),
+    });
+    acme
+}
+
+#[test]
+fn resolve_reauth_base_url_flag_wins_empty_included_and_ignores_the_terminal() {
+    let acme = acme_with_chain();
+    for tty in [false, true] {
+        assert_eq!(
+            resolve_reauth_base_url(Some("https://flag"), Some(&acme), tty).as_deref(),
+            Some("https://flag"),
+            "the flag wins over the stored endpoint, TTY or not"
+        );
+        assert_eq!(
+            resolve_reauth_base_url(Some(""), Some(&acme), tty).as_deref(),
+            Some(""),
+            "an empty flag passes through; collect_api_endpoint's empty-reject turns it into the bail"
+        );
+    }
+}
+
+#[test]
+fn resolve_reauth_base_url_a_tty_prompts() {
+    let acme = acme_with_chain();
+    assert_eq!(
+        resolve_reauth_base_url(None, Some(&acme), true),
+        None,
+        "a TTY keeps the prompt: None lets collect_api_endpoint ask"
+    );
+}
+
+#[test]
+fn resolve_reauth_base_url_headless_reuses_the_stored_endpoint() {
+    let acme = acme_with_chain();
+    assert_eq!(
+        resolve_reauth_base_url(None, Some(&acme), false).as_deref(),
+        Some("https://api.deepseek.com/anthropic"),
+        "a non-TTY re-key without --base-url takes the stored endpoint (owner ruling)"
+    );
+}
+
+#[test]
+fn resolve_reauth_base_url_headless_with_no_stored_endpoint_bails() {
+    let bare = crate::profile::Profile::new("acme".to_string(), None, None);
+    assert_eq!(
+        resolve_reauth_base_url(None, Some(&bare), false),
+        None,
+        "None reaches collect_api_endpoint, whose non-interactive refusal fires"
+    );
+    assert_eq!(
+        resolve_reauth_base_url(None, None, false),
+        None,
+        "a vanished profile reads the same as one with no endpoint stored"
+    );
+}
+
+#[test]
+fn api_reauth_snapshot_carries_the_stored_chain_through() {
+    let acme = acme_with_chain();
+    let snap = api_reauth_snapshot(
+        Some("https://api.deepseek.com/anthropic".to_string()),
+        Some("sk-new".to_string()),
+        Some(&acme),
+    );
+    let carried = snap
+        .credentials
+        .as_ref()
+        .expect("the stored chain rides the snapshot");
+    assert_eq!(carried.access_token(), Some("stored-access"));
+    assert_eq!(carried.refresh_token(), Some("stored-refresh"));
+    assert_eq!(
+        carried.access_token(),
+        acme.access_token(),
+        "the carried chain is the stored profile's own, not a restated constant"
+    );
+    assert_eq!(
+        snap.base_url.as_deref(),
+        Some("https://api.deepseek.com/anthropic")
+    );
+    assert_eq!(snap.api_key.as_deref(), Some("sk-new"));
+    assert_eq!(snap.account_uuid, None);
+}
+
+#[test]
+fn api_reauth_snapshot_without_a_stored_chain_carries_none() {
+    let bare = crate::profile::Profile::new(
+        "acme".to_string(),
+        Some("https://api.deepseek.com/anthropic".to_string()),
+        Some("sk-old".to_string()),
+    );
+    assert!(
+        api_reauth_snapshot(
+            Some("https://x".to_string()),
+            Some("sk-new".to_string()),
+            Some(&bare)
+        )
+        .credentials
+        .is_none(),
+        "a profile with no chain contributes none"
+    );
+    assert!(
+        api_reauth_snapshot(
+            Some("https://x".to_string()),
+            Some("sk-new".to_string()),
+            None
+        )
+        .credentials
+        .is_none(),
+        "a vanished profile reads the same"
+    );
+}
+
+// The composed helper, driving the real collect_api_endpoint so its
+// validation actually fires. interactive = false throughout: the helper
+// passes its own tty param through to collect_api_endpoint, so these pins
+// exercise the non-interactive arms under ANY runner stdin (pinned under a
+// pseudo-TTY, where the old stdin-keyed arm read the prompt leg instead).
+// The interactive arms (prompt, read stdin) stay pinned at the router level
+// only — driving them here would hang the suite.
+
+#[test]
+fn collect_api_reauth_snapshot_headless_reuses_endpoint_key_and_chain() {
+    let acme = acme_with_chain();
+    let snap = collect_api_reauth_snapshot(None, Some("sk-new"), Some(&acme), false)
+        .expect("a headless re-key with a stored endpoint must not prompt");
+    assert_eq!(
+        snap.base_url.as_deref(),
+        acme.base_url.as_deref(),
+        "the snapshot carries the STORED endpoint"
+    );
+    assert_eq!(snap.api_key.as_deref(), Some("sk-new"), "and the fresh key");
+    let carried = snap
+        .credentials
+        .as_ref()
+        .expect("and the stored chain rides through the composition");
+    assert_eq!(carried.access_token(), acme.access_token());
+}
+
+#[test]
+fn collect_api_reauth_snapshot_headless_with_no_stored_endpoint_refuses() {
+    let bare = crate::profile::Profile::new("acme".to_string(), None, None);
+    let err = collect_api_reauth_snapshot(None, Some("sk-new"), Some(&bare), false)
+        .expect_err("nothing to reuse and no way to prompt must refuse");
+    assert!(
+        err.to_string()
+            .contains("non-interactive stdin: pass --base-url"),
+        "the refusal must name the non-interactive bail: {err}"
+    );
+}
+
+#[test]
+fn collect_api_reauth_snapshot_empty_flag_refuses() {
+    let acme = acme_with_chain();
+    let err = collect_api_reauth_snapshot(Some(""), Some("sk-new"), Some(&acme), false)
+        .expect_err("an empty --base-url must bail, not store an empty endpoint");
+    assert!(
+        err.to_string().contains("base url is required"),
+        "the refusal must name the empty-reject: {err}"
     );
 }
 
@@ -1473,6 +1877,7 @@ mod static_token_verdicts {
                     "user:profile".to_string(),
                 ]),
                 subscription_type: Some("max".into()),
+                ..crate::profile::OAuthToken::default_extra()
             },
         )
         .expect("stamp");
@@ -1533,6 +1938,7 @@ mod static_token_verdicts {
                     "user:sessions:claude_code".to_string(),
                 ]),
                 subscription_type: None,
+                ..crate::profile::OAuthToken::default_extra()
             }),
         };
         std::fs::write(
@@ -1568,6 +1974,7 @@ mod static_token_verdicts {
                     "user:profile".to_string(),
                 ]),
                 subscription_type: Some("max".into()),
+                ..crate::profile::OAuthToken::default_extra()
             }),
         });
         crate::profile::save_profile(&profile).expect("save profile");
@@ -1600,6 +2007,142 @@ mod static_token_verdicts {
         assert!(!p.rolling_token, "nothing durable from a failed arm");
     }
 
+    /// The reauth confirm's survivor clause is the prompt's only affirmative
+    /// promise, and it is destructive to get wrong in either direction: a
+    /// profile told its endpoint survives when the arm will not fire, or one
+    /// told nothing survives while it silently keeps a key. It tracks the
+    /// preserve arm's own predicate, so an OAuth profile — which has neither
+    /// field — is never promised one.
+    #[test]
+    fn the_reauth_confirm_promises_a_survivor_only_where_one_survives() {
+        assert_eq!(
+            reauth_confirm_object(false, true),
+            "stored subscription login, keeping its endpoint and api key"
+        );
+        assert_eq!(reauth_confirm_object(false, false), "stored credentials");
+        // An api-mode login carries both fields and replaces them, so the
+        // preserve never applies whatever the profile holds.
+        assert_eq!(reauth_confirm_object(true, true), "endpoint + API key");
+        assert_eq!(reauth_confirm_object(true, false), "endpoint + API key");
+    }
+
+    /// "Name the split state" (owner ruling, 2026-08-30): a quarantined
+    /// third-party hybrid's dead chain sits beside a working api key, and the
+    /// bail says so instead of prescribing the bare browser login.
+    #[test]
+    fn rolling_token_on_a_flagged_third_party_hybrid_names_the_split_state() {
+        let _home = HomeSandbox::new();
+        let mut profile = crate::profile::Profile::new(
+            "rt-hybrid".to_string(),
+            Some("https://api.deepseek.com/anthropic".to_string()),
+            Some("sk-live".to_string()),
+        );
+        profile.credentials = Some(crate::profile::ClaudeCredentials {
+            claude_ai_oauth: Some(crate::profile::OAuthToken {
+                access_token: "at-dead".to_string(),
+                refresh_token: Some("rt-dead".to_string()),
+                expires_at: Some(crate::usage::now_ms() as i64 + 3_600_000),
+                scopes: None,
+                subscription_type: None,
+                ..crate::profile::OAuthToken::default_extra()
+            }),
+        });
+        crate::profile::save_profile(&profile).expect("save profile");
+        let state = crate::profile::AppState {
+            profiles: vec![profile.name.clone()],
+            auth_broken: vec![profile.name.clone()],
+            ..Default::default()
+        };
+        crate::profile::save_app_state(&state).expect("save state");
+
+        let err = cmd_rolling_token("rt-hybrid").expect_err("a flagged hybrid refuses up front");
+        assert_eq!(
+            format!("{err:#}"),
+            "stored OAuth chain is dead, its api key still works: rt-hybrid (run \
+             `clauth login rt-hybrid --api-key <key>` to clear the quarantine)"
+        );
+
+        // The keyless leg of the same bail. Its one reachable shape past the
+        // load boundary: a key non-empty after trim (so `effective_base_url`
+        // keeps the endpoint) that `validate_api_key` rejects — a hand-edited
+        // `config.toml` or a bad paste, the `ds-ctrl` shape the MCP surface
+        // fixtures. Without this the mirror can drift with nothing reddening.
+        let mut unusable = crate::profile::Profile::new(
+            "rt-badkey".to_string(),
+            Some("https://api.deepseek.com/anthropic".to_string()),
+            Some("sk-test\r\nInjected: x".to_string()),
+        );
+        unusable.credentials = Some(crate::profile::ClaudeCredentials {
+            claude_ai_oauth: Some(crate::profile::OAuthToken {
+                access_token: "at-dead".to_string(),
+                refresh_token: Some("rt-dead".to_string()),
+                expires_at: Some(crate::usage::now_ms() as i64 + 3_600_000),
+                scopes: None,
+                subscription_type: None,
+                ..crate::profile::OAuthToken::default_extra()
+            }),
+        });
+        crate::profile::save_profile(&unusable).expect("save profile");
+        let state = crate::profile::AppState {
+            profiles: vec![profile.name.clone(), unusable.name.clone()],
+            auth_broken: vec![profile.name.clone(), unusable.name.clone()],
+            ..Default::default()
+        };
+        crate::profile::save_app_state(&state).expect("save state");
+        #[allow(clippy::expect_used, reason = "test")]
+        let reloaded =
+            crate::profile::load_profile(&crate::profile::ProfileName::from("rt-badkey"))
+                .expect("reload");
+        assert!(
+            reloaded.is_third_party() && !crate::claude::has_inference_auth(&reloaded),
+            "fixture: the shape must survive the load boundary as keyless third-party",
+        );
+
+        let err = cmd_rolling_token("rt-badkey").expect_err("a flagged keyless hybrid refuses");
+        assert_eq!(
+            format!("{err:#}"),
+            "profile has no api key: rt-badkey (run `clauth login rt-badkey --api-key <key>`)"
+        );
+    }
+
+    /// "Copy-only: name why not" (owner ruling, 2026-08-30): an api-key
+    /// third-party profile has no chain to roll, so the bail names that and
+    /// prescribes nothing — a bare login would mint one, but that turns an
+    /// api-key account into an Anthropic login rather than answering the
+    /// request. An OAuth profile keeps the hint, where it IS the recovery.
+    #[test]
+    fn rolling_token_on_an_api_key_profile_names_the_missing_chain() {
+        let _home = HomeSandbox::new();
+        let ds = crate::profile::Profile::new(
+            "rt-keyed".to_string(),
+            Some("https://api.deepseek.com/anthropic".to_string()),
+            Some("sk-live".to_string()),
+        );
+        crate::profile::save_profile(&ds).expect("save ds");
+        let logged_out = crate::profile::Profile::new("rt-oauth".to_string(), None, None);
+        crate::profile::save_profile(&logged_out).expect("save oauth");
+        let state = crate::profile::AppState {
+            profiles: vec![
+                crate::profile::ProfileName::from("rt-keyed"),
+                crate::profile::ProfileName::from("rt-oauth"),
+            ],
+            ..Default::default()
+        };
+        crate::profile::save_app_state(&state).expect("save state");
+
+        let err = cmd_rolling_token("rt-keyed").expect_err("no chain, no roll");
+        assert_eq!(
+            format!("{err:#}"),
+            "'rt-keyed' has no usage OAuth chain to roll from"
+        );
+
+        let err = cmd_rolling_token("rt-oauth").expect_err("no chain either");
+        assert!(
+            format!("{err:#}").contains("run `clauth login rt-oauth` first"),
+            "an OAuth profile keeps the recovery hint: {err:#}"
+        );
+    }
+
     /// A mint chain shape for the arm tests: a real access token whose grant
     /// was never recorded (setup scopes only, no plan stamp) — the shape
     /// `roll_from_stored_chain` refuses pre-stamp, so the arm fails AFTER the
@@ -1617,6 +2160,7 @@ mod static_token_verdicts {
                     "user:sessions:claude_code".to_string(),
                 ]),
                 subscription_type: None,
+                ..crate::profile::OAuthToken::default_extra()
             }),
         });
         crate::profile::save_profile(&profile).expect("save profile");
@@ -1679,6 +2223,7 @@ mod static_token_verdicts {
                 expires_at: Some(crate::usage::now_ms() as i64 + 3_600_000),
                 scopes: None,
                 subscription_type: None,
+                ..crate::profile::OAuthToken::default_extra()
             }),
         };
         std::fs::write(
@@ -1713,6 +2258,7 @@ mod static_token_verdicts {
                     "user:sessions:claude_code".to_string(),
                 ]),
                 subscription_type: None,
+                ..crate::profile::OAuthToken::default_extra()
             }),
         };
         std::fs::write(
@@ -1740,6 +2286,7 @@ mod static_token_verdicts {
                     "user:sessions:claude_code".to_string(),
                 ]),
                 subscription_type: None,
+                ..crate::profile::OAuthToken::default_extra()
             }),
         };
         std::fs::write(
@@ -1972,6 +2519,7 @@ mod static_token_clear {
                     expires_at: Some(crate::usage::now_ms() as i64 + 8 * 3_600_000),
                     scopes: None,
                     subscription_type: None,
+                    ..crate::profile::OAuthToken::default_extra()
                 }),
             });
         }
@@ -2007,6 +2555,7 @@ mod static_token_clear {
                     "user:profile".to_string(),
                 ]),
                 subscription_type: Some("max".into()),
+                ..crate::profile::OAuthToken::default_extra()
             },
         )
         .expect("stamp");
@@ -2072,6 +2621,7 @@ mod static_token_clear {
                         expires_at: Some(crate::usage::now_ms() as i64 + 8 * 3_600_000),
                         scopes: None,
                         subscription_type: None,
+                        ..crate::profile::OAuthToken::default_extra()
                     }),
                 })
                 .expect("serialize login"),
@@ -2273,6 +2823,7 @@ mod static_token_clear {
                     expires_at: Some(crate::usage::now_ms() as i64 + 8 * 3_600_000),
                     scopes: None,
                     subscription_type: None,
+                    ..crate::profile::OAuthToken::default_extra()
                 }),
             })
             .expect("ser"),

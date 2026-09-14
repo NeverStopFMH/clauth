@@ -90,6 +90,22 @@ impl Drop for HomeSandbox {
     }
 }
 
+/// Run a switch fn (`switch_profile`/`switch_off`/`auto_switch_if_needed`, all
+/// [`crate::profile::ConfigHandle`]-taking) over an owned `AppConfig` and hand
+/// the mutated value back. The fns lock internally and run their post-switch
+/// feed republish on the handle, so the test moves the value in and clones it
+/// out after — every later assert reads the post-switch state.
+pub(crate) fn through_handle<T>(
+    config: crate::profile::AppConfig,
+    run: impl FnOnce(&crate::profile::ConfigHandle) -> T,
+) -> (crate::profile::AppConfig, T) {
+    let handle: crate::profile::ConfigHandle =
+        std::sync::Arc::new(crate::lockorder::RankedMutex::new(config));
+    let out = run(&handle);
+    let config = handle.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    (config, out)
+}
+
 /// Completion signals for detached background tasks that have no joinable
 /// handle of their own — e.g. the MCP background delegate, which detaches via
 /// `tokio::task::spawn_blocking` and drops the returned task handle
@@ -420,6 +436,7 @@ pub(crate) fn rotation_fixture_config(
             expires_at: Some(crate::usage::now_ms() as i64 + 86_400_000),
             scopes: None,
             subscription_type: None,
+            ..crate::profile::OAuthToken::default_extra()
         }),
     });
     crate::profile::save_profile(&profile).expect("save profile");
@@ -515,37 +532,68 @@ impl Drop for EndpointSandbox<'_> {
 /// pin still standing and let the next test run against it. As a borrow that
 /// inversion is E0505 at compile time instead of a race nothing checks.
 pub(crate) struct ConfigDirSandbox<'a> {
-    prev: Option<std::ffi::OsString>,
-    _home: std::marker::PhantomData<&'a HomeSandbox>,
+    _pin: EnvPin<'a>,
 }
 
 impl<'a> ConfigDirSandbox<'a> {
+    pub(crate) fn new(home: &'a HomeSandbox, dir: &Path) -> Self {
+        Self {
+            _pin: EnvPin::new(home, &[("CLAUDE_CONFIG_DIR", Some(dir.as_os_str()))]),
+        }
+    }
+}
+
+/// One or more process env pins, restored to their previous values on drop
+/// (even on panic), in reverse order. Same contract as every pin here: the env
+/// is process-global, serialized by `HOME_TEST_LOCK`, so the pin BORROWS the
+/// [`HomeSandbox`] that holds it; dropping the home first is E0505 at compile
+/// time instead of a race nothing checks.
+pub(crate) struct EnvPin<'a> {
+    prevs: Vec<(&'static str, Option<std::ffi::OsString>)>,
+    _home: std::marker::PhantomData<&'a HomeSandbox>,
+}
+
+impl<'a> EnvPin<'a> {
     #[expect(
         unsafe_code,
         reason = "env mutation is unsafe in Rust 2024; serialized by HOME_TEST_LOCK, held by the borrowed sandbox"
     )]
-    pub(crate) fn new(_home: &'a HomeSandbox, dir: &Path) -> Self {
-        let prev = std::env::var_os("CLAUDE_CONFIG_DIR");
-        // SAFETY: test-only, serialized by `HOME_TEST_LOCK`, restored on drop.
-        unsafe { std::env::set_var("CLAUDE_CONFIG_DIR", dir) };
+    pub(crate) fn new(
+        _home: &'a HomeSandbox,
+        pins: &[(&'static str, Option<&std::ffi::OsStr>)],
+    ) -> Self {
+        let mut prevs = Vec::with_capacity(pins.len());
+        for &(key, value) in pins {
+            let prev = std::env::var_os(key);
+            // SAFETY: test-only, serialized by `HOME_TEST_LOCK`, restored on drop.
+            unsafe {
+                match value {
+                    Some(v) => std::env::set_var(key, v),
+                    None => std::env::remove_var(key),
+                }
+            }
+            prevs.push((key, prev));
+        }
         Self {
-            prev,
+            prevs,
             _home: std::marker::PhantomData,
         }
     }
 }
 
-impl Drop for ConfigDirSandbox<'_> {
+impl Drop for EnvPin<'_> {
     #[expect(
         unsafe_code,
         reason = "env mutation is unsafe in Rust 2024; serialized by HOME_TEST_LOCK, held by the borrowed sandbox"
     )]
     fn drop(&mut self) {
-        // SAFETY: same as `new` — restore the prior value under the same lock.
-        unsafe {
-            match &self.prev {
-                Some(v) => std::env::set_var("CLAUDE_CONFIG_DIR", v),
-                None => std::env::remove_var("CLAUDE_CONFIG_DIR"),
+        // SAFETY: same as `new` — restore the prior values under the same lock.
+        for (key, prev) in self.prevs.iter().rev() {
+            unsafe {
+                match prev {
+                    Some(v) => std::env::set_var(key, v),
+                    None => std::env::remove_var(key),
+                }
             }
         }
     }
@@ -741,6 +789,27 @@ impl Drop for FakeClaude<'_> {
     }
 }
 
+/// Seed a plugin registration the heal gate must act on: a `clauth@clauth`
+/// user-scope row whose `installPath` is gone. The registry lives under the
+/// sandboxed claude dir, so this touches nothing outside it.
+#[cfg(unix)]
+pub(crate) fn seed_broken_plugin_registration() {
+    let dir = crate::profile::claude_dir()
+        .expect("claude dir")
+        .join("plugins");
+    std::fs::create_dir_all(&dir).expect("plugins dir");
+    std::fs::write(dir.join("known_marketplaces.json"), "{}").expect("marketplaces");
+    std::fs::write(
+        dir.join("installed_plugins.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "version": 2,
+            "plugins": {"clauth@clauth": [{"scope": "user", "installPath": "/gone/runtime/plugins/cache"}]}
+        }))
+        .expect("seed json"),
+    )
+    .expect("installed");
+}
+
 /// RAII tier pin: acquires `TIER_TEST_LOCK` and forces the process-global color
 /// tier for its lifetime, putting the previous pin back on drop (even on panic).
 /// Required for any test asserting on a tier-dependent style, since the tier is
@@ -796,6 +865,7 @@ pub(crate) fn blank_profile(name: &crate::profile::ProfileName) -> crate::profil
         credentials: None,
         usage: None,
         fetch_status: None,
+        usage_stale: false,
         provider: None,
         third_party_usage: None,
     }
@@ -864,6 +934,11 @@ pub(crate) const THIRD_PARTY_CACHE_BYTES: &str = r#"{"is_available":true,"rows":
 /// above is what it renders off a cache written before the rename.
 pub(crate) const DEEPSEEK_CACHE_BYTES: &str = r#"{"is_available":true,"rows":[{"label":"CNY balance","value":"","kind":"heading"},{"label":"api balance","value":"31.45 CNY","kind":"body"},{"label":"granted","value":"0.00 CNY","kind":"body"},{"label":"topped up","value":"31.45 CNY","kind":"body"}],"bars":[],"best_effort":false}"#;
 
+/// The same account after DeepSeek reports its balance cannot fund a call: the
+/// wallets still arrive and `ThirdPartyStats::unfunded` appends the refusal, so
+/// every surface can render the figure and the verdict together.
+pub(crate) const DEEPSEEK_UNFUNDED_CACHE_BYTES: &str = r#"{"is_available":false,"rows":[{"label":"CNY balance","value":"","kind":"heading"},{"label":"api balance","value":"0.00 CNY","kind":"body"},{"label":"granted","value":"0.00 CNY","kind":"body"},{"label":"topped up","value":"0.00 CNY","kind":"body"},{"label":"","value":"balance too low","kind":"danger"}],"bars":[],"best_effort":false}"#;
+
 /// The third shape, and the one a bar-count reader gets wrong: a provider that
 /// PUBLISHES usage windows answering with none of them. `alibaba::window_bar`
 /// drops a window whose percentage the response omitted and both are optional,
@@ -894,14 +969,41 @@ pub(crate) const CAPTURED_TWO_WALLET_DS_CACHE: &str = r#"{"is_available":true,"r
 /// as before.
 pub(crate) const CAPTURED_ONE_WALLET_DS_CACHE: &str = r#"{"is_available":true,"rows":[{"label":"CNY balance","value":"","kind":"heading"},{"label":"api balance","value":"3640.55 CNY","kind":"body"},{"label":"granted","value":"0.00 CNY","kind":"body"},{"label":"topped up","value":"3640.55 CNY","kind":"body"}],"bars":[],"best_effort":false}"#;
 
+/// Parse a captured `third_party_cache.json`, re-anchor its bar stamps (see
+/// [`write_captured_third_party_cache`]), and hand back the re-serialized
+/// bytes — for a test whose route to disk is a raw file write rather than the
+/// production cache writer.
+pub(crate) fn reanchored_bars_cache_bytes(json: &str) -> Vec<u8> {
+    let mut parsed: crate::providers::ThirdPartyStats =
+        serde_json::from_str(json).expect("captured cache parses");
+    let now = crate::usage::now_epoch_secs();
+    for bar in &mut parsed.bars {
+        // Each bar is stamped now + its own window length, read off the label
+        // the provider itself wrote — not the captured stamp, whose offset
+        // from another bar's can be internally inconsistent (one capture held
+        // a 5h bar resetting days before its own 30d bar) and preserving it
+        // would re-create lapsed bars as real time moves. An unparseable label
+        // still gets a future stamp: a shape fixture is not a lapsed case.
+        let span = crate::usage::window_duration_secs(&bar.label).unwrap_or(3600);
+        bar.resets_at = Some(crate::usage::epoch_secs_to_iso(now + span));
+    }
+    serde_json::to_vec(&parsed).expect("re-serialized cache parses")
+}
+
 /// Parse a captured `third_party_cache.json` and write it at `name`'s
 /// sandboxed path through the production cache writer — the same route the
 /// fetch leg takes — so a consumer is driven by captured bytes, never a
 /// hand-built [`crate::providers::ThirdPartyStats`] that mirrors the reader's
-/// own guess.
+/// own guess. A captured bar's `resets_at` is an ABSOLUTE stamp, so real time
+/// drifting past it turns a fixture meant to exercise the bars SHAPE into a
+/// lapsed-window case the liveness gate legitimately drops: every parseable
+/// bar stamp is re-stamped at now plus its own window length (see
+/// [`reanchored_bars_cache_bytes`]), so a captured cache renders its shape
+/// forever and lapsed behaviour is pinned only by the tests that mean it.
 pub(crate) fn write_captured_third_party_cache(name: &str, json: &str) {
+    let bytes = reanchored_bars_cache_bytes(json);
     let parsed: crate::providers::ThirdPartyStats =
-        serde_json::from_str(json).expect("captured cache parses");
+        serde_json::from_slice(&bytes).expect("captured cache parses");
     crate::profile_cache::write_profile_cache(
         &crate::profile::ProfileName::from(name),
         crate::profile_cache::THIRD_PARTY_CACHE_FILE,
@@ -930,12 +1032,43 @@ pub(crate) fn live_row(session_id: &str, profile: &str) -> crate::live_sessions:
 }
 
 /// Overwrite a file's modification time — for cache-staleness / tie-break tests.
+///
+/// The open retries while Windows reports a sharing violation: an open landing
+/// inside another thread's `MoveFileEx` replace over the same path fails with
+/// it, which is exactly what a fixture that back-dates a file the code under
+/// test is concurrently republishing does. POSIX renames never block an open,
+/// so `is_sharing_violation` is `false` off Windows and the loop degenerates to
+/// one attempt. Bounded, so a genuinely absent file still panics with its own
+/// error rather than hanging.
 pub(crate) fn set_mtime(path: &Path, when: SystemTime) {
-    let file = std::fs::OpenOptions::new()
-        .write(true)
-        .open(path)
-        .expect("open for mtime");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let file = loop {
+        match std::fs::OpenOptions::new().write(true).open(path) {
+            Ok(file) => break file,
+            Err(e) if is_sharing_violation(&e) && std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            Err(e) => panic!("open {} for mtime: {e}", path.display()),
+        }
+    };
     file.set_modified(when).expect("set_modified");
+}
+
+/// `ERROR_SHARING_VIOLATION`. `std::io::ErrorKind` maps it to `Uncategorized`,
+/// so the raw code is the only discriminator, and it is Windows-only: errno 32
+/// is `EPIPE` on Linux.
+///
+/// It names what an OPEN gets. A rename replace over a destination someone else
+/// holds open fails `ERROR_ACCESS_DENIED` (5) instead, measured on a real box,
+/// so this predicate does not carry to a publish.
+#[cfg(windows)]
+fn is_sharing_violation(e: &std::io::Error) -> bool {
+    e.raw_os_error() == Some(32)
+}
+
+#[cfg(not(windows))]
+fn is_sharing_violation(_: &std::io::Error) -> bool {
+    false
 }
 
 /// A `Press` key event with no modifiers.
@@ -996,4 +1129,172 @@ pub(crate) fn buffer_rows(buf: &ratatui::buffer::Buffer) -> Vec<String> {
     (0..h)
         .map(|y| (0..w).map(|x| buf.content[y * w + x].symbol()).collect())
         .collect()
+}
+
+// A fake `claude` on a PATH prefix whose final-run invocation holds the child
+// alive for a few seconds, so a test can read a session's runtime
+// `settings.json` MID-run: `ProfileRuntime`'s drop removes the tree once the
+// child exits, so nothing written there survives to be asserted afterwards.
+
+/// The poll helper: wait until a runtime settings.json appears under
+/// `profile_dir`, then return its content. Bounded so a fixture that never
+/// merges fails the test instead of hanging the suite.
+#[cfg(unix)]
+pub(crate) fn runtime_settings_until(profile_dir: &std::path::Path) -> Option<String> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    loop {
+        let mut found = None;
+        if let Ok(entries) = std::fs::read_dir(profile_dir) {
+            for entry in entries.flatten() {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if name.starts_with("runtime-") {
+                    let settings = entry.path().join("settings.json");
+                    if settings.is_file() {
+                        found = Some(settings);
+                        break;
+                    }
+                }
+            }
+        }
+        if let Some(settings) = found {
+            return std::fs::read_to_string(settings).ok();
+        }
+        if std::time::Instant::now() > deadline {
+            return None;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}
+
+/// A stateful slow `claude` shim: `--version` and `plugin` probes answer
+/// instantly (the start pre-flight's heal calls them), the session spawn
+/// itself sleeps a bounded five seconds so the poll above can observe the
+/// tree, then exits 0. Mutates process-global env, so it borrows the
+/// [`HomeSandbox`] whose `HOME_TEST_LOCK` serializes every other env pin in
+/// the suite — the same shape `FakeClaude` uses; this one differs only in
+/// keeping the final child alive.
+#[cfg(unix)]
+pub(crate) struct SlowClaude<'a> {
+    _home: std::marker::PhantomData<&'a HomeSandbox>,
+    _tmp: tempfile::TempDir,
+    prev_path: std::ffi::OsString,
+    prev_home: Option<std::ffi::OsString>,
+    prev_data: Option<std::ffi::OsString>,
+    prev_runtime: Option<std::ffi::OsString>,
+}
+
+#[cfg(unix)]
+impl<'a> SlowClaude<'a> {
+    #[expect(
+        unsafe_code,
+        reason = "env mutation is unsafe in Rust 2024; serialized by HOME_TEST_LOCK, held by the borrowed sandbox"
+    )]
+    pub(crate) fn new(home: &'a HomeSandbox) -> Self {
+        let tmp = tempfile::tempdir_in(home.home()).expect("shim dir");
+        let shim = tmp.path().join("claude");
+        std::fs::write(
+            &shim,
+            "#!/bin/sh\ncase \"$1\" in\n  --version) echo \"2.1.220 (Claude Code)\"; exit 0;;\n  plugin) exit 0;;\nesac\nsleep 5\nexit 0\n",
+        )
+        .expect("write shim");
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(&shim).expect("shim meta").permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&shim, perms).expect("chmod shim");
+
+        let prev_path = std::env::var_os("PATH").expect("PATH is set");
+        let mut path = std::ffi::OsString::from(tmp.path());
+        path.push(":");
+        path.push(&prev_path);
+        // The `dirs`-crate pins keep agentgear's data/runtime resolution off
+        // the operator's real dirs, exactly like `FakeClaude::stage`.
+        let pin = |key: &str, value: &std::path::Path| {
+            let prev = std::env::var_os(key);
+            // SAFETY: test-only, serialized by HOME_TEST_LOCK, restored on drop.
+            unsafe { std::env::set_var(key, value) };
+            prev
+        };
+        // SAFETY: test-only, serialized by HOME_TEST_LOCK, restored on drop.
+        unsafe { std::env::set_var("PATH", path) };
+        let prev_data = pin("XDG_DATA_HOME", &tmp.path().join("data"));
+        let prev_home = pin("HOME", home.home());
+        let prev_runtime = pin("XDG_RUNTIME_DIR", &tmp.path().join("run"));
+        Self {
+            _home: std::marker::PhantomData,
+            _tmp: tmp,
+            prev_path,
+            prev_home,
+            prev_data,
+            prev_runtime,
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for SlowClaude<'_> {
+    #[expect(
+        unsafe_code,
+        reason = "env mutation is unsafe in Rust 2024; serialized by HOME_TEST_LOCK, still held here"
+    )]
+    fn drop(&mut self) {
+        // SAFETY: restore the prior values under the same lock the sandbox holds.
+        unsafe {
+            std::env::set_var("PATH", &self.prev_path);
+            for (key, value) in [
+                ("XDG_DATA_HOME", &self.prev_data),
+                ("HOME", &self.prev_home),
+                ("XDG_RUNTIME_DIR", &self.prev_runtime),
+            ] {
+                match value {
+                    Some(v) => std::env::set_var(key, v),
+                    None => std::env::remove_var(key),
+                }
+            }
+        }
+    }
+}
+
+// ── Third-party stats fixtures ────────────────────────────────────────────────
+
+/// The `ThirdPartyStats` shell every typed-provider fixture builds: available,
+/// no rows, typed (never best-effort), carrying exactly the given bars — one
+/// definition so the non-bar fields cannot drift between test modules.
+pub(crate) fn stats_with_bars(
+    bars: Vec<crate::providers::UsageBar>,
+) -> crate::providers::ThirdPartyStats {
+    crate::providers::ThirdPartyStats {
+        is_available: true,
+        rows: Vec::new(),
+        bars,
+        plan: None,
+        endpoint: None,
+        best_effort: false,
+    }
+}
+
+/// One unstamped percentage bar — the shape a provider's `5h`/`7d` windows
+/// arrive as. [`bar_reset_in`] stamps one when a test needs liveness to hold.
+pub(crate) fn bar(label: &str, pct: f64) -> crate::providers::UsageBar {
+    crate::providers::UsageBar {
+        label: label.to_string(),
+        pct,
+        resets_at: None,
+        used: None,
+        total: None,
+    }
+}
+
+/// [`bar`] with a `resets_at` the given seconds into the future — a live
+/// window, for the surfaces that judge liveness off the stamp.
+pub(crate) fn bar_reset_in(
+    label: &str,
+    pct: f64,
+    secs_in_future: i64,
+) -> crate::providers::UsageBar {
+    crate::providers::UsageBar {
+        resets_at: Some(crate::usage::epoch_secs_to_iso(
+            crate::usage::now_epoch_secs() + secs_in_future,
+        )),
+        ..bar(label, pct)
+    }
 }

@@ -6,7 +6,7 @@ Edit the chain on the Fallback tab, or as `fallback_chain` in `profiles.toml`.
 
 ## The decision
 
-After every usage refresh, and once at startup:
+On every scheduler tick, and once at startup:
 
 1. The active account has to be a chain member. Nothing happens otherwise.
 2. It has to be exhausted or dead.
@@ -14,7 +14,7 @@ After every usage refresh, and once at startup:
 
 The walk prefers members whose usage was read live over ones showing cached numbers, and falls through to accept a stale-reading member rather than strand you on an exhausted account.
 
-The active account's own exhaustion is judged only on fresh readings, so a rate-limited poll cannot trigger a switch by itself. Dead accounts are the exception: those switch away on any reading.
+The active account's own exhaustion is judged only on fresh readings, so a rate-limited poll cannot trigger a switch by itself. Two states are the exception, because neither can ever report a fresh reading again: a dead account switches away on any reading, and an account whose usage polls have been rate-limited long enough to stop draining switches away too, once its last-known numbers say it is genuinely spent.
 
 ## Exhausted
 
@@ -28,6 +28,8 @@ An account is exhausted when either window is past its line.
 | 7d hard cap | `100%` | not configurable |
 
 The weekly lines are deliberately below 100. Topping out a week bricks an account for days rather than hours, so clauth moves off while there is still room to land the hop. The 100% hard cap blocks an account regardless of every toggle below.
+
+API-key accounts are judged on the same lines, using whatever 5h / 7d windows their provider publishes — Z.ai, MiniMax and Alibaba Model Studio today. Before, only OAuth accounts could ever be exhausted, so a `fallback_threshold` on an api-key member never fired. A window a provider does not publish simply has no line to cross, and a best-effort scan of an unrecognised endpoint never counts: its numbers are guessed from the response shape, and parking an account on a guess is worse than not switching. Windows on any other schedule (z.ai's 30d ceiling) render as bars but are not judged — the chain only knows the 5h and 7d lines.
 
 Per-model weekly windows (a "7d fable" window, say) gate the same way: an account whose scoped week is past the line stays out of rotation, since a session of the capped model landed there would strand, and the walk cannot know which model your next session runs.
 
@@ -45,13 +47,13 @@ The walk skips a member for any of these, worst first. The Overview and Fallback
 | `disabled` | you ran `clauth disable <name>`, or flipped it on the Setup tab |
 | `canceled` | the subscription reads canceled at Anthropic |
 | `auth broken` | a refresh was rejected for good; the login needs `clauth login <name>` |
-| `weekly hard cap` | 7d at 100%, dead until the week resets |
-| `kick rejected` | the messages limiter keeps refusing this account, twice running, with quota still ahead |
-| `budget spent` | out of subscription quota and out of the spend ceiling below |
-| `over threshold` | 5h past its line |
-| `weekly` / `scoped` | past a weekly line, per the gates above |
+| `weekly spent` | 7d at 100%, dead until the week resets |
+| `claude code blocked` | the messages limiter keeps refusing this account, twice running, with quota still ahead |
+| `extra usage spent` | out of subscription quota and out of the spend ceiling below |
+| `5h <pct>%` | 5h past its line |
+| `weekly <pct>%` / `<model> <pct>%` | past a weekly line, per the gates above |
 
-Being dead is its own switch trigger. An active account marked `auth broken`, `canceled`, or `kick rejected` can never report fresh usage again, so clauth walks off it instead of wedging on the corpse.
+Being dead is its own switch trigger. An active account marked `auth broken`, `canceled`, or `claude code blocked` can never report fresh usage again, so clauth walks off it instead of wedging on the corpse.
 
 ## Last resort and preferred
 
@@ -94,11 +96,15 @@ The ceiling is a real stop, not just a gate on starting: once the account has sp
 
 An armed account with `extra usage spent` set to `stay on active` and no `last resort` member in the chain can spend without a stop. clauth marks that on the card and the daemon warns about it at boot.
 
+## Keeping the chain warm
+
+An account's 5h window opens on its first real request, so a chain member you have not touched starts its clock only when the chain lands on it — and then holds you there for a full five hours before it resets. `auto_start` ([Configuration](Configuration#auto-start-the-5-hour-window)) opens that window ahead of time with a one-token ping, and the shared queue ([Configuration](Configuration#interleaving-it-across-accounts)) spaces those opens `5h / N` apart across the accounts that opted in, so whichever member the chain hops to has usually been cycling already and resets sooner. Both are independent of the chain itself: auto-start never switches anything, and the walk never consults it.
+
 ## Running it
 
 The chain runs wherever the decision loop runs: an open TUI, or `clauth daemon` with the TUI closed ([Daemon](Daemon)). Only one of them decides at a time.
 
-`clauth start <profile> --with-fallback` gives a single session its own chain, so that session hops accounts while your global one stays put. It needs a running daemon and an OAuth account inside the chain, and it does not work on macOS or alongside `--isolated` ([Quickstart](Quickstart#rules-worth-knowing)).
+`clauth start <profile> --with-fallback` gives a single session its own chain, so that session hops accounts while your global one stays put. It needs a running daemon and an OAuth account inside a chain that holds a second member to move to, and it does not work alongside `--isolated` ([Quickstart](Quickstart#rules-worth-knowing)). On macOS the swap also writes the session's per-config-dir Keychain item, so the running session follows the chain there too.
 
 ## Mixing account types
 

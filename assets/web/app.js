@@ -142,6 +142,8 @@ document.addEventListener("alpine:init", () => {
     _tickTimer: null,
     _dragIndex: null,
     nowTick: 0,
+    sortKey: "account",
+    sortDir: "asc",
 
     init() {
       this.fetchStatus();
@@ -211,6 +213,45 @@ document.addEventListener("alpine:init", () => {
       if (p.auth_status === "expiring") return { glyph: "⊘", cls: "danger" };
       if (p.active) return { glyph: "●", cls: "active" };
       return { glyph: "", cls: "" };
+    },
+
+    // Click-to-sort for the Overview table's account/5h/7d headers. `account`
+    // is a natural string sort (numeric:true makes "acc2" sort before
+    // "acc10"); `5h`/`7d` compare the window's raw utilization_pct number.
+    // Missing/never-fetched values (no window yet) always sort last,
+    // independent of direction, so an unsorted-looking blank row doesn't
+    // jump to the top under "desc".
+    setSort(key) {
+      if (this.sortKey === key) {
+        this.sortDir = this.sortDir === "asc" ? "desc" : "asc";
+      } else {
+        this.sortKey = key;
+        this.sortDir = "asc";
+      }
+    },
+
+    sortIndicator(key) {
+      if (this.sortKey !== key) return "";
+      return this.sortDir === "asc" ? " ▲" : " ▼";
+    },
+
+    sortedProfiles() {
+      const profiles = this.status ? this.status.profiles : [];
+      if (!this.sortKey) return profiles;
+      const dir = this.sortDir === "asc" ? 1 : -1;
+      const list = [...profiles];
+      list.sort((a, b) => {
+        if (this.sortKey === "account") {
+          return a.name.localeCompare(b.name, undefined, { numeric: true, sensitivity: "base" }) * dir;
+        }
+        const va = windowFor(a, this.sortKey)?.utilization_pct ?? null;
+        const vb = windowFor(b, this.sortKey)?.utilization_pct ?? null;
+        if (va === null && vb === null) return 0;
+        if (va === null) return 1;
+        if (vb === null) return -1;
+        return (va - vb) * dir;
+      });
+      return list;
     },
 
     async switchProfile(name) {

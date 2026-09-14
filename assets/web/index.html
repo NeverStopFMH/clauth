@@ -33,17 +33,23 @@
             <thead>
               <tr>
                 <th></th>
-                <th>account</th>
+                <th style="cursor: pointer; user-select: none" @click="setSort('account')">
+                  account<span x-text="sortIndicator('account')"></span>
+                </th>
                 <th>type</th>
-                <th>5h</th>
-                <th>7d</th>
+                <th style="cursor: pointer; user-select: none" @click="setSort('5h')">
+                  5h<span x-text="sortIndicator('5h')"></span>
+                </th>
+                <th style="cursor: pointer; user-select: none" @click="setSort('7d')">
+                  7d<span x-text="sortIndicator('7d')"></span>
+                </th>
                 <th>live</th>
                 <th>next</th>
                 <th></th>
               </tr>
             </thead>
             <tbody>
-              <template x-for="p in (status ? status.profiles : [])" :key="p.name">
+              <template x-for="p in sortedProfiles()" :key="p.name">
                 <tr>
                   <td x-text="statusMarker(p).glyph"></td>
                   <td x-text="p.name"></td>

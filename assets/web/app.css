@@ -6,6 +6,15 @@ body {
   background: var(--pico-background-color);
 }
 
+:root {
+  /* Approximate rendered height of the sticky `.app-header` (padding + brand
+     row + tab-bar row + its border). Anything else that pins itself under
+     the header (the Usage tab's account nav) offsets against this instead of
+     a guessed constant, so the two stay in sync if the header's own layout
+     changes. */
+  --header-offset: 6.5rem;
+}
+
 .app-shell {
   max-width: 1200px;
   margin: 0 auto;
@@ -19,6 +28,13 @@ body {
   box-shadow: var(--pico-card-box-shadow, 0 1px 4px rgba(0, 0, 0, 0.08));
   padding: 1rem 1.5rem 0;
   margin: 1.5rem 0 2rem;
+  /* Pinned to the viewport top so the tab bar stays reachable while a tab's
+     own content (a long account table, the Usage card stack) scrolls past
+     underneath it — an opaque background is load-bearing here, or scrolled
+     content would show through behind it. */
+  position: sticky;
+  top: 0;
+  z-index: 20;
 }
 
 nav.app-nav {
@@ -226,8 +242,55 @@ main article {
   opacity: 0.7;
 }
 
-/* Usage tab: one full-width card per account, stacked, no tab/click-through needed */
+/* Usage tab: a sticky account nav beside the card stack, so scrolling to a
+   given account in a long list doesn't mean scanning past every card ahead
+   of it. */
+.usage-layout {
+  display: flex;
+  gap: 1.5rem;
+  align-items: flex-start;
+}
+
+.usage-nav {
+  width: 160px;
+  flex-shrink: 0;
+  position: sticky;
+  top: var(--header-offset);
+  max-height: calc(100vh - var(--header-offset) - 1rem);
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 0.15rem;
+  border-right: 1px solid var(--pico-muted-border-color);
+  padding-right: 0.75rem;
+}
+
+.usage-nav a {
+  display: block;
+  padding: 0.35rem 0.5rem;
+  border-radius: 6px;
+  font-size: 0.85rem;
+  color: inherit;
+  cursor: pointer;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.usage-nav a:hover {
+  background: var(--pico-muted-border-color);
+}
+
+.usage-nav a.active {
+  background: rgba(108, 142, 224, 0.15);
+  color: var(--pico-primary);
+  font-weight: bold;
+}
+
+/* One full-width card per account, stacked, no tab/click-through needed */
 .usage-grid {
+  flex: 1;
+  min-width: 0;
   display: flex;
   flex-direction: column;
   gap: 1rem;

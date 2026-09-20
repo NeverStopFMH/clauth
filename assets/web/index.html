@@ -40,10 +40,15 @@
                 <th style="cursor: pointer; user-select: none" @click="setSort('5h')">
                   5h<span x-text="sortIndicator('5h')"></span>
                 </th>
+                <th style="cursor: pointer; user-select: none" @click="setSort('5h_resets')">
+                  resets<span x-text="sortIndicator('5h_resets')"></span>
+                </th>
                 <th style="cursor: pointer; user-select: none" @click="setSort('7d')">
                   7d<span x-text="sortIndicator('7d')"></span>
                 </th>
-                <th>live</th>
+                <th style="cursor: pointer; user-select: none" @click="setSort('7d_resets')">
+                  resets<span x-text="sortIndicator('7d_resets')"></span>
+                </th>
                 <th>next</th>
                 <th></th>
               </tr>
@@ -63,12 +68,13 @@
                           :style="{ width: (windowFor(p, '5h') ? windowFor(p, '5h').utilization_pct : 0) + '%' }"
                         ></span>
                       </span>
-                      <span
-                        class="gauge-label"
-                        x-text="fmtPct(windowFor(p, '5h') && windowFor(p, '5h').utilization_pct) + (windowFor(p, '5h') && windowFor(p, '5h').resets_at ? ' · ' + fmtReset(windowFor(p, '5h').resets_at) : '')"
-                      ></span>
+                      <span class="gauge-label" x-text="fmtPct(windowFor(p, '5h') && windowFor(p, '5h').utilization_pct)"></span>
                     </span>
                   </td>
+                  <td
+                    style="font-size: 0.8rem; opacity: 0.7"
+                    x-text="(windowFor(p, '5h') && windowFor(p, '5h').resets_at && fmtReset(windowFor(p, '5h').resets_at)) || '—'"
+                  ></td>
                   <td>
                     <span class="gauge">
                       <span class="gauge-track">
@@ -78,13 +84,13 @@
                           :style="{ width: (windowFor(p, '7d') ? windowFor(p, '7d').utilization_pct : 0) + '%' }"
                         ></span>
                       </span>
-                      <span
-                        class="gauge-label"
-                        x-text="fmtPct(windowFor(p, '7d') && windowFor(p, '7d').utilization_pct) + (windowFor(p, '7d') && windowFor(p, '7d').resets_at ? ' · ' + fmtReset(windowFor(p, '7d').resets_at) : '')"
-                      ></span>
+                      <span class="gauge-label" x-text="fmtPct(windowFor(p, '7d') && windowFor(p, '7d').utilization_pct)"></span>
                     </span>
                   </td>
-                  <td x-text="p.has_live_session ? '●' : ''"></td>
+                  <td
+                    style="font-size: 0.8rem; opacity: 0.7"
+                    x-text="(windowFor(p, '7d') && windowFor(p, '7d').resets_at && fmtReset(windowFor(p, '7d').resets_at)) || '—'"
+                  ></td>
                   <td style="font-size: 0.8rem; opacity: 0.7" x-text="fmtCountdown(p.next_refresh_at, nowTick)"></td>
                   <td>
                     <button
@@ -260,42 +266,49 @@
 
         <!-- Usage -->
         <section x-show="tab === 'usage'">
-          <div class="usage-grid" x-show="status">
-            <template x-for="p in (status ? status.profiles : [])" :key="p.name">
-              <article class="usage-card" :class="{ active: p.active }">
-                <div class="row" style="display: flex; justify-content: space-between; align-items: center">
-                  <h3 style="margin: 0" x-text="p.name"></h3>
-                  <span class="pill" :class="p.auth_status === 'ok' ? 'active' : 'blocked'" x-text="p.auth_status"></span>
-                </div>
-                <p style="font-size: 0.85rem; opacity: 0.7; display: flex; align-items: center; gap: 0.4rem; flex-wrap: wrap">
-                  <span x-text="p.tier || p.provider"></span>
-                  <span class="pill" :class="fetchStatusClass(p.fetch_status)" x-text="fetchStatusLabel(p.fetch_status)"></span>
-                  <span x-show="fmtCountdown(p.next_refresh_at, nowTick)">
-                    next in <span x-text="fmtCountdown(p.next_refresh_at, nowTick)"></span>
-                  </span>
-                </p>
-                <template x-for="w in p.windows" :key="w.label">
-                  <div style="margin-bottom: 1rem">
-                    <div style="font-size: 0.85rem; margin-bottom: 4px">
-                      <strong x-text="w.label"></strong>
-                      <span
-                        style="margin-left: 1rem"
-                        x-text="fmtPct(w.utilization_pct) + (w.resets_at ? ' · resets in ' + fmtReset(w.resets_at) : '')"
-                      ></span>
-                    </div>
-                    <span class="gauge-track" style="display: block; height: 8px">
-                      <span
-                        class="gauge-fill"
-                        :class="gaugeClass(w.utilization_pct, 100)"
-                        :style="{ width: w.utilization_pct + '%' }"
-                      ></span>
-                    </span>
-                    <div class="gauge-label" x-show="w.resets_at" x-text="fmtDualTz(w.resets_at)" style="margin-top: 4px"></div>
+          <div class="usage-layout" x-show="status">
+            <nav class="usage-nav">
+              <template x-for="p in usageProfiles()" :key="p.name">
+                <a :class="{ active: p.active }" @click="scrollToUsageCard(p.name)" x-text="p.name"></a>
+              </template>
+            </nav>
+            <div class="usage-grid">
+              <template x-for="p in usageProfiles()" :key="p.name">
+                <article class="usage-card" :id="'usage-card-' + p.name" :class="{ active: p.active }">
+                  <div class="row" style="display: flex; justify-content: space-between; align-items: center">
+                    <h3 style="margin: 0" x-text="p.name"></h3>
+                    <span class="pill" :class="p.auth_status === 'ok' ? 'active' : 'blocked'" x-text="p.auth_status"></span>
                   </div>
-                </template>
-                <p x-show="p.windows.length === 0" style="opacity: 0.6">No usage windows cached yet.</p>
-              </article>
-            </template>
+                  <p style="font-size: 0.85rem; opacity: 0.7; display: flex; align-items: center; gap: 0.4rem; flex-wrap: wrap">
+                    <span x-text="p.tier || p.provider"></span>
+                    <span class="pill" :class="fetchStatusClass(p.fetch_status)" x-text="fetchStatusLabel(p.fetch_status)"></span>
+                    <span x-show="fmtCountdown(p.next_refresh_at, nowTick)">
+                      next in <span x-text="fmtCountdown(p.next_refresh_at, nowTick)"></span>
+                    </span>
+                  </p>
+                  <template x-for="w in p.windows" :key="w.label">
+                    <div style="margin-bottom: 1rem">
+                      <div style="font-size: 0.85rem; margin-bottom: 4px">
+                        <strong x-text="w.label"></strong>
+                        <span
+                          style="margin-left: 1rem"
+                          x-text="fmtPct(w.utilization_pct) + (w.resets_at ? ' · resets in ' + fmtReset(w.resets_at) : '')"
+                        ></span>
+                      </div>
+                      <span class="gauge-track" style="display: block; height: 8px">
+                        <span
+                          class="gauge-fill"
+                          :class="gaugeClass(w.utilization_pct, 100)"
+                          :style="{ width: w.utilization_pct + '%' }"
+                        ></span>
+                      </span>
+                      <div class="gauge-label" x-show="w.resets_at" x-text="fmtDualTz(w.resets_at)" style="margin-top: 4px"></div>
+                    </div>
+                  </template>
+                  <p x-show="p.windows.length === 0" style="opacity: 0.6">No usage windows cached yet.</p>
+                </article>
+              </template>
+            </div>
           </div>
         </section>
 
@@ -541,20 +554,6 @@
           </article>
 
           <article>
-            <h3>Add account</h3>
-            <div class="field-grid">
-              <label>Name</label>
-              <input type="text" x-model="newProfile.name" />
-              <label>Base URL</label>
-              <input type="text" placeholder="leave blank for an OAuth account" x-model="newProfile.base_url" />
-              <label>API key</label>
-              <input type="password" placeholder="leave blank for an OAuth account" x-model="newProfile.api_key" />
-            </div>
-            <button style="margin-top: 0.75rem" @click="createProfile()">create</button>
-            <div class="field-error" x-show="createError" x-text="createError"></div>
-          </article>
-
-          <article>
             <h3>OAuth login (new account)</h3>
             <p style="font-size: 0.85rem; opacity: 0.7">Opens your browser to sign in with Claude, then adds the account under this name.</p>
             <div style="display: flex; gap: 0.5rem; align-items: center">
@@ -566,6 +565,22 @@
               <span x-show="oauthJob && oauthJob.status === 'succeeded'">signed in</span>
               <span class="field-error" x-show="oauthJob && oauthJob.status === 'failed'" x-text="oauthJob.error"></span>
             </div>
+          </article>
+
+          <article>
+            <details>
+              <summary>Add account with a custom endpoint (advanced)</summary>
+              <div class="field-grid" style="margin-top: 0.75rem">
+                <label>Name</label>
+                <input type="text" x-model="newProfile.name" />
+                <label>Base URL</label>
+                <input type="text" placeholder="leave blank for an OAuth account" x-model="newProfile.base_url" />
+                <label>API key</label>
+                <input type="password" placeholder="leave blank for an OAuth account" x-model="newProfile.api_key" />
+              </div>
+              <button style="margin-top: 0.75rem" @click="createProfile()">create</button>
+              <div class="field-error" x-show="createError" x-text="createError"></div>
+            </details>
           </article>
         </section>
 

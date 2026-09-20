@@ -82,6 +82,23 @@ function windowFor(profile, label) {
   return (profile.windows || []).find((w) => w.label === label) || null;
 }
 
+// Natural string order ("acc2" before "acc10") for account names, shared by
+// the Overview table's account-column sort and the Usage tab's always-sorted
+// nav/card order.
+function compareAccountNames(a, b) {
+  return a.name.localeCompare(b.name, undefined, { numeric: true, sensitivity: "base" });
+}
+
+// `va`/`vb` are numbers or null (a profile with no window/reset yet). A
+// missing value always sorts last, independent of `dir`, so a blank row
+// doesn't jump to the top under "desc".
+function compareNullable(va, vb, dir) {
+  if (va === null && vb === null) return 0;
+  if (va === null) return 1;
+  if (vb === null) return -1;
+  return (va - vb) * dir;
+}
+
 function gaugeClass(pct, threshold) {
   if (pct === null || pct === undefined) return "";
   const ratio = threshold ? pct / threshold : 0;
@@ -215,12 +232,11 @@ document.addEventListener("alpine:init", () => {
       return { glyph: "", cls: "" };
     },
 
-    // Click-to-sort for the Overview table's account/5h/7d headers. `account`
-    // is a natural string sort (numeric:true makes "acc2" sort before
-    // "acc10"); `5h`/`7d` compare the window's raw utilization_pct number.
-    // Missing/never-fetched values (no window yet) always sort last,
-    // independent of direction, so an unsorted-looking blank row doesn't
-    // jump to the top under "desc".
+    // Click-to-sort for the Overview table's headers. `account` is a natural
+    // string sort (numeric:true makes "acc2" sort before "acc10"); `5h`/`7d`
+    // compare the window's raw utilization_pct number; `5h_resets`/`7d_resets`
+    // compare the window's resets_at instant. Missing values (no window/reset
+    // yet) always sort last, independent of direction — see `compareNullable`.
     setSort(key) {
       if (this.sortKey === key) {
         this.sortDir = this.sortDir === "asc" ? "desc" : "asc";
@@ -242,16 +258,35 @@ document.addEventListener("alpine:init", () => {
       const list = [...profiles];
       list.sort((a, b) => {
         if (this.sortKey === "account") {
-          return a.name.localeCompare(b.name, undefined, { numeric: true, sensitivity: "base" }) * dir;
+          return compareAccountNames(a, b) * dir;
+        }
+        if (this.sortKey === "5h_resets" || this.sortKey === "7d_resets") {
+          const label = this.sortKey === "5h_resets" ? "5h" : "7d";
+          const ra = windowFor(a, label)?.resets_at;
+          const rb = windowFor(b, label)?.resets_at;
+          const va = ra ? new Date(ra).getTime() : null;
+          const vb = rb ? new Date(rb).getTime() : null;
+          return compareNullable(va, vb, dir);
         }
         const va = windowFor(a, this.sortKey)?.utilization_pct ?? null;
         const vb = windowFor(b, this.sortKey)?.utilization_pct ?? null;
-        if (va === null && vb === null) return 0;
-        if (va === null) return 1;
-        if (vb === null) return -1;
-        return (va - vb) * dir;
+        return compareNullable(va, vb, dir);
       });
       return list;
+    },
+
+    // ---- Usage ----
+
+    // Always naturally sorted by account name — the Usage tab has no sort
+    // controls of its own (cards, not a table), and a stable natural order is
+    // what makes the nav list below and the card stack line up predictably.
+    usageProfiles() {
+      const profiles = this.status ? this.status.profiles : [];
+      return [...profiles].sort(compareAccountNames);
+    },
+
+    scrollToUsageCard(name) {
+      document.getElementById(`usage-card-${name}`)?.scrollIntoView({ behavior: "smooth", block: "start" });
     },
 
     async switchProfile(name) {
